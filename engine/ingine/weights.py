@@ -1,6 +1,7 @@
 """Inkling-2-Mini weights in ingine's device layouts, read straight from the Hugging Face checkpoint.
 
-Dense matrices stay BF16 row-major ``[out, in]``; small per-channel parameters become FP32. Routed
+Dense matrices load as BF16 row-major ``[out, in]`` (the fused decoder may convert the large ones to FP8
+rows with per-row scales in place, see `Layer.scales`); small per-channel parameters become FP32. Routed
 experts keep their checkpoint encoding:
 
 * NVFP4 (layers 0-19): ``w13`` uint8 ``[128, 2304, 1152]`` (two E2M1 codes per byte, even element in the
@@ -70,6 +71,8 @@ class Layer:
     loop: bool
     t: dict[str, torch.Tensor] = field(default_factory=dict)
     experts: Experts | None = None
+    # FP32 per-row scales of the matrices in `t` stored as float8_e4m3fn rows (absent: BF16)
+    scales: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass
@@ -79,9 +82,15 @@ class Weights:
     embed_norm: torch.Tensor
     final_query: torch.Tensor
     final_norm: torch.Tensor
-    unembed: torch.Tensor
+    unembed: torch.Tensor  # BF16, or float8_e4m3fn rows with `unembed_scale`
     message_queries: torch.Tensor  # [12, 4, H]: q, k, v, mlp per loop layer
     expert_formats: dict[int, str]
+    unembed_scale: torch.Tensor | None = None
+
+
+def dequant(w: torch.Tensor, scale: torch.Tensor | None) -> torch.Tensor:
+    """BF16 matrix: FP8 rows `w` times their per-row `scale`, rounded to BF16; BF16 `w` (scale None) as is."""
+    return w if scale is None else (w.float() * scale[:, None]).to(torch.bfloat16)
 
 
 class _Reader:

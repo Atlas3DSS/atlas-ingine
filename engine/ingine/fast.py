@@ -66,12 +66,8 @@ class TorchOps:
         if out_bf16 is not None:
             out_bf16.copy_(M.rms_norm(mixed, norm_w[:, None, :]).to(torch.bfloat16))
 
-    @staticmethod
-    def _w(w, scale):
-        return w if scale is None else (w.float() * scale[:, None]).to(torch.bfloat16)
-
     def proj(self, xin, w, scale, layout, out):
-        w = self._w(w, scale)
+        w = W.dequant(w, scale)
         for name, b, e, i in layout:
             out[:, b:e] = M.linear(xin[i].float(), w[b:e])
 
@@ -106,8 +102,7 @@ class TorchOps:
         rel_logits = (rel.to(torch.bfloat16) @ t["rel_proj"].to(torch.bfloat16)).float()
         if layer.full:
             fi = st.full_index[v]
-            st.k_full[fi].index_copy_(0, pos, k)
-            st.v_full[fi].index_copy_(0, pos, vv)
+            st.write_full(fi, pos, k, vv)
             keys, values = st.k_full[fi], st.v_full[fi]
             kpos = torch.arange(st.max_ctx, device=proj.device)
             dist = pos[:, None] - kpos[None, :]
@@ -126,7 +121,7 @@ class TorchOps:
         out.copy_((o.to(torch.bfloat16).float() * gate).to(torch.bfloat16))
 
     def proj_conv(self, x, w, scale, conv_w, conv_state, out, conv_hist=None):
-        y = M.linear(x.float(), self._w(w, scale))
+        y = M.linear(x.float(), w, scale)
         if conv_hist is not None:
             conv_hist.copy_(y)
         y, new = M.static_conv(y, conv_state, conv_w, math.sqrt(CONV_K + 1))
@@ -156,7 +151,7 @@ class TorchOps:
         out.copy_(y)
 
     def head(self, x, w, scale, out):
-        out.copy_(M.softcap(M.linear(x.float(), self._w(w, scale)), W.LOGIT_SOFTCAP))
+        out.copy_(M.softcap(M.linear(x.float(), w, scale), W.LOGIT_SOFTCAP))
 
     def embed(self, token, table, norm_w, out):
         out.copy_(M.rms_norm(table[token].float(), norm_w).to(torch.bfloat16).float())
@@ -293,33 +288,49 @@ class Buffers:
 
 class FastDecoder:
     def __init__(self, weights: W.Weights, ablation: M.Ablation, state: M.State, ops=None, dense_fp8: bool = False):
+        """`dense_fp8`: store the dense matrices of the decode step as FP8 rows on the shared `weights`, in
+        place (the PyTorch prefill then reads the same values). Weights converted earlier stay FP8."""
         self.w, self.abl, self.st = weights, ablation, state
         self.ops = ops or TorchOps()
         self.bufs: dict[int, Buffers] = {}
         self._concat_projections()
         self._stack_layer_params()
+        if dense_fp8:
+            self._fp8_dense()
         self.final_norm1 = self.w.final_norm[None]
         # dense matrices of the decode step: (weight, per-row scale or None)
-        if dense_fp8:
-            from . import ext
-            fp8 = ext.load("dense").fp8_rows
-            self.proj_w = [tuple(fp8(l.t["wproj"])) for l in self.w.layers]
-            self.out_w = [tuple(fp8(l.t["wo"])) for l in self.w.layers]
-            self.head_w = tuple(fp8(self.w.unembed))
-        else:
-            self.proj_w = [(l.t["wproj"], None) for l in self.w.layers]
-            self.out_w = [(l.t["wo"], None) for l in self.w.layers]
-            self.head_w = (self.w.unembed, None)
+        self.proj_w = [(l.t["wproj"], l.scales.get("wproj")) for l in self.w.layers]
+        self.out_w = [(l.t["wo"], l.scales.get("wo")) for l in self.w.layers]
+        self.head_w = (self.w.unembed, self.w.unembed_scale)
 
     def _concat_projections(self):
         """One [R, H] matrix per layer in SPEC row order; the per-projection tensors become views into it
-        so the prefill path shares the memory."""
+        so the prefill path shares the memory. Idempotent."""
         for layer in self.w.layers:
+            if "wproj" in layer.t:
+                continue
             layout = proj_layout(layer.full)
             cat = torch.cat([layer.t[SEG_WEIGHT[name]] for name, _, _, _ in layout])
             for name, b, e, _ in layout:
                 layer.t[SEG_WEIGHT[name]] = cat[b:e]
             layer.t["wproj"] = cat
+
+    def _fp8_dense(self):
+        """`wproj` (with its per-projection views), `wo` and the unembedding -> FP8 rows + FP32 row scales
+        (`fp8_rows`), replacing the BF16 tensors so only one copy stays resident. Idempotent."""
+        from . import ext
+        fp8 = ext.load("dense").fp8_rows
+        for layer in self.w.layers:
+            t, sc = layer.t, layer.scales
+            if "wproj" in sc:
+                continue
+            for name in ("wproj", "wo"):
+                t[name], sc[name] = fp8(t[name])
+            for name, b, e, _ in proj_layout(layer.full):
+                t[SEG_WEIGHT[name]], sc[SEG_WEIGHT[name]] = t["wproj"][b:e], sc["wproj"][b:e]
+        if self.w.unembed_scale is None:
+            self.w.unembed, self.w.unembed_scale = fp8(self.w.unembed)
+        torch.cuda.empty_cache()  # return the freed BF16 blocks to the driver
 
     def _stack_layer_params(self):
         """Per-layer [G, ...] stacks the kernels take (norm weights per query, message-gate weights per gate);

@@ -7,7 +7,7 @@ in `ingine/fast.py` (owned by the integrator).
 
 The mathematical oracle is `ingine/model.py` (PyTorch, FP32 activations, BF16 matrix inputs), itself
 checked against the transformers reference. Weights come from `ingine/weights.py`;
-`weights.load_layer("/mnt/data/inkling/hf", l)` loads one layer (~0.8 GB GPU) for tests.
+`weights.load_layer(model_dir, l)` loads one layer (~0.8 GB GPU) for tests.
 
 ## Model facts used by kernels
 
@@ -80,19 +80,27 @@ log_scaling, workspace, out)`
     `(conv + x)/√5`); full layers use the dynamic conv: tap weight for lag ℓ (0 = current) of channel c in
     head h is `k_static[ℓ, c] + k_dyn[h*4 + ℓ]`, output `(Σ_ℓ w_ℓ x_{t-ℓ} + x_t)/3`. Conv states as above
     (`[3, 1024]`, inputs are the BF16-rounded projections). Then round to BF16; keys:
-    `clip(k.view(8,128), 22.627)`; values: per-head RMS norm without weight (eps 1e-6). Store BF16 into the
-    cache.
+    `clip(k.view(8,128), 22.627)`; values: per-head RMS norm without weight (eps 1e-6). Store into the cache
+    (dtype below).
   * Cache: full layers write position p at `k_cache[p]`; sliding layers write slot `p % 1024` and set
     `kpos[slot] = p` (`kpos` int64 `[1024]`, -1 = empty).
+  * Cache dtypes: `k_cache`/`v_cache` `[rows, 8, 128]` are both BF16, or, on full layers only, both
+    float8_e4m3fn (`kv_fp8`: no scale). The kernel dispatches on the dtype; the call signature is the same.
+    FP8 rule: the BF16 key/value above is rounded to E4M3, nearest even, saturated to ±448 (= torch
+    `x.clamp(-448, 448).to(torch.float8_e4m3fn)`; real keys have norm ≤ 22.627 and values are RMS-normed,
+    so saturation does not occur in practice). Every read of a cached entry, the call's own new keys/values
+    included, uses that E4M3 value. Sliding rings are BF16 only (an FP8 ring is rejected).
   * Scores over cached keys j (positions `kp`, distance `d = p - kp`): valid if `0 ≤ d` and, for sliding
     layers, `d < 1024` and `kp ≥ 0`. `s_j = (q_h · k_j)/√128 + (d < 1024 ? rel_logits[h, d] : 0)`.
     Softmax over valid j plus one sink logit `sink[h]` with zero value:
     `o_h = Σ_j e^{s_j} v_j / (Σ_j e^{s_j} + e^{sink_h})`. For M > 1 a token sees earlier tokens of the
     same call (write the call's keys first).
   * `out[m] = bf16( bf16(o) * sigmoid(gate) )`, bf16 `[M, 3072]` (head-major, as `o.reshape(3072)`).
-* Full layers can hold up to `max_ctx` (≥ 131072) positions: split the key range across blocks
-  (flash-decoding) with a combine pass, using `workspace`. Read the context length from `pos`, not from
-  the host.
+* Full layers hold up to `rows` = `max_ctx` positions, at most 2^30 (positions and loop bounds are int32 on
+  the device, row offsets 64-bit). The served profile uses 262,144 (FP8: 256 MiB per cache tensor, 512 MiB
+  K+V per full-attention visit, 4 GiB for the 8 visits; BF16 doubles that). Split the key range across
+  blocks (flash-decoding) with a combine pass, using `workspace`. Read the context length from `pos`, not
+  from the host; a call with `pos + M > rows` does nothing.
 * Target: close to DRAM bandwidth on the K/V bytes read for long contexts; small fixed overhead for the
   1024-key sliding layers.
 

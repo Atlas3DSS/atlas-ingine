@@ -10,12 +10,13 @@ INGINE_FULL_TESTS=1).
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-MODEL_DIR = "/mnt/data/inkling/hf"
+MODEL_DIR = os.environ.get("INGINE_MODEL_DIR", str(Path(__file__).resolve().parents[2] / "models" / "Inkling-2-Mini"))
 pytestmark = pytest.mark.skipif(os.environ.get("INGINE_FULL_TESTS") != "1", reason="set INGINE_FULL_TESTS=1")
 
 PROMPTS = [
@@ -87,24 +88,49 @@ def test_prefix_reuse_matches_fresh_prefill(engine):
 
 @pytest.mark.parametrize("prompt", PROMPTS)
 def test_greedy_speculation_matches_plain_greedy(engine, prompt):
+    """Prefill is deterministic, so both runs start from the same state; afterwards the verify calls (2-, 4- or
+    8-wide kernels) round differently from the 1-wide decode and the runs drift apart numerically. Speculation
+    must reproduce plain greedy decoding up to that drift: its target logits stay close to the plain ones
+    along the shared prefix, and a divergence picks a token plain decoding nearly picked too. Both runs stop at
+    the end of sampling: past it the model is off-distribution and any two implementations disagree."""
     from ingine.chat import Sampling
     ids = chat_ids(engine, prompt)
     n = 160
     greedy = Sampling(temperature=0.0)
-    engine.tokens_in_state = []
-    spec = list(engine.generate(ids, n, greedy, set()))
-    # plain greedy decode with the 1-wide graph, recording each step's top-2 margin
+    stop = {engine.tokenizer.convert_tokens_to_ids("<|content_model_end_sampling|>"), engine.tokenizer.eos_token_id}
+    rows = []  # the target logits behind every emitted speculative token after the first
+    accept = engine._accept
+
+    def record(drafts, draft_logits, target_logits, sampling, gen):
+        acc, nxt = accept(drafts, draft_logits, target_logits, sampling, gen)
+        rows.extend(target_logits[:acc + 1].float().clone())
+        return acc, nxt
+
+    engine._accept = record
+    try:
+        engine.tokens_in_state = []
+        spec = list(engine.generate(ids, n, greedy, stop))
+    finally:
+        engine._accept = accept
     engine.tokens_in_state = []
     logits, _ = engine._prefill(ids)
-    plain, margins = [], []
+    plain, plain_logits = [], []
     pos = len(ids)
     for _ in range(n):
-        top2 = logits.float().topk(2).values
-        margins.append(float(top2[0] - top2[1]))
+        plain_logits.append(logits.float().clone())
         tok = int(logits.argmax())
         plain.append(tok)
+        if tok in stop:
+            break
         logits = engine._decode_logits(tok, pos)
         pos += 1
-    first = next((i for i, (a, b) in enumerate(zip(spec, plain)) if a != b), None)
-    if first is not None:
-        assert margins[first] < 0.25, f"diverged at {first} with plain top-2 margin {margins[first]:.3f}"
+    first = next((i for i, (a, b) in enumerate(zip(spec, plain)) if a != b), min(len(spec), len(plain)))
+    assert first > 0, "the first token comes from the same prefill logits"
+    p = torch.stack(plain_logits[1:first])
+    q = torch.stack(rows[:first - 1])
+    lp, lq = F.log_softmax(p, -1), F.log_softmax(q, -1)
+    kl = (lp.exp() * (lp - lq)).sum(-1)
+    assert kl.mean() < 1e-2, f"speculative target logits drift from plain decoding: mean KL {kl.mean():.3e}"
+    if first < min(len(spec), len(plain)):
+        gap = float(plain_logits[first].max() - plain_logits[first][spec[first]])
+        assert gap < 1.0, f"diverged at {first} to a token {gap:.3f} below plain decoding's choice"

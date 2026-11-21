@@ -7,12 +7,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
+from pathlib import Path
 
 import torch
 
 from ingine.engine import Engine, Sampling, Stats
+
+MODEL_DIR = os.environ.get("INGINE_MODEL_DIR", str(Path(__file__).resolve().parents[2] / "models" / "Inkling-2-Mini"))
 
 PROMPTS = {
     "chat": "Explain how a hash map handles collisions, with a short Python example.",
@@ -22,7 +26,7 @@ PROMPTS = {
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model-dir", default="/mnt/data/inkling/hf")
+    ap.add_argument("--model-dir", default=MODEL_DIR)
     ap.add_argument("--backend", default="fast", choices=("torch", "fast"))
     ap.add_argument("--no-graph", action="store_true")
     ap.add_argument("--ablation")
@@ -31,6 +35,7 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--effort", default="low")
     ap.add_argument("--dense-fp8", action="store_true")
+    ap.add_argument("--kv-fp8", action="store_true", help="FP8 full-attention KV caches")
     ap.add_argument("--spec", action="store_true", help="DSpark speculative decoding")
     ap.add_argument("--spec-threshold", type=float, default=0.8,
                     help="verify the leading drafts whose draft probability exceeds this (0 = always all 7)")
@@ -41,7 +46,7 @@ def main():
     t = time.time()
     eng = Engine(args.model_dir, max_ctx=args.max_ctx, ablation=args.ablation, backend=args.backend,
                  graph=not args.no_graph, dense_fp8=args.dense_fp8, spec=args.spec,
-                 spec_threshold=args.spec_threshold)
+                 spec_threshold=args.spec_threshold, kv_fp8=args.kv_fp8)
     print(f"load+capture {time.time() - t:.1f}s, GPU {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
     stop = {eng.tokenizer.convert_tokens_to_ids("<|content_model_end_sampling|>")}
     results = {}

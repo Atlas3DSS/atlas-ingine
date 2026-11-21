@@ -12,7 +12,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attn_decode", &attn_decode,
           "Attention core of one layer visit for M consecutive tokens (SPEC.md, area attn): q/rel post-processing, "
           "key/value convs + state update, KV cache write, split-K attention with relative bias, sink and output "
-          "gate. window = 1024 (sliding ring, kpos [1024]) or 0 (full layer, linear cache, kpos ignored).",
+          "gate. window = 1024 (sliding ring, kpos [1024]) or 0 (full layer, linear cache, kpos ignored). "
+          "k_cache/v_cache: bfloat16, or float8_e4m3fn on full layers (both the same dtype; new entries rounded "
+          "to nearest, saturated to +-448).",
           py::arg("proj"), py::arg("q_scale"), py::arg("r_scale"), py::arg("rel_proj"), py::arg("k_conv"),
           py::arg("v_conv"), py::arg("conv_k_state"), py::arg("conv_v_state"), py::arg("k_cache"),
           py::arg("v_cache"), py::arg("kpos"), py::arg("pos"), py::arg("window"), py::arg("log_scaling"),

@@ -6,7 +6,8 @@ Follows vLLM `vllm/models/inkling2/nvidia/dspark.py` + `speculator.py` (and SGLa
   final normed hidden (index 48), each BF16 -> `feats [rows, 4, 2304]`.
 * Committed rows become draft context: per draft layer l, ``c = mix_rmsnorm(feats, alpha[l])``,
   ``k = rope(rmsnorm_128(c Wk_ctx))``, ``v = c Wv_ctx``. Layers 0 and 2 attend to the last 1024 committed
-  positions, layer 1 to all of them.
+  positions, layer 1 to the last `DRAFT_CTX` = 65536 (the reference: all of them; the cap keeps the cache
+  size independent of max_ctx).
 * A round drafts a block of 8 rows at positions P..P+7 (row 0 = the anchor token's normed embedding,
   rows 1-7 = `mask_embed`) through 3 bidirectional transformer layers, then a sequential Markov head turns
   rows 1-7 into 7 draft tokens: ``state <- GRU-like cell([state, W1[prev], h_i, f_rnn])`` and
@@ -30,6 +31,7 @@ GAMMA = BLOCK - 1
 RANK = 256
 LOCAL = (0, 2)
 WINDOW = 1024
+DRAFT_CTX = 65536  # positions (block rows included) the global layer attends to: a ring of this many slots
 TAPS = (5, 23, 41)  # visits whose entering partial block is tapped; tap 3 is the final normed hidden
 ROPE_THETA = 1e6
 EPS = 1e-6
@@ -65,7 +67,11 @@ class Drafter:
     """`head` = the target's unembedding as the fused decoder stores it, (weight, row scales or None): the
     drafter's base logits use the same matrix (FP8 rows when the decoder runs FP8 dense). The drafter's own
     q/k/v and gate/up projections run as FP8 rows through the dense GEMV kernel; drafts only have to be
-    good guesses, verification keeps the output exact."""
+    good guesses, verification keeps the output exact.
+
+    Global-layer cache: slot = position % `ctx` (ctx = min(max_ctx, DRAFT_CTX)). Every position before the
+    block is committed before a draft, so below `ctx` positions slot i holds position i, and beyond it every
+    slot holds one of the last `ctx` positions: either way the valid slots are those below P + 8."""
 
     CANDIDATES = 1024  # Markov-head vocabulary per step: the top base logits (q is supported on them)
 
@@ -78,12 +84,16 @@ class Drafter:
             t = {k: f.get_tensor(k) for k in f.keys()}
         self.alpha = bf(torch.softmax(t["fuse_weight"].float(), -1))  # [4 rows, 4 taps]
         self.embed, self.embed_norm = target.embed, target.embed_norm
-        self.head = head if head is not None else tuple(fp8(target.unembed))
+        if head is None:
+            head = ((target.unembed, target.unembed_scale) if target.unembed_scale is not None
+                    else tuple(fp8(target.unembed)))
+        self.head = head
         self.layers = []
         hw, hb = t["markov_head.hidden_out.weight"].double(), t["markov_head.hidden_out.bias"].double()
         fw, fb = [], []
-        for s in range(0, target.unembed.shape[0], 16384):  # FP64 fold, chunked to bound memory
-            u = target.unembed[s:s + 16384].double()
+        u_w, u_s = target.unembed, target.unembed_scale
+        for s in range(0, u_w.shape[0], 16384):  # FP64 fold, chunked to bound memory (FP8 rows dequantized)
+            u = W.dequant(u_w[s:s + 16384], None if u_s is None else u_s[s:s + 16384]).double()
             fw.append(bf(u @ hw))
             fb.append(bf(u @ hb))
         self.fold_w, self.fold_b = torch.cat(fw), torch.cat(fb)  # [V, 256], [V]
@@ -120,11 +130,11 @@ class Drafter:
         self.segments = {r: torch.tensor([[0, r, 0]], dtype=torch.int32, device=device)
                          for r in (self.qkv_out.shape[1], self.gu_out.shape[1], V)}
         self.none = torch.empty(0, device=device)
-        self.max_ctx = max_ctx
+        self.ctx = min(max_ctx, DRAFT_CTX)
         kv = dict(dtype=torch.bfloat16, device=device)
         # Context caches. Local layers: a 1024-slot ring plus 8 rows for the block being drafted. Global layer:
-        # every position; the block's rows are written at P..P+7 (not yet committed, overwritten by commit).
-        self.k_ctx = {l: torch.zeros((WINDOW + BLOCK) if l in LOCAL else max_ctx, KV_HEADS, HEAD_DIM, **kv)
+        # a `ctx`-slot ring; the block's rows are written at P..P+7 (not yet committed, overwritten by commit).
+        self.k_ctx = {l: torch.zeros((WINDOW + BLOCK) if l in LOCAL else self.ctx, KV_HEADS, HEAD_DIM, **kv)
                       for l in range(3)}
         self.v_ctx = {l: torch.zeros_like(self.k_ctx[l]) for l in range(3)}
         self.ctx_pos = {l: torch.full((WINDOW,), -1, dtype=torch.long, device=device) for l in LOCAL}
@@ -135,7 +145,7 @@ class Drafter:
         self.P = torch.zeros(1, dtype=torch.long, device=device)
         self.temperature = torch.zeros(1, device=device)
         self.draft_tokens = torch.zeros(GAMMA, dtype=torch.long, device=device)
-        self.bucket = max_ctx  # positions the global layer attends to (each draft graph has its own)
+        self.bucket = self.ctx  # global-layer slots attended to (each draft graph has its own)
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}  # context bucket -> draft graph, ascending
         # commit inputs for graph replay: the accepted rows of a verify call
         self.commit_feats = torch.zeros(BLOCK, 4, D, **kv)
@@ -167,15 +177,13 @@ class Drafter:
             k = bf(c @ L["wk_ctx"].T).view(-1, KV_HEADS, HEAD_DIM)
             k = rope(bf(rms(k, L["k_norm_ctx"])), positions)
             v = bf(c @ L["wv_ctx"].T).view(-1, KV_HEADS, HEAD_DIM)
+            size = WINDOW if l in LOCAL else self.ctx
+            keep = min(n, size)
+            slots = positions[-keep:] % size
+            self.k_ctx[l][slots] = k[-keep:]
+            self.v_ctx[l][slots] = v[-keep:]
             if l in LOCAL:
-                keep = min(n, WINDOW)
-                slots = positions[-keep:] % WINDOW
-                self.k_ctx[l][slots] = k[-keep:]
-                self.v_ctx[l][slots] = v[-keep:]
                 self.ctx_pos[l][slots] = positions[-keep:]
-            else:
-                self.k_ctx[l][positions] = k
-                self.v_ctx[l][positions] = v
         self.f_rnn.copy_(mix_rmsnorm(feats[-1:], self.alpha[3], self.f_norm)[0])
 
     def _gemv(self, x, w_scale, xin, out):
@@ -202,10 +210,11 @@ class Drafter:
             ring_ok = (cpos >= 0) & (cpos < P) & (cpos >= P - WINDOW)
             valid = torch.cat([ring_ok, torch.ones(n, dtype=torch.bool, device=xn.device)])
         else:
-            keys.index_copy_(0, positions, k)
-            vals.index_copy_(0, positions, v)
+            slots = positions % self.ctx
+            keys.index_copy_(0, slots, k)
+            vals.index_copy_(0, slots, v)
             keys, vals = keys[:self.bucket], vals[:self.bucket]
-            valid = torch.arange(self.bucket, device=xn.device) < P + n
+            valid = torch.arange(self.bucket, device=xn.device) < P + n  # all slots once P + n >= ctx
         o = F.scaled_dot_product_attention(q.transpose(0, 1)[None], keys.transpose(0, 1)[None],
                                            vals.transpose(0, 1)[None], attn_mask=valid[None, None, None, :],
                                            enable_gqa=True)
@@ -264,14 +273,14 @@ class Drafter:
 
     def capture(self):
         """CUDA graphs: the draft step once per context bucket (the global layer attends to the first
-        `bucket` positions, so short contexts do not pay for max_ctx), and the commit of 1..8 verified rows.
+        `bucket` slots, so short contexts do not pay for the whole ring), and the commit of 1..8 verified rows.
         All share one memory pool; they never run concurrently and their outputs are persistent buffers."""
         dev = self.mask_embed.device
         buckets, b = [], 1024
-        while b < self.max_ctx:
+        while b < self.ctx:
             buckets.append(b)
             b *= 2
-        buckets.append(self.max_ctx)
+        buckets.append(self.ctx)
         commit = {n: (lambda n=n: self._commit(self.commit_feats[:n], self.commit_start + torch.arange(n, device=dev)))
                   for n in range(1, BLOCK + 1)}
         pool = torch.cuda.graph_pool_handle()
@@ -290,7 +299,7 @@ class Drafter:
             with torch.cuda.graph(g, pool=pool):
                 self._draft()
             self.graphs[B] = g
-        self.bucket = self.max_ctx
+        self.bucket = self.ctx
         for n, fn in commit.items():
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g, pool=pool):
@@ -306,5 +315,6 @@ class Drafter:
         self.temperature.fill_(temperature)
         if not self.graphs:
             return self._draft()
-        self.graphs[next(b for b in self.graphs if b >= P + BLOCK)].replay()
+        # the smallest bucket holding the block; the whole ring once the context reaches it
+        self.graphs[next((b for b in self.graphs if b >= P + BLOCK), self.ctx)].replay()
         return self.draft_tokens, self.draft_logits

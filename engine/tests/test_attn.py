@@ -1,10 +1,12 @@
 """attn_decode against an FP64 oracle built from `Model._qkv` (projection post-processing, convs, states)
 and the semantics of `Model._attend` (cross-checked against it where memory allows), with real weights of
-sliding layers 0 and 7 and full layers 5 and 23."""
+sliding layers 0 and 7 and full layers 5 and 23; full layers with BF16 and FP8 (E4M3) caches."""
 from __future__ import annotations
 
 import math
+import os
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -14,9 +16,12 @@ torch.cuda.set_per_process_memory_fraction(0.06)
 from ingine import ext, weights as W  # noqa: E402
 from ingine.model import Model, l2_clip, linear, rms_norm  # noqa: E402
 
-HF = "/mnt/data/inkling/hf"
+MODEL_DIR = os.environ.get("INGINE_MODEL_DIR", str(Path(__file__).resolve().parents[2] / "models" / "Inkling-2-Mini"))
 H, HQ, HKV, D, WIN = W.HIDDEN, W.HEADS, W.KV_HEADS, W.HEAD_DIM, W.WINDOW
 FULL_CAP = 70016
+LONG_CAP = 262144  # served context: one FP8 full-layer cache of this many rows
+FP8 = torch.float8_e4m3fn
+KV_DTYPES = {"bf16": torch.bfloat16, "fp8": FP8}
 DEV = "cuda"
 
 
@@ -27,7 +32,7 @@ def mod():
 
 def _load(l):
     """One layer's dense tensors on the GPU (experts stay on the host: the GPU is shared)."""
-    layer = W.load_layer(HF, l, device="cpu")
+    layer = W.load_layer(MODEL_DIR, l, device="cpu")
     layer.experts = None
     layer.t = {k: v.to(DEV) for k, v in layer.t.items()}
     return layer
@@ -43,25 +48,37 @@ def sliding(request):
 
 @pytest.fixture(scope="module", params=[5, 23])
 def full(request):
+    """(layer, {"bf16": (k, v), "fp8": (k, v)}): FULL_CAP-row caches, the FP8 ones E4M3 of the BF16 ones."""
     layer = _load(request.param)
     g = torch.Generator(device=DEV).manual_seed(1000 + request.param)
     k_cache, v_cache = random_kv(FULL_CAP, g)
-    yield layer, k_cache, v_cache
-    del layer, k_cache, v_cache
+    caches = {"bf16": (k_cache, v_cache), "fp8": (to_cache(k_cache, FP8), to_cache(v_cache, FP8))}
+    yield layer, caches
+    del layer, k_cache, v_cache, caches
     torch.cuda.empty_cache()
 
 
 # --------------------------------------------------------------------------------------------- inputs
 
-def random_kv(rows, g):
+def to_cache(x, dtype):
+    """BF16 keys/values as a cache of `dtype` holds them: FP8 is E4M3, nearest even, saturated to ±448."""
+    return x if dtype == torch.bfloat16 else x.clamp(-448, 448).to(dtype)
+
+
+def raw(t):
+    """Bit patterns of FP8 tensors (comparisons and boolean indexing), other tensors as they are."""
+    return t.view(torch.uint8) if t.dtype == FP8 else t
+
+
+def random_kv(rows, g, dtype=torch.bfloat16):
     """Cache entries that look like real ones: L2-clipped keys (norms around the clip), RMS-normed values."""
-    k = torch.empty(rows, HKV, D, device=DEV, dtype=torch.bfloat16)
+    k = torch.empty(rows, HKV, D, device=DEV, dtype=dtype)
     v = torch.empty_like(k)
     for s in range(0, rows, 8192):
         e = min(rows, s + 8192)
         scale = torch.rand(e - s, HKV, 1, device=DEV, generator=g) * 3.0 + 0.5
-        k[s:e] = l2_clip(torch.randn(e - s, HKV, D, device=DEV, generator=g) * scale, W.QK_CLIP).bfloat16()
-        v[s:e] = rms_norm(torch.randn(e - s, HKV, D, device=DEV, generator=g)).bfloat16()
+        k[s:e] = to_cache(l2_clip(torch.randn(e - s, HKV, D, device=DEV, generator=g) * scale, W.QK_CLIP).bfloat16(), dtype)
+        v[s:e] = to_cache(rms_norm(torch.randn(e - s, HKV, D, device=DEV, generator=g)).bfloat16(), dtype)
     return k, v
 
 
@@ -121,18 +138,19 @@ def masks(kpos_old, p0, T, window):
     return dist, valid
 
 
-def attend64(q, keys, values, dist, valid, rel_logits, sink):
-    """FP64 attention with relative bias and sink, per KV head. Returns o [T, 3072] (float64)."""
+def attend64(q, keys, values, dist, valid, rel_logits, sink, chunk=1 << 16):
+    """FP64 attention with relative bias and sink, per KV head. keys/values (BF16 or FP8) are converted in
+    chunks of rows, so a long cache needs no FP64 copy. Returns o [T, 3072] (float64)."""
     T, L = dist.shape
     in_ext = (dist >= 0) & (dist < W.REL_EXTENT)
     idx = dist.clamp(0, W.REL_EXTENT - 1)
     out = torch.empty(T, HQ, D, device=DEV, dtype=torch.float64)
     G = HQ // HKV
     for g in range(HKV):
-        K = keys[:, g].double()
-        V = values[:, g].double()
         hs = slice(g * G, (g + 1) * G)
-        s = torch.einsum("thd,ld->thl", q[:, hs].double(), K) / math.sqrt(D)
+        qh = q[:, hs].double()
+        s = torch.cat([torch.einsum("thd,ld->thl", qh, keys[c:c + chunk, g].double())
+                       for c in range(0, L, chunk)], dim=-1) / math.sqrt(D)
         bias = rel_logits[:, hs].double().gather(-1, idx[:, None, :].expand(T, G, L))
         s = s + torch.where(in_ext[:, None, :], bias, torch.zeros_like(bias))
         s = s.masked_fill(~valid[:, None, :], float("-inf"))
@@ -140,8 +158,10 @@ def attend64(q, keys, values, dist, valid, rel_logits, sink):
         mx = torch.maximum(s.amax(-1), sk)
         e = torch.exp(s - mx[..., None])
         den = e.sum(-1) + torch.exp(sk - mx)
-        out[:, hs] = torch.einsum("thl,ld->thd", e, V) / den[..., None]
-        del K, V, s, bias, e
+        o = sum(torch.einsum("thl,ld->thd", e[..., c:c + chunk], values[c:c + chunk, g].double())
+                for c in range(0, L, chunk))
+        out[:, hs] = o / den[..., None]
+        del s, bias, e, o
     return out.reshape(T, HQ * D)
 
 
@@ -169,6 +189,24 @@ def check_kv(cache_rows, ref):
     frac = (diff > 0).float().mean().item()
     assert frac < 2e-3, frac
     return frac
+
+
+def check_kv8(cache_rows, ref):
+    """New FP8 cache entries vs torch's E4M3 rounding of the oracle's BF16 keys/values
+    (`to_cache(ref, FP8)`): identical bytes but where a rare 1-ulp BF16 flip (see check_kv) moves the E4M3
+    value by one E4M3 ulp."""
+    want = to_cache(ref, FP8)
+    a, b = cache_rows.float(), want.float()
+    ulp = 2.0 ** (torch.floor(torch.log2(torch.maximum(a.abs(), b.abs()).clamp(min=2.0 ** -6))) - 3)
+    diff = (a - b).abs()
+    assert (diff <= ulp).all(), (diff / ulp).max().item()  # NaN (a byte left unwritten) fails too
+    frac = (raw(cache_rows) != raw(want)).float().mean().item()
+    assert frac < 2e-3, frac
+    return frac
+
+
+def check_new_kv(cache_rows, ref):
+    return check_kv8(cache_rows, ref) if cache_rows.dtype == FP8 else check_kv(cache_rows, ref)
 
 
 # --------------------------------------------------------------------------------------------- tests
@@ -231,18 +269,23 @@ def test_sliding(mod, sliding, case, M):
     print(f"layer {layer.idx} {case} M={M}: {stats}")
 
 
+@pytest.mark.parametrize("kv", list(KV_DTYPES))
 @pytest.mark.parametrize("p0,M", FULL_CASES)
-def test_full(mod, full, p0, M):
-    layer, k_cache, v_cache = full
+def test_full(mod, full, p0, M, kv):
+    layer, caches = full
+    k_cache, v_cache = caches[kv]
     g = torch.Generator(device=DEV).manual_seed(layer.idx * 1000003 + p0 * 10 + M)
     ck, cv = conv_states(layer, p0, g)
     xq, xk, xv = inputs(layer, M, g)
     proj = make_proj(layer, xq, xk, xv)
     q, k, vv, rel_logits, sink, gate, nck, ncv = oracle_qkv(layer, xq, xk, xv, ck, cv, p0)
 
+    # the oracle sees the cache contents and the call's keys/values as the cache holds them (E4M3 for FP8)
+    dt = k_cache.dtype
     kpos_old = torch.arange(p0, device=DEV)
     dist, valid = masks(kpos_old, p0, M, 0)
-    keys, values = torch.cat([k_cache[:p0], k]), torch.cat([v_cache[:p0], vv])
+    keys = torch.cat([k_cache[:p0].bfloat16(), to_cache(k, dt).bfloat16()])
+    values = torch.cat([v_cache[:p0].bfloat16(), to_cache(vv, dt).bfloat16()])
     o64 = attend64(q, keys, values, dist, valid, rel_logits, sink)
     o32 = Model._attend(q, keys, values, dist, valid, rel_logits, sink) if p0 <= 4096 else None
     del keys, values
@@ -257,14 +300,65 @@ def test_full(mod, full, p0, M):
     torch.cuda.synchronize()
 
     stats = check_out(out.float(), o64, gate, o32)
-    stats["kv_flip"] = max(check_kv(k_cache[p0:p0 + M], k), check_kv(v_cache[p0:p0 + M], vv))
+    stats["kv_flip"] = max(check_new_kv(k_cache[p0:p0 + M], k), check_new_kv(v_cache[p0:p0 + M], vv))
     keep = torch.ones(hi - lo, dtype=torch.bool, device=DEV)
     keep[p0 - lo:p0 - lo + M] = False
-    assert torch.equal(k_cache[lo:hi][keep], around[0][keep]) and torch.equal(v_cache[lo:hi][keep], around[1][keep])
+    assert torch.equal(raw(k_cache[lo:hi])[keep], raw(around[0])[keep])
+    assert torch.equal(raw(v_cache[lo:hi])[keep], raw(around[1])[keep])
     k_cache[lo:hi], v_cache[lo:hi] = around  # restore for the next case
     assert torch.equal(ck, nck) and torch.equal(cv, ncv)
     assert ws[:64].view(torch.int32).abs().sum().item() == 0
-    print(f"layer {layer.idx} p0={p0} M={M}: {stats}")
+    print(f"layer {layer.idx} {kv} p0={p0} M={M}: {stats}")
+
+
+def test_full_long_fp8(mod, full):
+    """FP8 caches at the served context: the last position of a LONG_CAP-row cache, M = 1."""
+    layer = full[0]
+    M, p0 = 1, LONG_CAP - 1
+    g = torch.Generator(device=DEV).manual_seed(layer.idx * 1000003 + 7)
+    k_cache, v_cache = random_kv(LONG_CAP, g, FP8)
+    ck, cv = conv_states(layer, p0, g)
+    xq, xk, xv = inputs(layer, M, g)
+    proj = make_proj(layer, xq, xk, xv)
+    q, k, vv, rel_logits, sink, gate, nck, ncv = oracle_qkv(layer, xq, xk, xv, ck, cv, p0)
+
+    # the oracle reads the call's E4M3 keys/values from the rows the kernel writes (no copy of the cache);
+    # then those rows are set to NaN codes, which the kernel must overwrite and never read
+    k_cache[p0:p0 + M] = to_cache(k, FP8)
+    v_cache[p0:p0 + M] = to_cache(vv, FP8)
+    dist, valid = masks(torch.arange(p0, device=DEV), p0, M, 0)
+    o64 = attend64(q, k_cache[:p0 + M], v_cache[:p0 + M], dist, valid, rel_logits, sink)
+    raw(k_cache)[p0:p0 + M] = 0x7F
+    raw(v_cache)[p0:p0 + M] = 0x7F
+
+    out = torch.empty(M, HQ * D, device=DEV, dtype=torch.bfloat16)
+    ws = torch.zeros(mod.attn_workspace_bytes(M), dtype=torch.uint8, device=DEV)
+    pos = torch.tensor([p0], device=DEV)
+    no_kpos = torch.empty(0, dtype=torch.long, device=DEV)
+    mod.attn_decode(proj, *layer_params(layer), ck, cv, k_cache, v_cache, no_kpos, pos, 0, True, ws, out)
+    torch.cuda.synchronize()
+
+    stats = check_out(out.float(), o64, gate)
+    stats["kv_flip"] = max(check_kv8(k_cache[p0:p0 + M], k), check_kv8(v_cache[p0:p0 + M], vv))
+    assert torch.equal(ck, nck) and torch.equal(cv, ncv)
+    print(f"layer {layer.idx} fp8 p0={p0} M={M}: {stats}")
+    del k_cache, v_cache, dist, valid
+    torch.cuda.empty_cache()
+
+
+def test_fp8_ring_rejected(mod, sliding):
+    """FP8 caches are full-layer only: a sliding layer with an FP8 ring is an error, not a silent misread."""
+    layer = sliding
+    g = torch.Generator(device=DEV).manual_seed(13)
+    p0, kpos = ring_state("partial", g)
+    k_cache, v_cache = random_kv(WIN, g, FP8)
+    ck, cv = conv_states(layer, p0, g)
+    proj = make_proj(layer, *inputs(layer, 1, g))
+    out = torch.empty(1, HQ * D, device=DEV, dtype=torch.bfloat16)
+    ws = torch.zeros(mod.attn_workspace_bytes(1), dtype=torch.uint8, device=DEV)
+    with pytest.raises(RuntimeError, match="full layers"):
+        mod.attn_decode(proj, *layer_params(layer), ck, cv, k_cache, v_cache, kpos,
+                        torch.tensor([p0], device=DEV), WIN, False, ws, out)
 
 
 @pytest.mark.parametrize("M", [1, 3])
@@ -291,15 +385,15 @@ def test_unused_slots_ignored(mod, sliding, M):
 
 
 @pytest.mark.parametrize("M", [1, 8])
-@pytest.mark.parametrize("window", [WIN, 0])
-def test_graph_replay(mod, window, M):
+@pytest.mark.parametrize("window,kv", [(WIN, "bf16"), (0, "bf16"), (0, "fp8")])
+def test_graph_replay(mod, window, kv, M):
     """Captured once, replayed for consecutive calls: identical to eager calls (counters reset, no
-    host-side state), for a sliding layer (ring wrap-around included) and a full layer."""
+    host-side state), for a sliding layer (ring wrap-around included) and a full layer (BF16 and FP8)."""
     layer = _load(7 if window else 5)
     g = torch.Generator(device=DEV).manual_seed(7)
     rows = WIN if window else 4096
     p_start = 3000 if window else 1020
-    k_cache, v_cache = random_kv(rows, g)
+    k_cache, v_cache = random_kv(rows, g, KV_DTYPES[kv])
     kpos = torch.arange(WIN, device=DEV) + (p_start - WIN) if window else torch.empty(0, dtype=torch.long, device=DEV)
     if window:
         kpos = torch.roll(kpos, p_start % WIN)
@@ -337,6 +431,6 @@ def test_graph_replay(mod, window, M):
         assert torch.equal(out, eager_out[i]), i
     torch.cuda.synchronize()
     for a, b in zip(gs, eager_state):
-        assert torch.equal(a, b)
+        assert torch.equal(raw(a), raw(b))
     del layer
     torch.cuda.empty_cache()

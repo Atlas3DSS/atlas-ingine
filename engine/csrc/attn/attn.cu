@@ -49,14 +49,24 @@
 // * Ring semantics: a cached ring entry is used iff 0 <= kpos < p0 and p - kpos < 1024; entries at
 //   kpos >= p0 (left over from rejected speculative tokens) are ignored, as if overwritten first.
 //   Values of masked keys are never multiplied in, so unused cache slots may hold anything.
+// * FP8 full-layer caches (template F8; sliding rings are BF16 only): E4M3 without scale. The owner rounds
+//   its new keys / values to BF16 and then to E4M3 (round to nearest even, saturated to +-448) in shared
+//   memory, so the call's own keys are attended with exactly the values the cache will hold, and writes the
+//   E4M3 bytes at the end. M = 1 reads 8-byte vectors with the same lanes, dims and buffer depth (half the
+//   bytes in flight: the M = 1 kernels already use 128 registers). M > 1 copies a tile's E4M3 rows into the
+//   first half of its stage, then expands them in place to the BF16 K / FP16 V layout (each thread loads the
+//   chunks it copied, block barrier, writes); E4M3 values are exact in both.
 // * Capturable: no allocation, no host sync, current stream; positions come from `pos` on the device.
+// * Positions are int32 on the device (row offsets 64-bit); the host caps full caches at 2^30 rows.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <type_traits>
 
 
 namespace {
@@ -174,8 +184,8 @@ struct Params {
     const float* v_conv;
     float* conv_k;
     float* conv_v;
-    __nv_bfloat16* k_cache;
-    __nv_bfloat16* v_cache;
+    void* k_cache;  // __nv_bfloat16, or E4M3 bytes (F8)
+    void* v_cache;
     long long* kpos;
     const long long* pos;
     int* counter;
@@ -204,6 +214,29 @@ __device__ __forceinline__ void unpack8(const uint4 u, float f[8]) {
     f[6] = __uint_as_float(u.w << 16), f[7] = __uint_as_float(u.w & 0xffff0000u);
 }
 
+// E4M3 pair (low byte = lower dim) to floats, exact (cvt.f16x2.e4m3x2, then FP16 -> FP32)
+__device__ __forceinline__ float2 e4m3x2_f2(uint32_t pair) {
+    return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3)));
+}
+
+// 8 E4M3 values (dims 8c..8c+7, byte 0 = lowest dim)
+__device__ __forceinline__ void unpack8(const uint2 u, float f[8]) {
+    float2 a = e4m3x2_f2(u.x & 0xffffu), b = e4m3x2_f2(u.x >> 16);
+    f[0] = a.x, f[1] = a.y, f[2] = b.x, f[3] = b.y;
+    a = e4m3x2_f2(u.y & 0xffffu), b = e4m3x2_f2(u.y >> 16);
+    f[4] = a.x, f[5] = a.y, f[6] = b.x, f[7] = b.y;
+}
+
+// x rounded to E4M3: nearest even, saturated to +-448 (torch: x.clamp(-448, 448).to(float8_e4m3fn))
+__device__ __forceinline__ float e4m3r(float x) {
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3), __NV_E4M3)));
+}
+
+// two floats holding E4M3 values to their bytes (a in the low byte)
+__device__ __forceinline__ uint32_t pack_e4m3x2(float a, float b) {
+    return __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+}
+
 // Loads of anything an earlier kernel writes (caches, kpos, pos) are coherent `asm volatile` with a memory
 // clobber, so the compiler cannot hoist them above griddepcontrol.wait (programmatic dependent launch).
 __device__ __forceinline__ uint4 ld_kv(const void* ptr) {
@@ -212,6 +245,12 @@ __device__ __forceinline__ uint4 ld_kv(const void* ptr) {
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                  : "l"(ptr)
                  : "memory");
+    return v;
+}
+
+__device__ __forceinline__ uint2 ld_kv8(const void* ptr) {
+    uint2 v;
+    asm volatile("ld.global.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
     return v;
 }
 
@@ -257,15 +296,19 @@ __device__ __forceinline__ float clip_factor(float ss, float t) {
     return fminf(1.f, __fdividef(t, norm + 1e-6f));
 }
 
+template <typename KV>  // 8 dims of a cache row: uint4 = BF16, uint2 = E4M3
 struct Buf {
-    uint4 k[U], v[U];
+    KV k[U], v[U];
     int kp[U];    // key position, -1 = no key
     int dp[U];    // distance the rel_proj prefetch was made for
     float rp[U];  // rel_proj[c][dp] (0 if dp >= 1024)
 };
 
-template <int M, bool FULL>
+template <int M, bool FULL, bool F8>
 __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
+    static_assert(FULL || !F8, "FP8 caches are full-layer only");
+    using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
+    using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
     using L = Smem<M>;
     extern __shared__ __align__(16) float sm[];
@@ -276,6 +319,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     const int tok = warp / KW, kw = warp % KW;
     const bool owner = rank == 0;
     const int R = p.R;
+    CT* const kc = static_cast<CT*>(p.k_cache);
+    CT* const vc = static_cast<CT*>(p.v_cache);
 
     // ---- stage the inputs in shared memory with cp.async (one round trip, no registers held). Weights
     // first: they may be read before the previous kernel completes (programmatic dependent launch).
@@ -327,21 +372,26 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // the expensive relative-bias tail (distance < 1024) is spread over the whole cluster.
     constexpr int STEP = KW * 2 * U, TILE = 2 * STEP, STRIDE = CS * TILE;
     const int c0 = rank * TILE, old_end = L_old;
-    auto load_kv = [&](Buf& b, const int base) {
+    auto load_kv = [&](Buf<KV>& b, const int base) {
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const int j = base + (kw * U + u) * 2 + half;
-            b.k[u] = b.v[u] = make_uint4(0u, 0u, 0u, 0u);
+            b.k[u] = b.v[u] = KV{};
             b.kp[u] = -1;
             if (j < old_end) {
                 const size_t off = (size_t(j) * HKV + g) * D + c * 8;
-                b.k[u] = ld_kv(p.k_cache + off);
-                b.v[u] = ld_kv(p.v_cache + off);
+                if constexpr (F8) {
+                    b.k[u] = ld_kv8(kc + off);
+                    b.v[u] = ld_kv8(vc + off);
+                } else {
+                    b.k[u] = ld_kv(kc + off);
+                    b.v[u] = ld_kv(vc + off);
+                }
                 b.kp[u] = FULL ? j : int(ld_s64(p.kpos + j));
             }
         }
     };
-    auto load_rp = [&](Buf& b, const int base) {
+    auto load_rp = [&](Buf<KV>& b, const int base) {
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const int j = base + (kw * U + u) * 2 + half;
@@ -350,7 +400,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             b.rp[u] = j < old_end && b.dp[u] < EXT ? __ldg(p.rel_proj + c * EXT + b.dp[u]) : 0.f;
         }
     };
-    auto load = [&](Buf& b, const int base) {
+    auto load = [&](Buf<KV>& b, const int base) {
         load_kv(b, base);
         load_rp(b, base);
     };
@@ -370,12 +420,22 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         return FULL ? p0 - (base + KT - 1) : 1 + ((p0 - 1 - (base + KT - 1)) & (WIN - 1));
     };
     auto issue = [&](const int st, const int base) {
-        for (int i = tid; i < KT * 2 * (D / 8); i += NT) {
-            const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8), j = base + key;
-            const bool ok = j < L_old;
-            cp16z(reinterpret_cast<float*>(kvs + kv_off(st, key, kv, ch)),
-                  reinterpret_cast<const float*>((kv ? p.v_cache : p.k_cache) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 8),
-                  ok);
+        if constexpr (F8) {  // E4M3 rows to the first half of the stage (expand_kv converts them in place)
+            char* raw = reinterpret_cast<char*>(kvs + st * KT * 2 * D);
+            for (int i = tid; i < KT * 2 * (D / 16); i += NT) {
+                const int key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16), j = base + key;
+                const bool ok = j < L_old;
+                cp16z(reinterpret_cast<float*>(raw + 16 * i),
+                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok);
+            }
+        } else {
+            for (int i = tid; i < KT * 2 * (D / 8); i += NT) {
+                const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8), j = base + key;
+                const bool ok = j < L_old;
+                cp16z(reinterpret_cast<float*>(kvs + kv_off(st, key, kv, ch)),
+                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 8),
+                      ok);
+            }
         }
         if constexpr (!FULL) {
             for (int i = tid; i < KT; i += NT)  // low word of the int64 position
@@ -396,7 +456,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // the whole burst (measured: ~2.5 us instead of ~0.4 us for a sliding layer)
     asm volatile("cp.async.wait_all;" ::: "memory");
     __syncthreads();
-    Buf A, B;
+    Buf<KV> A, B;
     if constexpr (M == 1) {
         if (c0 < old_end) load_kv(A, c0);
         if (c0 + STEP < old_end) load_kv(B, c0 + STEP);
@@ -521,7 +581,12 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             const float4 x = reinterpret_cast<const float4*>(nkf + pr * D)[lane];
             const float ss = wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
             const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
-            const uint2 v = make_uint2(pack2(x.x * f, x.y * f), pack2(x.z * f, x.w * f));
+            float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
+            if constexpr (F8) {  // the values the cache will hold: BF16, then E4M3 (exact in BF16)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
+            }
+            const uint2 v = make_uint2(pack2(y[0], y[1]), pack2(y[2], y[3]));
             reinterpret_cast<uint2*>(&s_nkv[kv][m][0])[lane] = v;
         }
         __syncthreads();
@@ -535,7 +600,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 #pragma unroll
         for (int e = 0; e < 8; ++e) acc[i][e] = 0.f;
     }
-    auto compute = [&](const Buf& b, const bool is_new) {
+    auto compute = [&](const auto& b, const bool is_new) {  // Buf<uint4> (BF16) or Buf<uint2> (E4M3)
         float s[U][GQA];
         bool valid[U], need[U];
         int dist[U];
@@ -590,7 +655,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         for (int u = 0; u < U; ++u) {
             float vf[8];
             // a masked key's value may be anything (an unused cache slot): keep NaN/Inf out of 0 * v
-            unpack8(valid[u] ? b.v[u] : make_uint4(0u, 0u, 0u, 0u), vf);
+            using V = std::decay_t<decltype(b.v[0])>;
+            unpack8(valid[u] ? b.v[u] : V{}, vf);
 #pragma unroll
             for (int i = 0; i < GQA; ++i) {
                 const float pu = exp2f(s[u][i] - mrun[i]);
@@ -603,7 +669,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 
     if constexpr (M == 1) {
         if (owner) {  // the call's own key first, from shared memory, while the K/V stream is in flight
-            Buf N;
+            Buf<uint4> N;  // BF16 (holding E4M3 values when F8)
 #pragma unroll
             for (int u = 0; u < U; ++u) {
                 const int m2 = (kw * U + u) * 2 + half;
@@ -684,14 +750,14 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         //   P = exp2(S - m) as two fp16 terms hi + lo (P - hi), so P V carries ~22 bits of P; V converted
         //   to fp16 in place (exact for these values: |v| <= sqrt(128), tiny ones lose < 3e-8).
         //   O^T (dims x rows) += V^T P^T: mma m16n8k16 fp16, warp w owns dims 16w..16w+15 of every row.
-        // bf16 -> fp16, anything not finite and in range (only possible in masked, unused slots) -> 0
-        auto to_half = [](uint32_t w) {
-            float a = __uint_as_float(w << 16), b = __uint_as_float(w & 0xffff0000u);
+        // bf16 / e4m3 values -> fp16; anything not finite and in range (only possible in masked, unused slots) -> 0
+        auto half2_of = [](float a, float b) {
             a = fabsf(a) <= 65504.f ? a : 0.f;
             b = fabsf(b) <= 65504.f ? b : 0.f;
             const __half2 h = __floats2half2_rn(a, b);
             return *reinterpret_cast<const uint32_t*>(&h);
         };
+        auto to_half = [&](uint32_t w) { return half2_of(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u)); };
         // V rows of stage st to fp16: each thread converts the chunks it copied (its cp.async are done)
         auto convert_v = [&](const int st) {
             for (int i = tid; i < KT * 2 * (D / 8); i += NT) {
@@ -700,6 +766,31 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                     uint4* q = reinterpret_cast<uint4*>(kvs + kv_off(st, key, 1, ch));
                     const uint4 u = *q;
                     *q = make_uint4(to_half(u.x), to_half(u.y), to_half(u.z), to_half(u.w));
+                }
+            }
+        };
+        // F8: the E4M3 rows of stage st (first half of the stage) to the BF16 K / FP16 V layout, in place
+        auto expand_kv = [&](const int st) {
+            constexpr int NCH = KT * 2 * (D / 16) / NT;  // 16-byte E4M3 chunks per thread
+            static_assert(NCH * NT == KT * 2 * (D / 16), "chunks must divide over the block");
+            const uint4* raw = reinterpret_cast<const uint4*>(kvs + st * KT * 2 * D);
+            uint4 r[NCH];
+#pragma unroll
+            for (int n = 0; n < NCH; ++n) r[n] = raw[tid + n * NT];  // the chunks this thread copied
+            __syncthreads();  // every chunk is in registers before the stage is overwritten
+#pragma unroll
+            for (int n = 0; n < NCH; ++n) {
+                const int i = tid + n * NT, key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16);
+                const uint32_t w[4] = {r[n].x, r[n].y, r[n].z, r[n].w};
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {  // dims 16 ch + 8 h .. + 7: one 16-byte chunk of the row
+                    uint32_t o[4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const float2 f = e4m3x2_f2((w[2 * h + e / 2] >> (16 * (e % 2))) & 0xffffu);
+                        o[e] = kv ? half2_of(f.x, f.y) : pack2(f.x, f.y);
+                    }
+                    *reinterpret_cast<uint4*>(kvs + kv_off(st, key, kv, 2 * ch + h)) = make_uint4(o[0], o[1], o[2], o[3]);
                 }
             }
         };
@@ -855,7 +946,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         int st = 0;
         for (int base = rank * KT; base < L_old; base += CS * KT, st ^= 1) {
             asm volatile("cp.async.wait_group 0;" ::: "memory");  // tile `base` (the only one in flight)
-            convert_v(st);
+            if constexpr (F8) expand_kv(st); else convert_v(st);
             __syncthreads();  // tile landed for everyone; the previous tile's P V is done
             if (base + CS * KT < L_old) issue(st ^ 1, base + CS * KT);
             consume(st, base, false);
@@ -917,8 +1008,16 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
             const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
             const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
-            reinterpret_cast<uint4*>((kv ? p.v_cache : p.k_cache) + (size_t(row) * HKV + g) * D)[c8] =
-                reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+            const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+            CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
+            if constexpr (F8) {  // exact: the values are E4M3 already
+                float f[8];
+                unpack8(u, f);
+                reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
+                                                               pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
+            } else {
+                reinterpret_cast<uint4*>(dst)[c8] = u;
+            }
         }
         for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels
             const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
@@ -949,10 +1048,10 @@ struct Kernel {
     size_t smem;
 };
 
-template <int M, bool FULL>
+template <int M, bool FULL, bool F8>
 Kernel kernel_of() {
     static const Kernel k = [] {
-        const KernelFn f = attn_decode_kernel<M, FULL>;
+        const KernelFn f = attn_decode_kernel<M, FULL, F8>;
         C10_CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
         C10_CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M>::BYTES)));
         return Kernel{f, M, Smem<M>::BYTES};
@@ -960,17 +1059,17 @@ Kernel kernel_of() {
     return k;
 }
 
-template <bool FULL>
+template <bool FULL, bool F8 = false>
 Kernel select(int M) {
     switch (M) {
-        case 1: return kernel_of<1, FULL>();
-        case 2: return kernel_of<2, FULL>();
-        case 3: return kernel_of<3, FULL>();
-        case 4: return kernel_of<4, FULL>();
-        case 5: return kernel_of<5, FULL>();
-        case 6: return kernel_of<6, FULL>();
-        case 7: return kernel_of<7, FULL>();
-        default: return kernel_of<8, FULL>();
+        case 1: return kernel_of<1, FULL, F8>();
+        case 2: return kernel_of<2, FULL, F8>();
+        case 3: return kernel_of<3, FULL, F8>();
+        case 4: return kernel_of<4, FULL, F8>();
+        case 5: return kernel_of<5, FULL, F8>();
+        case 6: return kernel_of<6, FULL, F8>();
+        case 7: return kernel_of<7, FULL, F8>();
+        default: return kernel_of<8, FULL, F8>();
     }
 }
 
@@ -1000,6 +1099,7 @@ int64_t attn_workspace_bytes(int64_t max_m) {
 
 int64_t attn_max_active_clusters(int64_t M, int64_t window) {
     TORCH_CHECK(M >= 1 && M <= MAXM, "M must be in 1..8");
+    // the FP8 variants have the same launch shape, shared memory and register cap (launch bounds)
     const Kernel k = window == 0 ? select<true>(int(M)) : select<false>(int(M));
     cudaLaunchAttribute attrs[2];
     cudaLaunchConfig_t cfg = launch_config(k, nullptr, attrs);
@@ -1025,8 +1125,12 @@ void attn_decode(const at::Tensor& proj, const at::Tensor& q_scale, const at::Te
     check(v_conv, f32, "v_conv");
     check(conv_k_state, f32, "conv_k_state");
     check(conv_v_state, f32, "conv_v_state");
-    check(k_cache, bf16, "k_cache");
-    check(v_cache, bf16, "v_cache");
+    const auto kv_dt = k_cache.scalar_type();
+    const bool f8 = kv_dt == at::kFloat8_e4m3fn;
+    TORCH_CHECK(kv_dt == bf16 || f8, "k_cache has dtype ", kv_dt, ", expected BFloat16 or Float8_e4m3fn");
+    check(k_cache, kv_dt, "k_cache");
+    check(v_cache, kv_dt, "v_cache");  // same dtype as k_cache
+    TORCH_CHECK(full || !f8, "float8_e4m3fn caches are supported on full layers (window = 0) only");
     check(pos, at::kLong, "pos");
     check(out, bf16, "out");
     TORCH_CHECK(workspace.is_cuda() && workspace.is_contiguous(), "workspace must be a contiguous CUDA tensor");
@@ -1042,7 +1146,8 @@ void attn_decode(const at::Tensor& proj, const at::Tensor& q_scale, const at::Te
     TORCH_CHECK(conv_k_state.numel() == 3 * CONV_C && conv_v_state.numel() == 3 * CONV_C, "conv states [3, 1024]");
     TORCH_CHECK(k_cache.dim() == 3 && k_cache.size(1) == HKV && k_cache.size(2) == D && k_cache.sizes() == v_cache.sizes(),
                 "k_cache/v_cache must be [rows, 8, 128]");
-    TORCH_CHECK(k_cache.size(0) < (int64_t(1) << 31), "positions must fit in int32");
+    // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides
+    TORCH_CHECK(k_cache.size(0) <= (int64_t(1) << 30), "caches hold at most 2^30 positions");
     if (!full) {
         TORCH_CHECK(k_cache.size(0) == WIN, "sliding caches must have 1024 rows");
         check(kpos, at::kLong, "kpos");
@@ -1065,14 +1170,14 @@ void attn_decode(const at::Tensor& proj, const at::Tensor& q_scale, const at::Te
     p.v_conv = v_conv.data_ptr<float>();
     p.conv_k = conv_k_state.data_ptr<float>();
     p.conv_v = conv_v_state.data_ptr<float>();
-    p.k_cache = reinterpret_cast<__nv_bfloat16*>(k_cache.data_ptr());
-    p.v_cache = reinterpret_cast<__nv_bfloat16*>(v_cache.data_ptr());
+    p.k_cache = k_cache.data_ptr();
+    p.v_cache = v_cache.data_ptr();
     p.kpos = full ? nullptr : reinterpret_cast<long long*>(kpos.data_ptr<int64_t>());
     p.pos = reinterpret_cast<const long long*>(pos.data_ptr<int64_t>());
     p.counter = reinterpret_cast<int*>(workspace.data_ptr());
     p.part = reinterpret_cast<float*>(static_cast<char*>(workspace.data_ptr()) + WS_PART);
     p.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
-    const Kernel k = full ? select<true>(int(M)) : select<false>(int(M));
+    const Kernel k = full ? (f8 ? select<true, true>(int(M)) : select<true>(int(M))) : select<false>(int(M));
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, at::cuda::getCurrentCUDAStream(), attrs);
     C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));

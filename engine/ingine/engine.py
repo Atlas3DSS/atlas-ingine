@@ -35,7 +35,7 @@ class Stats:
 class Engine:
     def __init__(self, model_dir: str | Path, max_ctx: int = 65536, ablation: str | None = None,
                  backend: str = "torch", graph: bool = True, prefill_chunk: int = 2048, dense_fp8: bool = False,
-                 spec: bool = False, spec_threshold: float = 0.8):
+                 spec: bool = False, spec_threshold: float = 0.8, kv_fp8: bool = False):
         from transformers import AutoTokenizer
         self.model_dir = Path(model_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
@@ -44,7 +44,7 @@ class Engine:
         self.weights = W.load(self.model_dir)
         self.abl = M.Ablation.load(ablation) if ablation else M.Ablation.none()
         self.model = M.Model(self.weights, self.abl)
-        self.state = M.State(max_ctx)
+        self.state = M.State(max_ctx, kv_fp8=kv_fp8)
         self.max_model_len = max_ctx
         self.max_ctx = max_ctx
         self.prefill_chunk = prefill_chunk
@@ -171,6 +171,9 @@ class Engine:
                 logits = self.model.prefill(self.state, chunk)
                 if self.drafter is not None:
                     self.drafter.commit(self.model.last_taps, s)
+        # Prefill transients grow with the context (FP32 copies of the full-attention keys and values): hand
+        # them back to the driver so the resident footprint between requests is the persistent set.
+        torch.cuda.empty_cache()
         self.tokens_in_state = list(ids)
         return logits, start
 

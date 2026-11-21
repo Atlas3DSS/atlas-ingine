@@ -11,7 +11,7 @@ detokenisation, parsing and HTTP writes happen on the request thread, so the dec
 the client. The request thread polls its socket while waiting and sets ``job.cancel`` when the client
 disconnects (or when a stop string / stop token ends the turn), which the generator checks between tokens.
 
-Run ``python -m ingine.server --model-dir /mnt/data/inkling/hf --port 8003 --fake`` for a canned-output
+Run ``python -m ingine.server --model-dir models/Inkling-2-Mini --port 8003 --fake`` for a canned-output
 server; ``--generator module:factory`` plugs in a real engine (``factory(model_dir, tokenizer)`` returns
 an object implementing ``chat.Generator``).
 """
@@ -551,6 +551,8 @@ def main(argv: list[str] | None = None) -> None:
     eng.add_argument("--backend", choices=("fast", "torch"), default="fast", help="decode step implementation")
     eng.add_argument("--dense-fp8", action="store_true", help="FP8 E4M3 dense projections and head (row scales)")
     eng.add_argument("--spec", action="store_true", help="DSpark speculative decoding (mtp.safetensors drafter)")
+    eng.add_argument("--kv-fp8", action="store_true",
+                     help="FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)")
     eng.add_argument("--spec-threshold", type=float, default=0.8,
                      help="verify the leading drafts whose draft probability exceeds this (0 = always all 7)")
     ap.add_argument("--fake-delay", type=float, default=0.02, help="seconds per fake token")
@@ -568,7 +570,8 @@ def main(argv: list[str] | None = None) -> None:
     elif args.engine:
         from .engine import Engine
         generator = Engine(args.model_dir, max_ctx=args.max_ctx, ablation=args.ablation, backend=args.backend,
-                           dense_fp8=args.dense_fp8, spec=args.spec, spec_threshold=args.spec_threshold)
+                           dense_fp8=args.dense_fp8, spec=args.spec, spec_threshold=args.spec_threshold,
+                           kv_fp8=args.kv_fp8)
     else:
         mod, _, attr = args.generator.partition(":")
         generator = getattr(importlib.import_module(mod), attr or "create")(args.model_dir, fmt.tokenizer)

@@ -3,12 +3,13 @@
 `Model.prefill` runs a chunk of prompt tokens with host-side positions. `Model.decode` runs one token with
 the position read from device memory and no host synchronisation, so it can be captured in a CUDA graph.
 Both follow the transformers implementation (huggingface/transformers#51050) operation for operation;
-activations between operations stay FP32, matrix inputs are rounded to BF16 as in the reference.
+activations between operations stay FP32, matrix inputs are rounded to BF16 as in the reference. Dense
+matrices stored as FP8 rows (`W.Layer.scales`, `W.Weights.unembed_scale`) are dequantized to BF16 per use.
 
 State per request (`State`):
 
 * sliding-window visits (40): K/V rings of 1024 slots with the absolute position held in each slot;
-* full-attention visits (8): K/V for every position up to `max_ctx`;
+* full-attention visits (8): K/V for every position up to `max_ctx`, BF16 or (`kv_fp8`) FP8 E4M3;
 * every visit: the previous 3 inputs of its four short convolutions (key, value, post-attention,
   post-MLP), zero before the first token.
 
@@ -35,6 +36,8 @@ torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 SCALE = HEAD_DIM ** -0.5
 NEG = float("-inf")
+FP8_MAX = 448.0  # largest finite float8_e4m3fn
+LOGIT_ROWS = 32768  # unembedding rows dequantized at a time when it is stored as FP8
 TAP_VISITS = (5, 23, 41)  # DSpark drafter features: partial block entering these visits (+ final hidden)
 
 
@@ -59,9 +62,10 @@ def softcap(x, cap):
     return torch.tanh(x / cap) * cap
 
 
-def linear(x, w):
-    """BF16 matrix product with BF16 output, as the reference's `nn.Linear`; returns FP32."""
-    return F.linear(x.to(torch.bfloat16), w).float()
+def linear(x, w, scale=None):
+    """BF16 matrix product with BF16 output, as the reference's `nn.Linear`; returns FP32. FP8 rows `w` with
+    per-row `scale` are dequantized to BF16 for the call."""
+    return F.linear(x.to(torch.bfloat16), W.dequant(w, scale)).float()
 
 
 def block_attention(queries, blocks, partial):
@@ -118,7 +122,7 @@ def decode_experts(e: W.Experts, which: str, idx: torch.Tensor, lut: torch.Tenso
 # --------------------------------------------------------------------------------------------- state
 
 class State:
-    def __init__(self, max_ctx: int, device="cuda"):
+    def __init__(self, max_ctx: int, kv_fp8: bool = False, device="cuda"):
         self.max_ctx = max_ctx
         self.ring_index = {v: i for i, v in enumerate(SLIDING_VISITS)}
         self.full_index = {v: i for i, v in enumerate(FULL_VISITS)}
@@ -127,8 +131,9 @@ class State:
         self.k_ring = torch.zeros(ns, WINDOW, KV_HEADS, HEAD_DIM, **kv)
         self.v_ring = torch.zeros(ns, WINDOW, KV_HEADS, HEAD_DIM, **kv)
         self.ring_pos = torch.full((ns, WINDOW), -1, dtype=torch.long, device=device)
-        self.k_full = torch.zeros(nf, max_ctx, KV_HEADS, HEAD_DIM, **kv)
-        self.v_full = torch.zeros(nf, max_ctx, KV_HEADS, HEAD_DIM, **kv)
+        full = dict(dtype=torch.float8_e4m3fn if kv_fp8 else torch.bfloat16, device=device)
+        self.k_full = torch.zeros(nf, max_ctx, KV_HEADS, HEAD_DIM, **full)
+        self.v_full = torch.zeros(nf, max_ctx, KV_HEADS, HEAD_DIM, **full)
         f32 = dict(dtype=torch.float32, device=device)
         self.conv_k = torch.zeros(NUM_VISITS, CONV_K - 1, KV_HEADS * HEAD_DIM, **f32)
         self.conv_v = torch.zeros(NUM_VISITS, CONV_K - 1, KV_HEADS * HEAD_DIM, **f32)
@@ -137,6 +142,23 @@ class State:
         self.length = 0  # tokens in the context (host copy, prefill only)
 
     TENSORS = ("k_ring", "v_ring", "ring_pos", "k_full", "v_full", "conv_k", "conv_v", "conv_attn", "conv_mlp")
+
+    def full_store(self, x: torch.Tensor) -> torch.Tensor:
+        """BF16 keys or values as the full-attention caches hold them: as is, or FP8 E4M3 rounded to nearest
+        after saturating to ±448."""
+        if self.k_full.dtype == torch.bfloat16:
+            return x
+        return x.float().clamp(-FP8_MAX, FP8_MAX).to(self.k_full.dtype)
+
+    def write_full(self, fi: int, pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Keys/values [n, KV_HEADS, HEAD_DIM] (BF16) of full visit `fi` at positions `pos` (int64 [n] on the
+        device; no host synchronisation)."""
+        for cache, x in ((self.k_full[fi], k), (self.v_full[fi], v)):
+            x = self.full_store(x)
+            if x.dtype == torch.bfloat16:
+                cache.index_copy_(0, pos, x)
+            else:  # index_copy_ has no FP8 kernels: copy the bytes
+                cache.view(torch.uint8).index_copy_(0, pos, x.view(torch.uint8))
 
     def reset(self):
         self.ring_pos.fill_(-1)
@@ -223,22 +245,23 @@ class Model:
     def _qkv(self, layer: W.Layer, v: int, st: State, xq, xk, xv, positions):
         """Projections and their per-token post-processing. Updates the key/value conv states."""
         t = layer.t
+        mat = lambda name: (t[name], layer.scales.get(name))  # noqa: E731
         T = xq.shape[0]
         # inputs are rounded to BF16 like the reference's `.to(dtype)` before the attention module
         xq, xk, xv = (x.to(torch.bfloat16).float() for x in (xq, xk, xv))
-        q = linear(xq, t["wq"]).view(T, HEADS, HEAD_DIM) * t["q_scale"]
+        q = linear(xq, *mat("wq")).view(T, HEADS, HEAD_DIM) * t["q_scale"]
         q = l2_clip(q, W.QK_CLIP).to(torch.bfloat16).float()
-        rel = linear(xq, t["wr"]).view(T, HEADS, D_REL) * t["r_scale"]
+        rel = linear(xq, *mat("wr")).view(T, HEADS, D_REL) * t["r_scale"]
         rel = l2_clip(rel, W.REL_CLIP).to(torch.bfloat16).float()
         if layer.full:
             tau = log_scale(positions)[:, None, None]
             q = (q * tau).to(torch.bfloat16).float()
             rel = (rel * tau).to(torch.bfloat16).float()
-        k = linear(xk, t["wk"])
-        vv = linear(xv, t["wv"])
+        k = linear(xk, *mat("wk"))
+        vv = linear(xv, *mat("wv"))
         if layer.full:
-            k_dyn = linear(xk, t["wk_dyn"]).view(T, KV_HEADS, CONV_K)
-            v_dyn = linear(xv, t["wv_dyn"]).view(T, KV_HEADS, CONV_K)
+            k_dyn = linear(xk, *mat("wk_dyn")).view(T, KV_HEADS, CONV_K)
+            v_dyn = linear(xv, *mat("wv_dyn")).view(T, KV_HEADS, CONV_K)
             k, new_k = dynamic_conv(k, st.conv_k[v], t["k_static"], k_dyn)
             vv, new_v = dynamic_conv(vv, st.conv_v[v], t["v_static"], v_dyn)
         else:
@@ -249,8 +272,8 @@ class Model:
         k = l2_clip(k.to(torch.bfloat16).float().view(T, KV_HEADS, HEAD_DIM), W.QK_CLIP)
         vv = rms_norm(vv.to(torch.bfloat16).float().view(T, KV_HEADS, HEAD_DIM))
         rel_logits = (rel.to(torch.bfloat16) @ t["rel_proj"].to(torch.bfloat16)).float()  # [T, HEADS, EXT]
-        sink = linear(xq, t["wsink"])  # [T, HEADS]
-        gate = torch.sigmoid(linear(xq, t["wgate"]))  # [T, HEADS * HEAD_DIM]
+        sink = linear(xq, *mat("wsink"))  # [T, HEADS]
+        gate = torch.sigmoid(linear(xq, *mat("wgate")))  # [T, HEADS * HEAD_DIM]
         return q, k.to(torch.bfloat16), vv.to(torch.bfloat16), rel_logits, sink, gate
 
     @staticmethod
@@ -313,9 +336,12 @@ class Model:
         gu = torch._grouped_mm(xb[tok], w13.transpose(1, 2), offs=offs).float()
         act = self._act(gu[:, 0::2], gu[:, 1::2]).to(torch.bfloat16)
         down = torch._grouped_mm(act, w2.transpose(1, 2), offs=offs).float()
-        out = torch.zeros(T, HIDDEN, device=xb.device)
-        out.index_add_(0, tok, down * wts.flatten()[order][:, None])
-        return out
+        # Each (token, slot) pair occurs once: place the weighted outputs by pair, then sum each token's 8 slots
+        # in slot order. (index_add_ would accumulate with atomics in a run-dependent order, so a prompt's
+        # state, and greedy output after it, would differ from run to run.)
+        per_slot = torch.empty(T * TOP_K, HIDDEN, device=xb.device)
+        per_slot[order] = down * wts.flatten()[order][:, None]
+        return per_slot.view(T, TOP_K, HIDDEN).sum(1)
 
     @staticmethod
     def _act(gate, up):
@@ -329,7 +355,7 @@ class Model:
         q, k, vv, rel_logits, sink, gate = self._qkv(layer, v, st, xq, xk, xv, positions)
         attn = attend_fn(v, layer, q, k, vv, rel_logits, sink)
         attn = (attn.to(torch.bfloat16).float() * gate).to(torch.bfloat16)  # reference: BF16 attention output
-        attn = linear(attn, t["wo"])
+        attn = linear(attn, t["wo"], layer.scales.get("wo"))
         y, new = static_conv(attn.to(torch.bfloat16).float(), st.conv_attn[v], t["attn_conv"], math.sqrt(CONV_K + 1))
         st.conv_attn[v].copy_(new)
         y = ablate(y, self.ablation.attn_dirs[v], self.ablation.attn_w[v])
@@ -387,7 +413,13 @@ class Model:
         return h
 
     def logits(self, h):
-        return softcap(linear(h, self.w.unembed), W.LOGIT_SOFTCAP)
+        w, s = self.w.unembed, self.w.unembed_scale
+        if s is None:
+            z = linear(h, w)
+        else:  # FP8 rows: dequantized a row chunk at a time, never a whole BF16 copy
+            z = torch.cat([linear(h, w[r:r + LOGIT_ROWS], s[r:r + LOGIT_ROWS])
+                           for r in range(0, w.shape[0], LOGIT_ROWS)], dim=-1)
+        return softcap(z, W.LOGIT_SOFTCAP)
 
     def embed(self, ids):
         return rms_norm(self.w.embed[ids].float(), self.w.embed_norm).to(torch.bfloat16).float()
@@ -408,8 +440,10 @@ class Model:
         def attend(v, layer, q, k, vv, rel_logits, sink):
             if layer.full:
                 fi = st.full_index[v]
-                st.k_full[fi, pos0:pos0 + T] = k
-                st.v_full[fi, pos0:pos0 + T] = vv
+                st.k_full[fi, pos0:pos0 + T] = st.full_store(k)
+                st.v_full[fi, pos0:pos0 + T] = st.full_store(vv)
+                # only the filled prefix reaches Flex (which widens it to FP32): memory and time follow the
+                # context, not max_ctx; the chunk's own keys are read back at the cache precision
                 keys, values = st.k_full[fi, :pos0 + T], st.v_full[fi, :pos0 + T]
                 kpos = torch.arange(pos0 + T, device=self.device)
                 if "full" not in masks:
@@ -445,8 +479,7 @@ class Model:
         def attend(v, layer, q, k, vv, rel_logits, sink):
             if layer.full:
                 fi = st.full_index[v]
-                st.k_full[fi].index_copy_(0, pos, k)
-                st.v_full[fi].index_copy_(0, pos, vv)
+                st.write_full(fi, pos, k, vv)
                 keys, values, kpos = st.k_full[fi], st.v_full[fi], arange_full
                 dist = pos[:, None] - kpos[None, :]
                 valid = dist >= 0
