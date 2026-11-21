@@ -40,7 +40,7 @@ REPO_FILES = {  # stage path -> project path
     'LICENSE': 'LICENSE',
     'NOTICE': 'NOTICE',
 }
-PROVENANCE = ['ablate.py', 'inkling_ref.py', 'refusal_eval.py', 'capability_eval.py', 'eval.sh',
+PROVENANCE = ['ablate.py', 'inkling_ref.py', 'refusal_eval.py', 'capability_eval.py', 'reasoning_eval.py', 'eval.sh',
               'requirements.txt']
 CLEAN_PATHS = ['hf/README.md', 'LICENSE', 'NOTICE', 'ablation', 'tools', 'results']
 BIG = 64 << 20
