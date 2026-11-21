@@ -42,6 +42,10 @@ Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model
 * Qualification: FP64 CPU oracles at real model shapes (`tests/kernels/test_<area>.cpp`, NVFP4 and MXFP8,
   sliding and full, every M), real layers in `tests/model/test_layer.cpp`, and the whole model against the
   goldens in `tests/golden/model` (`ingine-validate`).
+* Bit locks: every output bit of a call of M = 1..8 rows is hashed on fixed inputs: mix, message_gates and
+  router in `tests/kernels/test_dense.cpp`; proj, proj_conv, head, moe_up / moe_down (both formats) and
+  sliding attention in `tests/kernels/test_bitlock.cpp`. A speed change to these kernels must keep the hashes
+  (a verify call of M rows keeps its bits).
 
 ## Area `moe` (routed experts)
 

@@ -56,7 +56,9 @@
 //   entry at distance 1024 (invalid for this token either way; a kpos >= p0 is ignored too), so the
 //   other heads may read either value. M > 1: the overwritten slots still hold keys earlier tokens of
 //   the call must see: the owner writes them after the cluster barrier (its head is done reading) and
-//   the last head to get there (global counter in the workspace, reset by itself) writes kpos.
+//   the last head to get there (global counter in the workspace, reset by itself) writes kpos. A head
+//   takes its turn right after its barrier, on a thread without output work, so the counter's round
+//   trip overlaps the output phase instead of ending the kernel (-0.5 us per call).
 // * Ring semantics: a cached ring entry is used iff 0 <= kpos < p0 and p - kpos < 1024; entries at
 //   kpos >= p0 (left over from rejected speculative tokens) are ignored, as if overwritten first.
 //   Values of masked keys are never multiplied in, so unused cache slots may hold anything.
@@ -992,6 +994,14 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
     // every partial of the head is written, and every block of the head is done reading the ring
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+    if (!FULL && M > 1 && owner && tid == NT - 1) {  // kpos is read by every head: the last head writes it
+        __threadfence();
+        if (atomicAdd(p.counter, 1) == HKV - 1) {
+            __threadfence();
+            for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
+            *p.counter = 0;
+        }
+    }
 
     // block `rank` outputs dims 8 rank .. 8 rank + 7 of every row: thread (row, dim) = (tid / 8, tid % 8)
     if (tid < ROWS * OD) {
@@ -1041,14 +1051,6 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = sm[L::NST + idx];
         }
         if (!FULL && M == 1 && g == 0 && tid == 0) p.kpos[p0 & (WIN - 1)] = p0;
-    }
-    if (!FULL && M > 1 && owner && tid == 0) {  // kpos is read by every head: the last head writes it
-        __threadfence();
-        if (atomicAdd(p.counter, 1) == HKV - 1) {
-            __threadfence();
-            for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
-            *p.counter = 0;
-        }
     }
 }
 
