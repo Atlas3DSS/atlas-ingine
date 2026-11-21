@@ -28,6 +28,7 @@
 // all tokens in one reduction, single-barrier block sums, mbarrier exchanges) and the prefetch.
 #include <cooperative_groups.h>
 
+#include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
@@ -42,6 +43,11 @@ namespace ingine::kernels::dense {
 namespace {
 
 constexpr int RANK = 64;
+// L2 class of the weight loads (l2.cuh): none. Evict::last does keep the gate weights (56 MB over the loop
+// layers) and the router matrices in the L2 through a token's weight streams, but the decode step was ~2%
+// slower with it: their fetch already overlaps the previous kernel, and the L2 (~96 MB) then has ~25 MB
+// left for everything else.
+constexpr l2::Evict WEIGHT_L2 = l2::Evict::none;
 
 struct GateArgs {
   const float* h;    // [G, M, H], or [M, H] read by every gate (h_shared)
@@ -115,14 +121,15 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   };
 
   // forget/gain slices (padded rows) -> shared memory, asynchronous, waited for before the forget/gain phase
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
   {
     const uint8_t* fsrc = reinterpret_cast<const uint8_t*>(a.w_forget) + (size_t(g) * H + rank * C::CPC) * C::ROW;
     const uint8_t* gsrc = reinterpret_cast<const uint8_t*>(a.w_gain) + (size_t(g) * H + rank * C::CPC) * C::ROW;
     constexpr int RCH = C::ROW / 16;
     for (int k = t; k < C::CPC * RCH; k += C::NT) {
       const int dst = (k / RCH) * C::RS + (k % RCH) * 16;
-      cp_async16(fg + dst, fsrc + size_t(k) * 16);
-      cp_async16(fg + C::SLICE + dst, gsrc + size_t(k) * 16);
+      l2::cp_async16<WEIGHT_L2>(fg + dst, fsrc + size_t(k) * 16, wpol);
+      l2::cp_async16<WEIGHT_L2>(fg + C::SLICE + dst, gsrc + size_t(k) * 16, wpol);
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
   }
@@ -132,7 +139,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   {
     const __nv_bfloat16* wr = a.w_down + (size_t(g) * RANK + rank * C::RPC + rl) * 2 * H + half * H;
 #pragma unroll
-    for (int i = 0; i < DCH; ++i) wv[i] = ld_stream(wr + (i * 32 + lane) * 8);
+    for (int i = 0; i < DCH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (i * 32 + lane) * 8, wpol);
   }
 
   // all weights are in flight; h and msg come from earlier kernels

@@ -81,6 +81,9 @@ struct MixParams {
   int M = 1;
 };
 void mix(const MixParams& p, bool pdl, cudaStream_t stream);
+// mix_pair: `p` (1..4 blocks, Q = 1 or 3) and the independent message mix `msg` (one block, Q = 4) of a
+// message visit in one launch; same results as two mix calls. Neither may read what the other writes.
+void mix_pair(const MixParams& p, const MixParams& msg, bool pdl, cudaStream_t stream);
 
 // message_gates (loop passes 1-2): h, msg fp32 [G, M, H] (G <= 3; h_shared: every gate reads h[0], i.e. h is
 // [M, H]); w_down bf16 [G, 64, 2H]; w_forget/w_gain [G, H, 64] fp32 (fg_fp32) or bf16; norm_w fp32 [G, H];

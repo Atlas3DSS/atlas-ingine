@@ -95,12 +95,6 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     p.M = m;
     return p;
   };
-  auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
-                 const float* abl_w, float* partial_out, const Tensor* queries, const float* norm_w,
-                 __nv_bfloat16* out_bf16, float* out_f32) {
-    dense::mix(mix_params(blocks, base, write, abl_r, abl_w, partial_out, queries, norm_w, out_bf16, out_f32), pdl,
-               stream);
-  };
 
   dense::embed(static_cast<const std::int64_t*>(b.token.data), m, static_cast<const __nv_bfloat16*>(w.embed.data),
                f32p(w.embed_norm), f32m(b.B0), pdl, stream);
@@ -135,14 +129,15 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
     const float* w_prev = mlp_w + pv;
+    dense::MixParams msg_mix;  // message visits: launched together with the attention read (independent of it)
     if (msgs) {
       const int i = l - LOOP_START;
       const float* src_base = i == 0 ? f32p(b.part) : f32p(b.E[p - 1]);
       const float* src_write = i == 0 ? f32p(b.y2) : nullptr;
       // messages from pass p-1: its layer-12 block and its final hidden (E[p-1], completed at i == 0)
       const Tensor mq = rm(f32m(w.message_queries) + std::size_t(i) * 4 * H, DType::FP32, {4, H});
-      mix({f32p(b.B2[p - 1])}, src_base, src_write, r_prev, w_prev, i == 0 ? f32m(b.E[p - 1]) : nullptr, &mq,
-          nullptr, nullptr, f32m(b.msgs));
+      msg_mix = mix_params({f32p(b.B2[p - 1])}, src_base, src_write, r_prev, w_prev,
+                           i == 0 ? f32m(b.E[p - 1]) : nullptr, &mq, nullptr, nullptr, f32m(b.msgs));
       if (i == 0) write = nullptr;  // pass p-1's last write went into E[p-1]; layer 6 restarts from B1
     }
     // ---- attention read(s); at a tap visit the same launch writes b.taps[:, tap] = bf16(hid)
@@ -157,7 +152,8 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       ap.new_bf16_stride = std::int64_t(NUM_TAPS) * H;
       ++tap;
     }
-    dense::mix(ap, pdl, stream);
+    if (msgs) dense::mix_pair(ap, msg_mix, pdl, stream);
+    else dense::mix(ap, pdl, stream);
     if (msgs)  // sliding layers mix one query: all three gates read b.mixf[0]
       dense::message_gates(f32p(b.mixf), !layer.full, f32p(b.msgs), 3, m,
                            static_cast<const __nv_bfloat16*>(layer.qkv_gate_down.data), layer.qkv_gate_forget16.data,

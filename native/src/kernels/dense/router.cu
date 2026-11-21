@@ -21,6 +21,7 @@
 // Ported from engine/csrc/dense/router.cu (torch launchers -> raw pointers; mbarrier exchange).
 #include <cooperative_groups.h>
 
+#include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
@@ -34,6 +35,8 @@ namespace ingine::kernels::dense {
 namespace {
 
 constexpr int EXPERTS = 128, TOPK = 8;
+// L2 class of the weight loads (l2.cuh): none (see gates.cu: evict-last residency made the step slower)
+constexpr l2::Evict WEIGHT_L2 = l2::Evict::none;
 
 template <int CL, bool WF32, int M>
 __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bfloat16* __restrict__ x,
@@ -68,8 +71,9 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   // weights and bias (constants) before the PDL wait, activations after it
   const uint8_t* wr = reinterpret_cast<const uint8_t*>(w) + size_t(row) * H * (WF32 ? 4 : 2);
   uint4 wv[CH];
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
 #pragma unroll
-  for (int i = 0; i < CH; ++i) wv[i] = ld_stream(wr + (size_t(i) * 32 + lane) * 16);
+  for (int i = 0; i < CH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (size_t(i) * 32 + lane) * 16, wpol);
   const float b = t < EXPERTS ? __ldg(bias + t) : 0.f;  // for the selection phase
 
   pdl_wait_fenced(zero);  // keeps the weight loads above ahead of the wait

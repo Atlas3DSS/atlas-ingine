@@ -129,6 +129,8 @@ update + attention residual + RMS norm.
   `q` (fp32 `[Q, H]`, Q ∈ {1, 3}): `a_i = softmax_i(q · n_i / √H)`, `mix_q = Σ_i a_i n_i`.
   `out_f32[q, m] = mix_q` (optional), `out_bf16[q, m] = bf16(rms_norm(mix_q) * norm_w[q])` (optional).
 * With no blocks and a single query the mix is skipped and `new` itself is normalised (layer 0).
+* `mix_pair(p, msg)` runs two independent mixes in one launch (a message visit's attention read and its
+  message mix: one block, four queries); same results as two `mix` calls.
 * Side outputs written by the same launch, so the decode step needs no separate conversion or copy nodes
   (they would break the PDL chain): `new_bf16` = `bf16(new)` at a row stride (DSpark taps), `out_copy` = a
   strided copy of `out_bf16` (Q = 1; the final tap), and up to two plain FP32 row copies (`copies`: the K/V

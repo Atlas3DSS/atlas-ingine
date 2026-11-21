@@ -108,14 +108,13 @@ __device__ __forceinline__ void sum_total(float (&out)[N], const float* scratch)
   for (int i = 0; i < N; ++i) out[i] = __shfl_sync(0xffffffffu, s, i);
 }
 
-// NS = states in the mix (blocks + new), Q = queries; NS == 1 && Q == 1 is the layer-0 path (no mix).
+// The mix of token m. NS = states in the mix (blocks + new), Q = queries; NS == 1 && Q == 1 is the layer-0
+// path (no mix). red1/red2/red3: block sum scratch, [REF_W * block_sum_slots<N>()] for N = 1, NS + Q NS, Q.
 template <int NS, int Q>
-__global__ void __launch_bounds__(MIX_T) mix_kernel(MixArgs a) {
+__device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, float* red2, float* red3) {
   constexpr bool SKIP = NS == 1 && Q == 1;
   constexpr int NV = NS + Q * NS;  // sums of squares + query dots
-  __shared__ float red1[REF_W * block_sum_slots<1>()], red2[REF_W * block_sum_slots<NV>()],
-      red3[REF_W * block_sum_slots<Q>()];
-  const int m = blockIdx.x, t = threadIdx.x;
+  const int t = threadIdx.x;
   const size_t row = size_t(m) * H;
   auto ld4 = [](const float* p) { return *reinterpret_cast<const float4*>(p); };
   auto ch = [t](int u) { return 4 * (t + u * MIX_T); };
@@ -293,6 +292,22 @@ __global__ void __launch_bounds__(MIX_T) mix_kernel(MixArgs a) {
   }
 }
 
+template <int NS, int Q>
+__global__ void __launch_bounds__(MIX_T) mix_kernel(MixArgs a) {
+  __shared__ float red1[REF_W * block_sum_slots<1>()], red2[REF_W * block_sum_slots<NS + Q * NS>()],
+      red3[REF_W * block_sum_slots<Q>()];
+  mix_token<NS, Q>(a, blockIdx.x, red1, red2, red3);
+}
+
+// Two independent mixes in one launch: CTAs [0, a.M) run `a` (NS states, Q queries), CTAs [a.M, 2 a.M) run
+// the message mix `b` (one block, four queries). One kernel boundary less on the message visits.
+template <int NS, int Q>
+__global__ void __launch_bounds__(MIX_T) mix_pair_kernel(MixArgs a, MixArgs b) {
+  __shared__ float red1[REF_W * block_sum_slots<1>()], red2[REF_W * 32], red3[REF_W * MAXQ];
+  if (static_cast<int>(blockIdx.x) < a.M) mix_token<NS, Q>(a, blockIdx.x, red1, red2, red3);
+  else mix_token<2, 4>(b, blockIdx.x - a.M, red1, red2, red3);
+}
+
 template <int NS>
 void launch_mix_q(int Q, int M, const MixArgs& a, bool pdl, cudaStream_t stream) {
   switch (Q) {
@@ -372,10 +387,12 @@ __global__ void __launch_bounds__(BW) embed_kernel(const int64_t* __restrict__ t
 
 }  // namespace
 
-void mix(const MixParams& p, bool pdl, cudaStream_t stream) {
+namespace {
+
+// Validates `p` and builds the kernel arguments.
+MixArgs mix_args(const MixParams& p) {
   require(p.base || p.write, "mix needs base and/or write");
-  const int M = p.M;
-  require(M >= 1, "mix: M must be >= 1");  // one CTA per row: decode uses 1..8, prefill any chunk length
+  require(p.M >= 1, "mix: M must be >= 1");  // one CTA per row: decode uses 1..8, prefill any chunk length
   const int nb = p.nblocks;
   require(nb >= 0 && nb <= MAXB, "mix: at most 5 blocks");
   require(nb == 0 || p.blocks, "mix: blocks table required");
@@ -409,15 +426,44 @@ void mix(const MixParams& p, bool pdl, cudaStream_t stream) {
             "mix: row copies need 16-byte aligned rows");
   }
   require(a.out_f32 || a.out_bf16 || a.partial || a.new_bf16, "mix has no output");
-  a.M = M;
+  a.M = p.M;
   a.zero = 0;
-  switch (nb + 1) {
-    case 1: launch_mix_q<1>(Q, M, a, pdl, stream); break;
-    case 2: launch_mix_q<2>(Q, M, a, pdl, stream); break;
-    case 3: launch_mix_q<3>(Q, M, a, pdl, stream); break;
-    case 4: launch_mix_q<4>(Q, M, a, pdl, stream); break;
-    case 5: launch_mix_q<5>(Q, M, a, pdl, stream); break;
-    case 6: launch_mix_q<6>(Q, M, a, pdl, stream); break;
+  return a;
+}
+
+template <int NS>
+void launch_pair_q(int Q, int M, const MixArgs& a, const MixArgs& b, bool pdl, cudaStream_t stream) {
+  switch (Q) {
+    case 1: launch_ex(mix_pair_kernel<NS, 1>, dim3(2 * M), MIX_T, 0, 1, pdl, stream, a, b); break;
+    case 3: launch_ex(mix_pair_kernel<NS, 3>, dim3(2 * M), MIX_T, 0, 1, pdl, stream, a, b); break;
+    default: require(false, "mix_pair: the first mix takes 1 or 3 queries");
+  }
+}
+
+}  // namespace
+
+void mix(const MixParams& p, bool pdl, cudaStream_t stream) {
+  const MixArgs a = mix_args(p);
+  switch (p.nblocks + 1) {
+    case 1: launch_mix_q<1>(p.Q, p.M, a, pdl, stream); break;
+    case 2: launch_mix_q<2>(p.Q, p.M, a, pdl, stream); break;
+    case 3: launch_mix_q<3>(p.Q, p.M, a, pdl, stream); break;
+    case 4: launch_mix_q<4>(p.Q, p.M, a, pdl, stream); break;
+    case 5: launch_mix_q<5>(p.Q, p.M, a, pdl, stream); break;
+    case 6: launch_mix_q<6>(p.Q, p.M, a, pdl, stream); break;
+  }
+}
+
+void mix_pair(const MixParams& p, const MixParams& msg, bool pdl, cudaStream_t stream) {
+  const MixArgs a = mix_args(p), b = mix_args(msg);
+  require(msg.nblocks == 1 && msg.Q == 4, "mix_pair: the message mix takes one block and four queries");
+  require(p.M == msg.M, "mix_pair: both mixes take the same tokens");
+  switch (p.nblocks + 1) {
+    case 2: launch_pair_q<2>(p.Q, p.M, a, b, pdl, stream); break;
+    case 3: launch_pair_q<3>(p.Q, p.M, a, b, pdl, stream); break;
+    case 4: launch_pair_q<4>(p.Q, p.M, a, b, pdl, stream); break;
+    case 5: launch_pair_q<5>(p.Q, p.M, a, b, pdl, stream); break;
+    default: require(false, "mix_pair: the first mix takes 1..4 blocks");
   }
 }
 

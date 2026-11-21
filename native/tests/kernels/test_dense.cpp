@@ -470,6 +470,173 @@ bool test_fp8_rows(Rng& rng) {
   return ok;
 }
 
+// ---- Bitwise lock. mix, message_gates and router are exact: on fixed inputs they must keep giving the bits
+// recorded in kLock (taken from kernels checked byte for byte against the implementation they were ported
+// from). A changed hash means the arithmetic changed (order of a sum, an FMA contraction the compiler chose
+// differently, a rounding point). Either undo that, or, when the change is deliberate and qualified against
+// the model (ingine-validate), record the new hashes this test prints.
+struct LockGen {  // integer generator, exact float conversion: the inputs do not depend on libm
+  uint64_t s;
+  uint64_t next() {
+    s += 0x9e3779b97f4a7c15ull;
+    uint64_t z = s;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+  }
+  float unit() { return float(int32_t(next() >> 40) - (1 << 23)) * (1.f / float(1 << 23)); }  // [-1, 1)
+  std::vector<float> vec(size_t n, float scale, float offset = 0.f) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = unit() * scale + offset;
+    return v;
+  }
+  std::vector<float> vec_bf16(size_t n, float scale) {
+    std::vector<float> v = vec(n, scale);
+    for (auto& x : v) x = round_bf16(x);
+    return v;
+  }
+};
+
+struct Fnv {
+  uint64_t h = 1469598103934665603ull;
+  template <class T>
+  void add(const std::vector<T>& v) {
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(v.data());
+    for (size_t i = 0; i < v.size() * sizeof(T); ++i) h = (h ^ b[i]) * 1099511628211ull;
+  }
+};
+
+// mix over the call shapes of the decode step, the pair launch included (same bits as two launches)
+uint64_t lock_mix(LockGen& g, int M, bool& pair_ok) {
+  const size_t n = size_t(M) * H;
+  std::vector<DeviceArray<float>> blocks;
+  std::vector<uint64_t> ptrs;
+  for (int i = 0; i < 5; ++i) {
+    blocks.emplace_back(g.vec(n, 2.f));
+    ptrs.push_back(reinterpret_cast<uint64_t>(blocks.back().get()));
+  }
+  DeviceArray<uint64_t> table(ptrs), table4(std::vector<uint64_t>{ptrs[4]});
+  DeviceArray<float> base(g.vec(n, 1.5f)), write(g.vec(n, 1.f)), r(g.vec(H, 0.03f)), aw(std::vector<float>{0.8125f});
+  DeviceArray<float> q(g.vec(size_t(4) * H, 0.08f)), nw(g.vec(size_t(4) * H, 0.25f, 1.f));
+  Fnv f;
+  auto run = [&](int nb, int Q, bool has_base, bool has_write, bool abl, bool bf16, bool f32) {
+    DeviceArray<float> part(n), of(size_t(Q) * n);
+    DeviceArray<__nv_bfloat16> ob(size_t(Q) * n), nb16(size_t(M) * 2 * H);
+    dense::MixParams p;
+    p.blocks = nb ? reinterpret_cast<const float* const*>(table.get()) : nullptr;
+    p.nblocks = nb;
+    p.base = has_base ? base.get() : nullptr;
+    p.write = has_write ? write.get() : nullptr;
+    p.abl_r = abl ? r.get() : nullptr;
+    p.abl_w = abl ? aw.get() : nullptr;
+    p.partial_out = part.get();
+    p.queries = nb == 0 && Q == 1 ? nullptr : q.get();
+    p.Q = Q;
+    p.norm_w = nw.get();
+    p.out_bf16 = bf16 ? ob.get() : nullptr;
+    p.out_f32 = f32 ? of.get() : nullptr;
+    p.new_bf16 = nb16.get() + H;
+    p.new_bf16_stride = 2 * H;
+    p.M = M;
+    dense::mix(p, true, g_stream);
+    sync();
+    f.add(part.download()), f.add(of.download()), f.add(ob.download()), f.add(nb16.download());
+  };
+  run(0, 1, true, false, false, true, false);  // layer 0
+  run(1, 1, true, true, true, true, false);    // sliding attention read
+  run(2, 3, true, true, true, true, true);     // full attention read
+  run(3, 1, false, true, true, true, false);   // MLP read at a block boundary
+  run(5, 1, true, true, false, true, false);   // the most blocks
+  // a message visit's two reads: one launch and two launches
+  std::vector<float> got[2][4];
+  for (int pair = 0; pair < 2; ++pair) {
+    DeviceArray<float> part(n), of(n), mpart(n), msgs(size_t(4) * n);
+    dense::MixParams a, b;
+    a.blocks = reinterpret_cast<const float* const*>(table.get()), a.nblocks = 2;
+    a.base = base.get(), a.write = write.get(), a.abl_r = r.get(), a.abl_w = aw.get();
+    a.partial_out = part.get(), a.queries = q.get(), a.Q = 1, a.out_f32 = of.get(), a.M = M;
+    b.blocks = reinterpret_cast<const float* const*>(table4.get()), b.nblocks = 1;
+    b.base = blocks[3].get(), b.write = write.get(), b.abl_r = r.get(), b.abl_w = aw.get();
+    b.partial_out = mpart.get(), b.queries = q.get(), b.Q = 4, b.out_f32 = msgs.get(), b.M = M;
+    if (pair) {
+      dense::mix_pair(a, b, true, g_stream);
+    } else {
+      dense::mix(b, true, g_stream);
+      dense::mix(a, true, g_stream);
+    }
+    sync();
+    got[pair][0] = part.download(), got[pair][1] = of.download(), got[pair][2] = mpart.download();
+    got[pair][3] = msgs.download();
+  }
+  for (int k = 0; k < 4; ++k) {
+    f.add(got[0][k]);
+    pair_ok = pair_ok && std::memcmp(got[0][k].data(), got[1][k].data(), got[0][k].size() * 4) == 0;
+  }
+  return f.h;
+}
+
+uint64_t lock_gates(LockGen& g, int M) {
+  Fnv f;
+  for (int G : {3, 1}) {
+    const bool shared = G == 3;
+    const size_t n = size_t(G) * M * H;
+    DeviceArray<float> h(g.vec(shared ? size_t(M) * H : n, 2.f)), msg(g.vec(n, 2.f)), nw(g.vec(size_t(G) * H, 0.25f, 1.f));
+    DeviceArray<float> of(n);
+    DeviceArray<__nv_bfloat16> wd(to_bf16(g.vec_bf16(size_t(G) * 64 * 2 * H, 0.04f)));
+    DeviceArray<__nv_bfloat16> wf(to_bf16(g.vec_bf16(size_t(G) * H * 64, 0.2f))), wg(to_bf16(g.vec_bf16(size_t(G) * H * 64, 0.2f)));
+    DeviceArray<__nv_bfloat16> ob(n);
+    dense::message_gates(h.get(), shared, msg.get(), G, M, wd.get(), wf.get(), wg.get(), false, nw.get(), ob.get(),
+                         of.get(), true, g_stream);
+    sync();
+    f.add(ob.download()), f.add(of.download());
+  }
+  return f.h;
+}
+
+uint64_t lock_router(LockGen& g, int M) {
+  std::vector<float> w = g.vec_bf16(size_t(128) * H, 0.04f), bias = g.vec(128, 0.2f);
+  for (int e : {9, 70, 71, 120}) {  // tied experts
+    std::copy_n(&w[size_t(3) * H], H, &w[size_t(e) * H]);
+    bias[e] = bias[3];
+  }
+  DeviceArray<__nv_bfloat16> x(to_bf16(g.vec_bf16(size_t(M) * H, 2.f))), dw(to_bf16(w));
+  DeviceArray<float> db(bias), wts(size_t(M) * 8);
+  DeviceArray<int> idx(size_t(M) * 8);
+  dense::router(x.get(), M, dw.get(), false, db.get(), idx.get(), wts.get(), true, g_stream);
+  sync();
+  Fnv f;
+  f.add(idx.download()), f.add(wts.download());
+  return f.h;
+}
+
+// [M - 1][mix, message_gates, router]
+constexpr uint64_t kLock[8][3] = {
+    {0x2b27dd32a1dd100eull, 0x5efdd3c8b07ce184ull, 0x51c35a315b7e90b3ull},
+    {0x75334db64229e2e1ull, 0x1940463968d37814ull, 0xea1ef0b8721fb3ffull},
+    {0xbcbd0a5db598e31eull, 0xc5d6d6cbeced9705ull, 0x92540ffd2106daacull},
+    {0xa6717a49034460f7ull, 0xc2cec0ccbcefa691ull, 0x70dd87ceaf1a3d15ull},
+    {0xee8f3095dd53a1c1ull, 0xfa3a8c6799d1da0aull, 0xe7e125992e15339eull},
+    {0xbe73b36287e82a47ull, 0x61ac1608d61c8021ull, 0xc8df312f5d2c4bc3ull},
+    {0x82fcad4fa28a5d54ull, 0x908da1a2466cd8ebull, 0x76e91bc67374d743ull},
+    {0x485152f0b0ead6f4ull, 0xd6dded13cf36fa5cull, 0xffe0d044657686f0ull},
+};
+
+bool test_bit_lock() {
+  bool ok = true;
+  for (int M = 1; M <= 8; ++M) {
+    LockGen gm{0x5eed0000ull + uint64_t(M)}, gg{0x5eed1000ull + uint64_t(M)}, gr{0x5eed2000ull + uint64_t(M)};
+    bool pair_ok = true;
+    const uint64_t got[3] = {lock_mix(gm, M, pair_ok), lock_gates(gg, M), lock_router(gr, M)};
+    const bool same = got[0] == kLock[M - 1][0] && got[1] == kLock[M - 1][1] && got[2] == kLock[M - 1][2];
+    std::printf("%s bit lock M=%d: {0x%016llxull, 0x%016llxull, 0x%016llxull}%s%s\n", same && pair_ok ? "PASS" : "FAIL", M,
+                static_cast<unsigned long long>(got[0]), static_cast<unsigned long long>(got[1]),
+                static_cast<unsigned long long>(got[2]), same ? "" : " differs from the recorded hashes",
+                pair_ok ? "" : "; mix_pair differs from two mix launches");
+    ok = ok && same && pair_ok;
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -517,6 +684,7 @@ int main() {
   ok &= test_gates(rng, 1, 5, true);  // FP32 forget/gain with several tokens: one staging buffer
   for (int M : {1, 3, 8}) ok &= test_embed(rng, M);
   ok &= test_fp8_rows(rng);
+  ok &= test_bit_lock();
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
