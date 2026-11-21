@@ -2,6 +2,7 @@
 // builds and settings are compared on identical text. Speculative rounds are traced (verify width, accepted
 // drafts, the run all 7 drafts would have reached, GPU ms of the verify and of the draft) and summarised per
 // output kind; the oracle estimate re-prices every round at the width that verifies exactly its run + 1.
+// With a free seed the items' prompts are continued freely instead (run_free): sampled speed and tokens/verify.
 #include "forced.h"
 
 #include <nlohmann/json.hpp>
@@ -123,16 +124,72 @@ nlohmann::ordered_json to_json(const Totals& t, const Totals& all, const std::ve
   return j;
 }
 
+struct Item {
+  std::string name;
+  std::vector<std::int32_t> prompt, output;
+};
+
+// Free generation from every item's prompt for len(output) tokens (no stop tokens) at the temperature, with
+// the sampler seeded by `seed`: decode tokens/s and tokens/verify of sampled decoding. A forced replay at
+// T > 0 under-counts sampled acceptance (a draft counts only if it equals the recorded token, where the loop
+// accepts it with min(1, p/q)), so sampled A/B needs these runs; the texts differ between builds, compare
+// several seeds.
+std::string run_free(model::Generator& gen, const std::string& path, const std::vector<Item>& list, double temperature,
+                     int seed, const std::string& trace_path) {
+  long items = 0, tokens = 0, rounds = 0, accepted = 0;
+  double seconds = 0;
+  for (const Item& it : list) {
+    if (it.output.size() < 2) continue;
+    model::Sampling sampling;
+    sampling.temperature = float(temperature);
+    sampling.seed = std::uint64_t(seed);
+    const model::GenerateStats st = gen.generate(it.prompt, int(it.output.size()), sampling, {},
+                                                 [](std::span<const std::int32_t>) { return true; });
+    const long tok = st.generated_tokens - 1;  // the first token comes with the prefill
+    std::printf("%-28s %6ld tok  %7.1f tok/s", it.name.c_str(), tok, st.decode_seconds > 0 ? tok / st.decode_seconds : 0.0);
+    if (st.spec_rounds) std::printf("  %5.2f tok/verify", double(st.spec_accepted + st.spec_rounds) / st.spec_rounds);
+    std::printf("\n");
+    std::fflush(stdout);
+    if (!trace_path.empty()) {
+      nlohmann::ordered_json row;
+      row["item"] = it.name;
+      row["free_seed"] = seed;
+      row["tokens"] = tok;
+      row["seconds"] = st.decode_seconds;
+      row["spec_rounds"] = st.spec_rounds;
+      row["spec_accepted"] = st.spec_accepted;
+      std::ofstream(trace_path, std::ios::app) << row.dump() << "\n";
+    }
+    ++items;
+    tokens += tok;
+    seconds += st.decode_seconds;
+    rounds += st.spec_rounds;
+    accepted += st.spec_accepted;
+  }
+  nlohmann::ordered_json j;
+  j["file"] = path;
+  j["items"] = items;
+  j["free_seed"] = seed;
+  j["temperature"] = temperature;
+  j["total"]["tokens"] = tokens;
+  j["total"]["tok_s"] = seconds > 0 ? double(tokens) / seconds : 0;
+  if (rounds) {
+    j["total"]["rounds"] = rounds;
+    j["total"]["tokens_per_verify"] = double(accepted + rounds) / double(rounds);
+  }
+  std::printf("%-28s %6ld tok  %7.1f tok/s", "TOTAL", tokens, seconds > 0 ? double(tokens) / seconds : 0.0);
+  if (rounds) std::printf("  %5.2f tok/verify", double(accepted + rounds) / double(rounds));
+  std::printf("\n");
+  std::fflush(stdout);
+  return j.dump();
+}
+
 }  // namespace
 
 std::string run_forced(model::Generator& gen, const std::string& path, double temperature, int skip, int items,
-                       const std::string& trace_path) {
+                       const std::string& trace_path, int free_seed) {
   std::ifstream in(path);
   if (!in) throw std::runtime_error("cannot open " + path);
-  struct Item {
-    std::string name;
-    std::vector<std::int32_t> prompt, output;
-  };
   std::vector<Item> list;
   int index = 0;
   for (std::string line; std::getline(in, line);) {
@@ -142,6 +199,7 @@ std::string run_forced(model::Generator& gen, const std::string& path, double te
                     j.at("output").get<std::vector<std::int32_t>>()});
     if (items > 0 && int(list.size()) == items) break;
   }
+  if (free_seed >= 0) return run_free(gen, path, list, temperature, free_seed, trace_path);
 
   Totals total, kinds[NKINDS];
   std::vector<model::SpecRoundRecord> trace_all, trace_kind[NKINDS];

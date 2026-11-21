@@ -3,6 +3,9 @@
 //
 //     ingine-bench --tokens 512 --dense-fp8
 //     ingine-bench --spec --forced agentic.jsonl   (teacher-forced replay, see forced.h)
+//     ingine-bench --spec --forced agentic.jsonl --forced-free 1 --temperature 1   (free generation from each
+//         item's prompt for len(output) tokens at the temperature: sampled A/B, where forced acceptance by
+//         equality under-counts)
 #include "forced.h"
 #include "ingine/generator.h"
 #include "serve/cli.h"
@@ -134,7 +137,7 @@ std::string default_model_dir() {
 
 int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
-  int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0;
+  int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
@@ -159,6 +162,7 @@ int main(int argc, char** argv) {
   ap.option("--forced-items", "", "replay at most N items of --forced", &forced_items);
   ap.option("--forced-skip", "", "skip the first N items of --forced", &forced_skip);
   ap.option("--forced-trace", "", "append every replayed item and round to FILE (JSON lines)", &forced_trace);
+  ap.option("--forced-free", "", "with --forced: sample freely from each item's prompt with this seed (no replay)", &forced_free);
   ap.parse(argc, argv);
 
   try {
@@ -182,7 +186,7 @@ int main(int argc, char** argv) {
     std::printf("load+capture %.1fs, GPU %.2f GB\n", load_s, double(free0 > free1 ? free0 - free1 : 0) / 1e9);
     std::fflush(stdout);
     if (!forced.empty()) {
-      std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace).c_str());
+      std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace, forced_free).c_str());
       return 0;
     }
 
