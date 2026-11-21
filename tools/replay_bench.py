@@ -32,8 +32,7 @@ of ttft, decode and model seconds (the cost of the loops), and the same split by
 32-128K, >128K tokens) and by what the output mostly is (tool call, text, reasoning-heavy: at least half of the
 output characters are reasoning).
 
-    tools/replay_bench.py --traces traces/run1 --base-url http://127.0.0.1:8017/v1 --temperature 0 \
-        --max-tokens 400 --cold --out a.json
+    tools/replay_bench.py --traces traces/run1 --temperature 0 --max-tokens 400 --cold --out a.json
     tools/replay_bench.py --compare a.json b.json
 
 For an A/B use --temperature 0 (greedy: both sides produce the same tokens unless the change alters the model's

@@ -203,7 +203,9 @@ int main(int argc, char** argv) {
         ingine::model::Sampling sampling;
         sampling.temperature = float(temperature);
         sampling.seed = uint64_t(r);
-        st = gen->generate(ids, tokens, sampling, r ? std::span<const int32_t>() : std::span<const int32_t>(stop),
+        // every run stops at the end-of-turn token: tokens after it are not what a request generates (and
+        // speculative decoding accepts few drafts there, which made later runs look slow)
+        st = gen->generate(ids, tokens, sampling, std::span<const int32_t>(stop),
                            [&](std::span<const int32_t> t) {
                              out.insert(out.end(), t.begin(), t.end());
                              return true;
