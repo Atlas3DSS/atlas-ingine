@@ -7,6 +7,9 @@ ROOT="$(cd -- "$(dirname -- "$SELF")/.." && pwd -P)"
 UNIT=inkling-ingine
 CONFIG="$HOME/.config/ingine/env"
 RUN="$ROOT/.run"
+BUILD="$ROOT/native/build-install"  # built by scripts/install.sh
+SERVER="$BUILD/apps/serve/ingine-serve"
+PROFILE="$BUILD/profile.env"
 NOTIFY=0
 MODE=systemd
 
@@ -16,16 +19,16 @@ Usage: ingine <command> [arguments]
 
 Commands
   serve [args...]  Run the server in the foreground (Ctrl-C stops it). Arguments are passed to
-                   python -m ingine.server after the profile, so later flags win (e.g. --max-ctx 131072).
+                   ingine-serve after the profile, so later flags win (e.g. --max-ctx 131072).
   start [args...]  Start the server in the background as the systemd user unit $UNIT (or, without a
                    systemd user session, as a nohup process logging to .run/ingine.log), wait until
                    /health answers, then print the API URL and model id. Returns at once if it already
                    runs; exits 1 if the server fails or is not ready within INGINE_START_TIMEOUT seconds
-                   (it keeps starting then; a first start without prebuilt kernels compiles them).
+                   (it keeps starting then).
   stop             Stop the server and wait until the port is free.
   status           Server state, /health, /v1/models and GPU memory. Exit 0 ready, 1 starting, 3 stopped.
   logs [-f]        Server log (journalctl --user -u $UNIT, or .run/ingine.log); -f follows it.
-  update           Update the code, environment and model: bash setup.sh --update.
+  update           Update the code, rebuild the server and update the model: bash setup.sh --update.
   help             This text.
 start and stop never prompt and send desktop notifications (notify-send), so they can be bound to keys.
 
@@ -38,8 +41,8 @@ Settings: environment variables, or shell assignments in $CONFIG (the environmen
   INGINE_EXTRA_ARGS     extra server flags, split on whitespace (e.g. "--spec-threshold 0.7")
   INGINE_START_TIMEOUT  seconds start waits for /health (default 300)
 Relative paths are relative to \$ROOT ($ROOT).
-Profile: \$ROOT/runtime-manifest.json "serving" (FP8 dense weights, FP8 KV cache, speculative decoding).
-CUDA settings come from \$ROOT/.cuda-toolkit/ingine.env, written by the installer, when present.
+Profile: \$ROOT/runtime-manifest.json "serving" (FP8 dense weights, FP8 KV cache, speculative decoding), as
+written by the installer to \$ROOT/native/build-install/profile.env next to the server binary.
 
 The API has no authentication; keep it on loopback.
 Endpoints: http://HOST:PORT/v1/chat/completions, /v1/models, /health.
@@ -60,7 +63,14 @@ die() {
   exit 1
 }
 
-case "${1:-help}" in help|-h|--help) usage; exit 0 ;; esac
+case "${1:-help}" in
+  help|-h|--help) usage; exit 0 ;;
+  update)
+    [[ -f "$ROOT/setup.sh" ]] || die "$ROOT/setup.sh is missing; reinstall with the curl command from the README."
+    shift
+    exec bash "$ROOT/setup.sh" --update "$@"
+    ;;
+esac
 
 # ---- settings: config file, then the environment on top ----------------------------------------------
 VARS=(INGINE_MODEL_DIR INGINE_ABLATION HOST PORT INGINE_CTX INGINE_EXTRA_ARGS INGINE_START_TIMEOUT)
@@ -76,74 +86,28 @@ if [[ -r "$CONFIG" ]]; then
 fi
 for name in "${!explicit[@]}"; do printf -v "$name" '%s' "${explicit[$name]}"; done
 
-# The venv by its physical path: torch writes the interpreter's include paths into the kernel build files, so the
-# same venv reached through a symlink (or by its target's name) would look like another environment and trigger a
-# full kernel rebuild at every switch.
-VENV="$(cd -- "$ROOT/.venv" 2>/dev/null && pwd -P || printf '%s' "$ROOT/.venv")"
-PY="$VENV/bin/python"
-[[ -x "$PY" ]] || PY="$(command -v python3 || true)"
-[[ -n "$PY" ]] || die "Python is missing. Run: bash $ROOT/setup.sh and choose 1 (install everything)."
-
-m_host='' m_port='' m_ctx='' m_model_id='' m_ablation='' m_dir=''
-FLAGS=() REQUIRED=()
-while IFS='=' read -r key value; do
-  case "$key" in
-    host) m_host="$value" ;;
-    port) m_port="$value" ;;
-    max_ctx) m_ctx="$value" ;;
-    model_id) m_model_id="$value" ;;
-    ablation) m_ablation="$value" ;;
-    directory) m_dir="$value" ;;
-    flag) FLAGS+=("$value") ;;
-    require) REQUIRED+=("$value") ;;
-  esac
-done < <("$PY" - "$ROOT/runtime-manifest.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    manifest = json.load(stream)
-serving, model = manifest["serving"], manifest["model"]
-for key in ("host", "port", "max_ctx", "model_id"):
-    print(f"{key}={serving[key]}")
-print(f"ablation={manifest['ablation']}")
-print(f"directory={model['directory']}")
-for key in ("dense_fp8", "kv_fp8", "spec"):
-    if serving[key]:
-        print("flag=--" + key.replace("_", "-"))
-if serving["spec"]:
-    print(f"flag=--spec-threshold\nflag={serving['spec_threshold']}")
-# Files the server reads; the ablation file is checked on its own because INGINE_ABLATION may replace it.
-skip = {"README.md", "LICENSE", "NOTICE", "SHA256SUMS", ".gitattributes", manifest["ablation"]}
-for name in dict.fromkeys(["config.json", *model["files"]]):
-    if name not in skip:
-        print(f"require={name}")
-PY
-)
-[[ -n "$m_port" && -n "$m_dir" ]] || die "Cannot read the serving profile from $ROOT/runtime-manifest.json."
+# The serving profile (runtime-manifest.json "serving"), written by the installer with the server binary.
+[[ -x "$SERVER" && -r "$PROFILE" ]] \
+  || die "ingine is not installed (no server build in $BUILD). Run: bash $ROOT/setup.sh and choose 1 (install everything)."
+profile_host='' profile_port='' profile_max_ctx='' profile_model_id='' profile_ablation='' profile_directory=''
+profile_flags=() profile_required=()
+# shellcheck source=/dev/null
+source "$PROFILE"
+[[ -n "$profile_port" && -n "$profile_directory" ]] || die "Cannot read the serving profile $PROFILE. Run: bash $ROOT/setup.sh and choose 1."
 
 absolute() { if [[ -z "$1" || "$1" == /* ]]; then say "$1"; else say "$ROOT/$1"; fi; }
-HOST="${HOST:-$m_host}"
-PORT="${PORT:-$m_port}"
-INGINE_CTX="${INGINE_CTX:-$m_ctx}"
-INGINE_MODEL_DIR="$(absolute "${INGINE_MODEL_DIR:-models/$m_dir}")"
+HOST="${HOST:-$profile_host}"
+PORT="${PORT:-$profile_port}"
+INGINE_CTX="${INGINE_CTX:-$profile_max_ctx}"
+INGINE_MODEL_DIR="$(absolute "${INGINE_MODEL_DIR:-models/$profile_directory}")"
 if [[ -v INGINE_ABLATION ]]; then
   INGINE_ABLATION="$(absolute "$INGINE_ABLATION")"  # set but empty: original model
 else
-  INGINE_ABLATION="$INGINE_MODEL_DIR/$m_ablation"
+  INGINE_ABLATION="$INGINE_MODEL_DIR/$profile_ablation"
 fi
 INGINE_EXTRA_ARGS="${INGINE_EXTRA_ARGS-}"
 INGINE_START_TIMEOUT="${INGINE_START_TIMEOUT:-300}"
 export HOST PORT INGINE_CTX INGINE_MODEL_DIR INGINE_ABLATION INGINE_EXTRA_ARGS INGINE_START_TIMEOUT
-
-# The installer's private CUDA toolkit: CUDA_HOME, CUDA_INC_PATH, NVCC_CCBIN, TORCH_CUDA_ARCH_LIST. They
-# enter the kernels' build flags, so serving with the install-time values reuses the prebuilt kernels.
-# Without the file the system toolkit is used (ingine.ext defaults CUDA_HOME to /opt/cuda).
-export TORCH_CUDA_ARCH_LIST=12.0a
-if [[ -r "$ROOT/.cuda-toolkit/ingine.env" ]]; then
-  # shellcheck source=/dev/null
-  source "$ROOT/.cuda-toolkit/ingine.env"
-fi
 
 # ---- helpers --------------------------------------------------------------------------------------
 case "$HOST" in
@@ -159,7 +123,12 @@ http_get() { curl -fsS --max-time 3 "$BASE$1" 2>/dev/null; }
 
 port_open() { timeout 2 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$PROBE" "$PORT" 2>/dev/null; }
 
-json_field() { "$PY" -c 'import json, sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$1"; }
+# Value of a top-level key ($1) in the server's compact JSON ($2), strings without quotes.
+json_field() {
+  local re="\"$1\":(\"([^\"]*)\"|[^,}]*)"
+  [[ "$2" =~ $re ]] || return 0
+  if [[ "${BASH_REMATCH[1]}" == \"* ]]; then say "${BASH_REMATCH[2]}"; else say "${BASH_REMATCH[1]}"; fi
+}
 
 have_systemd() { command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }
 
@@ -187,21 +156,9 @@ recent_log() {  # last server log lines since epoch $1
 
 require_curl() { command -v curl >/dev/null 2>&1 || die "curl is required (install it with your package manager)."; }
 
-# torch holds an advisory lock on engine/build/<kernel>/lock while it compiles that kernel (the file itself stays)
-compiling_now() {
-  local f
-  for f in "$ROOT"/engine/build/*/lock; do
-    [[ -e "$f" ]] || continue
-    flock -n "$f" true 2>/dev/null || return 0
-  done
-  return 1
-}
-
 check_install() {
-  [[ -x "$VENV/bin/python" ]] \
-    || die "ingine is not installed ($ROOT/.venv is missing). Run: bash $ROOT/setup.sh and choose 1 (install everything)."
   local missing=() name
-  for name in "${REQUIRED[@]}"; do [[ -f "$INGINE_MODEL_DIR/$name" ]] || missing+=("$name"); done
+  for name in "${profile_required[@]}"; do [[ -f "$INGINE_MODEL_DIR/$name" ]] || missing+=("$name"); done
   (( ${#missing[@]} == 0 )) || die "The model is missing or incomplete in $INGINE_MODEL_DIR (missing: ${missing[*]}). \
 Run: bash $ROOT/setup.sh and choose 2 (download/resume the model), or set INGINE_MODEL_DIR to an existing download."
   [[ -z "$INGINE_ABLATION" || -f "$INGINE_ABLATION" ]] || die "Ablation file not found: $INGINE_ABLATION. \
@@ -212,14 +169,13 @@ or set INGINE_ABLATION= (empty) to serve the original model."
 # ---- commands -------------------------------------------------------------------------------------
 cmd_serve() {
   check_install
-  export PATH="$VENV/bin${CUDA_HOME:+:$CUDA_HOME/bin}:$PATH"  # ninja and nvcc for the kernel build
   local args=(--engine --model-dir "$INGINE_MODEL_DIR" --host "$HOST" --port "$PORT" --max-ctx "$INGINE_CTX"
-              "${FLAGS[@]}")
-  if [[ -n "$INGINE_ABLATION" ]]; then args+=(--ablation "$INGINE_ABLATION" --model-id "$m_model_id"); fi
+              "${profile_flags[@]}")
+  if [[ -n "$INGINE_ABLATION" ]]; then args+=(--ablation "$INGINE_ABLATION" --model-id "$profile_model_id"); fi
   local extra=()
   read -r -a extra <<< "$INGINE_EXTRA_ARGS"
-  cd "$ROOT/engine"
-  exec "$VENV/bin/python" -m ingine.server "${args[@]}" "${extra[@]}" "$@"
+  cd "$ROOT"
+  exec "$SERVER" "${args[@]}" "${extra[@]}" "$@"
 }
 
 cmd_start() {
@@ -232,7 +188,7 @@ cmd_start() {
   local since body model
   since="$(date +%s)"
   if body="$(http_get /health)"; then
-    model="$(json_field model <<< "$body")"
+    model="$(json_field model "$body")"
     say "Already running: $BASE/v1 (model $model)"
     notify normal "Inkling ingine" "Already running: $BASE/v1 (model $model)"
     return 0
@@ -246,12 +202,12 @@ cmd_start() {
   elif [[ "$MODE" == systemd ]]; then
     systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
     local env=() name
-    for name in "${VARS[@]}" CUDA_HOME CUDA_INC_PATH NVCC_CCBIN TORCH_CUDA_ARCH_LIST PATH; do
+    for name in "${VARS[@]}"; do
       if [[ -v $name ]]; then env+=("--setenv=$name=${!name}"); fi
     done
     systemd-run --user --quiet --unit="$UNIT" --collect --service-type=exec \
       --description="Inkling-2-Mini abliterated (ingine) on $HOST:$PORT" \
-      --working-directory="$ROOT/engine" --property=TimeoutStopSec=30 \
+      --working-directory="$ROOT" --property=TimeoutStopSec=30 \
       "${env[@]}" "$SELF" serve "$@" \
       || unit_running || die "systemd-run could not start the user unit $UNIT."
     say "Started the user unit $UNIT; loading the model..."
@@ -262,10 +218,10 @@ cmd_start() {
     say "Started process $! (no systemd user session; log: $RUN/ingine.log); loading the model..."
   fi
 
-  local start=$SECONDS next=0 elapsed building=0 compiling=0
+  local start=$SECONDS next=0 elapsed
   while :; do
     if body="$(http_get /health)"; then
-      model="$(json_field model <<< "$body")"
+      model="$(json_field model "$body")"
       say "Ready after $((SECONDS - start)) s: $BASE/v1 (model $model)"
       notify normal "Inkling ingine ready" "$BASE/v1 (model $model)"
       return 0
@@ -275,14 +231,8 @@ cmd_start() {
       recent_log "$since" >&2
       die "The server failed to start; see: ingine logs"
     fi
-    # compiling the kernels does not count against the timeout
-    if compiling_now; then
-      (( building )) || say "Compiling ingine's CUDA kernels (once after an update or a new environment; a few minutes)..."
-      building=1
-      compiling=$((compiling + 2))
-    fi
     elapsed=$((SECONDS - start))
-    if (( elapsed - compiling >= INGINE_START_TIMEOUT )); then
+    if (( elapsed >= INGINE_START_TIMEOUT )); then
       say "Last log lines:" >&2
       recent_log "$since" >&2
       die "Not ready after $elapsed s; it keeps starting. Check: ingine status, ingine logs -f; stop: ingine stop"
@@ -324,7 +274,7 @@ cmd_stop() {
 
 cmd_status() {
   require_curl
-  local state='stopped' code=3 health models pid
+  local state='stopped' code=3 health models pid rest key value status='' stats=() cards=() re
   if pid="$(fallback_pid)"; then
     state="process $pid (log $RUN/ingine.log)"
   elif have_systemd && [[ "$(unit_state)" != inactive ]]; then
@@ -334,19 +284,28 @@ cmd_status() {
   say "Model:   $INGINE_MODEL_DIR${INGINE_ABLATION:+ + $INGINE_ABLATION}"
   if health="$(http_get /health)"; then
     models="$(http_get /v1/models || true)"
-    "$PY" - "$health" "$models" "$BASE" <<'PY'
-import json
-import sys
-
-health, base = json.loads(sys.argv[1]), sys.argv[3]
-stats = ", ".join(f"{k} {v}" for k, v in health.items() if k not in ("status", "model"))
-print(f"Health:  {health.get('status')}{' (' + stats + ')' if stats else ''}")
-try:
-    cards = json.loads(sys.argv[2])["data"]
-    print("API:     " + base + "/v1  " + ", ".join(f"{c['id']} ({c.get('max_model_len')} tokens)" for c in cards))
-except (ValueError, KeyError, TypeError):
-    print(f"API:     {base}/v1 (no /v1/models answer)")
-PY
+    # /health: {"status":"ok","model":...,"waiting":0,...}; every key but status and model is a statistic.
+    rest="$health" re='"([A-Za-z_]+)":("[^"]*"|[^,}]*)(.*)'
+    while [[ "$rest" =~ $re ]]; do
+      key="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}" rest="${BASH_REMATCH[3]}"
+      value="${value#\"}" value="${value%\"}"
+      case "$key" in status) status="$value" ;; model) ;; *) stats+=("$key $value") ;; esac
+    done
+    value="$(IFS=,; say "${stats[*]}")"
+    say "Health:  $status${value:+ (${value//,/, })}"
+    # /v1/models: {"object":"list","data":[{"id":...,"max_model_len":...},...]}
+    rest="$models" re='\{([^{}]*)\}(.*)'
+    while [[ "$rest" =~ $re ]]; do
+      value="${BASH_REMATCH[1]}" rest="${BASH_REMATCH[2]}"
+      key="$(json_field id "$value")"
+      [[ -z "$key" ]] || cards+=("$key ($(json_field max_model_len "$value") tokens)")
+    done
+    if (( ${#cards[@]} )); then
+      value="$(IFS=,; say "${cards[*]}")"
+      say "API:     $BASE/v1  ${value//,/, }"
+    else
+      say "API:     $BASE/v1 (no /v1/models answer)"
+    fi
     code=0
   elif is_running; then
     say "Health:  not answering yet (starting; see: ingine logs -f)"

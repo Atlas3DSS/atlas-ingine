@@ -5,7 +5,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export PATH="$ROOT/.tools/bin:$PATH"
 
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
-  printf 'Usage: bash setup.sh [--update]\n\nChoose 1 to install ingine (Python environment, private CUDA 13.4 toolkit, prebuilt\nkernels) and download the pinned Inkling-2-Mini checkpoint.\nChoose 2 to download or resume the model download.\nChoose 3 to start the server in the foreground with the manifest profile.\nChoose 4, or run bash setup.sh --update, to update this installer and rerun the install\nsteps; the model is downloaded again only when its pinned revision changed (mismatching\nfiles are moved to <model folder>.previous-<time>/, not deleted).\nChoose 5 to install the ingine command (start, stop, status, logs, update) as\n~/.local/bin/ingine.\n\nINGINE_MODEL_DIR reuses an existing download of the model. Serving requires Linux x86_64,\nan RTX 5090 (32 GB) and an NVIDIA driver for CUDA 13 (580 or newer). Allow about 20.2 GB\nfor the model plus about 6 GB for software.\n'
+  printf 'Usage: bash setup.sh [--update]\n\nChoose 1 to install ingine (build tools and a private CUDA 13.4 toolkit, then build the\nC++ server) and download the pinned Inkling-2-Mini checkpoint.\nChoose 2 to download or resume the model download.\nChoose 3 to start the server in the foreground with the manifest profile.\nChoose 4, or run bash setup.sh --update, to update this installer, rebuild the server (only\nwhat changed) and rerun the install steps; the model is downloaded again only when its\npinned revision changed (mismatching files are moved to <model folder>.previous-<time>/,\nnot deleted).\nChoose 5 to install the ingine command (start, stop, status, logs, update) as\n~/.local/bin/ingine.\n\nINGINE_MODEL_DIR reuses an existing download of the model. Serving requires Linux x86_64,\nan RTX 5090 (32 GB) and an NVIDIA driver for CUDA 13 (580 or newer). Allow about 20.2 GB\nfor the model plus about 3 GB for software.\n'
   exit 0
 fi
 # --update-continue is internal: after --update (or option 4) pulls the installer, the pulled
@@ -73,7 +73,7 @@ has_cuda_host_compiler() {
 
 check_system_tools() {
   local command missing=0
-  for command in curl git c++ setsid; do
+  for command in curl git cc c++ setsid; do
     if ! command -v "$command" >/dev/null; then
       printf 'Missing system tool: %s\n' "$command" >&2
       missing=1
@@ -239,13 +239,13 @@ fi
 while true; do
   printf '\nInkling-2-Mini abliterated - ingine\n'
   printf 'RTX 5090, 262,144-token context, FP8 weights and KV cache, speculative decoding\n\n'
-  printf '  1) Install everything (software + kernels + model)\n'
+  printf '  1) Install everything (software + C++ engine build + model)\n'
   printf '  2) Download / resume model\n'
   printf '  3) Start the server (Ctrl-C to stop)\n'
   printf '  4) Update to the latest version\n'
   printf '  5) Install the ingine command (~/.local/bin/ingine)\n'
   printf '  0) Exit\n\n'
-  printf 'Space: ~20.2 GB model files, plus ~6 GB software.\n'
+  printf 'Space: ~20.2 GB model files, plus ~3 GB software.\n'
   if ! read -r -p "Choose an option: " choice; then
     printf '\n'
     exit 0
@@ -262,7 +262,7 @@ while true; do
       fi
       ;;
     3)
-      if [[ ! -x "$ROOT/.venv/bin/python" || ! -r "$ROOT/.cuda-toolkit/ingine.env" ]]; then
+      if [[ ! -x "$ROOT/native/build-install/apps/serve/ingine-serve" || ! -r "$ROOT/native/build-install/profile.env" ]]; then
         echo "Choose 1 to install the engine and download the model first." >&2
       else
         exec bash "$ROOT/scripts/ingine" serve

@@ -1,5 +1,5 @@
-// Routed-expert kernels (engine/csrc/moe ported to raw-pointer launchers; contracts in engine/SPEC.md, area
-// `moe`) and the expert decode to BF16 (engine/csrc/prefill/dequant.cu). Launchers run on `stream`, never
+// Routed-expert kernels (the PyTorch extension's kernels ported to raw-pointer launchers; contracts in
+// native/KERNELS.md, area `moe`) and the expert decode to BF16. Launchers run on `stream`, never
 // allocate or synchronise, read routing from device memory and are CUDA-graph capturable. Shapes are
 // row-major (Python order); H = 2304, I = 1152, 128 experts, top-8. Invalid arguments throw
 // std::invalid_argument.

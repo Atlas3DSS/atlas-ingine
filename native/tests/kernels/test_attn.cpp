@@ -1,5 +1,5 @@
-// Attention core (src/kernels/attn) against an FP64 oracle of SPEC.md area `attn` (adapted from
-// engine/tests/test_attn.py): sliding layers with an empty, partially filled, wrapped, and wrapped ring
+// Attention core (src/kernels/attn) against an FP64 oracle of KERNELS.md area `attn` (adapted from the PyTorch
+// engine's test_attn.py): sliding layers with an empty, partially filled, wrapped, and wrapped ring
 // holding stale speculative entries, M = 1..8; full layers at p0 = 0, 3000 and 9000 (log scaling active)
 // with BF16 and FP8 (E4M3) caches. Checks the output, the new cache rows, ring positions and conv states.
 // Synthetic layer parameters; caches of 10016 rows (about 40 MB).

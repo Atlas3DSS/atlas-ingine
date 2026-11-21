@@ -1,13 +1,15 @@
 # ingine decode kernels: contracts
 
-ingine runs Inkling-2-Mini on one RTX 5090 (sm_120a, 32 GB, ~1.79 TB/s). Prefill is PyTorch; the decode
-step (one token, later up to 8 consecutive tokens for speculative verification) is a fixed sequence of
-custom kernels captured in one CUDA graph. This file is the contract between the kernels and the host code
-in `ingine/fast.py` (owned by the integrator).
+ingine runs Inkling-2-Mini on one RTX 5090 (sm_120a, 32 GB, ~1.79 TB/s). The decode step (one token, or up to 8
+consecutive tokens for speculative verification) is a fixed sequence of custom kernels captured in one CUDA graph
+per call width (`src/model/decoder.cpp`, `src/model/runtime.cpp`). This file is the contract between those
+kernels (`src/kernels/{moe,attn,dense}`) and the host code. The prefill (`src/kernels/prefill`) and the DSpark
+drafter (`src/kernels/draft`) compute the same model math; their headers document their own precision.
 
-The mathematical oracle is `ingine/model.py` (PyTorch, FP32 activations, BF16 matrix inputs), itself
-checked against the transformers reference. Weights come from `ingine/weights.py`;
-`weights.load_layer(model_dir, l)` loads one layer (~0.8 GB GPU) for tests.
+The kernels were written as PyTorch extensions, qualified against ingine's PyTorch model (FP32 activations, BF16
+matrix inputs; itself checked against the transformers reference) and then ported unchanged to C++ launchers.
+That engine was removed once the C++ engine matched it; it is in the history up to commit 44bc891 (`engine/`).
+Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model/weights.cpp`.
 
 ## Model facts used by kernels
 
@@ -15,29 +17,24 @@ checked against the transformers reference. Weights come from `ingine/weights.py
 * 48 layer visits per token: layers 0-5, layers 6-17 three times, layers 18-23. Full-attention layers are
   5, 11, 17, 23; all others use a 1024-token sliding window.
 * MoE: 128 experts, top-8, expert intermediate I = 1152. Experts of layers 0-19 are NVFP4, 20-23 MXFP8
-  (layouts in `weights.py` docstring). `w13` rows are interleaved: row 2i = gate i, row 2i+1 = up i.
+  (layouts in `src/model/model_data.h`). `w13` rows are interleaved: row 2i = gate i, row 2i+1 = up i.
 * All short convolutions have kernel 4 and keep the previous 3 inputs as state ``[3, C]`` (oldest first,
   zeros before the first token).
 
 ## Conventions (all kernels)
 
-* One pybind11 extension per area: `engine/csrc/<area>/` (`.cu` + `.cpp`), built by `ingine/ext.py`
-  (`ext.load("<area>")`). Shared helpers may go in `engine/csrc/common/<area>_*.cuh`; do not edit another
-  area's files.
-* Every op takes preallocated outputs and workspaces, launches on `at::cuda::getCurrentCUDAStream()`, never
-  allocates, never synchronises, and reads positions/lengths from device memory, so it can be captured in
-  a CUDA graph and replayed with different contents.
+* One static library per area: `src/kernels/<area>/` -> `ingine_kernels_<area>`, raw-pointer launchers declared
+  in `<area>.h`.
+* Every launcher takes preallocated outputs and workspaces and a stream, never allocates, never synchronises, and
+  reads positions/lengths from device memory, so it can be captured in a CUDA graph and replayed with different
+  contents.
 * `M` = tokens per call (1 ≤ M ≤ 8), consecutive positions. Correctness is required for every M in that
   range; performance matters first for M = 1.
 * Matrix inputs are BF16; accumulation and activations are FP32. Where the reference rounds an
   intermediate to BF16 (noted below), kernels round it too; everything else may stay FP32.
-* Qualification: an independent FP32/FP64 oracle built from `model.py` functions with decoded weights, at
-  real model shapes and real weights from several layers (cover NVFP4 and MXFP8; sliding and full;
-  loop and non-loop as relevant). Report max abs / relative error. Tests: `engine/tests/test_<area>.py`
-  (pytest, GPU memory < 3 GB). Benchmarks: `engine/bench/bench_<area>.py` (CUDA events, warm-up, rotate
-  over several layers' weights so L2 does not serve them; report µs and achieved GB/s of weight bytes).
-* The GPU is shared with a long-running ~22 GB job until the integrator says otherwise: keep memory low and
-  treat timings as noisy (repeat, take medians, state the condition).
+* Qualification: FP64 CPU oracles at real model shapes (`tests/kernels/test_<area>.cpp`, NVFP4 and MXFP8,
+  sliding and full, every M), real layers in `tests/model/test_layer.cpp`, and the whole model against the
+  goldens in `tests/golden/model` (`ingine-validate`).
 
 ## Area `moe` (routed experts)
 
@@ -134,11 +131,11 @@ update + attention residual + RMS norm.
   `[G, H, 64]`, `norm_w` fp32 `[G, H]`.
 * `g = bf16(w_down · bf16([n(h), n(msg)]))` (n = RMS norm without weight), then
   `gated = (1 - tanh(w_forget · g)) * h + tanh(w_gain · g) * msg`, `out_bf16[g, m] = bf16(rms_norm(gated)
-  * norm_w[g])`. For the MLP-side gate (G = 1) the integrator also needs `gated` in FP32: provide an
+  * norm_w[g])`. For the MLP-side gate (G = 1) the host also needs `gated` in FP32: provide an
   optional `out_f32`.
 
 `head(x, w, w_scale, out)` — `x` bf16 `[M, H]`, `w` `[200058, H]` bf16 or fp8 + row scales,
 `out[m, v] = 30 * tanh(bf16(w_v · x)/30)` fp32 `[M, 200058]`. Target: DRAM bandwidth (0.92 GB BF16).
 
-FP8 option (all GEMVs above): `fp8_rows(w_bf16) -> (w_fp8, scale)` with `scale[r] = max|w_r| / 448`, so the
-integrator can measure FP8 dense accuracy end to end.
+FP8 option (all GEMVs above): `fp8_rows(w_bf16) -> (w_fp8, scale)` with `scale[r] = max|w_r| / 448`; the
+serving profile uses it (`--dense-fp8`).

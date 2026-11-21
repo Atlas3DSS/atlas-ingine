@@ -13,11 +13,12 @@ The installer sets everything up and downloads the ready-to-run model from Huggi
 ## Run
 
 You need **Linux x86_64, an NVIDIA GPU with compute capability 12.0 and at least 32 GB of memory (RTX 5090), an
-NVIDIA driver for CUDA 13 (580 or newer), and about 30 GB of free disk** (20.2 GB of model files; the Python
-environment with PyTorch's CUDA libraries and the CUDA compiler take the rest). The RTX PRO 6000, 5000 and 4500
-Blackwell cards are also compute capability 12.0 but untested. Other GPUs are not supported: the kernels are
-built for `sm_120a` and decode the routed experts with Blackwell's FP4 conversion instructions. The installer does
-not install or change GPU drivers.
+NVIDIA driver for CUDA 13 (580 or newer), a C++20 compiler (GCC 12 to 16; the menu offers to install one), and
+about 24 GB of free disk** (20.2 GB of model files; the private CUDA toolkit, the build tools and the build take
+about 1.2 GB, uv's download cache about 1 GB more). The RTX PRO 6000, 5000 and 4500 Blackwell cards are also
+compute capability 12.0 but untested. Other GPUs are not supported: the kernels are built for `sm_120a` and decode
+the routed experts with Blackwell's FP4 conversion instructions. The installer does not install or change GPU
+drivers. The server is a C++/CUDA program: it needs no Python or PyTorch to run.
 
 Install with one command. It clones this repository to `~/inkling-2-mini-abliterated-ingine` and opens its menu:
 
@@ -25,8 +26,9 @@ Install with one command. It clones this repository to `~/inkling-2-mini-abliter
 curl -fsSL https://raw.githubusercontent.com/satellitedown/inkling-2-mini-abliterated-ingine/main/get.sh | bash
 ```
 
-Choose **1** to install (Python environment, CUDA toolkit, kernel build and model download), then **5** to add the
-`ingine` command and `ingine start` to run the server. Run the same command again any time to get back to the menu.
+Choose **1** to install (build tools, CUDA toolkit, build of the C++ engine and model download), then **5** to add
+the `ingine` command and `ingine start` to run the server. Run the same command again any time to get back to the
+menu.
 To install somewhere else, set the folder:
 `curl -fsSL https://raw.githubusercontent.com/satellitedown/inkling-2-mini-abliterated-ingine/main/get.sh | INGINE_DIR=/path/to/folder bash`.
 
@@ -40,8 +42,8 @@ bash setup.sh
 
 The menu:
 
-1. **Install everything:** check the GPU, driver, tools and disk space, create the Python environment, install a
-   private CUDA toolkit, compile ingine's CUDA kernels once (so the first start is fast) and download the model.
+1. **Install everything:** check the GPU, driver, tools and disk space, install CMake, Ninja and a private CUDA
+   13.4 toolkit (with cuBLAS), build the C++ engine (`ingine-serve`, a few minutes) and download the model.
 2. **Download / resume model:** download the pinned model files, or resume an interrupted download, and verify them.
 3. **Start the server (foreground):** run `ingine serve` in this terminal; **Ctrl+C** stops it.
 4. **Update:** pull this repository and rerun the install steps (see below). `bash setup.sh --update` does the same
@@ -53,19 +55,21 @@ Choose **0** to exit. Every step can be repeated: an interrupted install continu
 download with option 2. `bash setup.sh --help` lists the options without installing anything.
 
 **Updating** (`ingine update`, menu option 4 or `bash setup.sh --update`) fast-forwards this repository from
-GitHub, then reruns the idempotent install steps: Python packages, CUDA toolkit, kernel build, and the model check.
-The model is downloaded again only when the pinned revision in [runtime-manifest.json](runtime-manifest.json)
-changed; files that no longer match are moved aside to `models/Inkling-2-Mini.previous-<time>/`, never deleted.
-Delete that folder once the new version works. A running server keeps the old code until you restart it:
-`ingine stop && ingine start`.
+GitHub, then reruns the idempotent install steps: build tools, CUDA toolkit, an incremental rebuild of the engine,
+and the model check. The model is downloaded again only when the pinned revision in
+[runtime-manifest.json](runtime-manifest.json) changed; files that no longer match are moved aside to
+`models/Inkling-2-Mini.previous-<time>/`, never deleted. Delete that folder once the new version works. A running
+server keeps the old code until you restart it: `ingine stop && ingine start`. Installs from before the C++ engine
+kept a Python environment in `.venv/` and compiled kernels in `engine/`; the update leaves them in place and
+prints the command that deletes them (about 6 GB).
 
 Everything lives inside the install folder:
 
 | Path | Contents |
 |---|---|
-| `.venv/` | Python 3.12 with PyTorch 2.14 (CUDA 13.0 build) and ingine's dependencies ([requirements-engine.txt](requirements-engine.txt)) |
-| `.cuda-toolkit/` | private CUDA toolkit used only to compile ingine's kernels; the system CUDA is not used or changed |
-| `engine/build/` | ingine's compiled CUDA extensions |
+| `.tools/` | uv (when it was not installed already) and a small Python environment (`.tools/venv/`) with CMake, Ninja and `huggingface_hub`, used only by the installer |
+| `.cuda-toolkit/` | private CUDA 13.4 toolkit (nvcc, runtime, cuBLAS) used to build ingine; the server loads its CUDA libraries from here, and the system CUDA is not used or changed |
+| `native/build-install/` | the built server, `apps/serve/ingine-serve`, and its serving profile (`profile.env`, from [runtime-manifest.json](runtime-manifest.json)) |
 | `models/Inkling-2-Mini/` | the model from Hugging Face: Inkling-2-Mini's files and the abliteration file (set `INGINE_MODEL_DIR` to use a download elsewhere) |
 | `.run/` | pid file and server log, used only when there is no systemd user session (`ingine start` then runs the server with `nohup`) |
 
@@ -104,7 +108,7 @@ INGINE_CTX=131072
 ```
 
 `INGINE_MODEL_DIR` must hold the pinned revision; this checks it without downloading:
-`.venv/bin/python scripts/download_model.py --model-dir "$INGINE_MODEL_DIR" --verify-only`.
+`.tools/venv/bin/python scripts/download_model.py --model-dir "$INGINE_MODEL_DIR" --verify-only`.
 
 ## Connect an application
 

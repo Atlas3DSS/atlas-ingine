@@ -7,16 +7,17 @@ set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$HERE/.." && pwd)
 PY=$HERE/.venv/bin/python
+SERVER=${SERVER:-$ROOT/native/build-install/apps/serve/ingine-serve}  # built by scripts/install.sh
 PORT=8017
 MODEL=${MODEL:-${INGINE_MODEL_DIR:-$ROOT/models/Inkling-2-Mini}}
-ABLATION=$(realpath "${ABLATION:?set ABLATION to the ablation file}")  # the server runs from engine/
+ABLATION=${ABLATION:?set ABLATION to the ablation file}
 OUT=${OUT:-$ROOT/results}
 mkdir -p "$OUT"
 
 serve() {
   local label=$1; shift
-  (cd "$ROOT/engine" && exec "$PY" -m ingine.server --engine --model-dir "$MODEL" --host 127.0.0.1 --port $PORT \
-      --dense-fp8 --max-ctx 16384 "$@") >"$OUT/serve-$label.log" 2>&1 &
+  "$SERVER" --engine --model-dir "$MODEL" --host 127.0.0.1 --port $PORT --dense-fp8 --max-ctx 16384 "$@" \
+      >"$OUT/serve-$label.log" 2>&1 &
   PID=$!
   for _ in $(seq 1 300); do
     if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then return 0; fi

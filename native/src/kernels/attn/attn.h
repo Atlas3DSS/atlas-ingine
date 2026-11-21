@@ -1,5 +1,5 @@
-// Attention core of one layer visit for M = 1..8 consecutive decode tokens (engine/csrc/attn ported to a
-// raw-pointer launcher; contract in engine/SPEC.md, area `attn`): q/rel post-processing, key/value convs +
+// Attention core of one layer visit for M = 1..8 consecutive decode tokens (the PyTorch extension's kernel ported
+// to a raw-pointer launcher; contract in native/KERNELS.md, area `attn`): q/rel post-processing, key/value convs +
 // state update, KV cache write, split-K attention with relative bias, sink and output gate, in one kernel.
 // Always launched with programmatic dependent launch (as the Python binding does); graph capturable.
 #pragma once

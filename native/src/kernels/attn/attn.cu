@@ -1,5 +1,5 @@
 // Attention core of one Inkling-2-Mini layer visit for M = 1..8 consecutive decode tokens, in ONE kernel.
-// Contract: engine/SPEC.md, area `attn`.
+// Contract: native/KERNELS.md, area `attn`.
 //
 // Design
 // ------

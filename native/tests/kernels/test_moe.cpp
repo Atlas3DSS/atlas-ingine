@@ -1,5 +1,5 @@
-// Routed-expert kernels (src/kernels/moe) against FP64 oracles of SPEC.md area `moe` (adapted from
-// engine/tests/test_moe.py): moe_up and moe_down for NVFP4 and MXFP8 experts, M = 1, 3, 8 with experts
+// Routed-expert kernels (src/kernels/moe) against FP64 oracles of KERNELS.md area `moe` (adapted from the
+// PyTorch engine's test_moe.py): moe_up and moe_down for NVFP4 and MXFP8 experts, M = 1, 3, 8 with experts
 // shared between tokens (deduplicated passes), the post-MLP conv state update and conv history, and
 // dequant_experts. Synthetic experts in checkpoint encoding; only experts 0..E-1 are allocated (routing
 // stays below E), which keeps GPU memory small.

@@ -1,7 +1,8 @@
-// Dense decode kernels (engine/csrc/dense ported to raw-pointer launchers; contracts in engine/SPEC.md, area
-// `dense`). Every launcher runs on `stream`, never allocates or synchronises, reads token ids, positions and
-// routing from device memory, and is CUDA-graph capturable. pdl = programmatic dependent launch: the kernel
-// prefetches weights/constants, then waits for its predecessor before reading activations or state.
+// Dense decode kernels (the PyTorch extension's kernels ported to raw-pointer launchers; contracts in
+// native/KERNELS.md, area `dense`). Every launcher runs on `stream`, never allocates or synchronises, reads token
+// ids, positions and routing from device memory, and is CUDA-graph capturable. pdl = programmatic dependent
+// launch: the kernel prefetches weights/constants, then waits for its predecessor before reading activations or
+// state.
 // M (tokens per call) is 1..8 (mix and embed: any M >= 1, one CTA per row). Shapes are row-major (Python
 // order). Invalid arguments throw std::invalid_argument.
 #pragma once
@@ -45,7 +46,7 @@ void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloa
 void router(const __nv_bfloat16* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
             bool pdl, cudaStream_t stream);
 
-// mix: ablated residual update + attention residual over block states + RMS norm (SPEC.md).
+// mix: ablated residual update + attention residual over block states + RMS norm (KERNELS.md).
 struct MixParams {
   const float* const* blocks = nullptr;  // device table of nblocks device pointers, each fp32 [M, H]
   int nblocks = 0;                       // 0..5

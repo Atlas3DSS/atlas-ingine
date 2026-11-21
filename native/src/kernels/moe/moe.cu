@@ -1,5 +1,5 @@
 // Routed-expert kernels for Inkling-2-Mini decode: moe_up (W13 GEMV + softcapped SwiGLU) and moe_down
-// (W2 GEMV + routing-weighted sum + post-MLP short conv). Contract: engine/SPEC.md, area `moe`.
+// (W2 GEMV + routing-weighted sum + post-MLP short conv). Contract: native/KERNELS.md, area `moe`.
 //
 // Design
 // ------

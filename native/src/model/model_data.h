@@ -81,7 +81,7 @@ inline constexpr int NUM_TAPS = 4;
 
 // ----------------------------------------------------------------------------- fast.py projection layout
 
-// SEG_ROWS order (SPEC.md): q | gate | rel | sink | k | v | (full layers) k_dyn | v_dyn
+// SEG_ROWS order (KERNELS.md): q | gate | rel | sink | k | v | (full layers) k_dyn | v_dyn
 enum Seg : int { SEG_Q = 0, SEG_GATE, SEG_REL, SEG_SINK, SEG_K, SEG_V, SEG_K_DYN, SEG_V_DYN, NUM_SEGS };
 inline constexpr std::array<int, NUM_SEGS> SEG_ROWS = {HEADS * HEAD_DIM, HEADS * HEAD_DIM, HEADS * D_REL, HEADS,
                                                        KV_DIM,           KV_DIM,           KV_HEADS * CONV_K,
