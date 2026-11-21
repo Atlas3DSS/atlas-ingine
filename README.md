@@ -3,7 +3,7 @@
 An abliterated [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) served
 by **ingine**, a custom CUDA inference engine for one RTX 5090. It refuses neither when it answers directly nor when
 it reasons first (1/104 and 0/48 held-out harmful prompts) and stays close to the original elsewhere. ingine
-decodes about 255-260 tokens/s, 290-380 tokens/s with speculative decoding, with a 256K-token context and an
+generates 490-570 tokens/s, reads prompts at 6,200-10,900 tokens/s and serves 262,144 tokens of context through an
 OpenAI-compatible API.
 
 The installer sets everything up and downloads the ready-to-run model from Hugging Face,
@@ -118,8 +118,8 @@ authentication**: keep the server on loopback. Requests run one at a time; up to
 further ones get HTTP 503. `GET /health` and `GET /v1/models` report the state.
 
 A follow-up request only reads what is new in its conversation. Conversations that take turns (subagents, a
-second client) are kept warm in spare GPU memory, by default up to 3 GB and never the last 4 GB that are free
-after start-up (`--park-mb N` changes the budget, `0` turns it off); they are dropped when memory runs short.
+second client) are kept warm in spare GPU memory, by default up to 3 GiB and never the last 4 GiB that are free
+after start-up (`--park-mb N` sets the budget in MiB, `0` turns it off); they are dropped when memory runs short.
 
 `POST /v1/chat/completions` takes:
 
@@ -237,63 +237,46 @@ efforts; AIME 2024: 15 problems, effort high, up to 32,768 tokens):
 | AIME 2024: ran out of tokens | 2/15 | 2/15 |
 | reasoning that loops (95 samples) | 0 | 0 |
 
-Repeating a request with the same seed returned the same text in 6 of 6 cases for each model.
+Repeating a request with the same seed returned the same text in 6 of 6 cases for each model. Raw data:
+[`results/`](results).
 
-Lighter ablations from the same search, for comparison ([`results/`](results)):
+### Speed
 
-| ablation | direct refusals (harmful_test, JBB) | reasoning refusals | general-text KL, top-1 |
-|---|---|---|---|
-| trial 13 (shipped) | 1/104, 5/100 | 0/48 | 0.034, 91.2% |
-| trial 37 | 2/104, 15/100 | 26/48 | 0.006, 96.4% |
-| first search, direct answers only (trial 44) | 0/104, 1/100 | 43/48 | 0.017, 93.3% |
+One RTX 5090, one request, default profile, tokens per second while generating. "chat" explains hash-map
+collisions and "code" writes an LRU-cache module with tests (short prompts, up to 1024 tokens, median of 3 runs);
+"coding agent" replays 24 recorded agent requests (2K-39K-token prompts with tools):
 
-### Speed (RTX 5090, one request)
-
-Default profile, tokens per second while generating. "chat" explains hash-map collisions and "code" writes an
-LRU-cache module with tests (short prompts, up to 1024 tokens, median of 3 runs); "agent" replays 24 recorded
-coding-agent requests (2K-39K-token prompts with tools; reasoning, prose and tool calls):
-
-| | chat | code | agent |
+| | chat | code | coding agent |
 |---|---:|---:|---:|
-| plain decoding, greedy | 306 | 301 | |
-| DSpark, greedy | 486 | 568 | 524 |
-| plain decoding, temperature 1 | 301 | 301 | 279 |
-| DSpark, temperature 1 (the default) | 489 | 565 | 502 |
+| temperature 1 (the default) | 489 | 565 | 502 |
+| greedy (temperature 0) | 486 | 568 | 524 |
 
-DSpark (speculative decoding) is on by default. Its drafts are checked by the full model, so it returns what plain
-decoding returns (the same distribution when sampling). It helps most on predictable text: in the agent replay at
-temperature 1, tool calls run at 688, reasoning at 441 and prose at 444 tokens/s; outside English and code it is
-close to plain speed.
+The default profile runs DSpark speculative decoding: a small drafter proposes tokens and the full model checks
+every one, so it changes the speed, not the output distribution. Predictable text goes fastest: in the agent replay,
+tool calls run at 688 tokens/s, reasoning and prose at about 440; text outside English and code gains the least.
 
 A new prompt is read at 10,900 tokens/s (20K tokens), 9,600 (64K), 8,100 (131K) and 7,000 (200K); a short prompt
-takes 0.09 s to the first token. GPU memory: 24.4 GB after start-up, unchanged while reading a 254K-token prompt;
-conversations kept warm add up to 3 GB.
+takes 0.09 s to the first token. The server holds 23.8 GiB of GPU memory after start-up and no more while reading
+a 254K-token prompt; conversations kept warm add up to 3 GiB.
 
 ### Agent loops
 
 Twelve recorded Oh My Pi sessions (230 requests, prompts of 2K-89K tokens, 6.9M prompt tokens in total), replayed
-in their order, greedy, at most 400 tokens per answer:
-
-| | previous release | now |
-|---|---:|---:|
-| time to first token, all requests | 788 s | 50 s |
-| decoding | 82 s (448 tokens/s) | 66 s (563 tokens/s) |
-| requests that reuse their conversation | 17 / 230 | 214 / 230 |
-
-Two of these sessions taking turns, as an agent and its subagent do (67 requests): 8.5 s to first token in total,
-113 s with `--park-mb 0`.
+in order (greedy, up to 400 tokens per answer): 214 of the 230 requests continue a conversation the server still
+holds and read only what is new, so all 230 together wait 50 s for their first tokens; decoding runs at 563
+tokens/s. Two of these sessions taking turns, as an agent and its subagent do (67 requests), wait 8.5 s in total.
 
 ### Long context
 
-The default profile serves **262,144 tokens** of context (the checkpoint supports 1M); the long-range attention
-cache is stored in 8 bits so that it fits beside the model in 32 GB. A code haystack with a passphrase hidden in
-the middle, DSpark on:
+The default profile serves **262,144 tokens** of context (the checkpoint supports 1M). The long-range attention
+layers keep their cache in FP8, 16 KiB per token (4 GiB at 262,144 tokens, allocated at start-up), so that it fits
+beside the model in 32 GB; the sliding-window layers keep their last 1,024 tokens in BF16. A code haystack with a
+passphrase hidden in the middle:
 
 | | 131,443-token prompt | 254,019-token prompt |
 |---|---:|---:|
 | reading the prompt | 16.4 s (8,000 tokens/s) | 40.9 s (6,200 tokens/s) |
 | decoding afterwards | 354 tokens/s | 258 tokens/s |
-| GPU memory | 24.4 GB | 24.4 GB |
 
 The passphrase was found in both.
 
