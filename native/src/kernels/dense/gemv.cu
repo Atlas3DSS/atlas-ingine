@@ -212,12 +212,12 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// 2 E4M3 (low 16 bits of u) -> BF16x2, exact (via FP16 and FP32)
+// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one instruction (cvt.rn.bf16x2.e4m3x2; through FP16 and
+// FP32 it took four, 16 per mma)
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-  const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
-  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
-  const __nv_bfloat162 b = __float22bfloat162_rn(f);
-  return *reinterpret_cast<const uint32_t*>(&b);
+  uint32_t r;
+  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
+  return r;
 }
 
 #ifndef MMA_U_BF16
