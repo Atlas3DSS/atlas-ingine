@@ -43,6 +43,8 @@
 // Ported from engine/csrc/moe/moe.cu (kernel bodies unchanged; torch launchers -> raw pointers).
 #include "kernels/moe/moe.h"
 
+#include "kernels/common/l2.cuh"
+
 #include "core/device.h"
 
 #include <cuda_bf16.h>
@@ -67,12 +69,34 @@ constexpr int DOWN_WARPS = DOWN_GROUPS * DOWN_PAR;
 
 // ------------------------------------------------------------------------------------------- loads
 
-__device__ __forceinline__ uint4 ld_stream(const void* p) {
+// Expert weights are read once per step: their L2 lines are filled evict-first (kernels/common/l2.cuh), so
+// they stop evicting the activations, KV rings and the small kernels' evict-last constants.
+constexpr l2::Evict WEIGHT_L2 = l2::Evict::first;
+
+__device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
     uint4 v;
-    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(p));
+    if constexpr (l2::hinted<WEIGHT_L2>) {
+        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+                     : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                     : "l"(p), "l"(pol));
+    } else {
+        asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                     : "l"(p));
+    }
     return v;
+}
+__device__ __forceinline__ uint16_t ld_scale2(const void* p, std::uint64_t pol) {
+    uint16_t v;
+    if constexpr (l2::hinted<WEIGHT_L2>) asm volatile("ld.global.nc.L2::cache_hint.u16 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
+    else asm volatile("ld.global.nc.u16 %0, [%1];" : "=h"(v) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ uint8_t ld_scale1(const void* p, std::uint64_t pol) {
+    uint16_t v;
+    if constexpr (l2::hinted<WEIGHT_L2>) asm volatile("ld.global.nc.L2::cache_hint.u8 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
+    else asm volatile("ld.global.nc.u8 %0, [%1];" : "=h"(v) : "l"(p));
+    return uint8_t(v);
 }
 
 // Inputs written by earlier kernels (x, act, idx, wts, conv_state) use coherent loads in volatile asm with a
@@ -120,15 +144,15 @@ struct Layout {
 };
 
 template <int FMT>
-__device__ __forceinline__ Chunk<FMT> load_chunk(const uint8_t* codes, const uint8_t* scales, int c) {
+__device__ __forceinline__ Chunk<FMT> load_chunk(const uint8_t* codes, const uint8_t* scales, int c, std::uint64_t pol) {
     Chunk<FMT> ch;
     if constexpr (FMT == 0) {
-        ch.q = ld_stream(codes + 16 * c);
-        ch.s = __ldg(reinterpret_cast<const unsigned short*>(scales) + c);
+        ch.q = ld_stream(codes + 16 * c, pol);
+        ch.s = ld_scale2(scales + 2 * c, pol);
     } else {
-        ch.q0 = ld_stream(codes + 32 * c);
-        ch.q1 = ld_stream(codes + 32 * c + 16);
-        ch.s = __ldg(scales + c);
+        ch.q0 = ld_stream(codes + 32 * c, pol);
+        ch.q1 = ld_stream(codes + 32 * c + 16, pol);
+        ch.s = ld_scale1(scales + c, pol);
     }
     return ch;
 }
@@ -218,10 +242,10 @@ struct Frag {
 // Weights: `codes`/`scales` point at row g of the tile (row g+8 is 8 rows further).
 template <int FMT, int K>
 __device__ __forceinline__ void load_w(Frag<FMT>& f, const uint8_t* codes, const uint8_t* scales, int c,
-                                       float factor) {
+                                       float factor, std::uint64_t pol) {
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
-    f.r0 = load_chunk<FMT>(codes, scales, c);
-    f.r1 = load_chunk<FMT>(codes + 8 * CB, scales + 8 * SB, c);
+    f.r0 = load_chunk<FMT>(codes, scales, c, pol);
+    f.r1 = load_chunk<FMT>(codes + 8 * CB, scales + 8 * SB, c, pol);
     f.factor = factor;
 }
 
@@ -291,7 +315,8 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
     const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
     const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
     Frag<FMT> f;
-    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f);
+    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f,
+                   l2::policy<WEIGHT_L2>());
     load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
     float d[4] = {0.f, 0.f, 0.f, 0.f};
     mma_frag(f, d);
@@ -377,10 +402,11 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
         const uint32_t kmask = g < M ? uint32_t(umask[u] >> (8 * g)) & 0xffu : 0u;
         return kmask ? act + (static_cast<size_t>(g) * TOPK + (__ffs(kmask) - 1)) * K : nullptr;
     };
+    const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
     auto load = [&](int u, Frag<FMT>& f) {
         const int e = uexp[u];
         const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
-        load_w<FMT, K>(f, w + row * CB, ws + row * SB, c, FMT == 0 ? wfactor[e] : 1.f);
+        load_w<FMT, K>(f, w + row * CB, ws + row * SB, c, FMT == 0 ? wfactor[e] : 1.f, wpol);
     };
 
     // The first round's weights do not depend on moe_up: fetch them before waiting for it (PDL).

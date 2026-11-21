@@ -12,16 +12,6 @@ namespace ingine::kernels::dense {
 constexpr int H = 2304;
 constexpr float EPS = 1e-6f;
 
-// Streaming 16-byte weight load: read-only path, no L1 allocation (weights are read once per decode step).
-// `volatile` keeps all loads of a row issued up front, ahead of the activation loads.
-__device__ __forceinline__ uint4 ld_stream(const void* p) {
-  uint4 r;
-  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
-               : "l"(p));
-  return r;
-}
-
 // 16-byte load of activations (L1 cached: every row of a block re-reads the same vector). A coherent,
 // volatile load, not ld.global.nc: activations are written by the preceding kernel, and with programmatic
 // dependent launch they must not be read (or hoisted by the compiler) before griddepcontrol.wait.

@@ -41,15 +41,21 @@
 // (pdl_wait_fenced: a plain wait lets ptxas sink the loads below it; measured M = 1 proj 13.7 -> 11.8 us
 // behind a 2 us predecessor); activations are read (coherent, non-hoistable loads: ld_act) and
 // outputs/state written only after it, and the next kernel is released right after the wait.
+// L2: the weight rows are read once per step, so their lines are filled evict-first (kernels/common/l2.cuh):
+// they stop evicting the activations, KV rings and the small kernels' evict-last constants.
 // Ported from engine/csrc/dense/gemv.cu (kernel bodies unchanged; torch launchers -> raw pointers).
+#include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
 
+#include <cstdint>
 #include <type_traits>
 
 namespace ingine::kernels::dense {
 namespace {
+
+constexpr l2::Evict WEIGHT_L2 = l2::Evict::first;
 
 // ---- epilogues ----------------------------------------------------------------------------------------
 // input_of(row): input index of a row (-1: row not computed); x_of(i): that input, bf16 [M, K].
@@ -168,9 +174,10 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
   const __nv_bfloat16* x = epi.x_of(in);  // pointer arithmetic only: the segment table is a constant
 
   const uint8_t* wr = w + size_t(row) * ROW_BYTES;
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
   uint4 wv[CH];
 #pragma unroll
-  for (int i = 0; i < CH; ++i) wv[i] = ld_stream(wr + (size_t(i) * LANES + gl) * 16);
+  for (int i = 0; i < CH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (size_t(i) * LANES + gl) * 16, wpol);
   pdl_wait_fenced(zero);  // the whole row is in flight; the activation comes from an earlier kernel
   pdl_trigger();
 
@@ -243,6 +250,7 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
 
   float c[4] = {0.f, 0.f, 0.f, 0.f};
   bool waited = false;
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
   auto pass = [&](int cur) {
     const bool la = ia == cur, lb = ib == cur, lx = g < M;
     const uint8_t* wa = w + size_t(la ? ra : 0) * ROW_BYTES;
@@ -254,8 +262,8 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
 #pragma unroll
       for (int u = 0; u < U; ++u) {
         const size_t off = size_t(c0 + (jb + u) * SPAN) * (FP8 ? 1 : 2);
-        A[u] = la ? ld_stream(wa + off) : make_uint4(0, 0, 0, 0);
-        B[u] = lb ? ld_stream(wb + off) : make_uint4(0, 0, 0, 0);
+        A[u] = la ? l2::ld_stream<WEIGHT_L2>(wa + off, wpol) : make_uint4(0, 0, 0, 0);
+        B[u] = lb ? l2::ld_stream<WEIGHT_L2>(wb + off, wpol) : make_uint4(0, 0, 0, 0);
       }
       if (!waited) {  // the first batch of weights is in flight; activations come from earlier kernels
         pdl_wait_fenced(zero);
@@ -459,9 +467,11 @@ void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, 
     constexpr int MM = decltype(mc)::value;
     return GemvEpi<MM>{x, R, out};
   };
-  // K = 3072: as proj_conv; K = 9216: 36 chunks per lane would spill, so M = 1 also uses tensor cores
-  if (K == 3072) launch_gemv<3072, 32, CONV_SPLITK, GemvEpi>(w, M, pdl, stream, make);
-  else if (K == 9216) launch_gemv<9216, 0, 8, GemvEpi>(w, M, pdl, stream, make);
+  // 2304 rows = 144 blocks of 16 rows: 16 warps per block (K slices of 192 / 576 columns) keep enough
+  // bytes in flight (measured M = 8, BF16: K = 3072 10.4 -> 8.4 us, K = 9216 28.3 -> 26.0 us vs 8 warps).
+  // K = 3072, M = 1: as proj_conv; K = 9216: 36 chunks per lane would spill, so M = 1 uses tensor cores.
+  if (K == 3072) launch_gemv<3072, 32, 16, GemvEpi>(w, M, pdl, stream, make);
+  else if (K == 9216) launch_gemv<9216, 0, 16, GemvEpi>(w, M, pdl, stream, make);
   else require(false, "gemv: K must be 3072 or 9216");
 }
 

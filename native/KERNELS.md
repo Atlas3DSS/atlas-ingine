@@ -36,6 +36,9 @@ Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model
   kernels back) before `griddepcontrol.wait`, so they overlap its predecessor. ptxas sinks such loads
   below a plain wait (it only orders later accesses), so the wait goes in a loop with an opaque zero
   trip bound (`pdl_wait_fenced` in `dense/cluster.cuh`); check the SASS (`ACQBULK` after the `LDG`s).
+* L2 policy (`common/l2.cuh`): streams read once per step (dense and expert weights, the head, cached K/V)
+  are loaded evict-first (+1-2% end to end). The small weights re-read every step (gates, router) carry no
+  hint: evict-last keeps them resident but measured about 2% slower end to end.
 * Qualification: FP64 CPU oracles at real model shapes (`tests/kernels/test_<area>.cpp`, NVFP4 and MXFP8,
   sliding and full, every M), real layers in `tests/model/test_layer.cpp`, and the whole model against the
   goldens in `tests/golden/model` (`ingine-validate`).
