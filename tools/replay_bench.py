@@ -32,7 +32,8 @@ of ttft, decode and model seconds (the cost of the loops), and the same split by
 32-128K, >128K tokens) and by what the output mostly is (tool call, text, reasoning-heavy: at least half of the
 output characters are reasoning).
 
-    tools/replay_bench.py --base-url http://127.0.0.1:8017/v1 --temperature 0 --max-tokens 400 --cold --out a.json
+    tools/replay_bench.py --traces traces/run1 --base-url http://127.0.0.1:8017/v1 --temperature 0 \
+        --max-tokens 400 --cold --out a.json
     tools/replay_bench.py --compare a.json b.json
 
 For an A/B use --temperature 0 (greedy: both sides produce the same tokens unless the change alters the model's
@@ -180,6 +181,8 @@ def prepare(request, a):
         body['temperature'] = a.temperature
     if a.seed is not None:
         body['seed'] = a.seed
+    if a.top_p is not None:
+        body['top_p'] = a.top_p
     if a.max_tokens is not None:
         fields = [f for f in ('max_tokens', 'max_completion_tokens') if body.get(f) is not None] or ['max_tokens']
         for f in fields:
@@ -338,8 +341,8 @@ def replay(a):
     if a.out:
         result = {'label': a.label or Path(a.out).stem, 'base_url': a.base_url, 'traces': str(a.traces),
                   'time': time.strftime('%Y-%m-%dT%H:%M:%S'),
-                  'options': {'temperature': a.temperature, 'seed': a.seed, 'max_tokens': a.max_tokens,
-                              'only': a.only, 'repeat': a.repeat, 'cold': a.cold},
+                  'options': {'temperature': a.temperature, 'top_p': a.top_p, 'seed': a.seed,
+                              'max_tokens': a.max_tokens, 'only': a.only, 'repeat': a.repeat, 'cold': a.cold},
                   'requests': rows, 'totals': totals}
         if a.append and Path(a.out).exists():
             old = json.loads(Path(a.out).read_text())
@@ -428,10 +431,10 @@ def compare(path_a, path_b):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--traces', default='/mnt/data/inkling/work/traces/agentic-v1',
-                    help='directory of trace files written by tools/trace_proxy.py')
+    ap.add_argument('--traces', help='directory of trace files written by tools/trace_proxy.py')
     ap.add_argument('--base-url', default='http://127.0.0.1:8003/v1')
     ap.add_argument('--temperature', type=float, help='override the recorded temperature (0: greedy, for A/B)')
+    ap.add_argument('--top-p', type=float, help='override the recorded top_p')
     ap.add_argument('--seed', type=int, help='override the recorded seed')
     ap.add_argument('--max-tokens', type=int, help='cap the completion length of every request')
     ap.add_argument('--only', metavar='PATTERN', help='replay only trace files whose name matches this regex')
@@ -455,6 +458,8 @@ def main():
         return compare(*a.compare)
     if a.show:
         return show(a.show)
+    if not a.traces:
+        ap.error('--traces DIR is required to replay')
     return replay(a)
 
 

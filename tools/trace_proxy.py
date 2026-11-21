@@ -10,8 +10,8 @@ POST /v1/chat/completions additionally leaves one JSON file in the trace directo
                                      finish_reason, usage
   timing                             seconds from the request to the first delta, to the last delta and in total
 
-    tools/trace_proxy.py --trace-dir /mnt/data/inkling/work/traces/agentic-v1 --tag fix-test
-    tools/replay_bench.py --traces /mnt/data/inkling/work/traces/agentic-v1 --base-url http://127.0.0.1:8017/v1
+    tools/trace_proxy.py --trace-dir traces/run1 --tag fix-test
+    tools/replay_bench.py --traces traces/run1 --base-url http://127.0.0.1:8017/v1
 
 The usage block is only on the wire when the client asks for it (stream_options.include_usage); --force-usage adds
 that request field on the way up (the only change the proxy ever makes) and is off by default.
