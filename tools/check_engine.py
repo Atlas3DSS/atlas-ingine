@@ -10,6 +10,7 @@ distribution. Reported per position: KL(reference || engine), top-1 agreement.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ import torch.nn.functional as F
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "engine"))
-MODEL_DIR = "/mnt/data/inkling/hf"
+MODEL_DIR = os.environ.get("INGINE_MODEL_DIR", str(ROOT / "models" / "Inkling-2-Mini"))
 
 PROMPT = ("Write a Python function that merges overlapping intervals, then explain its time complexity "
           "and give two edge cases.")

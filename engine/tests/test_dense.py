@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gc
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +29,7 @@ from safetensors import safe_open
 from ingine import ext, model
 from ingine import weights as W
 
-CKPT = "/mnt/data/inkling/hf"
+CKPT = os.environ.get("INGINE_MODEL_DIR", str(Path(__file__).resolve().parents[2] / "models" / "Inkling-2-Mini"))
 H = W.HIDDEN
 LAYERS = [0, 5, 7, 11, 23]
 MS = [1, 2, 8]

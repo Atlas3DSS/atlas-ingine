@@ -10,12 +10,14 @@ from __future__ import annotations
 import copy
 import itertools
 import json
+import os
+from pathlib import Path
 
 import pytest
 
 from ingine.chat import (NO_THINKING_PREFILL, ChatError, ChatFormat, Delta, merge_deltas, normalize_messages)
 
-MODEL_DIR = "/mnt/data/inkling/hf"
+MODEL_DIR = os.environ.get("INGINE_MODEL_DIR", str(Path(__file__).resolve().parents[2] / "models" / "Inkling-2-Mini"))
 
 TOOLS = [
     {"type": "function", "function": {

@@ -7,16 +7,18 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import os
 import socket
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
 from ingine.chat import ChatFormat, Sampling
 from ingine.server import App, ChatServer, FakeGenerator
 
-MODEL_DIR = "/mnt/data/inkling/hf"
+MODEL_DIR = os.environ.get("INGINE_MODEL_DIR", str(Path(__file__).resolve().parents[2] / "models" / "Inkling-2-Mini"))
 MSGS = [{"role": "user", "content": "Hi 🎉"}]
 THINK_TEXT = ("<|message_model|><|content_thinking|>Let me think… 𓀀 ok<|end_message|>"
               "<|message_model|><|content_text|>Hello, wörld 𝔘! STOP here<|end_message|>"

@@ -21,14 +21,16 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 import statistics
+from pathlib import Path
 
 import torch
 
 from ingine import ext, model
 from ingine import weights as W
 
-CKPT = "/mnt/data/inkling/hf"
+CKPT = os.environ.get("INGINE_MODEL_DIR", str(Path(__file__).resolve().parents[2] / "models" / "Inkling-2-Mini"))
 H, I, E, TOPK = W.HIDDEN, W.INTER, W.EXPERTS, W.TOP_K
 PEAK = 1.79e12
 SETS = 16

@@ -21,8 +21,10 @@ greedy no-thinking answers to held-out harmless prompts, teacher-forced.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -33,7 +35,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import inkling_ref as ref  # noqa: E402
 
-MODEL_DIR = Path("/mnt/data/inkling/hf")
+MODEL_DIR = Path(os.environ.get("INGINE_MODEL_DIR", str(Path(__file__).resolve().parents[1] / "models" / "Inkling-2-Mini")))
 HF_DATASETS = Path.home() / ".cache/huggingface/hub"
 ANSWER_PREFIX = "<|message_model|><|content_text|>"
 END_TOKENS = ("<|end_message|>", "<|content_model_end_sampling|>")
@@ -77,7 +79,9 @@ def jbb_harmful() -> list[str]:
         return [row["Goal"] for row in csv.DictReader(f)]
 
 
-TEXT_SOURCES = [Path.home() / "Projects/cinference/README.md", *sorted((Path.home() / "Projects/cinference/docs").glob("*.md"))]
+_KL_TEXT = os.environ.get("INGINE_KL_TEXT") or os.pathsep.join((
+    str(Path.home() / "Projects/cinference/README.md"), str(Path.home() / "Projects/cinference/docs" / "*.md")))
+TEXT_SOURCES = [Path(p) for pat in _KL_TEXT.split(os.pathsep) for p in sorted(glob.glob(os.path.expanduser(pat)))]
 
 
 class Runner:

@@ -8,7 +8,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$HERE/.." && pwd)
 PY=$HERE/.venv/bin/python
 PORT=8017
-MODEL=${MODEL:-/mnt/data/inkling/hf}
+MODEL=${MODEL:-${INGINE_MODEL_DIR:-$ROOT/models/Inkling-2-Mini}}
 ABLATION=$(realpath "${ABLATION:?set ABLATION to the ablation file}")  # the server runs from engine/
 OUT=${OUT:-$ROOT/results}
 mkdir -p "$OUT"
