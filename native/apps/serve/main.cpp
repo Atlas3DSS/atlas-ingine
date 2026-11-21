@@ -1,0 +1,144 @@
+// ingine-serve: the OpenAI-compatible chat completions server (flags and defaults of `python -m ingine.server`).
+#include "engine/fake_generator.h"
+#include "engine/log.h"
+#include "ingine/generator.h"
+#include "serve/chat_server.h"
+#include "serve/cli.h"
+#include "text/chat.h"
+
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <csignal>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <thread>
+
+namespace {
+
+int g_stop_pipe[2] = {-1, -1};
+
+void handle_signal(int) {
+  const char c = 's';
+  (void)!::write(g_stop_pipe[1], &c, 1);
+}
+
+// tokenizer_config.json "model_max_length" (the Python server's fallback context limit), else 1 << 20.
+int tokenizer_max_length(const std::filesystem::path& model_dir) {
+  std::ifstream in(model_dir / "tokenizer_config.json");
+  if (!in) return 1 << 20;
+  try {
+    const auto cfg = nlohmann::json::parse(in);
+    if (auto it = cfg.find("model_max_length"); it != cfg.end() && it->is_number()) {
+      return int(std::min<double>(it->get<double>(), 2147483647.0));
+    }
+  } catch (const nlohmann::json::exception&) {
+  }
+  return 1 << 20;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
+  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0;
+  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false;
+  double spec_threshold = 0.8, fake_delay = 0.02;
+
+  ingine::serve::ArgParser ap("ingine-serve", "OpenAI-compatible chat completions server for ingine.");
+  ap.option("--model-dir", "", "checkpoint dir (tokenizer + chat template)", &model_dir, {}, true);
+  ap.option("--host", "", "", &host);
+  ap.option("--port", "", "", &port);
+  ap.flag("--engine", "serve the model with ingine", &engine);
+  ap.flag("--fake", "serve canned outputs (FakeGenerator)", &fake);
+  ap.exclusive({"--engine", "--fake"}, true);
+  ap.option("--ablation", "", "ablation file (safetensors) applied at every visit", &ablation);
+  ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
+  ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
+  ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
+  ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
+  ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
+          &kv_fp8);
+  ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
+            &spec_threshold);
+  ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
+  ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
+  ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
+  ap.option("--max-model-len", "",
+            "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
+  ap.option("--log-level", "", "", &log_level);
+  ap.parse(argc, argv);
+
+  auto& log = ingine::engine::server_log();
+  if (!ingine::engine::set_log_level(log_level)) {
+    std::cerr << "ingine-serve: error: unknown level: '" << log_level << "'\n";
+    return 2;
+  }
+  std::signal(SIGPIPE, SIG_IGN);
+
+  try {
+    const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
+    std::unique_ptr<ingine::model::Generator> generator;
+    if (fake) {
+      generator = std::make_unique<ingine::engine::FakeGenerator>(
+          fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir), ingine::engine::FakeGenerator::Responder{},
+          fake_delay);
+    } else {
+#ifdef INGINE_WITH_MODEL
+      ingine::model::RuntimeOptions options;
+      options.model_dir = model_dir;
+      options.ablation = ablation;
+      options.max_ctx = max_ctx;
+      options.dense_fp8 = dense_fp8;
+      options.kv_fp8 = kv_fp8;
+      options.spec = spec;
+      options.spec_threshold = float(spec_threshold);
+      generator = ingine::model::make_generator(options);
+#else
+      log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
+      return 1;
+#endif
+    }
+
+    ingine::serve::ServerOptions server_options;
+    server_options.max_queue = max_queue;
+    server_options.max_model_len = max_model_len;
+    server_options.model_id = model_id;
+    ingine::serve::ChatServer server(*generator, fmt, server_options);
+    if (!server.bind(host, port)) {
+      log.critical("cannot bind {}:{}", host, port);
+      return 1;
+    }
+
+    if (::pipe(g_stop_pipe) != 0) throw std::runtime_error("pipe() failed");
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
+    log.info("serving {} on http://{}:{}/v1", server.model_id(), host, server.port());
+    bool listened = true;
+    std::thread listener([&] {
+      listened = server.listen();
+      handle_signal(0);  // the accept loop ended on its own: wake the main thread
+    });
+    char c;
+    while (::read(g_stop_pipe[0], &c, 1) < 0 && errno == EINTR) {
+    }
+    server.stop();
+    listener.join();
+    if (!listened) {
+      log.critical("listen failed on {}:{}", host, server.port());
+      return 1;
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    log.critical("{}", e.what());
+    return 1;
+  }
+}

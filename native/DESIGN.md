@@ -1,0 +1,202 @@
+# ingine (C++): design and work plan
+
+ingine becomes a single C++20/CUDA program: `ingine-serve` loads Inkling-2-Mini (+ the ablation file) and serves
+the OpenAI-compatible API with no Python or PyTorch at run time. It reproduces the Python engine in
+`engine/ingine/` exactly (same model math, same decode kernels, same CLI flags and HTTP behaviour), then gets
+faster (decode kernel fusion, a native prefill). Hardware: RTX 5090 class only (`sm_120a`), CUDA 13.4, 32 GB.
+
+## Reference semantics (the spec)
+
+The Python engine stays in the repository, unchanged, as the reference until the C++ engine replaces it:
+
+| Python | What it defines |
+|---|---|
+| `engine/ingine/weights.py` | checkpoint names, constants, visit plan (48 visits: layers 0-5, 6-17 three times, 18-23), expert formats (NVFP4 layers 0-19, MXFP8 20-23) |
+| `engine/ingine/model.py` | the model math: `State` (caches), `Model.prefill` (chunked prompt processing), `Model.decode` (reference decode), ablation, taps |
+| `engine/ingine/fast.py` | the fused decode step: kernel sequence per visit, `Buffers` per call width, projection layout, FP8 dense conversion |
+| `engine/csrc/**`, `engine/SPEC.md` | the decode kernels and their contracts (ported as is) |
+| `engine/ingine/dspark.py` | the DSpark drafter (draft/commit, context buckets, top-1024 Markov candidates) |
+| `engine/ingine/engine.py` | prefix reuse, decode graphs per width (1, 2, 4, 8), speculative loop (draft, adaptive verify width, accept, rollback, commit), sampling |
+| `engine/ingine/chat.py` | chat rendering (the model's `chat_template.jinja`), reasoning/tool output parsing (`StreamParser`), effort levels |
+| `engine/ingine/server.py` | HTTP API: `/health`, `/v1/models`, `/v1/chat/completions` (streaming, `reasoning_content`, tools), FIFO scheduler |
+| `runtime-manifest.json` | serving profile: 262,144 tokens, `--dense-fp8 --kv-fp8 --spec --spec-threshold 0.8`, 127.0.0.1:8003 |
+
+Golden data from the Python engine lives in `native/tests/golden/` (see Testing).
+
+## Base: fngine
+
+Infrastructure comes from the user's fngine (`~/Projects/fngine`, Apache-2.0, itself derived from Cinference):
+build skeleton, vendored third-party libraries, core utilities, HTTP/OpenAI serving, the tokenizer/Jinja text stack
+and the sampling kernels. Copy what fits, rename the namespace `fngine` -> `ingine`, and put this header on every
+copied or adapted file (first line, after any existing license line):
+
+    // Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
+
+Do not copy Qwen-specific code (GDN/QSA/PLE/MTP kernels, `model_dims.h`, CPU expert tier, n-gram store, pack
+format, adaptive experts, placement, prefill stream). New files get no header beyond normal comments.
+
+## Layout and targets
+
+```
+native/
+  CMakeLists.txt, CMakePresets.json, cmake/          build (from fngine: arch gate 120a, no separable compilation,
+                                                     vendored deps, one target per component)
+  third_party/                                       nlohmann json, cpp-httplib, spdlog(+fmt), utf8proc, llama-jinja
+  include/ingine/                                    public API used by apps (engine.h, types.h)
+  src/core/        -> ingine_core                    device, arena, host memory, Tensor/DType, decode graphs, PDL,
+                                                     logging glue, safetensors reader (mmap)
+  src/text/        -> ingine_text                    tokenizer, Jinja adapter, ChatFormat, StreamParser (CUDA-free)
+  src/kernels/<a>/ -> ingine_kernels_<a>             dense, moe, attn, head (ported decode kernels + sampling),
+                                                     prefill (new), draft (new); aggregated by ingine_kernels
+  src/model/       -> ingine_model                   weights, state, decode step + graphs, prefill driver,
+                                                     drafter, speculative loop, Generator implementation
+  src/engine/      -> ingine_engine                  request scheduler (1 active + bounded FIFO), cancellation
+  src/serve/       -> ingine_serve                   HTTP server, OpenAI chat request/response, SSE
+  apps/serve/      -> ingine-serve                   the server binary
+  apps/bench/      -> ingine-bench                   decode/prefill/spec benchmarks (like engine/bench/bench_e2e.py)
+  apps/validate/   -> ingine-validate                parity against the golden data
+  tests/                                             CTest: text goldens (CPU), kernel tests, model parity (GPU)
+```
+
+Build: `cmake --preset release && cmake --build build -j` (presets as in fngine; `dev` adds tests). The private
+CUDA toolkit from the installer (`.cuda-toolkit/`) or `/opt/cuda` provides nvcc 13.4; GCC 16 works as host
+compiler on the dev machine.
+
+## Interfaces (contracts between work packages)
+
+### Text (`src/text`, namespace `ingine::text`), mirror of `chat.py`
+
+```cpp
+class Tokenizer {               // tokenizer.json: byte-level BPE, o200k-style split regex (see below), no
+ public:                        // normalizer, ignore_merges=true, 60 added tokens
+  static Tokenizer load(const std::filesystem::path& model_dir);
+  std::vector<int32_t> encode(std::string_view text, bool special) const;   // special: recognise added tokens
+  std::string decode(std::span<const int32_t> ids) const;                    // raw UTF-8 (may be partial)
+  std::string token_bytes(int32_t id) const;
+  std::optional<int32_t> token_id(std::string_view added_token) const;
+};
+struct ChatError : std::runtime_error { std::string param; };              // -> HTTP 400 with "param"
+struct ChatOptions {                       // reasoning_effort: "none".."max" or a number in [0, 0.99]
+  std::optional<std::variant<std::string, double>> reasoning_effort;
+  std::optional<bool> enable_thinking;
+};
+struct RenderedPrompt { std::vector<int32_t> ids; std::string text; std::vector<int32_t> prefill_ids; };
+struct ToolCallDelta { int index; std::optional<std::string> id, name; std::string arguments; };
+struct Delta { std::string reasoning_content, content; std::optional<ToolCallDelta> tool_call; };
+struct ToolCall { std::string id, name, arguments; };
+struct Completion { std::string reasoning_content, content; std::vector<ToolCall> tool_calls;
+                    std::optional<std::string> finish_reason; };
+class StreamParser {                       // chat.StreamParser: feed sampled tokens, get deltas
+ public:
+  std::vector<Delta> feed(int32_t token);
+  std::vector<Delta> finish();             // end of generation (length/cancel)
+  bool finished() const;                   // end of turn, stop string, or end-of-sampling token seen
+  Completion result() const;
+};
+class ChatFormat {
+ public:
+  static ChatFormat load(const std::filesystem::path& model_dir);   // tokenizer + chat_template.jinja
+  RenderedPrompt render(const nlohmann::ordered_json& messages, const nlohmann::ordered_json* tools,
+                        const ChatOptions& options) const;          // chat.normalize_messages + template
+  StreamParser parser(std::span<const int32_t> prefill_ids, std::vector<std::string> stop = {}) const;
+  std::vector<int32_t> stop_ids() const;                            // end-of-turn ids the generator stops at
+  const Tokenizer& tokenizer() const;
+};
+```
+
+The split regex (tokenizer.json `pre_tokenizer`) is
+`[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+`;
+implement it as a hand-written matcher with utf8proc categories (fngine's `qwen_word_end` approach).
+
+### Generator (`src/model`, namespace `ingine::model`), mirror of `engine.Engine.generate`
+
+```cpp
+struct Sampling { float temperature = 1.0f; float top_p = 1.0f; int top_k = 0; std::optional<uint64_t> seed; };
+struct GenerateStats { int prompt_tokens = 0, reused_tokens = 0, generated_tokens = 0;
+                       double prefill_seconds = 0, decode_seconds = 0; int spec_rounds = 0, spec_accepted = 0; };
+struct RuntimeOptions {
+  std::filesystem::path model_dir, ablation;      // empty ablation: original model
+  int max_ctx = 65536; int prefill_chunk = 2048;
+  bool dense_fp8 = true, kv_fp8 = false, spec = false; float spec_threshold = 0.8f;
+};
+class Generator {
+ public:
+  virtual ~Generator() = default;
+  virtual std::string model_id() const = 0;       // "inkling-2-mini-abliterated" with an ablation, else "inkling-2-mini"
+  virtual int max_model_len() const = 0;          // = max_ctx
+  // One request at a time. Emits sampled tokens in order through on_tokens (a speculative round emits several);
+  // stops after a token in stop_ids, after max_new_tokens, or when on_tokens returns false (cancel).
+  // Throws std::invalid_argument when the prompt does not fit max_ctx (reserve as engine.py does).
+  virtual GenerateStats generate(std::span<const int32_t> prompt, int max_new_tokens, const Sampling& sampling,
+                                 std::span<const int32_t> stop_ids,
+                                 const std::function<bool(std::span<const int32_t>)>& on_tokens) = 0;
+};
+std::unique_ptr<Generator> make_generator(const RuntimeOptions& options);   // the model
+```
+
+### Model data (`src/model/model_data.h`, owned by ModelCore, written first)
+
+C++ mirrors of `weights.Weights`/`Layer`/`Experts`, `model.State` and `fast.Buffers`, using `ingine::Tensor`
+(fngine's non-owning view: data, DType incl. FP8_E4M3FN, ne/nb) over device memory. Field names follow the
+Python names (`t["wq"]` -> `layer.wq`, `state.k_ring`, `buffers.taps`, ...), shapes and dtypes identical, plus
+the visit plan and constants of `weights.py`. The prefill and speculative packages code against this header.
+
+### Prefill (`src/model/prefill.{h,cpp}`, owned by Prefill)
+
+```cpp
+// Processes prompt tokens [T] (device int32) at positions pos0..pos0+T-1 on top of `state` (exactly
+// model.Model.prefill for one chunk): writes caches/conv state, returns the last token's logits (device fp32 [V],
+// softcapped like the head) and, if taps != nullptr, every row's DSpark taps (bf16 [T, 4, H], model.TAP_VISITS
+// + final normed hidden).
+class Prefiller {
+ public:
+  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream);
+  void run(State& state, const int32_t* tokens, int T, int pos0, float* logits, Tensor* taps);
+};
+```
+
+### Speculative decoding (`src/model/drafter.*`, `src/model/spec.*`, owned by Spec)
+
+`Drafter` mirrors `dspark.Drafter` (`draft(anchor, P, temperature) -> tokens[7], logits[7, V]`,
+`commit(feats [n,4,H], start)`, graphs per context bucket and per commit count). `generate_spec(...)` mirrors
+`engine.Engine._generate_spec` and is called by the Generator when `options.spec`. It uses ModelCore's decode
+graphs for widths 2, 4 and 8 (history + taps on) and ModelCore's state accessors for rollback.
+
+## Work packages and ownership
+
+| Package | Owns (only edits these) |
+|---|---|
+| Skeleton | `native/CMakeLists.txt`, `CMakePresets.json`, `cmake/**`, `third_party/**`, `src/core/**`, `tests/CMakeLists.txt` (+ top-level test helpers) |
+| Server | `include/ingine/**`, `src/engine/**`, `src/serve/**`, `apps/serve/**`, `apps/bench/**`, `tests/serve/**` |
+| Text | `src/text/**`, `tests/text/**`, `tools/goldens_text.py`, `tests/golden/text/**` |
+| ModelCore | `src/kernels/{common,dense,moe,attn,head}/**`, `src/model/**` except prefill.* drafter.* spec.*, `apps/validate/**`, `tests/model/**`, `tests/kernels/**`, `tools/goldens_model.py` |
+| Prefill | `src/kernels/prefill/**`, `src/model/prefill.{h,cpp}`, `tests/prefill/**` |
+| Spec | `src/kernels/draft/**`, `src/model/{drafter,spec}.{h,cpp}`, `tests/spec/**` |
+
+ModelCore writes `src/model/model_data.h` (weights, state, buffers) and `src/model/runtime.h` (the model runtime
+the Generator, Prefiller and speculative loop share: stream, weights, state, decode graphs per width with history
+and taps, state accessors for rollback) before anything else and tells Prefill and Spec when they exist.
+Third-party CMake targets come from Skeleton: `nlohmann_json::nlohmann_json`, `httplib::httplib`,
+`spdlog::spdlog`, `ingine_utf8proc`, `ingine_jinja`, `CUDA::cudart`, `CUDA::cublasLt`.
+
+A package needing a change in someone else's file asks that agent (or the orchestrator) instead of editing it.
+Each component's `CMakeLists.txt` lives in its directory and defines its target; Skeleton's top level adds every
+subdirectory (`if(EXISTS ...)`, so the tree builds while packages are in progress).
+
+## Conventions
+
+- C++20, CUDA 20, fngine style (2-space or 4-space as in the copied file; keep a file's existing style), no
+  exceptions through CUDA callbacks, `cudaLaunchKernelEx` + PDL as in `pdl.cuh`, one stream per Generator.
+- Kernels keep their numerics exactly (port, don't rewrite): every rounding point in SPEC.md stays.
+- Build in your own tree to avoid clashes: `cmake --preset dev -B native/build-<package>` then
+  `cmake --build native/build-<package> --target <yours> -j8`. CPU tests freely; GPU tests only if they need
+  < 2 GB of GPU memory (another server may be using the card). Never load the full model; the orchestrator runs
+  model-level tests.
+- No placeholders/TODO stubs in delivered code; say what is missing in the report instead.
+
+## Testing
+
+- `tests/golden/` (from the Python engine): `tools/goldens_text.py` writes tokenizer encodes, chat renders and
+  StreamParser delta sequences; `tools/goldens_model.py` writes model logits (prefill last-token top-k + decode steps).
+- Text: exact equality with goldens (CPU). Kernels: ported FP64-oracle tests where feasible (CPU oracle).
+  Model: KL and top-1 against golden logits; greedy speculation reproduces plain greedy decoding.
