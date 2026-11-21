@@ -6,8 +6,8 @@
    "want": 36,
    "got": 36,
    "ok": true,
-   "tokens": 113,
-   "seconds": 4.332940624008188
+   "tokens": 118,
+   "seconds": 0.39832052699057385
   },
   {
    "q": "A train travels 240 km in 3 hours, then 150 km in 2 hours. What is its average speed in km/h over the whole trip?",
@@ -15,15 +15,15 @@
    "got": 78,
    "ok": true,
    "tokens": 178,
-   "seconds": 2.60852825899201
+   "seconds": 0.622322940005688
   },
   {
    "q": "Maria has 5 times as many marbles as Leo. Together they have 84 marbles. How many marbles does Maria have?",
    "want": 70,
    "got": 70,
    "ok": true,
-   "tokens": 162,
-   "seconds": 0.8369274149881676
+   "tokens": 166,
+   "seconds": 0.5661310970026534
   },
   {
    "q": "A rectangle has a perimeter of 54 cm and its length is twice its width. What is its area in square cm?",
@@ -31,7 +31,7 @@
    "got": 162,
    "ok": true,
    "tokens": 171,
-   "seconds": 0.8953922049986431
+   "seconds": 0.578452905989252
   },
   {
    "q": "What is the sum of all integers from 1 to 200 that are divisible by 7?",
@@ -39,31 +39,31 @@
    "got": 2842,
    "ok": true,
    "tokens": 242,
-   "seconds": 1.1447948179993546
+   "seconds": 0.7798599720117636
   },
   {
    "q": "A tank fills at 12 litres per minute and drains at 5 litres per minute. Starting empty, how many minutes until it holds 147 litres?",
    "want": 21,
    "got": 21,
    "ok": true,
-   "tokens": 134,
-   "seconds": 0.758771483990131
+   "tokens": 141,
+   "seconds": 0.4687517209968064
   },
   {
    "q": "Three consecutive even numbers sum to 138. What is the largest of them?",
    "want": 48,
    "got": 48,
    "ok": true,
-   "tokens": 212,
-   "seconds": 1.0222895560000325
+   "tokens": 220,
+   "seconds": 0.7207053820020519
   },
   {
    "q": "A jacket costs $80. It is discounted by 25%, then the discounted price is raised by 10%. What is the final price in dollars?",
    "want": 66,
    "got": 66,
    "ok": true,
-   "tokens": 160,
-   "seconds": 0.8212012750009308
+   "tokens": 161,
+   "seconds": 0.5434220150054898
   },
   {
    "q": "How many minutes are there between 9:47 and 13:12 on the same day?",
@@ -71,7 +71,7 @@
    "got": 205,
    "ok": true,
    "tokens": 246,
-   "seconds": 1.1594570759916678
+   "seconds": 0.8191306880034972
   },
   {
    "q": "If 6 workers build a wall in 10 days, how many days would 15 workers take at the same rate?",
@@ -79,7 +79,7 @@
    "got": 4,
    "ok": true,
    "tokens": 128,
-   "seconds": 0.699718297997606
+   "seconds": 0.45686903499881737
   },
   {
    "q": "A number is multiplied by 7, then 15 is subtracted, giving 104. What is the number?",
@@ -87,55 +87,55 @@
    "got": 17,
    "ok": true,
    "tokens": 152,
-   "seconds": 0.7780277589918114
+   "seconds": 0.5148211590130813
   },
   {
    "q": "What is the remainder when 2 to the power 20 is divided by 7?",
    "want": 4,
    "got": 4,
    "ok": true,
-   "tokens": 204,
-   "seconds": 0.9743579950009007
+   "tokens": 193,
+   "seconds": 0.6394911700044759
   },
   {
    "q": "A recipe needs 3 eggs per 8 pancakes. How many eggs are needed for 56 pancakes?",
    "want": 21,
    "got": 21,
    "ok": true,
-   "tokens": 134,
-   "seconds": 0.7199681070051156
+   "tokens": 140,
+   "seconds": 0.46537707999232225
   },
   {
    "q": "The ages of a father and son sum to 64. In 4 years the father will be three times as old as the son. How old is the son now?",
    "want": 14,
    "got": 14,
    "ok": true,
-   "tokens": 233,
-   "seconds": 1.0942960209940793
+   "tokens": 236,
+   "seconds": 0.7602397979935631
   },
   {
    "q": "How many positive divisors does 360 have?",
    "want": 24,
    "got": 24,
    "ok": true,
-   "tokens": 206,
-   "seconds": 0.9702859060053015
+   "tokens": 207,
+   "seconds": 0.6788760519993957
   },
   {
    "q": "A car uses 6.5 litres of fuel per 100 km. How many litres does it use for 840 km? Give the answer times 10 as an integer.",
    "want": 546,
    "got": 546,
    "ok": true,
-   "tokens": 193,
-   "seconds": 0.9395977289968869
+   "tokens": 181,
+   "seconds": 0.5889168819994666
   },
   {
    "q": "What is the least common multiple of 18, 24 and 30?",
    "want": 360,
    "got": 360,
    "ok": true,
-   "tokens": 195,
-   "seconds": 0.9325614440022036
+   "tokens": 199,
+   "seconds": 0.6613191120268311
   },
   {
    "q": "A bag has 4 red, 6 blue and 10 green balls. How many balls must be added, all red, so that red makes up half the bag?",
@@ -143,7 +143,7 @@
    "got": 12,
    "ok": true,
    "tokens": 233,
-   "seconds": 1.0944699120009318
+   "seconds": 0.7674644070211798
   },
   {
    "q": "Compute 1234 * 56 - 7890.",
@@ -151,15 +151,15 @@
    "got": 61214,
    "ok": true,
    "tokens": 174,
-   "seconds": 0.8482514730130788
+   "seconds": 0.5740140550187789
   },
   {
    "q": "A clock shows 3:00. What is the smaller angle, in degrees, between the hour and minute hands at 3:30?",
    "want": 75,
    "got": 75,
    "ok": true,
-   "tokens": 216,
-   "seconds": 1.0275420840043807
+   "tokens": 234,
+   "seconds": 0.7579521650040988
   }
  ],
  "code": [
@@ -167,73 +167,73 @@
    "sig": "is_palindrome(s)",
    "ok": true,
    "error": "",
-   "seconds": 0.4155962489894591
+   "seconds": 0.18862183697638102
   },
   {
    "sig": "fib(n)",
    "ok": true,
    "error": "",
-   "seconds": 0.4107983829890145
+   "seconds": 0.1820102610217873
   },
   {
    "sig": "merge_sorted(a, b)",
    "ok": true,
    "error": "",
-   "seconds": 0.7272751529962989
+   "seconds": 0.4432249369856436
   },
   {
    "sig": "word_freq(text)",
    "ok": true,
    "error": "",
-   "seconds": 0.47759888200380374
+   "seconds": 0.23805595000158064
   },
   {
    "sig": "flatten(xs)",
    "ok": true,
    "error": "",
-   "seconds": 0.46513543400214985
+   "seconds": 0.23569543499615975
   },
   {
    "sig": "primes_below(n)",
    "ok": true,
    "error": "",
-   "seconds": 0.7412127749994397
+   "seconds": 0.44910815998446196
   },
   {
    "sig": "rle(s)",
    "ok": true,
    "error": "",
-   "seconds": 0.7283352179947542
+   "seconds": 0.44091921401559375
   },
   {
    "sig": "balanced(s)",
    "ok": true,
    "error": "",
-   "seconds": 0.6744609460001811
+   "seconds": 0.40873534901766106
   },
   {
    "sig": "two_sum(nums, target)",
    "ok": true,
    "error": "",
-   "seconds": 0.513054267008556
+   "seconds": 0.2631552940001711
   },
   {
    "sig": "roman(n)",
    "ok": true,
    "error": "",
-   "seconds": 0.9583213980076835
+   "seconds": 0.7181173489952926
   },
   {
    "sig": "matrix_mult(a, b)",
    "ok": true,
    "error": "",
-   "seconds": 1.0180819329980295
+   "seconds": 0.703924803994596
   },
   {
    "sig": "anagrams(words)",
    "ok": true,
    "error": "",
-   "seconds": 0.5851437189994613
+   "seconds": 0.32756814899039455
   }
  ],
  "mcq": [
@@ -256,7 +256,7 @@
    "want": "D",
    "got": "D",
    "ok": true,
-   "text": "DD"
+   "text": "D"
   },
   {
    "q": "In TCP, what does the three-way handshake begin with?",
@@ -291,7 +291,7 @@
    "want": "B",
    "got": "B",
    "ok": true,
-   "text": "B"
+   "text": "BB"
   },
   {
    "q": "Which organelle produces most of a cell's ATP?",
@@ -326,6 +326,6 @@
   "math": "20/20",
   "code": "12/12",
   "mcq": "12/12",
-  "math_tokens_mean": 184.3
+  "math_tokens_mean": 186.0
  }
 }

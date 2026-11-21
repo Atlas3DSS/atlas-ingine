@@ -98,7 +98,7 @@ Settings come from the profile in [runtime-manifest.json](runtime-manifest.json)
 | `INGINE_ABLATION` | `$INGINE_MODEL_DIR/inkling-2-mini-abliterated.safetensors` | abliteration file; a relative path is taken relative to the install folder; empty serves the original model (model id `inkling-2-mini`) |
 | `INGINE_CTX` | 262144 | context length; lower it to leave GPU memory to other programs |
 | `HOST`, `PORT` | 127.0.0.1, 8003 | bind address and port |
-| `INGINE_EXTRA_ARGS` | empty | further server arguments, e.g. `--spec-threshold 0.9` |
+| `INGINE_EXTRA_ARGS` | empty | further server arguments, e.g. `--top-p 0.95` (sampling for requests that set none, also `--temperature`, `--top-k`), `--park-mb 0` (see below), `--spec-threshold 0.9` |
 | `INGINE_START_TIMEOUT` | 300 | seconds `ingine start` waits for the server to report ready |
 
 ```bash
@@ -115,8 +115,11 @@ INGINE_CTX=131072
 Use the OpenAI-compatible API at **`http://127.0.0.1:8003/v1`**, model **`inkling-2-mini-abliterated`**
 (`inkling-2-mini` when serving without the ablation). No API key is required, and **there is no
 authentication**: keep the server on loopback. Requests run one at a time; up to 4 more wait in a queue and
-further ones get HTTP 503, so set agent frameworks to one concurrent request. `GET /health` and `GET /v1/models`
-report the state.
+further ones get HTTP 503. `GET /health` and `GET /v1/models` report the state.
+
+A follow-up request only reads what is new in its conversation. Conversations that take turns (subagents, a
+second client) are kept warm in spare GPU memory, by default up to 3 GB and never the last 4 GB that are free
+after start-up (`--park-mb N` changes the budget, `0` turns it off); they are dropped when memory runs short.
 
 `POST /v1/chat/completions` takes:
 
@@ -124,7 +127,8 @@ report the state.
   0, 0.1, 0.2, 0.7, 0.9, 0.99, 0.99) or a number from 0 to 0.99; the template's default is 0.9.
 * `enable_thinking: false` to answer without reasoning (also accepted in `chat_template_kwargs`).
 * `tools` (function calling through the model's chat template), `stop`, `max_tokens` / `max_completion_tokens`,
-  `temperature` (default 1; 0 is greedy), `top_p`, `top_k`, `seed`.
+  `temperature`, `top_p`, `top_k`, `seed`. Requests that omit the sampling fields use the model's defaults
+  (temperature 1, no cutoff; 0 is greedy) or the server's `--temperature` / `--top-p` / `--top-k`.
 * `stream: true` for server-sent events; reasoning arrives as `reasoning_content` deltas before the answer's
   `content` (non-streaming responses carry `message.reasoning_content`). `stream_options.include_usage` adds usage.
 
@@ -216,11 +220,24 @@ Through ingine (32 borderline prompts and a small capability set, greedy):
 
 | | original | abliterated |
 |---|---|---|
-| refusals, answering directly | 15/32 | 0/32 |
-| refusals, reasoning first | 10/32 | 0/32 |
+| refusals, answering directly | 15/32 | 1/32 (the reply notes it cannot produce images, then writes the scene) |
+| refusals, reasoning first | 8/32 | 0/32 |
 | math (20, reasoning, effort low) | 20/20 | 20/20 |
 | code (12, tests executed) | 12/12 | 12/12 |
 | multiple choice (12) | 12/12 | 12/12 |
+
+Reasoning stability with the default profile, sampled at temperature 1 (GSM8K: 40 problems at two reasoning
+efforts; AIME 2024: 15 problems, effort high, up to 32,768 tokens):
+
+| | original | abliterated |
+|---|---|---|
+| GSM8K, effort low: correct | 40/40 | 39/40 |
+| GSM8K, effort high: correct | 40/40 | 40/40 |
+| AIME 2024: correct | 13/15 | 13/15 |
+| AIME 2024: ran out of tokens | 2/15 | 2/15 |
+| reasoning that loops (95 samples) | 0 | 0 |
+
+Repeating a request with the same seed returned the same text in 6 of 6 cases for each model.
 
 Lighter ablations from the same search, for comparison ([`results/`](results)):
 
@@ -232,37 +249,53 @@ Lighter ablations from the same search, for comparison ([`results/`](results)):
 
 ### Speed (RTX 5090, one request)
 
-Default profile, 1024 generated tokens after a short chat prompt, median of 3 runs, tokens per second ("chat"
-explains hash-map collisions with a snippet, "code" writes an LRU-cache module with tests):
+Default profile, tokens per second while generating. "chat" explains hash-map collisions and "code" writes an
+LRU-cache module with tests (short prompts, up to 1024 tokens, median of 3 runs); "agent" replays 24 recorded
+coding-agent requests (2K-39K-token prompts with tools; reasoning, prose and tool calls):
 
-| | chat | code |
-|---|---|---|
-| decode, greedy | 262 | 254 |
-| decode + DSpark, greedy | 289 | 365 |
-| decode, temperature 1 | 257 | 254 |
-| decode + DSpark, temperature 1 | 307 | 382 |
+| | chat | code | agent |
+|---|---:|---:|---:|
+| plain decoding, greedy | 306 | 301 | |
+| DSpark, greedy | 486 | 568 | 524 |
+| plain decoding, temperature 1 | 301 | 301 | 279 |
+| DSpark, temperature 1 (the default) | 489 | 565 | 502 |
 
-Speculative decoding (DSpark) helps most on predictable text such as code; on loosely predictable prose it can be
-~10% slower than plain decoding.
+DSpark (speculative decoding) is on by default. Its drafts are checked by the full model, so it returns what plain
+decoding returns (the same distribution when sampling). It helps most on predictable text: in the agent replay at
+temperature 1, tool calls run at 688, reasoning at 441 and prose at 444 tokens/s; outside English and code it is
+close to plain speed.
 
-Prefill: about 2,800-2,900 tokens/s for 5K-16K-token prompts, 2,600 tokens/s at 30K. A short prompt takes ~0.17 s
-to the first token. GPU memory: 25.4 GB after startup, up to 28.1 GB while reading a 255K-token prompt.
+A new prompt is read at 10,900 tokens/s (20K tokens), 9,600 (64K), 8,100 (131K) and 7,000 (200K); a short prompt
+takes 0.09 s to the first token. GPU memory: 24.4 GB after start-up, unchanged while reading a 254K-token prompt;
+conversations kept warm add up to 3 GB.
+
+### Agent loops
+
+Twelve recorded Oh My Pi sessions (230 requests, prompts of 2K-89K tokens, 6.9M prompt tokens in total), replayed
+in their order, greedy, at most 400 tokens per answer:
+
+| | previous release | now |
+|---|---:|---:|
+| time to first token, all requests | 788 s | 50 s |
+| decoding | 82 s (448 tokens/s) | 66 s (563 tokens/s) |
+| requests that reuse their conversation | 17 / 230 | 214 / 230 |
+
+Two of these sessions taking turns, as an agent and its subagent do (67 requests): 8.5 s to first token in total,
+113 s with `--park-mb 0`.
 
 ### Long context
 
 The default profile serves **262,144 tokens** of context (the checkpoint supports 1M); the long-range attention
-cache is stored in 8 bits so that it fits beside the model in 32 GB. Measured with a code haystack prompt,
-DSpark on:
+cache is stored in 8 bits so that it fits beside the model in 32 GB. A code haystack with a passphrase hidden in
+the middle, DSpark on:
 
-| | 134,289-token prompt | 254,774-token prompt |
+| | 131,443-token prompt | 254,019-token prompt |
 |---|---:|---:|
-| prefill | 86 s (1,555 tokens/s) | 241 s (1,056 tokens/s) |
-| decode afterwards | 149 tokens/s | 156 tokens/s |
-| peak GPU memory | 27.1 GB | 28.1 GB |
+| reading the prompt | 16.4 s (8,000 tokens/s) | 40.9 s (6,200 tokens/s) |
+| decoding afterwards | 354 tokens/s | 258 tokens/s |
+| GPU memory | 24.4 GB | 24.4 GB |
 
-A passphrase hidden in the haystack was found at 134K, 200K and 250K tokens; at 255K, with it in the middle, the
-model was still searching in its reasoning after 400 tokens. A follow-up turn only prefills the new part of the
-conversation.
+The passphrase was found in both.
 
 ## License and credits
 
