@@ -161,8 +161,12 @@ runtime's decode graphs for widths 2, 4 and 8 (history + taps on): the verify wi
 from the draft's confidences (a CUDA graph with a switch node over the widths: backup, decode), a second
 switch graph accepts and rolls back, and a third (`Drafter::advance`, per context bucket) commits the
 accepted rows and drafts for the next anchor from device values, so a round and the next draft are launched
-back to back and the host synchronises once per round, after the acceptance. The drafter keeps checkpoints
-of its context for prompt-prefix reuse (`save_checkpoint`/`restore_checkpoint`).
+back to back and the host synchronises once per round, after the acceptance. The drafter scores its base
+logits over a shortlist head (the 32,768 most frequent tokens, the specials and up to 16,384 tokens of the
+context, `note_tokens`), runs its block attention on tensor cores and keeps its global ring in E4M3: any
+draft distribution is valid, because drafts are verified by the full model (greedy) or accepted with the
+probabilities they were drawn from. It keeps checkpoints of its context for prompt-prefix reuse
+(`save_checkpoint`/`restore_checkpoint`; `checkpoint_regions`/`adopt_checkpoint` for parked conversations).
 
 `src/model/runtime.h` is the model runtime the Generator, Prefiller and speculative loop share: stream, weights,
 state, decode graphs per width with history and taps, the state accessors for rollback, and pipelined width-1
@@ -173,11 +177,14 @@ full-attention caches are position-addressed).
 
 Prefix reuse (Generator): a prompt that extends the tokens in the state (previous prompt + processed generated
 tokens) prefills only its suffix; otherwise, if the prompt of the last prefill is a prefix of it, the checkpoint
-taken right after that prefill (target state, drafter context, last logits; one device buffer, ~437 MB at
+taken right after that prefill (target state, drafter context, last logits; one device buffer, ~300 MB at
 max_ctx 262144) is restored and only the rest is prefilled. That is the agent-loop case: the next request
 re-renders the previous answer (canonical tool-call JSON, retokenised text), which differs from the generated
-tokens right after the previous prompt. Otherwise the state is reset. The server logs the path per request
-(`<id>: reuse=extend|checkpoint|none reused=N prefilled=M prefill=<seconds>`).
+tokens right after the previous prompt. A conversation displaced by another one is parked: its checkpoint and
+its full-attention rows [0, n) are copied aside on the device (about 18 KB per token + 220 MB, within
+`RuntimeOptions::park_mb`, least recently used evicted, all released when a device allocation fails) and
+restored when a later prompt starts with its prompt. Otherwise the state is reset. The server logs the path
+per request (`<id>: reuse=extend|checkpoint|parked|none reused=N prefilled=M prefill=<seconds>`).
 
 Third-party CMake targets: `nlohmann_json::nlohmann_json`, `httplib::httplib`, `spdlog::spdlog`, `ingine_utf8proc`,
 `ingine_jinja`, `CUDA::cudart`, `CUDA::cublasLt`.
