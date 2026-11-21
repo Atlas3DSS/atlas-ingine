@@ -76,7 +76,11 @@ if [[ -r "$CONFIG" ]]; then
 fi
 for name in "${!explicit[@]}"; do printf -v "$name" '%s' "${explicit[$name]}"; done
 
-PY="$ROOT/.venv/bin/python"
+# The venv by its physical path: torch writes the interpreter's include paths into the kernel build files, so the
+# same venv reached through a symlink (or by its target's name) would look like another environment and trigger a
+# full kernel rebuild at every switch.
+VENV="$(cd -- "$ROOT/.venv" 2>/dev/null && pwd -P || printf '%s' "$ROOT/.venv")"
+PY="$VENV/bin/python"
 [[ -x "$PY" ]] || PY="$(command -v python3 || true)"
 [[ -n "$PY" ]] || die "Python is missing. Run: bash $ROOT/setup.sh and choose 1 (install everything)."
 
@@ -183,8 +187,18 @@ recent_log() {  # last server log lines since epoch $1
 
 require_curl() { command -v curl >/dev/null 2>&1 || die "curl is required (install it with your package manager)."; }
 
+# torch holds an advisory lock on engine/build/<kernel>/lock while it compiles that kernel (the file itself stays)
+compiling_now() {
+  local f
+  for f in "$ROOT"/engine/build/*/lock; do
+    [[ -e "$f" ]] || continue
+    flock -n "$f" true 2>/dev/null || return 0
+  done
+  return 1
+}
+
 check_install() {
-  [[ -x "$ROOT/.venv/bin/python" ]] \
+  [[ -x "$VENV/bin/python" ]] \
     || die "ingine is not installed ($ROOT/.venv is missing). Run: bash $ROOT/setup.sh and choose 1 (install everything)."
   local missing=() name
   for name in "${REQUIRED[@]}"; do [[ -f "$INGINE_MODEL_DIR/$name" ]] || missing+=("$name"); done
@@ -198,14 +212,14 @@ or set INGINE_ABLATION= (empty) to serve the original model."
 # ---- commands -------------------------------------------------------------------------------------
 cmd_serve() {
   check_install
-  export PATH="$ROOT/.venv/bin${CUDA_HOME:+:$CUDA_HOME/bin}:$PATH"  # ninja and nvcc for the kernel build
+  export PATH="$VENV/bin${CUDA_HOME:+:$CUDA_HOME/bin}:$PATH"  # ninja and nvcc for the kernel build
   local args=(--engine --model-dir "$INGINE_MODEL_DIR" --host "$HOST" --port "$PORT" --max-ctx "$INGINE_CTX"
               "${FLAGS[@]}")
   if [[ -n "$INGINE_ABLATION" ]]; then args+=(--ablation "$INGINE_ABLATION" --model-id "$m_model_id"); fi
   local extra=()
   read -r -a extra <<< "$INGINE_EXTRA_ARGS"
   cd "$ROOT/engine"
-  exec "$ROOT/.venv/bin/python" -m ingine.server "${args[@]}" "${extra[@]}" "$@"
+  exec "$VENV/bin/python" -m ingine.server "${args[@]}" "${extra[@]}" "$@"
 }
 
 cmd_start() {
@@ -248,7 +262,7 @@ cmd_start() {
     say "Started process $! (no systemd user session; log: $RUN/ingine.log); loading the model..."
   fi
 
-  local start=$SECONDS next=0 elapsed
+  local start=$SECONDS next=0 elapsed building=0 compiling=0
   while :; do
     if body="$(http_get /health)"; then
       model="$(json_field model <<< "$body")"
@@ -261,8 +275,14 @@ cmd_start() {
       recent_log "$since" >&2
       die "The server failed to start; see: ingine logs"
     fi
+    # compiling the kernels does not count against the timeout
+    if compiling_now; then
+      (( building )) || say "Compiling ingine's CUDA kernels (once after an update or a new environment; a few minutes)..."
+      building=1
+      compiling=$((compiling + 2))
+    fi
     elapsed=$((SECONDS - start))
-    if (( elapsed >= INGINE_START_TIMEOUT )); then
+    if (( elapsed - compiling >= INGINE_START_TIMEOUT )); then
       say "Last log lines:" >&2
       recent_log "$since" >&2
       die "Not ready after $elapsed s; it keeps starting. Check: ingine status, ingine logs -f; stop: ingine stop"
