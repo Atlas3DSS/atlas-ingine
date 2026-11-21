@@ -3,3 +3,12 @@ __pycache__/
 tools/.venv/
 engine/build/
 results/serve-*.log
+# created by the installer (setup.sh / scripts/install.sh) and scripts/ingine; no trailing slash, so a symlinked
+# .venv or models also stays untracked
+/.tools
+/.venv
+/.cuda-toolkit
+/models
+/.run
+# tools/publish_hf.py staging (default)
+/work
