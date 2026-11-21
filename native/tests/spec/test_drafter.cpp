@@ -156,6 +156,55 @@ int main() {
     expect(graph_b == eager_b, "draft after a commit graph == draft after the eager commit");
     const DraftOut& eager = eager_a;
 
+    // advance (commit + draft from device values) == the host-driven commit + draft
+    {
+      const int widths[3] = {2, 4, 8}, m = 4, acc = 2, next = 99;
+      std::vector<__nv_bfloat16> taps(size_t(8) * 4 * H);
+      for (auto& x : taps) x = float_to_bf16(float(r.normal()));
+      DeviceArray<__nv_bfloat16> d_taps(taps);
+      DeviceArray<int32_t> d_m(std::vector<int32_t>{m}), d_acc(std::vector<int32_t>{acc}),
+          d_next(std::vector<int32_t>{next}), d_other(std::vector<int32_t>{5});
+      commit_a();
+      d.commit(d_taps.get(), acc + 1, rows);
+      const DraftOut host_path = fetch(d.draft(next, rows + acc + 1, 0.f), stream);
+      commit_a();
+      ingine::kernels::draft::RoundInputs in;
+      in.nwidths = 3;
+      for (int i = 0; i < 3; ++i) {
+        in.widths[i] = widths[i];
+        in.taps[i] = d_taps.get();  // one buffer of 8 rows serves every width here
+      }
+      in.m = d_m.get();
+      in.accepted = d_acc.get();
+      in.next_greedy = d_next.get();
+      in.next_sampled = d_other.get();
+      d.bind_round(in);
+      d.draft(anchor, rows, 0.f);  // the round's draft: the verify call is at its position
+      const DraftOut device_path = fetch(d.advance(rows), stream);
+      d.advanced(acc + 1);
+      expect(device_path == host_path, "advance == host-driven commit + draft");
+      expect(d.length() == rows + acc + 1, "length after advance");
+      commit_b();
+    }
+
+    // checkpoint at L = rows; later commits/drafts cross the 1024-slot local window (no wrap of the 4096-slot
+    // global ring), then wrap the global ring too; a restore must give the same draft as before
+    {
+      DeviceArray<uint8_t> ckpt(d.checkpoint_bytes());
+      commit_b();
+      const DraftOut ref = fetch(d.draft(anchor, rows, 0.f), stream);
+      d.save_checkpoint(ckpt.get());
+      for (const int extra : {1500, 5000}) {
+        for (int s = rows; s < rows + extra; s += rows) d.commit(fp, rows, s);
+        fetch(d.draft(anchor, rows + extra, 0.f), stream);
+        d.restore_checkpoint(ckpt.get());
+        char what[96];
+        std::snprintf(what, sizeof(what), "restored checkpoint (after %d more positions) == draft at the checkpoint",
+                      extra);
+        expect(d.length() == rows && fetch(d.draft(anchor, rows, 0.f), stream) == ref, what);
+      }
+    }
+
     d.set_seed(123);
     const DraftOut s1 = fetch(d.draft(anchor, rows, 0.8f), stream);
     d.set_seed(123);

@@ -177,7 +177,11 @@ void Scheduler::run(Job& job) {
     return more;
   };
   try {
-    generator_.generate(job.prompt_ids, job.max_new_tokens, job.sampling, stop_list_, on_tokens);
+    const model::GenerateStats st =
+        generator_.generate(job.prompt_ids, job.max_new_tokens, job.sampling, stop_list_, on_tokens);
+    // prefix reuse of the prompt: the path, the tokens reused and prefilled, the prefill time
+    server_log().info("{}: reuse={} reused={} prefilled={} prefill={:.3f}s", job.id, model::to_string(st.reuse),
+                      st.reused_tokens, st.prompt_tokens - st.reused_tokens, st.prefill_seconds);
   } catch (const std::exception& e) {  // report to the client instead of killing the worker
     server_log().error("generator failed: {}: {}", type_name(e), e.what());
     job.fail("generation failed: " + type_name(e) + ": " + e.what());

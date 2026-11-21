@@ -155,14 +155,32 @@ class Prefiller {
 ### Speculative decoding (`src/model/drafter.*`, `src/model/spec.*`)
 
 `Drafter` mirrors `dspark.Drafter` (`draft(anchor, P, temperature) -> tokens[7], logits[7, V]`,
-`commit(feats [n,4,H], start)`, graphs per context bucket and per commit count). `generate_spec(...)` mirrors
-`engine.Engine._generate_spec` and is called by the Generator when `options.spec`. It uses the runtime's decode
-graphs for widths 2, 4 and 8 (history + taps on) and the runtime's state accessors for rollback.
+`commit(feats [n,4,H], start)`, graphs per context bucket and one for small commits). `SpecLoop::generate(...)`
+mirrors `engine.Engine._generate_spec` and is called by the Generator when `options.spec`. It uses the
+runtime's decode graphs for widths 2, 4 and 8 (history + taps on): the verify width is chosen on the device
+from the draft's confidences (a CUDA graph with a switch node over the widths: backup, decode), a second
+switch graph accepts and rolls back, and a third (`Drafter::advance`, per context bucket) commits the
+accepted rows and drafts for the next anchor from device values, so a round and the next draft are launched
+back to back and the host synchronises once per round, after the acceptance. The drafter keeps checkpoints
+of its context for prompt-prefix reuse (`save_checkpoint`/`restore_checkpoint`).
 
 `src/model/runtime.h` is the model runtime the Generator, Prefiller and speculative loop share: stream, weights,
-state, decode graphs per width with history and taps, and the state accessors for rollback. Third-party CMake
-targets: `nlohmann_json::nlohmann_json`, `httplib::httplib`, `spdlog::spdlog`, `ingine_utf8proc`, `ingine_jinja`,
-`CUDA::cudart`, `CUDA::cublasLt`.
+state, decode graphs per width with history and taps, the state accessors for rollback, and pipelined width-1
+steps (`chain_*`: each step's input token is the previous step's sampled token on the device, so plain decoding
+launches step N+1 before the host reads token N; a step launched past a stop token or a cancel is undone) and
+prompt checkpoints (`save_checkpoint`/`restore_checkpoint`: the sliding rings, ring positions and conv states;
+full-attention caches are position-addressed).
+
+Prefix reuse (Generator): a prompt that extends the tokens in the state (previous prompt + processed generated
+tokens) prefills only its suffix; otherwise, if the prompt of the last prefill is a prefix of it, the checkpoint
+taken right after that prefill (target state, drafter context, last logits; one device buffer, ~437 MB at
+max_ctx 262144) is restored and only the rest is prefilled. That is the agent-loop case: the next request
+re-renders the previous answer (canonical tool-call JSON, retokenised text), which differs from the generated
+tokens right after the previous prompt. Otherwise the state is reset. The server logs the path per request
+(`<id>: reuse=extend|checkpoint|none reused=N prefilled=M prefill=<seconds>`).
+
+Third-party CMake targets: `nlohmann_json::nlohmann_json`, `httplib::httplib`, `spdlog::spdlog`, `ingine_utf8proc`,
+`ingine_jinja`, `CUDA::cudart`, `CUDA::cublasLt`.
 
 ## Conventions
 

@@ -53,7 +53,7 @@ void* Drafter::alloc(std::size_t bytes) {
 
 Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream)
     : w_(w), stream_(stream), ctx_(std::min(max_ctx, DRAFT_CTX)) {
-  if (max_ctx <= 0) throw std::invalid_argument("Drafter: max_ctx must be positive");
+  if (max_ctx < 2 * BLOCK) throw std::invalid_argument("Drafter: max_ctx must hold two blocks");
   head_ = {w.unembed.w.data, w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
            w.unembed.rows()};
   V_ = w.unembed.rows();
@@ -69,7 +69,7 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   xn_ = bf16s(BLOCK * H);
   q_ = bf16s(BLOCK * kd::Q_DIM);
   attn_o_ = bf16s(BLOCK * kd::Q_DIM);
-  delta_ = bf16s(BLOCK * H);
+  delta_ = f32s(BLOCK * H);
   act_ = bf16s(std::size_t(BLOCK) * inter_);
   f_rnn_ = bf16s(H);
   state_ = bf16s((GAMMA + 1) * kd::RANK);
@@ -78,6 +78,8 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   gu_out_ = f32s(std::size_t(BLOCK) * 2 * inter_);
   base_ = f32s(std::size_t(GAMMA) * V_);
   attn_ws_ = f32s(std::max(kd::attention_workspace_floats(LOCAL_SLOTS), kd::attention_workspace_floats(ctx_)));
+  topk_ws_ = alloc(kd::topk_workspace_bytes(GAMMA, V_));
+  CUDA_CHECK(cudaMemsetAsync(topk_ws_, 0, kd::topk_workspace_bytes(GAMMA, V_), stream_));  // kept zeroed
   cand_val_ = f32s(GAMMA * kd::CANDIDATES);
   cand_logits_ = f32s(GAMMA * kd::CANDIDATES);
   part_ = f32s(GAMMA * kd::RNN_OUT);
@@ -86,26 +88,36 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   picks_ = static_cast<unsigned long long*>(alloc(GAMMA * sizeof(unsigned long long)));
   draft_logits_ = f32s(std::size_t(GAMMA) * V_);
   conf_ = f32s(GAMMA);
+  qstats_ = f32s(2 * GAMMA);
   tokens_ = i32s(GAMMA);
-  commit_feats_ = bf16s(std::size_t(BLOCK) * 4 * H);
+  warm_feats_ = bf16s(std::size_t(BLOCK) * 4 * H);
   ctx_c_ = bf16s(std::size_t(COMMIT_PIECE) * H);
   ctx_kv_ = bf16s(std::size_t(COMMIT_PIECE) * 2 * kd::KV_DIM);
+  commit_xin_ = bf16s(std::size_t(3) * BLOCK * H);
+  commit_kv_ = f32s(std::size_t(BLOCK) * 3 * 2 * kd::KV_DIM);
+  CUDA_CHECK(cudaMemsetAsync(warm_feats_, 0, std::size_t(BLOCK) * 4 * H * 2, stream_));
   CUDA_CHECK(cudaMemsetAsync(state_, 0, (GAMMA + 1) * kd::RANK * 2, stream_));  // state row 0 stays zero
   CUDA_CHECK(cudaMemsetAsync(prev_cand_, 0, GAMMA * kd::CANDIDATES * 4, stream_));
   CUDA_CHECK(cudaMemsetAsync(f_rnn_, 0, H * 2, stream_));
   kd::fill(draft_logits_, std::size_t(GAMMA) * V_, -INFINITY, stream_);
 
-  // one-segment tables (rows [0, R) from input 0) for the dense GEMV
-  auto segment = [&](int rows) {
-    int* d = i32s(3);
-    const int host[3] = {0, rows, 0};
-    CUDA_CHECK(cudaMemcpyAsync(d, host, sizeof(host), cudaMemcpyHostToDevice, stream_));
+  // segment tables (row_begin, row_end, input) for the dense GEMV
+  auto segments = [&](std::initializer_list<int> rows) {
+    std::vector<int> host;
+    int b = 0, input = 0;
+    for (int r : rows) {
+      host.insert(host.end(), {b, b + r, input++});
+      b += r;
+    }
+    int* d = i32s(host.size());
+    CUDA_CHECK(cudaMemcpyAsync(d, host.data(), host.size() * 4, cudaMemcpyHostToDevice, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     return d;
   };
-  seg_qkv_ = segment(kd::QKV_ROWS);
-  seg_gate_up_ = segment(2 * inter_);
-  seg_head_ = segment(V_);
+  seg_qkv_ = segments({kd::QKV_ROWS});
+  seg_gate_up_ = segments({2 * inter_});
+  seg_head_ = segments({V_});
+  seg_kv_ = segments({2 * kd::KV_DIM, 2 * kd::KV_DIM, 2 * kd::KV_DIM});  // layer l reads xin[l]
 
   for (int l = 0; l < 3; ++l) {
     DraftLayer& L = layers_[l];
@@ -115,15 +127,20 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
     CUDA_CHECK(cudaMemsetAsync(L.k_ctx, 0, std::size_t(slots) * kd::KV_DIM * 2, stream_));
     CUDA_CHECK(cudaMemsetAsync(L.v_ctx, 0, std::size_t(slots) * kd::KV_DIM * 2, stream_));
     L.ctx_pos = is_local(l) ? i32s(kd::WINDOW) : nullptr;
+    ctx_layers_.ctx_norm[l] = L.ctx_norm;
+    ctx_layers_.k_norm_ctx[l] = L.k_norm_ctx;
+    ctx_layers_.k_cache[l] = L.k_ctx;
+    ctx_layers_.v_cache[l] = L.v_ctx;
+    ctx_layers_.ctx_pos[l] = L.ctx_pos;
+    ctx_layers_.size[l] = is_local(l) ? kd::WINDOW : ctx_;
   }
 
   accept_.target = i32s(BLOCK);
   accept_.probs = f32s(std::size_t(BLOCK) * V_);
   accept_.resid = f32s(V_);
   accept_.uniforms = f32s(GAMMA);
-  accept_.ws = f32s(2 * GAMMA + 1);
+  accept_.ws = f32s(kd::sampled_accept_workspace_floats(V_));
   accept_.result = static_cast<kd::AcceptResult*>(alloc(sizeof(kd::AcceptResult)));
-  accept_.host = pinned_.data();
 
   reset();
   CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -131,7 +148,8 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
 
 Drafter::~Drafter() {
   for (auto& [b, g] : draft_graphs_) cudaGraphExecDestroy(g);
-  for (auto& [n, g] : commit_graphs_) cudaGraphExecDestroy(g);
+  if (commit_graph_) cudaGraphExecDestroy(commit_graph_);
+  for (auto& [b, g] : advance_graphs_) cudaGraphExecDestroy(g);
 }
 
 void Drafter::load(const std::filesystem::path& model_dir) {
@@ -208,6 +226,15 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     return kdense::Matrix{q, scale, int(rows)};
   };
 
+  // the three layers' context k/v projections in one matrix (one dense GEMV for a small commit)
+  {
+    auto kv = [](int l, const char* x) { return "layers." + std::to_string(l) + ".self_attn." + x + "_proj_ctx.weight"; };
+    const std::vector<std::int64_t> shape{kd::KV_DIM, h};
+    const __nv_bfloat16* all = persist({{kv(0, "k"), shape}, {kv(0, "v"), shape}, {kv(1, "k"), shape},
+                                        {kv(1, "v"), shape}, {kv(2, "k"), shape}, {kv(2, "v"), shape}});
+    wkv_all_ = kdense::Matrix{all, nullptr, 3 * 2 * kd::KV_DIM};
+    for (int l = 0; l < 3; ++l) layers_[l].wkv_ctx = all + std::size_t(l) * 2 * kd::KV_DIM * H;
+  }
   for (int l = 0; l < 3; ++l) {
     const std::string p = "layers." + std::to_string(l) + ".";
     const std::string a = p + "self_attn.";
@@ -222,7 +249,6 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     L.gate_up = fp8({{p + "mlp.gate_proj.weight", I}, {p + "mlp.up_proj.weight", I}});
     L.wo = persist({{a + "o_proj.weight", {h, kd::Q_DIM}}});
     L.w_down = persist({{p + "mlp.down_proj.weight", {h, I}}});
-    L.wkv_ctx = persist({{a + "k_proj_ctx.weight", {kd::KV_DIM, h}}, {a + "v_proj_ctx.weight", {kd::KV_DIM, h}}});
   }
   final_norm_ = persist({{"norm.weight", {h}}});
   mask_embed_ = persist({{"mask_embed", {h}}});
@@ -251,6 +277,75 @@ void Drafter::reset() {
 
 void Drafter::set_seed(std::uint64_t seed) { kd::set_seed(params_, seed, stream_); }
 
+void Drafter::global_written(int begin, int end) {
+  if (checkpoint_ == nullptr || checkpoint_clobbered_ || end <= begin) return;
+  // global slot = position % ctx; the checkpoint holds slots [0, min(L, ctx))
+  const int live = std::min(checkpoint_length_, ctx_);
+  checkpoint_clobbered_ = end - begin >= ctx_ || begin % ctx_ < live || begin / ctx_ != (end - 1) / ctx_;
+}
+
+// layout: local k/v of layers 0 and 2 (ring slots only), their ctx_pos, f_rnn, global k and v [ctx slots]
+namespace {
+constexpr std::size_t LOCAL_BYTES = std::size_t(kd::WINDOW) * kd::KV_DIM * 2;
+}
+
+std::size_t Drafter::checkpoint_bytes() const {
+  return 4 * LOCAL_BYTES + 2 * kd::WINDOW * sizeof(std::int32_t) + std::size_t(H) * 2 +
+         2 * std::size_t(ctx_) * kd::KV_DIM * 2;
+}
+
+void Drafter::save_checkpoint(void* dst) {
+  auto* d = static_cast<std::byte*>(dst);
+  auto copy = [&](std::size_t off, const void* src, std::size_t bytes) {
+    CUDA_CHECK(cudaMemcpyAsync(d + off, src, bytes, cudaMemcpyDeviceToDevice, stream_));
+  };
+  std::size_t off = 0;
+  for (int l : {0, 2}) {
+    copy(off, layers_[l].k_ctx, LOCAL_BYTES);
+    copy(off + LOCAL_BYTES, layers_[l].v_ctx, LOCAL_BYTES);
+    off += 2 * LOCAL_BYTES;
+  }
+  for (int l : {0, 2}) {
+    copy(off, layers_[l].ctx_pos, kd::WINDOW * sizeof(std::int32_t));
+    off += kd::WINDOW * sizeof(std::int32_t);
+  }
+  copy(off, f_rnn_, std::size_t(H) * 2);
+  off += std::size_t(H) * 2;
+  const std::size_t live = std::size_t(std::min(length_, ctx_)) * kd::KV_DIM * 2;
+  copy(off, layers_[1].k_ctx, live);
+  copy(off + std::size_t(ctx_) * kd::KV_DIM * 2, layers_[1].v_ctx, live);
+  checkpoint_ = dst;
+  checkpoint_length_ = length_;
+  checkpoint_clobbered_ = false;
+}
+
+void Drafter::restore_checkpoint(const void* src) {
+  if (src != checkpoint_) throw std::invalid_argument("Drafter::restore_checkpoint: not the last checkpoint saved");
+  const auto* s = static_cast<const std::byte*>(src);
+  auto copy = [&](void* dst, std::size_t off, std::size_t bytes) {
+    CUDA_CHECK(cudaMemcpyAsync(dst, s + off, bytes, cudaMemcpyDeviceToDevice, stream_));
+  };
+  std::size_t off = 0;
+  for (int l : {0, 2}) {
+    copy(layers_[l].k_ctx, off, LOCAL_BYTES);
+    copy(layers_[l].v_ctx, off + LOCAL_BYTES, LOCAL_BYTES);
+    off += 2 * LOCAL_BYTES;
+  }
+  for (int l : {0, 2}) {
+    copy(layers_[l].ctx_pos, off, kd::WINDOW * sizeof(std::int32_t));
+    off += kd::WINDOW * sizeof(std::int32_t);
+  }
+  copy(f_rnn_, off, std::size_t(H) * 2);
+  off += std::size_t(H) * 2;
+  if (checkpoint_clobbered_) {
+    const std::size_t live = std::size_t(std::min(checkpoint_length_, ctx_)) * kd::KV_DIM * 2;
+    copy(layers_[1].k_ctx, off, live);
+    copy(layers_[1].v_ctx, off + std::size_t(ctx_) * kd::KV_DIM * 2, live);
+  }
+  length_ = checkpoint_length_;
+  checkpoint_clobbered_ = false;
+}
+
 void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece) {
   for (int l = 0; l < 3; ++l) {
     const DraftLayer& L = layers_[l];
@@ -271,17 +366,26 @@ void Drafter::commit(const Tensor& feats, int start) {
 
 void Drafter::commit(const __nv_bfloat16* feats, int n, int start) {
   if (n <= 0) return;
-  kd::set_commit_start(params_, start, stream_);
-  if (auto it = commit_graphs_.find(n); it != commit_graphs_.end()) {
-    CUDA_CHECK(cudaMemcpyAsync(commit_feats_, feats, std::size_t(n) * 4 * H * 2, cudaMemcpyDeviceToDevice, stream_));
-    CUDA_CHECK(cudaGraphLaunch(it->second, stream_));
+  if (n <= BLOCK) {
+    kd::set_commit(params_, feats, n, start, stream_);
+    if (commit_graph_) CUDA_CHECK(cudaGraphLaunch(commit_graph_, stream_));
+    else run_small_commit();
   } else {
+    kd::set_commit_start(params_, start, stream_);
     for (int r0 = 0; r0 < n; r0 += COMMIT_PIECE) {
       const int k = std::min(COMMIT_PIECE, n - r0);
       run_commit(feats + std::size_t(r0) * 4 * H, k, r0, r0 + k == n);
     }
   }
+  global_written(start, start + n);
   length_ = start + n;
+}
+
+// the k/v context rows of the n = params_->ncommit rows of params_->commit_feats in all three layers
+void Drafter::run_small_commit() {
+  kd::commit_mix(params_, alpha_, ctx_layers_, f_norm_, commit_xin_, f_rnn_, stream_);
+  kdense::proj(commit_xin_, BLOCK, wkv_all_, seg_kv_, 3, commit_kv_, true, stream_);
+  kd::commit_store(commit_kv_, params_, ctx_layers_, stream_);
 }
 
 void Drafter::run_draft(int bucket) {
@@ -294,22 +398,23 @@ void Drafter::run_draft(int bucket) {
     kd::qkv_rope(qkv_out_, L.q_norm, L.k_norm, params_, q_, L.k_ctx, L.v_ctx, local, ctx_, stream_);
     kd::block_attention(q_, L.k_ctx, L.v_ctx, local ? LOCAL_SLOTS : bucket, L.ctx_pos, params_, attn_ws_, attn_o_,
                         stream_);
-    gemm_.run(attn_o_, BLOCK, L.wo, H, kd::Q_DIM, delta_, stream_);
+    kdense::gemv(attn_o_, BLOCK, kd::Q_DIM, kdense::Matrix{L.wo, nullptr, H}, delta_, true, stream_);
     kd::add_rmsnorm(res_, delta_, L.post_norm, xn_, BLOCK, stream_);
     kdense::proj(xn_, BLOCK, L.gate_up, seg_gate_up_, 1, gu_out_, true, stream_);
     kd::silu_mul(gu_out_, BLOCK, inter_, act_, stream_);
-    gemm_.run(act_, BLOCK, L.w_down, H, inter_, delta_, stream_);
+    kdense::gemv(act_, BLOCK, inter_, kdense::Matrix{L.w_down, nullptr, H}, delta_, true, stream_);
     kd::add_rmsnorm(res_, delta_, l < 2 ? layers_[l + 1].in_norm : final_norm_, xn_, BLOCK, stream_);
   }
   const __nv_bfloat16* h = xn_ + H;  // rows 1..7
   kdense::proj(h, GAMMA, head_, seg_head_, 1, base_, true, stream_);
-  kd::topk_candidates(base_, GAMMA, V_, cand_val_, cand_idx_, stream_);
+  kd::topk_candidates(base_, GAMMA, V_, cand_val_, cand_idx_, topk_ws_, stream_);
   kd::markov_pre(rnn_w_, h, f_rnn_, part_, stream_);
   for (int i = 0; i < GAMMA; ++i) {
     kd::markov_step(i, rnn_w_, rnn_b_, w1_, part_, picks_, cand_idx_, params_, state_, latent_, stream_);
     kd::markov_logits(i, fold_w_, fold_b_, cand_val_, cand_idx_, latent_, params_, cand_logits_, picks_, stream_);
   }
-  kd::markov_finish(cand_idx_, cand_logits_, picks_, prev_cand_, draft_logits_, V_, tokens_, conf_, params_, stream_);
+  kd::markov_finish(cand_idx_, cand_logits_, picks_, prev_cand_, draft_logits_, V_, tokens_, conf_, qstats_, params_,
+                    stream_);
 }
 
 // the smallest bucket holding the block; the whole ring once the context reaches it (and without graphs)
@@ -322,12 +427,44 @@ int Drafter::bucket_for(int P) const {
 Drafter::Draft Drafter::draft(int anchor, int P, float temperature) {
   if (anchor < 0 || anchor >= V_) throw std::invalid_argument("Drafter::draft: anchor out of range");
   kd::set_draft_inputs(params_, anchor, P, temperature, stream_);
+  global_written(P, P + BLOCK);  // the block's own rows
   const int bucket = bucket_for(P);
   if (auto it = draft_graphs_.find(bucket); it != draft_graphs_.end())
     CUDA_CHECK(cudaGraphLaunch(it->second, stream_));
   else
     run_draft(bucket);
-  return {tokens_, draft_logits_, conf_};
+  return {tokens_, draft_logits_, conf_, qstats_};
+}
+
+// set_round + small commit + draft, all reading device values
+void Drafter::run_advance(int bucket) {
+  kd::set_round(params_, round_, stream_);
+  run_small_commit();
+  run_draft(bucket);
+}
+
+void Drafter::bind_round(const kd::RoundInputs& in) {
+  for (auto& [b, g] : advance_graphs_) cudaGraphExecDestroy(g);
+  advance_graphs_.clear();
+  round_ = in;
+  round_bound_ = true;
+  for (const auto& [b, g] : draft_graphs_) {  // the same buckets as the draft graphs (none before capture())
+    capture_begin(stream_);
+    run_advance(b);
+    advance_graphs_[b] = capture_end(stream_);
+  }
+}
+
+Drafter::Draft Drafter::advance(int start) {
+  if (!round_bound_) throw std::logic_error("Drafter::advance: no bind_round()");
+  pending_start_ = start;
+  global_written(start, start + 2 * BLOCK);  // the commit (<= 8 rows) and the next block (P <= start + 8)
+  const int bucket = bucket_for(start + BLOCK);  // P = start + n <= start + 8
+  if (auto it = advance_graphs_.find(bucket); it != advance_graphs_.end())
+    CUDA_CHECK(cudaGraphLaunch(it->second, stream_));
+  else
+    run_advance(bucket);
+  return {tokens_, draft_logits_, conf_, qstats_};
 }
 
 void Drafter::capture() {
@@ -336,20 +473,19 @@ void Drafter::capture() {
   buckets.push_back(ctx_);
   // warm-up outside capture (cuBLASLt plans), then capture; the scratch context rows are reset afterwards
   kd::set_draft_inputs(params_, 0, 0, 0.f, stream_);
-  kd::set_commit_start(params_, 0, stream_);
+  kd::set_commit(params_, warm_feats_, BLOCK, 0, stream_);
   for (int b : buckets) run_draft(b);
-  for (int n = 1; n <= BLOCK; ++n) run_commit(commit_feats_, n, 0, true);
+  run_small_commit();
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   for (int b : buckets) {
     capture_begin(stream_);
     run_draft(b);
     draft_graphs_[b] = capture_end(stream_);
   }
-  for (int n = 1; n <= BLOCK; ++n) {
-    capture_begin(stream_);
-    run_commit(commit_feats_, n, 0, true);
-    commit_graphs_[n] = capture_end(stream_);
-  }
+  capture_begin(stream_);
+  run_small_commit();
+  commit_graph_ = capture_end(stream_);
+  if (round_bound_) bind_round(kd::RoundInputs(round_));
   reset();
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }

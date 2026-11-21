@@ -164,6 +164,104 @@ bool test_uniform() {
   return ok;
 }
 
+// The multi-block paths (rows <= 8; sampling without top-k / top-p) against the one-CTA kernels, which a
+// 9-row call still uses: argmax, Gumbel draws from logits and from probabilities are identical token for
+// token (same seed and counter: the noise is keyed by row and index), sampling_probs agrees up to the softmax
+// summation order. Plus the time per call of each multi-block path at the real vocabulary.
+bool test_fast_paths(Rng& rng) {
+  const int rows = 9;
+  std::vector<float> l = randn(rng, size_t(rows) * V, 3.0);
+  for (int r = 0; r < rows; ++r)
+    for (int i = 0; i < 30; ++i) l[size_t(r) * V + rng.next() % V] = float(10.0 + rng.normal());
+  l[size_t(4) * V + 999] = 40.f, l[size_t(4) * V + 77] = 40.f;  // argmax tie in a fast row: lower id
+  DeviceArray<float> dl(l), p9(size_t(rows) * V), p8(size_t(8) * V);
+  DeviceArray<int> a9(rows), a8(8), s9(rows), s8(8), m9(rows), m8(8);
+  const head::SamplingParams plain{1.0f, 0, 1.0f};
+  head::argmax(dl.get(), rows, V, V, a9.get(), g_stream);
+  head::argmax(dl.get(), 8, V, V, a8.get(), g_stream);
+  head::SamplerRng r1{42, 7}, r2{42, 7};
+  head::sample(dl.get(), rows, V, V, plain, r1, s9.get(), g_stream);
+  head::sample(dl.get(), 8, V, V, plain, r2, s8.get(), g_stream);
+  head::sampling_probs(dl.get(), rows, V, V, plain, p9.get(), g_stream);
+  head::sampling_probs(dl.get(), 8, V, V, plain, p8.get(), g_stream);
+  head::SamplerRng r3{43, 1}, r4{43, 1};
+  head::sample_from_probs(p9.get(), rows, V, V, r3, m9.get(), g_stream);
+  head::sample_from_probs(p9.get(), 8, V, V, r4, m8.get(), g_stream);
+  sync();
+  const auto A9 = a9.download(), A8 = a8.download(), S9 = s9.download(), S8 = s8.download();
+  const auto M9 = m9.download(), M8 = m8.download();
+  const auto P9 = p9.download(), P8 = p8.download();
+  bool same_a = A8[4] == 77, same_s = true, same_m = true;
+  for (int r = 0; r < 8; ++r) same_a &= A8[r] == A9[r], same_s &= S8[r] == S9[r], same_m &= M8[r] == M9[r];
+  double rel = 0;
+  for (size_t i = 0; i < P8.size(); ++i) rel = std::max(rel, std::fabs(double(P8[i]) - P9[i]) / std::max(double(P9[i]), 1e-30));
+  bool ok = same_a && same_s && same_m && rel < 1e-5;
+  std::printf("%s multi-block argmax/sample/sample_from_probs equal the one-CTA kernels (%d %d %d), probs rel diff %.1e\n",
+              ok ? "PASS" : "FAIL", int(same_a), int(same_s), int(same_m), rel);
+
+  // time per call, one row (plain decoding) and 8 rows (a verify call's probabilities)
+  cudaEvent_t e0, e1;
+  INGINE_TEST_CUDA(cudaEventCreate(&e0));
+  INGINE_TEST_CUDA(cudaEventCreate(&e1));
+  auto time_us = [&](auto&& call) {
+    for (int i = 0; i < 10; ++i) call();
+    INGINE_TEST_CUDA(cudaEventRecord(e0, g_stream));
+    for (int i = 0; i < 200; ++i) call();
+    INGINE_TEST_CUDA(cudaEventRecord(e1, g_stream));
+    INGINE_TEST_CUDA(cudaEventSynchronize(e1));
+    float ms = 0;
+    INGINE_TEST_CUDA(cudaEventElapsedTime(&ms, e0, e1));
+    return 1000.0 * ms / 200;
+  };
+  head::SamplerRng rt{1, 0};
+  const double t_arg = time_us([&] { head::argmax(dl.get(), 1, V, V, a8.get(), g_stream); });
+  const double t_s1 = time_us([&] { head::sample(dl.get(), 1, V, V, plain, rt, s8.get(), g_stream); });
+  const double t_p8 = time_us([&] { head::sampling_probs(dl.get(), 8, V, V, plain, p8.get(), g_stream); });
+  const double t_m1 = time_us([&] { head::sample_from_probs(p8.get(), 1, V, V, rt, m8.get(), g_stream); });
+  const double t_s1k = time_us([&] { head::sample(dl.get(), 1, V, V, {1.0f, 50, 0.95f}, rt, s8.get(), g_stream); });
+  INGINE_TEST_CUDA(cudaEventDestroy(e0));
+  INGINE_TEST_CUDA(cudaEventDestroy(e1));
+  std::printf("INFO us per call: argmax 1 row %.1f, sample T=1 1 row %.1f, sampling_probs 8 rows %.1f, "
+              "sample_from_probs 1 row %.1f, sample top-k/top-p (one-CTA path) %.1f\n",
+              t_arg, t_s1, t_p8, t_m1, t_s1k);
+  return ok;
+}
+
+// Draws of the multi-block paths over the full vocabulary follow engine._probs (T = 1, no top-k / top-p).
+bool test_fast_distribution(Rng& rng) {
+  std::vector<float> l = randn(rng, V, 1.0);
+  const int heads[6] = {11, 50000, 100001, 150000, 199000, 200057};
+  for (int i = 0; i < 6; ++i) l[heads[i]] = float(10.0 + 0.4 * i);  // most of the mass on six tokens
+  const head::SamplingParams plain{1.0f, 0, 1.0f};
+  const auto ref = probs_oracle(l, V, plain);
+  const int draws = 20000;
+  DeviceArray<float> dl(l), dp(V);
+  DeviceArray<int> out(draws), out2(draws);
+  head::SamplerRng r{777, 0};
+  for (int i = 0; i < draws; ++i) head::sample(dl.get(), 1, V, V, plain, r, out.get() + i, g_stream);
+  head::sampling_probs(dl.get(), 1, V, V, plain, dp.get(), g_stream);
+  for (int i = 0; i < draws; ++i) head::sample_from_probs(dp.get(), 1, V, V, r, out2.get() + i, g_stream);
+  sync();
+  bool ok = true;
+  for (const auto* o : {&out, &out2}) {
+    const auto got = o->download();
+    double worst = 0, rest_ref = 1, rest = 0;
+    for (int h : heads) {
+      const double f = double(std::count(got.begin(), got.end(), h)) / draws;
+      worst = std::max(worst, std::fabs(f - ref[h]) / std::sqrt(ref[h] * (1 - ref[h]) / draws));
+      rest_ref -= ref[h];
+      rest += f;
+    }
+    rest = 1 - rest;
+    worst = std::max(worst, std::fabs(rest - rest_ref) / std::sqrt(rest_ref * (1 - rest_ref) / draws + 1e-12));
+    const bool pass = worst < 5.0;
+    std::printf("%s %s (multi-block) over the vocabulary, %d draws: worst |freq - p| = %.2f sigma\n",
+                pass ? "PASS" : "FAIL", o == &out ? "sample" : "sample_from_probs", draws, worst);
+    ok &= pass;
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -178,6 +276,8 @@ int main() {
   ok &= test_sample_special(rng);
   ok &= test_sample_distribution(rng);
   ok &= test_uniform();
+  ok &= test_fast_paths(rng);
+  ok &= test_fast_distribution(rng);
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

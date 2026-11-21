@@ -1,12 +1,15 @@
 // Device helpers shared by the DSpark draft and speculative-acceptance kernels.
 #pragma once
 
+#include "core/device.h"
+#include "kernels/common/pdl.cuh"
+#include "kernels/draft/rng.h"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "kernels/draft/rng.h"
-
 #include <cstdint>
+#include <utility>
 
 namespace ingine::kernels::draft {
 
@@ -74,4 +77,21 @@ __device__ __forceinline__ unsigned long long pack_argmax(float score, uint32_t 
 __device__ __forceinline__ uint32_t unpack_argmax_index(unsigned long long p) {
   return 0xffffffffu - static_cast<uint32_t>(p & 0xffffffffu);
 }
+
+// 16-byte weight load issued ahead of pdl_wait(): ld.global.cg in asm volatile, which ptxas keeps above the
+// wait (it may sink .nc loads below it, see kernels/common/pdl.cuh), so the weights are in flight while the
+// predecessor finishes.
+__device__ __forceinline__ uint4 ld_weight(const void* p) {
+  uint4 r;
+  asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+  return r;
+}
+
+// Launches `kernel` as a programmatic dependent of its stream predecessor (kernels/common/pdl.cuh). The
+// kernel calls pdl_trigger() first and pdl_wait() before it touches data another kernel writes.
+template <class... Params, class... Args>
+void launch_pdl(void (*kernel)(Params...), dim3 grid, dim3 block, cudaStream_t stream, Args&&... args) {
+  CUDA_CHECK(pdl_launch(kernel, grid, block, 0, stream, std::forward<Args>(args)...));
+}
+
 }  // namespace ingine::kernels::draft

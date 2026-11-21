@@ -33,6 +33,19 @@ std::vector<double> softmax_t(const std::vector<float>& l, float T) {
   return q;
 }
 
+// markov_finish's q statistics of draft-logit rows dl [n, V]: (max l / T, sum exp(l / T - max)) per row
+std::vector<float> qstats_of(const std::vector<float>& dl, int n, float T) {
+  std::vector<float> st(2 * n);
+  for (int r = 0; r < n; ++r) {
+    float m = -INFINITY, s = 0.f;
+    for (int x = 0; x < V; ++x) m = std::max(m, dl[size_t(r) * V + x] / T);
+    for (int x = 0; x < V; ++x) s += std::exp(dl[size_t(r) * V + x] / T - m);
+    st[2 * r] = m;
+    st[2 * r + 1] = s;
+  }
+  return st;
+}
+
 int draw(Rng& r, const std::vector<double>& w) {
   double s = 0;
   for (double x : w) s += x;
@@ -96,12 +109,13 @@ void run_statistics(const Toy& toy, int trials, const char* name) {
       drafts[size_t(t) * n + i] = draw(r, q[i]);
       u[size_t(t) * n + i] = float(r.uniform());
     }
-  DeviceArray<float> d_p(p_flat), d_dl(dl_flat), d_u(u), d_ws(2 * kd::GAMMA + 1), d_resid(size_t(trials) * V);
+  DeviceArray<float> d_p(p_flat), d_dl(dl_flat), d_u(u), d_ws(kd::sampled_accept_workspace_floats(V)),
+      d_resid(size_t(trials) * V), d_q(qstats_of(dl_flat, n, toy.T));
   DeviceArray<int32_t> d_drafts(drafts);
   DeviceArray<kd::AcceptResult> d_out(trials);
   for (int t = 0; t < trials; ++t)
-    kd::sampled_accept(d_p.get(), d_dl.get(), V, d_drafts.get() + size_t(t) * n, n, toy.T, d_u.get() + size_t(t) * n,
-                       d_ws.get(), d_resid.get() + size_t(t) * V, d_out.get() + t, nullptr);
+    kd::sampled_accept(d_p.get(), d_dl.get(), V, d_drafts.get() + size_t(t) * n, n, toy.T, d_q.get(),
+                       d_u.get() + size_t(t) * n, d_ws.get(), d_resid.get() + size_t(t) * V, d_out.get() + t, nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto out = d_out.download();
   const auto resid = d_resid.download();
@@ -142,10 +156,11 @@ void edge_cases() {
     p[3] = 1.f;
     p[V + 5] = 1.f;
     dl[3] = 2.f;
-    DeviceArray<float> d_p(p), d_dl(dl), d_u(std::vector<float>{1.f}), d_ws(2 * kd::GAMMA + 1), d_resid(V);
+    DeviceArray<float> d_p(p), d_dl(dl), d_u(std::vector<float>{1.f}), d_ws(kd::sampled_accept_workspace_floats(V)),
+        d_resid(V), d_q(qstats_of(dl, 1, 1.f));
     DeviceArray<int32_t> d_drafts(std::vector<int32_t>{3});
     DeviceArray<kd::AcceptResult> d_out(1);
-    kd::sampled_accept(d_p.get(), d_dl.get(), V, d_drafts.get(), 1, 1.f, d_u.get(), d_ws.get(), d_resid.get(),
+    kd::sampled_accept(d_p.get(), d_dl.get(), V, d_drafts.get(), 1, 1.f, d_q.get(), d_u.get(), d_ws.get(), d_resid.get(),
                        d_out.get(), nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
     const auto resid = d_resid.download();
@@ -159,10 +174,11 @@ void edge_cases() {
     Rng r(3);
     for (auto& x : p) x = float(r.uniform(0.01, 1.0) / V);
     for (auto& x : dl) x = float(r.normal());
-    DeviceArray<float> d_p(p), d_dl(dl), d_u(std::vector<float>(n, 0.f)), d_ws(2 * kd::GAMMA + 1), d_resid(V);
+    DeviceArray<float> d_p(p), d_dl(dl), d_u(std::vector<float>(n, 0.f)), d_ws(kd::sampled_accept_workspace_floats(V)),
+        d_resid(V), d_q(qstats_of(dl, n, 0.6f));
     DeviceArray<int32_t> d_drafts(std::vector<int32_t>{1, 2, 3});
     DeviceArray<kd::AcceptResult> d_out(1);
-    kd::sampled_accept(d_p.get(), d_dl.get(), V, d_drafts.get(), n, 0.6f, d_u.get(), d_ws.get(), d_resid.get(),
+    kd::sampled_accept(d_p.get(), d_dl.get(), V, d_drafts.get(), n, 0.6f, d_q.get(), d_u.get(), d_ws.get(), d_resid.get(),
                        d_out.get(), nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
     const auto resid = d_resid.download();
@@ -187,10 +203,11 @@ void edge_cases() {
     bool ok = true;
     for (float u0 : {0.f, 0.3f, 0.99f}) {
       const std::vector<float> u{u0, 0.5f};
-      DeviceArray<float> d_p(p), d_dl(dl), d_u(u), d_ws(2 * kd::GAMMA + 1), d_resid(V);
+      DeviceArray<float> d_p(p), d_dl(dl), d_u(u), d_ws(kd::sampled_accept_workspace_floats(V)), d_resid(V),
+          d_q(qstats_of(dl, n, T));
       DeviceArray<int32_t> d_drafts(drafts);
       DeviceArray<kd::AcceptResult> d_out(1);
-      kd::sampled_accept(d_p.get(), d_dl.get(), V, d_drafts.get(), n, T, d_u.get(), d_ws.get(), d_resid.get(),
+      kd::sampled_accept(d_p.get(), d_dl.get(), V, d_drafts.get(), n, T, d_q.get(), d_u.get(), d_ws.get(), d_resid.get(),
                          d_out.get(), nullptr);
       INGINE_TEST_CUDA(cudaDeviceSynchronize());
       int acc = 0;

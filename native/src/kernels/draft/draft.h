@@ -1,8 +1,13 @@
 // DSpark drafter kernels (engine/ingine/dspark.py) and the speculative acceptance helpers of
 // engine.Engine._accept. Raw-pointer launchers on `stream`; they never allocate or synchronise and read
-// every per-call value (anchor, position, temperature, commit start, RNG draw) from device memory, so all
+// every per-call value (anchor, position, temperature, commit rows, RNG draw) from device memory, so all
 // of them are CUDA-graph capturable. Shapes are row-major (Python order). Rounding points follow dspark.py
 // (each `bf(...)` there is a BF16 rounding here).
+//
+// The kernels of the commit and draft chains are launched as programmatic dependents (PDL, see
+// kernels/common/pdl.cuh): each triggers its dependents first and waits for its predecessor before it reads
+// anything a kernel wrote, so launch latency overlaps the predecessor's tail. The set_* parameter kernels
+// are ordinary launches.
 #pragma once
 
 #include <cuda_bf16.h>
@@ -36,10 +41,31 @@ struct DraftParams {
   std::int32_t start = 0;       // first position of the rows being committed
   std::uint64_t seed = 0;       // Gumbel noise: uniform01(seed, draws, step, candidate)
   std::uint64_t draws = 0;      // drafts so far (advanced by markov_finish)
+  std::int32_t ncommit = 0;     // rows of the small commit (1..BLOCK)
+  std::int32_t pad = 0;
+  const __nv_bfloat16* commit_feats = nullptr;  // their taps, bf16 [ncommit, 4, H]
 };
 void set_draft_inputs(DraftParams* p, int anchor, int P, float temperature, cudaStream_t stream);
 void set_commit_start(DraftParams* p, int start, cudaStream_t stream);
 void set_seed(DraftParams* p, std::uint64_t seed, cudaStream_t stream);  // also resets draws
+// A small commit of n (1..BLOCK) rows from feats at positions start..start+n-1.
+void set_commit(DraftParams* p, const __nv_bfloat16* feats, int n, int start, cudaStream_t stream);
+
+// The device-side transition of a speculative round (engine._generate_spec after the acceptance), for a
+// verify call at the last draft's position: start = p->P. The call (width *m, rows start..start+*m-1)
+// accepted *accepted drafts; commit its first n = *accepted + 1 rows (taps[i] for m == widths[i], bf16
+// [m, 4, H]) at start, and draft next at P = start + n from the anchor *next_greedy (p->temperature <= 0)
+// or *next_sampled. The temperature stays.
+struct RoundInputs {
+  const __nv_bfloat16* taps[3] = {};
+  int widths[3] = {};
+  int nwidths = 0;
+  const std::int32_t* m = nullptr;
+  const std::int32_t* accepted = nullptr;
+  const std::int32_t* next_greedy = nullptr;
+  const std::int32_t* next_sampled = nullptr;
+};
+void set_round(DraftParams* p, const RoundInputs& in, cudaStream_t stream);
 
 // ---- context (commit) --------------------------------------------------------------------------------
 
@@ -55,6 +81,25 @@ void mix_rmsnorm(const __nv_bfloat16* feats, int n, const __nv_bfloat16* alpha, 
 void ctx_kv_store(const __nv_bfloat16* kv, int n, const DraftParams* p, int row0, int keep_from,
                   const __nv_bfloat16* k_norm, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int size,
                   std::int32_t* ctx_pos, cudaStream_t stream);
+
+// The three draft layers' context state, for the small (device-driven) commit.
+struct CtxLayers {
+  const __nv_bfloat16* ctx_norm[3] = {};    // bf16 [H]
+  const __nv_bfloat16* k_norm_ctx[3] = {};  // bf16 [128]
+  __nv_bfloat16* k_cache[3] = {};           // bf16 [size, 8, 128]
+  __nv_bfloat16* v_cache[3] = {};
+  std::int32_t* ctx_pos[3] = {};            // int32 [size] (local rings) or null (global ring)
+  int size[3] = {};                         // ring slots (>= BLOCK)
+};
+
+// Small commit, part 1 (n = p->ncommit rows of p->commit_feats): xin[l, r] = mix_rmsnorm(feats[r],
+// alpha[l], ctx_norm[l]) for r < n (zero rows above), xin bf16 [3, BLOCK, H] (the dense proj input of the
+// three layers' k/v projections); f_rnn = mix_rmsnorm(feats[n - 1], alpha[3], f_norm). alpha bf16 [4, 4].
+void commit_mix(const DraftParams* p, const __nv_bfloat16* alpha, const CtxLayers& L, const __nv_bfloat16* f_norm,
+                __nv_bfloat16* xin, __nv_bfloat16* f_rnn, cudaStream_t stream);
+// Small commit, part 2: kv fp32 [BLOCK, 3 * 2048] (BF16 values; layer l at columns l * 2048: k | v) of
+// rows r < n stored as ctx_kv_store does, at positions p->start + r.
+void commit_store(const float* kv, const DraftParams* p, const CtxLayers& L, cudaStream_t stream);
 
 // ---- draft block ---------------------------------------------------------------------------------------
 
@@ -80,9 +125,10 @@ void block_attention(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const
                      int nkeys, const std::int32_t* ctx_pos, const DraftParams* p, float* ws,
                      __nv_bfloat16* out, cudaStream_t stream);
 
-// res = bf16(res + delta); xn = bf16(rms(res) * w). res, delta, xn bf16 [rows, H], w bf16 [H].
-void add_rmsnorm(__nv_bfloat16* res, const __nv_bfloat16* delta, const __nv_bfloat16* w, __nv_bfloat16* xn,
-                 int rows, cudaStream_t stream);
+// res = bf16(res + delta); xn = bf16(rms(res) * w). res, xn bf16 [rows, H], delta fp32 [rows, H] (BF16 values),
+// w bf16 [H].
+void add_rmsnorm(__nv_bfloat16* res, const float* delta, const __nv_bfloat16* w, __nv_bfloat16* xn, int rows,
+                 cudaStream_t stream);
 
 // out = bf16(silu(gate) * up), gu fp32 [rows, 2I] (gate | up), out bf16 [rows, I].
 void silu_mul(const float* gu, int rows, int inter, __nv_bfloat16* out, cudaStream_t stream);
@@ -90,8 +136,11 @@ void silu_mul(const float* gu, int rows, int inter, __nv_bfloat16* out, cudaStre
 // ---- Markov head ---------------------------------------------------------------------------------------
 
 // Top-CANDIDATES per row of base fp32 [rows, V] (BF16-representable values), sorted by value descending,
-// equal values by index ascending: cand_val fp32 [rows, 1024], cand_idx int32 [rows, 1024].
-void topk_candidates(const float* base, int rows, int V, float* cand_val, std::int32_t* cand_idx,
+// equal values by index ascending: cand_val fp32 [rows, 1024], cand_idx int32 [rows, 1024]. A radix select
+// over many CTAs per row; ws: topk_workspace_bytes(rows, V) bytes, zeroed before the first call (every call
+// leaves it zeroed).
+std::size_t topk_workspace_bytes(int rows, int V);
+void topk_candidates(const float* base, int rows, int V, float* cand_val, std::int32_t* cand_idx, void* ws,
                      cudaStream_t stream);
 
 // part[i, r] = sum_{c >= 512} rnn_w[r, c] z_i[c] in fp32, z_i[512:] = (h[i], f_rnn): the step-independent
@@ -116,11 +165,12 @@ void markov_logits(int i, const __nv_bfloat16* fold_w, const __nv_bfloat16* fold
 
 // Outputs: tokens int32 [7] = picked candidates; draft_logits fp32 [7, V] = -inf except the step's
 // candidates (the entries of the previous draft, prev_cand int32 [7, 1024], are reset first; the buffer
-// must start all -inf); conf fp32 [7] = max softmax probability of each row; prev_cand <- cand_idx;
-// p->draws += 1.
+// must start all -inf); conf fp32 [7] = max softmax probability of each row; with p->temperature T > 0,
+// qstats fp32 [7, 2] = (max_x l_x / T, sum_x exp(l_x / T - max)) of each row, the statistics of the draft
+// distribution q = softmax(draft_logits / T) the acceptance needs; prev_cand <- cand_idx; p->draws += 1.
 void markov_finish(const std::int32_t* cand_idx, const float* cand_logits, const unsigned long long* picks,
                    std::int32_t* prev_cand, float* draft_logits, int V, std::int32_t* tokens, float* conf,
-                   DraftParams* p, cudaStream_t stream);
+                   float* qstats, DraftParams* p, cudaStream_t stream);
 
 // ---- load time -----------------------------------------------------------------------------------------
 
@@ -146,13 +196,15 @@ struct AcceptResult {
 void greedy_accept(const std::int32_t* target, const std::int32_t* drafts, int n, AcceptResult* out,
                    cudaStream_t stream);
 
-// Sampled, first half: p fp32 [n + 1, V] (engine._probs of the verify rows), draft_logits fp32 [n, V],
-// u fp32 [n] uniforms. q_r = softmax(draft_logits[r] / T); accepted = number of leading r with
-// u_r q_r(d_r) < p_r(d_r). resid fp32 [V] = max(p_a - q_a, 0) (a = accepted < n) or p_n (a = n); when its
-// sum is 0 it is replaced by p_a. The next token is then a multinomial draw from resid (unnormalised),
-// which the caller writes to out->next. ws: fp32 [2 * GAMMA + 1]. n in 1..GAMMA.
+// Sampled: p fp32 [n + 1, V] (engine._probs of the verify rows), draft_logits fp32 [n, V] with their q
+// statistics qstats fp32 [n, 2] (markov_finish), u fp32 [n] uniforms. q_r = softmax(draft_logits[r] / T);
+// accepted = number of leading r with u_r q_r(d_r) < p_r(d_r). resid fp32 [V] = max(p_a - q_a, 0)
+// (a = accepted < n) or p_n (a = n); when its sum is 0 it is replaced by p_a. The next token is then a
+// multinomial draw from resid (unnormalised), which the caller writes to out->next.
+// ws: sampled_accept_workspace_floats(V) floats. n in 1..GAMMA.
+std::size_t sampled_accept_workspace_floats(int V);
 void sampled_accept(const float* p, const float* draft_logits, int V, const std::int32_t* drafts, int n,
-                    float temperature, const float* u, float* ws, float* resid, AcceptResult* out,
-                    cudaStream_t stream);
+                    float temperature, const float* qstats, const float* u, float* ws, float* resid,
+                    AcceptResult* out, cudaStream_t stream);
 
 }  // namespace ingine::kernels::draft

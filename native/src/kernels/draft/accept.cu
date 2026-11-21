@@ -2,8 +2,6 @@
 #include "kernels/draft/draft.h"
 #include "kernels/draft/draft_device.cuh"
 
-#include "core/device.h"
-
 #include <stdexcept>
 
 namespace ingine::kernels::draft {
@@ -17,48 +15,33 @@ __global__ void greedy_accept_kernel(const std::int32_t* __restrict__ target, co
   out->next = target[acc];
 }
 
-constexpr int Q_THREADS = 1024;
 constexpr int R_THREADS = 256;
 constexpr int R_PER = 4;  // elements per thread in the residual kernels
+constexpr int R_SPAN = R_THREADS * R_PER;
 
-// q_r = softmax(draft_logits[r] / T): row max and sum (ws[2 r], ws[2 r + 1]); ws[2 GAMMA] = 0.
-__global__ void __launch_bounds__(Q_THREADS) q_stats_kernel(const float* __restrict__ draft_logits, int V,
-                                                            float temperature, float* __restrict__ ws) {
-  __shared__ float scratch[33];
-  const float* row = draft_logits + size_t(blockIdx.x) * V;
-  float m = -INFINITY;
-  for (int x = threadIdx.x; x < V; x += Q_THREADS) m = fmaxf(m, __fdiv_rn(row[x], temperature));
-  m = block_max(m, scratch);
-  float s = 0.f;
-  for (int x = threadIdx.x; x < V; x += Q_THREADS) s += expf(__fsub_rn(__fdiv_rn(row[x], temperature), m));
-  s = block_sum(s, scratch);
-  if (threadIdx.x == 0) {
-    ws[2 * blockIdx.x] = m;
-    ws[2 * blockIdx.x + 1] = s;
-    if (blockIdx.x == 0) ws[2 * GAMMA] = 0.f;
-  }
-}
+__host__ __device__ __forceinline__ int residual_blocks(int V) { return (V + R_SPAN - 1) / R_SPAN; }
 
+// q_r(x) = softmax(draft_logits[r] / T)(x) from the row's (max, sum) statistics
 __device__ __forceinline__ float q_of(const float* draft_logits, int V, int r, int x, float temperature,
-                                      const float* ws) {
+                                      const float* qstats) {
   const float s = __fdiv_rn(draft_logits[size_t(r) * V + x], temperature);
-  return __fdiv_rn(expf(__fsub_rn(s, ws[2 * r])), ws[2 * r + 1]);
+  return __fdiv_rn(expf(__fsub_rn(s, qstats[2 * r])), qstats[2 * r + 1]);
 }
 
-// accepted count (every CTA computes it), then the residual row and its sum
-__global__ void __launch_bounds__(R_THREADS) residual_kernel(const float* __restrict__ p,
-                                                             const float* __restrict__ draft_logits, int V,
-                                                             const std::int32_t* __restrict__ drafts, int n,
-                                                             float temperature, const float* __restrict__ u,
-                                                             float* __restrict__ ws, float* __restrict__ resid,
-                                                             AcceptResult* __restrict__ out) {
+// accepted count (every CTA computes it), then the residual row and this CTA's part of its sum (ws[block])
+__global__ void __launch_bounds__(R_THREADS) residual_kernel(const float* p, const float* draft_logits, int V,
+                                                             const std::int32_t* drafts, int n, float temperature,
+                                                             const float* qstats, const float* u, float* ws,
+                                                             float* resid, AcceptResult* out) {
   __shared__ int sh_acc;
   __shared__ float scratch[33];
+  pdl_trigger();
+  pdl_wait();
   if (threadIdx.x == 0) {
     int acc = 0;
     for (; acc < n; ++acc) {
       const int d = drafts[acc];
-      const float qd = q_of(draft_logits, V, acc, d, temperature, ws);
+      const float qd = q_of(draft_logits, V, acc, d, temperature, qstats);
       const float pd = p[size_t(acc) * V + d];
       if (!(__fmul_rn(u[acc], qd) < pd)) break;
     }
@@ -69,27 +52,30 @@ __global__ void __launch_bounds__(R_THREADS) residual_kernel(const float* __rest
   const int a = sh_acc;
   const float* pa = p + size_t(a) * V;
   float s = 0.f;
-  const int x0 = blockIdx.x * R_THREADS * R_PER;
+  const int x0 = blockIdx.x * R_SPAN;
 #pragma unroll
   for (int j = 0; j < R_PER; ++j) {
     const int x = x0 + j * R_THREADS + threadIdx.x;
     if (x >= V) break;
-    const float w = a < n ? fmaxf(__fsub_rn(pa[x], q_of(draft_logits, V, a, x, temperature, ws)), 0.f) : pa[x];
+    const float w = a < n ? fmaxf(__fsub_rn(pa[x], q_of(draft_logits, V, a, x, temperature, qstats)), 0.f) : pa[x];
     resid[x] = w;
     s += w;
   }
   s = block_sum(s, scratch);
-  if (threadIdx.x == 0) atomicAdd(&ws[2 * GAMMA], s);
+  if (threadIdx.x == 0) ws[blockIdx.x] = s;
 }
 
-// all-zero residual: draw from p_a instead
-__global__ void __launch_bounds__(R_THREADS) residual_fallback_kernel(const float* __restrict__ p, int V,
-                                                                      const float* __restrict__ ws,
-                                                                      float* __restrict__ resid,
-                                                                      const AcceptResult* __restrict__ out) {
-  if (ws[2 * GAMMA] > 0.f) return;
+// all-zero residual: draw from p_a instead (the partial sums are added in a fixed order)
+__global__ void __launch_bounds__(R_THREADS) residual_fallback_kernel(const float* p, int V, const float* ws,
+                                                                      float* resid, const AcceptResult* out) {
+  __shared__ float scratch[33];
+  pdl_trigger();
+  pdl_wait();
+  float s = 0.f;
+  for (int b = threadIdx.x; b < residual_blocks(V); b += R_THREADS) s += ws[b];
+  if (block_sum(s, scratch) > 0.f) return;
   const float* pa = p + size_t(out->accepted) * V;
-  const int x0 = blockIdx.x * R_THREADS * R_PER;
+  const int x0 = blockIdx.x * R_SPAN;
 #pragma unroll
   for (int j = 0; j < R_PER; ++j) {
     const int x = x0 + j * R_THREADS + threadIdx.x;
@@ -106,18 +92,18 @@ void greedy_accept(const std::int32_t* target, const std::int32_t* drafts, int n
   CUDA_CHECK(cudaGetLastError());
 }
 
+std::size_t sampled_accept_workspace_floats(int V) { return std::size_t(residual_blocks(V)); }
+
 void sampled_accept(const float* p, const float* draft_logits, int V, const std::int32_t* drafts, int n,
-                    float temperature, const float* u, float* ws, float* resid, AcceptResult* out,
-                    cudaStream_t stream) {
+                    float temperature, const float* qstats, const float* u, float* ws, float* resid,
+                    AcceptResult* out, cudaStream_t stream) {
   if (n < 1 || n > GAMMA) throw std::invalid_argument("sampled_accept: n must be in 1..7");
   if (!(temperature > 0.f)) throw std::invalid_argument("sampled_accept: temperature must be positive");
-  q_stats_kernel<<<n, Q_THREADS, 0, stream>>>(draft_logits, V, temperature, ws);
-  CUDA_CHECK(cudaGetLastError());
-  const int blocks = (V + R_THREADS * R_PER - 1) / (R_THREADS * R_PER);
-  residual_kernel<<<blocks, R_THREADS, 0, stream>>>(p, draft_logits, V, drafts, n, temperature, u, ws, resid, out);
-  CUDA_CHECK(cudaGetLastError());
-  residual_fallback_kernel<<<blocks, R_THREADS, 0, stream>>>(p, V, ws, resid, out);
-  CUDA_CHECK(cudaGetLastError());
+  const dim3 blocks(residual_blocks(V));
+  launch_pdl(residual_kernel, blocks, dim3(R_THREADS), stream, p, draft_logits, V, drafts, n, temperature, qstats, u,
+             ws, resid, out);
+  launch_pdl(residual_fallback_kernel, blocks, dim3(R_THREADS), stream, p, V, static_cast<const float*>(ws), resid,
+             static_cast<const AcceptResult*>(out));
 }
 
 }  // namespace ingine::kernels::draft

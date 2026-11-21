@@ -12,6 +12,12 @@
 // attention) already differs by KL 6e-3 .. 8e-2 per stage with top-1 flips at near ties, while a real bug gives
 // KL >= 1 on most stages. --generate needs every selected case's greedy tokens to match exactly, so it is meant
 // for prompts without near ties (the CTest entries pick the BF16-cache chat and 300-token cases).
+// --path N checks long generations, where exact goldens cannot exist: the Generator (with --spec: speculative)
+// emits N greedy tokens per case; then a plain runtime prefills the same prompt and is teacher-forced along those
+// tokens with the width-1 graph. Every emitted token must be the plain argmax, or lose to it by at most
+// --tie-margin logits (speculative verification runs wider kernels whose rounding differs, so near ties may
+// resolve differently); without --spec the generator runs the same width-1 kernels and must match exactly.
+// N > 1024 covers the sliding-window ring wrap and the drafter's context buckets.
 #include "ingine/generator.h"
 
 #include "core/arena.h"
@@ -43,7 +49,9 @@ struct Args {
   fs::path golden = fs::path(INGINE_REPO_DIR) / "native" / "tests" / "golden" / "model";
   std::string filter;
   bool generate = false;
-  bool spec = false;  // --generate with DSpark speculative decoding: greedy must reproduce the goldens
+  bool spec = false;  // --generate / --path with DSpark speculative decoding
+  int path_tokens = 0;        // --path N
+  double tie_margin = 0.5;    // --tie-margin X
   double max_kl = 0.25;
   double max_mean_kl = 0.01;
   double min_top1 = 0.95;
@@ -52,7 +60,7 @@ struct Args {
 void usage() {
   std::printf(
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec]]\n"
-      "                       [--max-kl X] [--max-mean-kl X] [--min-top1 F]\n"
+      "                       [--path N [--spec] [--tie-margin X]] [--max-kl X] [--max-mean-kl X] [--min-top1 F]\n"
       "--cases takes comma-separated name substrings\n");
 }
 
@@ -150,9 +158,12 @@ void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& ca
   }
 }
 
+// A fresh Generator per case: the golden prompts share prefixes (t300 starts t2100 starts t5000), and a Generator
+// that reuses the previous request's prompt checkpoint prefills the rest with other chunk boundaries than the
+// goldens and the plain reference runtime, which is a different (equally valid) rounding of the same state.
 void run_generate(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cases, Totals& tot) {
-  auto gen = make_generator(opt);
   for (const auto& c : cases) {
+    auto gen = make_generator(opt);
     const std::string name = c.at("name");
     const std::vector<std::int32_t> ids = c.at("prompt_ids").get<std::vector<std::int32_t>>();
     const std::vector<std::int32_t> want = c.at("greedy_tokens").get<std::vector<std::int32_t>>();
@@ -170,6 +181,68 @@ void run_generate(const RuntimeOptions& opt, const std::vector<nlohmann::json>& 
     tot.add(s);
     std::printf("%-22s generate: %zu/%zu greedy tokens match  (prefill %.3f s, decode %.3f s, %d tokens)\n",
                 name.c_str(), match, want.size(), st.prefill_seconds, st.decode_seconds, st.generated_tokens);
+  }
+}
+
+// --path: see the file header. One stage per case; `top1` is the case's verdict.
+void run_path(RuntimeOptions opt, const std::vector<nlohmann::json>& cases, const Args& a, Totals& tot) {
+  const int N = a.path_tokens;
+  std::size_t longest = 0;
+  for (const auto& c : cases) longest = std::max(longest, c.at("prompt_ids").size());
+  opt.max_ctx = std::max(opt.max_ctx, int((longest + N + 64 + 4095) / 4096 * 4096));
+  std::vector<std::vector<std::int32_t>> emitted(cases.size());
+  for (std::size_t i = 0; i < cases.size(); ++i) {
+    RuntimeOptions g = opt;
+    g.spec = a.spec;
+    auto gen = make_generator(g);  // per case (see run_generate); freed before the plain runtime loads
+    Sampling greedy;
+    greedy.temperature = 0.f;
+    const std::vector<std::int32_t> ids = cases[i].at("prompt_ids").get<std::vector<std::int32_t>>();
+    const GenerateStats st = gen->generate(ids, N, greedy, {}, [&](std::span<const std::int32_t> t) {
+      emitted[i].insert(emitted[i].end(), t.begin(), t.end());
+      return true;
+    });
+    std::printf("%-22s generated %zu tokens at %.1f tok/s%s\n", cases[i].at("name").get<std::string>().c_str(),
+                emitted[i].size(), st.decode_seconds > 0 ? st.generated_tokens / st.decode_seconds : 0.0,
+                a.spec ? (", " + std::to_string(st.spec_rounds) + " rounds").c_str() : "");
+  }
+  opt.spec = false;
+  Runtime rt(opt);
+  Prefiller prefiller(rt.weights(), rt.ablation(), opt.prefill_chunk, rt.stream());
+  DeviceBuffer tokens(std::size_t(opt.prefill_chunk) * 4), logits(std::size_t(UNPADDED_VOCAB) * 4);
+  std::vector<float> host(UNPADDED_VOCAB);
+  auto fetch = [&](const float* d) {
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), d, host.size() * 4, cudaMemcpyDeviceToHost, rt.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(rt.stream()));
+  };
+  for (std::size_t i = 0; i < cases.size(); ++i) {
+    const std::string name = cases[i].at("name");
+    const std::vector<std::int32_t> ids = cases[i].at("prompt_ids").get<std::vector<std::int32_t>>();
+    const std::vector<std::int32_t>& out = emitted[i];
+    reset_state(rt.state(), rt.stream());
+    for (int s = 0; s < int(ids.size()); s += opt.prefill_chunk) {
+      const int T = std::min(opt.prefill_chunk, int(ids.size()) - s);
+      CUDA_CHECK(cudaMemcpyAsync(tokens.p, ids.data() + s, std::size_t(T) * 4, cudaMemcpyHostToDevice, rt.stream()));
+      prefiller.run(rt.state(), static_cast<const std::int32_t*>(tokens.p), T, s, static_cast<float*>(logits.p),
+                    nullptr);
+    }
+    int other = 0, first = -1;
+    double worst = 0;
+    for (std::size_t k = 0; k < out.size(); ++k) {
+      // logits that predict out[k]: the prefill's last row, then the step that consumed out[k - 1]
+      fetch(k == 0 ? static_cast<const float*>(logits.p) : rt.decode_logits(out[k - 1], int(ids.size() + k - 1)));
+      const int best = int(std::max_element(host.begin(), host.end()) - host.begin());
+      if (best == out[k]) continue;
+      ++other;
+      if (first < 0) first = int(k);
+      worst = std::max(worst, double(host[best]) - double(host[out[k]]));
+    }
+    Stage s;
+    s.top1 = int(out.size()) == N && worst <= (a.spec ? a.tie_margin : 0.0) && other <= (a.spec ? N / 20 : 0);
+    s.max_diff = worst;
+    tot.add(s);
+    std::printf("%-22s path: %zu tokens, %d not the plain argmax (first at %d), largest gap %.4f logits  %s\n",
+                name.c_str(), out.size(), other, first, worst, s.top1 ? "ok" : "FAIL");
   }
 }
 
@@ -192,6 +265,8 @@ int main(int argc, char** argv) {
     else if (k == "--cases") a.filter = val();
     else if (k == "--generate") a.generate = true;
     else if (k == "--spec") a.spec = true;
+    else if (k == "--path") a.path_tokens = std::stoi(val());
+    else if (k == "--tie-margin") a.tie_margin = std::stod(val());
     else if (k == "--max-kl") a.max_kl = std::stod(val());
     else if (k == "--max-mean-kl") a.max_mean_kl = std::stod(val());
     else if (k == "--min-top1") a.min_top1 = std::stod(val());
@@ -234,12 +309,15 @@ int main(int argc, char** argv) {
       opt.spec = a.generate && a.spec;
       std::printf("== %s model, %s full-attention KV\n", key.first ? "abliterated" : "original",
                   key.second ? "FP8" : "BF16");
-      if (a.generate) run_generate(opt, cases, tot);
+      if (a.path_tokens > 0) run_path(opt, cases, a, tot);
+      else if (a.generate) run_generate(opt, cases, tot);
       else run_pieces(opt, cases, tot);
     }
     const double top1 = tot.stages ? double(tot.top1) / tot.stages : 0.0;
     const double mean_kl = tot.stages ? tot.sum_kl / tot.stages : 0.0;
-    const bool ok = (a.generate || (tot.max_kl <= a.max_kl && mean_kl <= a.max_mean_kl)) && top1 >= a.min_top1;
+    const bool no_kl = a.generate || a.path_tokens > 0;
+    const bool ok = (no_kl || (tot.max_kl <= a.max_kl && mean_kl <= a.max_mean_kl)) &&
+                    top1 >= (a.path_tokens > 0 ? 1.0 : a.min_top1);
     std::printf("%s: %d stages, top1 %.3f, KL mean %.3e max %.3e (limits: KL mean %.3e max %.3e, top1 %.3f)\n",
                 ok ? "PASS" : "FAIL", tot.stages, top1, mean_kl, tot.max_kl, a.max_mean_kl, a.max_kl, a.min_top1);
     return ok ? 0 : 1;

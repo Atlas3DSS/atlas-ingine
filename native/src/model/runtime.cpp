@@ -1,5 +1,6 @@
 // Model runtime: weights + ablation + state + decoder, decode graphs per call width (engine.Engine._capture),
-// state snapshots and speculative rollback (engine.Engine._snapshot/_restore/_rollback).
+// state snapshots and speculative rollback (engine.Engine._snapshot/_restore/_rollback), pipelined width-1
+// steps and the switch graphs of device-selected verify widths.
 #include "model/runtime.h"
 
 #include "core/device.h"
@@ -20,23 +21,45 @@ DeviceBuffer device_copy(const Tensor& t, cudaStream_t stream) {
   return b;
 }
 
-// Contiguous ring-slot runs of the call rows [r0, r1) at positions P + r: (first slot, first row, count).
-struct SlotRun {
-  int slot, row, count;
-};
-std::vector<SlotRun> slot_runs(int P, int r0, int r1) {
-  std::vector<SlotRun> runs;
-  int r = r0;
-  while (r < r1) {
-    const int slot = (P + r) % WINDOW;
-    const int n = std::min(r1 - r, WINDOW - slot);
-    runs.push_back({slot, r, n});
-    r += n;
+// Carves consecutive 256-byte aligned pieces out of one allocation.
+struct Carve {
+  char* p;
+  template <class T>
+  T* take(std::size_t count) {
+    T* r = reinterpret_cast<T*>(p);
+    p += (count * sizeof(T) + 255) / 256 * 256;
+    return r;
   }
-  return runs;
-}
+};
+constexpr std::size_t carved(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
+
+constexpr std::size_t kUndoBytes = carved(std::size_t(NUM_VISITS) * CONV_ROW_FLOATS * 4) +
+                                   2 * carved(std::size_t(NUM_SLIDING_VISITS) * KV_DIM * 2) +
+                                   carved(std::size_t(NUM_SLIDING_VISITS) * 8);
+constexpr std::size_t kBackupBytes = 2 * carved(std::size_t(NUM_VISITS) * 3 * KV_DIM * 4) +
+                                     2 * carved(std::size_t(NUM_VISITS) * 3 * HIDDEN * 4) +
+                                     2 * carved(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM * 2) +
+                                     carved(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * 8);
 
 }  // namespace
+
+GraphExec::~GraphExec() {
+  if (exec_) cudaGraphExecDestroy(exec_);
+}
+
+GraphExec& GraphExec::operator=(GraphExec&& o) noexcept {
+  if (this != &o) {
+    if (exec_) cudaGraphExecDestroy(exec_);
+    exec_ = o.exec_;
+    o.exec_ = nullptr;
+  }
+  return *this;
+}
+
+void GraphExec::launch(cudaStream_t stream) const {
+  if (!exec_) throw std::logic_error("GraphExec::launch: empty graph");
+  CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+}
 
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
@@ -59,6 +82,19 @@ void Runtime::init() {
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
+  token_ = DeviceBuffer(kMaxWidth * sizeof(std::int64_t));
+  token_.fill(0);
+  CUDA_CHECK(cudaStreamCreateWithFlags(&capture_stream_, cudaStreamNonBlocking));
+  for (cudaEvent_t& e : chain_done_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+  chain_host_ = MappedHostBuffer(2 * sizeof(std::int32_t));
+  for (int i = 0; i < 2; ++i) {
+    undo_storage_[i] = DeviceBuffer(kUndoBytes);
+    Carve c{static_cast<char*>(undo_storage_[i].p)};
+    undo_[i].conv = c.take<float>(std::size_t(NUM_VISITS) * CONV_ROW_FLOATS);
+    undo_[i].k = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
+    undo_[i].v = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
+    undo_[i].pos = c.take<std::int64_t>(NUM_SLIDING_VISITS);
+  }
 
   buffers_.emplace(1, make_buffers(1));
   history_[1] = false;
@@ -68,16 +104,16 @@ void Runtime::init() {
       history_[w] = true;
       verify_widths_.push_back(w);
     }
-    const std::size_t kv_conv = std::size_t(NUM_VISITS) * 3 * KV_DIM * 4;
-    const std::size_t h_conv = std::size_t(NUM_VISITS) * 3 * HIDDEN * 4;
-    old_conv_[0] = DeviceBuffer(kv_conv);
-    old_conv_[1] = DeviceBuffer(kv_conv);
-    old_conv_[2] = DeviceBuffer(h_conv);
-    old_conv_[3] = DeviceBuffer(h_conv);
-    ring_k_backup_ = DeviceBuffer(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM * 2);
-    ring_v_backup_ = DeviceBuffer(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM * 2);
-    ring_pos_backup_ = DeviceBuffer(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * sizeof(std::int64_t));
+    backup_storage_ = DeviceBuffer(kBackupBytes);
+    Carve c{static_cast<char*>(backup_storage_.p)};
+    for (int i = 0; i < 4; ++i) backup_.conv[i] = c.take<float>(std::size_t(NUM_VISITS) * 3 * CONV_COLS[i]);
+    backup_.k = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
+    backup_.v = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
+    backup_.pos = c.take<std::int64_t>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth);
   }
+  // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
+  // write one place)
+  for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
   for (const auto& [m, history] : history_) capture(m, history);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
@@ -87,6 +123,9 @@ Runtime::~Runtime() {
   for (auto& [m, exec] : graphs_) cudaGraphExecDestroy(exec);
   graphs_.clear();
   decoder_.reset();
+  for (cudaEvent_t e : chain_done_)
+    if (e) cudaEventDestroy(e);
+  if (capture_stream_) cudaStreamDestroy(capture_stream_);
   if (stream_) cudaStreamDestroy(stream_);
 }
 
@@ -98,6 +137,18 @@ Buffers& Runtime::buffers(int m) {
   auto it = buffers_.find(m);
   if (it == buffers_.end()) throw std::invalid_argument("no decode buffers for width " + std::to_string(m));
   return it->second;
+}
+
+StatePtrs Runtime::state_ptrs() const {
+  StatePtrs p;
+  p.conv[0] = ptr<float>(state_.conv_k);
+  p.conv[1] = ptr<float>(state_.conv_v);
+  p.conv[2] = ptr<float>(state_.conv_attn);
+  p.conv[3] = ptr<float>(state_.conv_mlp);
+  p.k_ring = ptr<__nv_bfloat16>(state_.k_ring);
+  p.v_ring = ptr<__nv_bfloat16>(state_.v_ring);
+  p.ring_pos = ptr<std::int64_t>(state_.ring_pos);
+  return p;
 }
 
 void Runtime::capture(int m, bool history) {
@@ -129,13 +180,8 @@ void Runtime::capture(int m, bool history) {
 
 void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
   const int m = int(tokens.size());
-  Buffers& b = buffers(m);
-  std::array<std::int64_t, kMaxWidth> t{};
-  for (int i = 0; i < m; ++i) t[i] = tokens[i];
-  const std::int64_t p = position;
-  // pageable source: the call returns once the bytes are staged, so the locals may go out of scope
-  CUDA_CHECK(cudaMemcpyAsync(b.token.data, t.data(), std::size_t(m) * 8, cudaMemcpyHostToDevice, stream_));
-  CUDA_CHECK(cudaMemcpyAsync(pos_.p, &p, 8, cudaMemcpyHostToDevice, stream_));
+  buffers(m);  // the width must exist
+  set_step_inputs(tokens.data(), m, position, this->tokens(), pos(), stream_);
 }
 
 const float* Runtime::run_step(int m) {
@@ -157,6 +203,21 @@ const float* Runtime::decode_logits(std::int32_t token, int position) {
   return run_step(1);
 }
 
+void Runtime::chain_advance(const std::int32_t* sampled, int position) {
+  const int k = position & 1;
+  model::chain_advance(sampled, tokens(), pos(), position, static_cast<std::int32_t*>(chain_host_.device_ptr()) + k,
+                       state_ptrs(), undo_[k], stream_);
+  CUDA_CHECK(cudaEventRecord(chain_done_[k], stream_));
+}
+
+std::int32_t Runtime::chain_token(int position) {
+  const int k = position & 1;
+  CUDA_CHECK(cudaEventSynchronize(chain_done_[k]));
+  return static_cast<const volatile std::int32_t*>(chain_host_.data())[k];
+}
+
+void Runtime::chain_undo(int position) { model::chain_undo(state_ptrs(), undo_[position & 1], position, stream_); }
+
 Runtime::Snapshot Runtime::snapshot() {
   Snapshot s;
   for (const Tensor* t : {&state_.ring_pos, &state_.conv_k, &state_.conv_v, &state_.conv_attn, &state_.conv_mlp})
@@ -170,68 +231,118 @@ void Runtime::restore(const Snapshot& snap) {
     CUDA_CHECK(cudaMemcpyAsync(ts[i]->data, snap.tensors[i].p, ts[i]->bytes(), cudaMemcpyDeviceToDevice, stream_));
 }
 
+namespace {
+// the state tensors a prompt checkpoint holds, in checkpoint order
+std::array<const Tensor*, 7> checkpoint_tensors(const State& st) {
+  return {&st.k_ring, &st.v_ring, &st.ring_pos, &st.conv_k, &st.conv_v, &st.conv_attn, &st.conv_mlp};
+}
+}  // namespace
+
+std::size_t Runtime::checkpoint_bytes() const {
+  std::size_t n = 0;
+  for (const Tensor* t : checkpoint_tensors(state_)) n += carved(t->bytes());
+  return n;
+}
+
+void Runtime::save_checkpoint(void* dst) {
+  char* p = static_cast<char*>(dst);
+  for (const Tensor* t : checkpoint_tensors(state_)) {
+    CUDA_CHECK(cudaMemcpyAsync(p, t->data, t->bytes(), cudaMemcpyDefault, stream_));
+    p += carved(t->bytes());
+  }
+}
+
+void Runtime::restore_checkpoint(const void* src) {
+  const char* p = static_cast<const char*>(src);
+  for (const Tensor* t : checkpoint_tensors(state_)) {
+    CUDA_CHECK(cudaMemcpyAsync(t->data, p, t->bytes(), cudaMemcpyDefault, stream_));
+    p += carved(t->bytes());
+  }
+}
+
 void Runtime::save_verify(int P, int m) {
   if (verify_widths_.empty()) throw std::logic_error("save_verify needs the speculative widths (options.spec)");
-  if (m < 1 || m > kMaxWidth) throw std::invalid_argument("save_verify: width out of range");
-  const Tensor* conv[4] = {&state_.conv_k, &state_.conv_v, &state_.conv_attn, &state_.conv_mlp};
-  for (int i = 0; i < 4; ++i)
-    CUDA_CHECK(cudaMemcpyAsync(old_conv_[i].p, conv[i]->data, conv[i]->bytes(), cudaMemcpyDeviceToDevice, stream_));
-  // ring_backup = (k_ring[:, slots], v_ring[:, slots], ring_pos[:, slots]) for slots (P + i) % WINDOW
-  const std::size_t row = std::size_t(KV_DIM) * 2;
-  for (const SlotRun& r : slot_runs(P, 0, m)) {
-    for (auto [ring, backup] : {std::pair{&state_.k_ring, &ring_k_backup_}, std::pair{&state_.v_ring, &ring_v_backup_}})
-      CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(backup->p) + std::size_t(r.row) * row, kMaxWidth * row,
-                                   static_cast<const char*>(ring->data) + std::size_t(r.slot) * row, WINDOW * row,
-                                   std::size_t(r.count) * row, NUM_SLIDING_VISITS, cudaMemcpyDeviceToDevice, stream_));
-    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::int64_t*>(ring_pos_backup_.p) + r.row, kMaxWidth * 8,
-                                 static_cast<const std::int64_t*>(state_.ring_pos.data) + r.slot, WINDOW * 8,
-                                 std::size_t(r.count) * 8, NUM_SLIDING_VISITS, cudaMemcpyDeviceToDevice, stream_));
-  }
+  verify_save(state_ptrs(), backup_, nullptr, P, m, stream_);
 }
 
 void Runtime::rollback(int P, int commit, int m) {
   if (commit == m) return;
   if (commit < 1 || commit > m) throw std::invalid_argument("rollback: commit out of range");
-  Buffers& b = buffers(m);
-  // conv state = cat([old, hist], dim=1)[:, commit:commit + 3]
-  struct Conv {
-    const Tensor* state;
-    const DeviceBuffer* old;
-    const Tensor* hist;
-    int C;
-  };
-  const Conv convs[4] = {{&state_.conv_k, &old_conv_[0], &b.hist_k, KV_DIM},
-                         {&state_.conv_v, &old_conv_[1], &b.hist_v, KV_DIM},
-                         {&state_.conv_attn, &old_conv_[2], &b.hist_attn, HIDDEN},
-                         {&state_.conv_mlp, &old_conv_[3], &b.hist_mlp, HIDDEN}};
-  for (const Conv& c : convs) {
-    const std::size_t row = std::size_t(c.C) * 4;
-    for (int j = 0; j < 3; ++j) {
-      const int i = commit + j;
-      const char* src;
-      std::size_t spitch;
-      if (i < 3) {
-        src = static_cast<const char*>(c.old->p) + std::size_t(i) * row;
-        spitch = 3 * row;
-      } else {
-        src = static_cast<const char*>(c.hist->data) + std::size_t(i - 3) * row;
-        spitch = std::size_t(m) * row;
-      }
-      CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(c.state->data) + std::size_t(j) * row, 3 * row, src, spitch, row,
-                                   NUM_VISITS, cudaMemcpyDeviceToDevice, stream_));
+  const Buffers& b = buffers(m);
+  const float* hist[4] = {ptr<float>(b.hist_k), ptr<float>(b.hist_v), ptr<float>(b.hist_attn), ptr<float>(b.hist_mlp)};
+  verify_rollback(state_ptrs(), backup_, hist, nullptr, P, nullptr, commit, m, stream_);
+}
+
+void Runtime::record_step(int m, cudaStream_t stream) {
+  if (!graphs_.count(m)) throw std::invalid_argument("record_step: no decode graph for width " + std::to_string(m));
+  decoder_->decode(buffers(m), pos(), history_.at(m), stream);
+}
+
+void Runtime::record_save_verify(int m, cudaStream_t stream) {
+  if (verify_widths_.empty()) throw std::logic_error("record_save_verify needs the speculative widths (options.spec)");
+  verify_save(state_ptrs(), backup_, pos(), 0, m, stream);
+}
+
+void Runtime::record_rollback(int m, const std::int32_t* accepted, cudaStream_t stream) {
+  if (!history_.count(m) || !history_.at(m)) throw std::invalid_argument("record_rollback: width without history");
+  const Buffers& b = buffers(m);
+  const float* hist[4] = {ptr<float>(b.hist_k), ptr<float>(b.hist_v), ptr<float>(b.hist_attn), ptr<float>(b.hist_mlp)};
+  verify_rollback(state_ptrs(), backup_, hist, pos(), 0, accepted, 0, m, stream);
+}
+
+GraphExec Runtime::capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
+                                  const std::function<void(cudaStream_t, int)>& branch) {
+  if (verify_widths_.empty()) throw std::logic_error("capture_switch needs the speculative widths (options.spec)");
+  const cudaStream_t s = capture_stream_;
+  cudaGraph_t graph = nullptr;
+  CUDA_CHECK(cudaGraphCreate(&graph, 0));
+  struct Owned {
+    cudaGraph_t g;
+    ~Owned() { cudaGraphDestroy(g); }
+  } owned{graph};
+  // run `body` captured into `g` (an exception ends the capture first)
+  auto captured = [&](cudaGraph_t g, const std::function<void()>& body) {
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(s, g, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
+    try {
+      body();
+    } catch (...) {
+      cudaGraph_t out = nullptr;
+      cudaStreamEndCapture(s, &out);
+      throw;
     }
-  }
-  // ring slots of the rejected rows back to their saved contents
-  const std::size_t row = std::size_t(KV_DIM) * 2;
-  for (const SlotRun& r : slot_runs(P, commit, m)) {
-    for (auto [ring, backup] : {std::pair{&state_.k_ring, &ring_k_backup_}, std::pair{&state_.v_ring, &ring_v_backup_}})
-      CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(ring->data) + std::size_t(r.slot) * row, WINDOW * row,
-                                   static_cast<const char*>(backup->p) + std::size_t(r.row) * row, kMaxWidth * row,
-                                   std::size_t(r.count) * row, NUM_SLIDING_VISITS, cudaMemcpyDeviceToDevice, stream_));
-    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::int64_t*>(state_.ring_pos.data) + r.slot, WINDOW * 8,
-                                 static_cast<const std::int64_t*>(ring_pos_backup_.p) + r.row, kMaxWidth * 8,
-                                 std::size_t(r.count) * 8, NUM_SLIDING_VISITS, cudaMemcpyDeviceToDevice, stream_));
-  }
+    cudaGraph_t out = nullptr;
+    CUDA_CHECK(cudaStreamEndCapture(s, &out));
+  };
+
+  cudaGraphConditionalHandle handle;
+  CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, graph, 0, 0));
+  cudaGraph_t* bodies = nullptr;
+  captured(graph, [&] {
+    head(s, handle);
+    cudaStreamCaptureStatus status;
+    cudaGraph_t g = nullptr;
+    const cudaGraphNode_t* deps = nullptr;
+    const cudaGraphEdgeData* edges = nullptr;
+    std::size_t n = 0;
+    CUDA_CHECK(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &edges, &n));
+    cudaGraphNodeParams p{};
+    p.type = cudaGraphNodeTypeConditional;
+    p.conditional.handle = handle;
+    p.conditional.type = cudaGraphCondTypeSwitch;
+    p.conditional.size = unsigned(verify_widths_.size());
+    cudaGraphNode_t node = nullptr;
+    CUDA_CHECK(cudaGraphAddNode(&node, g, deps, edges, n, &p));
+    bodies = p.conditional.phGraph_out;
+    CUDA_CHECK(cudaStreamUpdateCaptureDependencies(s, &node, nullptr, 1, cudaStreamSetCaptureDependencies));
+  });
+  for (std::size_t i = 0; i < verify_widths_.size(); ++i)
+    captured(bodies[i], [&] { branch(s, verify_widths_[i]); });
+
+  cudaGraphExec_t exec = nullptr;
+  CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+  GraphExec result(exec);
+  CUDA_CHECK(cudaGraphUpload(exec, stream_));
+  return result;
 }
 
 }  // namespace ingine::model

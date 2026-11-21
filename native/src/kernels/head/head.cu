@@ -7,7 +7,8 @@
 //     (integer sums, so the result does not depend on the summation order);
 //   * the draw: Gumbel-max (argmax of z + G, G = -log(-log u)) over the kept tokens, an exact sample of the
 //     renormalised distribution without a prefix scan.
-// One CTA of 1024 threads per row; every pass streams the row from L2.
+// One CTA of 1024 threads per row for top-k / top-p (every pass streams the row from L2); the common cases
+// (argmax, plain sampling, softmax, draws from probabilities; up to 8 rows) use the multi-block passes below.
 #include "kernels/head/head.h"
 
 #include "core/device.h"
@@ -303,6 +304,193 @@ __global__ void uniform_kernel(int n, unsigned long long seed, unsigned long lon
                       (1.0f / 16777216.0f);
 }
 
+// ---- multi-block passes (rows <= kFastRows): kParts blocks per row each reduce a contiguous slice; the last
+// block of a row to finish (atomic counter, reset by it) combines the slice results in slice order. The
+// result equals the one-CTA kernels' exactly for the selections (max score, lowest index on ties) and up to
+// the summation order for the softmax sum.
+constexpr int kFast = 256;
+constexpr int kFastWarps = kFast / 32;
+constexpr int kParts = 64;
+constexpr int kFastRows = 8;
+
+struct SelectPartials {
+  float v[kFastRows][kParts];
+  int i[kFastRows][kParts];
+  unsigned done[kFastRows];
+};
+struct SoftmaxPartials {
+  float m[kFastRows][kParts];  // slice max of z
+  float s[kFastRows][kParts];  // slice sum of exp(z - m)
+  float zmax[kFastRows], sum[kFastRows];
+  unsigned done[kFastRows];
+};
+// one set per entry point (argmax, sample, sample_from_probs; sampling_probs)
+__device__ SelectPartials g_select[3];
+__device__ SoftmaxPartials g_softmax;
+
+enum class Score { Logit, GumbelLogit, GumbelProb };
+
+struct FastReduce {
+  float f[kFastWarps];
+  int i[kFastWarps];
+  bool last;
+};
+
+// (value, index) argmax over the block, ties to the lower index; result in thread 0.
+__device__ __forceinline__ void fast_argmax(float& v, int& i, FastReduce& r) {
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+    const int oi = __shfl_xor_sync(0xffffffffu, i, o);
+    if (better(ov, oi, v, i)) v = ov, i = oi;
+  }
+  if ((threadIdx.x & 31) == 0) r.f[threadIdx.x >> 5] = v, r.i[threadIdx.x >> 5] = i;
+  __syncthreads();
+  if (threadIdx.x == 0)
+    for (int w = 1; w < kFastWarps; ++w)
+      if (better(r.f[w], r.i[w], v, i)) v = r.f[w], i = r.i[w];
+}
+
+// True in every thread of the block that finished its row last (after publishing its own part).
+__device__ __forceinline__ bool finish_part(unsigned* done, FastReduce& r) {
+  if (threadIdx.x == 0) {
+    __threadfence();
+    r.last = atomicAdd(done, 1u) == kParts - 1;
+  }
+  __syncthreads();
+  if (!r.last) return false;
+  __threadfence();
+  return true;
+}
+
+template <Score S>
+__global__ void __launch_bounds__(kFast) select_kernel(const float* __restrict__ in, int V, long long stride, float inv_t,
+                                                       unsigned long long seed, unsigned long long counter,
+                                                       SelectPartials* __restrict__ part, std::int32_t* __restrict__ out) {
+  __shared__ FastReduce red;
+  const int r = blockIdx.y, b = blockIdx.x;
+  const float* row = in + r * stride;
+  const int chunk = (V + kParts - 1) / kParts;
+  const int v1 = min(V, (b + 1) * chunk);
+  float bv = -CUDART_INF_F;
+  int bi = INT_MAX;
+  for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
+    float s;
+    if constexpr (S == Score::Logit) {
+      s = row[v];
+    } else if constexpr (S == Score::GumbelLogit) {
+      s = __fadd_rn(__fmul_rn(row[v], inv_t),
+                    gumbel(seed, counter, static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(v)));
+    } else {
+      const float p = row[v];
+      if (!(p > 0.f)) continue;
+      s = __fadd_rn(logf(p), gumbel(seed, counter, static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(v)));
+    }
+    if (better(s, v, bv, bi)) bv = s, bi = v;
+  }
+  fast_argmax(bv, bi, red);
+  if (threadIdx.x == 0) part->v[r][b] = bv, part->i[r][b] = bi;
+  if (!finish_part(&part->done[r], red)) return;
+  bv = -CUDART_INF_F;
+  bi = INT_MAX;
+  if (threadIdx.x < kParts) {
+    bv = const_cast<volatile float&>(part->v[r][threadIdx.x]);
+    bi = const_cast<volatile int&>(part->i[r][threadIdx.x]);
+  }
+  fast_argmax(bv, bi, red);
+  if (threadIdx.x == 0) {
+    out[r] = bi == INT_MAX ? 0 : bi;
+    part->done[r] = 0;
+  }
+}
+
+// softmax statistics of z = row * inv_t per row: zmax and sum exp(z - zmax) into g_softmax
+__global__ void __launch_bounds__(kFast) softmax_stats_kernel(const float* __restrict__ in, int V, long long stride,
+                                                              float inv_t, SoftmaxPartials* __restrict__ part) {
+  __shared__ FastReduce red;
+  __shared__ float bmax;
+  const int r = blockIdx.y, b = blockIdx.x;
+  const float* row = in + r * stride;
+  const int chunk = (V + kParts - 1) / kParts;
+  const int v0 = b * chunk, v1 = min(V, (b + 1) * chunk);
+  float m = -CUDART_INF_F;
+  for (int v = v0 + threadIdx.x; v < v1; v += kFast) m = fmaxf(m, __fmul_rn(row[v], inv_t));
+  for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+  if ((threadIdx.x & 31) == 0) red.f[threadIdx.x >> 5] = m;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float x = red.f[0];
+    for (int w = 1; w < kFastWarps; ++w) x = fmaxf(x, red.f[w]);
+    bmax = x;
+  }
+  __syncthreads();
+  m = bmax;
+  float s = 0.f;
+  if (m > -CUDART_INF_F)
+    for (int v = v0 + threadIdx.x; v < v1; v += kFast) s += expf(__fmul_rn(row[v], inv_t) - m);
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+  __syncthreads();
+  if ((threadIdx.x & 31) == 0) red.f[threadIdx.x >> 5] = s;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float x = 0.f;
+    for (int w = 0; w < kFastWarps; ++w) x += red.f[w];
+    part->m[r][b] = m;
+    part->s[r][b] = x;
+  }
+  if (!finish_part(&part->done[r], red)) return;
+  if (threadIdx.x == 0) {
+    float zmax = -CUDART_INF_F;
+    for (int k = 0; k < kParts; ++k) zmax = fmaxf(zmax, const_cast<volatile float&>(part->m[r][k]));
+    float sum = 0.f;
+    for (int k = 0; k < kParts; ++k) {
+      const float mk = const_cast<volatile float&>(part->m[r][k]);
+      if (mk > -CUDART_INF_F) sum += const_cast<volatile float&>(part->s[r][k]) * expf(mk - zmax);
+    }
+    part->zmax[r] = zmax;
+    part->sum[r] = sum;
+    part->done[r] = 0;
+  }
+}
+
+__global__ void __launch_bounds__(kFast) softmax_write_kernel(const float* __restrict__ in, int V, long long stride,
+                                                              float inv_t, const SoftmaxPartials* __restrict__ part,
+                                                              float* __restrict__ probs) {
+  const int r = blockIdx.y, b = blockIdx.x;
+  const float* row = in + r * stride;
+  float* pr = probs + static_cast<long long>(r) * V;
+  const float zmax = part->zmax[r], sum = part->sum[r];
+  const int chunk = (V + kParts - 1) / kParts;
+  const int v1 = min(V, (b + 1) * chunk);
+  for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) pr[v] = expf(__fmul_rn(row[v], inv_t) - zmax) / sum;
+}
+
+template <class T>
+T* symbol(const T& sym) {
+  void* p = nullptr;
+  CUDA_CHECK(cudaGetSymbolAddress(&p, sym));
+  return static_cast<T*>(p);
+}
+
+template <Score S>
+void launch_select(const float* in, int rows, int V, std::int64_t stride, float inv_t, unsigned long long seed,
+                   unsigned long long counter, int entry, std::int32_t* out, cudaStream_t stream) {
+  static SelectPartials* const part = symbol(g_select[0]);
+  select_kernel<S><<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, seed, counter, part + entry, out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_softmax(const float* in, int rows, int V, std::int64_t stride, float inv_t, float* probs,
+                    cudaStream_t stream) {
+  static SoftmaxPartials* const part = symbol(g_softmax);
+  softmax_stats_kernel<<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, part);
+  CUDA_CHECK(cudaGetLastError());
+  softmax_write_kernel<<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, part, probs);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// the multi-block paths: up to kFastRows rows; sampling without top-k / top-p
+bool plain_sampling(const SamplingParams& p, int V) { return (p.top_k <= 0 || p.top_k >= V) && p.top_p >= 1.f; }
+
 void require(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(std::string("head: ") + what);
 }
@@ -316,7 +504,10 @@ void check_rows(const void* p, int rows, int V, std::int64_t stride) {
 void argmax(const float* logits, int rows, int V, std::int64_t stride, std::int32_t* out, cudaStream_t stream) {
   check_rows(logits, rows, V, stride);
   if (rows == 0) return;
-  argmax_kernel<<<rows, kBlock, 0, stream>>>(logits, V, stride, out);
+  if (rows <= kFastRows)
+    launch_select<Score::Logit>(logits, rows, V, stride, 1.f, 0, 0, 0, out, stream);
+  else
+    argmax_kernel<<<rows, kBlock, 0, stream>>>(logits, V, stride, out);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -326,6 +517,10 @@ void sampling_probs(const float* logits, int rows, int V, std::int64_t stride, c
   require(params.temperature > 0.f, "sampling_probs needs temperature > 0");
   if (rows == 0) return;
   const float inv_t = 1.0f / params.temperature;
+  if (rows <= kFastRows && plain_sampling(params, V)) {
+    launch_softmax(logits, rows, V, stride, inv_t, probs, stream);
+    return;
+  }
   dist_kernel<1><<<rows, kBlock, 0, stream>>>(logits, V, stride, inv_t, params.top_k, params.top_p, 0ull, 0ull,
                                               nullptr, probs);
   CUDA_CHECK(cudaGetLastError());
@@ -340,6 +535,10 @@ void sample(const float* logits, int rows, int V, std::int64_t stride, const Sam
     return;
   }
   const float inv_t = 1.0f / params.temperature;
+  if (rows <= kFastRows && plain_sampling(params, V)) {
+    launch_select<Score::GumbelLogit>(logits, rows, V, stride, inv_t, rng.seed, rng.counter++, 1, out, stream);
+    return;
+  }
   dist_kernel<0><<<rows, kBlock, 0, stream>>>(logits, V, stride, inv_t, params.top_k, params.top_p, rng.seed,
                                               rng.counter++, out, nullptr);
   CUDA_CHECK(cudaGetLastError());
@@ -349,7 +548,10 @@ void sample_from_probs(const float* probs, int rows, int V, std::int64_t stride,
                        cudaStream_t stream) {
   check_rows(probs, rows, V, stride);
   if (rows == 0) return;
-  multinomial_kernel<<<rows, kBlock, 0, stream>>>(probs, V, stride, rng.seed, rng.counter++, out);
+  if (rows <= kFastRows)
+    launch_select<Score::GumbelProb>(probs, rows, V, stride, 1.f, rng.seed, rng.counter++, 2, out, stream);
+  else
+    multinomial_kernel<<<rows, kBlock, 0, stream>>>(probs, V, stride, rng.seed, rng.counter++, out);
   CUDA_CHECK(cudaGetLastError());
 }
 

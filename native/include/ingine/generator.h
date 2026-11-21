@@ -19,8 +19,23 @@ struct Sampling {
   std::optional<uint64_t> seed;
 };
 
+// How the prompt reused the state of earlier requests (reused_tokens were not prefilled again).
+enum class Reuse {
+  None,        // empty state, the whole prompt prefilled
+  Extend,      // the prompt extends the tokens in the state (previous prompt + processed generated tokens)
+  Checkpoint,  // restored the checkpoint taken after the previous prompt's prefill (a prefix of this prompt)
+};
+inline const char* to_string(Reuse reuse) {
+  switch (reuse) {
+    case Reuse::Extend: return "extend";
+    case Reuse::Checkpoint: return "checkpoint";
+    default: return "none";
+  }
+}
+
 struct GenerateStats {
   int prompt_tokens = 0, reused_tokens = 0, generated_tokens = 0;
+  Reuse reuse = Reuse::None;
   double prefill_seconds = 0, decode_seconds = 0;
   int spec_rounds = 0, spec_accepted = 0;
 };

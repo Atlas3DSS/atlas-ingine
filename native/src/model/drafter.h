@@ -44,7 +44,7 @@ class Drafter {
   Drafter(const Drafter&) = delete;
   Drafter& operator=(const Drafter&) = delete;
 
-  // Captures the draft graphs (per bucket) and commit graphs (1..8 rows), then reset()s.
+  // Captures the draft graphs (per bucket) and the small-commit graph, then reset()s.
   void capture();
   // Empty context (local rings invalidated, length 0). Stream-ordered.
   void reset();
@@ -53,7 +53,8 @@ class Drafter {
   int ctx() const { return ctx_; }
 
   // Committed target rows (feats bf16 [n, 4, H] on the device, positions start..start+n-1) become draft
-  // context. n of 1..8 replays a commit graph; larger n (prefill chunks) runs eagerly in pieces of <= 1024.
+  // context. n of 1..8 replays the small-commit graph (feats must stay valid until it ran); larger n
+  // (prefill chunks) runs eagerly in pieces of <= 1024.
   void commit(const Tensor& feats, int start);
   void commit(const __nv_bfloat16* feats, int n, int start);
 
@@ -63,11 +64,32 @@ class Drafter {
     const std::int32_t* tokens;  // int32 [7]
     const float* logits;         // fp32 [7, V]: softcapped corrected logits, -inf outside the candidates
     const float* conf;           // fp32 [7]: max softmax probability per row (softmax(logits).amax(-1))
+    const float* qstats;         // fp32 [7, 2]: sampled drafts' q statistics (kernels::draft::markov_finish)
   };
   Draft draft(int anchor, int P, float temperature);
 
   // Seed of the Gumbel noise of sampled drafts (resets the draw counter). Stream-ordered.
   void set_seed(std::uint64_t seed);
+
+  // A speculative round's transition, entirely from device values (no host synchronisation), for a verify
+  // call at the last draft's position `start`: commits the accepted rows (n = *in.accepted + 1 rows of the
+  // taps of width *in.m) and drafts for the next anchor at start + n (kernels::draft::set_round).
+  // bind_round() fixes the inputs and captures one graph per context bucket (after capture()); advance()
+  // replays the one for `start`. length() is unknown until advanced(n) reports n.
+  void bind_round(const kernels::draft::RoundInputs& in);
+  Draft advance(int start);
+  void advanced(int n) { length_ = pending_start_ + n; }
+
+  // Prefix-reuse checkpoints of the draft context at the current length L (DecodeLoop's prompt checkpoints):
+  // the local rings and their positions, f_rnn, L, and the global-ring slots [0, min(L, ctx)) (the global
+  // ring has no position tags: a draft at P reads slots below min(P + 8, ctx) as positions == slot mod ctx).
+  // checkpoint_bytes() is the fixed size of any checkpoint (allocate once); save_checkpoint copies what L
+  // needs (stream-ordered, after the last commit). restore_checkpoint(src) of the last save into src brings
+  // the drafter back to exactly that state (draft()/commit() bit-identical, length() == L); the global slots
+  // are copied back only if a commit or draft since the save wrote one of them.
+  std::size_t checkpoint_bytes() const;
+  void save_checkpoint(void* dst);
+  void restore_checkpoint(const void* src);
 
   int vocab() const { return V_; }
 
@@ -77,9 +99,8 @@ class Drafter {
     float* probs;                            // fp32 [8, V]: engine._probs of the verify rows
     float* resid;                            // fp32 [V]
     float* uniforms;                         // fp32 [7]
-    float* ws;                               // fp32 [2 * GAMMA + 1]
+    float* ws;                               // fp32 [sampled_accept_workspace_floats(V)]
     kernels::draft::AcceptResult* result;    // device
-    void* host;                              // pinned: AcceptResult, then tokens [7] + conf [7]
   };
   const AcceptScratch& accept_scratch() const { return accept_; }
   cudaStream_t stream() const { return stream_; }
@@ -90,7 +111,7 @@ class Drafter {
     kernels::dense::Matrix qkv, gate_up;  // FP8 rows + scales
     const __nv_bfloat16* wo;              // [H, 3072]
     const __nv_bfloat16* w_down;          // [H, inter]
-    const __nv_bfloat16* wkv_ctx;         // [2048, H]: k_proj_ctx | v_proj_ctx
+    const __nv_bfloat16* wkv_ctx;         // [2048, H]: k_proj_ctx | v_proj_ctx (a view into wkv_all_)
     __nv_bfloat16 *k_ctx, *v_ctx;         // [slots, 8, 128]
     std::int32_t* ctx_pos;                // local layers: int32 [WINDOW]; null for the global layer
   };
@@ -98,7 +119,9 @@ class Drafter {
   void* alloc(std::size_t bytes);
   void load(const std::filesystem::path& model_dir);
   void run_draft(int bucket);
-  void run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece);
+  void run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece);  // large commits
+  void run_small_commit();                                                      // from params_
+  void run_advance(int bucket);                                                 // round transition
   int bucket_for(int P) const;
 
   const Weights& w_;
@@ -107,6 +130,12 @@ class Drafter {
   int V_ = 0;
   int inter_ = 0;
   int length_ = 0;
+  int pending_start_ = 0;  // start of the last advance()
+  // the last checkpoint: where, its length, and whether the global slots it holds were overwritten since
+  const void* checkpoint_ = nullptr;
+  int checkpoint_length_ = 0;
+  bool checkpoint_clobbered_ = false;
+  void global_written(int begin, int end);  // positions [begin, end) written into the global ring
   std::vector<DeviceBuffer> storage_;
   kernels::draft::Bf16Gemm gemm_;
 
@@ -116,26 +145,32 @@ class Drafter {
   const __nv_bfloat16 *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;
   __nv_bfloat16 *fold_w_ = nullptr, *fold_b_ = nullptr;
   kernels::dense::Matrix head_{};
+  kernels::dense::Matrix wkv_all_{};      // BF16 [3 * 2048, H]: the three layers' k/v context projections
+  kernels::draft::CtxLayers ctx_layers_{};
 
   // per-call state and scratch
   kernels::draft::DraftParams* params_ = nullptr;
-  __nv_bfloat16 *res_ = nullptr, *xn_ = nullptr, *q_ = nullptr, *attn_o_ = nullptr, *delta_ = nullptr,
-                *act_ = nullptr, *f_rnn_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
-  float *qkv_out_ = nullptr, *gu_out_ = nullptr, *base_ = nullptr, *attn_ws_ = nullptr;
+  __nv_bfloat16 *res_ = nullptr, *xn_ = nullptr, *q_ = nullptr, *attn_o_ = nullptr, *act_ = nullptr,
+                *f_rnn_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
+  float *qkv_out_ = nullptr, *gu_out_ = nullptr, *delta_ = nullptr, *base_ = nullptr, *attn_ws_ = nullptr;
   float *cand_val_ = nullptr, *cand_logits_ = nullptr, *part_ = nullptr;
+  void* topk_ws_ = nullptr;
   std::int32_t *cand_idx_ = nullptr, *prev_cand_ = nullptr;
   unsigned long long* picks_ = nullptr;
-  float *draft_logits_ = nullptr, *conf_ = nullptr;
+  float *draft_logits_ = nullptr, *conf_ = nullptr, *qstats_ = nullptr;
   std::int32_t* tokens_ = nullptr;
-  int *seg_qkv_ = nullptr, *seg_gate_up_ = nullptr, *seg_head_ = nullptr;
-  // commit scratch
-  __nv_bfloat16 *commit_feats_ = nullptr, *ctx_c_ = nullptr, *ctx_kv_ = nullptr;
+  int *seg_qkv_ = nullptr, *seg_gate_up_ = nullptr, *seg_head_ = nullptr, *seg_kv_ = nullptr;
+  // commit scratch: large commits (cuBLASLt) and the small commit (dense proj over the three layers)
+  __nv_bfloat16 *warm_feats_ = nullptr, *ctx_c_ = nullptr, *ctx_kv_ = nullptr, *commit_xin_ = nullptr;
+  float* commit_kv_ = nullptr;
 
   AcceptScratch accept_{};
-  PinnedHostBuffer pinned_{256};
 
-  std::map<int, cudaGraphExec_t> draft_graphs_;   // bucket -> graph, ascending
-  std::map<int, cudaGraphExec_t> commit_graphs_;  // rows -> graph
+  std::map<int, cudaGraphExec_t> draft_graphs_;    // bucket -> graph, ascending
+  cudaGraphExec_t commit_graph_ = nullptr;         // the small commit (1..8 rows, from params_)
+  kernels::draft::RoundInputs round_{};            // bind_round()
+  bool round_bound_ = false;
+  std::map<int, cudaGraphExec_t> advance_graphs_;  // bucket -> round transition graph
 };
 
 }  // namespace ingine::model
