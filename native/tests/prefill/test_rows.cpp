@@ -320,6 +320,7 @@ int main() {
   ok &= test_attn_prep(rng, true, false, 7, 9000);
   ok &= test_attn_prep(rng, true, true, 7, 20000);
   ok &= test_rel_logits(rng, 21);
+  ok &= test_rel_logits(rng, 300);
   ok &= test_conv(rng, 2);
   ok &= test_conv(rng, 37);
   ok &= test_gates(rng, 5);

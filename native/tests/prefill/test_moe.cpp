@@ -85,7 +85,7 @@ bool run(Rng& rng, int fmt, int T) {
   DeviceArray<float> d_logits(logits), d_bias(bias), d_wts(size_t(T) * TOPK);
   DeviceArray<int> d_idx(size_t(T) * TOPK), counts(E), tiles_n(1), pair_token(size_t(T) * TOPK),
       pair_dst(size_t(T) * TOPK);
-  DeviceArray<int4> tiles(pk::moe_max_tiles(T));
+  DeviceArray<int4> tiles(pk::moe_tiles_capacity(T));
   DeviceArray<uint8_t> c13(w13.codes), s13(w13.scales), c2(w2.codes), s2(w2.scales);
   DeviceArray<float> f13(fmt == 0 ? w13.factor : std::vector<float>(1)), f2(fmt == 0 ? w2.factor : std::vector<float>(1));
   DeviceArray<uint16_t> d_x(x), act(size_t(T) * TOPK * I), down(size_t(T) * TOPK * H), out(size_t(T) * H);
@@ -140,7 +140,7 @@ bool run(Rng& rng, int fmt, int T) {
     for (int i = 0; i < nt; ++i) {
       const int4 tile = tl[i];
       covered += tile.z;
-      bad += tile.z <= 0 || tile.z > pk::kMoeTileRows;
+      bad += tile.z <= 0 || tile.z > pk::moe_tile_rows(T);
       for (int r = 0; r < tile.z; ++r) {
         const int pp = tile.y + r, dst = pdst[pp];
         bad += dst / TOPK != ptok[pp] || idx[dst] != tile.x;
@@ -226,6 +226,8 @@ int main() {
   ok &= run(rng, 0, 200);
   ok &= run(rng, 1, 200);
   ok &= run(rng, 0, 9);
+  ok &= run(rng, 0, 700);  // 128-row tiles (T > 512)
+  ok &= run(rng, 1, 700);
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

@@ -4,9 +4,9 @@ foreach(name attention moe rows)
   endif()
 endforeach()
 
-# Kernel timings at production sizes; exits 77 (skip) unless INGINE_BENCH=1.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench_prefill.cu)
-  ingine_add_test(NAME prefill_bench SOURCES bench_prefill.cu LIBS ingine_kernels_prefill GPU LABELS bench
+# Kernel timings at production sizes with real layer weights; exits 77 (skip) unless INGINE_BENCH=1.
+if(TARGET ingine_model AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench_prefill.cu)
+  ingine_add_test(NAME prefill_bench SOURCES bench_prefill.cu LIBS ingine_model GPU MODEL LABELS bench
                   TIMEOUT 900)
 endif()
 
@@ -28,4 +28,10 @@ endif()
 if(TARGET ingine_model AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench_prefill_synth.cu)
   ingine_add_test(NAME prefill_synth_bench SOURCES bench_prefill_synth.cu LIBS ingine_model GPU LABELS bench
                   TIMEOUT 900)
+endif()
+
+# Real-model timing at (chunk, context) points for nsys kernel breakdowns; exits 77 unless INGINE_BENCH=1.
+if(TARGET ingine_model AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/profile_prefill_model.cpp)
+  ingine_add_test(NAME prefill_profile SOURCES profile_prefill_model.cpp LIBS ingine_model nlohmann_json::nlohmann_json
+                  GPU MODEL LABELS bench TIMEOUT 900)
 endif()

@@ -17,7 +17,6 @@ inline constexpr int kKvDim = kKvHeads * kHeadDim;  // 1024
 inline constexpr int kInter = 1152, kExperts = 128, kTopK = 8;
 inline constexpr int kAttnKeyTile = 64;    // keys per attention tile (tile bounds granularity)
 inline constexpr int kAttnMaxTiles = 64;   // explicit-position key tiles per call (ring + chunk)
-inline constexpr int kMoeTileRows = 128;   // (token, expert) pairs per grouped-GEMM tile
 
 // ------------------------------------------------------------------------------------------------- GEMM
 
@@ -133,12 +132,17 @@ struct MoeWork {
   int* pair_token = nullptr;  // [T * 8] token of each expert-sorted pair
   int* pair_dst = nullptr;    // [T * 8] t * 8 + slot of each expert-sorted pair
 };
-inline int moe_max_tiles(int T) { return (T * kTopK + kMoeTileRows - 1) / kMoeTileRows + kExperts; }
+// (token, expert) pairs per grouped-GEMM tile: 32 for small chunks (few pairs per expert: deeper weight
+// prefetch), 128 otherwise. INGINE_MOE_TILE_ROWS (32 or 128) overrides it (benchmarks).
+int moe_tile_rows(int T);
+inline int moe_max_tiles(int T) { return (T * kTopK + moe_tile_rows(T) - 1) / moe_tile_rows(T) + kExperts; }
+// tile-list capacity for every chunk size up to max_T
+int moe_tiles_capacity(int max_T);
 
 // Router selection on FP32 logits [T, 128] (x . router^T): s = sigmoid, top-8 of s + bias (descending),
 // wts = 8 s / (sum s + 1e-20); counts[e] += hits.
 void moe_topk(const float* logits, const float* bias, int T, int* idx, float* wts, int* counts, cudaStream_t stream);
-// Expert-sorted pair lists and 128-pair tiles from idx and counts.
+// Expert-sorted pair lists and moe_tile_rows(T)-pair tiles from idx and counts.
 void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream);
 
 struct MoeExperts {

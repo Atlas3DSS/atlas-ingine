@@ -1,7 +1,12 @@
-// Prefill kernel timings at production sizes (T = 2048 chunk): attention over a 16K / 64K / 255K full cache
-// (BF16 and FP8) and a sliding visit, grouped MoE (NVFP4, MXFP8, all 128 experts hit), the dense projection
-// GEMMs, and the per-visit row kernels. Random data; < 2 GB of GPU memory. Runs only with INGINE_BENCH=1.
+// Prefill kernel timings with real layer weights (dense FP8 rows, NVFP4 and MXFP8 experts), rotating over layers
+// and caches so L2 does not serve the weights / keys from an earlier repetition. Per chunk size T: grouped MoE
+// (router + gate/up + down on real routing of random hidden rows), dense projections (proj + wo), relative
+// logits, sliding attention, full attention over an FP8 cache at 20K context, and full attention at 131K for
+// T = 2048. Prints ms, TFLOP/s of useful MMA work and GB/s of weight bytes. Needs the model (MODEL label) and
+// ~5 GB of GPU memory. Runs only with INGINE_BENCH=1.
+#include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
+#include "model/runtime.h"
 #include "common/test_util.h"
 
 #include <cuda_runtime.h>
@@ -9,9 +14,13 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
+#include <string>
 #include <vector>
 
+using namespace ingine;
+using namespace ingine::model;
 using namespace ingine::test;
 namespace pk = ingine::kernels::prefill;
 
@@ -21,36 +30,38 @@ __global__ void fill_bf16(uint16_t* p, size_t n, uint32_t seed, float scale) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
     uint32_t h = uint32_t(i) * 2654435761u ^ seed;
     h ^= h >> 15, h *= 2246822519u, h ^= h >> 13;
-    const float u = (h & 0xffffff) / 16777216.f - 0.5f;
-    p[i] = __bfloat16_as_ushort(__float2bfloat16(u * scale));
+    p[i] = __bfloat16_as_ushort(__float2bfloat16(((h & 0xffffff) / 16777216.f - 0.5f) * scale));
   }
 }
-__global__ void fill_bytes(uint8_t* p, size_t n, uint32_t seed, uint8_t mask, uint8_t base) {
+__global__ void fill_e4m3(uint8_t* p, size_t n, uint32_t seed) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
     uint32_t h = uint32_t(i) * 2654435761u ^ seed;
     h ^= h >> 15, h *= 2246822519u, h ^= h >> 13;
-    p[i] = uint8_t((h & mask) | base);
+    p[i] = uint8_t((h & 0x80) | ((4 + ((h >> 8) & 3)) << 3) | ((h >> 12) & 7));  // |v| in [1/8, 1)
   }
 }
 
 template <class T>
 T* dalloc(size_t n) {
   T* p = nullptr;
-  INGINE_TEST_CUDA(cudaMalloc(&p, n * sizeof(T) + 16));
-  INGINE_TEST_CUDA(cudaMemset(p, 0, n * sizeof(T) + 16));
+  INGINE_TEST_CUDA(cudaMalloc(&p, n * sizeof(T) + 256));
+  INGINE_TEST_CUDA(cudaMemset(p, 0, n * sizeof(T) + 256));
   return p;
 }
 
-float time_ms(const std::function<void()>& f, int reps = 5) {
+cudaStream_t g_stream;
+
+// median of `reps` timings of f(rep) (each call gets its repetition index to rotate inputs)
+float time_ms(const std::function<void(int)>& f, int reps = 6) {
   cudaEvent_t a, b;
   cudaEventCreate(&a), cudaEventCreate(&b);
-  f();
-  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+  f(0);
+  INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
   std::vector<float> t;
   for (int i = 0; i < reps; ++i) {
-    cudaEventRecord(a);
-    f();
-    cudaEventRecord(b);
+    cudaEventRecord(a, g_stream);
+    f(i + 1);
+    cudaEventRecord(b, g_stream);
     cudaEventSynchronize(b);
     float ms;
     cudaEventElapsedTime(&ms, a, b);
@@ -58,162 +69,197 @@ float time_ms(const std::function<void()>& f, int reps = 5) {
   }
   INGINE_TEST_CUDA(cudaGetLastError());
   std::sort(t.begin(), t.end());
+  cudaEventDestroy(a), cudaEventDestroy(b);
   return t[t.size() / 2];
 }
 
+const __nv_bfloat16* bf(const void* p) { return static_cast<const __nv_bfloat16*>(p); }
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   const char* on = std::getenv("INGINE_BENCH");
   if (!on || std::string(on) != "1") {
     std::printf("skip: set INGINE_BENCH=1 to run the prefill benchmark\n");
     return kSkip;
   }
   if (skip_without_gpu()) return kSkip;
-  const int T = 2048, H = 2304;
-  const int ld = 8664;
-  auto* q = dalloc<uint16_t>(size_t(T) * 3072);
-  auto* rel = dalloc<uint16_t>(size_t(T) * 24 * 1024);
-  auto* proj = dalloc<uint16_t>(size_t(T) * ld);
-  auto* out = dalloc<uint16_t>(size_t(T) * 3072);
-  fill_bf16<<<1024, 256>>>(q, size_t(T) * 3072, 1, 4.f);
-  fill_bf16<<<1024, 256>>>(rel, size_t(T) * 24 * 1024, 2, 2.f);
-  fill_bf16<<<1024, 256>>>(proj, size_t(T) * ld, 3, 2.f);
-
-  // ---- attention, full cache
-  const int max_ctx = 262144;
-  auto* kc = dalloc<uint8_t>(size_t(max_ctx) * 1024);  // FP8 cache (256 MiB) / BF16 view for <= 128K
-  auto* vc = dalloc<uint8_t>(size_t(max_ctx) * 1024);
-  fill_bytes<<<4096, 256>>>(kc, size_t(max_ctx) * 1024, 4, 0x3f, 0x10);
-  fill_bytes<<<4096, 256>>>(vc, size_t(max_ctx) * 1024, 5, 0x3f, 0x10);
-  pk::AttnParams p;
-  p.q = reinterpret_cast<const __nv_bfloat16*>(q);
-  p.rel = reinterpret_cast<const __nv_bfloat16*>(rel);
-  p.proj = reinterpret_cast<const __nv_bfloat16*>(proj), p.ld = ld;
-  p.out = reinterpret_cast<__nv_bfloat16*>(out);
-  p.T = T;
-  for (bool fp8 : {false, true}) {
-    for (int ctx : {16384, 65536, 131072, 262144}) {
-      if (!fp8 && ctx > 131072) continue;
-      if (!fp8) fill_bf16<<<4096, 256>>>(reinterpret_cast<uint16_t*>(kc), size_t(ctx) * 1024, 6, 0.3f),
-                fill_bf16<<<4096, 256>>>(reinterpret_cast<uint16_t*>(vc), size_t(ctx) * 1024, 7, 2.f);
-      p.k = kc, p.v = vc, p.kv_fp8 = fp8, p.kpos = nullptr, p.bounds = nullptr;
-      p.pos0 = ctx - T, p.L = ctx, p.window = 0;
-      const float ms = time_ms([&] { pk::attention(p, nullptr); }, 3);
-      // causal pairs: T queries over pos0 + t + 1 keys, 24 heads, 4 * 128 flop per pair
-      const double flop = 24.0 * 512 * (double(T) * (ctx - T) + 0.5 * double(T) * T);
-      std::printf("attention full %s ctx=%6d: %8.3f ms  %6.1f TFLOP/s\n", fp8 ? "fp8 " : "bf16", ctx, ms,
-                  flop / ms / 1e9);
-    }
+  const std::string model_dir = INGINE_MODEL_DIR;
+  if (!std::ifstream(model_dir + "/config.json")) {
+    std::printf("skip: no model at %s\n", model_dir.c_str());
+    return kSkip;
   }
-  // ---- attention, sliding (ring full + chunk)
-  {
-    const int L = 1024 + T, kr = (L + 63) / 64 * 64;
-    auto* rk = dalloc<uint16_t>(size_t(1024) * 1024);
-    auto* rv = dalloc<uint16_t>(size_t(1024) * 1024);
-    auto* rp = dalloc<int64_t>(1024);
-    std::vector<int64_t> pos(1024);
-    const int pos0 = 50000;
-    for (int s = 0; s < 1024; ++s) pos[s] = pos0 - 1024 + ((s - pos0 % 1024 + 1024) % 1024);
-    INGINE_TEST_CUDA(cudaMemcpy(rp, pos.data(), 1024 * 8, cudaMemcpyHostToDevice));
-    auto* krows = dalloc<uint16_t>(size_t(L) * 1024);
-    auto* vrows = dalloc<uint16_t>(size_t(L) * 1024);
-    fill_bf16<<<4096, 256>>>(krows, size_t(L) * 1024, 8, 0.3f);
-    fill_bf16<<<4096, 256>>>(vrows, size_t(L) * 1024, 9, 2.f);
-    auto* kp = dalloc<int>(kr);
-    auto* bounds = dalloc<int4>(kr / 64);
-    const float gather = time_ms([&] {
-      pk::ring_gather(reinterpret_cast<const __nv_bfloat16*>(rk), reinterpret_cast<const __nv_bfloat16*>(rv), rp, pos0,
-                      T, reinterpret_cast<__nv_bfloat16*>(krows), reinterpret_cast<__nv_bfloat16*>(vrows), kp, kr,
-                      nullptr);
-      pk::key_tile_bounds(kp, L, bounds, nullptr);
-    });
-    p.k = krows, p.v = vrows, p.kv_fp8 = false, p.kpos = kp, p.bounds = bounds, p.L = L, p.pos0 = pos0, p.window = 1024;
-    const float ms = time_ms([&] { pk::attention(p, nullptr); });
-    const double flop = 24.0 * 512 * double(T) * 1024;
-    std::printf("attention sliding: %8.3f ms  %6.1f TFLOP/s (window pairs)  gather+bounds %.3f ms\n", ms,
-                flop / ms / 1e9, gather);
-  }
-  cudaFree(kc), cudaFree(vc);
+  // sections: moe dense attn (default all)
+  std::string only = argc > 1 ? argv[1] : "all";
+  auto want = [&](const char* s) { return only == "all" || only.find(s) != std::string::npos; };
+  INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
+  const cudaStream_t s = g_stream;
+  const int H = HIDDEN, maxT = 2048;
+  std::vector<int> Ts = {64, 256, 1024, 2048};
+  if (const char* ts = std::getenv("INGINE_BENCH_T")) Ts = {std::atoi(ts)};  // one chunk size (profiling)
 
-  // ---- MoE
-  {
-    auto* x = dalloc<uint16_t>(size_t(T) * H);
-    fill_bf16<<<1024, 256>>>(x, size_t(T) * H, 10, 3.f);
-    std::vector<float> logits(size_t(T) * 128);
-    Rng rng(5);
-    for (auto& v : logits) v = float(rng.normal());
-    auto* dl = dalloc<float>(logits.size());
-    INGINE_TEST_CUDA(cudaMemcpy(dl, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice));
-    auto* bias = dalloc<float>(128);
-    auto* idx = dalloc<int>(size_t(T) * 8);
-    auto* wts = dalloc<float>(size_t(T) * 8);
-    pk::MoeWork w{dalloc<int>(128), dalloc<int>(1), dalloc<int4>(pk::moe_max_tiles(T)), dalloc<int>(size_t(T) * 8),
-                  dalloc<int>(size_t(T) * 8)};
-    auto* act = dalloc<uint16_t>(size_t(T) * 8 * 1152);
-    auto* down = dalloc<uint16_t>(size_t(T) * 8 * H);
-    auto* sum = dalloc<uint16_t>(size_t(T) * H);
-    const float route = time_ms([&] {
-      cudaMemsetAsync(w.counts, 0, 128 * 4);
-      pk::moe_topk(dl, bias, T, idx, wts, w.counts, nullptr);
-      pk::moe_route(idx, T, w, nullptr);
-    });
-    for (int fmt : {0, 1}) {
-      const size_t n13 = size_t(128) * 2304 * (fmt == 0 ? 1152 : 2304), n2 = n13 / 2;
-      auto* c13 = dalloc<uint8_t>(n13);
-      auto* s13 = dalloc<uint8_t>(n13 / (fmt == 0 ? 8 : 32));
-      auto* c2 = dalloc<uint8_t>(n2);
-      auto* s2 = dalloc<uint8_t>(n2 / (fmt == 0 ? 8 : 32));
-      fill_bytes<<<4096, 256>>>(c13, n13, 11, fmt == 0 ? 0xff : 0x3f, fmt == 0 ? 0 : 0x10);
-      fill_bytes<<<4096, 256>>>(c2, n2, 12, fmt == 0 ? 0xff : 0x3f, fmt == 0 ? 0 : 0x10);
-      fill_bytes<<<4096, 256>>>(s13, n13 / (fmt == 0 ? 8 : 32), 13, 0x07, fmt == 0 ? 0x30 : 0x78);
-      fill_bytes<<<4096, 256>>>(s2, n2 / (fmt == 0 ? 8 : 32), 14, 0x07, fmt == 0 ? 0x30 : 0x78);
-      std::vector<float> ones(128, 0.02f);
-      auto* f = dalloc<float>(128);
-      INGINE_TEST_CUDA(cudaMemcpy(f, ones.data(), 512, cudaMemcpyHostToDevice));
-      pk::MoeExperts e{fmt, c13, s13, fmt == 0 ? f : nullptr, c2, s2, fmt == 0 ? f : nullptr};
-      const float up = time_ms([&] {
-        pk::moe_gate_up(e, reinterpret_cast<const __nv_bfloat16*>(x), T, w, reinterpret_cast<__nv_bfloat16*>(act), nullptr);
-      });
-      const float dn = time_ms([&] {
-        pk::moe_down(e, reinterpret_cast<const __nv_bfloat16*>(act), T, w, reinterpret_cast<__nv_bfloat16*>(down), nullptr);
-      });
-      const float cb = time_ms([&] {
-        pk::moe_combine(reinterpret_cast<const __nv_bfloat16*>(down), wts, T, reinterpret_cast<__nv_bfloat16*>(sum), nullptr);
-      });
-      const double fu = 2.0 * T * 8 * 2304 * 2304, fd = 2.0 * T * 8 * 2304 * 1152;
-      std::printf("moe %s: gate_up %.3f ms (%.1f TFLOP/s)  down %.3f ms (%.1f TFLOP/s)  combine %.3f ms  route %.3f ms\n",
-                  fmt == 0 ? "nvfp4" : "mxfp8", up, fu / up / 1e9, dn, fd / dn / 1e9, cb, route);
-      cudaFree(c13), cudaFree(s13), cudaFree(c2), cudaFree(s2), cudaFree(f);
+  std::vector<DeviceBuffer> storage;
+  std::vector<Layer> nv;  // NVFP4 layers (sliding 1, 2, 3 and full 5)
+  for (int l : {1, 2, 3, 5}) nv.push_back(load_layer(model_dir, l, true, s, storage));
+  std::vector<Layer> mx;
+  if (want("moe")) mx.push_back(load_layer(model_dir, 20, true, s, storage));
+  INGINE_TEST_CUDA(cudaStreamSynchronize(s));
+  pk::Gemm gemm;
+
+  auto* x = dalloc<uint16_t>(size_t(maxT) * H);
+  fill_bf16<<<1024, 256, 0, s>>>(x, size_t(maxT) * H, 1, 3.4f);
+
+  if (want("moe")) {
+    auto* logits = dalloc<float>(size_t(maxT) * 128);
+    auto* idx = dalloc<int>(size_t(maxT) * 8);
+    auto* wts = dalloc<float>(size_t(maxT) * 8);
+    pk::MoeWork w{dalloc<int>(128), dalloc<int>(1), dalloc<int4>(pk::moe_tiles_capacity(maxT)), dalloc<int>(size_t(maxT) * 8),
+                  dalloc<int>(size_t(maxT) * 8)};
+    auto* act = dalloc<uint16_t>(size_t(maxT) * 8 * 1152);
+    auto* down = dalloc<uint16_t>(size_t(maxT) * 8 * H);
+    auto route = [&](const Layer& L, int T) {
+      gemm.run(bf(x), H, bf(L.router_bf16.data), H, logits, 128, true, T, 128, H, s);
+      cudaMemsetAsync(w.counts, 0, 512, s);
+      pk::moe_topk(logits, static_cast<const float*>(L.router_bias.data), T, idx, wts, w.counts, s);
+      pk::moe_route(idx, T, w, s);
+    };
+    auto experts = [](const Layer& L) {
+      const Experts& e = L.experts;
+      return pk::MoeExperts{e.fmt == ExpertFormat::NVFP4 ? 0 : 1, e.w13.data, e.w13_scale.data,
+                            static_cast<const float*>(e.w13_factor.data), e.w2.data, e.w2_scale.data,
+                            static_cast<const float*>(e.w2_factor.data)};
+    };
+    for (auto* set : {&nv, &mx}) {
+      const bool nvfp4 = set == &nv;
+      // per layer: route once (routing differs per layer), then time gate/up and down rotating over the layers
+      for (int T : Ts) {
+        std::vector<int> touched(set->size());
+        // each layer's routing lives in its own work buffers? Routing is cheap: re-route inside the timed loop
+        // would add its time; instead time route+gemm and route alone.
+        const float t_route = time_ms([&](int r) { route((*set)[r % set->size()], T); });
+        const float t_up = time_ms([&](int r) {
+          const Layer& L = (*set)[r % set->size()];
+          route(L, T);
+          pk::moe_gate_up(experts(L), bf(x), T, w, reinterpret_cast<__nv_bfloat16*>(act), s);
+        }) - t_route;
+        const float t_down = time_ms([&](int r) {
+          const Layer& L = (*set)[r % set->size()];
+          route(L, T);
+          pk::moe_down(experts(L), bf(act), T, w, reinterpret_cast<__nv_bfloat16*>(down), s);
+        }) - t_route;
+        // experts touched by the last routing
+        std::vector<int> counts(128);
+        INGINE_TEST_CUDA(cudaMemcpy(counts.data(), w.counts, 512, cudaMemcpyDeviceToHost));
+        const int hit = int(std::count_if(counts.begin(), counts.end(), [](int c) { return c > 0; }));
+        const double per_expert13 = nvfp4 ? 2304.0 * 1152 * (1 + 1.0 / 8) : 2304.0 * 2304 * (1 + 1.0 / 32);
+        const double per_expert2 = per_expert13 / 2;
+        const double fu = 2.0 * T * 8 * 2304 * 2304, fd = fu / 2;
+        std::printf("moe %s T=%4d: route %.3f ms | gate_up %.3f ms %6.1f TFLOP/s %6.0f GB/s | down %.3f ms %6.1f TFLOP/s "
+                    "%6.0f GB/s | %d experts\n",
+                    nvfp4 ? "nvfp4" : "mxfp8", T, t_route, t_up, fu / t_up / 1e9, hit * per_expert13 / t_up / 1e6,
+                    t_down, fd / t_down / 1e9, hit * per_expert2 / t_down / 1e6, hit);
+      }
     }
   }
 
-  // ---- dense GEMMs of one visit (full layer, three inputs) + wo
-  {
-    auto* xin = dalloc<uint16_t>(size_t(3) * T * H);
-    auto* wproj = dalloc<uint16_t>(size_t(ld) * H);
-    auto* wo = dalloc<uint16_t>(size_t(H) * 3072);
-    auto* pout = dalloc<uint16_t>(size_t(T) * ld);
-    auto* oout = dalloc<uint16_t>(size_t(T) * H);
-    auto* attn = dalloc<uint16_t>(size_t(T) * 3072);
-    fill_bf16<<<4096, 256>>>(xin, size_t(3) * T * H, 15, 2.f);
-    fill_bf16<<<4096, 256>>>(wproj, size_t(ld) * H, 16, 0.05f);
-    fill_bf16<<<4096, 256>>>(wo, size_t(H) * 3072, 17, 0.05f);
-    fill_bf16<<<4096, 256>>>(attn, size_t(T) * 3072, 18, 1.f);
-    pk::Gemm gemm;
-    auto bf = [](uint16_t* p) { return reinterpret_cast<const __nv_bfloat16*>(p); };
-    const float ms_proj = time_ms([&] {
-      gemm.run(bf(xin), H, bf(wproj), H, pout, ld, false, T, 6552, H, nullptr);
-      gemm.run(bf(xin) + size_t(T) * H, H, bf(wproj) + size_t(6552) * H, H, pout + 6552, ld, false, T, 1024, H, nullptr);
-      gemm.run(bf(xin) + size_t(2) * T * H, H, bf(wproj) + size_t(7576) * H, H, pout + 7576, ld, false, T, 1024, H, nullptr);
-      gemm.run(bf(xin) + size_t(T) * H, H, bf(wproj) + size_t(8600) * H, H, pout + 8600, ld, false, T, 32, H, nullptr);
-      gemm.run(bf(xin) + size_t(2) * T * H, H, bf(wproj) + size_t(8632) * H, H, pout + 8632, ld, false, T, 32, H, nullptr);
-    });
-    const float ms_single = time_ms([&] { gemm.run(bf(xin), H, bf(wproj), H, pout, 8600, false, T, 8600, H, nullptr); });
-    const float ms_wo = time_ms([&] { gemm.run(bf(attn), 3072, bf(wo), 3072, oout, H, false, T, H, 3072, nullptr); });
-    std::printf("dense: proj (5 GEMMs) %.3f ms (%.1f TFLOP/s), proj single %.3f ms (%.1f TFLOP/s), wo %.3f ms (%.1f TFLOP/s)\n",
-                ms_proj, 2.0 * T * ld * H / ms_proj / 1e9, ms_single, 2.0 * T * 8600 * H / ms_single / 1e9, ms_wo,
-                2.0 * T * H * 3072 / ms_wo / 1e9);
+  if (want("dense")) {
+    auto* scratch = dalloc<uint16_t>(size_t(PROJ_ROWS_FULL) * H);
+    auto* proj = dalloc<uint16_t>(size_t(maxT) * PROJ_ROWS_FULL);
+    auto* wo_out = dalloc<uint16_t>(size_t(maxT) * H);
+    auto* attn = dalloc<uint16_t>(size_t(maxT) * 3072);
+    fill_bf16<<<1024, 256, 0, s>>>(attn, size_t(maxT) * 3072, 2, 2.f);
+    for (int T : Ts) {
+      const float t = time_ms([&](int r) {
+        const Layer& L = nv[r % 3];  // sliding layers: single-input projection
+        kernels::dense::dequant_rows(L.wproj.w.data, static_cast<const float*>(L.wproj.scale.data), PROJ_ROWS_SLIDING, H,
+                                     reinterpret_cast<__nv_bfloat16*>(scratch), s);
+        gemm.run(bf(x), H, bf(scratch), H, proj, PROJ_ROWS_SLIDING, false, T, PROJ_ROWS_SLIDING, H, s);
+        kernels::dense::dequant_rows(L.wo.w.data, static_cast<const float*>(L.wo.scale.data), H, 3072,
+                                     reinterpret_cast<__nv_bfloat16*>(scratch), s);
+        gemm.run(bf(attn), 3072, bf(scratch), 3072, wo_out, H, false, T, H, 3072, s);
+      });
+      const double flop = 2.0 * T * H * (PROJ_ROWS_SLIDING + 3072), bytes = double(H) * (PROJ_ROWS_SLIDING + 3072);
+      std::printf("dense T=%4d: dequant + cuBLAS %.3f ms %6.1f TFLOP/s %6.0f GB/s (FP8 weight bytes)\n", T, t,
+                  flop / t / 1e9, bytes / t / 1e6);
+    }
+  }
+
+  if (want("attn")) {
+    auto* q = dalloc<uint16_t>(size_t(maxT) * 3072);
+    auto* rel16 = dalloc<uint16_t>(size_t(maxT) * 24 * 16);
+    auto* rel = dalloc<uint16_t>(size_t(maxT) * 24 * 1024);
+    auto* proj = dalloc<uint16_t>(size_t(maxT) * PROJ_ROWS_FULL);
+    auto* out = dalloc<uint16_t>(size_t(maxT) * 3072);
+    fill_bf16<<<1024, 256, 0, s>>>(q, size_t(maxT) * 3072, 3, 4.f);
+    fill_bf16<<<1024, 256, 0, s>>>(rel16, size_t(maxT) * 24 * 16, 4, 4.f);
+    fill_bf16<<<1024, 256, 0, s>>>(rel, size_t(maxT) * 24 * 1024, 5, 2.f);
+    fill_bf16<<<1024, 256, 0, s>>>(proj, size_t(maxT) * PROJ_ROWS_FULL, 6, 2.f);
+    pk::AttnParams p;
+    p.q = bf(q), p.rel = bf(rel), p.proj = bf(proj), p.ld = PROJ_ROWS_FULL, p.out = reinterpret_cast<__nv_bfloat16*>(out);
+    // rel_logits
+    for (int T : Ts) {
+      const float t = time_ms([&](int r) {
+        pk::rel_logits(bf(rel16), static_cast<const float*>(nv[r % 3].rel_proj.data), T,
+                       reinterpret_cast<__nv_bfloat16*>(rel), s);
+      });
+      std::printf("rel_logits T=%4d: %.3f ms\n", T, t);
+    }
+    // sliding: ring (full) + chunk rows, three copies rotating
+    {
+      const int L = 1024 + maxT, kr = (L + 63) / 64 * 64;
+      std::vector<uint16_t*> kr_(3), vr_(3);
+      std::vector<int*> kp_(3);
+      std::vector<int4*> bd_(3);
+      for (int i = 0; i < 3; ++i) {
+        kr_[i] = dalloc<uint16_t>(size_t(kr) * 1024), vr_[i] = dalloc<uint16_t>(size_t(kr) * 1024);
+        fill_bf16<<<1024, 256, 0, s>>>(kr_[i], size_t(kr) * 1024, 7 + i, 0.3f);
+        fill_bf16<<<1024, 256, 0, s>>>(vr_[i], size_t(kr) * 1024, 17 + i, 2.f);
+        kp_[i] = dalloc<int>(kr), bd_[i] = dalloc<int4>(kr / 64);
+      }
+      const int pos0 = 20480;
+      for (int T : Ts) {
+        std::vector<int> kpos(kr, -1);
+        for (int j = 0; j < 1024; ++j) kpos[j] = pos0 - 1024 + j;
+        for (int t = 0; t < T; ++t) kpos[1024 + t] = pos0 + t;
+        for (int i = 0; i < 3; ++i) {
+          INGINE_TEST_CUDA(cudaMemcpy(kp_[i], kpos.data(), kr * 4, cudaMemcpyHostToDevice));
+          pk::key_tile_bounds(kp_[i], 1024 + T, bd_[i], s);
+        }
+        const float t = time_ms([&](int r) {
+          pk::AttnParams a = p;
+          const int i = r % 3;
+          a.k = kr_[i], a.v = vr_[i], a.kv_fp8 = false, a.kpos = kp_[i], a.bounds = bd_[i], a.L = 1024 + T;
+          a.T = T, a.pos0 = pos0, a.window = 1024;
+          pk::attention(a, s);
+        });
+        const double flop = 24.0 * 512 * T * 1024;
+        std::printf("attn sliding T=%4d: %.3f ms %6.1f TFLOP/s (window pairs)\n", T, t, flop / t / 1e9);
+      }
+    }
+    // full FP8: 20K with three caches rotating, 131K with two
+    for (int ctx : {20480, 131072}) {
+      const int ncache = ctx > 32768 ? 2 : 3;
+      std::vector<uint8_t*> kc(ncache), vc(ncache);
+      for (int i = 0; i < ncache; ++i) {
+        kc[i] = dalloc<uint8_t>(size_t(ctx + maxT) * 1024), vc[i] = dalloc<uint8_t>(size_t(ctx + maxT) * 1024);
+        fill_e4m3<<<4096, 256, 0, s>>>(kc[i], size_t(ctx + maxT) * 1024, 30 + i);
+        fill_e4m3<<<4096, 256, 0, s>>>(vc[i], size_t(ctx + maxT) * 1024, 40 + i);
+      }
+      for (int T : Ts) {
+        if (ctx > 32768 && T != 2048) continue;
+        const float t = time_ms([&](int r) {
+          pk::AttnParams a = p;
+          const int i = r % ncache;
+          a.k = kc[i], a.v = vc[i], a.kv_fp8 = true, a.kpos = nullptr, a.bounds = nullptr, a.L = ctx + T;
+          a.T = T, a.pos0 = ctx, a.window = 0;
+          pk::attention(a, s);
+        }, ctx > 32768 ? 3 : 6);
+        const double flop = 24.0 * 512 * (double(T) * ctx + 0.5 * double(T) * T);
+        std::printf("attn full fp8 ctx=%6d T=%4d: %.3f ms %6.1f TFLOP/s %6.0f GB/s (K/V bytes)\n", ctx, T, t,
+                    flop / t / 1e9, 2.0 * (ctx + T) * 1024 / t / 1e6);
+      }
+      for (int i = 0; i < ncache; ++i) cudaFree(kc[i]), cudaFree(vc[i]);
+    }
   }
   return 0;
 }

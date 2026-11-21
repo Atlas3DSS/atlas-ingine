@@ -1,233 +1,15 @@
-// Prefill MoE (model._moe / _moe_grouped for T tokens): router selection, expert-sorted pair lists, grouped
-// expert GEMMs that decode the NVFP4 / MXFP8 weights on the fly, and the deterministic combine.
-//
-// Grouped GEMM design (structure from fngine src/kernels/moe/moe_grouped_gemm.cu). A CTA computes 128
-// (token, expert) pairs of one expert x 128 weight rows, K in steps of 64, 8 warps as 2 (rows) x 4 (columns),
-// mma.m16n8k16 BF16 with FP32 accumulation. Per step the next activation tile is gathered with cp.async and
-// the next weight tile's raw codes/scales are loaded into registers while the current step's MMAs run; the
-// codes are then decoded exactly as model.decode_experts / prefill dequant (NVFP4: bf16((e2m1 * e4m3 scale) *
-// factor), MXFP8: bf16(e4m3 * 2^(e8m0 - 127))) into the other BF16 shared-memory buffer, so the expert matrices
-// are never materialised. One barrier per step. m16 row blocks past the tile's pair count skip their MMAs.
-// gate/up epilogue: w13 rows are interleaved (2i gate, 2i + 1 up), so each thread holds gate and up of the same
-// i: act = bf16(softcap(bf16 g, 4) * sigmoid(bf16 g) * softcap(bf16 u, 25)). down epilogue: bf16 per pair,
-// placed at t * 8 + slot; moe_combine sums each token's slots in slot order (no atomics: deterministic).
+// Prefill MoE routing (model._moe / _moe_grouped for T tokens): router selection, expert-sorted pair lists and
+// tiles, and the deterministic combine. The grouped expert GEMMs are in wgemm.cu.
 #include "kernels/prefill/common.cuh"
 #include "kernels/prefill/prefill.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ingine::kernels::prefill {
 namespace {
-
-constexpr int TM = kMoeTileRows, TN = 128, BK = 64;
-constexpr int NT = 256;
-constexpr int KCH = BK / 8;  // 16-byte chunks per tile row
-constexpr int NTILES_N = kHidden / TN;  // 18 (gate/up: 2304 interleaved rows; down: 2304 outputs)
-
-__constant__ float kE2M1[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
-
-struct GemmSmem {
-  uint16_t a[2][TM * BK];
-  uint16_t w[2][TN * BK];
-  float lut[16];
-};
-
-template <int FMT>
-struct WRaw;
-template <>
-struct WRaw<0> {  // NVFP4: 32 codes (16 bytes) + 2 block scales
-  uint4 codes;
-  uint16_t scales;
-};
-template <>
-struct WRaw<1> {  // MXFP8: 32 codes + 1 E8M0 scale
-  uint4 codes[2];
-  uint8_t scale;
-};
-
-// Thread -> weight row tid / 2, elements [32 (tid & 1), +32) of the step.
-template <int FMT, int K>
-__device__ __forceinline__ void load_w(const uint8_t* codes_row, const uint8_t* scales_row, int ks, WRaw<FMT>& r) {
-  const int half = threadIdx.x & 1;
-  if constexpr (FMT == 0) {
-    r.codes = __ldg(reinterpret_cast<const uint4*>(codes_row + ks * (BK / 2) + half * 16));
-    r.scales = __ldg(reinterpret_cast<const uint16_t*>(scales_row + ks * (BK / 16) + half * 2));
-  } else {
-    const uint4* c = reinterpret_cast<const uint4*>(codes_row + ks * BK + half * 32);
-    r.codes[0] = __ldg(c);
-    r.codes[1] = __ldg(c + 1);
-    r.scale = __ldg(scales_row + ks * (BK / 32) + half);
-  }
-}
-
-template <int FMT>
-__device__ __forceinline__ void store_w(uint16_t* w, const float* lut, float factor, const WRaw<FMT>& r) {
-  const int row = threadIdx.x >> 1, chunk0 = (threadIdx.x & 1) * 4;
-  if constexpr (FMT == 0) {
-    const uint32_t cw[4] = {r.codes.x, r.codes.y, r.codes.z, r.codes.w};
-    const float2 sc = e4m3x2_to_float2(r.scales);
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {  // 8 elements (4 bytes) per 16-byte chunk; block scale per 16 elements
-      const float scale = q < 2 ? sc.x : sc.y;
-      uint32_t out[4];
-#pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        const uint32_t byte = (cw[q] >> (8 * b)) & 0xffu;
-        out[b] = pack_bf16x2((lut[byte & 0xf] * scale) * factor, (lut[byte >> 4] * scale) * factor);
-      }
-      *reinterpret_cast<uint4*>(w + swz<KCH>(row, chunk0 + q)) = make_uint4(out[0], out[1], out[2], out[3]);
-    }
-  } else {
-    const float s = exp2f(float(r.scale) - 127.f);
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      const uint4 c = r.codes[q >> 1];
-      const uint32_t w0 = (q & 1) ? c.z : c.x, w1 = (q & 1) ? c.w : c.y;
-      const float2 f0 = e4m3x2_to_float2(w0 & 0xffff), f1 = e4m3x2_to_float2(w0 >> 16);
-      const float2 f2 = e4m3x2_to_float2(w1 & 0xffff), f3 = e4m3x2_to_float2(w1 >> 16);
-      *reinterpret_cast<uint4*>(w + swz<KCH>(row, chunk0 + q)) =
-          make_uint4(pack_bf16x2(f0.x * s, f0.y * s), pack_bf16x2(f1.x * s, f1.y * s), pack_bf16x2(f2.x * s, f2.y * s),
-                     pack_bf16x2(f3.x * s, f3.y * s));
-    }
-  }
-}
-
-__device__ __forceinline__ float softcap(float x, float cap) { return tanhf(x * (1.f / cap)) * cap; }
-
-// UP: A = x rows of the pairs' tokens (K = H), W = w13 (N = 2I), out act [pairs, I].
-// !UP: A = act rows (K = I), W = w2 (N = H), out down [T * 8, H] at pair_dst.
-template <int FMT, bool UP>
-__global__ void __launch_bounds__(NT, 1)
-    moe_gemm_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
-                    const float* __restrict__ factors, const __nv_bfloat16* __restrict__ a_src, MoeWork w,
-                    __nv_bfloat16* __restrict__ out) {
-  constexpr int K = UP ? kHidden : kInter;
-  constexpr int N = UP ? 2 * kInter : kHidden;
-  constexpr int KS = K / BK;
-  constexpr int64_t CODE_ROW = FMT == 0 ? K / 2 : K;
-  constexpr int64_t SCALE_ROW = FMT == 0 ? K / 16 : K / 32;
-  extern __shared__ __align__(128) unsigned char smem_raw[];
-  GemmSmem& s = *reinterpret_cast<GemmSmem*>(smem_raw);
-
-  const int tile_idx = blockIdx.x / NTILES_N, nt_idx = blockIdx.x % NTILES_N;
-  if (tile_idx >= *w.tiles_n) return;
-  const int4 tile = w.tiles[tile_idx];
-  const int e = tile.x, pb = tile.y, n = tile.z;
-  const int n0 = nt_idx * TN;
-  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  if (tid < 16) s.lut[tid] = kE2M1[tid];
-
-  // activation rows of this thread's cp.async chunks: rows tid / 8 + 32 i, chunk tid % 8
-  const uint16_t* arow[TM / 32];
-#pragma unroll
-  for (int i = 0; i < TM / 32; ++i) {
-    const int r = (tid >> 3) + 32 * i;
-    const int rr = r < n ? r : 0;
-    arow[i] = UP ? reinterpret_cast<const uint16_t*>(a_src) + size_t(w.pair_token[pb + rr]) * K
-                 : reinterpret_cast<const uint16_t*>(a_src) + size_t(pb + rr) * K;
-  }
-  auto load_a = [&](int ks, int buf) {
-#pragma unroll
-    for (int i = 0; i < TM / 32; ++i) {
-      const int r = (tid >> 3) + 32 * i, c = tid & 7;
-      cp_async16(&s.a[buf][swz<KCH>(r, c)], arow[i] + ks * BK + c * 8, r < n ? 16 : 0);
-    }
-    cp_commit();
-  };
-  const int64_t wrow = int64_t(e) * N + n0 + (tid >> 1);
-  const uint8_t* codes_row = codes + wrow * CODE_ROW;
-  const uint8_t* scales_row = scales + wrow * SCALE_ROW;
-  const float factor = FMT == 0 ? __ldg(factors + e) : 1.f;
-
-  const int wm = warp & 1, wn = warp >> 1;
-  const int mact = min(max((n - wm * 64 + 15) / 16, 0), 4);  // active m16 blocks of this warp
-  float acc[4][4][4];
-#pragma unroll
-  for (int a = 0; a < 4; ++a)
-#pragma unroll
-    for (int b = 0; b < 4; ++b) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0.f;
-
-  WRaw<FMT> raw;
-  load_a(0, 0);
-  load_w<FMT, K>(codes_row, scales_row, 0, raw);
-  __syncthreads();  // lut
-  store_w<FMT>(s.w[0], s.lut, factor, raw);
-  cp_wait<0>();
-  __syncthreads();
-
-#pragma unroll 1
-  for (int ks = 0; ks < KS; ++ks) {
-    const int buf = ks & 1;
-    if (ks + 1 < KS) {
-      load_a(ks + 1, buf ^ 1);
-      load_w<FMT, K>(codes_row, scales_row, ks + 1, raw);
-    }
-    if (mact > 0) {
-      const uint16_t* A = s.a[buf];
-      const uint16_t* W = s.w[buf];
-#pragma unroll
-      for (int kk = 0; kk < BK / 16; ++kk) {
-        unsigned b[4][2];
-#pragma unroll
-        for (int np = 0; np < 2; ++np)
-          ldmatrix_x4(b[2 * np][0], b[2 * np][1], b[2 * np + 1][0], b[2 * np + 1][1],
-                      smem_addr(W + swz<KCH>(wn * 32 + np * 16 + (lane & 7) + ((lane >> 4) << 3),
-                                             kk * 2 + ((lane >> 3) & 1))));
-#pragma unroll
-        for (int mt = 0; mt < 4; ++mt) {
-          if (mt < mact) {
-            unsigned a[4];
-            ldmatrix_x4(a[0], a[1], a[2], a[3],
-                        smem_addr(A + swz<KCH>(wm * 64 + mt * 16 + (lane & 15), kk * 2 + (lane >> 4))));
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt) mma_bf16(acc[mt][nt], a, b[nt][0], b[nt][1]);
-          }
-        }
-      }
-    }
-    if (ks + 1 < KS) {
-      store_w<FMT>(s.w[buf ^ 1], s.lut, factor, raw);
-      cp_wait<0>();
-    }
-    __syncthreads();
-  }
-
-#pragma unroll
-  for (int mt = 0; mt < 4; ++mt) {
-    if (mt >= mact) continue;
-#pragma unroll
-    for (int half = 0; half < 2; ++half) {
-      const int row = wm * 64 + mt * 16 + (lane >> 2) + half * 8;
-      if (row >= n) continue;
-#pragma unroll
-      for (int nt = 0; nt < 4; ++nt) {
-        const int col = n0 + wn * 32 + nt * 8 + (lane & 3) * 2;
-        const float c0 = acc[mt][nt][2 * half], c1 = acc[mt][nt][2 * half + 1];
-        if constexpr (UP) {
-          const float g = round_bf16(c0), u = round_bf16(c1);
-          const float sig = 1.f / (1.f + expf(-g));
-          const float v = __fmul_rn(__fmul_rn(softcap(g, 4.f), sig), softcap(u, 25.f));
-          reinterpret_cast<uint16_t*>(out)[size_t(pb + row) * kInter + col / 2] = f2bf_bits(v);
-        } else {
-          const int dst = w.pair_dst[pb + row];
-          *reinterpret_cast<uint32_t*>(reinterpret_cast<uint16_t*>(out) + size_t(dst) * kHidden + col) =
-              pack_bf16x2(c0, c1);
-        }
-      }
-    }
-  }
-}
-
-template <int FMT, bool UP>
-void launch_gemm(const void* codes, const void* scales, const float* factors, const __nv_bfloat16* a, int T,
-                 const MoeWork& w, __nv_bfloat16* out, cudaStream_t stream) {
-  static const cudaError_t attr = cudaFuncSetAttribute(
-      moe_gemm_kernel<FMT, UP>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(GemmSmem)));
-  if (attr != cudaSuccess) throw std::runtime_error("prefill moe: shared memory attribute failed");
-  moe_gemm_kernel<FMT, UP><<<moe_max_tiles(T) * NTILES_N, NT, sizeof(GemmSmem), stream>>>(
-      static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), factors, a, w, out);
-}
 
 // Warp per token: sigmoid scores, 8 rounds of arg-max over s + bias (lowest expert on ties).
 __global__ void topk_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int T,
@@ -279,7 +61,7 @@ __global__ void topk_kernel(const float* __restrict__ logits, const float* __res
 
 // One CTA: expert offsets, tiles, scatter of the pairs into expert order (order within an expert does not
 // affect any result: every pair row is computed independently).
-__global__ void __launch_bounds__(1024) route_kernel(const int* __restrict__ idx, int T, MoeWork w) {
+__global__ void __launch_bounds__(1024) route_kernel(const int* __restrict__ idx, int T, int TR, MoeWork w) {
   __shared__ int offs[kExperts], tile0[kExperts + 1], cursor[kExperts];
   const int tid = threadIdx.x;
   if (tid == 0) {
@@ -289,7 +71,7 @@ __global__ void __launch_bounds__(1024) route_kernel(const int* __restrict__ idx
       offs[e] = o;
       tile0[e] = tl;
       o += c;
-      tl += (c + TM - 1) / TM;
+      tl += (c + TR - 1) / TR;
     }
     tile0[kExperts] = tl;
     *w.tiles_n = tl;
@@ -298,7 +80,7 @@ __global__ void __launch_bounds__(1024) route_kernel(const int* __restrict__ idx
   __syncthreads();
   if (tid < kExperts) {
     const int c = w.counts[tid];
-    for (int i = 0; i * TM < c; ++i) w.tiles[tile0[tid] + i] = make_int4(tid, offs[tid] + i * TM, min(TM, c - i * TM), 0);
+    for (int i = 0; i * TR < c; ++i) w.tiles[tile0[tid] + i] = make_int4(tid, offs[tid] + i * TR, min(TR, c - i * TR), 0);
   }
   for (int p = tid; p < T * kTopK; p += blockDim.x) {
     const int e = idx[p];
@@ -327,24 +109,23 @@ __global__ void __launch_bounds__(kHidden / 4) combine_kernel(const uint2* __res
 
 }  // namespace
 
+int moe_tile_rows(int T) {
+  static const int forced = [] {
+    const char* e = std::getenv("INGINE_MOE_TILE_ROWS");
+    const int v = e ? std::atoi(e) : 0;
+    return v == 32 || v == 128 ? v : 0;
+  }();
+  return forced ? forced : T <= 512 ? 32 : 128;
+}
+
+int moe_tiles_capacity(int max_T) { return std::max(moe_max_tiles(std::min(max_T, 512)), moe_max_tiles(max_T)); }
+
 void moe_topk(const float* logits, const float* bias, int T, int* idx, float* wts, int* counts, cudaStream_t stream) {
   topk_kernel<<<(T + 7) / 8, 256, 0, stream>>>(logits, bias, T, idx, wts, counts);
 }
 
 void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream) {
-  route_kernel<<<1, 1024, 0, stream>>>(idx, T, w);
-}
-
-void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
-                 cudaStream_t stream) {
-  if (e.fmt == 0) launch_gemm<0, true>(e.w13, e.w13_scale, e.w13_factor, x, T, w, act, stream);
-  else launch_gemm<1, true>(e.w13, e.w13_scale, nullptr, x, T, w, act, stream);
-}
-
-void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
-              cudaStream_t stream) {
-  if (e.fmt == 0) launch_gemm<0, false>(e.w2, e.w2_scale, e.w2_factor, act, T, w, down, stream);
-  else launch_gemm<1, false>(e.w2, e.w2_scale, nullptr, act, T, w, down, stream);
+  route_kernel<<<1, 1024, 0, stream>>>(idx, T, moe_tile_rows(T), w);
 }
 
 void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat16* out, cudaStream_t stream) {

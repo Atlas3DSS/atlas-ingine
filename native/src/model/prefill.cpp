@@ -75,7 +75,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   router_logits_ = f32(C * EXPERTS), wts_ = f32(C * TOP_K);
   idx_ = i32(C * TOP_K);
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(C * TOP_K), pair_dst_ = i32(C * TOP_K);
-  tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_max_tiles(max_chunk)) * sizeof(int4)));
+  tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4)));
   act_ = bf16(C * TOP_K * INTER), down_ = bf16(C * TOP_K * H), moe_sum_ = bf16(C * H);
   gin_ = rel_;
   fpre_ = reinterpret_cast<float*>(down_), gpre_ = fpre_ + C * H;
