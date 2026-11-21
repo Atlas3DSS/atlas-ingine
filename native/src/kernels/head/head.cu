@@ -42,19 +42,35 @@ __host__ __device__ __forceinline__ unsigned long long splitmix64(unsigned long 
   return x ^ (x >> 31);
 }
 
-// 24 random bits for (seed, counter, row, index): a pure function of its inputs.
-__device__ __forceinline__ std::uint32_t random_bits(unsigned long long seed, unsigned long long counter,
-                                                     std::uint32_t row, std::uint32_t index) {
-  unsigned long long k = splitmix64(seed ^ (counter * 0xD1B54A32D192ED03ull));
-  k = splitmix64(k ^ ((static_cast<unsigned long long>(row) << 32) | index));
-  return static_cast<std::uint32_t>(k >> 40);
+// 64 random bits for (seed, counter, row, index): a pure function of its inputs.
+__device__ __forceinline__ unsigned long long random64(unsigned long long seed, unsigned long long counter,
+                                                       std::uint32_t row, std::uint32_t index) {
+  const unsigned long long k = splitmix64(seed ^ (counter * 0xD1B54A32D192ED03ull));
+  return splitmix64(k ^ ((static_cast<unsigned long long>(row) << 32) | index));
 }
 
-// Gumbel noise from a uniform strictly inside (0, 1).
+// 24 random bits (uniform()).
+__device__ __forceinline__ std::uint32_t random_bits(unsigned long long seed, unsigned long long counter,
+                                                     std::uint32_t row, std::uint32_t index) {
+  return static_cast<std::uint32_t>(random64(seed, counter, row, index) >> 40);
+}
+
+// Gumbel noise G = -log(E), E = -log(1 - v) a standard exponential, v uniform in (0, 1) from 64 random bits in
+// floating point: the 24 bits from the leading one of k on (exact in float) and the leading-zero count as
+// exponent, so v keeps 24 significant bits down to 2^-64 (v < 1 always; v > 0: k < 2^24 adds 1/2) and E (computed
+// as -log1p(-v) for v < 1/2, -log(1 - v) above, both exact operations) resolves the extreme upper tail of G that
+// decides draws of rare tokens: a token wins a Gumbel-max draw with its exact probability down to ratios of about
+// e^-44 to the most likely one. (A 24-bit uniform resolves only e^-17: at a 200058-token vocabulary that
+// under-samples the far tail, and its largest value rounded u to 1 in float, an infinite noise that made 1 draw
+// in 84 a uniformly random token.)
 __device__ __forceinline__ float gumbel(unsigned long long seed, unsigned long long counter, std::uint32_t row,
                                         std::uint32_t index) {
-  const float u = (static_cast<float>(random_bits(seed, counter, row, index)) + 0.5f) * (1.0f / 16777216.0f);
-  return -logf(-logf(u));
+  const unsigned long long k = random64(seed, counter, row, index);
+  const int z = min(__clzll(static_cast<long long>(k)), 40);
+  const float m = static_cast<float>(static_cast<std::uint32_t>(k >> (40 - z))) + (z == 40 ? 0.5f : 0.0f);
+  const float v = m * __int_as_float((127 - 24 - z) << 23);                              // m * 2^-(24 + z)
+  const float e = v < 0.5f ? -log1pf(-v) : -logf(1.0f - v);
+  return -logf(e);
 }
 
 __device__ __forceinline__ bool better(float value, int index, float best_value, int best_index) {
