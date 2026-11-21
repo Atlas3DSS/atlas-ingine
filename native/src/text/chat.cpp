@@ -5,7 +5,10 @@
 #include "text/unicode.h"
 
 #include <algorithm>
+#include <cstring>
+#include <deque>
 #include <fstream>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <unordered_map>
@@ -17,6 +20,20 @@ using Json = nlohmann::ordered_json;
 namespace uni = unicode;
 
 namespace detail {
+// Recent rendered prompts (text, ids, added-token boundaries) for incremental tokenisation: consecutive requests
+// of a conversation share a long prefix of rendered text, and only the text after the last added token in that
+// prefix needs encoding. Shared by request threads.
+struct RenderCache {
+  struct Entry {
+    std::string text;
+    std::vector<int32_t> ids;
+    std::vector<TokenBoundary> boundaries;
+  };
+  static constexpr std::size_t kEntries = 4;  // concurrent conversations kept
+  std::mutex mu;
+  std::deque<std::shared_ptr<const Entry>> entries;  // most recent first
+};
+
 struct FormatData {
   Tokenizer tokenizer;
   JinjaTemplate chat_template;
@@ -24,6 +41,7 @@ struct FormatData {
   int32_t content_text = -1, end_message = -1, end_sampling = -1, endoftext = -1;
   std::unordered_set<int32_t> stop_ids;
   std::unordered_map<int32_t, int> content_kind;  // tag id -> StreamParser kind (1 thinking, 2 text, 3 tool json)
+  std::unique_ptr<RenderCache> cache = std::make_unique<RenderCache>();
 };
 }  // namespace detail
 
@@ -148,6 +166,68 @@ std::string random_call_id() {
   std::string id = "call_";
   for (int i = 0; i < 24; ++i) id.push_back(kHex[rng() & 15]);
   return id;
+}
+
+// Length of the common prefix of a and b (memcmp in blocks, then bytewise in the differing block).
+std::size_t common_prefix(std::string_view a, std::string_view b) {
+  const std::size_t n = std::min(a.size(), b.size());
+  constexpr std::size_t kBlock = 4096;
+  std::size_t i = 0;
+  while (i + kBlock <= n && std::memcmp(a.data() + i, b.data() + i, kBlock) == 0) i += kBlock;
+  while (i < n && a[i] == b[i]) ++i;
+  return i;
+}
+
+// tokenizer.encode(text, true), reusing the ids of a cached render that shares a prefix with text: the ids up to
+// the last added token whose end b satisfies b + max_added - 1 <= p (p = common prefix length) are exact, because
+// every added-token match starting before b reads only bytes before p, and BPE never crosses an added token.
+std::vector<int32_t> encode_prompt(const detail::FormatData& fmt, const std::string& text) {
+  detail::RenderCache& cache = *fmt.cache;
+  std::deque<std::shared_ptr<const detail::RenderCache::Entry>> entries;
+  {
+    std::lock_guard lock(cache.mu);
+    entries = cache.entries;
+  }
+  std::shared_ptr<const detail::RenderCache::Entry> base;
+  std::size_t common = 0;
+  for (const auto& e : entries) {
+    const std::size_t p = common_prefix(e->text, text);
+    if (p > common || !base) base = e, common = p;
+  }
+
+  auto entry = std::make_shared<detail::RenderCache::Entry>();
+  entry->text = text;
+  if (base && common == text.size() && base->text.size() == text.size()) {
+    entry->ids = base->ids;
+    entry->boundaries = base->boundaries;
+  } else {
+    std::size_t byte = 0, tokens = 0, kept = 0;
+    if (base) {
+      const std::size_t reach = fmt.tokenizer.max_added_token_bytes();
+      for (const TokenBoundary& b : base->boundaries) {
+        if (b.byte + reach > common + 1) break;
+        byte = b.byte, tokens = b.tokens, ++kept;
+      }
+    }
+    entry->ids.reserve(tokens + (text.size() - byte) / 3 + 1);
+    if (base) {
+      entry->ids.assign(base->ids.begin(), base->ids.begin() + static_cast<std::ptrdiff_t>(tokens));
+      entry->boundaries.assign(base->boundaries.begin(), base->boundaries.begin() + static_cast<std::ptrdiff_t>(kept));
+    }
+    fmt.tokenizer.encode_special(std::string_view(text).substr(byte), entry->ids, &entry->boundaries, byte);
+  }
+  std::vector<int32_t> ids = entry->ids;
+  {
+    std::lock_guard lock(cache.mu);
+    // A render extending most of the one it reused supersedes it (the conversation moved on); other
+    // conversations keep their entries.
+    if (base && common >= base->text.size() - base->text.size() / 10) {
+      cache.entries.erase(std::remove(cache.entries.begin(), cache.entries.end(), base), cache.entries.end());
+    }
+    cache.entries.push_front(std::move(entry));
+    while (cache.entries.size() > detail::RenderCache::kEntries) cache.entries.pop_back();
+  }
+  return ids;
 }
 
 }  // namespace
@@ -279,6 +359,11 @@ ChatFormat ChatFormat::load(const std::filesystem::path& model_dir) {
 
 const Tokenizer& ChatFormat::tokenizer() const { return data_->tokenizer; }
 
+void ChatFormat::clear_render_cache() const {
+  std::lock_guard lock(data_->cache->mu);
+  data_->cache->entries.clear();
+}
+
 std::vector<int32_t> ChatFormat::stop_ids() const {
   std::vector<int32_t> ids(data_->stop_ids.begin(), data_->stop_ids.end());
   std::sort(ids.begin(), ids.end());
@@ -332,8 +417,8 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
   // reasoning: the first non-None one becomes reasoning_content and thinking).
   for (Json& m : msgs) {
     Json cleaned = Json::object();
-    for (const auto& [key, value] : m.items()) {
-      if (!value.is_null()) cleaned[key] = value;
+    for (auto it = m.begin(); it != m.end(); ++it) {
+      if (!it->is_null()) cleaned[it.key()] = std::move(*it);
     }
     for (const char* key : {"reasoning_content", "thinking", "reasoning"}) {
       if (const Json* r = get(cleaned, key)) {
@@ -341,7 +426,7 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
         if (!cleaned.contains("thinking")) {
           Json aliased = Json::object();
           aliased["thinking"] = reasoning;
-          for (const auto& [k, v] : cleaned.items()) aliased[k] = v;
+          for (auto it = cleaned.begin(); it != cleaned.end(); ++it) aliased[it.key()] = std::move(*it);
           cleaned = std::move(aliased);
         }
         cleaned["reasoning_content"] = std::move(reasoning);
@@ -367,7 +452,7 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
     prompt.text += CONTENT_TEXT;
     prompt.prefill_ids = no_thinking_prefill();
   }
-  prompt.ids = data_->tokenizer.encode(prompt.text, true);
+  prompt.ids = encode_prompt(*data_, prompt.text);
   return prompt;
 }
 

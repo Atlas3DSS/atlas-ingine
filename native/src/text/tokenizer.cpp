@@ -300,6 +300,7 @@ Tokenizer Tokenizer::from_json(std::string_view tokenizer_json) {
     tok.special_[index] = t.special;
     tok.added_[index] = true;
     tok.added_by_content_.emplace(t.content, t.id);
+    tok.max_added_bytes_ = std::max(tok.max_added_bytes_, t.content.size());
     tok.added_tokens_.push_back(std::move(t));
   }
   for (std::size_t i = 0; i < tok.added_tokens_.size(); ++i) {
@@ -415,6 +416,12 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool special) cons
     encode_ordinary(text, ids);
     return ids;
   }
+  encode_special(text, ids, nullptr, 0);
+  return ids;
+}
+
+void Tokenizer::encode_special(std::string_view text, std::vector<int32_t>& ids, std::vector<TokenBoundary>* boundaries,
+                               std::size_t byte_base) const {
   std::size_t ordinary_begin = 0;
   for (std::size_t pos = 0; pos < text.size();) {
     const AddedToken* match = nullptr;
@@ -433,9 +440,9 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool special) cons
     ids.push_back(match->id);
     pos += match->content.size();
     ordinary_begin = pos;
+    if (boundaries != nullptr) boundaries->push_back(TokenBoundary{byte_base + pos, ids.size()});
   }
   encode_ordinary(text.substr(ordinary_begin), ids);
-  return ids;
 }
 
 std::string Tokenizer::decode(std::span<const int32_t> ids) const {

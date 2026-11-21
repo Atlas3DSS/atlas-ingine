@@ -36,6 +36,8 @@ struct string {
     std::string str() const;
     std::size_t length() const;
     std::size_t byte_size() const;
+    // Same text as other (parts may be split differently); no allocation.
+    bool equals(const string& other) const;
     void hash_update(hasher& hash) const noexcept;
     bool is_uppercase() const;
     bool is_lowercase() const;

@@ -27,6 +27,23 @@ std::size_t string::byte_size() const {
     return result;
 }
 
+bool string::equals(const string& other) const {
+    if (parts.size() == 1 && other.parts.size() == 1) return parts[0].val == other.parts[0].val;
+    if (byte_size() != other.byte_size()) return false;
+    std::size_t a = 0, a_off = 0, b = 0, b_off = 0;
+    while (true) {
+        while (a < parts.size() && a_off == parts[a].val.size()) ++a, a_off = 0;
+        while (b < other.parts.size() && b_off == other.parts[b].val.size()) ++b, b_off = 0;
+        if (a == parts.size() || b == other.parts.size()) return a == parts.size() && b == other.parts.size();
+        const auto& x = parts[a].val;
+        const auto& y = other.parts[b].val;
+        const std::size_t n = std::min(x.size() - a_off, y.size() - b_off);
+        if (x.compare(a_off, n, y, b_off, n) != 0) return false;
+        a_off += n;
+        b_off += n;
+    }
+}
+
 std::size_t string::length() const { return unicode::length(str()); }
 
 void string::hash_update(hasher& hash) const noexcept {

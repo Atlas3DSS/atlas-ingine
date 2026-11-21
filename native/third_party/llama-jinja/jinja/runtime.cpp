@@ -13,11 +13,11 @@ namespace jinja {
 
 
 static value_string exec_statements(const statements& stmts, context& ctx) {
-    auto result = mk_val<value_array>();
-    for (const auto& stmt : stmts) { result->push_back(stmt->execute(ctx)); }
+    std::vector<value> result;
+    for (const auto& stmt : stmts) { result.push_back(stmt->execute(ctx)); }
     // convert to string parts
     value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
+    for (const auto& item : result) { gather_string_parts_recursive(item, str); }
     return str;
 }
 
@@ -249,7 +249,7 @@ value binary_expression::execute_impl(context& ctx) {
 static value try_builtin_func(context& ctx, const std::string& name, value& input,
                               bool undef_on_missing = false) {
 
-    auto builtins = input->get_builtins();
+    const auto& builtins = input->get_builtins();
     auto it       = builtins.find(name);
     if (it != builtins.end()) { return mk_val<value_func>(name, it->second, input); }
     if (undef_on_missing) { return mk_val<value_undefined>(name); }
@@ -371,16 +371,34 @@ value unary_expression::execute_impl(context& ctx) {
 value if_statement::execute_impl(context& ctx) {
     value test_val = test->execute(ctx);
 
-    auto out = mk_val<value_array>();
-    if (test_val->as_bool()) {
-        for (auto& stmt : body) { out->push_back(stmt->execute(ctx)); }
-    } else {
-        for (auto& stmt : alternate) { out->push_back(stmt->execute(ctx)); }
-    }
+    // Outputs are gathered after the branch has run, as before; a plain vector avoids an array value.
+    std::vector<value> out;
+    for (auto& stmt : test_val->as_bool() ? body : alternate) { out.push_back(stmt->execute(ctx)); }
     // convert to string parts
     value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(out, str);
+    for (const auto& item : out) { gather_string_parts_recursive(item, str); }
     return str;
+}
+
+const value& scope_frame::loop_object() {
+    if (!loop_value) {
+        const auto& items      = *loop_items;
+        const size_t i         = loop_index;
+        value_object loop_obj  = mk_val<value_object>();
+        loop_obj->has_builtins = false; // loop object has no builtins
+        loop_obj->insert("index", mk_val<value_int>(i + 1));
+        loop_obj->insert("index0", mk_val<value_int>(i));
+        loop_obj->insert("revindex", mk_val<value_int>(items.size() - i));
+        loop_obj->insert("revindex0", mk_val<value_int>(items.size() - i - 1));
+        loop_obj->insert("first", mk_val<value_bool>(i == 0));
+        loop_obj->insert("last", mk_val<value_bool>(i == items.size() - 1));
+        loop_obj->insert("length", mk_val<value_int>(items.size()));
+        loop_obj->insert("previtem", i > 0 ? items[i - 1] : mk_val<value_undefined>("previtem"));
+        loop_obj->insert("nextitem",
+                         i < items.size() - 1 ? items[i + 1] : mk_val<value_undefined>("nextitem"));
+        loop_value = loop_obj;
+    }
+    return loop_value;
 }
 
 value for_statement::execute_impl(context& ctx) {
@@ -430,31 +448,35 @@ value for_statement::execute_impl(context& ctx) {
         for (const auto& item : arr) { items.push_back(item); }
     }
 
-    std::vector<std::function<void(context&)>> scope_update_fns;
-
-    std::vector<value> filtered_items;
-    for (size_t i = 0; i < items.size(); ++i) {
-        context loop_scope(scope);
-
-        value current = items[i];
-
-        std::function<void(context&)> scope_update_fn = [](context&) { /* no-op */ };
+    // Binds the loop variable(s) of item i in ctx.
+    const auto assign = [&](context& c, size_t i) {
         if (is_stmt<identifier>(loopvar)) {
-            auto id = cast_stmt<identifier>(loopvar)->val;
-
-            if (is_val<value_object>(iterable_val)) {
-                // case example: {% for key in dict %}
-                current         = items[i]->as_array()[0];
-                scope_update_fn = [id, &items, i](context& ctx) {
-                    ctx.set_val(id, items[i]->as_array()[0]);
-                };
-            } else {
-                // case example: {% for item in list %}
-                scope_update_fn = [id, &items, i](context& ctx) { ctx.set_val(id, items[i]); };
+            const auto& id = cast_stmt<identifier>(loopvar)->val;
+            // {% for key in dict %} binds the key; {% for item in list %} the item
+            c.set_val(id, is_val<value_object>(iterable_val) ? items[i]->as_array()[0] : items[i]);
+        } else {
+            // {% for key, value in dict %}
+            auto tuple   = cast_stmt<tuple_literal>(loopvar);
+            auto& c_arr  = items[i]->as_array();
+            for (size_t j = 0; j < tuple->val.size(); ++j) {
+                if (!is_stmt<identifier>(tuple->val[j])) {
+                    throw std::runtime_error("Cannot unpack non-identifier type: " +
+                                             tuple->val[j]->type());
+                }
+                c.set_val(cast_stmt<identifier>(tuple->val[j])->val, c_arr[j]);
             }
+        }
+    };
 
+    std::vector<size_t> filtered_index;  // index into items of each iteration
+    std::vector<value> filtered_items;   // the iterated values (loop.previtem / loop.nextitem)
+    filtered_index.reserve(items.size());
+    filtered_items.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        value current = items[i];
+        if (is_stmt<identifier>(loopvar)) {
+            if (is_val<value_object>(iterable_val)) current = items[i]->as_array()[0];
         } else if (is_stmt<tuple_literal>(loopvar)) {
-            // case example: {% for key, value in dict %}
             auto tuple = cast_stmt<tuple_literal>(loopvar);
             if (!is_val<value_array>(current)) {
                 throw std::runtime_error("Cannot unpack non-iterable type: " + current->type());
@@ -465,72 +487,65 @@ value for_statement::execute_impl(context& ctx) {
                                          (tuple->val.size() > c_arr.size() ? "few" : "many") +
                                          " items to unpack");
             }
-            scope_update_fn = [tuple, &items, i](context& ctx) {
-                auto& c_arr = items[i]->as_array();
-                for (size_t j = 0; j < tuple->val.size(); ++j) {
-                    if (!is_stmt<identifier>(tuple->val[j])) {
-                        throw std::runtime_error("Cannot unpack non-identifier type: " +
-                                                 tuple->val[j]->type());
-                    }
-                    auto id = cast_stmt<identifier>(tuple->val[j])->val;
-                    ctx.set_val(id, c_arr[j]);
-                }
-            };
-
         } else {
             throw std::runtime_error("Invalid loop variable(s): " + loopvar->type());
         }
 
         if (select_expr && test_expr) {
-            scope_update_fn(loop_scope);
+            context loop_scope(scope);
+            assign(loop_scope, i);
             value test_val = test_expr->execute(loop_scope);
             if (!test_val->as_bool()) { continue; }
         }
         filtered_items.push_back(current);
-        scope_update_fns.push_back(scope_update_fn);
+        filtered_index.push_back(i);
     }
 
-    auto result = mk_val<value_array>();
+    std::vector<value> result;
 
+    // `loop` is built only when the body reads it (scope_frame::loop_object).
+    scope_frame& frame = scope.local_scope();
+    struct loop_state_guard {
+        scope_frame& frame;
+        ~loop_state_guard() {
+            frame.loop_items = nullptr;
+            frame.loop_value = nullptr;
+        }
+    } guard{frame};
     bool noIteration = true;
+    bool started     = false;
     for (size_t i = 0; i < filtered_items.size(); i++) {
-        value_object loop_obj  = mk_val<value_object>();
-        loop_obj->has_builtins = false; // loop object has no builtins
-        loop_obj->insert("index", mk_val<value_int>(i + 1));
-        loop_obj->insert("index0", mk_val<value_int>(i));
-        loop_obj->insert("revindex", mk_val<value_int>(filtered_items.size() - i));
-        loop_obj->insert("revindex0", mk_val<value_int>(filtered_items.size() - i - 1));
-        loop_obj->insert("first", mk_val<value_bool>(i == 0));
-        loop_obj->insert("last", mk_val<value_bool>(i == filtered_items.size() - 1));
-        loop_obj->insert("length", mk_val<value_int>(filtered_items.size()));
-        loop_obj->insert("previtem",
-                         i > 0 ? filtered_items[i - 1] : mk_val<value_undefined>("previtem"));
-        loop_obj->insert("nextitem", i < filtered_items.size() - 1
-                                         ? filtered_items[i + 1]
-                                         : mk_val<value_undefined>("nextitem"));
-        scope.set_val("loop", loop_obj);
-        scope_update_fns[i](scope);
+        frame.erase("loop");
+        frame.loop_items = &filtered_items;
+        frame.loop_index = i;
+        frame.loop_value = nullptr;
+        started          = true;
+        assign(scope, filtered_index[i]);
         try {
             for (auto& stmt : body) {
                 value val = stmt->execute(scope);
-                result->push_back(val);
+                result.push_back(std::move(val));
             }
         } catch (const continue_statement::signal&) {
             continue;
         } catch (const break_statement::signal&) { break; }
         noIteration = false;
     }
+    // A macro defined in the body keeps this scope: it sees the last iteration's `loop`.
+    if (started && !frame.find_local("loop") && scope.current_scope().use_count() > 1) {
+        frame.set("loop", frame.loop_object());
+    }
 
     if (noIteration) {
         for (auto& stmt : default_block) {
             value val = stmt->execute(ctx);
-            result->push_back(val);
+            result.push_back(std::move(val));
         }
     }
 
     // convert to string parts
     value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
+    for (const auto& item : result) { gather_string_parts_recursive(item, str); }
     return str;
 }
 
@@ -676,6 +691,12 @@ value call_statement::execute_impl(context& ctx) {
 
     return callee_func->invoke(args);
 }
+void member_expression::init_property_key() {
+    if (!computed && is_stmt<identifier>(property)) {
+        property_key = mk_val<value_string>(cast_stmt<identifier>(property)->val);
+    }
+}
+
 
 value member_expression::execute_impl(context& ctx) {
     value object = this->object->execute(ctx);
@@ -712,8 +733,8 @@ value member_expression::execute_impl(context& ctx) {
         if (!is_stmt<identifier>(this->property)) {
             throw std::runtime_error("Static member property must be an identifier");
         }
-        property         = mk_val<value_string>(cast_stmt<identifier>(this->property)->val);
-        std::string prop = property->as_string().str();
+        const std::string& prop = cast_stmt<identifier>(this->property)->val;
+        property                = property_key;
 
         // behavior of jinja2: obj having prop as a built-in function AND 'prop', as an object key,
         // then obj.prop returns the built-in function, not the property value.
@@ -721,24 +742,33 @@ value member_expression::execute_impl(context& ctx) {
         // example: {"obj": {"items": 123}} -> obj.items is the built-in function, obj['items'] is
         // 123
 
-        value val = try_builtin_func(ctx, prop, object, true);
-        if (!is_val<value_undefined>(val)) { return val; }
+        const auto& builtins = object->get_builtins();
+        if (auto it = builtins.find(prop); it != builtins.end()) {
+            return mk_val<value_func>(prop, it->second, object);
+        }
         // else, fallthrough to normal property access below
     }
 
-    value val = mk_val<value_undefined>("object_property");
+    value val; // unset: undefined ("object_property"), created only when returned
 
-    if (property->is_undefined()) { return val; }
+    if (property->is_undefined()) { return mk_val<value_undefined>("object_property"); }
 
     ensure_key_type_allowed(property);
 
     if (is_val<value_undefined>(object)) {
-        return val;
+        return mk_val<value_undefined>("object_property");
 
     } else if (is_val<value_object>(object)) {
-        auto key = property->as_string().str();
-        val      = object->at(property, val);
-        if (is_val<value_undefined>(val)) { val = try_builtin_func(ctx, key, object, true); }
+        auto* obj = cast_val<value_object>(object);
+        if (is_val<value_string>(property)) {
+            // strings are immutable and hashable: has_key's check holds, one lookup suffices
+            if (auto it = obj->unordered.find(property); it != obj->unordered.end()) val = it->second;
+        } else if (object->has_key(property)) {
+            val = object->at(property);
+        }
+        if (!val || is_val<value_undefined>(val)) {
+            val = try_builtin_func(ctx, property->as_string().str(), object, true);
+        }
 
     } else if (is_val<value_array>(object) || is_val<value_string>(object)) {
         if (is_val<value_int>(property)) {
@@ -773,8 +803,7 @@ value member_expression::execute_impl(context& ctx) {
         val      = try_builtin_func(ctx, key, object, true);
     }
 
-
-
+    if (!val) val = mk_val<value_undefined>("object_property");
     return val;
 }
 

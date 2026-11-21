@@ -160,15 +160,19 @@ class StreamParser {
   std::optional<std::string> finish_reason_;
 };
 
-// Tokenizer-bound renderer and parser factory. Immutable after load; all methods are thread-safe.
+// Tokenizer-bound renderer and parser factory. Immutable after load except for the render cache (below); all
+// methods are thread-safe.
 class ChatFormat {
  public:
   static ChatFormat load(const std::filesystem::path& model_dir);  // tokenizer.json + chat_template.jinja
 
   // ChatFormat.render(messages, tools=tools, reasoning_effort=..., enable_thinking=..., **template_kwargs).
-  // `tools` null = absent. Throws ChatError.
+  // `tools` null = absent. Throws ChatError. The ids are tokenised incrementally against the most recent renders
+  // (a few conversations): only the text after the last added token of the shared rendered prefix is encoded.
   RenderedPrompt render(const nlohmann::ordered_json& messages, const nlohmann::ordered_json& tools,
                         const ChatOptions& options) const;
+  // Forget the cached renders (shared by copies of this ChatFormat): the next render tokenises from scratch.
+  void clear_render_cache() const;
   // Parser primed with the prompt's prefill ids. id_factory makes tool-call ids (default "call_" + 24 hex).
   StreamParser parser(std::span<const int32_t> prefill_ids, std::vector<std::string> stop = {},
                       std::function<std::string()> id_factory = {}) const;

@@ -54,6 +54,13 @@ class BpeMergeTable {
   std::uint64_t mask_ = 0;
 };
 
+// End of an added token in an encoded text: the byte offset just after it and the number of ids up to and
+// including it. Added tokens split the BPE, so the ids before such a boundary depend only on the text before it.
+struct TokenBoundary {
+  std::size_t byte = 0;
+  std::size_t tokens = 0;
+};
+
 class Tokenizer {
  public:
   static Tokenizer load(const std::filesystem::path& model_dir);  // reads model_dir/tokenizer.json
@@ -63,6 +70,12 @@ class Tokenizer {
   // otherwise the whole text is ordinary (encode_special_tokens=True). Throws std::invalid_argument on
   // invalid UTF-8.
   std::vector<int32_t> encode(std::string_view text, bool special) const;
+  // encode(text, true) appended to ids; with boundaries, records every added token's TokenBoundary (byte
+  // offsets shifted by byte_base, token counts absolute in ids).
+  void encode_special(std::string_view text, std::vector<int32_t>& ids, std::vector<TokenBoundary>* boundaries,
+                      std::size_t byte_base) const;
+  // Longest added token in bytes: whether a byte starts an added token depends on at most this many bytes.
+  std::size_t max_added_token_bytes() const noexcept { return max_added_bytes_; }
   // Concatenated token bytes, raw UTF-8 that may be partial or invalid; unknown ids contribute nothing.
   std::string decode(std::span<const int32_t> ids) const;
   // tokenizer.decode(ids): decode() with invalid sequences replaced by U+FFFD (String::from_utf8_lossy).
@@ -91,6 +104,7 @@ class Tokenizer {
   std::unordered_map<std::string, int32_t> vocab_by_bytes_;  // ordinary vocabulary, raw bytes -> id
   BpeMergeTable merges_;
   std::array<int32_t, 256> byte_ids_{};
+  std::size_t max_added_bytes_ = 0;
   std::vector<AddedToken> added_tokens_;
   std::array<std::vector<std::size_t>, 256> added_candidates_;  // by first byte, longest content first
   std::unordered_map<std::string, int32_t> added_by_content_;

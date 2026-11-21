@@ -40,12 +40,18 @@ int main() {
       c.expect(e.param == err["param"].get<std::string>(), note + ": param " + e.param);
     }
   }
-  // Concurrency: every thread renders every request and compares with a serial render.
+  // Concurrency: every thread renders every request and compares text and ids with a serial render (the
+  // render cache is shared by the threads).
+  const auto fingerprint = [](const RenderedPrompt& p) {
+    std::string s = p.text + "|";
+    for (const int32_t id : p.ids) s += std::to_string(id) + ",";
+    return s;
+  };
   std::vector<std::string> serial;
   for (const Json& req : golden) {
     ChatOptions options{req["reasoning_effort"], req["enable_thinking"], req["kwargs"]};
     try {
-      serial.push_back(fmt.render(req["messages"], req["tools"], options).text);
+      serial.push_back(fingerprint(fmt.render(req["messages"], req["tools"], options)));
     } catch (const ChatError& e) {
       serial.push_back(std::string("error:") + e.what());
     }
@@ -61,7 +67,7 @@ int main() {
           ChatOptions options{req["reasoning_effort"], req["enable_thinking"], req["kwargs"]};
           std::string got;
           try {
-            got = fmt.render(req["messages"], req["tools"], options).text;
+            got = fingerprint(fmt.render(req["messages"], req["tools"], options));
           } catch (const ChatError& e) {
             got = std::string("error:") + e.what();
           }

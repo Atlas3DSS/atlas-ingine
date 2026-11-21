@@ -51,6 +51,53 @@ const T* cast_stmt(const statement_ptr& ptr) {
 using visitor_pair = std::pair<std::string, std::vector<statement*>>;
 using visitor_fn   = std::function<void(bool, statement*, std::vector<visitor_pair>)>;
 
+// Variables of one scope. A scope reads through to its parent (the enclosing scope, or for a macro call the
+// scope the macro was defined in) instead of copying the parent's variables on entry; writes stay local.
+// Within one render a parent is never written while a child scope is alive, so this reads exactly what the
+// former copy-on-entry scopes read.
+struct scope_frame {
+    std::vector<std::pair<std::string, value>> vars;
+    std::shared_ptr<scope_frame> parent;
+
+    // `loop` of a for loop iterating in this scope, built on first use in each iteration.
+    const std::vector<value>* loop_items = nullptr;
+    size_t loop_index                    = 0;
+    value loop_value;
+
+    explicit scope_frame(std::shared_ptr<scope_frame> parent_frame = nullptr)
+        : parent(std::move(parent_frame)) {}
+
+    value* find_local(const std::string& name) {
+        for (auto& pair : vars) {
+            if (pair.first == name) return &pair.second;
+        }
+        return nullptr;
+    }
+
+    void set(const std::string& name, const value& val) {
+        if (value* slot = find_local(name)) {
+            *slot = val;
+        } else {
+            vars.emplace_back(name, val);
+        }
+    }
+
+    void erase(const std::string& name) {
+        for (auto it = vars.begin(); it != vars.end(); ++it) {
+            if (it->first == name) {
+                vars.erase(it);
+                return;
+            }
+        }
+    }
+
+    // The loop object of the current iteration (index, index0, revindex, revindex0, first, last, length,
+    // previtem, nextitem).
+    const value& loop_object();
+};
+
+using scope_frame_ptr = std::shared_ptr<scope_frame>;
+
 struct context {
     std::shared_ptr<std::string>
         src;                  // for debugging; use shared_ptr to avoid copying on scope creation
@@ -61,15 +108,14 @@ struct context {
     visitor_fn visitor;
 
     // src is optional, used for error reporting
-    context(std::string src = "") : src(std::make_shared<std::string>(std::move(src))) {
-        env               = mk_val<value_object>();
-        env->has_builtins = false; // context object has no builtins
-        env->insert("true", mk_val<value_bool>(true));
-        env->insert("True", mk_val<value_bool>(true));
-        env->insert("false", mk_val<value_bool>(false));
-        env->insert("False", mk_val<value_bool>(false));
-        env->insert("none", mk_val<value_none>());
-        env->insert("None", mk_val<value_none>());
+    context(std::string src = "")
+        : src(std::make_shared<std::string>(std::move(src))), frame(std::make_shared<scope_frame>()) {
+        frame->set("true", mk_val<value_bool>(true));
+        frame->set("True", mk_val<value_bool>(true));
+        frame->set("false", mk_val<value_bool>(false));
+        frame->set("False", mk_val<value_bool>(false));
+        frame->set("none", mk_val<value_none>());
+        frame->set("None", mk_val<value_none>());
         current_time = std::time(nullptr);
     }
 
@@ -77,48 +123,55 @@ struct context {
 
     // Keep macro definition scopes alive for this render. Callables refer back weakly,
     // so an environment containing its own macro does not form an ownership cycle.
-    std::weak_ptr<value_object_t> capture_scope() {
-        captured_scopes->push_back(env);
-        return env;
+    std::weak_ptr<scope_frame> capture_scope() {
+        captured_scopes->push_back(frame);
+        return frame;
     }
 
-    std::weak_ptr<value_object_t> current_scope() const { return env; }
+    std::weak_ptr<scope_frame> current_scope() const { return frame; }
 
-    context(const context& caller, const std::weak_ptr<value_object_t>& lexical_scope) : context() {
-        const auto scope = lexical_scope.lock();
+    // Scope of a macro or caller-block call: reads through to the scope it was defined in.
+    context(const context& caller, const std::weak_ptr<scope_frame>& lexical_scope)
+        : src(caller.src), current_time(caller.current_time), checkpoint(caller.checkpoint),
+          captured_scopes(caller.captured_scopes) {
+        auto scope = lexical_scope.lock();
         if (!scope) throw std::runtime_error("macro definition scope has expired");
-        for (const auto& pair : scope->as_ordered_object()) set_val(pair.first, pair.second);
-        current_time    = caller.current_time;
-        checkpoint      = caller.checkpoint;
-        src             = caller.src;
-        captured_scopes = caller.captured_scopes;
+        frame = std::make_shared<scope_frame>(std::move(scope));
     }
 
-    context(const context& parent) : context() {
-        // inherit variables (for example, when entering a new scope)
-        auto& pvar = parent.env->as_ordered_object();
-        for (const auto& pair : pvar) { set_val(pair.first, pair.second); }
-        current_time    = parent.current_time;
-        checkpoint      = parent.checkpoint;
-        src             = parent.src;
-        captured_scopes = parent.captured_scopes;
-    }
+    // New scope (for example, a for loop) reading through to the parent's.
+    context(const context& parent)
+        : src(parent.src), current_time(parent.current_time), checkpoint(parent.checkpoint),
+          frame(std::make_shared<scope_frame>(parent.frame)), captured_scopes(parent.captured_scopes) {}
 
     value get_val(const std::string& name) {
-        value default_val = mk_val<value_undefined>(name);
-        return env->at(name, default_val);
+        for (scope_frame* f = frame.get(); f != nullptr; f = f->parent.get()) {
+            if (value* v = f->find_local(name)) return *v;
+            if (f->loop_items != nullptr && name == "loop") return f->loop_object();
+        }
+        return mk_val<value_undefined>(name);
     }
 
-    void set_val(const std::string& name, const value& val) { env->insert(name, val); }
+    void set_val(const std::string& name, const value& val) { frame->set(name, val); }
 
-    void set_val(const value& name, const value& val) { env->insert(name, val); }
+    void set_val(const value& name, const value& val) { frame->set(name->as_string().str(), val); }
 
-    void print_vars() const { printf("Context Variables:\n%s\n", value_to_json(env, 2).c_str()); }
+    scope_frame& local_scope() { return *frame; }
+
+    void print_vars() const {
+        auto vars = mk_val<value_object>();
+        for (auto* f = frame.get(); f != nullptr; f = f->parent.get()) {
+            for (const auto& pair : f->vars) {
+                if (!vars->has_key(mk_val<value_string>(pair.first))) vars->insert(pair.first, pair.second);
+            }
+        }
+        printf("Context Variables:\n%s\n", value_to_json(vars, 2).c_str());
+    }
 
 private:
-    value_object env;
-    std::shared_ptr<std::vector<value_object>> captured_scopes =
-        std::make_shared<std::vector<value_object>>();
+    scope_frame_ptr frame;
+    std::shared_ptr<std::vector<scope_frame_ptr>> captured_scopes =
+        std::make_shared<std::vector<scope_frame_ptr>>();
 };
 
 // utils for visiting AST nodes
@@ -353,12 +406,17 @@ struct member_expression : public expression {
     statement_ptr object;
     statement_ptr property;
     bool computed; // true if obj[expr] and false if obj.prop
+    // obj.prop: the key value "prop", made once at parse time (never mutated; shared by renders)
+    value property_key;
 
     member_expression(statement_ptr&& object, statement_ptr&& property, bool computed)
         : object(std::move(object)), property(std::move(property)), computed(computed) {
         chk_type<expression>(this->object);
         chk_type<expression>(this->property);
+        init_property_key();
     }
+
+    void init_property_key();
 
     std::string type() const override { return "MemberExpression"; }
 
@@ -425,12 +483,14 @@ struct float_literal : public expression {
 
 struct string_literal : public expression {
     std::string val;
+    // Made once at parse time: string values are never modified in place, so renders share it.
+    value cached;
 
-    explicit string_literal(const std::string& val) : val(val) {}
+    explicit string_literal(const std::string& val) : val(val), cached(mk_val<value_string>(val)) {}
 
     std::string type() const override { return "StringLiteral"; }
 
-    value execute_impl(context&) override { return mk_val<value_string>(val); }
+    value execute_impl(context&) override { return cached; }
 };
 
 struct array_literal : public expression {
@@ -775,7 +835,7 @@ static void gather_string_parts_recursive(const value& val, value_string& parts)
         std::string str_val = val->as_string().str();
         parts->val_str.append(str_val);
     } else if (is_val<value_array>(val)) {
-        auto items = cast_val<value_array>(val)->as_array();
+        const auto& items = cast_val<value_array>(val)->as_array();
         for (const auto& item : items) { gather_string_parts_recursive(item, parts); }
     }
 }

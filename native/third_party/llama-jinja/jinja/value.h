@@ -237,10 +237,13 @@ struct value_int_t : public value_t {
 
     virtual bool is_hashable() const override { return true; }
 
-    virtual hasher unique_hash() const noexcept override {
-        return hasher(typeid(*this))
-            .update(&val_int, sizeof(val_int))
-            .update(&val_flt, sizeof(val_flt));
+    virtual hasher unique_hash() const noexcept override { return hash_of(val_int); }
+
+    // unique_hash() of value_int_t(v), without making one (floats and bools hash like their integer).
+    static hasher hash_of(int64_t v) noexcept {
+        double f = static_cast<double>(v);
+        if (static_cast<int64_t>(f) != v) { f = v < 0 ? -INFINITY : INFINITY; }
+        return hasher(typeid(value_int_t)).update(&v, sizeof(v)).update(&f, sizeof(f));
     }
 protected:
     virtual bool equivalent(const value_t& other) const override {
@@ -255,12 +258,9 @@ protected:
 using value_int = std::shared_ptr<value_int_t>;
 
 struct value_float_t : public value_t {
-    value val;
-
     value_float_t(double v) {
         val_flt = v;
         val_int = std::isfinite(v) ? static_cast<int64_t>(v) : 0;
-        val     = mk_val<value_int>(val_int);
     }
 
     virtual std::string type() const override { return "Float"; }
@@ -281,7 +281,7 @@ struct value_float_t : public value_t {
 
     virtual hasher unique_hash() const noexcept override {
         if (static_cast<double>(val_int) == val_flt) {
-            return val->unique_hash();
+            return value_int_t::hash_of(val_int);
         } else {
             return hasher(typeid(*this))
                 .update(&val_int, sizeof(val_int))
@@ -311,7 +311,8 @@ struct value_string_t : public value_t {
 
     virtual string as_string() const override { return val_str; }
 
-    virtual bool as_bool() const override { return val_str.length() > 0; }
+    // Non-empty text has at least one character: no need to count them.
+    virtual bool as_bool() const override { return val_str.byte_size() > 0; }
 
     virtual const func_builtins& get_builtins() const override;
 
@@ -327,19 +328,16 @@ struct value_string_t : public value_t {
 
 protected:
     virtual bool equivalent(const value_t& other) const override {
-        return typeid(*this) == typeid(other) && val_str.str() == other.val_str.str();
+        return typeid(*this) == typeid(other) && val_str.equals(other.val_str);
     }
 };
 
 using value_string = std::shared_ptr<value_string_t>;
 
 struct value_bool_t : public value_t {
-    value val;
-
     value_bool_t(bool v) {
         val_int = static_cast<int64_t>(v);
         val_flt = static_cast<double>(v);
-        val     = mk_val<value_int>(val_int);
     }
 
     virtual std::string type() const override { return "Boolean"; }
@@ -358,7 +356,7 @@ struct value_bool_t : public value_t {
 
     virtual bool is_hashable() const override { return true; }
 
-    virtual hasher unique_hash() const noexcept override { return val->unique_hash(); }
+    virtual hasher unique_hash() const noexcept override { return value_int_t::hash_of(val_int); }
 protected:
     virtual bool equivalent(const value_t& other) const override {
         return other.is_numeric() && val_int == other.val_int && val_flt == other.val_flt;

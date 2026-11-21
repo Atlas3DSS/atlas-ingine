@@ -112,8 +112,9 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   options.template_kwargs = std::move(kwargs);
   const auto messages = body.find("messages");
   const auto tools = body.find("tools");
-  text::RenderedPrompt prompt = fmt.render(messages == body.end() ? Json() : *messages,
-                                           tools == body.end() ? Json() : *tools, options);
+  static const Json kAbsent;  // null: no messages/tools key (passed by reference, not a deep copy of the body)
+  text::RenderedPrompt prompt = fmt.render(messages == body.end() ? kAbsent : *messages,
+                                           tools == body.end() ? kAbsent : *tools, options);
 
   const int64_t room = int64_t(max_model_len) - int64_t(prompt.ids.size());
   if (room <= 0) {
