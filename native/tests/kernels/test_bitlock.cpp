@@ -287,7 +287,8 @@ constexpr uint64_t kLock[8][kLocks] = {
     {0xc7e8b065cd281619ull, 0x8def6144b8d1a6ddull, 0xf728fa27f51a6addull, 0xf8f5d56151931c89ull, 0xd2b386c363d4d43dull, 0x3b08c7121c1f7f30ull},
     {0xa916f12be963aee1ull, 0x24ff175b36d98597ull, 0xff957e3c72a1220eull, 0x8400a007229514c9ull, 0xfd6d7163fa91de54ull, 0xc5c4d8fd1dd6de9eull},
     {0xf940f814b1aeab52ull, 0x5acd1dc5543cd309ull, 0x3bb8e61b7b123ee1ull, 0xfa4d0561c1ae8319ull, 0x2406078539f39eabull, 0x60c2fcfa9e617660ull},
-    {0x96acab9db3688209ull, 0x0860e87ad1181b6bull, 0xed4e557d3be4bc9full, 0x40873edc05b60326ull, 0x1ead80b992b2cc6aull, 0x70b9b19687e1971full},
+    // attn sliding differs from 32489d5: that M = 8 build left 2 of 6 bias adds unfused; pinned to fmaf
+    {0x96acab9db3688209ull, 0x0860e87ad1181b6bull, 0xed4e557d3be4bc9full, 0x40873edc05b60326ull, 0x1ead80b992b2cc6aull, 0xeb11175f858ef93eull},
 };
 
 }  // namespace
