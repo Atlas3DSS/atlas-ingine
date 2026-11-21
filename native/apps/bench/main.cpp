@@ -2,6 +2,8 @@
 // engine/bench/bench_e2e.py; same flags, lines and JSON).
 //
 //     ingine-bench --tokens 512 --dense-fp8
+//     ingine-bench --spec --forced agentic.jsonl   (teacher-forced replay, see forced.h)
+#include "forced.h"
 #include "ingine/generator.h"
 #include "serve/cli.h"
 #include "text/chat.h"
@@ -131,8 +133,8 @@ std::string default_model_dir() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low";
-  int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0;
+  std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
+  int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
@@ -152,6 +154,11 @@ int main(int argc, char** argv) {
             &spec_threshold);
   ap.option("--temperature", "", "", &temperature);
   ap.option("--long-prompt", "", "also time prefill of a synthetic prompt of N tokens", &long_prompt);
+  ap.option("--forced", "", "teacher-forced replay of the outputs in FILE (JSON lines {name, prompt, output})",
+            &forced);
+  ap.option("--forced-items", "", "replay at most N items of --forced", &forced_items);
+  ap.option("--forced-skip", "", "skip the first N items of --forced", &forced_skip);
+  ap.option("--forced-trace", "", "append every replayed item and round to FILE (JSON lines)", &forced_trace);
   ap.parse(argc, argv);
 
   try {
@@ -174,6 +181,10 @@ int main(int argc, char** argv) {
     cudaMemGetInfo(&free1, &total);
     std::printf("load+capture %.1fs, GPU %.2f GB\n", load_s, double(free0 > free1 ? free0 - free1 : 0) / 1e9);
     std::fflush(stdout);
+    if (!forced.empty()) {
+      std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace).c_str());
+      return 0;
+    }
 
     const auto fmt = ingine::text::ChatFormat::load(model_dir);
     const auto& tok = fmt.tokenizer();

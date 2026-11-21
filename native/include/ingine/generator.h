@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace ingine::model {
 
@@ -17,6 +18,11 @@ struct Sampling {
   float top_p = 1.0f;
   int top_k = 0;  // 0 => disabled
   std::optional<uint64_t> seed;
+  // Teacher-forced replay (test/benchmark only; empty = off): generate() emits exactly these tokens
+  // (max_new_tokens is capped at their count), running its real loop along them: plain decoding samples as
+  // usual and then takes the forced token; speculative decoding accepts a draft iff it equals the forced token
+  // and continues with the forced token after the accepted run. Fills GenerateStats::spec_trace.
+  std::span<const int32_t> forced;
 };
 
 // How the prompt reused the state of earlier requests (reused_tokens were not prefilled again).
@@ -33,11 +39,19 @@ inline const char* to_string(Reuse reuse) {
   }
 }
 
+// One speculative round of a forced replay: verify width, accepted drafts, the drafts that would have been
+// accepted had all 7 been verified, and GPU time of the round's verify (+ acceptance) and of its draft.
+struct SpecRoundRecord {
+  int width = 0, accepted = 0, accepted_all = 0;
+  float verify_ms = 0, draft_ms = 0;
+};
+
 struct GenerateStats {
   int prompt_tokens = 0, reused_tokens = 0, generated_tokens = 0;
   Reuse reuse = Reuse::None;
   double prefill_seconds = 0, decode_seconds = 0;
   int spec_rounds = 0, spec_accepted = 0;
+  std::vector<SpecRoundRecord> spec_trace;  // forced replay only
 };
 
 struct RuntimeOptions {

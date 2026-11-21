@@ -78,6 +78,7 @@ class EngineGenerator final : public Generator {
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     const int n = int(prompt.size());
+    if (!sampling.forced.empty()) max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
     // a verify call writes up to max(verify widths) positions
     const int reserve = drafter_ ? *std::max_element(rt_.verify_widths().begin(), rt_.verify_widths().end()) : 0;
     if (n + std::int64_t(max_new_tokens) + reserve > options_.max_ctx) {
@@ -96,7 +97,8 @@ class EngineGenerator final : public Generator {
       prefill(prompt, stats);
       stats.prompt_tokens = n;
       if (spec_) {
-        const std::int32_t token = sample(static_cast<const float*>(logits_.p), sampling, rng);
+        std::int32_t token = sample(static_cast<const float*>(logits_.p), sampling, rng);
+        if (!sampling.forced.empty()) token = sampling.forced[0];
         stats.prefill_seconds = seconds_since(t);
         t = std::chrono::steady_clock::now();
         if (max_new_tokens > 0) {
@@ -143,9 +145,19 @@ class EngineGenerator final : public Generator {
     const cudaStream_t stream = rt_.stream();
     const head::SamplingParams params{sampling.temperature, sampling.top_k, sampling.top_p};
     auto* sampled = static_cast<std::int32_t*>(token_.p);
+    // forced replay: the forced tokens on the device; each sampled token is replaced by its forced one
+    DeviceBuffer forced;
+    if (!sampling.forced.empty()) {
+      forced = DeviceBuffer(sampling.forced.size_bytes());
+      CUDA_CHECK(cudaMemcpyAsync(forced.p, sampling.forced.data(), sampling.forced.size_bytes(),
+                                 cudaMemcpyHostToDevice, stream));
+    }
     // engine._sample of the logits into `sampled`, then the inputs of the step at `position`
     auto sample_for = [&](const float* logits, int position) {
       head::sample(logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, params, rng, sampled, stream);
+      if (forced.p)
+        CUDA_CHECK(cudaMemcpyAsync(sampled, static_cast<const std::int32_t*>(forced.p) + (position - n),
+                                   sizeof(std::int32_t), cudaMemcpyDeviceToDevice, stream));
       rt_.chain_advance(sampled, position);
     };
     // the step at `position` (its input token is on the device), then the next token

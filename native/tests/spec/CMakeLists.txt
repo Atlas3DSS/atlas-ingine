@@ -10,3 +10,7 @@ if(TARGET ingine_kernels_dense)
                   LIBS ingine_kernels_draft ingine_kernels_dense ingine_core CUDA::cudart
                   GPU MODEL TIMEOUT 600)
 endif()
+# Teacher-forced replay through the Generator (full model).
+if(TARGET ingine_model)
+  ingine_add_test(NAME spec_forced SOURCES test_forced.cpp LIBS ingine_model CUDA::cudart GPU MODEL TIMEOUT 600)
+endif()

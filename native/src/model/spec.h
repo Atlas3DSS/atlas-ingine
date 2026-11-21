@@ -60,9 +60,10 @@ class SpecLoop {
   Drafter::Draft draft_{};             // the drafter's fixed output buffers
   DeviceBuffer width_;                 // int32: the verify width chosen on the device
   MappedHostBuffer record_;            // VerifyRecord of the last round
+  MappedHostBuffer forced_window_;     // forced replay: int32 [8], the forced tokens after the round's anchor
   GraphExec verify_, accept_;
   struct AcceptKey {
-    bool greedy;
+    bool greedy, forced;
     float temperature, top_p;
     int top_k;
     bool operator==(const AcceptKey&) const = default;
