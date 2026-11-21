@@ -12,7 +12,8 @@
 // Epilogue: o = O 2^-15 / l, lse = ln(sum e^s), o * sigmoid(lse - sink) rounded to BF16, times
 // sigmoid(gate), rounded to BF16.
 // Keys/values are staged through registers into double-buffered swizzled shared memory: tile i + 1 is loaded
-// from global memory while tile i is multiplied (one barrier per tile). Keys are either implicit (key j at
+// from global memory at the start of tile i and stored to the other buffer right after tile i's Q.K^T (one
+// barrier per tile); fragment loads of a k16 group are issued before its MMAs. Keys are either implicit (key j at
 // position j: the full-attention cache prefix) or explicit (kpos, the sliding ring + chunk rows) with per-tile
 // position bounds deciding which tiles are skipped, need no mask, or need the bias. CTAs run heaviest row tiles
 // (latest tokens) first.
@@ -247,15 +248,22 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     const uint16_t* Ks = s.k[buf];
 #pragma unroll
     for (int kk = 0; kk < DCH / 2; ++kk) {
+      // all of the k16 group's key fragments first, then its 8 MMAs (each MMA no longer waits on the ldmatrix
+      // issued right before it)
+      unsigned b[BK / 16][4];
+#pragma unroll
+      for (int np = 0; np < BK / 16; ++np)
+        ldmatrix_x4(b[np][0], b[np][1], b[np][2], b[np][3],
+                    smem_addr(Ks + swz<DCH>(np * 16 + (lane & 7) + ((lane >> 4) << 3), kk * 2 + ((lane >> 3) & 1))));
 #pragma unroll
       for (int np = 0; np < BK / 16; ++np) {
-        unsigned b0, b1, b2, b3;
-        ldmatrix_x4(b0, b1, b2, b3,
-                    smem_addr(Ks + swz<DCH>(np * 16 + (lane & 7) + ((lane >> 4) << 3), kk * 2 + ((lane >> 3) & 1))));
-        mma_bf16(sc[2 * np], qf[kk], b0, b1);
-        mma_bf16(sc[2 * np + 1], qf[kk], b2, b3);
+        mma_bf16(sc[2 * np], qf[kk], b[np][0], b[np][1]);
+        mma_bf16(sc[2 * np + 1], qf[kk], b[np][2], b[np][3]);
       }
     }
+    // stage the next tile now (its buffer was last read before the previous barrier): the conversion and the
+    // shared stores overlap the Q.K^T MMAs in flight instead of trailing the P.V MMAs
+    if (i + 1 < ntiles) store_tile<FP8, EXPLICIT>(s, buf ^ 1, regs);
 
     // ---- scores (log2 units), bias, mask
     float rmax[2] = {m[0], m[1]};
@@ -311,16 +319,21 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
                              pack_half2(sc[2 * kk + 1][0], sc[2 * kk + 1][1]),
                              pack_half2(sc[2 * kk + 1][2], sc[2 * kk + 1][3])};
 #pragma unroll
-      for (int dp = 0; dp < D / 16; ++dp) {
-        unsigned b0, b1, b2, b3;
-        ldmatrix_x4_t(b0, b1, b2, b3,
-                      smem_addr(Vs + swz<DCH>(kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, dp * 2 + (lane >> 4))));
-        mma_f16(o[2 * dp], a, b0, b1);
-        mma_f16(o[2 * dp + 1], a, b2, b3);
+      for (int dq = 0; dq < D / 32; ++dq) {  // two value fragment loads, then their four MMAs
+        unsigned b[2][4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+          ldmatrix_x4_t(b[h][0], b[h][1], b[h][2], b[h][3],
+                        smem_addr(Vs + swz<DCH>(kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8,
+                                                (2 * dq + h) * 2 + (lane >> 4))));
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          mma_f16(o[2 * (2 * dq + h)], a, b[h][0], b[h][1]);
+          mma_f16(o[2 * (2 * dq + h) + 1], a, b[h][2], b[h][3]);
+        }
       }
     }
 
-    if (i + 1 < ntiles) store_tile<FP8, EXPLICIT>(s, buf ^ 1, regs);
     __syncthreads();
   }
 
