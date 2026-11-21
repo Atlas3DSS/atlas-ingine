@@ -2,7 +2,7 @@
   "name": "Inkling-2-Mini abliterated - ingine",
   "model": {
     "repo_id": "satellitedown/Inkling-2-Mini-abliterated-ingine",
-    "revision": "b1fc4864ee4291211c3106bcd5240386456bceb7",
+    "revision": "6e823ba0031071d549e4973ec8caf86873cf60db",
     "directory": "Inkling-2-Mini",
     "files": {
       "LICENSE": {
@@ -14,12 +14,12 @@
         "sha256": "913090d214ecee2c5eebf9858735fb26cc04db516229f7abc55409c91dc6e494"
       },
       "README.md": {
-        "size": 10997,
-        "sha256": "025215293a98a615ce204deada7da540ee05fd755dd7cf03833643f29a7cf733"
+        "size": 11386,
+        "sha256": "dac772f899be8a3f68f981d294b607744994bcf449c00e9e9ea74b38041c3776"
       },
       "SHA256SUMS": {
         "size": 2961,
-        "sha256": "5779a2ec772ec72bea1e412bcc855b35bda4126e731a20d1648b884d93409d79"
+        "sha256": "90cf2a00e4491244a4d0e4d0f3da5c294abae10ef5cc74090d89089016961a9e"
       },
       "chat_template.jinja": {
         "size": 6868,

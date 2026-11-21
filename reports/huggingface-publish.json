@@ -1,0 +1,134 @@
+{
+ "repo": "satellitedown/Inkling-2-Mini-abliterated-ingine",
+ "revision": "6e823ba0031071d549e4973ec8caf86873cf60db",
+ "files": {
+  "LICENSE": {
+   "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+   "size": 11357
+  },
+  "NOTICE": {
+   "sha256": "913090d214ecee2c5eebf9858735fb26cc04db516229f7abc55409c91dc6e494",
+   "size": 3136
+  },
+  "README.md": {
+   "sha256": "dac772f899be8a3f68f981d294b607744994bcf449c00e9e9ea74b38041c3776",
+   "size": 11386
+  },
+  "SHA256SUMS": {
+   "sha256": "90cf2a00e4491244a4d0e4d0f3da5c294abae10ef5cc74090d89089016961a9e",
+   "size": 2961
+  },
+  "abliteration/ablate.py": {
+   "sha256": "3cbf96228303d89ee42817cb4e3b8026e1abe159374793df97a3630602586b17",
+   "size": 25585
+  },
+  "abliteration/capability_eval.py": {
+   "sha256": "af31afec0e0b517db1430e771caef83f7c3ff5ffc0d1388f902da7179159a24b",
+   "size": 11342
+  },
+  "abliteration/eval.sh": {
+   "sha256": "faacea3610971ee7f4970fb922a4a6c85deadf346094a5db0ad5813cb1f6e661",
+   "size": 2147
+  },
+  "abliteration/inkling_ref.py": {
+   "sha256": "c1aaed1bb2773dde784f7c6d37cd716f0837088f3e177d5c49c657a861909832",
+   "size": 10310
+  },
+  "abliteration/refusal_eval.py": {
+   "sha256": "1bf36ffc8d5334b4ff345e153c3304be7589a0f464b3607386ecbd876bfd44d7",
+   "size": 9117
+  },
+  "abliteration/requirements.txt": {
+   "sha256": "b952f7caba76619837063b343eba701205f60211b71babd5ddbdf684da23bdaa",
+   "size": 252
+  },
+  "abliteration/results/capability-abliterated.json": {
+   "sha256": "53dd9629773c77910cf9cd6a88d36756c2f149f867701eca79c6caca54764f06",
+   "size": 7054
+  },
+  "abliteration/results/capability-original.json": {
+   "sha256": "77636b404aa4a8173a492c527689235c40298772d1eaff8dea315fd5a81fb858",
+   "size": 7056
+  },
+  "abliteration/results/refusals-abliterated-thinking.json": {
+   "sha256": "c31bbb03cd2800cc2ccc30daf23e6b6c2b36d13c563f99fab8fb474283fbf9b4",
+   "size": 58990
+  },
+  "abliteration/results/refusals-abliterated.json": {
+   "sha256": "f7347b1da5efee1601701753525d725f55331f84a285a290f371b6320b54ff81",
+   "size": 39215
+  },
+  "abliteration/results/refusals-original-thinking.json": {
+   "sha256": "a423d58c69ccca2cdb83ce44d9b6e39bb23ba2f4077b56ea2cdc75c404fdff13",
+   "size": 50796
+  },
+  "abliteration/results/refusals-original.json": {
+   "sha256": "34809638d06bbf38f6c7da167da06180d1d5a9ab6a132c2e8e072d9140334588",
+   "size": 36888
+  },
+  "abliteration/results/verify-abliterated.json": {
+   "sha256": "f478f62433e9e94f3d32db9f2e77eacb91dbdfb1ba8b7950fad94aef775db1ef",
+   "size": 6392
+  },
+  "abliteration/results/verify-alt-t37.json": {
+   "sha256": "7171e7a4a363d6adf7475ba98157c75057c6f605f78a017bcce6512af04fd117",
+   "size": 6384
+  },
+  "abliteration/results/verify-nothink-t44.json": {
+   "sha256": "9ed9ef3240239f21558edb5155ced91c1e93662d3ec440e51c6698ae9a6610b1",
+   "size": 4302
+  },
+  "chat_template.jinja": {
+   "sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc",
+   "size": 6868
+  },
+  "config.json": {
+   "sha256": "8216dd43157f5474cfff88f486a1e433fef703c674f694e485a86a761c412b1e",
+   "size": 2699
+  },
+  "generation_config.json": {
+   "sha256": "a08737c07a65a8fdf69f7cf086576210e5aad4b241437090b26d7b0c4f7905f7",
+   "size": 98
+  },
+  "hf_quant_config.json": {
+   "sha256": "7c656207d3ce37879c7be209a036b0dde43bf01f78159bff06880b868ed57143",
+   "size": 67924
+  },
+  "inkling-2-mini-abliterated.safetensors": {
+   "sha256": "9467240bdbcd4737a3496bf167525989d79196dbeec582361880ad4d8cbe4d73",
+   "size": 885848
+  },
+  "model-00001-of-00001.safetensors": {
+   "sha256": "65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1",
+   "size": 19526019168
+  },
+  "model.safetensors.index.json": {
+   "sha256": "c1631065b7b00787993522dddc66a68b3abee869192977fb3dcb796e63bc5838",
+   "size": 109300
+  },
+  "mtp.safetensors": {
+   "sha256": "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2",
+   "size": 635801416
+  },
+  "processor_config.json": {
+   "sha256": "d7350adce18c8be4b607f261c8f0f7eabbf720bb7aaf648a43d4f8372bbacc2d",
+   "size": 461
+  },
+  "special_tokens_map.json": {
+   "sha256": "c16f44b3594563d82743ddb0417a2be1bfe3e2000dfad2da4b8f32554593e1a0",
+   "size": 529
+  },
+  "tiktoken/tokenizer.model": {
+   "sha256": "f170372dd655728909228220d77cf6b8104a59f38a91262a7d2c4027906ec0d8",
+   "size": 3386494
+  },
+  "tokenizer.json": {
+   "sha256": "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6",
+   "size": 26178678
+  },
+  "tokenizer_config.json": {
+   "sha256": "bf09342d285139fd37ce10c70878af1d52cb390e9901e10248654293a80ee636",
+   "size": 13235
+  }
+ }
+}
