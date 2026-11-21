@@ -1,10 +1,11 @@
 // Drafter smoke test with the real mtp.safetensors (~1.2 GB of GPU memory at peak) and a small synthetic
 // target (embedding/unembedding of 4096 tokens): eager and graph drafts agree bit for bit, commits through
 // the per-row-count graphs equal eager commits, the outputs are well formed (tokens are each row's first
-// maximum, -inf outside 1024 candidates, conf = 1 / sum exp(l - max)), and sampled drafts are reproducible
-// per seed.
+// maximum, -inf outside 1024 candidates, conf = 1 / sum exp(l - max)), sampled drafts are reproducible per
+// seed, and the shortlist head proposes only its ranked tokens and the noted context tokens.
 #include "common/test_util.h"
 #include "kernels/dense/dense.h"
+#include "kernels/draft/shortlist.h"
 #include "model/drafter.h"
 
 #include <algorithm>
@@ -124,8 +125,21 @@ int main() {
   d_feats.copy_from_host(feats.data(), feats.size() * 2);
   const auto* fp = static_cast<const __nv_bfloat16*>(d_feats.p);
 
+  // the shortlist head over the 4096-token vocabulary: the first SHORT ranked ids; the others can join only as
+  // context tokens
+  constexpr int SHORT = 2048;
+  std::vector<std::uint8_t> ranked(V, 0);
+  std::vector<std::int32_t> outside;
   {
-    model::Drafter d(dir, w, MAX_CTX, stream);
+    int taken = 0;
+    for (const std::uint32_t t : ingine::kernels::draft::draft_shortlist_ranks())
+      if (taken < SHORT && t < std::uint32_t(V) && !ranked[t]) ranked[t] = 1, ++taken;
+    for (int t = 0; t < V; ++t)
+      if (!ranked[t]) outside.push_back(t);
+  }
+
+  {
+    model::Drafter d(dir, w, MAX_CTX, stream, SHORT);
     const int anchor = 17;
     // A: one eager commit of all rows; B: rows - 5 rows, then 5 rows (a commit graph once captured)
     auto commit_a = [&] { d.commit(fp, rows, 0); };
@@ -196,6 +210,7 @@ int main() {
       d.save_checkpoint(ckpt.get());
       for (const int extra : {1500, 5000}) {
         for (int s = rows; s < rows + extra; s += rows) d.commit(fp, rows, s);
+        d.note_tokens(outside);  // context tokens added after the checkpoint are dropped by the restore
         fetch(d.draft(anchor, rows + extra, 0.f), stream);
         d.restore_checkpoint(ckpt.get());
         char what[96];
@@ -203,6 +218,26 @@ int main() {
                       extra);
         expect(d.length() == rows && fetch(d.draft(anchor, rows, 0.f), stream) == ref, what);
       }
+    }
+
+    // the shortlist head: drafts come from the ranked tokens and the noted context tokens only
+    {
+      auto allowed_only = [&](const DraftOut& o, const std::vector<std::uint8_t>& ok) {
+        for (std::size_t i = 0; i < o.logits.size(); ++i)
+          if (std::isfinite(o.logits[i]) && !ok[i % V]) return false;
+        return true;
+      };
+      expect(allowed_only(eager_a, ranked), "drafts come from the shortlist");
+      d.note_tokens(outside);
+      const DraftOut noted = fetch(d.draft(anchor, rows, 0.f), stream);
+      std::vector<std::uint8_t> with = ranked;
+      for (const int t : outside) with[t] = 1;
+      bool uses = false;
+      for (std::size_t i = 0; i < noted.logits.size(); ++i) uses |= std::isfinite(noted.logits[i]) && !ranked[i % V];
+      expect(well_formed(noted, true) && allowed_only(noted, with) && uses, "noted context tokens join the candidates");
+      d.reset();  // drops them again
+      commit_b();
+      expect(fetch(d.draft(anchor, rows, 0.f), stream) == eager_b, "reset drops the context tokens");
     }
 
     d.set_seed(123);

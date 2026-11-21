@@ -39,7 +39,7 @@ struct DraftParams {
   std::int32_t P = 0;           // position of the anchor
   float temperature = 0.f;      // <= 0: greedy drafts, else Gumbel-max at this temperature
   std::int32_t start = 0;       // first position of the rows being committed
-  std::uint64_t seed = 0;       // Gumbel noise: uniform01(seed, draws, step, candidate)
+  std::uint64_t seed = 0;       // Gumbel noise: gumbel(seed, draws, step, candidate) (rng.h)
   std::uint64_t draws = 0;      // drafts so far (advanced by markov_finish)
   std::int32_t ncommit = 0;     // rows of the small commit (1..BLOCK)
   std::int32_t pad = 0;
@@ -142,6 +142,14 @@ void silu_mul(const float* gu, int rows, int inter, __nv_bfloat16* out, cudaStre
 std::size_t topk_workspace_bytes(int rows, int V);
 void topk_candidates(const float* base, int rows, int V, float* cand_val, std::int32_t* cand_idx, void* ws,
                      cudaStream_t stream);
+
+// Shortlist head (the base logits over a subset of the vocabulary): cand_idx[i] = map[cand_idx[i]] for n
+// entries (shortlist row -> token id).
+void map_candidates(std::int32_t* cand_idx, int n, const std::int32_t* map, cudaStream_t stream);
+// Copies head rows ids[0..n) of src [V, row_bytes] (+ the FP32 row scales of FP8 rows if src_scale) to dst
+// rows 0..n (+ dst_scale) and sets map[i] = ids[i]. row_bytes: a multiple of 16.
+void gather_head_rows(const void* src, const float* src_scale, std::size_t row_bytes, const std::int32_t* ids, int n,
+                      void* dst, float* dst_scale, std::int32_t* map, cudaStream_t stream);
 
 // part[i, r] = sum_{c >= 512} rnn_w[r, c] z_i[c] in fp32, z_i[512:] = (h[i], f_rnn): the step-independent
 // part of the rnn projection. rnn_w bf16 [768, 5120], h bf16 [GAMMA, H], f_rnn bf16 [H], part fp32 [7, 768].

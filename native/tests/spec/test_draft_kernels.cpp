@@ -494,6 +494,49 @@ void test_topk(Rng& r) {
   }
 }
 
+// gather_head_rows copies the chosen rows (FP8 + scales, or BF16) and records their ids; map_candidates
+// turns shortlist rows into token ids.
+void test_shortlist_head(Rng& r) {
+  const int V = 3000, n = 777;
+  for (const bool fp8 : {true, false}) {
+    const std::size_t row_bytes = fp8 ? std::size_t(H) : std::size_t(H) * 2;
+    std::vector<uint8_t> src(std::size_t(V) * row_bytes);
+    for (auto& b : src) b = uint8_t(r.uniform(0, 256));
+    std::vector<float> scale(V);
+    for (auto& s : scale) s = float(r.uniform(0.1, 2.0));
+    std::vector<int32_t> ids(n);
+    for (auto& t : ids) t = int32_t(r.uniform(0, V));
+    DeviceArray<uint8_t> d_src(src), d_dst(std::size_t(n + 5) * row_bytes);
+    DeviceArray<float> d_scale(scale), d_dscale(n + 5);
+    DeviceArray<int32_t> d_ids(ids), d_map(n + 5);
+    // rows from 5 on, as for context rows appended to a shortlist
+    kd::gather_head_rows(d_src.get(), fp8 ? d_scale.get() : nullptr, row_bytes, d_ids.get(), n,
+                         d_dst.get() + 5 * row_bytes, fp8 ? d_dscale.get() + 5 : nullptr, d_map.get() + 5, nullptr);
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+    const auto dst = d_dst.download();
+    const auto dscale = d_dscale.download();
+    const auto map = d_map.download();
+    bool ok = true;
+    for (int i = 0; i < n; ++i) {
+      ok &= std::equal(dst.begin() + std::ptrdiff_t((5 + i) * row_bytes), dst.begin() + std::ptrdiff_t((6 + i) * row_bytes),
+                       src.begin() + std::ptrdiff_t(ids[i] * row_bytes));
+      ok &= map[5 + i] == ids[i] && (!fp8 || dscale[5 + i] == scale[ids[i]]);
+    }
+    for (int i = 0; i < 5; ++i) ok &= map[i] == 0 && dscale[i] == 0.f;  // rows before untouched
+    expect(ok, fp8 ? "gather_head_rows FP8 rows + scales" : "gather_head_rows BF16 rows");
+    // map_candidates over [7, 1024] candidate rows of this shortlist
+    std::vector<int32_t> cand(std::size_t(kd::GAMMA) * kd::CANDIDATES);
+    for (auto& c : cand) c = 5 + int32_t(r.uniform(0, n));
+    DeviceArray<int32_t> d_cand(cand);
+    kd::map_candidates(d_cand.get(), int(cand.size()), d_map.get(), nullptr);
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+    const auto mapped = d_cand.download();
+    bool ok_map = true;
+    for (std::size_t i = 0; i < cand.size(); ++i) ok_map &= mapped[i] == map[cand[i]];
+    expect(ok_map, "map_candidates");
+  }
+}
+
 void test_markov(Rng& r) {
   const int V = 3000;
   auto rnn_w = rand_bf16(r, size_t(kd::RNN_OUT) * kd::RNN_IN, 0.02);
@@ -600,10 +643,7 @@ void test_markov(Rng& r) {
       float best_s = -INFINITY;
       for (int k = 0; k < kd::CANDIDATES; ++k) {
         float s = got_logits[k];
-        if (T > 0.f) {
-          const float u = std::max(kd::uniform01(42, 0, uint32_t(i), uint32_t(k)), 1e-20f);
-          s = got_logits[k] / std::max(T, 1e-6f) - std::log(-std::log(u));
-        }
+        if (T > 0.f) s = got_logits[k] / std::max(T, 1e-6f) + kd::gumbel(42, 0, uint32_t(i), uint32_t(k));
         if (s > best_s) {
           best_s = s;
           best = k;
@@ -659,6 +699,42 @@ void test_markov(Rng& r) {
     std::printf("%s markov_finish (T=%.1f)\n", ok ? "PASS" : "FAIL", T);
     expect(ok, "markov_finish");
   }
+}
+
+// The draft Gumbel noise: -log(-log(1 - v)) for v = k / 2^64 to float precision over the whole range (no cap
+// on the noise from a coarse uniform), and its tail frequency.
+void test_gumbel() {
+  bool ok = true;
+  float worst = 0.f;
+  for (int sh = 0; sh < 64; ++sh)
+    for (const std::uint64_t f : {1ull, 3ull, 0x9e3779b97f4a7c15ull}) {
+      const std::uint64_t k = sh == 0 ? f : (f << sh) | (f >> (64 - sh));
+      if (k == 0) continue;
+      // below 2^24 the kernel takes the bin's midpoint k + 0.5
+      const double v = std::ldexp(double(k) + (k < (1ull << 24) ? 0.5 : 0.0), -64);
+      const double ref = -std::log(-std::log1p(-v));
+      const float got = kd::gumbel_from_bits(k);
+      // v keeps 24 significant bits: |dv / v| <= 2^-24, d noise = dv / ((1 - v) E) with E = -log(1 - v)
+      const double tol = 1e-5 * std::max(1.0, std::fabs(ref)) + std::ldexp(v / ((1 - v) * -std::log1p(-v)), -23);
+      worst = std::max(worst, float(std::fabs(got - ref)));
+      ok &= std::isfinite(got) && std::fabs(got - ref) <= tol;
+    }
+  ok &= kd::gumbel_from_bits(1) > 43.f && kd::gumbel_from_bits(~0ull) < -2.7f;  // ends of the range
+  // tail frequency over 2^22 draws: P(G > t) = 1 - exp(-e^-t); counts within 5 sigma
+  const int n = 1 << 22;
+  const double ts[] = {0.0, 3.0, 8.0, 12.0};
+  long cnt[4] = {0, 0, 0, 0};
+  for (int j = 0; j < n; ++j) {
+    const float g = kd::gumbel(7, 3, uint32_t(j), 11u);
+    for (int t = 0; t < 4; ++t) cnt[t] += g > ts[t];
+  }
+  for (int t = 0; t < 4; ++t) {
+    const double p = -std::expm1(-std::exp(-ts[t])), mean = n * p, sd = std::sqrt(n * p * (1 - p));
+    ok &= std::fabs(cnt[t] - mean) <= 5 * sd + 1;
+  }
+  std::printf("%s draft gumbel noise exact to the tail (worst |diff| %.3g, %ld above 12 of %.1f)\n", ok ? "PASS" : "FAIL",
+              double(worst), cnt[3], n * -std::expm1(-std::exp(-12.0)));
+  expect(ok, "draft gumbel noise");
 }
 
 void test_fold(Rng& r) {
@@ -743,7 +819,9 @@ int main() {
   test_block_attention(r);
   test_add_rmsnorm_silu(r);
   test_topk(r);
+  test_shortlist_head(r);
   test_markov(r);
+  test_gumbel();
   test_fold(r);
   test_greedy_accept();
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);

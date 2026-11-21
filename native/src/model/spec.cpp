@@ -164,6 +164,7 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     }
     stats.generated_tokens = emitted;
     const bool go_on = on_tokens(std::span<const std::int32_t>(out.data(), k));
+    drafter_.note_tokens(std::span<const std::int32_t>(out.data(), k));  // for the drafts after the next one
     if (done || !go_on) {
       // The last emitted token stays unprocessed, as in plain decoding. If the generation ended inside the
       // round's accepted drafts (out[k - 1] with k - 1 < accepted), the state, the drafter and

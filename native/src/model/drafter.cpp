@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/safetensors.h"
+#include "kernels/draft/shortlist.h"
 
 #include <algorithm>
 #include <cmath>
@@ -51,7 +52,8 @@ void* Drafter::alloc(std::size_t bytes) {
   return storage_.back().p;
 }
 
-Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream)
+Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream,
+                 int shortlist_rows)
     : w_(w), stream_(stream), ctx_(std::min(max_ctx, DRAFT_CTX)) {
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("Drafter: max_ctx must hold two blocks");
   head_ = {w.unembed.w.data, w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
@@ -76,7 +78,8 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   latent_ = bf16s(kd::RANK);
   qkv_out_ = f32s(BLOCK * kd::QKV_ROWS);
   gu_out_ = f32s(std::size_t(BLOCK) * 2 * inter_);
-  base_ = f32s(std::size_t(GAMMA) * V_);
+  // the shortlist head's base logits (rows past the ones in use stay -inf)
+  base_ = f32s(std::size_t(GAMMA) * std::max(V_, shortlist_rows + 256 + CONTEXT_ROWS));
   attn_ws_ = f32s(std::max(kd::attention_workspace_floats(LOCAL_SLOTS), kd::attention_workspace_floats(ctx_)));
   topk_ws_ = alloc(kd::topk_workspace_bytes(GAMMA, V_));
   CUDA_CHECK(cudaMemsetAsync(topk_ws_, 0, kd::topk_workspace_bytes(GAMMA, V_), stream_));  // kept zeroed
@@ -116,7 +119,31 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   };
   seg_qkv_ = segments({kd::QKV_ROWS});
   seg_gate_up_ = segments({2 * inter_});
-  seg_head_ = segments({V_});
+  // the shortlist head: the shortlist_rows most frequent tokens and the specials, by ascending id (so equal
+  // base logits break ties towards the lower id, as over the full head), then room for context tokens
+  {
+    short_in_.assign(V_, 0);
+    int taken = 0;
+    for (std::uint32_t t : kd::draft_shortlist_ranks())
+      if (taken < shortlist_rows && t < std::uint32_t(V_) && !short_in_[t]) short_in_[t] = 1, ++taken;
+    for (int t = 199990; t < V_; ++t) short_in_[t] = 1;  // <|unused|>, <|endoftext|> and the added tokens
+    std::vector<std::int32_t> list;
+    for (int t = 0; t < V_; ++t)
+      if (short_in_[t]) list.push_back(t);
+    short_K_ = int(list.size());
+    const int rows = short_K_ + CONTEXT_ROWS;
+    const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
+    void* q = alloc(std::size_t(rows) * row_bytes);
+    auto* qs = head_.scale ? f32s(rows) : nullptr;
+    short_map_ = i32s(rows);
+    short_ids_ = i32s(rows);
+    CUDA_CHECK(cudaMemsetAsync(short_map_, 0, std::size_t(rows) * 4, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(short_ids_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
+    kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, short_K_, q, qs, short_map_, stream_);
+    short_head_ = kdense::Matrix{q, qs, rows};
+    seg_short_ = segments({short_K_});
+    kd::fill(base_, std::size_t(GAMMA) * rows, -INFINITY, stream_);
+  }
   seg_kv_ = segments({2 * kd::KV_DIM, 2 * kd::KV_DIM, 2 * kd::KV_DIM});  // layer l reads xin[l]
 
   for (int l = 0; l < 3; ++l) {
@@ -273,6 +300,41 @@ void Drafter::reset() {
   for (const DraftLayer& L : layers_)
     if (L.ctx_pos != nullptr) CUDA_CHECK(cudaMemsetAsync(L.ctx_pos, 0xff, kd::WINDOW * 4, stream_));
   length_ = 0;
+  set_context_rows(0);
+}
+
+void Drafter::set_context_rows(int rows) {
+  if (rows >= short_E_) return;
+  for (std::size_t i = std::size_t(rows); i < short_extra_.size(); ++i) short_in_[short_extra_[i]] = 0;
+  short_extra_.resize(std::size_t(rows));
+  short_E_ = rows;
+  const int seg[3] = {0, short_K_ + rows, 0};  // pageable source: copied before cudaMemcpyAsync returns
+  CUDA_CHECK(cudaMemcpyAsync(seg_short_, seg, sizeof seg, cudaMemcpyHostToDevice, stream_));
+  // the dropped rows' base logits back to -inf (the GEMV only writes the rows in use)
+  for (int i = 0; i < GAMMA; ++i)
+    kd::fill(base_ + std::size_t(i) * short_head_.rows + short_K_ + rows, std::size_t(CONTEXT_ROWS - rows), -INFINITY,
+             stream_);
+}
+
+void Drafter::note_tokens(std::span<const std::int32_t> ids) {
+  std::vector<std::int32_t> add;
+  for (std::int32_t t : ids)
+    if (t >= 0 && t < V_ && !short_in_[t] && short_E_ + int(add.size()) < CONTEXT_ROWS) {
+      short_in_[t] = 1;
+      add.push_back(t);
+    }
+  if (add.empty()) return;
+  const std::size_t row = std::size_t(short_K_ + short_E_);
+  const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
+  // pageable sources: copied before cudaMemcpyAsync returns; short_ids_ is free once earlier gathers ran
+  CUDA_CHECK(cudaMemcpyAsync(short_ids_, add.data(), add.size() * 4, cudaMemcpyHostToDevice, stream_));
+  kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, int(add.size()),
+                       static_cast<std::uint8_t*>(const_cast<void*>(short_head_.w)) + row * row_bytes,
+                       head_.scale ? const_cast<float*>(short_head_.scale) + row : nullptr, short_map_ + row, stream_);
+  short_extra_.insert(short_extra_.end(), add.begin(), add.end());
+  short_E_ += int(add.size());
+  const int seg[3] = {0, short_K_ + short_E_, 0};
+  CUDA_CHECK(cudaMemcpyAsync(seg_short_, seg, sizeof seg, cudaMemcpyHostToDevice, stream_));
 }
 
 void Drafter::set_seed(std::uint64_t seed) { kd::set_seed(params_, seed, stream_); }
@@ -317,6 +379,7 @@ void Drafter::save_checkpoint(void* dst) {
   checkpoint_ = dst;
   checkpoint_length_ = length_;
   checkpoint_clobbered_ = false;
+  checkpoint_extra_ = short_extra_;
 }
 
 void Drafter::restore_checkpoint(const void* src) {
@@ -344,6 +407,11 @@ void Drafter::restore_checkpoint(const void* src) {
   }
   length_ = checkpoint_length_;
   checkpoint_clobbered_ = false;
+  // the context tokens of the checkpoint: drop the ones added since (rebuild if they were reset meanwhile)
+  const bool prefix = short_extra_.size() >= checkpoint_extra_.size() &&
+                      std::equal(checkpoint_extra_.begin(), checkpoint_extra_.end(), short_extra_.begin());
+  set_context_rows(prefix ? int(checkpoint_extra_.size()) : 0);
+  if (!prefix) note_tokens(checkpoint_extra_);
 }
 
 void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece) {
@@ -406,8 +474,9 @@ void Drafter::run_draft(int bucket) {
     kd::add_rmsnorm(res_, delta_, l < 2 ? layers_[l + 1].in_norm : final_norm_, xn_, BLOCK, stream_);
   }
   const __nv_bfloat16* h = xn_ + H;  // rows 1..7
-  kdense::proj(h, GAMMA, head_, seg_head_, 1, base_, true, stream_);
-  kd::topk_candidates(base_, GAMMA, V_, cand_val_, cand_idx_, topk_ws_, stream_);
+  kdense::proj(h, GAMMA, short_head_, seg_short_, 1, base_, true, stream_);
+  kd::topk_candidates(base_, GAMMA, short_head_.rows, cand_val_, cand_idx_, topk_ws_, stream_);
+  kd::map_candidates(cand_idx_, GAMMA * kd::CANDIDATES, short_map_, stream_);
   kd::markov_pre(rnn_w_, h, f_rnn_, part_, stream_);
   for (int i = 0; i < GAMMA; ++i) {
     kd::markov_step(i, rnn_w_, rnn_b_, w1_, part_, picks_, cand_idx_, params_, state_, latent_, stream_);

@@ -3,6 +3,9 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstdint>
 
 namespace ingine::kernels::draft {
@@ -29,12 +32,32 @@ struct Philox {
   }
 };
 
-// Uniform in [0, 1) (24-bit resolution, like torch.rand for FP32) for (seed, stream, a, b).
-__host__ __device__ __forceinline__ float uniform01(std::uint64_t seed, std::uint64_t stream, std::uint32_t a,
-                                                    std::uint32_t b) {
+// Gumbel noise -log(E), E = -log(1 - v) ~ Exp(1), from 64 random bits k: v = k / 2^64 kept to 24 significant
+// bits below its leading zeros (down to 2^-64; the last 24 bits get + 0.5), so v is never 0 or 1 and the noise
+// is not capped (it reaches about 44): the drafts follow softmax(logits / T) to float precision. The same
+// construction as gumbel() in kernels/head/head.cu.
+__host__ __device__ __forceinline__ float gumbel_from_bits(std::uint64_t k) {
+#ifdef __CUDA_ARCH__
+  const int z = min(__clzll(static_cast<long long>(k)), 40);
+#else
+  const int z = std::min(std::countl_zero(k), 40);
+#endif
+  const float m = static_cast<float>(static_cast<std::uint32_t>(k >> (40 - z))) + (z == 40 ? 0.5f : 0.0f);
+#ifdef __CUDA_ARCH__
+  const float v = m * __int_as_float((127 - 24 - z) << 23);  // m * 2^-(24 + z)
+#else
+  const float v = m * std::bit_cast<float>((127 - 24 - z) << 23);
+#endif
+  const float e = v < 0.5f ? -log1pf(-v) : -logf(1.0f - v);
+  return -logf(e);
+}
+
+// Gumbel noise for (seed, stream, a, b).
+__host__ __device__ __forceinline__ float gumbel(std::uint64_t seed, std::uint64_t stream, std::uint32_t a,
+                                                 std::uint32_t b) {
   std::uint32_t c[4] = {static_cast<std::uint32_t>(stream), static_cast<std::uint32_t>(stream >> 32), a, b};
   Philox::generate(c, seed);
-  return static_cast<float>(c[0] >> 8) * (1.0f / 16777216.0f);
+  return gumbel_from_bits((static_cast<std::uint64_t>(c[0]) << 32) | c[1]);
 }
 
 }  // namespace ingine::kernels::draft

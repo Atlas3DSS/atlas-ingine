@@ -225,7 +225,10 @@ class EngineGenerator final : public Generator {
       if (drafter_) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
                      drafter_ ? &taps : nullptr);
-      if (drafter_) drafter_->commit(taps, int(s));
+      if (drafter_) {
+        drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
+        drafter_->commit(taps, int(s));
+      }
     }
     tokens_in_state_.assign(ids.begin(), ids.end());
     if (start < n) save_checkpoint();
