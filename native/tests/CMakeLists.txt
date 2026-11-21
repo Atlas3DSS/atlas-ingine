@@ -9,7 +9,19 @@
 #   concurrently: `ctest -L gpu` / `ctest -LE gpu` select or exclude them.
 #   Model-level tests (MODEL flag) carry the label `model` (they load real weights).
 
-set(INGINE_TEST_MODEL_DIR "/mnt/data/inkling/hf" CACHE PATH "Model directory for model-level tests")
+# Model directory for model-level tests: -DINGINE_TEST_MODEL_DIR=<dir>, else $INGINE_MODEL_DIR, else the
+# installer's setting in ~/.config/ingine/env, else the installer's download location.
+set(_model_dir "$ENV{INGINE_MODEL_DIR}")
+if(NOT _model_dir AND EXISTS "$ENV{HOME}/.config/ingine/env")
+  file(STRINGS "$ENV{HOME}/.config/ingine/env" _lines REGEX "^INGINE_MODEL_DIR=")
+  foreach(_line IN LISTS _lines)
+    string(REGEX REPLACE "^INGINE_MODEL_DIR=[\"']?([^\"']*)[\"']?$" "\\1" _model_dir "${_line}")
+  endforeach()
+endif()
+if(NOT _model_dir)
+  get_filename_component(_model_dir "${PROJECT_SOURCE_DIR}/../models/Inkling-2-Mini" ABSOLUTE)
+endif()
+set(INGINE_TEST_MODEL_DIR "${_model_dir}" CACHE PATH "Model directory for model-level tests")
 
 # ingine_add_test(NAME <name> SOURCES <src>... [LIBS <lib>...] [ARGS <arg>...] [LABELS <l>...]
 #                 [TIMEOUT <seconds>] [GPU] [MODEL] [ORACLE])

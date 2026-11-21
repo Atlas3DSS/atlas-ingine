@@ -8,19 +8,16 @@ ingine_add_test(NAME model_runtime SOURCES test_runtime.cpp LIBS ingine_model GP
 ingine_add_test(NAME model_reuse SOURCES test_reuse.cpp LIBS ingine_model GPU MODEL TIMEOUT 900)
 # full-model parity against the Python engine's goldens (tools/goldens_model.py); ~20 GB of GPU memory
 if(TARGET ingine-validate)
-  add_test(NAME model_parity COMMAND ingine-validate --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)
+  set(_validate ingine-validate --model-dir ${INGINE_TEST_MODEL_DIR} --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)
+  add_test(NAME model_parity COMMAND ${_validate})
   # exact greedy continuations only where the goldens have no near ties (long and FP8-cache cases flip at ties)
   set(_greedy_cases --cases kv16_chat,kv16_t300 --min-top1 1)
-  add_test(NAME model_parity_generate COMMAND ingine-validate --generate ${_greedy_cases}
-    --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)
-  add_test(NAME model_parity_spec COMMAND ingine-validate --generate --spec ${_greedy_cases}
-    --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)
+  add_test(NAME model_parity_generate COMMAND ${_validate} --generate ${_greedy_cases})
+  add_test(NAME model_parity_spec COMMAND ${_validate} --generate --spec ${_greedy_cases})
   # long greedy paths of the Generator teacher-forced through a plain width-1 runtime: plain decoding exact,
   # speculative decoding within the near-tie margin
-  add_test(NAME model_path COMMAND ingine-validate --path 1500 --cases abl_kv8_t300
-    --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)
-  add_test(NAME model_path_spec COMMAND ingine-validate --path 3000 --spec --cases abl_kv8_t300,abl_kv8_t2100
-    --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)
+  add_test(NAME model_path COMMAND ${_validate} --path 1500 --cases abl_kv8_t300)
+  add_test(NAME model_path_spec COMMAND ${_validate} --path 3000 --spec --cases abl_kv8_t300,abl_kv8_t2100)
   set_tests_properties(model_parity model_parity_generate model_parity_spec model_path model_path_spec PROPERTIES
     LABELS "gpu;model" RESOURCE_LOCK gpu TIMEOUT 3600)
 endif()

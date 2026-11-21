@@ -43,8 +43,14 @@ using namespace ingine::model;
 
 namespace {
 
+// $INGINE_MODEL_DIR, else the installer's download location (as ingine-bench)
+fs::path default_model_dir() {
+  if (const char* env = std::getenv("INGINE_MODEL_DIR"); env != nullptr && *env != '\0') return env;
+  return fs::path(INGINE_REPO_DIR) / "models" / "Inkling-2-Mini";
+}
+
 struct Args {
-  fs::path model_dir = "/mnt/data/inkling/hf";
+  fs::path model_dir = default_model_dir();
   fs::path ablation = fs::path(INGINE_REPO_DIR) / "ablation" / "inkling-2-mini-abliterated.safetensors";
   fs::path golden = fs::path(INGINE_REPO_DIR) / "native" / "tests" / "golden" / "model";
   std::string filter;
