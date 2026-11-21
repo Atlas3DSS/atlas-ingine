@@ -6,21 +6,25 @@
 //   loads its rows [r * 128/CL, +128/CL) whole into registers (one warp per row, 16-byte streaming loads:
 //   FP32 18 per lane, BF16 9), so the weight stream never waits on activation latency. Spreading the
 //   1.2 MB over 16 SMs keeps per-SM traffic at ~74 KB.
-// * the M logits of a row are reduce-scattered over the warp (lane m holds token m) and pushed through
-//   distributed shared memory to CTA m, which owns token m's selection; one release/acquire cluster
-//   barrier publishes them (a relaxed arrive at kernel start + wait before the remote stores guarantees
-//   every CTA is resident).
+// * the M logits of a row are reduce-scattered over the warp (lane m holds token m), gathered per token
+//   and sent to CTA m, which owns token m's selection, as 16-byte st.async stores (4 rows each) completing
+//   on CTA m's mbarrier (dsmem.cuh; a relaxed cluster arrive at kernel start + wait before the remote
+//   stores guarantees every CTA is resident and its barrier initialised). CTAs that own no token exit
+//   after sending.
 // * selection in CTA m: thread e computes v_e = sigmoid(logit_e) + bias_e and its rank among the 128
-//   values (#greater + #equal with a lower index: ties go to the lower expert) with broadcast shared
-//   reads, so the 8 winners land in rank order (descending score) without a serial argmax chain; lanes
-//   0..7 then write idx and wts = s / (sum s + 1e-20) * 8.
-// * pdl=True: weights and bias are loaded before griddepcontrol.wait, the activations after it.
-// Ported from engine/csrc/dense/router.cu (kernel bodies unchanged; torch launchers -> raw pointers).
+//   values (#greater + #equal with a lower index: ties go to the lower expert) as the number of greater
+//   unique keys (order-preserving bits of v_e, then 127 - e), counted with broadcast shared reads by all
+//   threads of the CTA (each a part of the 128 keys), so the 8 winners land in rank order (descending
+//   score) without a serial argmax chain; lanes 0..7 then write idx and wts = s / (sum s + 1e-20) * 8.
+// * pdl=True: weights and bias are loaded before griddepcontrol.wait (pdl_wait_fenced: ptxas would sink
+//   them below a plain wait), the activations after it.
+// Ported from engine/csrc/dense/router.cu (torch launchers -> raw pointers; mbarrier exchange).
 #include <cooperative_groups.h>
 
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
+#include "kernels/dense/dsmem.cuh"
 
 #include <type_traits>
 
@@ -35,19 +39,29 @@ template <int CL, bool WF32, int M>
 __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bfloat16* __restrict__ x,
                                                                    const void* __restrict__ w,
                                                                    const float* __restrict__ bias,
-                                                                   int* __restrict__ idx, float* __restrict__ wts) {
+                                                                   int* __restrict__ idx, float* __restrict__ wts,
+                                                                   uint32_t zero) {
   constexpr int RPC = EXPERTS / CL, NT = 32 * RPC;
   constexpr int EPC = WF32 ? 4 : 8;  // weights per 16-byte chunk
   constexpr int CH = H / (EPC * 32);
   __shared__ __align__(16) __nv_bfloat16 xs[M][H];
   __shared__ __align__(16) float logits[EXPERTS];  // token `rank`'s logits (CTAs rank < M)
-  __shared__ __align__(16) float sv[EXPERTS];      // sigmoid + bias
+  __shared__ __align__(8) uint64_t mbar;           // completes when the 128 logits arrived
+  __shared__ __align__(16) float part[M][RPC];     // this CTA's logits
+  __shared__ unsigned long long keys[EXPERTS];    // selection keys of sigmoid + bias
+  __shared__ int cnt[NT];                          // partial ranks
   __shared__ float sel_s[TOPK];
   __shared__ int sel_e[TOPK];
 
-  cluster_arrive_relaxed();
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
+  const uint32_t logits_u = smem_u32(logits), mb = smem_u32(&mbar);
+  if (threadIdx.x == 0) {
+    mb_init(mb);
+    fence_mbarrier_init();
+    if (rank < M) mb_expect(mb, 4u * EXPERTS);
+  }
+  cluster_arrive_relaxed();
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int row = rank * RPC + warp;
 
@@ -58,7 +72,7 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   for (int i = 0; i < CH; ++i) wv[i] = ld_stream(wr + (size_t(i) * 32 + lane) * 16);
   const float b = t < EXPERTS ? __ldg(bias + t) : 0.f;  // for the selection phase
 
-  pdl_wait();
+  pdl_wait_fenced(zero);  // keeps the weight loads above ahead of the wait
   pdl_trigger();
   for (int k = t; k < M * H / 8; k += NT) cp_async16(&xs[0][0] + k * 8, x + size_t(k) * 8);
   asm volatile("cp.async.commit_group;" ::: "memory");
@@ -94,28 +108,45 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   }
   const float logit = reduce_scatter<32, M>(acc);  // lane m: token m
 
-  cluster_wait();  // every CTA has started: remote shared memory is live
-  if (lane < M) cluster.map_shared_rank(&logits[0], lane)[row] = logit;
-  cluster_arrive();
-  cluster_wait();
+  // gather the CTA's RPC logits of each token, then one 16-byte store per (token, 4 rows)
+  if (lane < M) part[lane][warp] = logit;
+  __syncthreads();
+  cluster_wait();  // every CTA has started and initialised its barrier
+  if (t < M * (RPC / 4)) {
+    const int tok = t % M, grp = t / M;
+    st_async4(remote(logits_u + 4u * (rank * RPC + grp * 4), tok),
+              *reinterpret_cast<const float4*>(&part[tok][grp * 4]), remote(mb, tok));
+  }
   if (rank >= M) return;
+  mb_wait(mb);
 
+  // selection: unique 39-bit keys (order-preserving bits of v, then 127 - e: ties go to the lower expert),
+  // rank = number of greater keys, counted by all NT threads (NT / 128 parts of the key range)
   const int m = rank;
-  float s = 0.f, v = 0.f;
+  float s = 0.f;
   if (t < EXPERTS) {
     s = 1.f / (1.f + expf(-logits[t]));
-    v = s + b;
-    sv[t] = v;
+    const uint32_t u = __float_as_uint(s + b + 0.f);  // + 0: -0 -> +0, which compares equal
+    const uint32_t o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    keys[t] = (static_cast<unsigned long long>(o) << 7) | static_cast<unsigned>(EXPERTS - 1 - t);
+  }
+  __syncthreads();
+  {
+    constexpr int PARTS = NT / EXPERTS, W = EXPERTS / PARTS;
+    const int e = t % EXPERTS, part = t / EXPERTS;
+    const unsigned long long mine = keys[e];
+    int c[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int j = 0; j < W; j += 4)
+#pragma unroll
+      for (int k = 0; k < 4; ++k) c[k] += keys[part * W + j + k] > mine;
+    cnt[t] = c[0] + c[1] + c[2] + c[3];
   }
   __syncthreads();
   if (t < EXPERTS) {
     int r = 0;
-#pragma unroll 8
-    for (int j = 0; j < EXPERTS; j += 4) {
-      const float4 o = *reinterpret_cast<const float4*>(&sv[j]);
-      r += (o.x > v) + (o.y > v) + (o.z > v) + (o.w > v);
-      r += (o.x == v && j < t) + (o.y == v && j + 1 < t) + (o.z == v && j + 2 < t) + (o.w == v && j + 3 < t);
-    }
+#pragma unroll
+    for (int p = 0; p < NT / EXPERTS; ++p) r += cnt[p * EXPERTS + t];
     if (r < TOPK) {
       sel_e[r] = t;
       sel_s[r] = s;
@@ -137,7 +168,8 @@ void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bi
                    cudaStream_t stream) {
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
-    launch_ex(router_kernel<CL, WF32, MM>, dim3(CL), 32 * EXPERTS / CL, 0, CL, pdl, stream, x, w, bias, idx, wts);
+    launch_ex(router_kernel<CL, WF32, MM>, dim3(CL), 32 * EXPERTS / CL, 0, CL, pdl, stream, x, w, bias, idx, wts,
+              0u);
   };
   switch (M) {
     case 1: go(std::integral_constant<int, 1>{}); break;

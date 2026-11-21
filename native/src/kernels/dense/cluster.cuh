@@ -32,6 +32,15 @@ __device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.w
 // the kernel was not launched with the PDL attribute.
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+// griddepcontrol.wait that keeps the loads issued before it ahead of it. ptxas sinks independent loads
+// below a plain griddepcontrol.wait (legal: the wait only orders later accesses), even below a
+// __syncthreads, which silently turns the "weights in flight before the wait" prefetch into loads issued
+// after the predecessor completed; it does not move them into a loop whose trip count it cannot see.
+// `zero` must be 0 at run time and opaque to the compiler (a kernel argument).
+__device__ __forceinline__ void pdl_wait_fenced(uint32_t zero) {
+#pragma unroll 1
+  for (uint32_t i = 0; i <= zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
+}
 
 // Launches `kernel` on `stream` (graph capturable): as clusters of `cl` CTAs if cl > 1, with
 // the programmatic-stream-serialization attribute if `pdl` (captured as a programmatic graph edge).

@@ -35,6 +35,10 @@ void proj_conv(const __nv_bfloat16* x, int M, Matrix w, const float* conv_w, flo
 // head: out[m, v] = 30 tanh(bf16(w_v . x[m]) / 30), x bf16 [M, H], out fp32 [M, V], V = w.rows.
 void head(const __nv_bfloat16* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream);
 
+// gemv: plain GEMV (drafter o_proj / down_proj). x bf16 [M, K] (row stride K), out fp32 [M, R] =
+// bf16(w[r] . x[m]), R = w.rows; K = 3072 or 9216; same PDL contract as proj.
+void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream);
+
 // fp8_rows: bf16 [rows, K] -> float8_e4m3fn [rows, K] (q) + fp32 scale [rows] = amax / 448.
 void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream);
 
@@ -47,6 +51,15 @@ void router(const __nv_bfloat16* x, int M, const void* w, bool w_fp32, const flo
             bool pdl, cudaStream_t stream);
 
 // mix: ablated residual update + attention residual over block states + RMS norm (KERNELS.md).
+// Side copies: FP32 rows copied by the same launch (dst + m * dst_stride <- src + m * src_stride, `cols`
+// floats; 16-byte aligned), so the decode step needs no separate memcpy node.
+struct MixRowCopy {
+  const float* src = nullptr;
+  long long src_stride = 0;
+  float* dst = nullptr;  // null: no copy
+  long long dst_stride = 0;
+  int cols = 0;
+};
 struct MixParams {
   const float* const* blocks = nullptr;  // device table of nblocks device pointers, each fp32 [M, H]
   int nblocks = 0;                       // 0..5
@@ -60,14 +73,19 @@ struct MixParams {
   const float* norm_w = nullptr;         // [Q, H], required with out_bf16
   __nv_bfloat16* out_bf16 = nullptr;     // [Q, M, H] or null
   float* out_f32 = nullptr;              // [Q, M, H] or null
+  __nv_bfloat16* new_bf16 = nullptr;     // bf16(new), row m at new_bf16 + m * new_bf16_stride, or null
+  long long new_bf16_stride = 0;
+  __nv_bfloat16* out_copy = nullptr;     // Q == 1: copy of out_bf16, row m at out_copy + m * out_copy_stride
+  long long out_copy_stride = 0;
+  MixRowCopy copies[2];
   int M = 1;
 };
 void mix(const MixParams& p, bool pdl, cudaStream_t stream);
 
-// message_gates (loop passes 1-2): h, msg fp32 [G, M, H] (G <= 3); w_down bf16 [G, 64, 2H];
-// w_forget/w_gain [G, H, 64] fp32 (fg_fp32) or bf16; norm_w fp32 [G, H]; out_bf16 [G, M, H];
-// out_f32 [G, M, H] (gated, before the norm) or null.
-void message_gates(const float* h, const float* msg, int G, int M, const __nv_bfloat16* w_down,
+// message_gates (loop passes 1-2): h, msg fp32 [G, M, H] (G <= 3; h_shared: every gate reads h[0], i.e. h is
+// [M, H]); w_down bf16 [G, 64, 2H]; w_forget/w_gain [G, H, 64] fp32 (fg_fp32) or bf16; norm_w fp32 [G, H];
+// out_bf16 [G, M, H]; out_f32 [G, M, H] (gated, before the norm) or null.
+void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const __nv_bfloat16* w_down,
                    const void* w_forget, const void* w_gain, bool fg_fp32, const float* norm_w,
                    __nv_bfloat16* out_bf16, float* out_f32, bool pdl, cudaStream_t stream);
 

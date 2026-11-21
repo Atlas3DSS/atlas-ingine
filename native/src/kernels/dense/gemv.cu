@@ -37,9 +37,10 @@
 // dot by the row scale.
 //
 // Programmatic dependent launch (pdl=True): the M = 1 kernel issues all its row's weight loads, the
-// M >= 2 kernel its first batch, before griddepcontrol.wait, so they overlap the previous kernel's tail;
-// activations are read (coherent, non-hoistable loads: ld_act) and outputs/state written only after it,
-// and the next kernel is released right after the wait.
+// M >= 2 kernel its first batch, before griddepcontrol.wait, so they overlap the previous kernel's tail
+// (pdl_wait_fenced: a plain wait lets ptxas sink the loads below it; measured M = 1 proj 13.7 -> 11.8 us
+// behind a 2 us predecessor); activations are read (coherent, non-hoistable loads: ld_act) and
+// outputs/state written only after it, and the next kernel is released right after the wait.
 // Ported from engine/csrc/dense/gemv.cu (kernel bodies unchanged; torch launchers -> raw pointers).
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
@@ -86,6 +87,19 @@ struct HeadEpi {
   __device__ void store1(int row, int m, float v) const {
     out[size_t(m) * V + row] = tanhf(round_bf16(v) / 30.f) * 30.f;
   }
+};
+
+// plain GEMV (drafter): one input x [M, K] (row stride K), out [M, R] = bf16(w . x)
+template <int M>
+struct GemvEpi {
+  static constexpr int kInputs = 1;
+  static constexpr bool kScatter = true;
+  const __nv_bfloat16* x;
+  int R;
+  float* out;  // [M, R]
+  __device__ int input_of(int) const { return 0; }
+  __device__ const __nv_bfloat16* x_of(int) const { return x; }
+  __device__ void store1(int row, int m, float v) const { out[size_t(m) * R + row] = round_bf16(v); }
 };
 
 template <int M>
@@ -138,7 +152,8 @@ struct ConvEpi {
 
 template <bool FP8, int K, int LANES, int BLOCK, class Epi>
 __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__ w,
-                                                     const float* __restrict__ w_scale, int rows, Epi epi) {
+                                                     const float* __restrict__ w_scale, int rows, uint32_t zero,
+                                                     Epi epi) {
   constexpr int EPC = FP8 ? 16 : 8;  // elements per 16-byte chunk
   constexpr int CH = K / (EPC * LANES);
   static_assert(K % (EPC * LANES) == 0, "row must split evenly over the lane group");
@@ -156,7 +171,7 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
   uint4 wv[CH];
 #pragma unroll
   for (int i = 0; i < CH; ++i) wv[i] = ld_stream(wr + (size_t(i) * LANES + gl) * 16);
-  pdl_wait();  // the whole row is in flight; the activation comes from an earlier kernel
+  pdl_wait_fenced(zero);  // the whole row is in flight; the activation comes from an earlier kernel
   pdl_trigger();
 
   float acc = 0.f;
@@ -243,7 +258,7 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
         B[u] = lb ? ld_stream(wb + off) : make_uint4(0, 0, 0, 0);
       }
       if (!waited) {  // the first batch of weights is in flight; activations come from earlier kernels
-        pdl_wait();
+        pdl_wait_fenced(zero);
         pdl_trigger();
         waited = true;
       }
@@ -320,7 +335,8 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
 
 // ---- launch helpers -----------------------------------------------------------------------------------
 
-// BLOCK: threads per block of the M = 1 kernel; SPLITK: warps per 16-row block of the M >= 2 kernel.
+// BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
+// whole row per lane would not fit in registers); SPLITK: warps per 16-row block of the M >= 2 kernel.
 template <int K, int BLOCK, int SPLITK, template <int> class Epi, class Make>
 void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make) {
   const bool fp8 = w.scale != nullptr;
@@ -332,9 +348,10 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     constexpr int MM = decltype(mc)::value;
     auto epi = make(std::integral_constant<int, MM>{});
     using E = decltype(epi);
-    if constexpr (MM == 1) {
-      if (fp8) launch_ex(gemv_kernel<true, K, 16, BLOCK, E>, dim3((rows * 16 + BLOCK - 1) / BLOCK), BLOCK, 0, 1, pdl, stream, wp, sc, rows, epi);
-      else launch_ex(gemv_kernel<false, K, 32, BLOCK, E>, dim3((rows * 32 + BLOCK - 1) / BLOCK), BLOCK, 0, 1, pdl, stream, wp, sc, rows, epi);
+    if constexpr (MM == 1 && BLOCK > 0) {
+      constexpr int B = BLOCK > 0 ? BLOCK : 32;  // (the branch is discarded for BLOCK = 0)
+      if (fp8) launch_ex(gemv_kernel<true, K, 16, B, E>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
+      else launch_ex(gemv_kernel<false, K, 32, B, E>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
     } else {
       const dim3 blocks((rows + 15) / 16);
       if (fp8) launch_ex(gemv_mma_kernel<true, K, MM, SPLITK, MMA_U_FP8, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
@@ -433,6 +450,19 @@ void head(const __nv_bfloat16* x, int M, Matrix w, float* out, bool pdl, cudaStr
     constexpr int MM = decltype(mc)::value;
     return HeadEpi<MM>{x, V, out};
   });
+}
+
+void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream) {
+  require(x && out, "gemv: null argument");
+  const int R = w.rows;
+  auto make = [&](auto mc) {
+    constexpr int MM = decltype(mc)::value;
+    return GemvEpi<MM>{x, R, out};
+  };
+  // K = 3072: as proj_conv; K = 9216: 36 chunks per lane would spill, so M = 1 also uses tensor cores
+  if (K == 3072) launch_gemv<3072, 32, CONV_SPLITK, GemvEpi>(w, M, pdl, stream, make);
+  else if (K == 9216) launch_gemv<9216, 0, 8, GemvEpi>(w, M, pdl, stream, make);
+  else require(false, "gemv: K must be 3072 or 9216");
 }
 
 void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream) {

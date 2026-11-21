@@ -10,20 +10,31 @@
 //   new keys. Everything is sized from `pos` on the device, so the launch shape is fixed for a CUDA graph.
 // * At short contexts the kernel is bound by dependent round trips, not bytes, so it has few of them:
 //   (1) every input that does not depend on `pos` (q / rel / gate / sink rows of `proj` and their scales,
-//   the owner's conv inputs and rel_proj[:, 0..7]) is fetched with cp.async into shared memory while
-//   `pos` is read: one round trip. The K/V stream is issued right after it lands (issued earlier, the
-//   4 MB burst of a sliding layer delays that round trip by ~2 us). (2) The rel_proj column of each key
-//   is fetched together with its K/V for the distance a full, in-order ring (or the linear cache)
-//   implies, and re-read only if the actual kpos disagrees. (3) q / rel post-processing (scale, L2 clip,
-//   BF16, log scaling) is done once per block by a few warps, branch-free, and shared through shared
-//   memory. (4) Split partials (max, sum, unnormalised o) go to the workspace (L2); one cluster barrier;
+//   the owner's conv inputs and rel_proj[:, 0..7]) is fetched with cp.async into shared memory: one round
+//   trip. M = 1 issues the K/V stream (first two buffers, all of a sliding layer's keys) before the PDL
+//   wait, so it is in flight during proj's tail and the staged round trip is not queued behind it (K/V
+//   issued after the wait but ahead of the staged inputs delays them by ~2 us; after them it costs a
+//   round trip, 0.5 us per sliding visit in the decode step); M > 1 issues its first tile after the staged
+//   inputs land. (2) The rel_proj column of each key is fetched together with its K/V for the distance a
+//   full, in-order ring (or the linear cache) implies, and re-read only if the actual kpos disagrees.
+//   (3) q / rel post-processing (scale, L2 clip, BF16, log scaling) is done once per block by a few
+//   warps, branch-free, and shared through shared memory. (4) Split partials (max, sum, unnormalised o)
+//   go to the workspace (L2); one cluster barrier;
 //   block r then produces output dims 8r..8r+7 of every row (sink logit, sigmoid gate, BF16) from the 16
 //   partials. (Distributed shared memory was measured slower here: ~1 GB/s per SM on this GPU.)
 //   (5) Programmatic dependent launch: weights are staged before griddepcontrol.wait, and dependents are
-//   released after the main loop. Everything an earlier kernel writes (proj, pos, conv states, caches,
-//   kpos, workspace) is read after the wait only: cp.async / coherent `asm volatile` loads with memory
-//   clobbers, which the compiler cannot hoist (checked in the SASS: only the weight cp.asyncs precede
-//   the ACQBULK).
+//   released as soon as the block's first K/V loads are issued (all 128 blocks are resident by then, so
+//   the next kernel, proj_conv, only takes free SM resources and streams its weights while this kernel
+//   is latency-bound, its requests queued behind ours; it still waits for this grid's completion before
+//   reading our output). What the kernel right before (proj) writes, and what this kernel writes for its
+//   own tokens (conv states, cache rows >= p0, workspace), is read after the wait only: cp.async /
+//   coherent `asm volatile` loads with memory clobbers, which the compiler cannot hoist. `pos` (any M),
+//   kpos and the cache rows below p0 (M = 1) are read before it: their writers ran two or more kernels
+//   back, and those are complete once this grid runs, because it starts only after every proj block has
+//   passed its own griddepcontrol.wait (gemv triggers after it), which returns once the kernel before
+//   proj, and hence every earlier kernel, has completed. This holds as long as attention follows a kernel
+//   that triggers only after its own wait. The wait is fenced (a loop over p.zero): ptxas sinks loads
+//   below a plain one.
 // * Main loop, M = 1: warp = key slice (8 warps). A half-warp owns one key; lane c of the half holds dims
 //   8c..8c+7, so each K and V row (256 B) is read with 16-byte vector loads (coherent, no L1
 //   allocation). Two register buffers of 2 key pairs per warp alternate (one in flight while the other
@@ -195,6 +206,7 @@ struct Params {
     int* counter;
     float* part;
     __nv_bfloat16* out;
+    int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
 };
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
@@ -339,33 +351,6 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         for (int i = tid; i < DREL * 2; i += NT)  // rel_proj[:, 0..7]: the new keys' distances
             cp16(sm + L::RELP0 + 4 * i, p.rel_proj + (i / 2) * EXT + 4 * (i % 2));
     }
-    asm volatile("griddepcontrol.wait;" ::: "memory");  // everything below may come from earlier kernels
-    for (int i = tid; i < M * GQA * D / 4; i += NT)       // q rows of heads 3g..3g+2 are contiguous
-        cp16(sm + L::Q + 4 * i, p.proj + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
-    for (int i = tid; i < M * GQA * DREL / 4; i += NT)
-        cp16(sm + L::REL + 4 * i,
-             p.proj + size_t(i / (GQA * DREL / 4)) * R + OFF_REL + g * GQA * DREL + 4 * (i % (GQA * DREL / 4)));
-    for (int i = tid; i < ROWS * OD / 4; i += NT) {
-        const int row = i / (OD / 4), part = i % (OD / 4);
-        cp16(sm + L::GATE + 4 * i,
-             p.proj + size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + rank * OD + 4 * part);
-    }
-    for (int i = tid; i < ROWS; i += NT) cp4(sm + L::SINK + i, p.proj + size_t(i / GQA) * R + OFF_SINK + g * GQA + i % GQA);
-    if (owner) {
-        for (int i = tid; i < 3 * 2 * D / 4; i += NT) {  // [j][kv][D]
-            const int j = i / (2 * D / 4), kv = (i / (D / 4)) % 2, q = i % (D / 4);
-            cp16(sm + L::ST + 4 * i, (kv ? p.conv_v : p.conv_k) + j * CONV_C + g * D + 4 * q);
-        }
-        for (int i = tid; i < M * 2 * D / 4; i += NT) {  // [m][kv][D]
-            const int m = i / (2 * D / 4), kv = (i / (D / 4)) % 2, q = i % (D / 4);
-            cp16(sm + L::X + 4 * i, p.proj + size_t(m) * R + (kv ? OFF_V : OFF_K) + g * D + 4 * q);
-        }
-        if constexpr (FULL) {
-            for (int i = tid; i < M * 2; i += NT)
-                cp16(sm + L::DYN + 4 * i, p.proj + size_t(i / 2) * R + (i % 2 ? OFF_VDYN : OFF_KDYN) + g * 4);
-        }
-    }
-
     const int p0 = int(ld_s64(p.pos));
     if (FULL && p0 + M > p.cap) return;  // out of cache capacity (uniform: no block reaches a barrier)
     const int L_old = FULL ? p0 : WIN;
@@ -456,19 +441,53 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
-    // the staged inputs land first: issued before them, the K/V burst would delay their round trip by
-    // the whole burst (measured: ~2.5 us instead of ~0.4 us for a sliding layer)
-    asm volatile("cp.async.wait_all;" ::: "memory");
-    __syncthreads();
+    // M = 1: the cached keys' K/V and kpos are issued before the wait. pos, kpos and the cache rows below
+    // p0 were written two or more kernels back (see PDL above), and the staged inputs then come in one
+    // round trip that is not queued behind the K/V burst (issued after the wait, ahead of the staged
+    // inputs, the burst delays them by ~2 us; behind them it costs a round trip).
     Buf<KV> A, B;
     if constexpr (M == 1) {
         if (c0 < old_end) load_kv(A, c0);
         if (c0 + STEP < old_end) load_kv(B, c0 + STEP);
         if (c0 < old_end) load_rp(A, c0);
         if (c0 + STEP < old_end) load_rp(B, c0 + STEP);
-    } else {
+    }
+    // a loop ptxas cannot see through: it would sink the loads above below a plain wait
+#pragma unroll 1
+    for (int i = 0; i <= p.zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
+    for (int i = tid; i < M * GQA * D / 4; i += NT)       // q rows of heads 3g..3g+2 are contiguous
+        cp16(sm + L::Q + 4 * i, p.proj + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
+    for (int i = tid; i < M * GQA * DREL / 4; i += NT)
+        cp16(sm + L::REL + 4 * i,
+             p.proj + size_t(i / (GQA * DREL / 4)) * R + OFF_REL + g * GQA * DREL + 4 * (i % (GQA * DREL / 4)));
+    for (int i = tid; i < ROWS * OD / 4; i += NT) {
+        const int row = i / (OD / 4), part = i % (OD / 4);
+        cp16(sm + L::GATE + 4 * i,
+             p.proj + size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + rank * OD + 4 * part);
+    }
+    for (int i = tid; i < ROWS; i += NT) cp4(sm + L::SINK + i, p.proj + size_t(i / GQA) * R + OFF_SINK + g * GQA + i % GQA);
+    if (owner) {
+        for (int i = tid; i < 3 * 2 * D / 4; i += NT) {  // [j][kv][D]
+            const int j = i / (2 * D / 4), kv = (i / (D / 4)) % 2, q = i % (D / 4);
+            cp16(sm + L::ST + 4 * i, (kv ? p.conv_v : p.conv_k) + j * CONV_C + g * D + 4 * q);
+        }
+        for (int i = tid; i < M * 2 * D / 4; i += NT) {  // [m][kv][D]
+            const int m = i / (2 * D / 4), kv = (i / (D / 4)) % 2, q = i % (D / 4);
+            cp16(sm + L::X + 4 * i, p.proj + size_t(m) * R + (kv ? OFF_V : OFF_K) + g * D + 4 * q);
+        }
+        if constexpr (FULL) {
+            for (int i = tid; i < M * 2; i += NT)
+                cp16(sm + L::DYN + 4 * i, p.proj + size_t(i / 2) * R + (i % 2 ? OFF_VDYN : OFF_KDYN) + g * 4);
+        }
+    }
+
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    __syncthreads();
+    if constexpr (M > 1) {
         if (rank * KT < L_old) issue(0, rank * KT);  // in flight during q / rel and the owner's work
     }
+    // dependents (proj_conv) may launch now: their weight stream queues behind this block's K/V requests
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
     // ---- q and rel post-processing, once per block. q: one warp per row (lane = 4 dims); rel: one
     // half-warp per row. Fixed trip counts and clamped rows (no branches), so the reductions of a warp's
@@ -695,9 +714,6 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 if (base + STRIDE + STEP < old_end) load(B, base + STRIDE + STEP);
             }
         }
-
-        // the next kernel may be scheduled now; it must still griddepcontrol.wait for this grid's results
-        asm volatile("griddepcontrol.launch_dependents;");
 
         // ---- block partial: merge the two half-warps, then the 8 warps
 #pragma unroll
@@ -955,9 +971,6 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             if (base + CS * KT < L_old) issue(st ^ 1, base + CS * KT);
             consume(st, base, false);
         }
-
-        // the next kernel may be scheduled now; it must still griddepcontrol.wait for this grid's results
-        asm volatile("griddepcontrol.launch_dependents;");
 
         // this block's partial (unnormalised o, then max and sum per row) to the workspace (L2)
         float* part = p.part + size_t(g * CS + rank) * ROWS * PSTR;

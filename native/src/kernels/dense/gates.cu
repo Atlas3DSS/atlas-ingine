@@ -4,27 +4,35 @@
 // gated channels -> their RMS norm), so each gate is one cluster of CL = 16 CTAs (non-portable size; with
 // 8 the FP32 forget/gain slices would not fit in shared memory) and the dependencies are crossed with
 // distributed shared memory instead of extra launches. Per-SM DRAM concurrency is the limit for such a
-// small grid (~110 KB per SM at G = 3), so every byte is requested at kernel start. CTA r of gate g:
-// * issues, in this order: its share of the token-0 inputs (L2 hits), cp.async copies of its forget/gain
-//   row slices (rows [r * 144, +144), padded rows in shared memory), and 16-byte streaming loads of its
-//   4 rows of `w_down` (2 warps per row: half 0 against n(h), half 1 against n(msg)) into registers;
-// * down projection, one token at a time: a block sum of squares normalises h and msg once per CTA,
-//   bf16(x * rinv) is staged in shared memory (each input element is read from L2 once per CTA), and
-//   every warp dots its row half against it; the next token's inputs are loaded during the dots;
-// * the 4 BF16-rounded down outputs per token are pushed into every CTA's copy of g [M, 64]; one cluster
-//   barrier later every CTA holds the full g (this thread's h, msg, norm_w values load meanwhile);
+// small grid (~110 KB per SM at G = 3), so every weight byte is requested before the PDL wait. CTA r of
+// gate g:
+// * issues cp.async copies of its forget/gain row slices (rows [r * 144, +144), padded rows in shared
+//   memory) and 16-byte streaming loads of its 4 rows of `w_down` (2 warps per row: half 0 against n(h),
+//   half 1 against n(msg)) into registers;
+// * row norms: one block sum gives the sums of squares of h and msg of every token (each CTA computes all of
+//   them, so all CTAs normalise identically);
+// * down projection, one token at a time: bf16(x * rinv) is staged in shared memory (two buffers, so a token
+//   is staged while the previous one's dots finish) and every warp dots its row half against it;
+// * the 4 BF16-rounded down outputs of a token go as one 16-byte st.async store to every CTA's copy of g
+//   [M, 64], completing on the receiver's mbarrier (dsmem.cuh: no cluster barrier round trip); this thread's
+//   h, msg, norm_w values load meanwhile;
 // * forget/gain: one thread per channel reads its two weight rows from shared memory (16-byte chunks,
 //   the 16-byte row padding puts 8 consecutive threads in distinct banks) against broadcast g, applies
 //   gated = (1 - tanh) h + tanh msg in registers, a block sum gives the CTA's per-token sum of squares,
-//   pushed to every CTA; after a second barrier each CTA normalises and writes its own channels.
-// Every CTA sums the pushed partials in the same order, so all CTAs use identical g and norms.
-// pdl=True: all weight copies/loads are issued before griddepcontrol.wait, h/msg are read after it.
-// Ported from engine/csrc/dense/gates.cu (kernel bodies unchanged; torch launchers -> raw pointers).
+//   sent to every CTA the same way; each CTA then normalises and writes its own channels.
+// Every CTA sums the received partials in the same order, so all CTAs use identical g and norms.
+// pdl=True: all weight copies/loads are issued before griddepcontrol.wait (pdl_wait_fenced: ptxas would sink
+// them below a plain wait), h/msg are read after it.
+// Ported from engine/csrc/dense/gates.cu (torch launchers -> raw pointers). Results are bit-identical to that
+// kernel: same thread layout, expressions and order of every FP32 sum; changed are the barriers (norms of
+// all tokens in one reduction, single-barrier block sums, mbarrier exchanges) and the prefetch.
 #include <cooperative_groups.h>
 
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
+#include "kernels/dense/dsmem.cuh"
+#include "kernels/dense/reduce.cuh"
 
 #include <type_traits>
 
@@ -36,7 +44,8 @@ namespace {
 constexpr int RANK = 64;
 
 struct GateArgs {
-  const float* h;    // [G, M, H]
+  const float* h;    // [G, M, H], or [M, H] read by every gate (h_shared)
+  bool h_shared;
   const float* msg;  // [G, M, H]
   const __nv_bfloat16* w_down;  // [G, 64, 2H]
   const void* w_forget;         // [G, H, 64] fp32 or bf16
@@ -44,6 +53,7 @@ struct GateArgs {
   const float* norm_w;  // [G, H]
   __nv_bfloat16* out_bf16;  // [G, M, H]
   float* out_f32;           // [G, M, H] or null
+  uint32_t zero;            // 0 (opaque to the compiler: pdl_wait_fenced)
 };
 
 template <int CL, bool FG32>
@@ -51,13 +61,15 @@ struct GateCfg {
   static constexpr int RPC = RANK / CL;           // down rows per CTA
   static constexpr int NW = 2 * RPC;              // warps: (row, half)
   static constexpr int NT = 32 * NW;              // threads
-  static constexpr int CPC = H / CL;              // channels per CTA (one thread each in phase C)
+  static constexpr int CPC = H / CL;              // channels per CTA (one thread each in the forget/gain phase)
   static constexpr int FGB = FG32 ? 4 : 2;        // bytes per forget/gain weight
   static constexpr int ROW = RANK * FGB;          // bytes of one forget/gain row
   static constexpr int RS = ROW + 16;             // padded row stride in shared memory (no bank conflicts)
   static constexpr int SLICE = CPC * RS;          // bytes of one padded matrix slice
-  static_assert(CPC <= NT && ROW % 16 == 0, "uneven split");
+  static_assert(CPC <= NT && ROW % 16 == 0 && RPC == 4, "uneven split");
   static constexpr int SMEM = 2 * SLICE;
+  // two staging buffers unless the FP32 slices leave no room for the second (then a barrier per token)
+  static constexpr int XBUF = FG32 ? 1 : 2;
 };
 
 template <int CL, bool FG32, int M>
@@ -65,22 +77,32 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   using C = GateCfg<CL, FG32>;
   constexpr int DCH = H / (8 * 32);  // 9 chunks of 8 down weights per lane
   constexpr int XPT = H / C::NT;     // inputs per thread per half when staging x
+  constexpr int MQ = (M + 3) / 4;    // 16-byte stores holding M values
   static_assert(H % C::NT == 0, "x staging split");
   extern __shared__ __align__(16) uint8_t fg[];  // forget slice, then gain slice (padded rows)
-  __shared__ __align__(16) float gall[M][RANK];  // full down output (BF16 values)
-  __shared__ __align__(16) __nv_bfloat16 xs[2 * H];  // bf16([n(h), n(msg)]) of the current token
-  __shared__ float part[C::RPC][2][M];  // per-half partial dots
-  __shared__ float ssall[CL][M];
-  __shared__ float red[(C::NW + 1) * block_sum_slots<M>()], red2[(C::NW + 1) * 2];
+  __shared__ __align__(16) float gall[M][RANK];  // full down output (BF16 values), received
+  __shared__ __align__(16) __nv_bfloat16 xs[C::XBUF][2 * H];  // bf16([n(h), n(msg)]) of a token
+  __shared__ __align__(16) float part[M][2][C::RPC];  // per-half partial dots
+  __shared__ __align__(16) float ssall[CL][4 * MQ];   // per-CTA sums of squares of the gated output, received
+  __shared__ float red[C::NW * 32], red2[C::NW * 32];
+  __shared__ __align__(8) uint64_t mbar[2];  // g, sums of squares
 
-  cluster_arrive_relaxed();
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
   const int g = blockIdx.x / CL;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int rl = warp >> 1, half = warp & 1;  // down projection: warp = (row_local, half)
-  const float* hg = a.h + size_t(g) * M * H;
+  const float* hg = a.h + (a.h_shared ? size_t(0) : size_t(g) * M * H);
   const float* mg = a.msg + size_t(g) * M * H;
+  const uint32_t mb_g = smem_u32(&mbar[0]), mb_s = smem_u32(&mbar[1]);
+  if (t == 0) {
+    mb_init(mb_g);
+    mb_init(mb_s);
+    fence_mbarrier_init();
+    mb_expect(mb_g, 16u * CL * M);
+    mb_expect(mb_s, 16u * CL * MQ);
+  }
+  cluster_arrive_relaxed();  // waited for before the first remote store
 
   // inputs: XPT of h and of msg per thread, coalesced (activations: loaded after the PDL wait)
   float xh[XPT], xm[XPT];
@@ -92,7 +114,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     }
   };
 
-  // forget/gain slices (padded rows) -> shared memory, asynchronous, waited for before phase C
+  // forget/gain slices (padded rows) -> shared memory, asynchronous, waited for before the forget/gain phase
   {
     const uint8_t* fsrc = reinterpret_cast<const uint8_t*>(a.w_forget) + (size_t(g) * H + rank * C::CPC) * C::ROW;
     const uint8_t* gsrc = reinterpret_cast<const uint8_t*>(a.w_gain) + (size_t(g) * H + rank * C::CPC) * C::ROW;
@@ -114,51 +136,64 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   }
 
   // all weights are in flight; h and msg come from earlier kernels
-  pdl_wait();
+  pdl_wait_fenced(a.zero);
   pdl_trigger();
-  load_x(0);
 
-  // down projection, one token at a time: the CTA normalises the token's h and msg once (block sum of
-  // squares), stages bf16(x * rinv) in shared memory, and every warp dots its row half against it
-#pragma unroll 1
+  // row norms of every token: thread partials (9 inputs per half), then one block sum for the 2 M values
+  float ss[2 * M];
+#pragma unroll
   for (int m = 0; m < M; ++m) {
-    float ss[2] = {0.f, 0.f};
+    load_x(m);
+    float sh = 0.f, sm = 0.f;
 #pragma unroll
     for (int k = 0; k < XPT; ++k) {
-      ss[0] = fmaf(xh[k], xh[k], ss[0]);
-      ss[1] = fmaf(xm[k], xm[k], ss[1]);
+      sh = fmaf(xh[k], xh[k], sh);
+      sm = fmaf(xm[k], xm[k], sm);
     }
-    block_sum(ss, red2);  // its barriers also order the previous token's dots before xs is rewritten
-    const float rh = rsqrtf(ss[0] / H + EPS), rm = rsqrtf(ss[1] / H + EPS);
+    ss[2 * m] = sh;
+    ss[2 * m + 1] = sm;
+  }
+  block_sum_bcast<2 * M, C::NW>(ss, red2);
+
+  // down projection, one token at a time: stage bf16(x * rinv) in shared memory, every warp dots its row half
+  // against it (M > 1: the inputs are read again, from L1)
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+    if constexpr (M > 1) load_x(m);
+    const float rh = rsqrtf(ss[2 * m] / H + EPS), rm = rsqrtf(ss[2 * m + 1] / H + EPS);
+    __nv_bfloat16* xb = xs[m % C::XBUF];
 #pragma unroll
     for (int k = 0; k < XPT; ++k) {
-      xs[k * C::NT + t] = __float2bfloat16_rn(xh[k] * rh);
-      xs[H + k * C::NT + t] = __float2bfloat16_rn(xm[k] * rm);
+      xb[k * C::NT + t] = __float2bfloat16_rn(xh[k] * rh);
+      xb[H + k * C::NT + t] = __float2bfloat16_rn(xm[k] * rm);
     }
-    if (m + 1 < M) load_x(m + 1);  // next token's inputs fly during this token's dots
     __syncthreads();
     float acc = 0.f;
 #pragma unroll
     for (int i = 0; i < DCH; ++i) {
       float wf[8], xf[8];
       unpack_bf16x8(wv[i], wf);
-      unpack_bf16x8(*reinterpret_cast<const uint4*>(&xs[half * H + (i * 32 + lane) * 8]), xf);
+      unpack_bf16x8(*reinterpret_cast<const uint4*>(&xb[half * H + (i * 32 + lane) * 8]), xf);
 #pragma unroll
       for (int j = 0; j < 8; ++j) acc = fmaf(wf[j], xf[j], acc);
     }
     acc = group_sum<32>(acc);
-    if (lane == 0) part[rl][half][m] = acc;
+    if (lane == 0) part[m][half][rl] = acc;
+    // one staging buffer: this token's dots end before the next token is staged
+    if constexpr (C::XBUF == 1 && M > 1) __syncthreads();
   }
   __syncthreads();
 
-  cluster_wait();  // all CTAs resident: remote shared memory may be written
-  for (int k = t; k < CL * C::RPC * M; k += C::NT) {
-    const int d = k / (C::RPC * M), r = (k / M) % C::RPC, m = k % M;
-    float* dst = cluster.map_shared_rank(&gall[0][0], d);
-    dst[m * RANK + rank * C::RPC + r] = round_bf16(part[r][0][m] + part[r][1][m]);
+  cluster_wait();  // all CTAs resident, barriers initialised: remote stores may start
+  if (t < M * CL) {  // thread (token m, destination d): the token's 4 rows as one 16-byte store
+    const int m = t % M, d = t / M;
+    const float4 p0 = *reinterpret_cast<const float4*>(&part[m][0][0]);
+    const float4 p1 = *reinterpret_cast<const float4*>(&part[m][1][0]);
+    const float4 v = make_float4(round_bf16(p0.x + p1.x), round_bf16(p0.y + p1.y), round_bf16(p0.z + p1.z),
+                                 round_bf16(p0.w + p1.w));
+    st_async4(remote(smem_u32(&gall[m][rank * C::RPC]), d), v, remote(mb_g, d));
   }
-  cluster_arrive();
-  // this thread's channel inputs fly during the barrier
+  // this thread's channel inputs fly during the exchange
   const int c = rank * C::CPC + t;
   const bool own = t < C::CPC;
   float hv[M], mv[M], nw = 0.f;
@@ -173,8 +208,8 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     nw = a.norm_w[size_t(g) * H + c];
   }
   asm volatile("cp.async.wait_all;" ::: "memory");
-  cluster_wait();
   __syncthreads();  // forget/gain slices from all threads' copies are visible
+  mb_wait(mb_g);
 
   // forget / gain: one thread per channel; its two weight rows are read as 16-byte chunks from the padded
   // slices (8 consecutive threads hit 8 distinct bank groups), g is a broadcast read
@@ -218,14 +253,18 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     }
   }
 
-  // per-token sums of squares of this CTA's channels, pushed to every CTA
-  block_sum(sq, red);
-  if (t < CL) {
+  // per-token sums of squares of this CTA's channels, sent to every CTA
+  block_sum_bcast<M, C::NW>(sq, red);
+  if (t < CL) {  // to CTA t: the M sums as 16-byte stores
+    float r[4 * MQ] = {};
 #pragma unroll
-    for (int m = 0; m < M; ++m) cluster.map_shared_rank(&ssall[0][0], t)[rank * M + m] = sq[m];
+    for (int m = 0; m < M; ++m) r[m] = sq[m];
+#pragma unroll
+    for (int q = 0; q < MQ; ++q)
+      st_async4(remote(smem_u32(&ssall[rank][4 * q]), t), make_float4(r[4 * q], r[4 * q + 1], r[4 * q + 2], r[4 * q + 3]),
+                remote(mb_s, t));
   }
-  cluster_arrive();
-  cluster_wait();
+  mb_wait(mb_s);
 
   if (own) {
 #pragma unroll
@@ -260,13 +299,14 @@ void launch_gates(int G, int M, const GateArgs& a, bool pdl, cudaStream_t stream
 
 }  // namespace
 
-void message_gates(const float* h, const float* msg, int G, int M, const __nv_bfloat16* w_down,
+void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const __nv_bfloat16* w_down,
                    const void* w_forget, const void* w_gain, bool fg_fp32, const float* norm_w,
                    __nv_bfloat16* out_bf16, float* out_f32, bool pdl, cudaStream_t stream) {
   require(G >= 1 && G <= 3 && M >= 1 && M <= 8, "message_gates: G in 1..3, M in 1..8");
   require(h && msg && w_down && w_forget && w_gain && norm_w && out_bf16, "message_gates: null argument");
   GateArgs a;
   a.h = h;
+  a.h_shared = h_shared;
   a.msg = msg;
   a.w_down = w_down;
   a.w_forget = w_forget;
@@ -274,6 +314,7 @@ void message_gates(const float* h, const float* msg, int G, int M, const __nv_bf
   a.norm_w = norm_w;
   a.out_bf16 = out_bf16;
   a.out_f32 = out_f32;
+  a.zero = 0;
   // 16-CTA clusters (non-portable, verified schedulable on the RTX 5090): the FP32 forget/gain slices of
   // an 8-CTA split would not fit in shared memory.
   if (fg_fp32) launch_gates<16, true>(G, M, a, pdl, stream);

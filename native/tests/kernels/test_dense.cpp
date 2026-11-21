@@ -160,9 +160,24 @@ bool test_head(Rng& rng, int M, bool fp8) {
   return Check{what, 1.0 / 128, 1e-5, 1.0}(got, ref);
 }
 
-bool test_router(Rng& rng, int M, bool wf32) {
-  const std::vector<float> w = randn_bf16(rng, size_t(128) * H, 0.02);
-  const std::vector<float> bias = randn(rng, 128, 0.1);
+// ties: groups of experts with identical rows and biases (identical scores, the lower index must win), one
+// group pushed into the top 8 so that the tie straddles the cut; some biases below -1 (negative scores).
+bool test_router(Rng& rng, int M, bool wf32, bool ties = false) {
+  std::vector<float> w = randn_bf16(rng, size_t(128) * H, 0.02);
+  std::vector<float> bias = randn(rng, 128, 0.1);
+  if (ties) {
+    const int groups[3][4] = {{5, 40, 41, 127}, {0, 63, 64, 100}, {17, 18, 19, 90}};
+    for (int g = 0; g < 3; ++g)
+      for (int k = 1; k < 4; ++k) {
+        std::copy_n(&w[size_t(groups[g][0]) * H], H, &w[size_t(groups[g][k]) * H]);
+        bias[groups[g][k]] = bias[groups[g][0]];
+      }
+    for (int k = 0; k < 4; ++k) bias[groups[0][k]] = 2.f;   // all four in the top 8
+    bias[50] = 2.5f;                                        // rank 0 or 4
+    for (int k = 0; k < 4; ++k) bias[groups[1][k]] = 1.5f;  // four tied for ranks 5..7: expert 100 is cut
+    for (int e : {7, 8, 9, 77}) bias[e] = -1.25f;
+    for (int e : {30, 31, 32, 33, 34, 35}) bias[e] = 1.5f - 1e-3f * float(e);  // crowd around the cut
+  }
   const std::vector<float> x = randn_bf16(rng, size_t(M) * H, 1.0);
   DeviceArray<__nv_bfloat16> dx(to_bf16(x)), dwb(to_bf16(w));
   DeviceArray<float> dwf(w), db(bias), wts(size_t(M) * 8);
@@ -192,14 +207,15 @@ bool test_router(Rng& rng, int M, bool wf32) {
       rw[size_t(m) * 8 + k] = s[order[k]] / (sum + 1e-20) * 8.0;
     }
   }
-  std::printf("%s router M=%d %s: expert ids %s\n", ok ? "PASS" : "FAIL", M, wf32 ? "fp32" : "bf16",
-              ok ? "match" : "differ");
+  std::printf("%s router M=%d %s%s: expert ids %s\n", ok ? "PASS" : "FAIL", M, wf32 ? "fp32" : "bf16",
+              ties ? " ties" : "", ok ? "match" : "differ");
   return Check{"router weights", 1e-5, 1e-6, 1.0}(gw, rw) && ok;
 }
 
 struct MixCase {
   int nb, Q;
   bool base, write, abl, bf16, f32, partial;
+  bool side = false;  // side outputs: bf16(new) and a copy of out_bf16 (Q = 1) at row stride 2H, two row copies
 };
 
 bool test_mix(Rng& rng, int M, const MixCase& c) {
@@ -225,7 +241,9 @@ bool test_mix(Rng& rng, int M, const MixCase& c) {
   std::vector<float> gw(g);
   for (auto& v : gw) v += 1.f;
   DeviceArray<float> dbase(base), dwrite(write), dr(r), daw(aw), dq(q), dg(gw), part(n), of(size_t(c.Q) * n);
-  DeviceArray<__nv_bfloat16> ob(size_t(c.Q) * n);
+  DeviceArray<__nv_bfloat16> ob(size_t(c.Q) * n), nb16(size_t(M) * 2 * H), oc16(size_t(M) * 2 * H);
+  const std::vector<float> csrc = randn(rng, size_t(M) * 3 * H, 1.0);
+  DeviceArray<float> dcsrc(csrc), dcdst(size_t(M) * 2 * 1024);
   dense::MixParams p;
   p.blocks = c.nb ? reinterpret_cast<const float* const*>(table.get()) : nullptr;
   p.nblocks = c.nb;
@@ -241,6 +259,15 @@ bool test_mix(Rng& rng, int M, const MixCase& c) {
   p.out_bf16 = c.bf16 ? ob.get() : nullptr;
   p.out_f32 = c.f32 ? of.get() : nullptr;
   p.M = M;
+  const bool copy_out = c.side && c.bf16 && c.Q == 1;
+  if (c.side) {
+    p.new_bf16 = nb16.get() + H;  // second half of each 2H row
+    p.new_bf16_stride = 2 * H;
+    if (copy_out) p.out_copy = oc16.get(), p.out_copy_stride = 2 * H;
+    // the K/V segments of a [M, 3H] row-major "projection" into two [M, 1024] slabs
+    p.copies[0] = dense::MixRowCopy{dcsrc.get() + 100 * 4, 3 * H, dcdst.get(), 1024, 1024};
+    p.copies[1] = dense::MixRowCopy{dcsrc.get() + 1000 * 4, 3 * H, dcdst.get() + size_t(M) * 1024, 1024, 1024};
+  }
   dense::mix(p, true, g_stream);
   sync();
   // oracle
@@ -296,32 +323,59 @@ bool test_mix(Rng& rng, int M, const MixCase& c) {
     }
   }
   char what[96];
-  std::snprintf(what, sizeof what, "mix M=%d blocks=%d Q=%d%s%s%s", M, c.nb, c.Q, c.base ? " base" : "",
-                c.write ? " write" : "", c.abl ? " abl" : "");
+  std::snprintf(what, sizeof what, "mix M=%d blocks=%d Q=%d%s%s%s%s", M, c.nb, c.Q, c.base ? " base" : "",
+                c.write ? " write" : "", c.abl ? " abl" : "", c.side ? " side" : "");
   bool ok = true;
   if (c.partial) ok &= Check{(std::string(what) + " partial").c_str(), 1e-5, 1e-5, 1.0}(part.download(), nw);
   if (c.f32) ok &= Check{(std::string(what) + " f32").c_str(), 1e-4, 1e-5, 1.0}(of.download(), mixr);
   if (c.bf16) ok &= Check{(std::string(what) + " bf16").c_str(), 1.0 / 128, 1e-5, 0.01}(bf16_download(ob), outb, &outbr);
+  if (c.side) {
+    // bf16(new) and the out_bf16 copy are bit-exact with the kernel's own FP32 `new` / out_bf16
+    const auto gn = bf16_download(nb16), gc = bf16_download(oc16), gb = bf16_download(ob);
+    const auto gp = c.partial ? part.download() : std::vector<float>();
+    std::vector<float> gnew(n);
+    std::vector<double> rnew(n);
+    size_t bad = 0;
+    for (int m = 0; m < M; ++m)
+      for (int k = 0; k < H; ++k) {
+        const size_t i = size_t(m) * H + k;
+        gnew[i] = gn[size_t(m) * 2 * H + H + k];
+        rnew[i] = rbf(nw[i]);
+        if (c.partial && gnew[i] != round_bf16(gp[i])) ++bad;
+        if (gn[size_t(m) * 2 * H + k] != 0.f) ++bad;  // untouched first half
+        if (copy_out && gc[size_t(m) * 2 * H + k] != gb[i]) ++bad;
+      }
+    const auto gd = dcdst.download();
+    for (int m = 0; m < M; ++m)
+      for (int k = 0; k < 1024; ++k) {
+        bad += gd[size_t(m) * 1024 + k] != csrc[size_t(m) * 3 * H + 400 + k];
+        bad += gd[(size_t(M) + m) * 1024 + k] != csrc[size_t(m) * 3 * H + 4000 + k];
+      }
+    ok &= Check{(std::string(what) + " new_bf16").c_str(), 1.0 / 128, 1e-5, 0.01}(gnew, nw, &rnew);
+    std::printf("%s %s side outputs: %zu mismatches\n", bad ? "FAIL" : "PASS", what, bad);
+    ok &= bad == 0;
+  }
   return ok;
 }
 
-bool test_gates(Rng& rng, int G, int M, bool fg32) {
+bool test_gates(Rng& rng, int G, int M, bool fg32, bool h_shared = false) {
   const size_t n = size_t(G) * M * H;
-  const std::vector<float> h = randn(rng, n, 1.0), msg = randn(rng, n, 1.0);
+  const std::vector<float> h = randn(rng, h_shared ? size_t(M) * H : n, 1.0), msg = randn(rng, n, 1.0);
   const std::vector<float> wd = randn_bf16(rng, size_t(G) * 64 * 2 * H, 0.02);
   const std::vector<float> wf = randn_bf16(rng, size_t(G) * H * 64, 0.1), wg = randn_bf16(rng, size_t(G) * H * 64, 0.1);
   std::vector<float> nw = randn(rng, size_t(G) * H, 0.1);
   for (auto& v : nw) v += 1.f;
   DeviceArray<float> dh(h), dm(msg), dwf32(wf), dwg32(wg), dn(nw), of(n);
   DeviceArray<__nv_bfloat16> dwd(to_bf16(wd)), dwf16(to_bf16(wf)), dwg16(to_bf16(wg)), ob(n);
-  dense::message_gates(dh.get(), dm.get(), G, M, dwd.get(), fg32 ? (const void*)dwf32.get() : (const void*)dwf16.get(),
+  dense::message_gates(dh.get(), h_shared, dm.get(), G, M, dwd.get(),
+                       fg32 ? (const void*)dwf32.get() : (const void*)dwf16.get(),
                        fg32 ? (const void*)dwg32.get() : (const void*)dwg16.get(), fg32, dn.get(), ob.get(), of.get(),
                        true, g_stream);
   sync();
   std::vector<double> gated(n), out(n), outr(n);
   for (int g = 0; g < G; ++g)
     for (int m = 0; m < M; ++m) {
-      const float* hv = &h[(size_t(g) * M + m) * H];
+      const float* hv = &h[((h_shared ? 0 : size_t(g)) * M + m) * H];
       const float* mv = &msg[(size_t(g) * M + m) * H];
       double sh = 0, sm = 0;
       for (int k = 0; k < H; ++k) sh += double(hv[k]) * hv[k], sm += double(mv[k]) * mv[k];
@@ -350,7 +404,8 @@ bool test_gates(Rng& rng, int G, int M, bool fg32) {
       }
     }
   char what[64];
-  std::snprintf(what, sizeof what, "message_gates G=%d M=%d %s", G, M, fg32 ? "fp32" : "bf16");
+  std::snprintf(what, sizeof what, "message_gates G=%d M=%d %s%s", G, M, fg32 ? "fp32" : "bf16",
+                h_shared ? " shared-h" : "");
   // the BF16 roundings of the normalised inputs and of g may flip against the oracle: loose bounds
   bool ok = Check{(std::string(what) + " gated").c_str(), 2e-3, 2e-3, 1.0}(of.download(), gated);
   ok &= Check{(std::string(what) + " out").c_str(), 1.0 / 64, 4e-3, 0.05}(bf16_download(ob), out, &outr);
@@ -439,6 +494,8 @@ int main() {
     ok &= test_router(rng, M, false);
   }
   ok &= test_router(rng, 3, false);
+  ok &= test_router(rng, 2, false, true);
+  ok &= test_router(rng, 8, true, true);
   const MixCase cases[] = {
       {0, 1, true, false, false, true, false, false},   // layer 0: base only, no mix
       {0, 1, true, true, true, true, true, true},       // skip path with an ablated write
@@ -446,12 +503,18 @@ int main() {
       {3, 3, false, true, true, true, true, true},      // full layer at a block boundary
       {1, 4, true, true, true, false, true, true},      // loop messages (Q = 4)
       {5, 1, true, true, false, true, false, false},    // the most blocks a mix takes (5)
+      {2, 1, true, true, true, true, false, true, true},     // side outputs (taps, history copies)
+      {0, 1, true, true, true, true, false, false, true},    // side outputs on the skip path, no partial
+      {4, 3, true, true, true, false, true, true, true},     // side outputs with Q = 3 (no out copy)
   };
   for (int M : {1, 3})
     for (const auto& c : cases) ok &= test_mix(rng, M, c);
   ok &= test_gates(rng, 3, 1, false);
   ok &= test_gates(rng, 3, 2, true);
   ok &= test_gates(rng, 1, 8, false);
+  ok &= test_gates(rng, 3, 4, false, true);
+  ok &= test_gates(rng, 3, 8, false, true);
+  ok &= test_gates(rng, 1, 5, true);  // FP32 forget/gain with several tokens: one staging buffer
   for (int M : {1, 3, 8}) ok &= test_embed(rng, M);
   ok &= test_fp8_rows(rng);
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));

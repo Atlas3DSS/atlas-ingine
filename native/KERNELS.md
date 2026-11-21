@@ -32,6 +32,10 @@ Weight layouts and the visit plan are in `src/model/model_data.h` and `src/model
   range; performance matters first for M = 1.
 * Matrix inputs are BF16; accumulation and activations are FP32. Where the reference rounds an
   intermediate to BF16 (noted below), kernels round it too; everything else may stay FP32.
+* Programmatic dependent launch: a kernel may issue loads of weights (and of data written two or more
+  kernels back) before `griddepcontrol.wait`, so they overlap its predecessor. ptxas sinks such loads
+  below a plain wait (it only orders later accesses), so the wait goes in a loop with an opaque zero
+  trip bound (`pdl_wait_fenced` in `dense/cluster.cuh`); check the SASS (`ACQBULK` after the `LDG`s).
 * Qualification: FP64 CPU oracles at real model shapes (`tests/kernels/test_<area>.cpp`, NVFP4 and MXFP8,
   sliding and full, every M), real layers in `tests/model/test_layer.cpp`, and the whole model against the
   goldens in `tests/golden/model` (`ingine-validate`).
@@ -125,10 +129,15 @@ update + attention residual + RMS norm.
   `q` (fp32 `[Q, H]`, Q ∈ {1, 3}): `a_i = softmax_i(q · n_i / √H)`, `mix_q = Σ_i a_i n_i`.
   `out_f32[q, m] = mix_q` (optional), `out_bf16[q, m] = bf16(rms_norm(mix_q) * norm_w[q])` (optional).
 * With no blocks and a single query the mix is skipped and `new` itself is normalised (layer 0).
+* Side outputs written by the same launch, so the decode step needs no separate conversion or copy nodes
+  (they would break the PDL chain): `new_bf16` = `bf16(new)` at a row stride (DSpark taps), `out_copy` = a
+  strided copy of `out_bf16` (Q = 1; the final tap), and up to two plain FP32 row copies (`copies`: the K/V
+  projection segments kept for speculative rollback).
 
 `message_gates(h, msg, w_down, w_forget, w_gain, norm_w, out_bf16)` — loop passes 2 and 3.
 * `h`, `msg` fp32 `[G, M, H]` (G ≤ 3 gates), `w_down` bf16 `[G, 64, 2H]`, `w_forget`/`w_gain` fp32
-  `[G, H, 64]`, `norm_w` fp32 `[G, H]`.
+  `[G, H, 64]`, `norm_w` fp32 `[G, H]`. `h_shared`: `h` is `[M, H]` and every gate reads it (sliding
+  layers mix one query for the three gates).
 * `g = bf16(w_down · bf16([n(h), n(msg)]))` (n = RMS norm without weight), then
   `gated = (1 - tanh(w_forget · g)) * h + tanh(w_gain · g) * msg`, `out_bf16[g, m] = bf16(rms_norm(gated)
   * norm_w[g])`. For the MLP-side gate (G = 1) the host also needs `gated` in FP32: provide an

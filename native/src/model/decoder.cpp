@@ -7,7 +7,6 @@
 #include "kernels/attn/attn.h"
 #include "kernels/dense/dense.h"
 #include "kernels/moe/moe.h"
-#include "model/model_kernels.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -76,9 +75,9 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   State& st = st_;
   const std::size_t slab = std::size_t(m) * H;  // one [m, H] slab of a [G, m, H] buffer
 
-  auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
-                 const float* abl_w, float* partial_out, const Tensor* queries, const float* norm_w,
-                 __nv_bfloat16* out_bf16, float* out_f32) {
+  auto mix_params = [&](const std::vector<const float*>& blocks, const float* base, const float* write,
+                        const float* abl_r, const float* abl_w, float* partial_out, const Tensor* queries,
+                        const float* norm_w, __nv_bfloat16* out_bf16, float* out_f32) {
     dense::MixParams p;
     p.blocks = blocks.empty() ? nullptr : reinterpret_cast<const float* const*>(block_table(blocks));
     p.nblocks = int(blocks.size());
@@ -94,7 +93,13 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     p.out_bf16 = out_bf16;
     p.out_f32 = out_f32;
     p.M = m;
-    dense::mix(p, pdl, stream);
+    return p;
+  };
+  auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
+                 const float* abl_w, float* partial_out, const Tensor* queries, const float* norm_w,
+                 __nv_bfloat16* out_bf16, float* out_f32) {
+    dense::mix(mix_params(blocks, base, write, abl_r, abl_w, partial_out, queries, norm_w, out_bf16, out_f32), pdl,
+               stream);
   };
 
   dense::embed(static_cast<const std::int64_t*>(b.token.data), m, static_cast<const __nv_bfloat16*>(w.embed.data),
@@ -140,27 +145,24 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
           nullptr, nullptr, f32m(b.msgs));
       if (i == 0) write = nullptr;  // pass p-1's last write went into E[p-1]; layer 6 restarts from B1
     }
-    // ---- attention read(s)
+    // ---- attention read(s); at a tap visit the same launch writes b.taps[:, tap] = bf16(hid)
     const Tensor* queries = layer.attn_query.data ? &layer.attn_query : nullptr;
     float* partial_out = hid != base ? hid : nullptr;
-    if (msgs) {
-      mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nullptr, nullptr, f32m(b.mixf));
-      if (!layer.full) {  // b.mixf[1:] = b.mixf[:1]
-        CUDA_CHECK(cudaMemcpyAsync(f32m(b.mixf) + slab, f32p(b.mixf), slab * 4, cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(
-            cudaMemcpyAsync(f32m(b.mixf) + 2 * slab, f32p(b.mixf), slab * 4, cudaMemcpyDeviceToDevice, stream));
-      }
-      dense::message_gates(f32p(b.mixf), f32p(b.msgs), 3, m, static_cast<const __nv_bfloat16*>(layer.qkv_gate_down.data),
-                           layer.qkv_gate_forget16.data, layer.qkv_gate_gain16.data, false, f32p(layer.attn_norm3),
-                           bf16m(b.xin), nullptr, pdl, stream);
-    } else {
-      mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, f32p(layer.attn_norm_mix),
-          bf16m(b.xin), nullptr);
-    }
-    if (tap < 3 && v == TAP_VISITS[tap]) {  // b.taps[:, tap] = hid
-      f32_to_bf16_rows(hid, m, H, taps + std::size_t(tap) * H, std::int64_t(NUM_TAPS) * H, stream);
+    dense::MixParams ap =
+        msgs ? mix_params(blocks, base, write, r_prev, w_prev, partial_out, queries, nullptr, nullptr, f32m(b.mixf))
+             : mix_params(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr,
+                          f32p(layer.attn_norm_mix), bf16m(b.xin), nullptr);
+    if (tap < 3 && v == TAP_VISITS[tap]) {
+      ap.new_bf16 = taps + std::size_t(tap) * H;
+      ap.new_bf16_stride = std::int64_t(NUM_TAPS) * H;
       ++tap;
     }
+    dense::mix(ap, pdl, stream);
+    if (msgs)  // sliding layers mix one query: all three gates read b.mixf[0]
+      dense::message_gates(f32p(b.mixf), !layer.full, f32p(b.msgs), 3, m,
+                           static_cast<const __nv_bfloat16*>(layer.qkv_gate_down.data), layer.qkv_gate_forget16.data,
+                           layer.qkv_gate_gain16.data, false, f32p(layer.attn_norm3), bf16m(b.xin), nullptr, pdl,
+                           stream);
     // ---- attention
     const bool single = !layer.full && !msgs;
     const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
@@ -168,12 +170,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     const int R = proj_rows(layer.full);
     dense::proj(bf16m(b.xin), m, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full),
                 f32m(proj_out), pdl, stream);
-    if (history) {
-      for (auto [dst, s] : {std::pair{&b.hist_k, SEG_K}, std::pair{&b.hist_v, SEG_V}})
-        CUDA_CHECK(cudaMemcpy2DAsync(f32m(*dst) + std::size_t(v) * m * KV_DIM, KV_DIM * 4,
-                                     f32p(proj_out) + SEG_BEGIN[s], std::size_t(R) * 4, KV_DIM * 4, m,
-                                     cudaMemcpyDeviceToDevice, stream));
-    }
+    // b.hist_k/hist_v[v] (K and V segments of proj_out) are copied by the MLP-side mix below
     attn::DecodeArgs a;
     a.proj = f32p(proj_out);
     a.M = m;
@@ -216,17 +213,23 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     std::vector<const float*> mlp_blocks = blocks;
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
-    if (msgs) {
-      mix(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + v, f32m(b.part), &layer.mlp_query,
-          nullptr, nullptr, f32m(b.mixm));
-      dense::message_gates(f32p(b.mixm), f32p(b.msgs) + 3 * slab, 1, m,
+    dense::MixParams mp =
+        msgs ? mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + v, f32m(b.part),
+                          &layer.mlp_query, nullptr, nullptr, f32m(b.mixm))
+             : mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + v, f32m(b.part),
+                          &layer.mlp_query, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr);
+    if (history) {  // b.hist_k/hist_v[v] = proj_out[:, K/V segment]
+      int c = 0;
+      for (auto [dst, s] : {std::pair{&b.hist_k, SEG_K}, std::pair{&b.hist_v, SEG_V}})
+        mp.copies[c++] = dense::MixRowCopy{f32p(proj_out) + SEG_BEGIN[s], R, f32m(*dst) + std::size_t(v) * m * KV_DIM,
+                                           KV_DIM, KV_DIM};
+    }
+    dense::mix(mp, pdl, stream);
+    if (msgs)
+      dense::message_gates(f32p(b.mixm), false, f32p(b.msgs) + 3 * slab, 1, m,
                            static_cast<const __nv_bfloat16*>(layer.mlp1_gate_down.data), layer.mlp1_gate_forget16.data,
                            layer.mlp1_gate_gain16.data, false, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr, pdl,
                            stream);
-    } else {
-      mix(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + v, f32m(b.part), &layer.mlp_query,
-          f32p(layer.mlp_norm1), bf16m(b.xm), nullptr);
-    }
     dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
                   static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
     const Experts& ex = layer.experts;
@@ -239,14 +242,14 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
                   history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, pdl, stream);
     prev_v = v;
   }
-  // ---- final read
+  // ---- final read; the same launch writes b.taps[:, 3] = b.xf
   const Tensor final_norm1 = rm(w.final_norm.data, DType::FP32, {1, H});
-  mix({f32p(b.B0), f32p(b.B1), f32p(b.B2[2]), f32p(b.E[2])}, f32p(b.part), f32p(b.y2),
-      mlp_dirs + std::size_t(prev_v) * H, mlp_w + prev_v, nullptr, &w.final_query, f32p(final_norm1), bf16m(b.xf),
-      nullptr);
-  // b.taps[:, 3] = b.xf[0]
-  CUDA_CHECK(cudaMemcpy2DAsync(taps + std::size_t(tap) * H, std::size_t(NUM_TAPS) * H * 2, b.xf.data,
-                               std::size_t(H) * 2, std::size_t(H) * 2, m, cudaMemcpyDeviceToDevice, stream));
+  dense::MixParams fp = mix_params({f32p(b.B0), f32p(b.B1), f32p(b.B2[2]), f32p(b.E[2])}, f32p(b.part), f32p(b.y2),
+                                   mlp_dirs + std::size_t(prev_v) * H, mlp_w + prev_v, nullptr, &w.final_query,
+                                   f32p(final_norm1), bf16m(b.xf), nullptr);
+  fp.out_copy = taps + std::size_t(tap) * H;
+  fp.out_copy_stride = std::int64_t(NUM_TAPS) * H;
+  dense::mix(fp, pdl, stream);
   dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
 }
 

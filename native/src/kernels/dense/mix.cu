@@ -1,18 +1,24 @@
 // mix: ablated residual update + attention residual over block states + weighted RMS norm.
 //
-// Design. Latency-bound (a few 9 KB vectors per token), so one CTA per token with 576 threads, each owning
-// 4 consecutive channels (one float4 of every state, query and output: coalesced 16-byte accesses, states
-// live in registers for the whole kernel). At most three block reductions, each a warp stage + one shared
-// round: (1) r . write for the ablation, (2) for every state i its sum of squares and the raw dots
-// q_j . s_i (q_j . n_i = rinv_i * (q_j . s_i), so normalisation, logits and softmax need a single
+// Design. Latency-bound (a few 9 KB vectors per token), so one CTA per token whose threads own a few channel
+// quads each (one float4 of every state, query and output per quad: coalesced 16-byte accesses, states live
+// in registers for the whole kernel). At most three block reductions, each a warp stage + one shared round
+// with a single barrier: (1) r . write for the ablation, (2) for every state i its sum of squares and the
+// raw dots q_j . s_i (q_j . n_i = rinv_i * (q_j . s_i), so normalisation, logits and softmax need a single
 // reduction; its up to 30 values use the transposing reduce_scatter, 31 shuffles instead of 150), (3) the
 // sum of squares of each mixed output for the final RMS norm. The state count (blocks + 1) and query
 // count are template parameters, so no work is spent on absent states. Block pointers are read from
-// device memory, so the graph can be replayed with other blocks; counts (blocks, queries, which optional
-// tensors exist) are fixed per call site. Queries, ablation direction/weight and norm weights are loaded
-// before griddepcontrol.wait (pdl=True), the pointer table and every state after it. `embed` (also here)
-// reproduces torch's reduction order so that it is bit-exact with model.Model.embed.
-// Ported from engine/csrc/dense/mix.cu (kernel bodies unchanged; torch launchers -> raw pointers).
+// device memory (constant tables, loaded before the PDL wait), so the graph can be replayed with other
+// blocks; counts (blocks, queries, which optional tensors exist) are fixed per call site. Queries,
+// ablation direction/weight, norm weights and the block pointers are loaded before griddepcontrol.wait
+// (pdl=True; pdl_wait_fenced, as ptxas would sink them below a plain wait), every state after it. Side
+// outputs (a BF16 copy of `new`, a strided copy of out_bf16, plain FP32 row copies) let the decode step drop
+// separate conversion/memcpy nodes, which would break the PDL chain. `embed` (also here) reproduces torch's
+// reduction order so that it is bit-exact with model.Model.embed.
+// Ported from engine/csrc/dense/mix.cu (torch launchers -> raw pointers). Results are bit-identical to that
+// kernel (checked byte for byte against it over all state/query counts, M = 1, 2, 3, 8): same expressions
+// and the same order of every FP32 sum (see REF_W below); changed are the thread count, the barriers, what
+// is loaded before the PDL wait, and the side outputs.
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
@@ -20,8 +26,15 @@
 namespace ingine::kernels::dense {
 namespace {
 
-constexpr int MIX_T = H / 4;  // 576
+// The arithmetic is that of the reference kernel (576 threads, thread = one channel quad): every block sum
+// adds the per-quad terms of each of its 18 warps with a 32-lane butterfly, then the 18 warp sums in warp
+// order. Here a thread owns MIX_V quads, t + u * MIX_T (the same lane of reference warp w + u * MIX_W), so
+// the same butterflies run once per u and the totals are bit-identical for any MIX_T dividing 576 by 32s.
+constexpr int REF_W = H / 4 / 32;      // 18 reference warps
+constexpr int MIX_T = 192;             // threads per token
 constexpr int MIX_W = MIX_T / 32;
+constexpr int MIX_V = REF_W / MIX_W;   // channel quads per thread
+static_assert(MIX_T % 32 == 0 && MIX_V * MIX_W == REF_W, "MIX_T must split the 18 reference warps evenly");
 constexpr int MAXB = 5, MAXQ = 4;
 
 struct MixArgs {
@@ -35,10 +48,22 @@ struct MixArgs {
   const float* norm_w;   // [Q, H] (needed with out_bf16)
   __nv_bfloat16* out_bf16;  // [Q, M, H] or null
   float* out_f32;           // [Q, M, H] or null
+  __nv_bfloat16* new_bf16;  // row m at + m * new_bf16_stride, or null
+  long long new_bf16_stride;
+  __nv_bfloat16* out_copy;  // Q == 1: row m at + m * out_copy_stride, or null
+  long long out_copy_stride;
+  MixRowCopy copies[2];     // dst == null: unused
   int M;
+  uint32_t zero;  // 0 (opaque to the compiler: pdl_wait_fenced)
 };
 
 __device__ __forceinline__ float dot4(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+// Sum of squares of one channel quad for the output norms, with the FMA pattern of the reference build
+// pinned: left to the compiler, the restructured kernel got another one here (same sum, other rounding of
+// the first two products), which moved about one output element in 10^6 by a BF16 ulp.
+__device__ __forceinline__ float sumsq4(float4 a) {
+  return __fmaf_rn(a.w, a.w, __fmaf_rn(a.z, a.z, __fmaf_rn(a.x, a.x, __fmul_rn(a.y, a.y))));
+}
 __device__ __forceinline__ float4 scale4(float4 a, float s) { return make_float4(a.x * s, a.y * s, a.z * s, a.w * s); }
 
 __device__ __forceinline__ void store_bf16x4(__nv_bfloat16* p, float4 v) {
@@ -49,85 +74,168 @@ __device__ __forceinline__ void store_bf16x4(__nv_bfloat16* p, float4 v) {
   *reinterpret_cast<uint2*>(p) = u;
 }
 
+// Block sum of N per-quad values in two steps. sum_part: the warp stage for this thread's quad `u`, i.e.
+// reference warp w + u * MIX_W (butterflies, or the transposing reduce_scatter for N >= 6: the same
+// additions), stored in `scratch` ([REF_W * block_sum_slots<N>()]). sum_total: one barrier, then lane i adds
+// the 18 warp sums of value i in warp order and the totals are broadcast by shuffles (no second barrier;
+// `scratch` belongs to one reduction).
+template <int N>
+__device__ __forceinline__ void sum_part(float (&v)[N], float* scratch, int u) {
+  constexpr int S = block_sum_slots<N>();
+  const int lane = threadIdx.x & 31, rw = (threadIdx.x >> 5) + u * MIX_W;
+  if constexpr (S == N) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) v[i] = group_sum<32>(v[i]);
+    if (lane == 0) {
+#pragma unroll
+      for (int i = 0; i < N; ++i) scratch[rw * N + i] = v[i];
+    }
+  } else {
+    scratch[rw * 32 + lane] = reduce_scatter<32, N>(v);  // lane l: value l % P
+  }
+}
+template <int N>
+__device__ __forceinline__ void sum_total(float (&out)[N], const float* scratch) {
+  constexpr int S = block_sum_slots<N>();
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  float s = 0.f;
+  if (lane < N) {
+#pragma unroll
+    for (int w = 0; w < REF_W; ++w) s += scratch[w * S + lane];
+  }
+#pragma unroll
+  for (int i = 0; i < N; ++i) out[i] = __shfl_sync(0xffffffffu, s, i);
+}
+
 // NS = states in the mix (blocks + new), Q = queries; NS == 1 && Q == 1 is the layer-0 path (no mix).
 template <int NS, int Q>
 __global__ void __launch_bounds__(MIX_T) mix_kernel(MixArgs a) {
   constexpr bool SKIP = NS == 1 && Q == 1;
   constexpr int NV = NS + Q * NS;  // sums of squares + query dots
-  __shared__ float red1[(MIX_W + 1) * block_sum_slots<1>()], red2[(MIX_W + 1) * block_sum_slots<NV>()],
-      red3[(MIX_W + 1) * block_sum_slots<Q>()];
+  __shared__ float red1[REF_W * block_sum_slots<1>()], red2[REF_W * block_sum_slots<NV>()],
+      red3[REF_W * block_sum_slots<Q>()];
   const int m = blockIdx.x, t = threadIdx.x;
-  const size_t off = size_t(m) * H + 4 * t;
+  const size_t row = size_t(m) * H;
   auto ld4 = [](const float* p) { return *reinterpret_cast<const float4*>(p); };
+  auto ch = [t](int u) { return 4 * (t + u * MIX_T); };
 
-  // constants (queries, ablation direction and weight, norm weights) before the PDL wait; states after
-  float4 s[NS], q[Q], r4 = make_float4(0.f, 0.f, 0.f, 0.f), g4[Q];
+  // constants (queries, ablation direction and weight, norm weights, block pointers) before the PDL wait;
+  // states after it
+  float4 s[NS][MIX_V], q[Q][MIX_V], r4[MIX_V], g4[Q][MIX_V];
+  const float* bp[NS > 1 ? NS - 1 : 1];
+#pragma unroll
+  for (int i = 0; i < NS - 1; ++i) bp[i] = a.blocks[i];
   float aw = 0.f;
-  if constexpr (!SKIP) {
 #pragma unroll
-    for (int j = 0; j < Q; ++j) q[j] = ld4(a.queries + size_t(j) * H + 4 * t);
-  }
-  if (a.abl_r) {
-    r4 = ld4(a.abl_r + 4 * t);
-    aw = __ldg(a.abl_w);
-  }
-  if (a.out_bf16) {
+  for (int u = 0; u < MIX_V; ++u) {
+    if constexpr (!SKIP) {
 #pragma unroll
-    for (int j = 0; j < Q; ++j) g4[j] = ld4(a.norm_w + size_t(j) * H + 4 * t);
+      for (int j = 0; j < Q; ++j) q[j][u] = ld4(a.queries + size_t(j) * H + ch(u));
+    }
+    r4[u] = a.abl_r ? ld4(a.abl_r + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (a.out_bf16) {
+#pragma unroll
+      for (int j = 0; j < Q; ++j) g4[j][u] = ld4(a.norm_w + size_t(j) * H + ch(u));
+    }
   }
+  if (a.abl_r) aw = __ldg(a.abl_w);
 
-  pdl_wait();
+  pdl_wait_fenced(a.zero);  // keeps the constant loads above ahead of the wait
   pdl_trigger();
+  // side copies first: their loads fly during the mix
 #pragma unroll
-  for (int i = 0; i < NS - 1; ++i) s[i] = ld4(a.blocks[i] + off);  // pointer table, then block states
+  for (int c = 0; c < 2; ++c) {
+    const MixRowCopy& cp = a.copies[c];
+    if (!cp.dst) continue;
+    const float4* src = reinterpret_cast<const float4*>(cp.src + m * cp.src_stride);
+    float4* dst = reinterpret_cast<float4*>(cp.dst + m * cp.dst_stride);
+    for (int k = t; k < cp.cols / 4; k += MIX_T) dst[k] = src[k];
+  }
+  float4 nw[MIX_V], y[MIX_V];
+#pragma unroll
+  for (int u = 0; u < MIX_V; ++u) {
+#pragma unroll
+    for (int i = 0; i < NS - 1; ++i) s[i][u] = ld4(bp[i] + row + ch(u));
+    nw[u] = a.base ? ld4(a.base + row + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (a.write) y[u] = ld4(a.write + row + ch(u));
+  }
 
   // new = base + (write - (w * (write . r)) * r)
-  float4 nw = a.base ? ld4(a.base + off) : make_float4(0.f, 0.f, 0.f, 0.f);
   if (a.write) {
-    float4 y = ld4(a.write + off);
     if (a.abl_r) {
-      const float4 r = r4;
-      float d[1] = {dot4(y, r)};
-      block_sum(d, red1);
+#pragma unroll
+      for (int u = 0; u < MIX_V; ++u) {
+        float d[1] = {dot4(y[u], r4[u])};
+        sum_part(d, red1, u);
+      }
+      float d[1];
+      sum_total(d, red1);
       const float c = aw * d[0];
-      y = make_float4(y.x - c * r.x, y.y - c * r.y, y.z - c * r.z, y.w - c * r.w);
+#pragma unroll
+      for (int u = 0; u < MIX_V; ++u) {
+        const float4 r = r4[u];
+        y[u] = make_float4(y[u].x - c * r.x, y[u].y - c * r.y, y[u].z - c * r.z, y[u].w - c * r.w);
+      }
     }
-    if (a.base) nw = make_float4(nw.x + y.x, nw.y + y.y, nw.z + y.z, nw.w + y.w);
-    else nw = y;
+#pragma unroll
+    for (int u = 0; u < MIX_V; ++u) {
+      if (a.base) nw[u] = make_float4(nw[u].x + y[u].x, nw[u].y + y[u].y, nw[u].z + y[u].z, nw[u].w + y[u].w);
+      else nw[u] = y[u];
+    }
   }
-  if (a.partial) *reinterpret_cast<float4*>(a.partial + off) = nw;
+#pragma unroll
+  for (int u = 0; u < MIX_V; ++u) {
+    if (a.partial) *reinterpret_cast<float4*>(a.partial + row + ch(u)) = nw[u];
+    if (a.new_bf16) store_bf16x4(a.new_bf16 + m * a.new_bf16_stride + ch(u), nw[u]);
+  }
 
   if constexpr (SKIP) {
-    float ss[1] = {dot4(nw, nw)};
-    block_sum(ss, red3);
+#pragma unroll
+    for (int u = 0; u < MIX_V; ++u) {
+      float ss[1] = {sumsq4(nw[u])};
+      sum_part(ss, red3, u);
+    }
+    float ss[1];
+    sum_total(ss, red3);
     const float rinv = rsqrtf(ss[0] / H + EPS);
-    if (a.out_f32) *reinterpret_cast<float4*>(a.out_f32 + off) = nw;
-    if (a.out_bf16) {
-      const float4 g = g4[0];
-      const float4 n = scale4(nw, rinv);
-      store_bf16x4(a.out_bf16 + off, make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w));
+#pragma unroll
+    for (int u = 0; u < MIX_V; ++u) {
+      if (a.out_f32) *reinterpret_cast<float4*>(a.out_f32 + row + ch(u)) = nw[u];
+      if (a.out_bf16) {
+        const float4 g = g4[0][u];
+        const float4 n = scale4(nw[u], rinv);
+        const float4 o = make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w);
+        store_bf16x4(a.out_bf16 + row + ch(u), o);
+        if (a.out_copy) store_bf16x4(a.out_copy + m * a.out_copy_stride + ch(u), o);
+      }
     }
     return;
   } else {
-    s[NS - 1] = nw;
-    float v[NV];
 #pragma unroll
-    for (int i = 0; i < NS; ++i) {
-      v[i] = dot4(s[i], s[i]);
+    for (int u = 0; u < MIX_V; ++u) {
+      s[NS - 1][u] = nw[u];
+      float p[NV];
 #pragma unroll
-      for (int j = 0; j < Q; ++j) v[NS + j * NS + i] = dot4(q[j], s[i]);
+      for (int i = 0; i < NS; ++i) {
+        p[i] = dot4(s[i][u], s[i][u]);
+#pragma unroll
+        for (int j = 0; j < Q; ++j) p[NS + j * NS + i] = dot4(q[j][u], s[i][u]);
+      }
+      sum_part(p, red2, u);
     }
-    block_sum(v, red2);
+    float v[NV];
+    sum_total(v, red2);
 
     float rinv[NS];
 #pragma unroll
     for (int i = 0; i < NS; ++i) {
       rinv[i] = rsqrtf(v[i] / H + EPS);
-      s[i] = scale4(s[i], rinv[i]);  // n_i
+#pragma unroll
+      for (int u = 0; u < MIX_V; ++u) s[i][u] = scale4(s[i][u], rinv[i]);  // n_i
     }
     const float inv_sqrt_h = 1.f / 48.f;  // H ** -0.5
-    float4 mix[Q];
-    float ms[Q];
+    float4 mix[Q][MIX_V];
 #pragma unroll
     for (int j = 0; j < Q; ++j) {
       float lg[NS], mx = -INFINITY;
@@ -142,27 +250,45 @@ __global__ void __launch_bounds__(MIX_T) mix_kernel(MixArgs a) {
         lg[i] = expf(lg[i] - mx);
         den += lg[i];
       }
-      float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
-      for (int i = 0; i < NS; ++i) {
-        const float p = lg[i] / den;
-        o = make_float4(o.x + p * s[i].x, o.y + p * s[i].y, o.z + p * s[i].z, o.w + p * s[i].w);
+      for (int u = 0; u < MIX_V; ++u) {
+        float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int i = 0; i < NS; ++i) {
+          const float p = lg[i] / den;
+          o = make_float4(o.x + p * s[i][u].x, o.y + p * s[i][u].y, o.z + p * s[i][u].z, o.w + p * s[i][u].w);
+        }
+        mix[j][u] = o;
       }
-      mix[j] = o;
-      ms[j] = dot4(o, o);
     }
     if (a.out_f32) {
 #pragma unroll
-      for (int j = 0; j < Q; ++j) *reinterpret_cast<float4*>(a.out_f32 + size_t(j) * a.M * H + off) = mix[j];
+      for (int j = 0; j < Q; ++j)
+#pragma unroll
+        for (int u = 0; u < MIX_V; ++u)
+          *reinterpret_cast<float4*>(a.out_f32 + size_t(j) * a.M * H + row + ch(u)) = mix[j][u];
     }
     if (!a.out_bf16) return;
-    block_sum(ms, red3);
+#pragma unroll
+    for (int u = 0; u < MIX_V; ++u) {
+      float p[Q];
+#pragma unroll
+      for (int j = 0; j < Q; ++j) p[j] = sumsq4(mix[j][u]);
+      sum_part(p, red3, u);
+    }
+    float ms[Q];
+    sum_total(ms, red3);
 #pragma unroll
     for (int j = 0; j < Q; ++j) {
       const float r = rsqrtf(ms[j] / H + EPS);
-      const float4 g = g4[j];
-      const float4 n = scale4(mix[j], r);
-      store_bf16x4(a.out_bf16 + size_t(j) * a.M * H + off, make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w));
+#pragma unroll
+      for (int u = 0; u < MIX_V; ++u) {
+        const float4 g = g4[j][u];
+        const float4 n = scale4(mix[j][u], r);
+        const float4 o = make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w);
+        store_bf16x4(a.out_bf16 + size_t(j) * a.M * H + row + ch(u), o);
+        if (j == 0 && a.out_copy) store_bf16x4(a.out_copy + m * a.out_copy_stride + ch(u), o);
+      }
     }
   }
 }
@@ -270,8 +396,21 @@ void mix(const MixParams& p, bool pdl, cudaStream_t stream) {
   a.out_bf16 = p.out_bf16;
   a.norm_w = p.out_bf16 ? p.norm_w : nullptr;
   require(!a.out_bf16 || a.norm_w, "mix: norm_w is required with out_bf16");
-  require(a.out_f32 || a.out_bf16 || a.partial, "mix has no output");
+  a.new_bf16 = p.new_bf16;
+  a.new_bf16_stride = p.new_bf16_stride;
+  require(a.new_bf16_stride % 4 == 0 && p.out_copy_stride % 4 == 0, "mix: bf16 copy strides must be multiples of 4");
+  a.out_copy = p.out_copy;
+  a.out_copy_stride = p.out_copy_stride;
+  require(!a.out_copy || (a.out_bf16 && Q == 1), "mix: out_copy needs out_bf16 and Q == 1");
+  for (int c = 0; c < 2; ++c) {
+    a.copies[c] = p.copies[c];
+    require(!a.copies[c].dst || (a.copies[c].src && a.copies[c].cols % 4 == 0 && a.copies[c].src_stride % 4 == 0 &&
+                                 a.copies[c].dst_stride % 4 == 0),
+            "mix: row copies need 16-byte aligned rows");
+  }
+  require(a.out_f32 || a.out_bf16 || a.partial || a.new_bf16, "mix has no output");
   a.M = M;
+  a.zero = 0;
   switch (nb + 1) {
     case 1: launch_mix_q<1>(Q, M, a, pdl, stream); break;
     case 2: launch_mix_q<2>(Q, M, a, pdl, stream); break;
