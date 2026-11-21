@@ -36,8 +36,10 @@ struct ChatRequest {
   bool include_usage = false;
 };
 
-// Validates `body` (a JSON object) and renders the prompt. Throws BadRequest or text::ChatError.
-ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len);
+// Validates `body` (a JSON object) and renders the prompt. Throws BadRequest or text::ChatError. Sampling fields
+// the request omits (temperature, top_p, top_k) take their values from `defaults`.
+ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                          const model::Sampling& defaults = {});
 
 // {"error": {"message", "type", "param", "code"}} with the type server.py maps from the status.
 Json error_body(int status, std::string_view message, const std::optional<std::string>& param = std::nullopt);

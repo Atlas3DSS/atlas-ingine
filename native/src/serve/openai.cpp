@@ -82,7 +82,8 @@ bool truthy(const Json& value) {
   }
 }
 
-ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len) {
+ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
+                          const model::Sampling& defaults) {
   if (num_int(body, "n", Bound{1, "1"}, Bound{1, "1"}).value_or(1) != 1) {
     throw BadRequest("only n=1 is supported", "n");
   }
@@ -127,11 +128,10 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
 
   ChatRequest req;
   req.sampling.temperature =
-      float(num_float(body, "temperature", Bound{0.0, "0.0"}, Bound{2.0, "2.0"}).value_or(model::Sampling{}.temperature));
-  req.sampling.top_p =
-      float(num_float(body, "top_p", Bound{0.0, "0.0"}, Bound{1.0, "1.0"}).value_or(model::Sampling{}.top_p));
+      float(num_float(body, "temperature", Bound{0.0, "0.0"}, Bound{2.0, "2.0"}).value_or(defaults.temperature));
+  req.sampling.top_p = float(num_float(body, "top_p", Bound{0.0, "0.0"}, Bound{1.0, "1.0"}).value_or(defaults.top_p));
   req.sampling.top_k =
-      clamp_int(std::max<int64_t>(0, num_int(body, "top_k", Bound{-1, "-1"}).value_or(model::Sampling{}.top_k)));
+      clamp_int(std::max<int64_t>(0, num_int(body, "top_k", Bound{-1, "-1"}).value_or(defaults.top_k)));
   if (auto seed = num_int(body, "seed")) req.sampling.seed = static_cast<uint64_t>(*seed);
   if (req.sampling.top_p <= 0.0f) throw BadRequest("'top_p' must be in (0, 1]", "top_p");
 

@@ -25,6 +25,7 @@ struct ServerOptions {
   int max_queue = 4;      // requests allowed to wait behind the running one
   int max_model_len = 0;  // context limit; 0: generator.max_model_len()
   std::string model_id;   // model name reported by the API; empty: generator.model_id()
+  model::Sampling sampling;  // temperature / top_p / top_k of requests that omit them
 };
 
 class ChatServer {
@@ -58,6 +59,7 @@ class ChatServer {
   const text::ChatFormat& fmt_;
   const std::string model_id_;
   const int max_model_len_;
+  const model::Sampling sampling_defaults_;
   const int64_t created_;
   engine::Scheduler scheduler_;
   httplib::Server server_;

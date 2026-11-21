@@ -5,10 +5,11 @@
 //   * top-k: the k-th largest z by a 4-pass MSB radix select (8-bit digits) over order-preserving keys;
 //   * top-p: the boundary token by the same descent over the probability mass in 2^-40 fixed point
 //     (integer sums, so the result does not depend on the summation order);
-//   * the draw: Gumbel-max (argmax of z + G, G = -log(-log u)) over the kept tokens, an exact sample of the
-//     renormalised distribution without a prefix scan.
-// One CTA of 1024 threads per row for top-k / top-p (every pass streams the row from L2); the common cases
-// (argmax, plain sampling, softmax, draws from probabilities; up to 8 rows) use the multi-block passes below.
+//   * the draw: Gumbel-max (argmax of z + G, G = -log E, E exponential) over the kept tokens, an exact sample of
+//     the renormalised distribution without a prefix scan.
+// Up to 8 rows every selection runs as multi-block passes (256 blocks per row, the last block of a row combines;
+// top-k / top-p one launch per digit); more rows use one CTA of 1024 threads per row (every pass streams the row
+// from L2). Both give the same draws.
 #include "kernels/head/head.h"
 
 #include "core/device.h"
@@ -17,6 +18,7 @@
 
 #include <climits>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <math_constants.h>
 #include <stdexcept>
@@ -68,7 +70,7 @@ __device__ __forceinline__ float gumbel(unsigned long long seed, unsigned long l
   const unsigned long long k = random64(seed, counter, row, index);
   const int z = min(__clzll(static_cast<long long>(k)), 40);
   const float m = static_cast<float>(static_cast<std::uint32_t>(k >> (40 - z))) + (z == 40 ? 0.5f : 0.0f);
-  const float v = m * __int_as_float((127 - 24 - z) << 23);                              // m * 2^-(24 + z)
+  const float v = m * __int_as_float((127 - 24 - z) << 23);  // m * 2^-(24 + z)
   const float e = v < 0.5f ? -log1pf(-v) : -logf(1.0f - v);
   return -logf(e);
 }
@@ -326,7 +328,7 @@ __global__ void uniform_kernel(int n, unsigned long long seed, unsigned long lon
 // the summation order for the softmax sum.
 constexpr int kFast = 256;
 constexpr int kFastWarps = kFast / 32;
-constexpr int kParts = 64;
+constexpr int kParts = 256;  // blocks per row (= kFast: the last block combines one part per thread)
 constexpr int kFastRows = 8;
 
 struct SelectPartials {
@@ -378,10 +380,32 @@ __device__ __forceinline__ bool finish_part(unsigned* done, FastReduce& r) {
   return true;
 }
 
+// Block-wide max / sum over kFast threads (fixed order: deterministic); every thread gets the result.
+__device__ __forceinline__ float fast_max(float v, FastReduce& r) {
+  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  __syncthreads();
+  if ((threadIdx.x & 31) == 0) r.f[threadIdx.x >> 5] = v;
+  __syncthreads();
+  v = r.f[0];
+  for (int w = 1; w < kFastWarps; ++w) v = fmaxf(v, r.f[w]);
+  return v;
+}
+__device__ __forceinline__ float fast_sum(float v, FastReduce& r) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  __syncthreads();
+  if ((threadIdx.x & 31) == 0) r.f[threadIdx.x >> 5] = v;
+  __syncthreads();
+  v = 0.f;
+  for (int w = 0; w < kFastWarps; ++w) v += r.f[w];
+  return v;
+}
+
+// thr (optional, per row): only tokens whose key fkey(z) >= thr[r] take part (top-k / top-p truncation)
 template <Score S>
 __global__ void __launch_bounds__(kFast) select_kernel(const float* __restrict__ in, int V, long long stride, float inv_t,
                                                        unsigned long long seed, unsigned long long counter,
-                                                       SelectPartials* __restrict__ part, std::int32_t* __restrict__ out) {
+                                                       SelectPartials* __restrict__ part, std::int32_t* __restrict__ out,
+                                                       const std::uint32_t* __restrict__ thr) {
   __shared__ FastReduce red;
   const int r = blockIdx.y, b = blockIdx.x;
   const float* row = in + r * stride;
@@ -394,8 +418,9 @@ __global__ void __launch_bounds__(kFast) select_kernel(const float* __restrict__
     if constexpr (S == Score::Logit) {
       s = row[v];
     } else if constexpr (S == Score::GumbelLogit) {
-      s = __fadd_rn(__fmul_rn(row[v], inv_t),
-                    gumbel(seed, counter, static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(v)));
+      const float z = __fmul_rn(row[v], inv_t);
+      if (thr && fkey(z) < thr[r]) continue;
+      s = __fadd_rn(z, gumbel(seed, counter, static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(v)));
     } else {
       const float p = row[v];
       if (!(p > 0.f)) continue;
@@ -454,14 +479,12 @@ __global__ void __launch_bounds__(kFast) softmax_stats_kernel(const float* __res
     part->s[r][b] = x;
   }
   if (!finish_part(&part->done[r], red)) return;
+  // one part per thread (kParts == kFast), combined by block reductions
+  const float mk = const_cast<volatile float&>(part->m[r][threadIdx.x]);
+  const float sk = const_cast<volatile float&>(part->s[r][threadIdx.x]);
+  const float zmax = fast_max(mk, red);
+  const float sum = fast_sum(mk > -CUDART_INF_F ? sk * expf(mk - zmax) : 0.f, red);
   if (threadIdx.x == 0) {
-    float zmax = -CUDART_INF_F;
-    for (int k = 0; k < kParts; ++k) zmax = fmaxf(zmax, const_cast<volatile float&>(part->m[r][k]));
-    float sum = 0.f;
-    for (int k = 0; k < kParts; ++k) {
-      const float mk = const_cast<volatile float&>(part->m[r][k]);
-      if (mk > -CUDART_INF_F) sum += const_cast<volatile float&>(part->s[r][k]) * expf(mk - zmax);
-    }
     part->zmax[r] = zmax;
     part->sum[r] = sum;
     part->done[r] = 0;
@@ -480,6 +503,251 @@ __global__ void __launch_bounds__(kFast) softmax_write_kernel(const float* __res
   for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) pr[v] = expf(__fmul_rn(row[v], inv_t) - zmax) / sum;
 }
 
+// ---- multi-block top-k / top-p: dist_kernel's selections pass by pass (one launch per 8-bit digit, the last
+// block of a row decides it), so the k-th key and the top-p boundary are the one-CTA kernel's (the top-p mass is
+// summed in fixed point, independent of the order; only the softmax sum's rounding may differ).
+struct TruncState {
+  std::uint32_t hist[kFastRows][256];
+  unsigned long long mass[kFastRows][256];
+  std::uint32_t prefix[kFastRows];
+  int remaining[kFastRows];
+  unsigned long long above[kFastRows];
+  std::uint32_t kth[kFastRows], thr[kFastRows];
+  int nocut[kFastRows];
+  float zmax[kFastRows], sum[kFastRows], kept[kFastRows];
+  float m[kFastRows][kParts], s[kFastRows][kParts];
+  unsigned done[kFastRows];
+};
+__device__ TruncState g_trunc[2];  // sample, sampling_probs
+
+// key bits above the digit at `shift` (the digits decided by earlier passes)
+__device__ __forceinline__ std::uint32_t pass_mask(int shift) { return shift == 24 ? 0u : ~((1u << (shift + 8)) - 1u); }
+
+__global__ void trunc_init_kernel(int rows, int top_k, TruncState* __restrict__ st) {
+  const int r = threadIdx.x;
+  if (r >= rows) return;
+  st->prefix[r] = 0;
+  st->remaining[r] = top_k;
+  st->above[r] = 0;
+  st->kth[r] = st->thr[r] = 0;
+  st->nocut[r] = 0;
+  st->kept[r] = 1.f;
+}
+
+// one digit of the k-th largest key (kth_key)
+__global__ void __launch_bounds__(kFast) kth_pass_kernel(const float* __restrict__ in, int V, long long stride,
+                                                         float inv_t, int shift, TruncState* __restrict__ st) {
+  __shared__ FastReduce red;
+  __shared__ unsigned h[256];
+  const int r = blockIdx.y, b = blockIdx.x;
+  const float* row = in + r * stride;
+  for (int i = threadIdx.x; i < 256; i += kFast) h[i] = 0;
+  __syncthreads();
+  const std::uint32_t prefix = st->prefix[r], mask = pass_mask(shift);
+  const int chunk = (V + kParts - 1) / kParts;
+  const int v1 = min(V, (b + 1) * chunk);
+  // most keys share the digit (similar magnitudes): accumulate runs per thread, one atomic per change of digit
+  std::uint32_t run_bin = 256, run = 0;
+  for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
+    const std::uint32_t key = fkey(__fmul_rn(row[v], inv_t));
+    if ((key & mask) != prefix) continue;
+    const std::uint32_t bin = (key >> shift) & 255u;
+    if (bin != run_bin) {
+      if (run) atomicAdd(&h[run_bin], run);
+      run_bin = bin, run = 0;
+    }
+    ++run;
+  }
+  if (run) atomicAdd(&h[run_bin], run);
+  __syncthreads();
+  for (int i = threadIdx.x; i < 256; i += kFast)
+    if (h[i]) atomicAdd(&st->hist[r][i], h[i]);
+  if (!finish_part(&st->done[r], red)) return;
+  // the row's histogram into shared memory in parallel (and cleared for the next pass), then the descent
+  for (int i = threadIdx.x; i < 256; i += kFast) {
+    h[i] = const_cast<volatile std::uint32_t&>(st->hist[r][i]);
+    st->hist[r][i] = 0;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int rem = st->remaining[r];
+    int d = 255;
+    for (; d > 0; --d) {
+      const int c = int(h[d]);
+      if (c >= rem) break;
+      rem -= c;
+    }
+    const std::uint32_t p = prefix | (static_cast<std::uint32_t>(d) << shift);
+    st->remaining[r] = rem;
+    st->prefix[r] = p;
+    if (shift == 0) st->kth[r] = st->thr[r] = p;
+    st->done[r] = 0;
+  }
+}
+
+// zmax over the row, sum of exp(z - zmax) over keys >= kth; resets the prefix for the top-p passes
+__global__ void __launch_bounds__(kFast) trunc_stats_kernel(const float* __restrict__ in, int V, long long stride,
+                                                            float inv_t, TruncState* __restrict__ st) {
+  __shared__ FastReduce red;
+  __shared__ float bmax;
+  const int r = blockIdx.y, b = blockIdx.x;
+  const float* row = in + r * stride;
+  const std::uint32_t kth = st->kth[r];
+  const int chunk = (V + kParts - 1) / kParts;
+  const int v0 = b * chunk, v1 = min(V, (b + 1) * chunk);
+  float m = -CUDART_INF_F;
+  for (int v = v0 + threadIdx.x; v < v1; v += kFast) m = fmaxf(m, __fmul_rn(row[v], inv_t));
+  for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+  if ((threadIdx.x & 31) == 0) red.f[threadIdx.x >> 5] = m;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float x = red.f[0];
+    for (int w = 1; w < kFastWarps; ++w) x = fmaxf(x, red.f[w]);
+    bmax = x;
+  }
+  __syncthreads();
+  m = bmax;
+  float s = 0.f;
+  if (m > -CUDART_INF_F)
+    for (int v = v0 + threadIdx.x; v < v1; v += kFast) {
+      const float z = __fmul_rn(row[v], inv_t);
+      if (fkey(z) >= kth) s += expf(z - m);
+    }
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+  __syncthreads();
+  if ((threadIdx.x & 31) == 0) red.f[threadIdx.x >> 5] = s;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float x = 0.f;
+    for (int w = 0; w < kFastWarps; ++w) x += red.f[w];
+    st->m[r][b] = m;
+    st->s[r][b] = x;
+  }
+  if (!finish_part(&st->done[r], red)) return;
+  const float mk = const_cast<volatile float&>(st->m[r][threadIdx.x]);
+  const float sk = const_cast<volatile float&>(st->s[r][threadIdx.x]);
+  const float zmax = fast_max(mk, red);
+  const float sum = fast_sum(mk > -CUDART_INF_F ? sk * expf(mk - zmax) : 0.f, red);
+  if (threadIdx.x == 0) {
+    st->zmax[r] = zmax;
+    st->sum[r] = sum;
+    st->prefix[r] = 0;
+    st->done[r] = 0;
+  }
+}
+
+// one digit of the top-p boundary key (top_p_key): the first key, descending, whose inclusive mass exceeds limit
+__global__ void __launch_bounds__(kFast) mass_pass_kernel(const float* __restrict__ in, int V, long long stride,
+                                                          float inv_t, int shift, unsigned long long limit,
+                                                          TruncState* __restrict__ st) {
+  __shared__ FastReduce red;
+  __shared__ unsigned long long h[256];
+  const int r = blockIdx.y, b = blockIdx.x;
+  if (st->nocut[r]) return;  // decided by an earlier pass: everything kept
+  const float* row = in + r * stride;
+  for (int i = threadIdx.x; i < 256; i += kFast) h[i] = 0;
+  __syncthreads();
+  const std::uint32_t prefix = st->prefix[r], mask = pass_mask(shift), kth = st->kth[r];
+  const float zmax = st->zmax[r], inv_sum = 1.f / st->sum[r];
+  const int chunk = (V + kParts - 1) / kParts;
+  const int v1 = min(V, (b + 1) * chunk);
+  std::uint32_t run_bin = 256;
+  unsigned long long run = 0;
+  for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
+    const float z = __fmul_rn(row[v], inv_t);
+    const std::uint32_t key = fkey(z);
+    if (key < kth || (key & mask) != prefix) continue;
+    const unsigned long long q = fixed_mass(expf(z - zmax) * inv_sum);
+    if (!q) continue;
+    const std::uint32_t bin = (key >> shift) & 255u;
+    if (bin != run_bin) {
+      if (run) atomicAdd(&h[run_bin], run);
+      run_bin = bin, run = 0;
+    }
+    run += q;
+  }
+  if (run) atomicAdd(&h[run_bin], run);
+  __syncthreads();
+  for (int i = threadIdx.x; i < 256; i += kFast)
+    if (h[i]) atomicAdd(&st->mass[r][i], h[i]);
+  if (!finish_part(&st->done[r], red)) return;
+  for (int i = threadIdx.x; i < 256; i += kFast) {
+    h[i] = const_cast<volatile unsigned long long&>(st->mass[r][i]);
+    st->mass[r][i] = 0;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    unsigned long long above = st->above[r];
+    int d = 255;
+    bool hit = false;
+    for (; d >= 0; --d) {
+      if (above + h[d] > limit) {
+        hit = true;
+        break;
+      }
+      above += h[d];
+    }
+    st->above[r] = above;
+    if (!hit) {
+      st->nocut[r] = 1;
+      st->thr[r] = kth;
+    } else {
+      const std::uint32_t p = prefix | (static_cast<std::uint32_t>(d) << shift);
+      st->prefix[r] = p;
+      if (shift == 0) st->thr[r] = p;
+    }
+    st->done[r] = 0;
+  }
+}
+
+// kept = sum over keys >= thr of exp(z - zmax) / sum, when top-p cut the row (else 1)
+__global__ void __launch_bounds__(kFast) trunc_kept_kernel(const float* __restrict__ in, int V, long long stride,
+                                                           float inv_t, TruncState* __restrict__ st) {
+  __shared__ FastReduce red;
+  const int r = blockIdx.y, b = blockIdx.x;
+  if (st->nocut[r]) return;
+  const float* row = in + r * stride;
+  const std::uint32_t thr = st->thr[r];
+  const float zmax = st->zmax[r], sum = st->sum[r];
+  const int chunk = (V + kParts - 1) / kParts;
+  const int v1 = min(V, (b + 1) * chunk);
+  float k = 0.f;
+  for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
+    const float z = __fmul_rn(row[v], inv_t);
+    if (fkey(z) >= thr) k += expf(z - zmax) / sum;
+  }
+  for (int o = 16; o > 0; o >>= 1) k += __shfl_xor_sync(0xffffffffu, k, o);
+  if ((threadIdx.x & 31) == 0) red.f[threadIdx.x >> 5] = k;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float x = 0.f;
+    for (int w = 0; w < kFastWarps; ++w) x += red.f[w];
+    st->s[r][b] = x;
+  }
+  if (!finish_part(&st->done[r], red)) return;
+  const float kept = fast_sum(const_cast<volatile float&>(st->s[r][threadIdx.x]), red);
+  if (threadIdx.x == 0) {
+    st->kept[r] = kept;
+    st->done[r] = 0;
+  }
+}
+
+__global__ void __launch_bounds__(kFast) trunc_write_kernel(const float* __restrict__ in, int V, long long stride,
+                                                            float inv_t, const TruncState* __restrict__ st,
+                                                            float* __restrict__ probs) {
+  const int r = blockIdx.y, b = blockIdx.x;
+  const float* row = in + r * stride;
+  float* pr = probs + static_cast<long long>(r) * V;
+  const std::uint32_t thr = st->thr[r];
+  const float zmax = st->zmax[r], sum = st->sum[r], kept = st->kept[r];
+  const int chunk = (V + kParts - 1) / kParts;
+  const int v1 = min(V, (b + 1) * chunk);
+  for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
+    const float z = __fmul_rn(row[v], inv_t);
+    pr[v] = fkey(z) >= thr ? (expf(z - zmax) / sum) / kept : 0.f;
+  }
+}
+
 template <class T>
 T* symbol(const T& sym) {
   void* p = nullptr;
@@ -489,9 +757,11 @@ T* symbol(const T& sym) {
 
 template <Score S>
 void launch_select(const float* in, int rows, int V, std::int64_t stride, float inv_t, unsigned long long seed,
-                   unsigned long long counter, int entry, std::int32_t* out, cudaStream_t stream) {
+                   unsigned long long counter, int entry, std::int32_t* out, cudaStream_t stream,
+                   const std::uint32_t* thr = nullptr) {
   static SelectPartials* const part = symbol(g_select[0]);
-  select_kernel<S><<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, seed, counter, part + entry, out);
+  select_kernel<S><<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, seed, counter, part + entry, out,
+                                                              thr);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -504,8 +774,29 @@ void launch_softmax(const float* in, int rows, int V, std::int64_t stride, float
   CUDA_CHECK(cudaGetLastError());
 }
 
+bool top_k_active(const SamplingParams& p, int V) { return p.top_k > 0 && p.top_k < V; }
 // the multi-block paths: up to kFastRows rows; sampling without top-k / top-p
-bool plain_sampling(const SamplingParams& p, int V) { return (p.top_k <= 0 || p.top_k >= V) && p.top_p >= 1.f; }
+bool plain_sampling(const SamplingParams& p, int V) { return !top_k_active(p, V) && p.top_p >= 1.f; }
+
+// The top-k / top-p selections of `rows` rows into g_trunc[entry]; returns it (thr per row: the lowest key kept).
+TruncState* launch_truncation(const float* in, int rows, int V, std::int64_t stride, float inv_t,
+                              const SamplingParams& p, int entry, cudaStream_t stream) {
+  static TruncState* const states = symbol(g_trunc[0]);
+  TruncState* st = states + entry;
+  const dim3 grid(kParts, rows);
+  trunc_init_kernel<<<1, 32, 0, stream>>>(rows, top_k_active(p, V) ? p.top_k : 0, st);
+  if (top_k_active(p, V))
+    for (int shift = 24; shift >= 0; shift -= 8)
+      kth_pass_kernel<<<grid, kFast, 0, stream>>>(in, V, stride, inv_t, shift, st);
+  trunc_stats_kernel<<<grid, kFast, 0, stream>>>(in, V, stride, inv_t, st);
+  if (p.top_p < 1.f) {
+    const unsigned long long limit = static_cast<unsigned long long>(static_cast<double>(p.top_p) * kMassOne);
+    for (int shift = 24; shift >= 0; shift -= 8)
+      mass_pass_kernel<<<grid, kFast, 0, stream>>>(in, V, stride, inv_t, shift, limit, st);
+  }
+  CUDA_CHECK(cudaGetLastError());
+  return st;
+}
 
 void require(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(std::string("head: ") + what);
@@ -537,6 +828,14 @@ void sampling_probs(const float* logits, int rows, int V, std::int64_t stride, c
     launch_softmax(logits, rows, V, stride, inv_t, probs, stream);
     return;
   }
+  if (rows <= kFastRows) {
+    TruncState* st = launch_truncation(logits, rows, V, stride, inv_t, params, 1, stream);
+    const dim3 grid(kParts, rows);
+    if (params.top_p < 1.f) trunc_kept_kernel<<<grid, kFast, 0, stream>>>(logits, V, stride, inv_t, st);
+    trunc_write_kernel<<<grid, kFast, 0, stream>>>(logits, V, stride, inv_t, st, probs);
+    CUDA_CHECK(cudaGetLastError());
+    return;
+  }
   dist_kernel<1><<<rows, kBlock, 0, stream>>>(logits, V, stride, inv_t, params.top_k, params.top_p, 0ull, 0ull,
                                               nullptr, probs);
   CUDA_CHECK(cudaGetLastError());
@@ -553,6 +852,12 @@ void sample(const float* logits, int rows, int V, std::int64_t stride, const Sam
   const float inv_t = 1.0f / params.temperature;
   if (rows <= kFastRows && plain_sampling(params, V)) {
     launch_select<Score::GumbelLogit>(logits, rows, V, stride, inv_t, rng.seed, rng.counter++, 1, out, stream);
+    return;
+  }
+  if (rows <= kFastRows) {
+    const TruncState* st = launch_truncation(logits, rows, V, stride, inv_t, params, 0, stream);
+    const auto* thr = reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const char*>(st) + offsetof(TruncState, thr));
+    launch_select<Score::GumbelLogit>(logits, rows, V, stride, inv_t, rng.seed, rng.counter++, 1, out, stream, thr);
     return;
   }
   dist_kernel<0><<<rows, kBlock, 0, stream>>>(logits, V, stride, inv_t, params.top_k, params.top_p, rng.seed,

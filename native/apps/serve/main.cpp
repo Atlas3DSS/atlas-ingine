@@ -45,6 +45,22 @@ int tokenizer_max_length(const std::filesystem::path& model_dir) {
   return 1 << 20;
 }
 
+// Sampling of requests that omit temperature / top_p / top_k: generation_config.json's values where present,
+// else ingine's defaults (temperature 1, no top-p, no top-k).
+ingine::model::Sampling generation_defaults(const std::filesystem::path& model_dir) {
+  ingine::model::Sampling s;
+  std::ifstream in(model_dir / "generation_config.json");
+  if (!in) return s;
+  try {
+    const auto cfg = nlohmann::json::parse(in);
+    if (auto it = cfg.find("temperature"); it != cfg.end() && it->is_number()) s.temperature = it->get<float>();
+    if (auto it = cfg.find("top_p"); it != cfg.end() && it->is_number()) s.top_p = it->get<float>();
+    if (auto it = cfg.find("top_k"); it != cfg.end() && it->is_number_integer()) s.top_k = std::max(0, it->get<int>());
+  } catch (const nlohmann::json::exception&) {
+  }
+  return s;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -52,6 +68,9 @@ int main(int argc, char** argv) {
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, fake_delay = 0.02;
+  // sampling defaults; negative: from generation_config.json
+  double temperature = -1, top_p = -1;
+  int top_k = -1;
 
   ingine::serve::ArgParser ap("ingine-serve", "OpenAI-compatible chat completions server for ingine.");
   ap.option("--model-dir", "", "checkpoint dir (tokenizer + chat template)", &model_dir, {}, true);
@@ -75,7 +94,16 @@ int main(int argc, char** argv) {
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
   ap.option("--log-level", "", "", &log_level);
+  ap.option("--temperature", "", "temperature of requests that omit it (default: generation_config.json, else 1)",
+            &temperature);
+  ap.option("--top-p", "", "top_p of requests that omit it (default: generation_config.json, else 1)", &top_p);
+  ap.option("--top-k", "", "top_k of requests that omit it, 0 = off (default: generation_config.json, else 0)",
+            &top_k);
   ap.parse(argc, argv);
+  if (temperature > 2 || top_p == 0 || top_p > 1) {
+    std::cerr << "ingine-serve: error: --temperature must be in [0, 2] and --top-p in (0, 1]\n";
+    return 2;
+  }
 
   auto& log = ingine::engine::server_log();
   if (!ingine::engine::set_log_level(log_level)) {
@@ -112,6 +140,12 @@ int main(int argc, char** argv) {
     server_options.max_queue = max_queue;
     server_options.max_model_len = max_model_len;
     server_options.model_id = model_id;
+    server_options.sampling = generation_defaults(model_dir);
+    if (temperature >= 0) server_options.sampling.temperature = float(temperature);
+    if (top_p >= 0) server_options.sampling.top_p = float(top_p);
+    if (top_k >= 0) server_options.sampling.top_k = top_k;
+    log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
+             server_options.sampling.top_p, server_options.sampling.top_k);
     ingine::serve::ChatServer server(*generator, fmt, server_options);
     if (!server.bind(host, port)) {
       log.critical("cannot bind {}:{}", host, port);

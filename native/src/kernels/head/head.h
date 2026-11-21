@@ -11,11 +11,11 @@
 // function of (seed, counter, row, index), so a seeded request is reproducible and graph replay is safe;
 // every launcher that draws randomness uses rng.counter and then increments it.
 //
-// No workspace, no host synchronisation; all outputs are device memory on `stream`. Up to 8 rows, argmax,
-// sampling without top-k / top-p, sampling_probs without them and sample_from_probs split each row over 64
-// blocks (a few microseconds at V = 200058) and combine the slices through per-entry-point partials in static
-// device memory: calls of the same entry point must not run concurrently (one stream, as the Generator uses).
-// Their draws equal the one-CTA kernels' token for token; top-k / top-p use one CTA per row.
+// No workspace, no host synchronisation; all outputs are device memory on `stream`. Up to 8 rows, every entry
+// point splits each row over 256 blocks (a few microseconds at V = 200058; top-k / top-p select their threshold
+// key digit by digit, one launch per 8-bit digit, ~25 us of GPU time per row) and combines the slices through
+// per-entry-point state in static device memory: calls of the same entry point must not run concurrently (one
+// stream, as the Generator uses). Their draws equal the one-CTA kernels' (more than 8 rows) token for token.
 #pragma once
 
 #include <cuda_runtime.h>

@@ -86,13 +86,15 @@ struct Served {
 };
 
 std::unique_ptr<Served> serve(std::string text = THINK_TEXT, double delay = 0.0, int max_queue = 4,
-                              int max_model_len = 0, FakeGenerator::Responder responder = {}) {
+                              int max_model_len = 0, FakeGenerator::Responder responder = {},
+                              ingine::model::Sampling sampling = {}) {
   auto s = std::make_unique<Served>();
   if (!responder) responder = [text](std::span<const int32_t>) { return FakeGenerator::Output(text); };
   s->gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-test", 1 << 20, responder, delay);
   ingine::serve::ServerOptions options;
   options.max_queue = max_queue;
   options.max_model_len = max_model_len;
+  options.sampling = sampling;
   s->srv = std::make_unique<ChatServer>(*s->gen, *g_fmt, options);
   if (!s->srv->bind("127.0.0.1", 0)) throw std::runtime_error("bind failed");
   s->srv->start();
@@ -441,6 +443,25 @@ void test_sampling_and_max_tokens() {
   CHECK(check_chunks(sr.body).finish == "length");
 }
 
+// ServerOptions::sampling (ingine-serve --temperature / --top-p / --top-k) fills the fields a request omits;
+// fields the request sets win.
+void test_sampling_defaults() {
+  ingine::model::Sampling defaults;
+  defaults.temperature = 0.7f;
+  defaults.top_p = 0.95f;
+  defaults.top_k = 40;
+  auto s = serve(THINK_TEXT, 0.0, 4, 0, {}, defaults);
+  chat(s->port(), {{"max_tokens", 2}});
+  auto call = s->gen->calls().back();
+  CHECK(call.sampling.temperature == 0.7f && call.sampling.top_p == 0.95f && call.sampling.top_k == 40);
+  chat(s->port(), {{"max_tokens", 2}, {"temperature", 1.0}, {"top_p", 1.0}, {"top_k", 0}});
+  call = s->gen->calls().back();
+  CHECK(call.sampling.temperature == 1.0f && call.sampling.top_p == 1.0f && call.sampling.top_k == 0);
+  chat(s->port(), {{"max_tokens", 2}, {"top_p", 0.5}});
+  call = s->gen->calls().back();
+  CHECK(call.sampling.temperature == 0.7f && call.sampling.top_p == 0.5f && call.sampling.top_k == 40);
+}
+
 void test_context_limit() {
   const int n = int(render(MSGS).ids.size());
   {
@@ -648,6 +669,7 @@ int main() {
       {"tool_round_trip_prompt", test_tool_round_trip_prompt},
       {"thinking_controls", test_thinking_controls},
       {"sampling_and_max_tokens", test_sampling_and_max_tokens},
+      {"sampling_defaults", test_sampling_defaults},
       {"context_limit", test_context_limit},
       {"stop_strings_cancel_generation[False]", [] { test_stop_strings_cancel_generation(false); }},
       {"stop_strings_cancel_generation[True]", [] { test_stop_strings_cancel_generation(true); }},

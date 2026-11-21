@@ -228,6 +228,71 @@ bool test_fast_paths(Rng& rng) {
 }
 
 // Draws of the multi-block paths over the full vocabulary follow engine._probs (T = 1, no top-k / top-p).
+// top-k / top-p through the multi-block passes (rows <= 8) against the one-CTA kernel (9 rows): the same
+// draws token for token (same seed and counter) and the same probabilities up to the softmax sum's rounding;
+// plus the time per call.
+bool test_fast_truncation(Rng& rng) {
+  const int rows = 9;
+  std::vector<float> l = randn(rng, size_t(rows) * V, 3.0);
+  for (int r = 0; r < rows; ++r)
+    for (int i = 0; i < 300; ++i) l[size_t(r) * V + rng.next() % V] = float(8.0 + 2.0 * rng.normal());
+  DeviceArray<float> dl(l), p9(size_t(rows) * V), p8(size_t(8) * V);
+  DeviceArray<int> s9(rows), s8(8);
+  bool ok = true;
+  for (const head::SamplingParams p : {head::SamplingParams{0.7f, 50, 1.0f}, head::SamplingParams{1.0f, 0, 0.9f},
+                                       head::SamplingParams{1.3f, 1000, 0.95f}, head::SamplingParams{1.0f, 40, 0.8f},
+                                       head::SamplingParams{1.0f, 1, 1.0f}}) {
+    int same = 0;
+    for (int c = 0; c < 20; ++c) {
+      head::SamplerRng r1{5, std::uint64_t(c)}, r2{5, std::uint64_t(c)};
+      head::sample(dl.get(), rows, V, V, p, r1, s9.get(), g_stream);
+      head::sample(dl.get(), 8, V, V, p, r2, s8.get(), g_stream);
+      sync();
+      const auto A = s9.download(), B = s8.download();
+      for (int r = 0; r < 8; ++r) same += A[r] == B[r];
+    }
+    head::sampling_probs(dl.get(), rows, V, V, p, p9.get(), g_stream);
+    head::sampling_probs(dl.get(), 8, V, V, p, p8.get(), g_stream);
+    sync();
+    const auto P9 = p9.download(), P8 = p8.download();
+    double rel = 0;
+    size_t support = 0;
+    for (size_t i = 0; i < P8.size(); ++i) {
+      rel = std::max(rel, std::fabs(double(P8[i]) - P9[i]) / std::max(double(P9[i]), 1e-30));
+      support += (P8[i] > 0) != (P9[i] > 0);
+    }
+    const bool pass = same == 160 && rel < 1e-5 && support == 0;
+    std::printf("%s multi-block top-k/top-p T=%.1f k=%d p=%.2f: %d/160 draws equal the one-CTA kernel, probs rel diff "
+                "%.1e, support diffs %zu\n",
+                pass ? "PASS" : "FAIL", p.temperature, p.top_k, p.top_p, same, rel, support);
+    ok &= pass;
+  }
+  cudaEvent_t e0, e1;
+  INGINE_TEST_CUDA(cudaEventCreate(&e0));
+  INGINE_TEST_CUDA(cudaEventCreate(&e1));
+  auto time_us = [&](auto&& call) {
+    for (int i = 0; i < 10; ++i) call();
+    INGINE_TEST_CUDA(cudaEventRecord(e0, g_stream));
+    for (int i = 0; i < 100; ++i) call();
+    INGINE_TEST_CUDA(cudaEventRecord(e1, g_stream));
+    INGINE_TEST_CUDA(cudaEventSynchronize(e1));
+    float ms = 0;
+    INGINE_TEST_CUDA(cudaEventElapsedTime(&ms, e0, e1));
+    return 1000.0 * ms / 100;
+  };
+  head::SamplerRng rt{1, 0};
+  const head::SamplingParams topp{1.0f, 0, 0.95f}, both{1.0f, 50, 0.95f};
+  const double t1 = time_us([&] { head::sample(dl.get(), 1, V, V, topp, rt, s8.get(), g_stream); });
+  const double t2 = time_us([&] { head::sample(dl.get(), 1, V, V, both, rt, s8.get(), g_stream); });
+  const double t3 = time_us([&] { head::sampling_probs(dl.get(), 8, V, V, topp, p8.get(), g_stream); });
+  INGINE_TEST_CUDA(cudaEventDestroy(e0));
+  INGINE_TEST_CUDA(cudaEventDestroy(e1));
+  std::printf("INFO us per call (multi-block truncation): sample top-p 1 row %.1f, top-k + top-p 1 row %.1f, "
+              "sampling_probs top-p 8 rows %.1f\n",
+              t1, t2, t3);
+  return ok;
+}
+
 bool test_fast_distribution(Rng& rng) {
   std::vector<float> l = randn(rng, V, 1.0);
   const int heads[6] = {11, 50000, 100001, 150000, 199000, 200057};
@@ -278,6 +343,7 @@ int main() {
   ok &= test_uniform();
   ok &= test_fast_paths(rng);
   ok &= test_fast_distribution(rng);
+  ok &= test_fast_truncation(rng);
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

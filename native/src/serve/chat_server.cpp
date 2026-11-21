@@ -142,6 +142,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
     : fmt_(fmt),
       model_id_(options.model_id.empty() ? generator.model_id() : options.model_id),
       max_model_len_(options.max_model_len ? options.max_model_len : generator.max_model_len()),
+      sampling_defaults_(options.sampling),
       created_(std::time(nullptr)),
       scheduler_(generator, fmt.stop_ids(), options.max_queue) {
   // A pool thread per connection, as ThreadingHTTPServer: the running request, the waiting ones, the ones
@@ -210,7 +211,7 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
       return;
     }
     if (!body.is_object()) throw BadRequest("request body must be a JSON object");
-    request = parse_request(body, fmt_, max_model_len_);
+    request = parse_request(body, fmt_, max_model_len_, sampling_defaults_);
   } catch (const BadRequest& e) {
     send_error(res, e.status, e.what(), e.param);
     return;
