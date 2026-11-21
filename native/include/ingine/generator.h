@@ -30,11 +30,13 @@ enum class Reuse {
   None,        // empty state, the whole prompt prefilled
   Extend,      // the prompt extends the tokens in the state (previous prompt + processed generated tokens)
   Checkpoint,  // restored the checkpoint taken after the previous prompt's prefill (a prefix of this prompt)
+  Parked,      // restored a parked conversation's checkpoint (a prefix of this prompt; RuntimeOptions::park_mb)
 };
 inline const char* to_string(Reuse reuse) {
   switch (reuse) {
     case Reuse::Extend: return "extend";
     case Reuse::Checkpoint: return "checkpoint";
+    case Reuse::Parked: return "parked";
     default: return "none";
   }
 }
@@ -62,6 +64,10 @@ struct RuntimeOptions {
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
   float spec_threshold = 0.8f;
+  // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
+  // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
+  // min(3072, free memory after start-up - 4096), at least 0.
+  int park_mb = -1;
 };
 
 class Generator {

@@ -220,6 +220,36 @@ int main() {
       }
     }
 
+    // conversation parking: the live regions of a checkpoint (with some context tokens) copied out, another
+    // conversation (other context tokens, in another order) saves its checkpoint into the same buffer, the
+    // parked regions copied back and adopted with their context tokens: the same draft as at the save
+    {
+      DeviceArray<uint8_t> ckpt(d.checkpoint_bytes()), parked(d.checkpoint_bytes());
+      const std::vector<int32_t> mine(outside.begin(), outside.begin() + outside.size() / 2),
+          theirs(outside.rbegin(), outside.rend());
+      auto move = [&](uint8_t* to, const uint8_t* from) {
+        for (const model::Drafter::Region& r : d.checkpoint_regions(rows))
+          INGINE_TEST_CUDA(cudaMemcpyAsync(to + r.offset, from + r.offset, r.bytes, cudaMemcpyDeviceToDevice, stream));
+      };
+      d.reset();
+      commit_b();
+      d.note_tokens(mine);
+      const DraftOut ref = fetch(d.draft(anchor, rows, 0.f), stream);
+      d.save_checkpoint(ckpt.get());
+      move(parked.get(), ckpt.get());
+      const std::vector<int32_t> context = d.checkpoint_context();
+      d.reset();
+      commit_a();
+      d.note_tokens(theirs);
+      d.save_checkpoint(ckpt.get());
+      fetch(d.draft(anchor, rows, 0.f), stream);
+      move(ckpt.get(), parked.get());
+      d.adopt_checkpoint(ckpt.get(), rows, context);
+      d.restore_checkpoint(ckpt.get());
+      expect(context == mine && d.length() == rows && fetch(d.draft(anchor, rows, 0.f), stream) == ref,
+             "adopted parked checkpoint (other context tokens meanwhile) == draft at the save");
+    }
+
     // the shortlist head: drafts come from the ranked tokens and the noted context tokens only
     {
       auto allowed_only = [&](const DraftOut& o, const std::vector<std::uint8_t>& ok) {

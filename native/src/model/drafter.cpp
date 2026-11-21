@@ -356,6 +356,19 @@ std::size_t Drafter::checkpoint_bytes() const {
          2 * std::size_t(ctx_) * kd::KV_DIM * 2;
 }
 
+std::array<Drafter::Region, 3> Drafter::checkpoint_regions(int length) const {
+  const std::size_t head = 4 * LOCAL_BYTES + 2 * kd::WINDOW * sizeof(std::int32_t) + std::size_t(H) * 2;
+  const std::size_t live = std::size_t(std::min(std::max(length, 0), ctx_)) * kd::KV_DIM * 2;
+  return {Region{0, head}, Region{head, live}, Region{head + std::size_t(ctx_) * kd::KV_DIM * 2, live}};
+}
+
+void Drafter::adopt_checkpoint(const void* src, int length, std::span<const std::int32_t> context) {
+  checkpoint_ = src;
+  checkpoint_length_ = length;
+  checkpoint_clobbered_ = true;
+  checkpoint_extra_.assign(context.begin(), context.end());
+}
+
 void Drafter::save_checkpoint(void* dst) {
   auto* d = static_cast<std::byte*>(dst);
   auto copy = [&](std::size_t off, const void* src, std::size_t bytes) {

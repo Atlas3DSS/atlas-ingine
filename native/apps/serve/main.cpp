@@ -65,7 +65,7 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0;
+  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -88,6 +88,10 @@ int main(int argc, char** argv) {
           &kv_fp8);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
+  ap.option("--park-mb", "",
+            "device memory (MiB) for conversations displaced by another one, released when memory runs short, "
+            "0 = off (default: min(3072, free memory after start-up - 4096))",
+            &park_mb);
   ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
   ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
@@ -129,6 +133,7 @@ int main(int argc, char** argv) {
       options.kv_fp8 = kv_fp8;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
+      options.park_mb = park_mb;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

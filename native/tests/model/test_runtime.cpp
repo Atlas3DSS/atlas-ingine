@@ -429,6 +429,40 @@ bool run(bool kv_fp8) {
     ok &= report(copy_state(rt) == saved_state, buf + tag);
   }
 
+  // 8b. conversation parking: A decodes 1100 positions, parks (checkpoint + full rows [0, 1100)); B starts
+  //     over and decodes 1500 positions (every full row A used and the rings overwritten); A restored decodes
+  //     on with the same logits, bit for bit, as A never displaced
+  {
+    const int n = 1100, more = 20;
+    auto run_a = [&](int from, int to, std::vector<float>* logits) {
+      for (int i = from; i < to; ++i) {
+        rt.decode_logits(toks[i % 8], i);
+        if (logits) {
+          const auto row = logits_row(rt, 1, 0);
+          logits->insert(logits->end(), row.begin(), row.end());
+        }
+      }
+    };
+    reset_state(rt.state(), s);
+    run_a(0, n, nullptr);
+    std::vector<float> want, got;
+    run_a(n, n + more, &want);
+    reset_state(rt.state(), s);
+    run_a(0, n, nullptr);
+    DeviceBuffer ck(rt.checkpoint_bytes()), rows(rt.full_rows_bytes(n));
+    rt.save_checkpoint(ck.p);
+    rt.save_full_rows(rows.p, n);
+    reset_state(rt.state(), s);
+    for (int i = 0; i < 1500; ++i) rt.decode_logits(toks[(3 * i + 1) % 8], i);
+    rt.restore_checkpoint(ck.p);
+    rt.restore_full_rows(rows.p, n);
+    run_a(n, n + more, &got);
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "parked conversation restores bit for bit after another one (%.1f KB per position)",
+                  double(rt.full_rows_bytes(n)) / n / 1e3);
+    ok &= report(!want.empty() && got == want, buf + tag);
+  }
+
   // 9. device width selection: verify_select (confidences -> lead -> width, drafts into token[1..7]) for
   //    leads 0, 1, 2, 4, 7; width_select of a width that is not a verify width runs no branch; verify_publish
   //    writes the host record

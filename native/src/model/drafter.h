@@ -104,6 +104,18 @@ class Drafter {
   void save_checkpoint(void* dst);
   void restore_checkpoint(const void* src);
 
+  // Conversation parking: the bytes of a checkpoint of length L that hold data, as {offset, bytes} regions of
+  // its checkpoint_bytes() (the rest is unused), and the context tokens of the last save (shortlist rows, in
+  // row order). adopt_checkpoint(src, L, context) declares that `src` holds a checkpoint of length L with
+  // these context tokens, put there by the caller (its regions copied back from a parked copy of an earlier
+  // save), so the next restore_checkpoint(src) restores all of it, context rows in the same order.
+  struct Region {
+    std::size_t offset, bytes;
+  };
+  std::array<Region, 3> checkpoint_regions(int length) const;
+  const std::vector<std::int32_t>& checkpoint_context() const { return checkpoint_extra_; }
+  void adopt_checkpoint(const void* src, int length, std::span<const std::int32_t> context);
+
   int vocab() const { return V_; }
 
   // Device scratch of the acceptance step (engine._accept), owned here so it is allocated once.
