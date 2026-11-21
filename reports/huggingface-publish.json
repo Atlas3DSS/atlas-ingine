@@ -1,22 +1,22 @@
 {
  "repo": "satellitedown/Inkling-2-Mini-abliterated-ingine",
- "revision": "6e823ba0031071d549e4973ec8caf86873cf60db",
+ "revision": "afd44de1d9cb5da68f1c251ca4f198e0517c72e0",
  "files": {
   "LICENSE": {
    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
    "size": 11357
   },
   "NOTICE": {
-   "sha256": "913090d214ecee2c5eebf9858735fb26cc04db516229f7abc55409c91dc6e494",
-   "size": 3136
+   "sha256": "9239466ee07825a8449ad24eba94a3f1483725008770df9781ecfe5c79bb7329",
+   "size": 5144
   },
   "README.md": {
-   "sha256": "dac772f899be8a3f68f981d294b607744994bcf449c00e9e9ea74b38041c3776",
-   "size": 11386
+   "sha256": "afa596023818ccab9eb87dfac06410a601153f518d8d77c67b6f3f16b7cbfd2e",
+   "size": 7455
   },
   "SHA256SUMS": {
-   "sha256": "90cf2a00e4491244a4d0e4d0f3da5c294abae10ef5cc74090d89089016961a9e",
-   "size": 2961
+   "sha256": "1580d3006d1fe72fa95b8eba2497541ccb400bd111887f7a75b2da1c5d40abd1",
+   "size": 3283
   },
   "abliteration/ablate.py": {
    "sha256": "3cbf96228303d89ee42817cb4e3b8026e1abe159374793df97a3630602586b17",
@@ -27,12 +27,16 @@
    "size": 11342
   },
   "abliteration/eval.sh": {
-   "sha256": "faacea3610971ee7f4970fb922a4a6c85deadf346094a5db0ad5813cb1f6e661",
-   "size": 2147
+   "sha256": "6b38dfec0224c954d5c60e228db0d4b0e6bd030545655852c3e84917079d63c3",
+   "size": 2927
   },
   "abliteration/inkling_ref.py": {
    "sha256": "c1aaed1bb2773dde784f7c6d37cd716f0837088f3e177d5c49c657a861909832",
    "size": 10310
+  },
+  "abliteration/reasoning_eval.py": {
+   "sha256": "3cfcdc33e7568a94169ca69e6fafb9fd2de6e5e58dd18476107f8fca1bef6b62",
+   "size": 7842
   },
   "abliteration/refusal_eval.py": {
    "sha256": "1bf36ffc8d5334b4ff345e153c3304be7589a0f464b3607386ecbd876bfd44d7",
@@ -43,28 +47,36 @@
    "size": 252
   },
   "abliteration/results/capability-abliterated.json": {
-   "sha256": "53dd9629773c77910cf9cd6a88d36756c2f149f867701eca79c6caca54764f06",
-   "size": 7054
+   "sha256": "cf10afe708378f1526a41572e4bcad9e47535f2352581dba4e4b3f07c1345bfc",
+   "size": 7066
   },
   "abliteration/results/capability-original.json": {
-   "sha256": "77636b404aa4a8173a492c527689235c40298772d1eaff8dea315fd5a81fb858",
-   "size": 7056
+   "sha256": "0884277e1d3029316b95135d9c9f392e1c817eac7feedc2b7d2664d60757a8a9",
+   "size": 7061
+  },
+  "abliteration/results/reasoning-abliterated.json": {
+   "sha256": "54a71731af5dd596dfcf57146a207641128726f392fdc788465cc72c5b9ad15f",
+   "size": 28325
+  },
+  "abliteration/results/reasoning-original.json": {
+   "sha256": "2ca2244f09d1632263d23d513d265f60640a09b2e45efd16e1b794002fff515a",
+   "size": 28319
   },
   "abliteration/results/refusals-abliterated-thinking.json": {
-   "sha256": "c31bbb03cd2800cc2ccc30daf23e6b6c2b36d13c563f99fab8fb474283fbf9b4",
-   "size": 58990
+   "sha256": "35488082fcc594e9d714cbe5c857d7073fd10c52325213f1115f939d08c0ba72",
+   "size": 59027
   },
   "abliteration/results/refusals-abliterated.json": {
-   "sha256": "f7347b1da5efee1601701753525d725f55331f84a285a290f371b6320b54ff81",
-   "size": 39215
+   "sha256": "6d7f0359ae59ffaea7a29239e1cfa2c32808aff3caa71e6c964fe36abdd208ec",
+   "size": 38782
   },
   "abliteration/results/refusals-original-thinking.json": {
-   "sha256": "a423d58c69ccca2cdb83ce44d9b6e39bb23ba2f4077b56ea2cdc75c404fdff13",
-   "size": 50796
+   "sha256": "c612028adf88a4c2ab8a0ef9e2772f7f4e693ea4ecb7b6e4f33305b33ab8f41b",
+   "size": 51173
   },
   "abliteration/results/refusals-original.json": {
-   "sha256": "34809638d06bbf38f6c7da167da06180d1d5a9ab6a132c2e8e072d9140334588",
-   "size": 36888
+   "sha256": "e652ee2b5ea22eb709f48c719d7850f08055766cfaf374a182f74b3bbaabd4c4",
+   "size": 38199
   },
   "abliteration/results/verify-abliterated.json": {
    "sha256": "f478f62433e9e94f3d32db9f2e77eacb91dbdfb1ba8b7950fad94aef775db1ef",
