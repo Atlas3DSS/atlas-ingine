@@ -266,9 +266,15 @@ __global__ void __launch_bounds__(ROW_T) gate_apply_kernel(const float* __restri
 
 // ---- misc
 
-__global__ void widen_kernel(const int32_t* __restrict__ in, int T, int64_t* __restrict__ out) {
+__global__ void widen_kernel(const int32_t* __restrict__ in, int T, int64_t* __restrict__ out, int32_t negative_as) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < T) out[i] = in[i];
+  if (i < T) out[i] = in[i] < 0 ? negative_as : in[i];
+}
+
+__global__ void __launch_bounds__(ROW_T) put_rows_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst) {
+  const size_t off = size_t(blockIdx.x) * H + threadIdx.x * 4;
+  const uint16_t* s = src + off;
+  *reinterpret_cast<float4*>(dst + off) = make_float4(bf2f(s[0]), bf2f(s[1]), bf2f(s[2]), bf2f(s[3]));
 }
 
 __global__ void __launch_bounds__(ROW_T) tap_kernel(const float* __restrict__ x, uint16_t* __restrict__ out,
@@ -352,8 +358,12 @@ void gate_apply(const float* h, const float* msg, const float* f, const float* g
   gate_apply_kernel<<<T, ROW_T, 0, stream>>>(h, msg, f, g, norm_w, reinterpret_cast<uint16_t*>(out));
 }
 
-void widen_ids(const int32_t* in, int T, int64_t* out, cudaStream_t stream) {
-  widen_kernel<<<(T + 255) / 256, 256, 0, stream>>>(in, T, out);
+void widen_ids(const int32_t* in, int T, int64_t* out, int32_t negative_as, cudaStream_t stream) {
+  widen_kernel<<<(T + 255) / 256, 256, 0, stream>>>(in, T, out, negative_as);
+}
+
+void put_rows(const __nv_bfloat16* src, int count, float* dst, cudaStream_t stream) {
+  if (count > 0) put_rows_kernel<<<count, ROW_T, 0, stream>>>(reinterpret_cast<const uint16_t*>(src), dst);
 }
 
 void store_tap(const float* x, int T, __nv_bfloat16* out, int64_t out_stride, cudaStream_t stream) {

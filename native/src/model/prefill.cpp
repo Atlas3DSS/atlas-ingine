@@ -10,6 +10,7 @@
 #include "model/prefill.h"
 
 #include "core/device.h"
+#include "ingine/generator.h"
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
 
@@ -102,7 +103,8 @@ const float* const* Prefiller::block_table(const std::vector<const float*>& bloc
   return static_cast<const float* const*>(it->second.p);
 }
 
-void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps) {
+void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
+                    std::span<const EmbedRows> rows) {
   if (T < 1 || T > max_chunk_) throw std::invalid_argument("Prefiller::run: T outside 1..max_chunk");
   if (pos0 < 0 || pos0 + T > st.max_ctx)
     throw std::invalid_argument("context " + std::to_string(pos0 + T) + " exceeds max_ctx " +
@@ -158,8 +160,14 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     }
   };
 
-  pk::widen_ids(tokens, T, ids_, s);
+  pk::widen_ids(tokens, T, ids_, IMAGE_PLACEHOLDER_ID, s);
   dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
+  // image tokens: the vision tower's rows take the place of the placeholder's embedding (model.forward's
+  // masked_scatter into the normed embeddings); every later read of the embedding block sees them
+  for (const EmbedRows& r : rows) {
+    if (r.row < 0 || r.count < 0 || r.row + r.count > T) throw std::invalid_argument("Prefiller::run: embedding rows outside the chunk");
+    pk::put_rows(r.src, r.count, B0_ + std::size_t(r.row) * H, s);
+  }
   int prev_v = -1;
   int tap = 0;
 

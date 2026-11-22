@@ -23,3 +23,9 @@ if(TARGET ingine-validate)
   set_tests_properties(model_parity model_parity_generate model_parity_spec model_path model_path_spec PROPERTIES
     LABELS "gpu;model" RESOURCE_LOCK gpu TIMEOUT 3600)
 endif()
+# image input on the full model: colours and text of images, prompt caches with images, an image over several
+# prefill chunks (~22 GB of GPU memory)
+if(TARGET ingine_serve AND TARGET ingine_kernels_vision)
+  ingine_add_test(NAME model_vision SOURCES test_vision_generate.cpp LIBS ingine_model ingine_serve
+                  LABELS vision GPU MODEL TIMEOUT 900)
+endif()

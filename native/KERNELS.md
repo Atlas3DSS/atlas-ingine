@@ -159,3 +159,54 @@ update + attention residual + RMS norm.
 
 FP8 option (all GEMVs above): `fp8_rows(w_bf16) -> (w_fp8, scale)` with `scale[r] = max|w_r| / 448`; the
 serving profile uses it (`--dense-fp8`).
+
+## Area `vision` (image tower)
+
+Not part of the decode step: `model::VisionEncoder` runs these once per image, before the prefill chunk that
+holds the image's tokens. Reference: transformers `Inkling2ImageProcessor` and `Inkling2VisionModel`
+(`tools/vision_ref.py`; its `--check-spec` implements this section in NumPy and compares it with transformers).
+Matrix products are `kernels::prefill::Gemm` (BF16 operands, FP32 accumulation); the kernels of this area are
+the elementwise work between them (`src/kernels/vision/vision.h`).
+
+Pixels. RGB bytes `[H, W, 3]`; transparency is composited before (`src/image`): `(c * a + bg * (255 - a) + 127)
+// 255` with `bg = 204` where `(y // 8 + x // 8)` is even, else `153`. No resizing. The image is padded right
+and bottom to whole 40x40 tiles with the value -1 (on the 0-255 scale), then `x = (v - 127.5) / 127.5`.
+
+Tokens. `rows x cols` tiles (`ceil(H/40)`, `ceil(W/40)`) in raster order, one language-model token each. Tile
+`t` owns patches `4t .. 4t+3`: its (0,0), (0,1), (1,0), (1,1) quadrants of 20x20 pixels, each flattened
+`(y, x, channel)` to 1200 values. The tower's sequence is the class token followed by the `4 rows cols` patches
+(`S = 1 + 4 rows cols`); buffers pad `S` to a multiple of 64 (`Sp`), and no valid row reads a padding row.
+
+* `patchify`: `out[p] = bf16(x)` of patch `p` (bf16 `[Sp, 1200]`).
+* Patch embedding: GEMM with `patch_embedding.weight` `[1024, 1200]` (no bias).
+* `embed_assemble`: `h[0] = class_embedding + cls_position_embedding`; `h[1 + p] = patch[p] + pos(p)`, where
+  `pos` resamples the learned `[32, 32, 1024]` table bilinearly to the `2 rows x 2 cols` patch grid at the
+  patch's row and column: `src = (i + 0.5) * 32 / size - 0.5`, taps `floor(src)` and `floor(src) + 1` clamped
+  to `[0, 31]`, weights `1 - frac` and `frac`, per axis (FP32 weights, as the reference).
+* `layernorm` (`ln_pre`): `(x - mean) / sqrt(var + 1e-5) * w + b` over the 1024 columns; `h` stays FP32.
+
+23 layers, pre-LayerNorm with layer scale:
+
+* `x = bf16(layernorm(h, ln_1))`; one GEMM with the stacked `[q; k; v]` weights `[3072, 1024]`.
+* `qkv_post`: adds the biases; turns `q` and `k` by the token's 2-D rotary angles: 16 heads of 64, pair `j < 16`
+  by `(col + 1) * f_j`, pair `16 + j` by `(row + 1) * f_j`, `f_j = 10000^(-2j/32)`, the class token at (0, 0),
+  `(a, b) -> (a cos - b sin, b cos + a sin)`; writes `q`, `k` bf16 `[16, Sp, 64]` and `v` transposed bf16
+  `[16, 64, Sp]`.
+* Attention, full within the image: per head and chunk of queries, GEMM `q k^T` (FP32 scores), `softmax_rows`
+  (`softmax(scores / 8)` over the `S` valid keys in FP32, rounded to BF16, zeros for padding keys), GEMM with
+  `v^T` (bf16 `[Sp, 1024]`, heads side by side).
+* `out_proj` GEMM; `bias_scale_residual`: `h += ls_1 * (y + bias)`.
+* `x = bf16(layernorm(h, ln_2))`; `c_fc` GEMM `[4096, 1024]`; `bias_act`: `bf16(gelu(y + bias))`, GELU exact
+  (`x * Phi(x)`); `c_proj` GEMM; `h += ls_2 * (y + bias)`.
+
+There is no final norm. Projector: `merge_rows` drops the class token and places each tile's four patch states
+side by side (bf16 `[N, 4096]`, contiguous by the token order above); `proj_in` GEMM `[4096, 4096]` (no bias),
+exact GELU, `proj_out` GEMM `[2304, 4096]` (no bias) into BF16: one row per image token.
+
+In the language model these rows replace the rows of the embedding block at the image's tokens
+(`prefill::put_rows`, after `dense::embed`): the reference scatters them into the normed embeddings, so they
+get no embedding norm, and they are BF16 values like the embedding rows.
+
+Rounding points: the BF16 GEMM operands (pixels, LayerNorm outputs, `q`/`k`/`v`, attention probabilities and
+outputs, GELU outputs, merger rows); everything else is FP32. The reference in BF16 rounds the residual stream
+as well.

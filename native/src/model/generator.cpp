@@ -13,11 +13,13 @@
 #include "model/prefill.h"
 #include "model/runtime.h"
 #include "model/spec.h"
+#include "model/vision.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <deque>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -51,6 +53,8 @@ class EngineGenerator final : public Generator {
 
   int max_model_len() const override { return options_.max_ctx; }
 
+  bool supports_images() const override { return vision_ != nullptr; }
+
  private:
   EngineGenerator(const RuntimeOptions& options, std::unique_ptr<Runtime> runtime)
       : options_(options),
@@ -72,6 +76,8 @@ class EngineGenerator final : public Generator {
     checkpoint_drafter_ = carved(rt_.checkpoint_bytes());
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
     checkpoint_ = DeviceBuffer(checkpoint_logits_ + logits_.bytes);
+    // the vision tower's weights are resident: loaded before the park budget below is measured
+    if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
     if (options.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
       std::size_t free = 0, total = 0;
@@ -88,8 +94,16 @@ class EngineGenerator final : public Generator {
   GenerateStats generate(std::span<const std::int32_t> prompt, int max_new_tokens, const Sampling& sampling,
                          std::span<const std::int32_t> stop_ids,
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
+    return generate(Prompt{prompt, {}}, max_new_tokens, sampling, stop_ids, on_tokens);
+  }
+
+  GenerateStats generate(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
+                         std::span<const std::int32_t> stop_ids,
+                         const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
+    const std::span<const std::int32_t> prompt = full_prompt.ids;
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     const int n = int(prompt.size());
+    const int image_tokens = check_images(full_prompt);
     if (!sampling.forced.empty()) max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
     // a verify call writes up to max(verify widths) positions
     const int reserve = drafter_ ? *std::max_element(rt_.verify_widths().begin(), rt_.verify_widths().end()) : 0;
@@ -106,8 +120,9 @@ class EngineGenerator final : public Generator {
 
     auto t = std::chrono::steady_clock::now();
     try {
-      prefill(prompt, stats);
+      prefill(prompt, full_prompt.images, stats);
       stats.prompt_tokens = n;
+      stats.image_tokens = image_tokens;
       if (spec_) {
         std::int32_t token = sample(static_cast<const float*>(logits_.p), sampling, rng);
         if (!sampling.forced.empty()) token = sampling.forced[0];
@@ -136,6 +151,34 @@ class EngineGenerator final : public Generator {
   }
 
  private:
+  // The images of a prompt lie inside it, in order and without overlap, and cover exactly its negative ids
+  // (an image token's id; anything else negative would index outside the embedding table). Returns their tokens.
+  int check_images(const Prompt& prompt) const {
+    if (!prompt.images.empty() && !vision_) {
+      throw std::invalid_argument("the prompt has images but the vision tower is not loaded (RuntimeOptions::vision)");
+    }
+    const std::int64_t n = std::int64_t(prompt.ids.size());
+    std::int64_t end = 0, tokens = 0;
+    for (const PromptImage& image : prompt.images) {
+      if (!image.rgb || image.height < 1 || image.width < 1 ||
+          image.rgb->size() != std::size_t(image.height) * std::size_t(image.width) * 3) {
+        throw std::invalid_argument("a prompt image has no pixels or pixels of another size");
+      }
+      if (image.pos < end || std::int64_t(image.pos) + image.tokens() > n) {
+        throw std::invalid_argument("the prompt's images overlap, are out of order or lie outside the prompt");
+      }
+      end = std::int64_t(image.pos) + image.tokens();
+      tokens += image.tokens();
+    }
+    const std::int64_t negative = std::count_if(prompt.ids.begin(), prompt.ids.end(), [](std::int32_t id) { return id < 0; });
+    bool covered = negative == tokens;
+    for (const PromptImage& image : prompt.images) {
+      for (int k = 0; covered && k < image.tokens(); ++k) covered = prompt.ids[std::size_t(image.pos + k)] < 0;
+    }
+    if (!covered) throw std::invalid_argument("negative token ids of the prompt are not exactly its image tokens");
+    return int(tokens);
+  }
+
   // After a failure anywhere in a request the device state may be ahead of or behind tokens_in_state_ (a step
   // in flight, a partial prefill, a round between launch and bookkeeping): wait for the stream and forget
   // everything reusable, so the next request starts from an empty state.
@@ -209,7 +252,12 @@ class EngineGenerator final : public Generator {
   //   live conversation, restore the parked one's checkpoint and prefill the rest.
   // * None: park the live conversation, reset and prefill everything.
   // After a prefill the checkpoint moves to the end of `ids`.
-  void prefill(std::span<const std::int32_t> ids, GenerateStats& stats) {
+  //
+  // Images: an image token's id is a function of the image's content, so the comparisons above tell images
+  // apart. The vision tower encodes an image when the first chunk that holds some of its tokens is reached
+  // (images inside the reused prefix are not encoded again), and the Prefiller writes its rows over the
+  // embeddings of its tokens; an image may span chunks.
+  void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, GenerateStats& stats) {
     const std::vector<std::int32_t>& prev = tokens_in_state_;
     const std::size_t n = ids.size();
     const bool drafter_in_step = !drafter_ || drafter_->length() == int(prev.size());  // else a row is missing
@@ -246,19 +294,52 @@ class EngineGenerator final : public Generator {
     }
     st.length = int(start);  // decode steps advance the state without its host-side length
     const std::size_t chunk = std::size_t(options_.prefill_chunk);
+    struct Encoded {
+      const PromptImage* image;
+      DeviceBuffer rows;  // bf16 [>= tokens, HIDDEN]
+    };
+    std::deque<Encoded> encoded;  // images whose rows the chunks still need (or were queued to read)
+    std::size_t next_image = 0;
+    while (next_image < images.size() &&
+           std::size_t(images[next_image].pos) + std::size_t(images[next_image].tokens()) <= start) {
+      ++next_image;  // inside the reused prefix
+    }
+    std::vector<EmbedRows> rows;
     for (std::size_t s = start; s < n; s += chunk) {
       const int T = int(std::min(chunk, n - s));
+      for (; next_image < images.size() && std::size_t(images[next_image].pos) < s + std::size_t(T); ++next_image) {
+        const PromptImage& image = images[next_image];
+        const auto t = std::chrono::steady_clock::now();
+        DeviceBuffer out = vision_->encode(image.rgb->data(), image.height, image.width);
+        // encode() returns with the stream idle: the rows of images that ended before this chunk have been read
+        while (!encoded.empty() && std::size_t(encoded.front().image->pos + encoded.front().image->tokens()) <= s) {
+          encoded.pop_front();
+        }
+        encoded.push_back(Encoded{&image, std::move(out)});
+        stats.vision_seconds += seconds_since(t);
+        ++stats.images_encoded;
+      }
+      rows.clear();
+      for (const Encoded& e : encoded) {
+        const std::int64_t first = std::max<std::int64_t>(e.image->pos, std::int64_t(s));
+        const std::int64_t last = std::min<std::int64_t>(std::int64_t(e.image->pos) + e.image->tokens(), std::int64_t(s) + T);
+        if (first < last) {
+          rows.push_back(EmbedRows{int(first - std::int64_t(s)), int(last - first),
+                                   static_cast<const __nv_bfloat16*>(e.rows.p) + std::size_t(first - e.image->pos) * HIDDEN});
+        }
+      }
       CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, ids.data() + s, std::size_t(T) * sizeof(std::int32_t),
                                  cudaMemcpyHostToDevice, stream));
       Tensor taps;
       if (drafter_) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
-                     drafter_ ? &taps : nullptr);
+                     drafter_ ? &taps : nullptr, rows);
       if (drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
       }
     }
+    if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream));  // queued chunks read the rows freed here
     tokens_in_state_.assign(ids.begin(), ids.end());
     if (start < n) save_checkpoint();
     stats.reused_tokens = int(start);
@@ -430,6 +511,7 @@ class EngineGenerator final : public Generator {
   Prefiller prefiller_;
   std::unique_ptr<Drafter> drafter_;
   std::unique_ptr<SpecLoop> spec_;
+  std::unique_ptr<VisionEncoder> vision_;  // image input (RuntimeOptions::vision)
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;
   PinnedHostBuffer host_token_;
   // prompt checkpoint (save_checkpoint) and the prompt it holds (empty: none)

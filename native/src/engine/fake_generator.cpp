@@ -143,6 +143,7 @@ model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, i
   }
   model::GenerateStats stats;
   stats.prompt_tokens = int(prompt.size());
+  stats.image_tokens = image_tokens;
   stats.generated_tokens = yielded;
   return stats;
 }

@@ -166,8 +166,12 @@ void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat
 
 // ------------------------------------------------------------------------------------------------ misc
 
-// int32 -> int64 token ids.
-void widen_ids(const int32_t* in, int T, int64_t* out, cudaStream_t stream);
+// int32 -> int64 token ids; a negative id (an image token, whose embedding row put_rows replaces) becomes
+// `negative_as`, so the embedding lookup stays inside its table.
+void widen_ids(const int32_t* in, int T, int64_t* out, int32_t negative_as, cudaStream_t stream);
+// dst[r] = float(src[r]) for `count` rows of H: precomputed embedding rows (image tokens) over the rows of
+// the embedding block. src bf16 [count, H], dst f32 [count, H].
+void put_rows(const __nv_bfloat16* src, int count, float* dst, cudaStream_t stream);
 // out[t * out_stride] = bf16(x[t]) per row, x fp32 [T, H] (DSpark taps).
 void store_tap(const float* x, int T, __nv_bfloat16* out, int64_t out_stride, cudaStream_t stream);
 // model.logits for one row: out[v] = 30 tanh(bf16(w_v . x) / 30), w bf16 [V, H] or FP8 rows dequantized

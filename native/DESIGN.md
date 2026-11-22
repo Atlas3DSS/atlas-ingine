@@ -17,6 +17,7 @@ math, decode kernels, CLI flags and HTTP behaviour. Hardware: RTX 5090 class onl
 | `src/model/generator.cpp`, `spec.*`, `src/kernels/head` | `engine.py`: prefix reuse, decode graphs per width (1, 2, 4, 8), speculative loop (draft, adaptive verify width, accept, rollback, commit), sampling |
 | `src/text` | `chat.py`: chat rendering (the model's `chat_template.jinja`), reasoning/tool output parsing (`StreamParser`), effort levels |
 | `src/serve`, `src/engine` | `server.py`: `/health`, `/v1/models`, `/v1/chat/completions` (streaming, `reasoning_content`, tools), FIFO scheduler |
+| `src/image`, `src/kernels/vision`, `src/model/vision.*` | none (the Python engine was text only): image input, written against the transformers reference (`Inkling2ImageProcessor`, `Inkling2VisionModel`); see "Images" below |
 
 The serving profile (262,144 tokens, `--dense-fp8 --kv-fp8 --spec --spec-threshold 0.8`, 127.0.0.1:8003) comes
 from `runtime-manifest.json`.
@@ -38,15 +39,20 @@ No Qwen-specific code (GDN/QSA/PLE/MTP kernels, CPU expert tier, n-gram store, p
 native/
   CMakeLists.txt, CMakePresets.json, cmake/          build (from fngine: arch gate 120a, no separable compilation,
                                                      vendored deps, one target per component)
-  third_party/                                       nlohmann json, cpp-httplib, spdlog(+fmt), utf8proc, llama-jinja
+  third_party/                                       nlohmann json, cpp-httplib, spdlog(+fmt), utf8proc, llama-jinja,
+                                                     stb_image
   include/ingine/                                    public API used by apps (generator.h)
   src/core/        -> ingine_core                    device, arena, host memory, Tensor/DType, decode graphs, PDL,
                                                      logging glue, safetensors reader (mmap)
   src/text/        -> ingine_text                    tokenizer, Jinja adapter, ChatFormat, StreamParser (CUDA-free)
+  src/image/       -> ingine_image                   image decoding (stb_image), the reference processor's pixels,
+                                                     reduction, content hash and prompt ids (CUDA-free)
   src/kernels/<a>/ -> ingine_kernels_<a>             dense, moe, attn, head (ported decode kernels + sampling),
-                                                     prefill (new), draft (new); aggregated by ingine_kernels
+                                                     prefill (new), draft (new), vision (new); aggregated by
+                                                     ingine_kernels
   src/model/       -> ingine_model                   weights, state, decode step + graphs, prefill driver,
-                                                     drafter, speculative loop, Generator implementation
+                                                     drafter, speculative loop, vision tower, Generator
+                                                     implementation
   src/engine/      -> ingine_engine                  request scheduler (1 active + bounded FIFO), cancellation
   src/serve/       -> ingine_serve                   HTTP server, OpenAI chat request/response, SSE
   apps/serve/      -> ingine-serve                   the server binary
@@ -148,9 +154,68 @@ the visit plan and constants of `weights.py`. The decode step, the prefill and t
 class Prefiller {
  public:
   Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream);
-  void run(State& state, const int32_t* tokens, int T, int pos0, float* logits, Tensor* taps);
+  // rows: embedding rows computed elsewhere (image tokens) for rows of the chunk
+  void run(State& state, const int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
+           std::span<const EmbedRows> rows = {});
 };
 ```
+
+### Images (`src/image`, `src/kernels/vision`, `src/model/vision.{h,cpp}`)
+
+The checkpoint holds Inkling-2's vision tower (`model.visual.*`, 422 BF16 tensors, 636 MB): a 23-layer ViT over
+20x20-pixel patches with a class token, learned position embeddings resampled to the patch grid, 2-D rotary
+attention and layer scale, and a projector that merges 2x2 patches into one row of the language model's width.
+The language model sees an image as one token per 40x40-pixel tile, `ceil(H/40) * ceil(W/40)` of them, whose
+embeddings are those rows; positions stay ordinary sequence positions. `KERNELS.md` has the arithmetic.
+
+```cpp
+namespace ingine::image {                    // CPU: a request thread decodes
+struct Image { int width, height; std::vector<uint8_t> rgb; uint64_t hash; int tokens() const; };
+Image decode_data_uri(std::string_view uri, const Limits& limits);   // PNG, JPEG, GIF, BMP (stb_image)
+int32_t token_id(uint64_t hash, int k);      // prompt id of image token k: negative, from content and k
+}
+namespace ingine::model {
+struct PromptImage { int pos, height, width; std::shared_ptr<const std::vector<uint8_t>> rgb; };
+struct Prompt { std::span<const int32_t> ids; std::span<const PromptImage> images; };
+class VisionEncoder {                        // GPU: resident weights, working memory per call
+ public:
+  VisionEncoder(const std::filesystem::path& model_dir, cudaStream_t stream);
+  DeviceBuffer encode(const uint8_t* rgb, int height, int width);   // bf16 [tokens (padded), 2304]
+};
+}
+```
+
+Path of an image through a request:
+
+1. `serve::parse_request` collects the image parts of the messages (base64 `data:` URIs; nothing is fetched).
+   The chat template renders each as `<|content_image|><|unused_200054|><|end_message|>`: one placeholder
+   token. A request whose text spells the placeholder as well as carrying images is rejected (the count of
+   placeholders must equal the count of images), so the k-th placeholder is the k-th image.
+2. `image::decode_data_uri` produces the pixels of the reference processor: transparency composited onto its
+   checkerboard, no resizing. An image above `--image-max-tokens` (4096) is reduced by area averaging, which
+   the reference does not do (it takes any size up to 4096x4096 pixels, 10,609 tokens).
+3. Each placeholder is replaced by the image's tokens as `image::token_id(hash, k)`: negative ids, a function
+   of the pixels and the tile index. The Generator's prompt caches compare token ids, so with these ids they
+   tell images apart without knowing about images: the same image gives the same prompt (extend, checkpoint
+   and parked reuse work, and an image inside the reused prefix is not encoded again), another image at the
+   same place ends the common prefix at its first token, and a prefix that ends inside one image never
+   matches another. A false match needs 31 random bits to agree per token. The context check and the usage
+   count the expanded prompt.
+4. `EngineGenerator::prefill` encodes an image when the first chunk holding some of its tokens is reached
+   and passes its rows to `Prefiller::run`, which writes them over the embedding block after the token
+   embedding (negative ids are embedded as the placeholder first, so the lookup stays in its table). The model
+   feeds image rows in as they are (no embedding norm); every later read of the embedding block, the taps
+   of the drafter included, sees them. An image may span chunks. Decoding is unchanged: generated tokens are
+   never image tokens.
+
+Precision: matrix products take BF16 operands with FP32 accumulation, the residual stream, LayerNorm, softmax
+and GELU are FP32. Against transformers in FP32, the output is about twice as close as transformers' own BF16
+model on every fixture (relative RMS error 0.3-3%, cosine 0.9995-0.99999; the tower amplifies rounding noise
+about a hundredfold over its 23 layers). Memory: the weights are resident (609 MiB, loaded before the park
+budget is measured); one encode holds about 36 KB per patch plus up to 256 MiB of attention scores (0.85 GB
+for 4096 tokens), released on return. Time on an RTX 5090: 3 ms up to 64 tokens, 21 ms for 576, 0.17 s for
+1849, 1.1 s for 4096 (attention is a GEMM pair per head over chunks of queries; a fused kernel would be the
+next step). `RuntimeOptions::vision` (ingine-serve: on unless `--no-vision`) loads the tower.
 
 ### Speculative decoding (`src/model/drafter.*`, `src/model/spec.*`)
 
@@ -187,7 +252,7 @@ restored when a later prompt starts with its prompt. Otherwise the state is rese
 per request (`<id>: reuse=extend|checkpoint|parked|none reused=N prefilled=M prefill=<seconds>`).
 
 Third-party CMake targets: `nlohmann_json::nlohmann_json`, `httplib::httplib`, `spdlog::spdlog`, `ingine_utf8proc`,
-`ingine_jinja`, `CUDA::cudart`, `CUDA::cublasLt`.
+`ingine_jinja`, `ingine_stb`, `CUDA::cudart`, `CUDA::cublasLt`.
 
 ## Conventions
 
@@ -207,5 +272,12 @@ Third-party CMake targets: `nlohmann_json::nlohmann_json`, `httplib::httplib`, `
   `tests/spec`, < 2 GB of GPU memory). Model: `ingine-validate` (KL and top-1 per stage, limits at the Python
   reference's own reproducibility; see `apps/validate/main.cpp`) and exact greedy continuations, with and without
   speculation, on the tie-free cases.
+- Images: `tests/golden/vision` holds outputs of the transformers reference (image processor, vision tower
+  and projector in FP32) for the fixtures in `tests/golden/vision/fixtures`, written by `tools/vision_ref.py`
+  (CPU only; `--check-spec` also compares an independent NumPy implementation of `KERNELS.md`'s description).
+  `image` (CPU): decoded pixels equal the processor's. `vision_kernels`: FP64 oracles. `vision_model`: the whole
+  tower against the goldens, within transformers' own BF16 error (needs the model file, 1.5 GB of GPU memory).
+  `model_vision` (full model): colours and text of images, the prompt caches with images, an image over
+  several prefill chunks. `ctest -L vision` runs them.
 - `ctest --test-dir build -LE model` runs everything but the full-model tests; `-L model` needs about 26 GB of
   GPU memory (stop the server first).

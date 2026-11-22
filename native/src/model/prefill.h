@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace ingine::kernels::prefill {
@@ -27,6 +28,14 @@ namespace ingine::model {
 // with T rows; projections are cuBLASLt BF16 GEMMs over the dequantized weight rows (weights.dequant), the
 // attention a flash-attention prefill kernel, the MoE grouped GEMMs over the experts decoded on the fly.
 // Stream-ordered on `stream`; run() only synchronises for its first use of a block-pointer table.
+// Embedding rows computed elsewhere (image tokens from the vision tower) for rows [row, row + count) of a
+// chunk: src bf16 [count, HIDDEN] on the device replaces the token embeddings of those rows (which the model
+// feeds in as they are: no embedding norm).
+struct EmbedRows {
+  int row = 0, count = 0;
+  const __nv_bfloat16* src = nullptr;
+};
+
 class Prefiller {
  public:
   Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream);
@@ -34,7 +43,9 @@ class Prefiller {
   Prefiller(const Prefiller&) = delete;
   Prefiller& operator=(const Prefiller&) = delete;
 
-  void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps);
+  // Tokens with a negative id must be covered by `rows` (their embedding is the image placeholder's otherwise).
+  void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
+           std::span<const EmbedRows> rows = {});
 
   int max_chunk() const { return max_chunk_; }
   std::size_t device_bytes() const;  // scratch held by this object

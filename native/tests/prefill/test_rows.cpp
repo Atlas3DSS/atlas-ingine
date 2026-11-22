@@ -309,6 +309,30 @@ bool test_taps(Rng& rng) {
   return check_close("store_tap", got, ref, 0, 0);
 }
 
+// Image tokens: negative ids are widened to the placeholder id, and put_rows writes BF16 rows as FP32.
+bool test_image_rows(Rng& rng) {
+  const std::vector<int32_t> ids = {5, -1, 200053, -2147483647 - 1, 0, -77};
+  DeviceArray<int32_t> d_ids(ids);
+  DeviceArray<int64_t> wide(ids.size());
+  pk::widen_ids(d_ids.get(), int(ids.size()), wide.get(), 200054, nullptr);
+  const int rows = 3;
+  const auto src = rand_bf16(rng, size_t(rows) * H, 1.0);
+  DeviceArray<uint16_t> d_src(src);
+  DeviceArray<float> dst(size_t(rows + 2) * H);
+  dst.upload(std::vector<float>(dst.count, 9.f));
+  pk::put_rows(reinterpret_cast<const __nv_bfloat16*>(d_src.get()), rows, dst.get() + H, nullptr);
+  pk::put_rows(reinterpret_cast<const __nv_bfloat16*>(d_src.get()), 0, dst.get(), nullptr);  // no rows: no launch
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+  bool ok = wide.download() == std::vector<int64_t>{5, 200054, 200053, 200054, 0, 200054};
+  const auto got = dst.download();
+  for (size_t i = 0; i < got.size(); ++i) {
+    const bool inside = i >= size_t(H) && i < size_t(rows + 1) * H;
+    ok &= got[i] == (inside ? bf16_val(src[i - H]) : 9.f);  // exact, and the rows around untouched
+  }
+  std::printf("%s widen_ids negative ids, put_rows\n", ok ? "PASS" : "FAIL");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -328,6 +352,7 @@ int main() {
   ok &= test_head(rng, true);
   ok &= test_gemm(rng);
   ok &= test_taps(rng);
+  ok &= test_image_rows(rng);
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }
