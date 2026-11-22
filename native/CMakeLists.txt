@@ -66,7 +66,7 @@ endfunction()
 ingine_add_component(src/text)
 ingine_add_component(src/image)
 
-set(INGINE_KERNEL_AREAS common dense moe attn head prefill draft)
+set(INGINE_KERNEL_AREAS common dense moe attn head prefill draft vision)
 foreach(area ${INGINE_KERNEL_AREAS})
   ingine_add_component(src/kernels/${area})
 endforeach()
