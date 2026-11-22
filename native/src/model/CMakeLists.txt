@@ -28,3 +28,8 @@ foreach(area prefill draft)
     target_link_libraries(ingine_model PUBLIC ingine_kernels_${area})
   endif()
 endforeach()
+# the vision tower (image input); its matrix products use the prefill GEMM
+if(TARGET ingine_kernels_vision AND TARGET ingine_kernels_prefill AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vision.cpp)
+  target_sources(ingine_model PRIVATE vision.cpp)
+  target_link_libraries(ingine_model PUBLIC ingine_kernels_vision)
+endif()
