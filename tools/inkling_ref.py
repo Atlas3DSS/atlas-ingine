@@ -9,10 +9,10 @@ It also owns two research hooks used by the abliteration tools:
 
 * `Visits` numbers the 48 decoder-layer visits of a forward pass (layers 0-5, three passes of 6-17,
   layers 18-23) so per-visit state can be keyed on them.
-* `Ablation` removes a direction from the residual-stream writes, i.e. from the outputs of every
-  `post_attention_convolution` and `post_mlp_convolution`: ``y <- y - w * r * (r . y)``. These outputs are
-  the only writes into the attention-residual blocks besides the embedding, so with ``w = 1`` the residual
-  stream never contains ``r``.
+* `Ablation` edits the residual-stream writes, i.e. the outputs of every `post_attention_convolution` and
+  `post_mlp_convolution`: ``y <- y - w * r * (r . y - c)``, optionally only for the part above the offset c and
+  only for writes that a detector flags. These outputs are the only writes into the attention-residual blocks
+  besides the embedding, so the plain projection (c = 0, w = 1) keeps ``r`` out of the residual stream.
 """
 from __future__ import annotations
 
@@ -185,10 +185,13 @@ class Visits:
 
 
 class Ablation:
-    """Directional ablation of residual writes, per visit: ``y <- y - w * r * (r . y)``.
+    """Directional ablation of residual writes, per visit: ``y <- y - w * r * g(r . y - c)``.
 
     `attn_dirs`/`mlp_dirs`: [48, hidden] unit vectors (FP32); `attn_w`/`mlp_w`: [48] weights. A weight of 0
-    leaves that write untouched.
+    leaves that write untouched. `attn_c`/`mlp_c`: [48] offsets (0 by default: the plain projection). `g` is
+    the identity, or ``max(., 0)`` with `gate`: then a write is only changed where its component along `r`
+    exceeds `c`. With detectors (`set_detectors`: [48, hidden] vectors and [48] thresholds per kind) a write is
+    changed only where ``det . y`` exceeds the visit's threshold.
     """
 
     def __init__(self, model, visits: Visits):
@@ -199,6 +202,10 @@ class Ablation:
         self.mlp_dirs = torch.zeros(NUM_VISITS, hidden, device=device)
         self.attn_w = torch.zeros(NUM_VISITS, device=device)
         self.mlp_w = torch.zeros(NUM_VISITS, device=device)
+        self.attn_c = torch.zeros(NUM_VISITS, device=device)
+        self.mlp_c = torch.zeros(NUM_VISITS, device=device)
+        self.gate = False
+        self.detectors = None  # {"attn": (det [48, hidden], threshold [48]), "mlp": ...}
         self.enabled = False
         self.handles = []
         for layer in model.model.language_model.layers:
@@ -212,17 +219,33 @@ class Ablation:
             v = self.visits.current
             w = (self.attn_w if kind == "attn" else self.mlp_w)[v]
             r = (self.attn_dirs if kind == "attn" else self.mlp_dirs)[v]
+            c = (self.attn_c if kind == "attn" else self.mlp_c)[v]
             y = output.float()
-            y = y - w * (y @ r)[..., None] * r
+            p = y @ r - c
+            if self.gate:
+                p = p.clamp(min=0)
+            if self.detectors is not None:
+                det, threshold = self.detectors[kind]
+                p = p * ((y @ det[v]) > threshold[v])
+            y = y - w * p[..., None] * r
             return y.to(output.dtype)
         return hook
 
-    def set(self, attn_dirs, attn_w, mlp_dirs, mlp_w):
+    def set(self, attn_dirs, attn_w, mlp_dirs, mlp_w, attn_c=None, mlp_c=None, gate=False):
         self.attn_dirs.copy_(F.normalize(attn_dirs.float(), dim=-1))
         self.mlp_dirs.copy_(F.normalize(mlp_dirs.float(), dim=-1))
         self.attn_w.copy_(attn_w)
         self.mlp_w.copy_(mlp_w)
+        self.attn_c.zero_() if attn_c is None else self.attn_c.copy_(attn_c)
+        self.mlp_c.zero_() if mlp_c is None else self.mlp_c.copy_(mlp_c)
+        self.gate = bool(gate)
+        self.detectors = None
         self.enabled = True
+
+    def set_detectors(self, attn_det, attn_threshold, mlp_det, mlp_threshold):
+        dev = self.attn_dirs.device
+        self.detectors = {"attn": (attn_det.float().to(dev), attn_threshold.float().to(dev)),
+                          "mlp": (mlp_det.float().to(dev), mlp_threshold.float().to(dev))}
 
     def remove(self):
         for h in self.handles:
