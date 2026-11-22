@@ -67,7 +67,8 @@ int main(int argc, char** argv) {
   const bool kv_fp8 = argc > 1 && std::string(argv[1]) == "fp8";
   RuntimeOptions opt;
   opt.model_dir = model_dir;
-  const std::string abl = std::string(INGINE_SOURCE_DIR) + "/../ablation/inkling-2-mini-abliterated.safetensors";
+  // the plain-projection ablation the goldens were made with
+  const std::string abl = std::string(INGINE_GOLDEN_DIR) + "/model/ablation.safetensors";
   if (std::ifstream(abl)) opt.ablation = abl;
   opt.max_ctx = 8192;
   opt.dense_fp8 = true;

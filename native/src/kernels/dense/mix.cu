@@ -42,7 +42,8 @@ struct MixArgs {
   const float* base;   // [M, H] or null
   const float* write;  // [M, H] or null
   const float* abl_r;  // [H] or null (no ablation)
-  const float* abl_w;  // [1]
+  const float* abl_d;  // [H] detector or null (no detector: the ablation always acts)
+  const float* abl_w;  // [4]: weight, offset, floor, detector threshold
   float* partial;      // [M, H] or null
   const float* queries;  // [Q, H]
   const float* norm_w;   // [Q, H] (needed with out_bf16)
@@ -109,7 +110,7 @@ __device__ __forceinline__ void sum_total(float (&out)[N], const float* scratch)
 }
 
 // The mix of token m. NS = states in the mix (blocks + new), Q = queries; NS == 1 && Q == 1 is the layer-0
-// path (no mix). red1/red2/red3: block sum scratch, [REF_W * block_sum_slots<N>()] for N = 1, NS + Q NS, Q.
+// path (no mix). red1/red2/red3: block sum scratch, [REF_W * block_sum_slots<N>()] for N = 2, NS + Q NS, Q.
 // COPIES: the call has side row copies (a.copies); without, the kernel carries no code for them.
 template <int NS, int Q, bool COPIES>
 __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, float* red2, float* red3) {
@@ -122,11 +123,11 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
 
   // constants (queries, ablation direction and weight, norm weights, block pointers) before the PDL wait;
   // states after it
-  float4 s[NS][MIX_V], q[Q][MIX_V], r4[MIX_V], g4[Q][MIX_V];
+  float4 s[NS][MIX_V], q[Q][MIX_V], r4[MIX_V], dt4[MIX_V], g4[Q][MIX_V];
   const float* bp[NS > 1 ? NS - 1 : 1];
 #pragma unroll
   for (int i = 0; i < NS - 1; ++i) bp[i] = a.blocks[i];
-  float aw = 0.f;
+  float aw = 0.f, ac = 0.f, alo = 0.f, atau = 0.f;
 #pragma unroll
   for (int u = 0; u < MIX_V; ++u) {
     if constexpr (!SKIP) {
@@ -134,12 +135,16 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
       for (int j = 0; j < Q; ++j) q[j][u] = ld4(a.queries + size_t(j) * H + ch(u));
     }
     r4[u] = a.abl_r ? ld4(a.abl_r + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    dt4[u] = a.abl_d ? ld4(a.abl_d + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
     if (a.out_bf16) {
 #pragma unroll
       for (int j = 0; j < Q; ++j) g4[j][u] = ld4(a.norm_w + size_t(j) * H + ch(u));
     }
   }
-  if (a.abl_r) aw = __ldg(a.abl_w);
+  if (a.abl_r) {
+    const float4 ap = __ldg(reinterpret_cast<const float4*>(a.abl_w));
+    aw = ap.x, ac = ap.y, alo = ap.z, atau = ap.w;
+  }
 
   pdl_wait_fenced(a.zero);  // keeps the constant loads above ahead of the wait
   pdl_trigger();
@@ -182,17 +187,31 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
     }
   }
 
-  // new = base + (write - (w * (write . r)) * r)
+  // new = base + (write - (w * max(write . r - offset, floor)) * r); offset 0 with floor -FLT_MAX is the plain
+  // projection, bit for bit (x - 0 and max(x, -FLT_MAX) return x). With a detector the write is only changed
+  // where write . detector exceeds its threshold (the same block reduction carries both dots).
   if (a.write) {
     if (a.abl_r) {
+      float c;
+      if (a.abl_d) {
 #pragma unroll
-      for (int u = 0; u < MIX_V; ++u) {
-        float d[1] = {dot4(y[u], r4[u])};
-        sum_part(d, red1, u);
+        for (int u = 0; u < MIX_V; ++u) {
+          float d[2] = {dot4(y[u], r4[u]), dot4(y[u], dt4[u])};
+          sum_part(d, red1, u);
+        }
+        float d[2];
+        sum_total(d, red1);
+        c = d[1] > atau ? aw * fmaxf(d[0] - ac, alo) : 0.f;
+      } else {
+#pragma unroll
+        for (int u = 0; u < MIX_V; ++u) {
+          float d[1] = {dot4(y[u], r4[u])};
+          sum_part(d, red1, u);
+        }
+        float d[1];
+        sum_total(d, red1);
+        c = aw * fmaxf(d[0] - ac, alo);
       }
-      float d[1];
-      sum_total(d, red1);
-      const float c = aw * d[0];
 #pragma unroll
       for (int u = 0; u < MIX_V; ++u) {
         const float4 r = r4[u];
@@ -316,7 +335,7 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
 
 template <int NS, int Q, bool COPIES>
 __global__ void __launch_bounds__(MIX_T) mix_kernel(MixArgs a) {
-  __shared__ float red1[REF_W * block_sum_slots<1>()], red2[REF_W * block_sum_slots<NS + Q * NS>()],
+  __shared__ float red1[REF_W * block_sum_slots<2>()], red2[REF_W * block_sum_slots<NS + Q * NS>()],
       red3[REF_W * block_sum_slots<Q>()];
   mix_token<NS, Q, COPIES>(a, blockIdx.x, red1, red2, red3);
 }
@@ -326,7 +345,7 @@ __global__ void __launch_bounds__(MIX_T) mix_kernel(MixArgs a) {
 // copies (the launcher rejects them).
 template <int NS, int Q>
 __global__ void __launch_bounds__(MIX_T) mix_pair_kernel(MixArgs a, MixArgs b) {
-  __shared__ float red1[REF_W * block_sum_slots<1>()], red2[REF_W * 32], red3[REF_W * MAXQ];
+  __shared__ float red1[REF_W * block_sum_slots<2>()], red2[REF_W * 32], red3[REF_W * MAXQ];
   if (static_cast<int>(blockIdx.x) < a.M) mix_token<NS, Q, false>(a, blockIdx.x, red1, red2, red3);
   else mix_token<2, 4, false>(b, blockIdx.x - a.M, red1, red2, red3);
 }
@@ -432,6 +451,7 @@ MixArgs mix_args(const MixParams& p) {
   a.base = p.base;
   a.write = p.write;
   a.abl_r = p.abl_r;
+  a.abl_d = a.abl_r ? p.abl_d : nullptr;
   a.abl_w = p.abl_w;
   require(!a.abl_r || a.abl_w, "mix: abl_w is required with abl_r");
   a.partial = p.partial_out;

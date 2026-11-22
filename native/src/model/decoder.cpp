@@ -85,6 +85,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     p.write = write;
     // KernelOps.mix: the ablation applies to `write` only
     p.abl_r = write ? abl_r : nullptr;
+    p.abl_d = write && abl.detect ? abl_r + std::size_t(NUM_VISITS) * H : nullptr;  // the detector of the same visit
     p.abl_w = write ? abl_w : nullptr;
     p.partial_out = partial_out;
     p.queries = queries ? f32p(*queries) : nullptr;
@@ -128,7 +129,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     }
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
-    const float* w_prev = mlp_w + pv;
+    const float* w_prev = mlp_w + 4 * std::size_t(pv);
     dense::MixParams msg_mix;  // message visits: launched together with the attention read (independent of it)
     if (msgs) {
       const int i = l - LOOP_START;
@@ -210,9 +211,9 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
     dense::MixParams mp =
-        msgs ? mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + v, f32m(b.part),
+        msgs ? mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), f32m(b.part),
                           &layer.mlp_query, nullptr, nullptr, f32m(b.mixm))
-             : mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + v, f32m(b.part),
+             : mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), f32m(b.part),
                           &layer.mlp_query, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr);
     if (history) {  // b.hist_k/hist_v[v] = proj_out[:, K/V segment]
       int c = 0;
@@ -241,7 +242,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   // ---- final read; the same launch writes b.taps[:, 3] = b.xf
   const Tensor final_norm1 = rm(w.final_norm.data, DType::FP32, {1, H});
   dense::MixParams fp = mix_params({f32p(b.B0), f32p(b.B1), f32p(b.B2[2]), f32p(b.E[2])}, f32p(b.part), f32p(b.y2),
-                                   mlp_dirs + std::size_t(prev_v) * H, mlp_w + prev_v, nullptr, &w.final_query,
+                                   mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr, &w.final_query,
                                    f32p(final_norm1), bf16m(b.xf), nullptr);
   fp.out_copy = taps + std::size_t(tap) * H;
   fp.out_copy_stride = std::int64_t(NUM_TAPS) * H;

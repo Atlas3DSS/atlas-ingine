@@ -66,7 +66,10 @@ struct MixParams {
   const float* base = nullptr;           // [M, H] or null
   const float* write = nullptr;          // [M, H] or null
   const float* abl_r = nullptr;          // [H] or null (no ablation of `write`)
-  const float* abl_w = nullptr;          // [1] (device), required with abl_r
+  const float* abl_d = nullptr;          // [H] detector or null: with it `write` is ablated only where write . abl_d
+                                         // exceeds the threshold in abl_w
+  const float* abl_w = nullptr;          // [4] (device, 16-byte aligned): weight, offset, floor, detector threshold;
+                                         // required with abl_r
   float* partial_out = nullptr;          // [M, H] or null
   const float* queries = nullptr;        // [Q, H]; null only for the layer-0 path (no blocks, Q = 1)
   int Q = 1;                             // 1..4

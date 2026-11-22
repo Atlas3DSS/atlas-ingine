@@ -130,8 +130,10 @@ log_scaling, workspace, out)`
 `mix(blocks, base, write, abl_r, abl_w, partial_out, queries, norm_w, out_bf16, out_f32)` — residual
 update + attention residual + RMS norm.
 * `blocks`: int64 tensor of device pointers to completed block states, each fp32 `[M, H]` (0-5 of them).
-* `new = base + write - abl_w * abl_r * (abl_r · write)` per token (`base` and/or `write` may be absent:
-  pass empty tensors; `abl_r` fp32 `[H]` unit, `abl_w` fp32 `[1]` on device). Written to `partial_out`.
+* `new = base + write - w * abl_r * max(abl_r · write - offset, floor)` per token (`base` and/or `write` may be
+  absent: pass empty tensors; `abl_r` fp32 `[H]` unit, `abl_w` fp32 `[4]` on device = `w, offset, floor,
+  threshold`; offset 0 and floor `-FLT_MAX` give the plain projection). With a detector `abl_d` (fp32 `[H]`) the
+  write is left unchanged unless `abl_d · write > threshold`. Written to `partial_out`.
 * Stack `S = [blocks..., new]`, each state normalised `n_i = s_i / sqrt(mean(s_i²) + 1e-6)`. For each query
   `q` (fp32 `[Q, H]`, Q ∈ {1, 3}): `a_i = softmax_i(q · n_i / √H)`, `mix_q = Σ_i a_i n_i`.
   `out_f32[q, m] = mix_q` (optional), `out_bf16[q, m] = bf16(rms_norm(mix_q) * norm_w[q])` (optional).

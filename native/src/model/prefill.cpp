@@ -125,6 +125,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     p.base = base;
     p.write = write;
     p.abl_r = write ? abl_r : nullptr;
+    p.abl_d = write && abl_.detect ? abl_r + std::size_t(NUM_VISITS) * H : nullptr;  // the detector of the same visit
     p.abl_w = write ? abl_w : nullptr;
     p.partial_out = partial_out;
     p.queries = queries;
@@ -183,7 +184,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     }
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
-    const float* w_prev = mlp_w + pv;
+    const float* w_prev = mlp_w + 4 * std::size_t(pv);
     if (msgs) {
       const int i = l - LOOP_START;
       const float* src_base = i == 0 ? part_ : E_[p - 1];
@@ -283,14 +284,14 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
     if (msgs) {
-      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + v, part_, f32p(layer.mlp_query), 1, nullptr,
+      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1, nullptr,
           nullptr, mixm_);
       pk::GateRows rows;
       rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
       gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1),
             xm_);
     } else {
-      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + v, part_, f32p(layer.mlp_query), 1,
+      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1,
           f32p(layer.mlp_norm1), xm_, nullptr);
     }
 
@@ -312,7 +313,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   }
 
   // ---- final read, taps, head of the last row
-  mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H, mlp_w + prev_v, nullptr,
+  mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr,
       f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
   if (tap_out)
     CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,

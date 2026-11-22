@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <limits>
 #include <numeric>
 
 using namespace ingine::test;
@@ -216,6 +217,10 @@ struct MixCase {
   int nb, Q;
   bool base, write, abl, bf16, f32, partial;
   bool side = false;  // side outputs: bf16(new) and a copy of out_bf16 (Q = 1) at row stride 2H, two row copies
+  float offset = 0.f;  // ablation offset
+  bool gate = false;   // remove only the component above the offset
+  bool detect = false;  // detector: ablate only rows with write . detector > threshold
+  float threshold = 0.f;
 };
 
 bool test_mix(Rng& rng, int M, const MixCase& c) {
@@ -236,7 +241,9 @@ bool test_mix(Rng& rng, int M, const MixCase& c) {
   double rn = 0;
   for (float v : r) rn += double(v) * v;
   for (auto& v : r) v = float(v / std::sqrt(rn));
-  const std::vector<float> aw = {0.8f};
+  const std::vector<float> aw = {0.8f, c.offset, c.gate ? 0.f : std::numeric_limits<float>::lowest(), c.threshold};
+  const std::vector<float> det = randn(rng, H, 0.05);  // write . det ~ N(0, 1.7^2)
+  DeviceArray<float> ddet(det);
   const std::vector<float> q = randn(rng, size_t(c.Q) * H, 0.05), g = randn(rng, size_t(c.Q) * H, 0.1);
   std::vector<float> gw(g);
   for (auto& v : gw) v += 1.f;
@@ -250,6 +257,7 @@ bool test_mix(Rng& rng, int M, const MixCase& c) {
   p.base = c.base ? dbase.get() : nullptr;
   p.write = c.write ? dwrite.get() : nullptr;
   p.abl_r = c.abl ? dr.get() : nullptr;
+  p.abl_d = c.abl && c.detect ? ddet.get() : nullptr;
   p.abl_w = c.abl ? daw.get() : nullptr;
   p.partial_out = c.partial ? part.get() : nullptr;
   const bool skip = c.nb == 0 && c.Q == 1;
@@ -274,11 +282,12 @@ bool test_mix(Rng& rng, int M, const MixCase& c) {
   std::vector<double> nw(n), mixr(size_t(c.Q) * n), outb(size_t(c.Q) * n), outbr(size_t(c.Q) * n);
   for (int m = 0; m < M; ++m) {
     const float* y = &write[size_t(m) * H];
-    double d = 0;
-    for (int k = 0; k < H; ++k) d += double(y[k]) * r[k];
+    double d = 0, dd = 0;
+    for (int k = 0; k < H; ++k) d += double(y[k]) * r[k], dd += double(y[k]) * det[k];
+    const double amount = c.detect && !(dd > double(aw[3])) ? 0.0 : aw[0] * std::max(d - double(aw[1]), double(aw[2]));
     for (int k = 0; k < H; ++k) {
       double v = c.base ? base[size_t(m) * H + k] : 0.0;
-      if (c.write) v += c.abl ? y[k] - aw[0] * d * r[k] : y[k];
+      if (c.write) v += c.abl ? y[k] - amount * r[k] : y[k];
       nw[size_t(m) * H + k] = v;
     }
     std::vector<const double*> states;
@@ -516,7 +525,9 @@ uint64_t lock_mix(LockGen& g, int M, bool& pair_ok) {
     ptrs.push_back(reinterpret_cast<uint64_t>(blocks.back().get()));
   }
   DeviceArray<uint64_t> table(ptrs), table4(std::vector<uint64_t>{ptrs[4]});
-  DeviceArray<float> base(g.vec(n, 1.5f)), write(g.vec(n, 1.f)), r(g.vec(H, 0.03f)), aw(std::vector<float>{0.8125f});
+  // plain projection: offset 0, no floor (the layout of an ablation file without offsets)
+  DeviceArray<float> base(g.vec(n, 1.5f)), write(g.vec(n, 1.f)), r(g.vec(H, 0.03f)),
+      aw(std::vector<float>{0.8125f, 0.f, std::numeric_limits<float>::lowest(), 0.f});
   DeviceArray<float> q(g.vec(size_t(4) * H, 0.08f)), nw(g.vec(size_t(4) * H, 0.25f, 1.f));
   Fnv f;
   auto run = [&](int nb, int Q, bool has_base, bool has_write, bool abl, bool bf16, bool f32) {
@@ -673,6 +684,14 @@ int main() {
       {2, 1, true, true, true, true, false, true, true},     // side outputs (taps, history copies)
       {0, 1, true, true, true, true, false, false, true},    // side outputs on the skip path, no partial
       {4, 3, true, true, true, false, true, true, true},     // side outputs with Q = 3 (no out copy)
+      {1, 1, true, true, true, true, false, true, false, 0.3f, false},   // ablation about an offset
+      {1, 1, true, true, true, true, false, true, false, 0.2f, true},    // gated: only above the offset
+      {3, 3, false, true, true, true, true, true, false, -0.4f, true},   // gated, negative offset
+      {1, 4, true, true, true, false, true, true, false, 5.f, true},     // gated, never above: write untouched
+      {1, 1, true, true, true, true, false, true, false, 0.f, false, true, 0.3f},    // detector: some rows ablated
+      {3, 3, false, true, true, true, true, true, false, 0.2f, false, true, -0.5f},  // detector with an offset
+      {2, 1, true, true, true, true, false, true, true, 0.1f, true, true, 0.f},      // detector, gate, side outputs
+      {1, 4, true, true, true, false, true, true, false, 0.f, false, true, 1e30f},   // detector never fires
   };
   for (int M : {1, 3})
     for (const auto& c : cases) ok &= test_mix(rng, M, c);

@@ -6,8 +6,10 @@
 // device-selected verify (switch graph, positions and accepted count on the device) equals the host-driven
 // call. The Generator (plain, pipelined decoding): stop tokens, cancellation and max_new_tokens end the
 // output exactly, and a follow-up request reusing the prefix generates what it generates after a request
-// that never ran past its end.
+// that never ran past its end. The ablation file layouts through prefill and decode: zero offsets without the
+// gate equal the plain file, a gate that is never reached equals no ablation, a reachable one differs.
 #include "common/test_util.h"
+#include "core/fixture.h"
 
 #include "kernels/dense/dense.h"
 #include "model/model_kernels.h"
@@ -679,6 +681,89 @@ bool run_generator() {
   return ok;
 }
 
+// The ablation file layouts (weights.cpp load_ablation) through the whole model: greedy tokens after a prefill.
+bool run_ablation_layouts() {
+  using ingine::test::FixtureTensor;
+  const ingine::test::TempDir dir;
+  Rng rng(9);
+  const std::size_t nd = std::size_t(NUM_VISITS) * H;
+  std::vector<float> attn_dirs(nd), mlp_dirs(nd), attn_w(NUM_VISITS), mlp_w(NUM_VISITS);
+  for (auto& x : attn_dirs) x = float(rng.normal());
+  for (auto& x : mlp_dirs) x = float(rng.normal());
+  for (auto& x : attn_w) x = float(rng.uniform(0.5, 1.5));
+  for (auto& x : mlp_w) x = float(rng.uniform(0.5, 1.5));
+  auto bytes = [](const std::vector<float>& v) {
+    std::vector<std::uint8_t> b(v.size() * 4);
+    std::memcpy(b.data(), v.data(), b.size());
+    return b;
+  };
+  const std::vector<std::int64_t> dshape = {NUM_VISITS, H}, vshape = {NUM_VISITS};
+  // threshold: detectors (random vectors) with this threshold for every visit; NaN = a file without detectors
+  auto file = [&](const char* name, bool plain, float offset, float gate, float threshold = std::nanf("")) {
+    std::vector<FixtureTensor> t = {{"attn_dirs", "F32", dshape, bytes(attn_dirs)},
+                                    {"mlp_dirs", "F32", dshape, bytes(mlp_dirs)}};
+    if (plain) {
+      t.push_back({"attn_w", "F32", vshape, bytes(attn_w)});
+      t.push_back({"mlp_w", "F32", vshape, bytes(mlp_w)});
+    } else {
+      const std::vector<float> off(NUM_VISITS, offset);
+      t.push_back({"attn_weight", "F32", vshape, bytes(attn_w)});
+      t.push_back({"mlp_weight", "F32", vshape, bytes(mlp_w)});
+      t.push_back({"attn_offset", "F32", vshape, bytes(off)});
+      t.push_back({"mlp_offset", "F32", vshape, bytes(off)});
+      t.push_back({"gate", "F32", {1}, bytes({gate})});
+      if (!std::isnan(threshold)) {
+        const std::vector<float> tau(NUM_VISITS, threshold);
+        t.push_back({"attn_det", "F32", dshape, bytes(mlp_dirs)});  // any vectors serve as detectors here
+        t.push_back({"mlp_det", "F32", dshape, bytes(attn_dirs)});
+        t.push_back({"attn_threshold", "F32", vshape, bytes(tau)});
+        t.push_back({"mlp_threshold", "F32", vshape, bytes(tau)});
+      }
+    }
+    const std::filesystem::path p = dir.path / name;
+    ingine::test::write_safetensors(p, t);
+    return p;
+  };
+  auto tokens = [&](const std::filesystem::path& ablation) {
+    RuntimeOptions opt;
+    opt.max_ctx = 2048;
+    opt.kv_fp8 = true;
+    opt.prefill_chunk = 64;
+    cudaStream_t s0;
+    INGINE_TEST_CUDA(cudaStreamCreate(&s0));
+    Weights w = synthetic_weights(s0);
+    INGINE_TEST_CUDA(cudaStreamDestroy(s0));
+    const auto gen = make_generator(opt, std::move(w), load_ablation(ablation));
+    Rng r(5);
+    std::vector<std::int32_t> prompt(100);
+    for (auto& t : prompt) t = std::int32_t(r.next() % kVocab);
+    Sampling greedy;
+    greedy.temperature = 0.f;
+    std::vector<std::int32_t> out;
+    gen->generate(prompt, 32, greedy, {}, [&](std::span<const std::int32_t> t) {
+      out.insert(out.end(), t.begin(), t.end());
+      return true;
+    });
+    return out;
+  };
+  const auto none = tokens({});
+  const auto plain = tokens(file("plain.safetensors", true, 0.f, 0.f));
+  const auto zero = tokens(file("zero.safetensors", false, 0.f, 0.f));
+  const auto never = tokens(file("never.safetensors", false, 1e30f, 1.f));
+  const auto gated = tokens(file("gated.safetensors", false, 0.f, 1.f));
+  const auto det_open = tokens(file("det_open.safetensors", false, 0.f, 0.f, -1e30f));
+  const auto det_shut = tokens(file("det_shut.safetensors", false, 0.f, 0.f, 1e30f));
+  const auto det_some = tokens(file("det_some.safetensors", false, 0.f, 0.f, 0.f));
+  bool ok = report(none.size() == 32 && plain != none, "an ablation changes the greedy tokens");
+  ok &= report(zero == plain, "zero offsets without the gate equal the plain file");
+  ok &= report(never == none, "a gate that is never reached equals no ablation");
+  ok &= report(gated != plain && gated != none, "a gate at offset 0 differs from both");
+  ok &= report(det_open == plain, "detectors that always fire equal the plain file");
+  ok &= report(det_shut == none, "detectors that never fire equal no ablation");
+  ok &= report(det_some != plain && det_some != none, "detectors at threshold 0 differ from both");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -692,6 +777,7 @@ int main() {
   bool ok = run(false);
   ok &= run(true);
   ok &= run_generator();
+  ok &= run_ablation_layouts();
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

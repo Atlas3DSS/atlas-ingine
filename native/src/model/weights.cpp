@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -392,16 +393,25 @@ Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t 
   return layer;
 }
 
+// File layouts (FP32 or BF16 tensors):
+//   attn_dirs, mlp_dirs [48, H]; attn_w, mlp_w [48]                                  plain projection
+//   attn_dirs, mlp_dirs [48, H]; attn_weight, mlp_weight, attn_offset, mlp_offset [48]; gate [1];
+//       optionally attn_det, mlp_det [48, H] and attn_threshold, mlp_threshold [48]
+// The second form removes w * r * (r . y - offset), limited to components above the offset when gate is
+// non-zero and, with detectors, to writes with det . y above the threshold. Its weights carry other names so
+// that engines that only know the first form reject the file.
 Ablation load_ablation(const fs::path& path) {
   Ablation a;
   const int H = HIDDEN;
-  std::vector<float> attn_dirs(std::size_t(NUM_VISITS) * H, 0.f), mlp_dirs(attn_dirs.size(), 0.f);
-  std::vector<float> attn_w(NUM_VISITS, 0.f), mlp_w(NUM_VISITS, 0.f);
+  const std::size_t nd = std::size_t(NUM_VISITS) * H;
+  // rows 0..47: directions, rows 48..95: detectors (zero without them)
+  std::vector<float> attn_dirs(2 * nd, 0.f), mlp_dirs(2 * nd, 0.f);
+  std::vector<float> attn_w(std::size_t(NUM_VISITS) * 4, 0.f), mlp_w(attn_w.size(), 0.f);
   if (!path.empty()) {
     const SafetensorsModel m(path);
-    auto read = [&](const char* name, std::size_t n) {
+    auto read = [&](const std::string& name, std::size_t n) {
       std::vector<float> v = host_f32(m, name);
-      if (v.size() != n) throw std::runtime_error(std::string("ablation: ") + name + " has the wrong size");
+      if (v.size() != n) throw std::runtime_error("ablation: " + name + " has the wrong size");
       return v;
     };
     // F.normalize(dirs, dim=-1): x / max(||x||, 1e-12) in FP32
@@ -414,10 +424,25 @@ Ablation load_ablation(const fs::path& path) {
       }
       return v;
     };
-    attn_dirs = normalize(read("attn_dirs", attn_dirs.size()));
-    mlp_dirs = normalize(read("mlp_dirs", mlp_dirs.size()));
-    attn_w = read("attn_w", NUM_VISITS);
-    mlp_w = read("mlp_w", NUM_VISITS);
+    const bool plain = m.contains("attn_w");
+    a.detect = !plain && m.contains("attn_det");
+    const float floor = !plain && read("gate", 1)[0] != 0.f ? 0.f : -std::numeric_limits<float>::max();
+    auto load = [&](const std::string& kind, std::vector<float>& dirs, std::vector<float>& rows) {
+      const std::vector<float> r = normalize(read(kind + "_dirs", nd));
+      std::copy(r.begin(), r.end(), dirs.begin());
+      const std::vector<float> w = read(kind + (plain ? "_w" : "_weight"), NUM_VISITS);
+      const std::vector<float> c = plain ? std::vector<float>(NUM_VISITS, 0.f) : read(kind + "_offset", NUM_VISITS);
+      std::vector<float> tau(NUM_VISITS, 0.f);
+      if (a.detect) {
+        const std::vector<float> d = read(kind + "_det", nd);  // as stored: the threshold is in its units
+        std::copy(d.begin(), d.end(), dirs.begin() + std::ptrdiff_t(nd));
+        tau = read(kind + "_threshold", NUM_VISITS);
+      }
+      for (int v = 0; v < NUM_VISITS; ++v)
+        rows[4 * v] = w[v], rows[4 * v + 1] = c[v], rows[4 * v + 2] = floor, rows[4 * v + 3] = tau[v];
+    };
+    load("attn", attn_dirs, attn_w);
+    load("mlp", mlp_dirs, mlp_w);
     a.active = true;
   }
   auto up = [&](const std::vector<float>& h, std::initializer_list<std::int32_t> shape) {
@@ -425,10 +450,10 @@ Ablation load_ablation(const fs::path& path) {
     CUDA_CHECK(cudaMemcpy(a.storage.back().p, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
     return rm(a.storage.back().p, DType::FP32, shape);
   };
-  a.attn_dirs = up(attn_dirs, {NUM_VISITS, H});
-  a.attn_w = up(attn_w, {NUM_VISITS});
-  a.mlp_dirs = up(mlp_dirs, {NUM_VISITS, H});
-  a.mlp_w = up(mlp_w, {NUM_VISITS});
+  a.attn_dirs = up(attn_dirs, {2 * NUM_VISITS, H});
+  a.attn_w = up(attn_w, {NUM_VISITS, 4});
+  a.mlp_dirs = up(mlp_dirs, {2 * NUM_VISITS, H});
+  a.mlp_w = up(mlp_w, {NUM_VISITS, 4});
   return a;
 }
 

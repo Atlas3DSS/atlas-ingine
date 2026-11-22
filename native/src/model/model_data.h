@@ -206,14 +206,17 @@ struct Weights {
   std::vector<DeviceBuffer> storage;  // device allocations behind the views
 };
 
-// model.Ablation: per visit y <- y - w * r * (r . y) on the attention / MLP writes. Without an ablation
-// file (Ablation.none) directions and weights are zero.
+// model.Ablation: per visit y <- y - w * r * max(r . y - offset, floor) on the attention / MLP writes; offset 0
+// with floor -FLT_MAX is the plain projection y - w * r * (r . y), floor 0 removes only what exceeds the
+// offset. With detectors a write is changed only where det . y exceeds the visit's threshold. Without an
+// ablation file (Ablation.none) directions and weights are zero.
 struct Ablation {
-  Tensor attn_dirs;  // fp32 [48, H] unit rows
-  Tensor attn_w;     // fp32 [48]
-  Tensor mlp_dirs;   // fp32 [48, H]
-  Tensor mlp_w;      // fp32 [48]
+  Tensor attn_dirs;  // fp32 [96, H]: rows 0..47 unit directions, rows 48..95 detectors (zero without them)
+  Tensor attn_w;     // fp32 [48, 4] rows: weight, offset, floor, detector threshold
+  Tensor mlp_dirs;   // fp32 [96, H]
+  Tensor mlp_w;      // fp32 [48, 4]
   bool active = false;  // loaded from a file
+  bool detect = false;  // the file has detectors
 
   std::vector<DeviceBuffer> storage;
 };

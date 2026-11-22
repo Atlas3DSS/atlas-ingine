@@ -54,7 +54,7 @@ fs::path default_model_dir() {
 
 struct Args {
   fs::path model_dir = default_model_dir();
-  fs::path ablation = fs::path(INGINE_REPO_DIR) / "ablation" / "inkling-2-mini-abliterated.safetensors";
+  fs::path ablation;  // --ablation; default: the file the goldens were made with, <golden>/ablation.safetensors
   fs::path golden = fs::path(INGINE_REPO_DIR) / "native" / "tests" / "golden" / "model";
   std::string filter;
   bool generate = false;
@@ -72,7 +72,8 @@ void usage() {
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec]]\n"
       "                       [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
       "                       [--min-top1 F]\n"
-      "--cases takes comma-separated name substrings\n");
+      "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
+      "plain-projection file the goldens of the abliterated model were made with\n");
 }
 
 struct Stage {
@@ -301,6 +302,7 @@ int main(int argc, char** argv) {
       return k == "--help" || k == "-h" ? 0 : 2;
     }
   }
+  if (a.ablation.empty()) a.ablation = a.golden / "ablation.safetensors";
   try {
     const nlohmann::json manifest = load_json(a.golden / "manifest.json");
     // one runtime per (ablated, kv_fp8) configuration, loaded one at a time
