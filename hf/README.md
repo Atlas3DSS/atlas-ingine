@@ -3,7 +3,7 @@ license: apache-2.0
 base_model: thinkingmachines/Inkling-2-Mini
 base_model_relation: finetune
 library_name: ingine
-pipeline_tag: text-generation
+pipeline_tag: image-text-to-text
 tags:
 - abliterated
 - uncensored
@@ -20,13 +20,15 @@ tags:
 
 An **abliterated** [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) for
 **[ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine)**, a C++/CUDA inference engine
-written for this model. It answers instead of refusing, whether it replies directly or reasons first, and keeps the
-original's scores on the tested math, code and knowledge sets. On one RTX 5090 ingine decodes about 300 tokens/s,
-490-560 tokens/s with DSpark speculative decoding, reads prompts at 6,200-10,900 tokens/s and serves 262,144
-tokens of context through an OpenAI-compatible API.
+written for this model. It answers instead of refusing, whether it replies directly or reasons first, keeps the
+original's scores on the tested math, code and knowledge sets, and reads images as well as text through the
+checkpoint's own vision tower. On one RTX 5090 ingine decodes about 300 tokens/s, 490-560 tokens/s with DSpark
+speculative decoding, reads prompts at 6,200-10,900 tokens/s and serves 262,144 tokens of context through an
+OpenAI-compatible API.
 
-This repository is ready to run: Inkling-2-Mini's files, unchanged, plus `inkling-2-mini-abliterated.safetensors`,
-which ingine applies at run time. No weights were trained or modified.
+This repository is ready to run with ingine: Inkling-2-Mini's files, unchanged, plus
+`inkling-2-mini-abliterated.safetensors`, which ingine applies at run time. No weights were trained or modified, so
+other inference engines load these files as the original model and ignore the abliteration ([Files](#files)).
 
 > **Reduced safety filtering.** Refusal behaviour has been largely removed. The model can produce content
 > that the original would decline. You are responsible for how you use it and for complying with
@@ -47,6 +49,10 @@ tools, `reasoning_content`, `reasoning_effort` (`none` .. `max`) and `enable_thi
 curl -N http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"inkling-2-mini-abliterated","stream":true,"messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+Images are content parts with a base64 `data:` URI (PNG, JPEG, WebP, GIF or BMP; URLs are not fetched), for example
+`{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`. An image costs one token per 40x40
+pixels; one above 4,096 tokens is reduced to fit.
 
 ingine runs one request at a time with a short queue; a follow-up only reads what is new in its conversation, and
 conversations that take turns (subagents, a second client) stay warm in spare GPU memory. The
@@ -95,6 +101,10 @@ DSpark's drafts are checked by the full model, so it returns what plain decoding
 twelve recorded agent sessions (230 requests) need 50 s to first token in total. Decoding after 254K tokens of
 context runs at 258 tokens/s, and a passphrase hidden in the middle of those 254K tokens of source code was found.
 
+Images: the vision tower takes 3 ms for an image of up to 64 tokens, 0.17 s for 1,849 tokens (1720x1720 pixels) and
+1.1 s for 4,096, and its image embeddings match the transformers reference (FP32) to a cosine of 0.9995-0.99999 on
+the test images.
+
 ## Manual setup
 
 With CMake 3.28 or newer, Ninja and a CUDA 13.4 toolkit with cuBLAS (e.g. in `/opt/cuda`):
@@ -108,21 +118,25 @@ build/apps/serve/ingine-serve --engine --model-dir ../../inkling-2-mini-ablitera
     --max-ctx 262144 --dense-fp8 --kv-fp8 --spec --host 127.0.0.1 --port 8003
 ```
 
-Without `--ablation`, ingine serves the original model.
+Without `--ablation`, ingine serves the original model; `--no-vision` leaves out the vision tower (text only, 0.6 GB
+less GPU memory).
 
 ## Files
 
 | Path | Contents | Size |
 |---|---|---:|
-| `model-00001-of-00001.safetensors`, `model.safetensors.index.json` | Inkling-2-Mini's weights (BF16 dense, NVFP4/MXFP8 routed experts), unchanged | 19.5 GB |
+| `model-00001-of-00001.safetensors`, `model.safetensors.index.json` | Inkling-2-Mini's weights (BF16 dense layers and vision tower, NVFP4/MXFP8 routed experts), unchanged | 19.5 GB |
 | `mtp.safetensors` | Inkling-2-Mini's DSpark drafter, unchanged | 636 MB |
 | `inkling-2-mini-abliterated.safetensors` | the abliteration | 1.8 MB |
 | `config.json`, `generation_config.json`, `hf_quant_config.json`, `processor_config.json`, tokenizer files, `tiktoken/`, `chat_template.jinja` | Inkling-2-Mini's configuration, tokenizer and chat template, unchanged | small |
 | `README.md`, `LICENSE`, `NOTICE`, `SHA256SUMS` | this card, Apache-2.0, attributions, checksums of every file | small |
 | `abliteration/` | the scripts and raw results behind the numbers above | small |
 
-The abliteration file works only with an engine that applies it as ingine does, to every attention and MLP write
-after its short convolution; folding it into the weights gives a different model, which was not measured.
+Other inference engines load these files as the original Inkling-2-Mini and ignore the abliteration file. It takes
+effect only where it is applied as ingine applies it: to every attention and MLP write after its short convolution,
+with its own weight for each pass through the looped layers, and only where a detector flags the write. Because the
+detector depends on the input, it cannot be folded into the weights. The transformers-based reference in
+`abliteration/inkling_ref.py` applies it too (for measurements, not serving).
 
 ## License
 
@@ -133,5 +147,5 @@ after its short convolution; folding it into the weights gives a different model
   p-e-w. Attributions are in `NOTICE`.
 
 Unofficial community release, not endorsed by Thinking Machines; provided as is, without warranty. Not tested:
-refusals with sampling or in other languages, broad benchmarks, other GPUs and other inference engines. Do not
-expose the server unauthenticated to untrusted networks.
+refusals with sampling or in other languages, broad benchmarks, image benchmarks, other GPUs. Do not expose the
+server unauthenticated to untrusted networks.
