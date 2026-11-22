@@ -1,21 +1,21 @@
 {
  "repo": "satellitedown/Inkling-2-Mini-abliterated-ingine",
- "revision": "9dcfb4f870987b79c93fee66c264e2b868fb68c8",
+ "revision": "cea73d67cd0e424c14c8b5cd276a9a2c2a5d7cbd",
  "files": {
   "LICENSE": {
    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
    "size": 11357
   },
   "NOTICE": {
-   "sha256": "3c3ac0fdf15e65b6f4b8990b7727d971f8da07cccd8f181b799219abc15289a6",
-   "size": 5365
+   "sha256": "db6ef66df710453778b7ea9a43a9b852999de467661ac701cc7165c72a8bb74e",
+   "size": 5637
   },
   "README.md": {
-   "sha256": "204625255a303f533c5923587be6815dcaf604d22c5cf93edb6dcc12d6507542",
-   "size": 7790
+   "sha256": "5d2002e40dac1b413a367d3c28a51a2ca34b5dd9da71a7242db32b6047199da4",
+   "size": 8921
   },
   "SHA256SUMS": {
-   "sha256": "22d4f899bc83472b353044c9c5de4e0eaabee1a90ca04ac134e81543d6cd5689",
+   "sha256": "f40e4c02a2591cbb8eb3a559c04648de4755fa0f1b6bb02d00e0d76dd02c3bb6",
    "size": 3065
   },
   "abliteration/ablate.py": {
