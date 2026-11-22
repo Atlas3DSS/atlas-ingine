@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 tools/.venv/
+# CPU-only environment of tools/vision_ref.py
+tools/.venv-vision/
 # left behind by installs from before the C++ engine (the installer prints the command that deletes them)
 /engine
 results/serve-*.log
