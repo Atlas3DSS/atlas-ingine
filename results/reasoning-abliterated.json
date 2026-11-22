@@ -13,9 +13,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 206,
-   "reasoning_chars": 511,
-   "seconds": 0.4
+   "tokens": 129,
+   "reasoning_chars": 252,
+   "seconds": 0.3
   },
   {
    "task": "gsm8k",
@@ -28,10 +28,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 1.0,
-   "tokens": 270,
-   "reasoning_chars": 497,
-   "seconds": 0.5
+   "distinct": 0.991,
+   "tokens": 284,
+   "reasoning_chars": 662,
+   "seconds": 0.6
   },
   {
    "task": "gsm8k",
@@ -45,9 +45,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 143,
-   "reasoning_chars": 239,
-   "seconds": 0.3
+   "tokens": 131,
+   "reasoning_chars": 237,
+   "seconds": 0.2
   },
   {
    "task": "gsm8k",
@@ -61,8 +61,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 329,
-   "reasoning_chars": 930,
+   "tokens": 305,
+   "reasoning_chars": 799,
    "seconds": 0.6
   },
   {
@@ -77,9 +77,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 322,
-   "reasoning_chars": 576,
-   "seconds": 0.7
+   "tokens": 276,
+   "reasoning_chars": 506,
+   "seconds": 0.6
   },
   {
    "task": "gsm8k",
@@ -93,9 +93,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 144,
-   "reasoning_chars": 202,
-   "seconds": 0.3
+   "tokens": 166,
+   "reasoning_chars": 369,
+   "seconds": 0.4
   },
   {
    "task": "gsm8k",
@@ -109,9 +109,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 272,
-   "reasoning_chars": 653,
-   "seconds": 0.6
+   "tokens": 163,
+   "reasoning_chars": 321,
+   "seconds": 0.4
   },
   {
    "task": "gsm8k",
@@ -124,9 +124,9 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.98,
-   "tokens": 217,
-   "reasoning_chars": 562,
+   "distinct": 1.0,
+   "tokens": 229,
+   "reasoning_chars": 597,
    "seconds": 0.5
   },
   {
@@ -140,10 +140,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.947,
-   "tokens": 395,
-   "reasoning_chars": 1029,
-   "seconds": 0.7
+   "distinct": 1.0,
+   "tokens": 304,
+   "reasoning_chars": 671,
+   "seconds": 0.6
   },
   {
    "task": "gsm8k",
@@ -157,8 +157,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 148,
-   "reasoning_chars": 435,
+   "tokens": 150,
+   "reasoning_chars": 437,
    "seconds": 0.4
   },
   {
@@ -173,8 +173,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 142,
-   "reasoning_chars": 309,
+   "tokens": 119,
+   "reasoning_chars": 250,
    "seconds": 0.3
   },
   {
@@ -189,9 +189,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 102,
-   "reasoning_chars": 156,
-   "seconds": 0.2
+   "tokens": 117,
+   "reasoning_chars": 230,
+   "seconds": 0.3
   },
   {
    "task": "gsm8k",
@@ -205,8 +205,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 188,
-   "reasoning_chars": 390,
+   "tokens": 160,
+   "reasoning_chars": 274,
    "seconds": 0.4
   },
   {
@@ -221,9 +221,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 117,
-   "reasoning_chars": 247,
-   "seconds": 0.3
+   "tokens": 180,
+   "reasoning_chars": 414,
+   "seconds": 0.4
   },
   {
    "task": "gsm8k",
@@ -237,9 +237,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 163,
-   "reasoning_chars": 324,
-   "seconds": 0.3
+   "tokens": 227,
+   "reasoning_chars": 575,
+   "seconds": 0.5
   },
   {
    "task": "gsm8k",
@@ -253,8 +253,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 148,
-   "reasoning_chars": 240,
+   "tokens": 132,
+   "reasoning_chars": 181,
    "seconds": 0.3
   },
   {
@@ -269,9 +269,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 183,
-   "reasoning_chars": 470,
-   "seconds": 0.4
+   "tokens": 136,
+   "reasoning_chars": 215,
+   "seconds": 0.3
   },
   {
    "task": "gsm8k",
@@ -285,8 +285,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 162,
-   "reasoning_chars": 310,
+   "tokens": 165,
+   "reasoning_chars": 309,
    "seconds": 0.4
   },
   {
@@ -301,8 +301,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 156,
-   "reasoning_chars": 174,
+   "tokens": 138,
+   "reasoning_chars": 164,
    "seconds": 0.3
   },
   {
@@ -317,8 +317,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 144,
-   "reasoning_chars": 345,
+   "tokens": 137,
+   "reasoning_chars": 287,
    "seconds": 0.3
   },
   {
@@ -333,8 +333,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 113,
-   "reasoning_chars": 164,
+   "tokens": 125,
+   "reasoning_chars": 212,
    "seconds": 0.3
   },
   {
@@ -349,9 +349,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 85,
-   "reasoning_chars": 166,
-   "seconds": 0.2
+   "tokens": 136,
+   "reasoning_chars": 401,
+   "seconds": 0.3
   },
   {
    "task": "gsm8k",
@@ -364,10 +364,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 1.0,
-   "tokens": 351,
-   "reasoning_chars": 980,
-   "seconds": 0.7
+   "distinct": 0.983,
+   "tokens": 399,
+   "reasoning_chars": 936,
+   "seconds": 0.8
   },
   {
    "task": "gsm8k",
@@ -381,8 +381,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 124,
-   "reasoning_chars": 221,
+   "tokens": 114,
+   "reasoning_chars": 215,
    "seconds": 0.2
   },
   {
@@ -397,8 +397,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 317,
-   "reasoning_chars": 715,
+   "tokens": 291,
+   "reasoning_chars": 704,
    "seconds": 0.7
   },
   {
@@ -413,9 +413,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 219,
-   "reasoning_chars": 403,
-   "seconds": 0.5
+   "tokens": 175,
+   "reasoning_chars": 291,
+   "seconds": 0.4
   },
   {
    "task": "gsm8k",
@@ -428,10 +428,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.961,
-   "tokens": 373,
-   "reasoning_chars": 1181,
-   "seconds": 0.8
+   "distinct": 1.0,
+   "tokens": 318,
+   "reasoning_chars": 881,
+   "seconds": 0.7
   },
   {
    "task": "gsm8k",
@@ -445,9 +445,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 373,
-   "reasoning_chars": 1047,
-   "seconds": 0.8
+   "tokens": 422,
+   "reasoning_chars": 1211,
+   "seconds": 1.0
   },
   {
    "task": "gsm8k",
@@ -461,9 +461,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 283,
-   "reasoning_chars": 729,
-   "seconds": 0.6
+   "tokens": 236,
+   "reasoning_chars": 570,
+   "seconds": 0.5
   },
   {
    "task": "gsm8k",
@@ -477,9 +477,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 358,
-   "reasoning_chars": 790,
-   "seconds": 0.8
+   "tokens": 317,
+   "reasoning_chars": 589,
+   "seconds": 0.6
   },
   {
    "task": "gsm8k",
@@ -493,8 +493,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 139,
-   "reasoning_chars": 216,
+   "tokens": 158,
+   "reasoning_chars": 238,
    "seconds": 0.3
   },
   {
@@ -509,8 +509,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 158,
-   "reasoning_chars": 309,
+   "tokens": 205,
+   "reasoning_chars": 439,
    "seconds": 0.4
   },
   {
@@ -524,10 +524,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.954,
-   "tokens": 1582,
-   "reasoning_chars": 4791,
-   "seconds": 3.0
+   "distinct": 0.972,
+   "tokens": 1255,
+   "reasoning_chars": 3659,
+   "seconds": 2.5
   },
   {
    "task": "gsm8k",
@@ -541,8 +541,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 155,
-   "reasoning_chars": 286,
+   "tokens": 138,
+   "reasoning_chars": 181,
    "seconds": 0.3
   },
   {
@@ -557,8 +557,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 249,
-   "reasoning_chars": 483,
+   "tokens": 181,
+   "reasoning_chars": 292,
    "seconds": 0.4
   },
   {
@@ -573,9 +573,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 213,
-   "reasoning_chars": 471,
-   "seconds": 0.4
+   "tokens": 227,
+   "reasoning_chars": 560,
+   "seconds": 0.5
   },
   {
    "task": "gsm8k",
@@ -589,8 +589,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 197,
-   "reasoning_chars": 403,
+   "tokens": 189,
+   "reasoning_chars": 379,
    "seconds": 0.4
   },
   {
@@ -599,15 +599,15 @@
    "effort": "low",
    "seed": 2067,
    "want": 245,
-   "got": 24500,
-   "ok": false,
+   "got": 245,
+   "ok": true,
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 1.0,
-   "tokens": 241,
-   "reasoning_chars": 513,
-   "seconds": 0.5
+   "distinct": 0.995,
+   "tokens": 416,
+   "reasoning_chars": 1177,
+   "seconds": 0.9
   },
   {
    "task": "gsm8k",
@@ -621,9 +621,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 191,
-   "reasoning_chars": 456,
-   "seconds": 0.4
+   "tokens": 149,
+   "reasoning_chars": 292,
+   "seconds": 0.3
   },
   {
    "task": "gsm8k",
@@ -637,8 +637,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 96,
-   "reasoning_chars": 121,
+   "tokens": 113,
+   "reasoning_chars": 195,
    "seconds": 0.2
   },
   {
@@ -653,9 +653,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 254,
-   "reasoning_chars": 681,
-   "seconds": 0.6
+   "tokens": 177,
+   "reasoning_chars": 344,
+   "seconds": 0.4
   },
   {
    "task": "gsm8k",
@@ -668,10 +668,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.981,
-   "tokens": 360,
-   "reasoning_chars": 871,
-   "seconds": 0.7
+   "distinct": 1.0,
+   "tokens": 382,
+   "reasoning_chars": 911,
+   "seconds": 0.8
   },
   {
    "task": "gsm8k",
@@ -685,9 +685,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 180,
-   "reasoning_chars": 273,
-   "seconds": 0.3
+   "tokens": 178,
+   "reasoning_chars": 288,
+   "seconds": 0.4
   },
   {
    "task": "gsm8k",
@@ -700,10 +700,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.924,
-   "tokens": 681,
-   "reasoning_chars": 2343,
-   "seconds": 1.4
+   "distinct": 0.952,
+   "tokens": 497,
+   "reasoning_chars": 1391,
+   "seconds": 1.0
   },
   {
    "task": "gsm8k",
@@ -717,8 +717,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 342,
-   "reasoning_chars": 560,
+   "tokens": 327,
+   "reasoning_chars": 620,
    "seconds": 0.7
   },
   {
@@ -733,8 +733,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 146,
-   "reasoning_chars": 182,
+   "tokens": 134,
+   "reasoning_chars": 183,
    "seconds": 0.3
   },
   {
@@ -749,9 +749,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 327,
-   "reasoning_chars": 848,
-   "seconds": 0.7
+   "tokens": 397,
+   "reasoning_chars": 1046,
+   "seconds": 0.8
   },
   {
    "task": "gsm8k",
@@ -765,8 +765,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 216,
-   "reasoning_chars": 286,
+   "tokens": 210,
+   "reasoning_chars": 390,
    "seconds": 0.4
   },
   {
@@ -780,9 +780,9 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.934,
-   "tokens": 590,
-   "reasoning_chars": 1677,
+   "distinct": 0.96,
+   "tokens": 579,
+   "reasoning_chars": 1647,
    "seconds": 1.1
   },
   {
@@ -797,9 +797,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 200,
-   "reasoning_chars": 466,
-   "seconds": 0.4
+   "tokens": 191,
+   "reasoning_chars": 403,
+   "seconds": 0.5
   },
   {
    "task": "gsm8k",
@@ -813,9 +813,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 150,
-   "reasoning_chars": 316,
-   "seconds": 0.4
+   "tokens": 118,
+   "reasoning_chars": 244,
+   "seconds": 0.3
   },
   {
    "task": "gsm8k",
@@ -829,9 +829,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 224,
-   "reasoning_chars": 477,
-   "seconds": 0.4
+   "tokens": 129,
+   "reasoning_chars": 211,
+   "seconds": 0.3
   },
   {
    "task": "gsm8k",
@@ -845,9 +845,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 240,
-   "reasoning_chars": 598,
-   "seconds": 0.5
+   "tokens": 262,
+   "reasoning_chars": 664,
+   "seconds": 0.6
   },
   {
    "task": "gsm8k",
@@ -861,9 +861,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 167,
-   "reasoning_chars": 357,
-   "seconds": 0.3
+   "tokens": 222,
+   "reasoning_chars": 580,
+   "seconds": 0.5
   },
   {
    "task": "gsm8k",
@@ -877,9 +877,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 264,
-   "reasoning_chars": 721,
-   "seconds": 0.5
+   "tokens": 294,
+   "reasoning_chars": 907,
+   "seconds": 0.6
   },
   {
    "task": "gsm8k",
@@ -893,8 +893,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 158,
-   "reasoning_chars": 185,
+   "tokens": 175,
+   "reasoning_chars": 231,
    "seconds": 0.3
   },
   {
@@ -909,9 +909,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 140,
-   "reasoning_chars": 208,
-   "seconds": 0.3
+   "tokens": 165,
+   "reasoning_chars": 306,
+   "seconds": 0.4
   },
   {
    "task": "gsm8k",
@@ -925,9 +925,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 194,
-   "reasoning_chars": 443,
-   "seconds": 0.4
+   "tokens": 286,
+   "reasoning_chars": 788,
+   "seconds": 0.6
   },
   {
    "task": "gsm8k",
@@ -941,9 +941,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 202,
-   "reasoning_chars": 270,
-   "seconds": 0.4
+   "tokens": 220,
+   "reasoning_chars": 512,
+   "seconds": 0.5
   },
   {
    "task": "gsm8k",
@@ -957,9 +957,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 221,
-   "reasoning_chars": 635,
-   "seconds": 0.5
+   "tokens": 222,
+   "reasoning_chars": 581,
+   "seconds": 0.4
   },
   {
    "task": "gsm8k",
@@ -973,9 +973,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 127,
-   "reasoning_chars": 147,
-   "seconds": 0.3
+   "tokens": 148,
+   "reasoning_chars": 171,
+   "seconds": 0.4
   },
   {
    "task": "gsm8k",
@@ -989,8 +989,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 96,
-   "reasoning_chars": 117,
+   "tokens": 106,
+   "reasoning_chars": 114,
    "seconds": 0.2
   },
   {
@@ -1004,9 +1004,9 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.97,
-   "tokens": 653,
-   "reasoning_chars": 1812,
+   "distinct": 0.893,
+   "tokens": 609,
+   "reasoning_chars": 1794,
    "seconds": 1.4
   },
   {
@@ -1021,8 +1021,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 138,
-   "reasoning_chars": 156,
+   "tokens": 144,
+   "reasoning_chars": 327,
    "seconds": 0.3
   },
   {
@@ -1036,10 +1036,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.974,
-   "tokens": 547,
-   "reasoning_chars": 1542,
-   "seconds": 1.1
+   "distinct": 1.0,
+   "tokens": 433,
+   "reasoning_chars": 1200,
+   "seconds": 0.9
   },
   {
    "task": "gsm8k",
@@ -1053,8 +1053,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 240,
-   "reasoning_chars": 311,
+   "tokens": 230,
+   "reasoning_chars": 333,
    "seconds": 0.4
   },
   {
@@ -1068,10 +1068,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.962,
-   "tokens": 1208,
-   "reasoning_chars": 4109,
-   "seconds": 2.4
+   "distinct": 0.983,
+   "tokens": 385,
+   "reasoning_chars": 1095,
+   "seconds": 0.7
   },
   {
    "task": "gsm8k",
@@ -1085,9 +1085,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 826,
-   "reasoning_chars": 2601,
-   "seconds": 1.8
+   "tokens": 2246,
+   "reasoning_chars": 8016,
+   "seconds": 5.3
   },
   {
    "task": "gsm8k",
@@ -1100,10 +1100,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.961,
-   "tokens": 487,
-   "reasoning_chars": 1487,
-   "seconds": 1.0
+   "distinct": 0.959,
+   "tokens": 885,
+   "reasoning_chars": 3036,
+   "seconds": 1.8
   },
   {
    "task": "gsm8k",
@@ -1116,10 +1116,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.99,
-   "tokens": 490,
-   "reasoning_chars": 1044,
-   "seconds": 1.0
+   "distinct": 1.0,
+   "tokens": 331,
+   "reasoning_chars": 638,
+   "seconds": 0.7
   },
   {
    "task": "gsm8k",
@@ -1133,8 +1133,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 154,
-   "reasoning_chars": 167,
+   "tokens": 141,
+   "reasoning_chars": 157,
    "seconds": 0.3
   },
   {
@@ -1149,9 +1149,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 189,
-   "reasoning_chars": 239,
-   "seconds": 0.4
+   "tokens": 178,
+   "reasoning_chars": 235,
+   "seconds": 0.3
   },
   {
    "task": "gsm8k",
@@ -1164,10 +1164,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.985,
-   "tokens": 3863,
-   "reasoning_chars": 12705,
-   "seconds": 7.6
+   "distinct": 1.0,
+   "tokens": 4995,
+   "reasoning_chars": 16301,
+   "seconds": 10.3
   },
   {
    "task": "gsm8k",
@@ -1180,10 +1180,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 1.0,
-   "tokens": 170,
-   "reasoning_chars": 304,
-   "seconds": 0.4
+   "distinct": 0.969,
+   "tokens": 375,
+   "reasoning_chars": 1128,
+   "seconds": 0.8
   },
   {
    "task": "gsm8k",
@@ -1197,9 +1197,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 411,
-   "reasoning_chars": 929,
-   "seconds": 0.7
+   "tokens": 312,
+   "reasoning_chars": 673,
+   "seconds": 0.6
   },
   {
    "task": "gsm8k",
@@ -1212,10 +1212,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.977,
-   "tokens": 618,
-   "reasoning_chars": 1674,
-   "seconds": 1.2
+   "distinct": 1.0,
+   "tokens": 455,
+   "reasoning_chars": 960,
+   "seconds": 0.8
   },
   {
    "task": "gsm8k",
@@ -1228,10 +1228,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.971,
-   "tokens": 350,
-   "reasoning_chars": 923,
-   "seconds": 0.7
+   "distinct": 1.0,
+   "tokens": 316,
+   "reasoning_chars": 727,
+   "seconds": 0.6
   },
   {
    "task": "gsm8k",
@@ -1244,10 +1244,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 1.0,
-   "tokens": 2739,
-   "reasoning_chars": 9745,
-   "seconds": 5.9
+   "distinct": 0.85,
+   "tokens": 830,
+   "reasoning_chars": 2751,
+   "seconds": 1.7
   },
   {
    "task": "gsm8k",
@@ -1261,8 +1261,8 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 247,
-   "reasoning_chars": 650,
+   "tokens": 222,
+   "reasoning_chars": 577,
    "seconds": 0.5
   },
   {
@@ -1277,9 +1277,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 143,
-   "reasoning_chars": 239,
-   "seconds": 0.3
+   "tokens": 103,
+   "reasoning_chars": 150,
+   "seconds": 0.2
   },
   {
    "task": "aime",
@@ -1293,9 +1293,9 @@
    "finished": true,
    "loop": false,
    "distinct": 0.995,
-   "tokens": 1384,
-   "reasoning_chars": 2680,
-   "seconds": 2.5
+   "tokens": 1411,
+   "reasoning_chars": 2463,
+   "seconds": 2.6
   },
   {
    "task": "aime",
@@ -1309,9 +1309,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 13325,
-   "reasoning_chars": 30030,
-   "seconds": 25.7
+   "tokens": 13485,
+   "reasoning_chars": 28616,
+   "seconds": 26.6
   },
   {
    "task": "aime",
@@ -1319,16 +1319,15 @@
    "effort": "high",
    "seed": 2002,
    "want": 371,
-   "got": null,
-   "ok": false,
-   "finish": "length",
-   "finished": false,
+   "got": 371,
+   "ok": true,
+   "finish": "stop",
+   "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 32768,
-   "reasoning_chars": 88801,
-   "seconds": 67.8,
-   "tail": "r A index0, p,q are {1,3}, {?}. Also p,q could be {0,?}, but A index0 already, remaining p,q \u2208{1,2,3}; only differ2: {1,3}. What about {2,?} difference? {2,?} difference2 would require ?=0 or? ?=0 not in remaining (A), or ?=? 2+2=0 mod4 (A), 2-2=0 mod4. So no. Good. Thus if rotate-able, p,q={1,3}. Only four relative shapes fail. Good.\n\nNeed also consider r=0: There are 16 subsets with no antipodal pairs. We said rotate by4. For B with no antipodal pairs, B+4 is disjoint? If x+4 equals y (another blue point) then x,y antipodal, forbidden; so disjoint. Cannot equal? size4, complement size4,\n---\n"
+   "tokens": 22104,
+   "reasoning_chars": 56993,
+   "seconds": 45.2
   },
   {
    "task": "aime",
@@ -1341,11 +1340,11 @@
    "finish": "length",
    "finished": false,
    "loop": false,
-   "distinct": 1.0,
+   "distinct": 0.98,
    "tokens": 32768,
-   "reasoning_chars": 71477,
-   "seconds": 61.8,
-   "tail": " (period1/12). Within each period, \u03a6(C) is a function of C that starts/ends at1 (r=1) and oscillates. L(C)=|sin(2\u03c0\u03a6(C))| = h(\u03a6(C)), where h(z)=|sin(2\u03c0z)|. But \u03a6(C) itself is a function of |cos(12\u03c0C)|; maybe h\u2218\u03a6 simplifies again. Let's test: \u03a6(C) starts/ends1 across a period; h(1)=0. At endpoints of \u03a6 period, L=0. In the interior, \u03a6 dips to0 at r=1/4,3/4? Let's list \u03a6(C) for a period (\u03b8\u2208[0,\u03c0], r=|cos\u03b8|):\n r=1 (\u03b8=0) \u03a6=1 (since \u03c61=1); r=3/4 \u03a6=0; r=1/2 \u03a6=1; r=1/4 \u03a6=0; r=0 \u03a6=1; then as \u03b8 increases (r increases), r=1/4 \u03a6=0; r=1/2 \u03a6=1; r=3/4 \u03a6=0; r=1 \u03a6=1. So \u03a6(C) (over \u03b8 0\u2192\u03c0) goes: 1\u21920\u21921\u21920\u21921\u21920\u21921\n---\n"
+   "reasoning_chars": 69967,
+   "seconds": 61.9,
+   "tail": "dpoints at1 and line t+c could equal1 at final segment endpoint for k=2? Need handle endpoints and exact equality carefully.\n\nBut wait: The copy shape F(w) spans full range [0,1] on each G-segment, and the line t+c also spans [c, c+1/3] across the period. For k=0 (c=0), line on [0,1/3] spans [0,1/3]. It is never above1/3. R(t) has many sections going from0 to1 and back; each monotonic section with values spanning across line will have exactly one intersection. Since R starts at1 and ends at1 within each copy, and line low (0..1/3), every section that descends from1 to0 or ascends from0 to\n---\n"
   },
   {
    "task": "aime",
@@ -1359,9 +1358,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 9743,
-   "reasoning_chars": 22538,
-   "seconds": 20.7
+   "tokens": 7903,
+   "reasoning_chars": 18074,
+   "seconds": 17.9
   },
   {
    "task": "aime",
@@ -1375,9 +1374,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 11259,
-   "reasoning_chars": 28161,
-   "seconds": 21.3
+   "tokens": 6217,
+   "reasoning_chars": 13144,
+   "seconds": 11.8
   },
   {
    "task": "aime",
@@ -1391,9 +1390,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 11656,
-   "reasoning_chars": 30561,
-   "seconds": 23.7
+   "tokens": 12860,
+   "reasoning_chars": 31514,
+   "seconds": 26.7
   },
   {
    "task": "aime",
@@ -1407,9 +1406,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 1544,
-   "reasoning_chars": 3179,
-   "seconds": 2.8
+   "tokens": 1149,
+   "reasoning_chars": 2381,
+   "seconds": 2.2
   },
   {
    "task": "aime",
@@ -1423,9 +1422,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 4751,
-   "reasoning_chars": 11086,
-   "seconds": 9.4
+   "tokens": 3227,
+   "reasoning_chars": 7703,
+   "seconds": 6.7
   },
   {
    "task": "aime",
@@ -1438,10 +1437,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 0.99,
-   "tokens": 1093,
-   "reasoning_chars": 2483,
-   "seconds": 2.2
+   "distinct": 0.972,
+   "tokens": 1118,
+   "reasoning_chars": 2690,
+   "seconds": 2.4
   },
   {
    "task": "aime",
@@ -1455,9 +1454,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 13639,
-   "reasoning_chars": 37741,
-   "seconds": 28.1
+   "tokens": 15209,
+   "reasoning_chars": 40059,
+   "seconds": 31.3
   },
   {
    "task": "aime",
@@ -1471,9 +1470,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 1529,
-   "reasoning_chars": 4899,
-   "seconds": 3.5
+   "tokens": 3453,
+   "reasoning_chars": 11068,
+   "seconds": 7.5
   },
   {
    "task": "aime",
@@ -1487,9 +1486,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 2080,
-   "reasoning_chars": 3870,
-   "seconds": 3.8
+   "tokens": 1805,
+   "reasoning_chars": 3644,
+   "seconds": 3.5
   },
   {
    "task": "aime",
@@ -1502,10 +1501,10 @@
    "finish": "stop",
    "finished": true,
    "loop": false,
-   "distinct": 1.0,
-   "tokens": 29039,
-   "reasoning_chars": 97664,
-   "seconds": 65.5
+   "distinct": 0.992,
+   "tokens": 15590,
+   "reasoning_chars": 48858,
+   "seconds": 33.9
   },
   {
    "task": "aime",
@@ -1519,9 +1518,9 @@
    "finished": true,
    "loop": false,
    "distinct": 1.0,
-   "tokens": 4127,
-   "reasoning_chars": 10771,
-   "seconds": 8.8
+   "tokens": 6804,
+   "reasoning_chars": 17992,
+   "seconds": 14.4
   }
  ],
  "determinism": [
@@ -1530,8 +1529,8 @@
    "seed": null,
    "same": true,
    "tokens": [
-    154,
-    154
+    125,
+    125
    ]
   },
   {
@@ -1539,8 +1538,8 @@
    "seed": 1234,
    "same": true,
    "tokens": [
-    164,
-    164
+    167,
+    167
    ]
   },
   {
@@ -1548,8 +1547,8 @@
    "seed": null,
    "same": true,
    "tokens": [
-    255,
-    255
+    265,
+    265
    ]
   },
   {
@@ -1557,8 +1556,8 @@
    "seed": 1234,
    "same": true,
    "tokens": [
-    255,
-    255
+    287,
+    287
    ]
   },
   {
@@ -1566,8 +1565,8 @@
    "seed": null,
    "same": true,
    "tokens": [
-    115,
-    115
+    119,
+    119
    ]
   },
   {
@@ -1575,20 +1574,20 @@
    "seed": 1234,
    "same": true,
    "tokens": [
-    123,
-    123
+    126,
+    126
    ]
   }
  ],
  "summary": {
   "gsm8k/low": {
    "n": 40,
-   "correct": 39,
+   "correct": 40,
    "finished": 40,
    "looping": 0,
    "truncated": 0,
-   "tokens_median": 189.5,
-   "tokens_p90": 358
+   "tokens_median": 170.5,
+   "tokens_p90": 318
   },
   "gsm8k/high": {
    "n": 40,
@@ -1596,17 +1595,17 @@
    "finished": 40,
    "looping": 0,
    "truncated": 0,
-   "tokens_median": 240.0,
-   "tokens_p90": 681
+   "tokens_median": 246.0,
+   "tokens_p90": 609
   },
   "aime/high": {
    "n": 15,
-   "correct": 13,
-   "finished": 13,
+   "correct": 14,
+   "finished": 14,
    "looping": 0,
-   "truncated": 2,
-   "tokens_median": 9743,
-   "tokens_p90": 29039
+   "truncated": 1,
+   "tokens_median": 6804,
+   "tokens_p90": 15590
   },
   "deterministic": "6/6"
  }

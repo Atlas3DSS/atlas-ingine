@@ -22,7 +22,7 @@ An **abliterated** [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thin
 **[ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine)**, a C++/CUDA inference engine
 written for this model. It answers instead of refusing, whether it replies directly or reasons first, and keeps the
 original's scores on the tested math, code and knowledge sets. On one RTX 5090 ingine decodes about 300 tokens/s,
-490-570 tokens/s with DSpark speculative decoding, reads prompts at 6,200-10,900 tokens/s and serves 262,144
+490-560 tokens/s with DSpark speculative decoding, reads prompts at 6,200-10,900 tokens/s and serves 262,144
 tokens of context through an OpenAI-compatible API.
 
 This repository is ready to run: Inkling-2-Mini's files, unchanged, plus `inkling-2-mini-abliterated.safetensors`,
@@ -66,16 +66,18 @@ context and memory settings, updates and agent setup (including Oh My Pi).
 |---|---:|---:|
 | Refusals, `mlabonne/harmful_behaviors` test (104), direct answer | 104 | **1** |
 | Refusals, JailbreakBench harmful behaviours (100), direct answer | 100 | **5** |
-| Refusals, `harmful_behaviors` test (48), reasoning first | 47 | **0** |
-| Refusals, 32 mild borderline prompts, direct / reasoning first | 15 / 8 | **1 / 0** (the one notes it cannot produce images, then writes the scene) |
+| Refusals, `harmful_behaviors` test (48), reasoning first | 48 | **3** (each says what it cannot literally do, such as publish the text, then writes it) |
+| Refusals, 32 mild borderline prompts, direct / reasoning first | 15 / 8 | **1 / 0** (the one hedges, then writes a toned-down scene) |
 | Math (20, reasoning) / Python (12, tests executed) / multiple choice (12) | 20/20, 12/12, 12/12 | **20/20, 12/12, 12/12** |
-| Reasoning at temperature 1, correct: GSM8K (40) effort low / high, AIME 2024 (15) | 40/40, 40/40, 13/15 | **39/40, 40/40, 13/15** |
+| Reasoning at temperature 1, correct: GSM8K (40) effort low / high, AIME 2024 (15) | 40/40, 40/40, 13/15 | **40/40, 40/40, 14/15** |
 | Reasoning at temperature 1: samples that loop (95) | 0 | **0** |
-| Agreement with the original on 8,192 tokens of technical docs: top-1 / mean KLD | 1 / 0 | **0.912 / 0.034** |
-| KL divergence on the original's own answers to 64 held-out harmless prompts | 0 | **0.043** |
+| Agreement with the original on 8,192 tokens of technical docs: top-1 / mean KLD | 1 / 0 | **0.964 / 0.005** |
+| KL divergence on the original's own answers to 64 harmless prompts | 0 | **0.014** |
 
-Greedy decoding on prompts the abliteration never saw, except the reasoning rows (sampled, through ingine's default
-profile); raw data in `abliteration/results/`.
+Greedy decoding, except the reasoning rows (sampled, through ingine's default profile). A refusal is an answer that
+contains a refusal phrase. The weight per layer comes from an earlier search that scored part of the
+`harmful_behaviors` test prompts and these 64 harmless prompts; on the 40 test prompts and 90 JailbreakBench prompts
+that nothing used, this release refuses 0 and 4. Raw data, with every answer, in `abliteration/results/`.
 
 Speed on one RTX 5090 with the default profile (262,144-token context, FP8 KV cache), one request, tokens per
 second while generating ("chat" explains hash-map collisions and "code" writes an LRU-cache module with tests:
@@ -84,9 +86,9 @@ short prompts, up to 1024 tokens; "agent" replays 24 recorded coding-agent reque
 | | chat | code | agent |
 |---|---:|---:|---:|
 | plain decoding, greedy | 306 | 301 | |
-| DSpark, greedy | 486 | 568 | 524 |
+| DSpark, greedy | 501 | 561 | 510 |
 | plain decoding, temperature 1 | 301 | 301 | 279 |
-| DSpark, temperature 1 (the default) | 489 | 565 | 502 |
+| DSpark, temperature 1 (the default) | 487 | 554 | 501 |
 
 DSpark's drafts are checked by the full model, so it returns what plain decoding returns. A new prompt is read at
 10,900 tokens/s (20K tokens), 8,000 (131K) and 6,200 (254K, 41 s); a follow-up request only reads what is new:
@@ -114,7 +116,7 @@ Without `--ablation`, ingine serves the original model.
 |---|---|---:|
 | `model-00001-of-00001.safetensors`, `model.safetensors.index.json` | Inkling-2-Mini's weights (BF16 dense, NVFP4/MXFP8 routed experts), unchanged | 19.5 GB |
 | `mtp.safetensors` | Inkling-2-Mini's DSpark drafter, unchanged | 636 MB |
-| `inkling-2-mini-abliterated.safetensors` | the abliteration | 885 KB |
+| `inkling-2-mini-abliterated.safetensors` | the abliteration | 1.8 MB |
 | `config.json`, `generation_config.json`, `hf_quant_config.json`, `processor_config.json`, tokenizer files, `tiktoken/`, `chat_template.jinja` | Inkling-2-Mini's configuration, tokenizer and chat template, unchanged | small |
 | `README.md`, `LICENSE`, `NOTICE`, `SHA256SUMS` | this card, Apache-2.0, attributions, checksums of every file | small |
 | `abliteration/` | the scripts and raw results behind the numbers above | small |

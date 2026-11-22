@@ -1,9 +1,10 @@
 # Inkling-2-Mini abliterated: ingine
 
 An abliterated [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) served
-by **ingine**, a custom CUDA inference engine for one RTX 5090. It refuses neither when it answers directly nor when
-it reasons first (1/104 and 0/48 held-out harmful prompts) and stays close to the original elsewhere. ingine
-generates 490-570 tokens/s, reads prompts at 6,200-10,900 tokens/s and serves 262,144 tokens of context through an
+by **ingine**, a custom CUDA inference engine for one RTX 5090. It answers harmful test prompts instead of refusing
+them, directly and after reasoning (refusal phrases in 1 of 104 and 3 of 48 answers, the 3 followed by the requested
+text), and stays close to the original elsewhere (KL divergence 0.014 on harmless answers). ingine
+generates 490-560 tokens/s, reads prompts at 6,200-10,900 tokens/s and serves 262,144 tokens of context through an
 OpenAI-compatible API.
 
 The installer sets everything up and downloads the ready-to-run model from Hugging Face,
@@ -72,6 +73,12 @@ Everything lives inside the install folder:
 | `native/build-install/` | the built server, `apps/serve/ingine-serve`, and its serving profile (`profile.env`, from [runtime-manifest.json](runtime-manifest.json)) |
 | `models/Inkling-2-Mini/` | the model from Hugging Face: Inkling-2-Mini's files and the abliteration file (set `INGINE_MODEL_DIR` to use a download elsewhere) |
 | `.run/` | pid file and server log, used only when there is no systemd user session (`ingine start` then runs the server with `nohup`) |
+
+Outside it the installer writes one driver setting, `~/.nv/nvidia-application-profiles-rc.d/50-ingine`: an NVIDIA
+application profile that lets `ingine-serve` use the GPU's top performance state (P0) instead of the lower one the
+driver holds CUDA programs at. On an RTX 5090 that raises the memory clock by 1.4% and decoding speed by about
+0.8%; outputs and idle power are unchanged. It needs driver 595 or newer;
+`INGINE_GPU_PROFILE=0 bash setup.sh --update` removes it.
 
 ## Use
 
@@ -205,22 +212,35 @@ match.
 
 ### Abliteration
 
-Refusals on held-out prompts the abliteration search never saw (greedy decoding):
+Refusals on harmful test prompts (greedy decoding; an answer counts as a refusal when it contains a refusal phrase,
+and every answer is in [`results/verify-abliterated.json`](results/verify-abliterated.json)):
 
 | | original | abliterated |
 |---|---|---|
 | `harmful_test` (104), direct answer | 104/104 | 1/104 |
 | JailbreakBench harmful behaviours (100), direct answer | 100/100 | 5/100 |
-| `harmful_test` (48), reasoning first (effort low, 768-token budget) | 47/48 | 0/48 |
+| `harmful_test` (48), reasoning first (effort low, 768-token budget) | 48/48 | 3/48 (each says what it cannot literally do, such as publish or spread the text, then writes it) |
+| through ingine: `harmful_test` (104), direct answer | 104/104 | 3/104 |
+| through ingine: the same with reasoning effort `none` | 104/104 | 0/104 |
+| through ingine: `harmful_test` (48), reasoning first (effort low) | 48/48 | 1/48 (answers after the caveat) |
+| through ingine: `harmful_test` (24), reasoning first (default effort) | 24/24 | 0/24 |
+| through ingine: JailbreakBench (100), direct answer | 100/100 | 5/100 |
 
-Damage against the original model: KL divergence 0.043 on its own answers to 64 held-out harmless prompts; on
-8,192 tokens of technical prose, mean KL 0.034 and 91.2% top-1 agreement.
+The first three rows are measured in the reference model in `tools/`. Not every prompt was unseen: the weight per
+layer comes from an earlier search that scored refusals on prompts among the first 64 of `harmful_test`, and 10
+JailbreakBench prompts occur in data some step used. On the prompts that nothing used, the abliterated model
+refuses 0 of the other 40 `harmful_test` prompts and 4 of 90 JailbreakBench prompts, in the reference model and
+through ingine alike.
+
+Damage against the original model: KL divergence 0.014 on its own answers to 64 harmless prompts (the same earlier
+search minimised KL on these prompts); on 8,192 tokens of technical prose that no step used, mean KL 0.005 and 96.4%
+top-1 agreement.
 
 Through ingine (32 borderline prompts and a small capability set, greedy):
 
 | | original | abliterated |
 |---|---|---|
-| refusals, answering directly | 15/32 | 1/32 (the reply notes it cannot produce images, then writes the scene) |
+| refusals, answering directly | 15/32 | 1/32 (the reply hedges, then writes a toned-down scene) |
 | refusals, reasoning first | 8/32 | 0/32 |
 | math (20, reasoning, effort low) | 20/20 | 20/20 |
 | code (12, tests executed) | 12/12 | 12/12 |
@@ -231,10 +251,10 @@ efforts; AIME 2024: 15 problems, effort high, up to 32,768 tokens):
 
 | | original | abliterated |
 |---|---|---|
-| GSM8K, effort low: correct | 40/40 | 39/40 |
+| GSM8K, effort low: correct | 40/40 | 40/40 |
 | GSM8K, effort high: correct | 40/40 | 40/40 |
-| AIME 2024: correct | 13/15 | 13/15 |
-| AIME 2024: ran out of tokens | 2/15 | 2/15 |
+| AIME 2024: correct | 13/15 | 14/15 |
+| AIME 2024: ran out of tokens | 2/15 | 1/15 |
 | reasoning that loops (95 samples) | 0 | 0 |
 
 Repeating a request with the same seed returned the same text in 6 of 6 cases for each model. Raw data:
@@ -243,17 +263,17 @@ Repeating a request with the same seed returned the same text in 6 of 6 cases fo
 ### Speed
 
 One RTX 5090, one request, default profile, tokens per second while generating. "chat" explains hash-map
-collisions and "code" writes an LRU-cache module with tests (short prompts, up to 1024 tokens, median of 3 runs);
-"coding agent" replays 24 recorded agent requests (2K-39K-token prompts with tools):
+collisions and "code" writes an LRU-cache module with tests (short prompts, up to 1024 tokens, median of 6 runs);
+"coding agent" replays 24 recorded agent requests (2K-39K-token prompts with tools; mean of two replays):
 
 | | chat | code | coding agent |
 |---|---:|---:|---:|
-| temperature 1 (the default) | 489 | 565 | 502 |
-| greedy (temperature 0) | 486 | 568 | 524 |
+| temperature 1 (the default) | 487 | 554 | 501 |
+| greedy (temperature 0) | 501 | 561 | 510 |
 
 The default profile runs DSpark speculative decoding: a small drafter proposes tokens and the full model checks
 every one, so it changes the speed, not the output distribution. Predictable text goes fastest: in the agent replay,
-tool calls run at 688 tokens/s, reasoning and prose at about 440; text outside English and code gains the least.
+tool calls run at about 740 tokens/s, reasoning and prose at about 450; text outside English and code gains the least.
 
 A new prompt is read at 10,900 tokens/s (20K tokens), 9,600 (64K), 8,100 (131K) and 7,000 (200K); a short prompt
 takes 0.09 s to the first token. The server holds 23.8 GiB of GPU memory after start-up and no more while reading

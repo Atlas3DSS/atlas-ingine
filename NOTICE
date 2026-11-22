@@ -78,7 +78,10 @@ Method and references
 - Abliteration literature: refusal directions as a difference of means and
   directional ablation (Arditi et al., "Refusal in Language Models Is
   Mediated by a Single Direction", 2024), and projected abliteration
-  (directions made orthogonal to the harmless mean).
+  (directions made orthogonal to the harmless mean). Here the ablation acts
+  only on activations that a linear detector flags: the direction along
+  which harmful activations stand out most from harmless ones under the
+  harmless covariance (Fisher's linear discriminant).
 - Datasets used for directions and evaluation: mlabonne/harmful_behaviors,
   mlabonne/harmless_alpaca, JailbreakBench (JBB-Behaviors), under their own
   licenses; they are downloaded by the tools, not redistributed.
