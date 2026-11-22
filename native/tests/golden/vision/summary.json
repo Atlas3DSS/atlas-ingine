@@ -1,4 +1,12 @@
 {
+ "animated_80x80.webp": {
+  "width": 80,
+  "height": 80,
+  "rows": 2,
+  "cols": 2,
+  "bf16_rel_rms": 0.017314937582629312,
+  "bf16_cosine": 0.999852642158377
+ },
  "big_1720x1720.png": {
   "width": 1720,
   "height": 1720,
@@ -22,6 +30,22 @@
   "cols": 2,
   "bf16_rel_rms": 0.015450634947573764,
   "bf16_cosine": 0.9998806731701886
+ },
+ "lossless_alpha_72x56.webp": {
+  "width": 72,
+  "height": 56,
+  "rows": 2,
+  "cols": 2,
+  "bf16_rel_rms": 0.0333036046752136,
+  "bf16_cosine": 0.9994454833066616
+ },
+ "lossy_160x120.webp": {
+  "width": 160,
+  "height": 120,
+  "rows": 3,
+  "cols": 4,
+  "bf16_rel_rms": 0.031715253776840265,
+  "bf16_cosine": 0.9995003509544876
  },
  "medium_720x680.png": {
   "width": 720,

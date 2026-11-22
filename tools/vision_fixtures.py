@@ -4,8 +4,8 @@
 The fixtures are small, deterministic images that cover the cases of the image path: one token, sizes that
 are not a multiple of 40 (padding), every kind of transparency the reference processor composites onto its
 checkerboard (RGBA, grey + alpha, palette), a tall strip, a grid above 32 patches per side (the position
-table is upsampled), a large image for the long-sequence path, a JPEG and a GIF (decoder tolerance) and a
-rendered line of text for the end-to-end check. tools/vision_ref.py turns them into goldens.
+table is upsampled), a large image for the long-sequence path, a JPEG and a GIF (decoder tolerance), WebP files
+(lossy, lossless with transparency, animated) and a rendered line of text for the end-to-end check. tools/vision_ref.py turns them into goldens.
 
 Needs pillow and numpy (tools/.venv-vision). Rerunning writes the same pixels; commit the files.
 """
@@ -69,6 +69,12 @@ def build():
     gif.putpalette([v for i in range(16) for v in (i * 17, (i * 53) % 256, 255 - i * 17)])
     images["palette_80x40.gif"] = gif
     images["text_inkling42_320x80.png"] = text_image("INKLING 42")
+    # WebP: lossy, lossless with transparency, and an animation (the model sees its first frame)
+    images["lossy_160x120.webp"] = Image.fromarray(smooth(120, 160, 11))
+    alpha = noise(56, 72, 4, 12)
+    alpha[..., 3] = np.linspace(0, 255, 56).astype(np.uint8)[:, None]
+    images["lossless_alpha_72x56.webp"] = Image.fromarray(alpha, "RGBA")
+    images["animated_80x80.webp"] = [Image.fromarray(smooth(80, 80, 13)), Image.fromarray(smooth(80, 80, 14))]
     return images
 
 
@@ -79,7 +85,12 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     for name, image in build().items():
         path = args.out / name
-        if name.endswith(".jpg"):
+        if isinstance(image, list):  # animation
+            image[0].save(path, save_all=True, append_images=image[1:], duration=200, lossless=True)
+            image = image[0]
+        elif name.endswith(".webp"):
+            image.save(path, lossless=image.mode == "RGBA", quality=85, method=6)
+        elif name.endswith(".jpg"):
             image.save(path, quality=90, subsampling=0)
         elif name.endswith(".gif"):
             image.save(path)

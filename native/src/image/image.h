@@ -54,7 +54,7 @@ struct Image {
 // Standard base64 (RFC 4648 alphabet); ASCII whitespace is skipped and padding is optional.
 [[nodiscard]] std::string decode_base64(std::string_view text);
 
-// PNG, JPEG, GIF (first frame) or BMP bytes -> Image. Throws Error.
+// PNG, JPEG, WebP, GIF or BMP bytes (the first frame of an animation) -> Image. Throws Error.
 [[nodiscard]] Image decode(std::span<const std::uint8_t> bytes, const Limits& limits = {});
 
 // "data:[<media type>];base64,<data>" -> Image. The media type is ignored: the bytes say what they are.

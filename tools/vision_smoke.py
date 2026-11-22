@@ -31,7 +31,7 @@ def check(ok, what):
 
 
 def data_uri(name):
-    kind = {"png": "png", "jpg": "jpeg", "gif": "gif"}[name.rsplit(".", 1)[1]]
+    kind = {"png": "png", "jpg": "jpeg", "gif": "gif", "webp": "webp"}[name.rsplit(".", 1)[1]]
     return f"data:image/{kind};base64," + base64.b64encode((FIXTURES / name).read_bytes()).decode()
 
 
@@ -105,7 +105,8 @@ def main():
         image("text_inkling42_320x80.png"), text("What is written in this image? Reply with the text only.")]}])
     check(status == 200 and "inkling" in answer and "42" in answer, f"reads the text of an image: {answer!r}")
 
-    for name in ("photo_160x120.jpg", "palette_80x40.gif", "rgba_64x64.png"):
+    for name in ("photo_160x120.jpg", "palette_80x40.gif", "rgba_64x64.png", "lossy_160x120.webp",
+                 "lossless_alpha_72x56.webp", "animated_80x80.webp"):
         status, answer, _, _ = server.chat([{"role": "user", "content": [image(name), text("Describe this image briefly.")]}],
                                            max_tokens=24)
         check(status == 200 and len(answer) > 0, f"{name}: {answer[:60]!r}")
@@ -133,7 +134,7 @@ def main():
 
     # rejected requests
     for content, needle in (([{"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}], "data: uris"),
-                            ([{"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}], "png, jpeg"),
+                            ([{"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}], "png, jpeg, webp"),
                             ([text("a <|unused_200054|> b"), image("solid_red_40x40.png")], "placeholder")):
         status, message, _, _ = server.chat([{"role": "user", "content": content}])
         check(status == 400 and needle in message.lower(), f"rejected with 400: {message[:90]!r}")

@@ -42,6 +42,9 @@ Vendored dependencies in native/third_party retain their original copyright
 and license notices:
 - cpp-httplib: native/third_party/cpp-httplib/LICENSE
   Copyright (c) 2017 yhirose; MIT License.
+- libwebp (decoder sources of v1.6.0): native/third_party/libwebp/COPYING
+  Copyright (c) 2010, Google Inc.; BSD 3-Clause License, with the additional
+  patent grant in native/third_party/libwebp/PATENTS.
 - llama-jinja (llama.cpp's common/jinja, via fngine):
   native/third_party/llama-jinja/LICENSE
   Copyright (c) 2023-2026 The ggml authors; MIT License. Unicode data under

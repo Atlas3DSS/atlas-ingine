@@ -252,7 +252,7 @@ def main():
 
     failures = 0
     summary = {}
-    names = args.only or sorted(p.name for p in args.fixtures.iterdir() if p.suffix in (".png", ".jpg", ".gif"))
+    names = args.only or sorted(p.name for p in args.fixtures.iterdir() if p.suffix in (".png", ".jpg", ".gif", ".webp"))
     for name in names:
         image = Image.open(args.fixtures / name)
         width, height = image.size
@@ -299,7 +299,10 @@ def main():
             args.out.mkdir(parents=True, exist_ok=True)
             save_file(golden, str(args.out / (stem + ".safetensors")))
     if not args.no_write:
-        (args.out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
+        path = args.out / "summary.json"
+        if args.only and path.exists():  # keep the fixtures not run this time
+            summary = dict(sorted({**json.loads(path.read_text()), **summary}.items()))
+        path.write_text(json.dumps(summary, indent=1) + "\n")
     if failures:
         sys.exit(f"{failures} fixture(s) differ from the description")
 

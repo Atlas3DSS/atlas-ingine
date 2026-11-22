@@ -6,4 +6,4 @@ add_library(ingine_image STATIC
 )
 ingine_internal_includes(ingine_image)
 target_include_directories(ingine_image PUBLIC ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(ingine_image PRIVATE ingine_stb)
+target_link_libraries(ingine_image PRIVATE ingine_stb ingine_webp)

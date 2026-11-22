@@ -40,13 +40,14 @@ native/
   CMakeLists.txt, CMakePresets.json, cmake/          build (from fngine: arch gate 120a, no separable compilation,
                                                      vendored deps, one target per component)
   third_party/                                       nlohmann json, cpp-httplib, spdlog(+fmt), utf8proc, llama-jinja,
-                                                     stb_image
+                                                     stb_image, libwebp (decoder)
   include/ingine/                                    public API used by apps (generator.h)
   src/core/        -> ingine_core                    device, arena, host memory, Tensor/DType, decode graphs, PDL,
                                                      logging glue, safetensors reader (mmap)
   src/text/        -> ingine_text                    tokenizer, Jinja adapter, ChatFormat, StreamParser (CUDA-free)
-  src/image/       -> ingine_image                   image decoding (stb_image), the reference processor's pixels,
-                                                     reduction, content hash and prompt ids (CUDA-free)
+  src/image/       -> ingine_image                   image decoding (stb_image, libwebp), the reference
+                                                     processor's pixels, reduction, content hash and prompt ids
+                                                     (CUDA-free)
   src/kernels/<a>/ -> ingine_kernels_<a>             dense, moe, attn, head (ported decode kernels + sampling),
                                                      prefill (new), draft (new), vision (new); aggregated by
                                                      ingine_kernels
@@ -171,7 +172,7 @@ embeddings are those rows; positions stay ordinary sequence positions. `KERNELS.
 ```cpp
 namespace ingine::image {                    // CPU: a request thread decodes
 struct Image { int width, height; std::vector<uint8_t> rgb; uint64_t hash; int tokens() const; };
-Image decode_data_uri(std::string_view uri, const Limits& limits);   // PNG, JPEG, GIF, BMP (stb_image)
+Image decode_data_uri(std::string_view uri, const Limits& limits);   // PNG, JPEG, GIF, BMP (stb_image), WebP (libwebp)
 int32_t token_id(uint64_t hash, int k);      // prompt id of image token k: negative, from content and k
 }
 namespace ingine::model {
@@ -192,7 +193,8 @@ Path of an image through a request:
    token. A request whose text spells the placeholder as well as carrying images is rejected (the count of
    placeholders must equal the count of images), so the k-th placeholder is the k-th image.
 2. `image::decode_data_uri` produces the pixels of the reference processor: transparency composited onto its
-   checkerboard, no resizing. An image above `--image-max-tokens` (4096) is reduced by area averaging, which
+   checkerboard, no resizing, the first frame of an animation (PNG, GIF and WebP pixels are identical to the
+   reference's, JPEG within 2 levels). An image above `--image-max-tokens` (4096) is reduced by area averaging, which
    the reference does not do (it takes any size up to 4096x4096 pixels, 10,609 tokens).
 3. Each placeholder is replaced by the image's tokens as `image::token_id(hash, k)`: negative ids, a function
    of the pixels and the tile index. The Generator's prompt caches compare token ids, so with these ids they
@@ -252,7 +254,7 @@ restored when a later prompt starts with its prompt. Otherwise the state is rese
 per request (`<id>: reuse=extend|checkpoint|parked|none reused=N prefilled=M prefill=<seconds>`).
 
 Third-party CMake targets: `nlohmann_json::nlohmann_json`, `httplib::httplib`, `spdlog::spdlog`, `ingine_utf8proc`,
-`ingine_jinja`, `ingine_stb`, `CUDA::cudart`, `CUDA::cublasLt`.
+`ingine_jinja`, `ingine_stb`, `ingine_webp`, `CUDA::cudart`, `CUDA::cublasLt`.
 
 ## Conventions
 

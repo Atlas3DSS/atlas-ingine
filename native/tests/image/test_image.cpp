@@ -174,7 +174,8 @@ void test_reduce() {
   CHECK(whole.width == 720 && whole.height == 680 && whole.tokens() == 17 * 18 && whole.hash != reduced.hash);
 }
 
-// The decoded pixels are the reference processor's, exactly (PNG, GIF) or within the decoder's tolerance (JPEG).
+// The decoded pixels are the reference processor's, exactly (PNG, GIF, WebP: the reference decodes WebP with
+// libwebp too) or within the decoder's tolerance (JPEG).
 void test_reference_pixels() {
   int checked = 0;
   for (const auto& entry : fs::directory_iterator(kGolden / "fixtures")) {
@@ -206,7 +207,34 @@ void test_reference_pixels() {
     CHECK(worst <= allowed);
     ++checked;
   }
-  CHECK(checked >= 10);
+  CHECK(checked >= 13);
+}
+
+void test_webp() {
+  const fs::path fixtures = kGolden / "fixtures";
+  const image::Image lossy = image::decode(read_file(fixtures / "lossy_160x120.webp"));
+  CHECK(lossy.width == 160 && lossy.height == 120 && lossy.tokens() == 12);
+  const image::Image alpha = image::decode(read_file(fixtures / "lossless_alpha_72x56.webp"));
+  CHECK(alpha.width == 72 && alpha.height == 56);
+  // the top row is fully transparent: the checkerboard shows (204 at the origin, 153 eight pixels on)
+  CHECK(alpha.rgb[0] == 204 && alpha.rgb[1] == 204 && alpha.rgb[2] == 204 && alpha.rgb[8 * 3] == 153);
+  const image::Image frame = image::decode(read_file(fixtures / "animated_80x80.webp"));  // the first frame
+  CHECK(frame.width == 80 && frame.height == 80);
+  // the media type of a data: URI is ignored, also for WebP
+  CHECK(image::decode_data_uri("data:image/png;base64," + to_base64(read_file(fixtures / "lossy_160x120.webp"))).hash ==
+        lossy.hash);
+  // truncated and corrupt files are rejected, and sizes are checked before decoding
+  std::vector<std::uint8_t> bytes = read_file(fixtures / "lossy_160x120.webp");
+  std::vector<std::uint8_t> cut(bytes.begin(), bytes.begin() + std::ptrdiff_t(bytes.size() / 2));
+  CHECK(rejects([&] { (void)image::decode(cut); }));
+  CHECK(rejects([&] { (void)image::decode(std::vector<std::uint8_t>{'R', 'I', 'F', 'F', 4, 0, 0, 0, 'W', 'E', 'B', 'P'}); }));
+  image::Limits small;
+  small.max_side = 100;
+  CHECK(rejects([&] { (void)image::decode(bytes, small); }));
+  small = {};
+  small.max_tokens = 4;
+  const image::Image reduced = image::decode(bytes, small);
+  CHECK(reduced.tokens() <= 4 && reduced.source_width == 160);
 }
 
 void test_identity() {
@@ -245,6 +273,7 @@ int main() {
   test_fit();
   test_reduce();
   test_reference_pixels();
+  test_webp();
   test_identity();
   if (failures) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);

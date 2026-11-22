@@ -1,10 +1,13 @@
 #include "image/image.h"
 
 #include <stb/stb_image.h>
+#include <webp/decode.h>
+#include <webp/demux.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -20,9 +23,82 @@ std::uint64_t mix(std::uint64_t z) {  // splitmix64 finaliser
   return z ^ (z >> 31);
 }
 
-struct StbFree {
-  void operator()(stbi_uc* p) const { stbi_image_free(p); }
+// Decoded pixels as the file has them: 1 grey, 2 grey + alpha, 3 RGB or 4 RGBA bytes per pixel.
+struct Raw {
+  int width = 0, height = 0, channels = 0;
+  std::unique_ptr<std::uint8_t, void (*)(void*)> pixels{nullptr, +[](void*) {}};
 };
+
+void check_size(int width, int height, const Limits& limits) {
+  if (width < 1 || height < 1) throw Error("image has no pixels");
+  if (width > limits.max_side || height > limits.max_side || std::int64_t(width) * height > limits.max_pixels) {
+    throw Error("image of " + std::to_string(width) + "x" + std::to_string(height) + " pixels is too large (at most " +
+                std::to_string(limits.max_side) + " per side and " + std::to_string(limits.max_pixels) + " in all)");
+  }
+}
+
+bool is_webp(std::span<const std::uint8_t> bytes) {
+  return bytes.size() >= 12 && std::memcmp(bytes.data(), "RIFF", 4) == 0 && std::memcmp(bytes.data() + 8, "WEBP", 4) == 0;
+}
+
+// WebP (libwebp): RGBA when the file has an alpha channel, else RGB; of an animation, its first frame on the
+// canvas (as the reference's decoder, Pillow, which also sits on libwebp).
+Raw decode_webp(std::span<const std::uint8_t> bytes, const Limits& limits) {
+  WebPBitstreamFeatures features;
+  if (WebPGetFeatures(bytes.data(), bytes.size(), &features) != VP8_STATUS_OK) {
+    throw Error("image is not a valid WebP file");
+  }
+  check_size(features.width, features.height, limits);
+  Raw raw;
+  raw.width = features.width;
+  raw.height = features.height;
+  raw.channels = features.has_alpha ? 4 : 3;
+  if (features.has_animation) {
+    WebPAnimDecoderOptions options;
+    if (!WebPAnimDecoderOptionsInit(&options)) throw Error("WebP image could not be decoded");
+    options.color_mode = MODE_RGBA;
+    options.use_threads = 0;
+    const WebPData data{bytes.data(), bytes.size()};
+    const std::unique_ptr<WebPAnimDecoder, void (*)(WebPAnimDecoder*)> decoder(WebPAnimDecoderNew(&data, &options),
+                                                                               &WebPAnimDecoderDelete);
+    std::uint8_t* canvas = nullptr;  // owned by the decoder
+    int timestamp = 0;
+    if (!decoder || !WebPAnimDecoderGetNext(decoder.get(), &canvas, &timestamp)) {
+      throw Error("WebP image could not be decoded");
+    }
+    const std::size_t pixels = std::size_t(raw.width) * raw.height;
+    auto* copy = static_cast<std::uint8_t*>(std::malloc(pixels * std::size_t(raw.channels)));
+    if (!copy) throw Error("image is too large");
+    for (std::size_t i = 0; i < pixels; ++i) std::memcpy(copy + i * raw.channels, canvas + i * 4, std::size_t(raw.channels));
+    raw.pixels = {copy, &std::free};
+  } else {
+    int width = 0, height = 0;
+    std::uint8_t* pixels = features.has_alpha ? WebPDecodeRGBA(bytes.data(), bytes.size(), &width, &height)
+                                              : WebPDecodeRGB(bytes.data(), bytes.size(), &width, &height);
+    if (!pixels) throw Error("WebP image could not be decoded");
+    raw.pixels = {pixels, &WebPFree};
+    if (width != raw.width || height != raw.height) throw Error("WebP image could not be decoded");
+  }
+  return raw;
+}
+
+// PNG, JPEG, GIF (first frame) and BMP (stb_image), in the file's own channel count (palettes are expanded).
+Raw decode_stb(std::span<const std::uint8_t> bytes, const Limits& limits) {
+  const int length = int(bytes.size());
+  Raw raw;
+  if (!stbi_info_from_memory(bytes.data(), length, &raw.width, &raw.height, &raw.channels)) {
+    throw Error("image is not a supported PNG, JPEG, WebP, GIF or BMP file");
+  }
+  check_size(raw.width, raw.height, limits);
+  stbi_uc* pixels = stbi_load_from_memory(bytes.data(), length, &raw.width, &raw.height, &raw.channels, 0);
+  if (!pixels) {
+    const char* reason = stbi_failure_reason();
+    throw Error(std::string("image could not be decoded") + (reason ? std::string(": ") + reason : std::string()));
+  }
+  raw.pixels = {pixels, +[](void* p) { stbi_image_free(p); }};
+  if (raw.channels < 1 || raw.channels > 4) throw Error("image has an unsupported number of channels");
+  return raw;
+}
 
 bool starts_with_nocase(std::string_view text, std::string_view prefix) {
   if (text.size() < prefix.size()) return false;
@@ -113,29 +189,14 @@ std::int32_t token_id(std::uint64_t hash, int k) {
 Image decode(std::span<const std::uint8_t> bytes, const Limits& limits) {
   if (bytes.empty()) throw Error("image is empty");
   if (bytes.size() > std::size_t(0x7FFFFFFF)) throw Error("image is too large");
-  const int length = int(bytes.size());
-  int width = 0, height = 0, channels = 0;
-  if (!stbi_info_from_memory(bytes.data(), length, &width, &height, &channels)) {
-    throw Error("image is not a supported PNG, JPEG, GIF or BMP file");
-  }
-  if (width < 1 || height < 1) throw Error("image has no pixels");
-  if (width > limits.max_side || height > limits.max_side || std::int64_t(width) * height > limits.max_pixels) {
-    throw Error("image of " + std::to_string(width) + "x" + std::to_string(height) + " pixels is too large (at most " +
-                std::to_string(limits.max_side) + " per side and " + std::to_string(limits.max_pixels) + " in all)");
-  }
-  // 0: the file's own channel count (1 grey, 2 grey + alpha, 3 RGB, 4 RGBA; palettes are expanded)
-  std::unique_ptr<stbi_uc, StbFree> pixels(stbi_load_from_memory(bytes.data(), length, &width, &height, &channels, 0));
-  if (!pixels) {
-    const char* reason = stbi_failure_reason();
-    throw Error(std::string("image could not be decoded") + (reason ? std::string(": ") + reason : std::string()));
-  }
-  if (channels < 1 || channels > 4) throw Error("image has an unsupported number of channels");
+  Raw raw = is_webp(bytes) ? decode_webp(bytes, limits) : decode_stb(bytes, limits);
+  const int width = raw.width, height = raw.height, channels = raw.channels;
 
   Image image;
   image.source_width = width;
   image.source_height = height;
   std::vector<std::uint8_t> rgb(std::size_t(width) * height * 3);
-  const stbi_uc* src = pixels.get();
+  const std::uint8_t* src = raw.pixels.get();
   const bool grey = channels <= 2, alpha = channels == 2 || channels == 4;
   for (int y = 0; y < height; ++y) {
     std::uint8_t* dst = rgb.data() + std::size_t(y) * width * 3;
@@ -151,7 +212,7 @@ Image decode(std::span<const std::uint8_t> bytes, const Limits& limits) {
       dst[2] = std::uint8_t(c[2]);
     }
   }
-  pixels.reset();
+  raw.pixels.reset();
 
   const auto [out_height, out_width] = fit(height, width, std::clamp(limits.max_tokens, 1, MAX_TOKENS));
   if (out_height != height || out_width != width) rgb = reduce(rgb, height, width, out_height, out_width);

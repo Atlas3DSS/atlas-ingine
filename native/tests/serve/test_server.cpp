@@ -747,7 +747,7 @@ void test_images() {
   const std::vector<std::pair<Json, const char*>> bad = {
       {user(Json::array({image_part("https://example.com/cat.png")})), "data: URIs"},
       {user(Json::array({image_part("data:image/png;base64,!!!")})), "base64"},
-      {user(Json::array({image_part("data:image/png;base64,aGVsbG8gd29ybGQ=")})), "PNG, JPEG, GIF or BMP"},
+      {user(Json::array({image_part("data:image/png;base64,aGVsbG8gd29ybGQ=")})), "PNG, JPEG, WebP, GIF or BMP"},
       {user(Json::array({image_part("data:image/png," + base64)})), "base64-encoded"},
       {user(Json::array({{{"type", "image_url"}}})), "needs a base64 data: URI"},
       {user(Json::array({{{"type", "text"}, {"text", "a <|unused_200054|> b"}}, image_part(red)})), "placeholder"},

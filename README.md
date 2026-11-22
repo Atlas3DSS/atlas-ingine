@@ -138,7 +138,7 @@ after start-up (`--park-mb N` sets the budget in MiB, `0` turns it off); they ar
   (temperature 1, no cutoff; 0 is greedy) or the server's `--temperature` / `--top-p` / `--top-k`.
 * `stream: true` for server-sent events; reasoning arrives as `reasoning_content` deltas before the answer's
   `content` (non-streaming responses carry `message.reasoning_content`). `stream_options.include_usage` adds usage.
-* Images in user and tool messages, as content parts with a base64 `data:` URI (PNG, JPEG, GIF or BMP):
+* Images in user and tool messages, as content parts with a base64 `data:` URI (PNG, JPEG, WebP, GIF or BMP):
   `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`; `input_image` parts and Anthropic's
   `{"type": "image", "source": {"type": "base64", "data": ...}}` are accepted too. URLs are not fetched. See
   [Images](#images).
