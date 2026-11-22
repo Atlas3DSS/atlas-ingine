@@ -139,8 +139,8 @@ def main():
         check(status == 400 and needle in message.lower(), f"rejected with 400: {message[:90]!r}")
 
     if args.long:
-        # about 9.4 tokens per line; the passphrase is near the start, the image at the end
-        lines = [f"Line {i}: the quick brown fox jumps over the lazy dog." for i in range(int(args.long / 13.0))]
+        # about 18 tokens per line; the passphrase is near the start, the image at the end
+        lines = [f"Line {i}: the quick brown fox jumps over the lazy dog." for i in range(int(args.long / 18.0))]
         lines.insert(len(lines) // 50, "The passphrase is MARIGOLD-42.")
         question = "Two questions. What is the passphrase from the text? What is written in the image?"
         status, answer, usage, seconds = server.chat([{"role": "user", "content": [

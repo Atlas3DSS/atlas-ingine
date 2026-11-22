@@ -4,8 +4,8 @@ An abliterated [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinking
 by **ingine**, a custom CUDA inference engine for one RTX 5090. It answers harmful test prompts instead of refusing
 them, directly and after reasoning (refusal phrases in 1 of 104 and 3 of 48 answers, the 3 followed by the requested
 text), and stays close to the original elsewhere (KL divergence 0.014 on harmless answers). ingine
-generates 490-560 tokens/s, reads prompts at 6,200-10,900 tokens/s and serves 262,144 tokens of context through an
-OpenAI-compatible API.
+generates 490-560 tokens/s, reads prompts at 6,200-10,900 tokens/s, takes images as well as text and serves
+262,144 tokens of context through an OpenAI-compatible API.
 
 The installer sets everything up and downloads the ready-to-run model from Hugging Face,
 [satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine)
@@ -138,6 +138,10 @@ after start-up (`--park-mb N` sets the budget in MiB, `0` turns it off); they ar
   (temperature 1, no cutoff; 0 is greedy) or the server's `--temperature` / `--top-p` / `--top-k`.
 * `stream: true` for server-sent events; reasoning arrives as `reasoning_content` deltas before the answer's
   `content` (non-streaming responses carry `message.reasoning_content`). `stream_options.include_usage` adds usage.
+* Images in user and tool messages, as content parts with a base64 `data:` URI (PNG, JPEG, GIF or BMP):
+  `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`; `input_image` parts and Anthropic's
+  `{"type": "image", "source": {"type": "base64", "data": ...}}` are accepted too. URLs are not fetched. See
+  [Images](#images).
 
 ```bash
 curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -164,6 +168,29 @@ for chunk in stream:
     print(getattr(delta, "reasoning_content", None) or delta.content or "", end="", flush=True)
 ```
 
+### Images
+
+The model reads images through its own vision tower, which is part of the checkpoint (no extra download). An
+image costs **one token per 40x40 pixels**, `ceil(height / 40) * ceil(width / 40)`: 432 tokens for 960x720,
+1,296 for 1920x1080. The model takes pixels as they are, without resizing; an image above 4,096 tokens (about
+2560x2560, or a 4K screenshot) is reduced to fit, keeping its aspect ratio (`--image-max-tokens N`, up to the
+model's 10,609 for 4096x4096 pixels). Transparency is shown on a grey checkerboard, as the model was trained.
+
+```bash
+curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "inkling-2-mini-abliterated",
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$(base64 -w0 picture.png)"'"}},
+    {"type": "text", "text": "What is in this picture?"}]}],
+  "max_tokens": 1024
+}'
+```
+
+A request may hold 16 images and 32,768 image tokens (`--max-images`, `--max-image-tokens`); `usage.prompt_tokens`
+counts image tokens. An image is read once per conversation: follow-up requests reuse it like any other part of
+the prompt, and the same picture sent again is recognised by its pixels. `--no-vision` (in `INGINE_EXTRA_ARGS`)
+serves text only and frees 0.6 GiB of GPU memory.
+
 ## Oh My Pi (OMP)
 
 Merge this provider into `~/.omp/agent/models.yml`, keeping existing providers:
@@ -185,7 +212,7 @@ providers:
           efforts: [minimal, low, medium, high, xhigh, max]
           defaultLevel: medium
           requiresEffort: false
-        input: [text]
+        input: [text, image]
         cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
         compat:
           supportsDeveloperRole: true
@@ -276,8 +303,14 @@ every one, so it changes the speed, not the output distribution. Predictable tex
 tool calls run at about 740 tokens/s, reasoning and prose at about 450; text outside English and code gains the least.
 
 A new prompt is read at 10,900 tokens/s (20K tokens), 9,600 (64K), 8,100 (131K) and 7,000 (200K); a short prompt
-takes 0.09 s to the first token. The server holds 23.8 GiB of GPU memory after start-up and no more while reading
-a 254K-token prompt; conversations kept warm add up to 3 GiB.
+takes 0.09 s to the first token. The server holds 24.4 GiB of GPU memory after start-up (23.8 GiB with
+`--no-vision`) and no more while reading a 254K-token prompt; conversations kept warm add up to 3 GiB.
+
+Images: the vision tower takes 3 ms for an image of up to 64 tokens (320x320 pixels), 21 ms for 576 tokens
+(960x960), 0.17 s for 1,849 tokens (1720x1720) and 1.1 s for 4,096 tokens, using up to 0.85 GiB of working memory
+for the largest; its tokens are then read like text. A 3840x2160 screenshot (reduced to 4,080 tokens) is answered
+1.5 s after the request. Against the transformers reference in FP32 the image embeddings have a cosine of 0.9995
+to 0.99999, closer than transformers' own BF16 model (`native/tests/vision`).
 
 ### Agent loops
 
@@ -298,7 +331,8 @@ passphrase hidden in the middle:
 | reading the prompt | 16.4 s (8,000 tokens/s) | 40.9 s (6,200 tokens/s) |
 | decoding afterwards | 354 tokens/s | 258 tokens/s |
 
-The passphrase was found in both.
+The passphrase was found in both. With an image after 199,000 tokens of text, the model answers from both: the
+passphrase at the start of the text and the words written in the image (26.5 s).
 
 ## License and credits
 
