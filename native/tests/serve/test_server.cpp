@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <algorithm>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -651,6 +653,173 @@ void test_echo() {
 
 }  // namespace
 
+// ---- images
+
+std::string data_uri(const std::string& fixture) {
+  const std::filesystem::path path = std::filesystem::path(INGINE_GOLDEN_DIR) / "vision" / "fixtures" / fixture;
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot read " + path.string());
+  const std::string bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+  return "data:image/png;base64," + httplib::detail::base64_encode(bytes);
+}
+
+Json image_part(const std::string& uri) { return {{"type", "image_url"}, {"image_url", {{"url", uri}}}}; }
+
+Json user(Json content) { return Json::array({{{"role", "user"}, {"content", std::move(content)}}}); }
+
+std::vector<int32_t> image_ids(const std::vector<int32_t>& prompt) {
+  std::vector<int32_t> out;
+  for (const int32_t id : prompt) {
+    if (id < 0) out.push_back(id);
+  }
+  return out;
+}
+
+void test_images() {
+  const std::string red = data_uri("solid_red_40x40.png"), blue = data_uri("solid_blue_40x40.png");
+  const std::string grad = data_uri("grad_100x60.png");  // 2 x 3 tiles: 6 tokens
+  auto s = serve();
+  CHECK(Json::parse(request(s->port(), "GET", "/v1/models").body)["data"][0]["input_modalities"] ==
+        Json::array({"text", "image"}));
+
+  // one image: its placeholder becomes 6 negative ids; the usage counts them
+  const Json one = user(Json::array({{{"type", "text"}, {"text", "What is this?"}}, image_part(grad)}));
+  Chat r = chat(s->port(), {{"messages", one}});
+  CHECK(r.status == 200);
+  const std::vector<int32_t> rendered = render(one).ids;  // with the template's single placeholder
+  CHECK(std::count(rendered.begin(), rendered.end(), 200054) == 1);
+  FakeGenerator::Call call = s->gen->calls().back();
+  CHECK(call.images == 1 && call.image_tokens == 6);
+  CHECK(call.prompt_ids.size() == rendered.size() - 1 + 6);
+  CHECK(std::count(call.prompt_ids.begin(), call.prompt_ids.end(), 200054) == 0);
+  const std::vector<int32_t> grad_ids = image_ids(call.prompt_ids);
+  CHECK(grad_ids.size() == 6 && std::set<int32_t>(grad_ids.begin(), grad_ids.end()).size() == 6);
+  CHECK(r.body["usage"]["prompt_tokens"] == int(call.prompt_ids.size()));
+  // the ids take the placeholder's place, between <|content_image|> (200005) and <|end_message|> (200010)
+  const auto first = std::find(call.prompt_ids.begin(), call.prompt_ids.end(), grad_ids[0]);
+  CHECK(first != call.prompt_ids.begin() && *(first - 1) == 200005 && *(first + 6) == 200010);
+  CHECK(std::equal(grad_ids.begin(), grad_ids.end(), first));
+
+  // the same image again gives the same prompt (the prompt caches can reuse it), another image another one
+  r = chat(s->port(), {{"messages", one}});
+  CHECK(r.status == 200 && s->gen->calls().back().prompt_ids == call.prompt_ids);
+  r = chat(s->port(), {{"messages", user(Json::array({{{"type", "text"}, {"text", "What is this?"}}, image_part(red)}))}});
+  CHECK(r.status == 200);
+  const std::vector<int32_t> red_ids = image_ids(s->gen->calls().back().prompt_ids);
+  CHECK(red_ids.size() == 1 && red_ids[0] != grad_ids[0]);
+  r = chat(s->port(), {{"messages", user(Json::array({image_part(blue)}))}});
+  CHECK(r.status == 200 && image_ids(s->gen->calls().back().prompt_ids) != red_ids);
+
+  // several images keep their order; other part shapes carry the same image
+  r = chat(s->port(), {{"messages", user(Json::array({image_part(red), {{"type", "text"}, {"text", "and"}}, image_part(grad)}))}});
+  CHECK(r.status == 200 && s->gen->calls().back().images == 2 && s->gen->calls().back().image_tokens == 7);
+  std::vector<int32_t> both = red_ids;
+  both.insert(both.end(), grad_ids.begin(), grad_ids.end());
+  CHECK(image_ids(s->gen->calls().back().prompt_ids) == both);
+  const std::string base64 = grad.substr(grad.find(',') + 1);
+  const Json shapes = Json::array({
+      {{"type", "image_url"}, {"image_url", grad}},
+      {{"type", "input_image"}, {"image_url", grad}},
+      {{"type", "image"}, {"image", grad}},
+      {{"type", "image"}, {"url", grad}},
+      {{"type", "image"}, {"source", {{"type", "base64"}, {"media_type", "image/png"}, {"data", base64}}}},
+  });
+  for (const Json& shape : shapes) {
+    r = chat(s->port(), {{"messages", user(Json::array({shape}))}});
+    CHECK(r.status == 200 && image_ids(s->gen->calls().back().prompt_ids) == grad_ids);
+  }
+  // an image in a tool message, and streaming with usage
+  r = chat(s->port(), {{"messages", Json::array({{{"role", "user"}, {"content", "look"}},
+                                                 {{"role", "tool"}, {"content", Json::array({image_part(red)})}}})}});
+  CHECK(r.status == 200 && image_ids(s->gen->calls().back().prompt_ids) == red_ids);
+  r = chat(s->port(), {{"messages", one}, {"stream", true}, {"stream_options", {{"include_usage", true}}}});
+  CHECK(r.status == 200);
+  bool usage_seen = false;
+  for (const Json& event : r.body) {
+    if (event.is_object() && event.contains("usage") && event["usage"].is_object()) {
+      usage_seen = event["usage"]["prompt_tokens"] == int(call.prompt_ids.size());
+    }
+  }
+  CHECK(usage_seen);
+
+  // rejected with 400, param messages, before anything reaches the generator
+  const std::size_t calls_before = s->gen->calls().size();
+  const std::vector<std::pair<Json, const char*>> bad = {
+      {user(Json::array({image_part("https://example.com/cat.png")})), "data: URIs"},
+      {user(Json::array({image_part("data:image/png;base64,!!!")})), "base64"},
+      {user(Json::array({image_part("data:image/png;base64,aGVsbG8gd29ybGQ=")})), "PNG, JPEG, GIF or BMP"},
+      {user(Json::array({image_part("data:image/png," + base64)})), "base64-encoded"},
+      {user(Json::array({{{"type", "image_url"}}})), "needs a base64 data: URI"},
+      {user(Json::array({{{"type", "text"}, {"text", "a <|unused_200054|> b"}}, image_part(red)})), "placeholder"},
+      {Json::array({{{"role", "user"}, {"content", "hi"}},
+                    {{"role", "assistant"}, {"content", Json::array({image_part(red)})}}}),
+       "user and tool"},
+      {user(Json::array({{{"type", "input_audio"}, {"input_audio", {{"data", "x"}}}}})), "text and images only"},
+  };
+  for (const auto& [messages, needle] : bad) {
+    r = chat(s->port(), {{"messages", messages}});
+    const std::string message = r.status == 400 ? r.body["error"]["message"].get<std::string>() : std::string();
+    if (r.status != 400 || message.find(needle) == std::string::npos) {
+      std::fprintf(stderr, "image request %s -> %d %s (expected '%s')\n", messages.dump().substr(0, 200).c_str(),
+                   r.status, r.body.dump().c_str(), needle);
+    }
+    CHECK(r.status == 400 && r.body["error"]["param"] == "messages" && message.find(needle) != std::string::npos);
+  }
+  CHECK(s->gen->calls().size() == calls_before);
+  // without an image the placeholder's spelling is ordinary text, as before
+  r = chat(s->port(), {{"messages", user("a <|unused_200054|> b")}});
+  CHECK(r.status == 200 && s->gen->calls().back().images == 0);
+
+  // limits: images per request, image tokens per request, tokens per image (reduced, not rejected), context
+  auto limited = [](ingine::serve::ImageOptions images, int max_model_len = 0) {
+    auto served = std::make_unique<Served>();
+    served->gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-test");
+    ingine::serve::ServerOptions options;
+    options.images = images;
+    options.max_model_len = max_model_len;
+    served->srv = std::make_unique<ChatServer>(*served->gen, *g_fmt, options);
+    if (!served->srv->bind("127.0.0.1", 0)) throw std::runtime_error("bind failed");
+    served->srv->start();
+    return served;
+  };
+  ingine::serve::ImageOptions options;
+  options.max_images = 1;
+  auto few = limited(options);
+  CHECK(chat(few->port(), {{"messages", user(Json::array({image_part(red)}))}}).status == 200);
+  r = chat(few->port(), {{"messages", user(Json::array({image_part(red), image_part(blue)}))}});
+  CHECK(r.status == 400 && r.body["error"]["message"].get<std::string>().find("at most 1") != std::string::npos);
+  options = {};
+  options.max_total_tokens = 6;
+  auto tight = limited(options);
+  CHECK(chat(tight->port(), {{"messages", user(Json::array({image_part(grad)}))}}).status == 200);
+  r = chat(tight->port(), {{"messages", user(Json::array({image_part(grad), image_part(red)}))}});
+  CHECK(r.status == 400 && r.body["error"]["message"].get<std::string>().find("7 tokens") != std::string::npos);
+  options = {};
+  options.limits.max_tokens = 4;
+  auto small = limited(options);
+  r = chat(small->port(), {{"messages", user(Json::array({image_part(grad)}))}});
+  CHECK(r.status == 200 && small->gen->calls().back().images == 1);
+  CHECK(small->gen->calls().back().image_tokens <= 4 && small->gen->calls().back().image_tokens >= 2);
+  // the context check counts the image's tokens: 306 of them do not fit 200 positions
+  auto narrow = limited({}, 200);
+  CHECK(chat(narrow->port(), {{"messages", user(Json::array({image_part(red)}))}}).status == 200);
+  r = chat(narrow->port(), {{"messages", user(Json::array({image_part(data_uri("medium_720x680.png"))}))}});
+  CHECK(r.status == 400 && r.body["error"]["message"].get<std::string>().find("the model context is 200") !=
+                               std::string::npos);
+
+  // a server without the vision tower rejects images and says so in its model card
+  options = {};
+  options.enabled = false;
+  auto text_only = limited(options);
+  r = chat(text_only->port(), {{"messages", user(Json::array({image_part(red)}))}});
+  CHECK(r.status == 400 && r.body["error"]["message"].get<std::string>().find("does not take images") !=
+                               std::string::npos);
+  CHECK(text_only->gen->calls().empty());
+  CHECK(Json::parse(request(text_only->port(), "GET", "/v1/models").body)["data"][0]["input_modalities"] ==
+        Json::array({"text"}));
+  CHECK(chat(text_only->port(), Json::object()).status == 200);
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -681,6 +850,7 @@ int main() {
       {"bad_requests", test_bad_requests},
       {"invalid_json", test_invalid_json},
       {"echo", test_echo},
+      {"images", test_images},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {

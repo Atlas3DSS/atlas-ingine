@@ -30,6 +30,7 @@ class FakeGenerator final : public model::Generator {
     std::vector<int32_t> prompt_ids;
     int max_new_tokens = 0;
     model::Sampling sampling;
+    int images = 0, image_tokens = 0;  // of the prompt
     int yielded = 0;
     bool cancelled = false;
     bool done = false;
@@ -42,7 +43,14 @@ class FakeGenerator final : public model::Generator {
   int max_model_len() const override { return max_model_len_; }
   model::GenerateStats generate(std::span<const int32_t> prompt, int max_new_tokens,
                                 const model::Sampling& sampling, std::span<const int32_t> stop_ids,
+                                const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
+    return generate(model::Prompt{prompt, {}}, max_new_tokens, sampling, stop_ids, on_tokens);
+  }
+  // Images are recorded, not looked at (their tokens are negative ids, which echo() skips).
+  model::GenerateStats generate(const model::Prompt& prompt, int max_new_tokens, const model::Sampling& sampling,
+                                std::span<const int32_t> stop_ids,
                                 const std::function<bool(std::span<const int32_t>)>& on_tokens) override;
+  bool supports_images() const override { return true; }
 
   std::string echo(std::span<const int32_t> prompt_ids) const;
   std::vector<Call> calls() const;

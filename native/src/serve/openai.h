@@ -2,6 +2,7 @@
 // (Handler._parse_request, _num, _send_error, _delta_json).
 #pragma once
 
+#include "image/image.h"
 #include "ingine/generator.h"
 #include "text/chat.h"
 
@@ -26,9 +27,18 @@ struct BadRequest : std::runtime_error {
   int status;
 };
 
+// Image input of chat requests.
+struct ImageOptions {
+  bool enabled = true;          // false: requests with images are rejected (no vision tower)
+  image::Limits limits;         // per image: token limit (larger images are reduced) and source size limits
+  int max_images = 16;          // per request
+  int max_total_tokens = 32768;  // image tokens per request
+};
+
 struct ChatRequest {
-  std::vector<int32_t> prompt_ids;   // full prompt, prefill included
+  std::vector<int32_t> prompt_ids;   // full prompt, prefill included; images expanded to their tokens
   std::vector<int32_t> prefill_ids;  // tail of prompt_ids the model would otherwise have generated
+  std::vector<model::PromptImage> images;  // by position in prompt_ids
   int max_new_tokens = 0;
   model::Sampling sampling;
   std::vector<std::string> stop;
@@ -38,8 +48,14 @@ struct ChatRequest {
 
 // Validates `body` (a JSON object) and renders the prompt. Throws BadRequest or text::ChatError. Sampling fields
 // the request omits (temperature, top_p, top_k) take their values from `defaults`.
+//
+// Images are content parts of user and tool messages: {"type": "image_url", "image_url": {"url": URI} | URI},
+// {"type": "input_image", "image_url": URI}, {"type": "image", "image" | "url": URI} or the Anthropic shape
+// {"type": "image", "source": {"type": "base64", "data": BASE64}}; URI is a base64 data: URI (nothing is
+// fetched). The template renders one placeholder token per image; each is replaced by the image's tokens
+// (image::token_id), so prompt_ids, the context check and the usage count the expanded prompt.
 ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
-                          const model::Sampling& defaults = {});
+                          const model::Sampling& defaults = {}, const ImageOptions& images = {});
 
 // {"error": {"message", "type", "param", "code"}} with the type server.py maps from the status.
 Json error_body(int status, std::string_view message, const std::optional<std::string>& param = std::nullopt);

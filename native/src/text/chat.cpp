@@ -278,8 +278,10 @@ Json normalize_messages(const Json& messages) {
       for (const Json& part : *content) {
         if (part.is_object()) {
           const Json* type = get(part, "type");
-          if (!is_none(type) && !(*type == "text" || *type == "input_text")) {
-            throw ChatError("unsupported content part type " + py::repr(*type) + " (text only)");
+          // image parts reach the template, which renders the image placeholder (user and tool messages)
+          if (!is_none(type) && !(*type == "text" || *type == "input_text" || *type == "image_url" ||
+                                  *type == "input_image" || *type == "image")) {
+            throw ChatError("unsupported content part type " + py::repr(*type) + " (text and images only)");
           }
         }
         if (!part.is_string() && !part.is_object()) throw ChatError("content parts must be strings or objects");

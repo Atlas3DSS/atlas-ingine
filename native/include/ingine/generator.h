@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,28 @@ struct Sampling {
   // usual and then takes the forced token; speculative decoding accepts a draft iff it equals the forced token
   // and continues with the forced token after the accepted run. Fills GenerateStats::spec_trace.
   std::span<const int32_t> forced;
+};
+
+// The token whose embedding an image token replaces (<|unused_200054|>, the chat template's image placeholder).
+inline constexpr std::int32_t IMAGE_PLACEHOLDER_ID = 200054;
+
+// One image of a prompt. The chat template marks an image with one placeholder token; the prompt holds
+// tokens() ids in its place, one per 40x40-pixel tile in raster order, whose embeddings the vision tower
+// computes from the pixels. These ids are negative (never a vocabulary id) and a function of the image
+// content and the tile index (image::token_id), so prompts compare equal exactly when their images do.
+struct PromptImage {
+  int pos = 0;                                           // prompt position of the image's first token
+  int height = 0, width = 0;                             // pixels
+  std::shared_ptr<const std::vector<std::uint8_t>> rgb;  // [height, width, 3]
+  [[nodiscard]] int rows() const { return (height + 39) / 40; }
+  [[nodiscard]] int cols() const { return (width + 39) / 40; }
+  [[nodiscard]] int tokens() const { return rows() * cols(); }
+};
+
+// A prompt: token ids and its images, in the order of their positions (without overlap).
+struct Prompt {
+  std::span<const std::int32_t> ids;
+  std::span<const PromptImage> images;
 };
 
 // How the prompt reused the state of earlier requests (reused_tokens were not prefilled again).
@@ -54,6 +77,10 @@ struct GenerateStats {
   double prefill_seconds = 0, decode_seconds = 0;
   int spec_rounds = 0, spec_accepted = 0;
   std::vector<SpecRoundRecord> spec_trace;  // forced replay only
+  // Images: tokens of the prompt's images, how many images the vision tower encoded for this request (those
+  // not inside the reused prefix) and its time (part of prefill_seconds).
+  int image_tokens = 0, images_encoded = 0;
+  double vision_seconds = 0;
 };
 
 struct RuntimeOptions {
@@ -68,6 +95,8 @@ struct RuntimeOptions {
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
   // min(3072, free memory after start-up - 4096), at least 0.
   int park_mb = -1;
+  // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
+  bool vision = false;
 };
 
 class Generator {
@@ -81,6 +110,14 @@ class Generator {
   virtual GenerateStats generate(std::span<const int32_t> prompt, int max_new_tokens, const Sampling& sampling,
                                  std::span<const int32_t> stop_ids,
                                  const std::function<bool(std::span<const int32_t>)>& on_tokens) = 0;
+  // The same for a prompt with images. Generators without image input take prompts without images only.
+  virtual GenerateStats generate(const Prompt& prompt, int max_new_tokens, const Sampling& sampling,
+                                 std::span<const int32_t> stop_ids,
+                                 const std::function<bool(std::span<const int32_t>)>& on_tokens) {
+    if (!prompt.images.empty()) throw std::invalid_argument("this generator does not take images");
+    return generate(prompt.ids, max_new_tokens, sampling, stop_ids, on_tokens);
+  }
+  virtual bool supports_images() const { return false; }
 };
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options);  // the model (ingine_model)

@@ -3903,15 +3903,15 @@
   }
  },
  {
-  "note": "image part -> ChatError",
+  "note": "audio part -> ChatError",
   "messages": [
    {
     "role": "user",
     "content": [
      {
-      "type": "image_url",
-      "image_url": {
-       "url": "x"
+      "type": "input_audio",
+      "input_audio": {
+       "data": "x"
       }
      }
     ]
@@ -3922,7 +3922,7 @@
   "enable_thinking": true,
   "kwargs": {},
   "error": {
-   "message": "unsupported content part type 'image_url' (text only)",
+   "message": "unsupported content part type 'input_audio' (text and images only)",
    "param": "messages"
   }
  },

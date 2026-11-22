@@ -1,6 +1,7 @@
 // ingine-serve: the OpenAI-compatible chat completions server (flags and defaults of `python -m ingine.server`).
 #include "engine/fake_generator.h"
 #include "engine/log.h"
+#include "image/image.h"
 #include "ingine/generator.h"
 #include "serve/chat_server.h"
 #include "serve/cli.h"
@@ -66,7 +67,8 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
-  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false;
+  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
+  int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
   double temperature = -1, top_p = -1;
@@ -92,6 +94,13 @@ int main(int argc, char** argv) {
             "device memory (MiB) for conversations displaced by another one, released when memory runs short, "
             "0 = off (default: min(3072, free memory after start-up - 4096))",
             &park_mb);
+  ap.flag("--no-vision", "text only: do not load the vision tower (saves 0.6 GB) and reject requests with images",
+          &no_vision);
+  ap.option("--image-max-tokens", "",
+            "tokens of one image (one per 40x40 pixels); a larger image is reduced to fit (at most 10609)",
+            &image_max_tokens);
+  ap.option("--max-images", "", "images accepted in one request", &max_images);
+  ap.option("--max-image-tokens", "", "image tokens accepted in one request", &max_image_tokens);
   ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
   ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
@@ -104,6 +113,11 @@ int main(int argc, char** argv) {
   ap.option("--top-k", "", "top_k of requests that omit it, 0 = off (default: generation_config.json, else 0)",
             &top_k);
   ap.parse(argc, argv);
+  if (image_max_tokens < 1 || image_max_tokens > ingine::image::MAX_TOKENS || max_images < 0 || max_image_tokens < 0) {
+    std::cerr << "ingine-serve: error: --image-max-tokens must be in [1, " << ingine::image::MAX_TOKENS
+              << "] and --max-images, --max-image-tokens at least 0\n";
+    return 2;
+  }
   if (temperature > 2 || top_p == 0 || top_p > 1) {
     std::cerr << "ingine-serve: error: --temperature must be in [0, 2] and --top-p in (0, 1]\n";
     return 2;
@@ -134,6 +148,7 @@ int main(int argc, char** argv) {
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
+      options.vision = !no_vision;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
@@ -149,6 +164,10 @@ int main(int argc, char** argv) {
     if (temperature >= 0) server_options.sampling.temperature = float(temperature);
     if (top_p >= 0) server_options.sampling.top_p = float(top_p);
     if (top_k >= 0) server_options.sampling.top_k = top_k;
+    server_options.images.enabled = !no_vision;
+    server_options.images.limits.max_tokens = image_max_tokens;
+    server_options.images.max_images = max_images;
+    server_options.images.max_total_tokens = max_image_tokens;
     log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
              server_options.sampling.top_p, server_options.sampling.top_k);
     ingine::serve::ChatServer server(*generator, fmt, server_options);
@@ -160,6 +179,10 @@ int main(int argc, char** argv) {
     if (::pipe(g_stop_pipe) != 0) throw std::runtime_error("pipe() failed");
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
+    log.info("image input: {}", !no_vision && generator->supports_images()
+                                    ? fmt::format("on (at most {} tokens per image, {} images and {} image tokens per request)",
+                                                  image_max_tokens, max_images, max_image_tokens)
+                                    : std::string("off"));
     log.info("serving {} on http://{}:{}/v1", server.model_id(), host, server.port());
     bool listened = true;
     std::thread listener([&] {

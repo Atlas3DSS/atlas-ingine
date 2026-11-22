@@ -35,9 +35,11 @@ std::string type_name(const std::exception& e) {
 
 }  // namespace
 
-Job::Job(std::vector<int32_t> prompt_ids_, int max_new_tokens_, model::Sampling sampling_)
+Job::Job(std::vector<int32_t> prompt_ids_, int max_new_tokens_, model::Sampling sampling_,
+         std::vector<model::PromptImage> images_)
     : id("chatcmpl-" + random_hex32()),
       prompt_ids(std::move(prompt_ids_)),
+      images(std::move(images_)),
       max_new_tokens(max_new_tokens_),
       sampling(sampling_),
       t_submit(Clock::now()) {}
@@ -177,11 +179,15 @@ void Scheduler::run(Job& job) {
     return more;
   };
   try {
-    const model::GenerateStats st =
-        generator_.generate(job.prompt_ids, job.max_new_tokens, job.sampling, stop_list_, on_tokens);
+    const model::GenerateStats st = generator_.generate(model::Prompt{job.prompt_ids, job.images}, job.max_new_tokens,
+                                                        job.sampling, stop_list_, on_tokens);
     // prefix reuse of the prompt: the path, the tokens reused and prefilled, the prefill time
     server_log().info("{}: reuse={} reused={} prefilled={} prefill={:.3f}s", job.id, model::to_string(st.reuse),
                       st.reused_tokens, st.prompt_tokens - st.reused_tokens, st.prefill_seconds);
+    if (!job.images.empty()) {  // images: all of the prompt, those the vision tower encoded now, its time
+      server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job.id, job.images.size(),
+                        st.image_tokens, st.images_encoded, st.vision_seconds);
+    }
   } catch (const std::exception& e) {  // report to the client instead of killing the worker
     server_log().error("generator failed: {}: {}", type_name(e), e.what());
     job.fail("generation failed: " + type_name(e) + ": " + e.what());

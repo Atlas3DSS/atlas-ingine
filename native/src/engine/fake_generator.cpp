@@ -101,9 +101,12 @@ std::string FakeGenerator::echo(std::span<const int32_t> prompt_ids) const {
   return out;
 }
 
-model::GenerateStats FakeGenerator::generate(std::span<const int32_t> prompt, int max_new_tokens,
+model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, int max_new_tokens,
                                              const model::Sampling& sampling, std::span<const int32_t> stop_ids,
                                              const std::function<bool(std::span<const int32_t>)>& on_tokens) {
+  const std::span<const int32_t> prompt = full_prompt.ids;
+  int image_tokens = 0;
+  for (const model::PromptImage& image : full_prompt.images) image_tokens += image.tokens();
   Output reply = responder_ ? responder_(prompt) : Output(echo(prompt));
   std::vector<int32_t> out = std::holds_alternative<std::string>(reply)
                                  ? tokenizer_.encode(std::get<std::string>(reply), /*special=*/true)
@@ -112,7 +115,8 @@ model::GenerateStats FakeGenerator::generate(std::span<const int32_t> prompt, in
   {
     std::lock_guard lock(mutex_);
     index = calls_.size();
-    calls_.push_back(Call{std::vector<int32_t>(prompt.begin(), prompt.end()), max_new_tokens, sampling});
+    calls_.push_back(Call{std::vector<int32_t>(prompt.begin(), prompt.end()), max_new_tokens, sampling,
+                          int(full_prompt.images.size()), image_tokens});
   }
   const std::unordered_set<int32_t> stops(stop_ids.begin(), stop_ids.end());
   const size_t limit = std::min(out.size(), size_t(std::max(max_new_tokens, 0)));

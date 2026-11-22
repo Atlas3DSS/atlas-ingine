@@ -3,6 +3,7 @@
 #include "text/chat.h"
 #include "text_test.h"
 
+#include <algorithm>
 #include <atomic>
 #include <thread>
 
@@ -39,6 +40,36 @@ int main() {
                    test::show(err["message"].get<std::string>()));
       c.expect(e.param == err["param"].get<std::string>(), note + ": param " + e.param);
     }
+  }
+  // Image parts (not in the goldens of the text-only Python engine): the template renders each as its own
+  // message segment with one placeholder token, in the order of the parts, for user and tool messages only.
+  {
+    const Json image = {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AAAA"}}}};
+    const Json messages = Json::array(
+        {{{"role", "user"}, {"content", Json::array({{{"type", "text"}, {"text", "Compare"}}, image,
+                                                     {{"type", "input_image"}, {"image_url", "x"}},
+                                                     {{"type", "image"}, {"image", "y"}}})}}});
+    const RenderedPrompt p = fmt.render(messages, Json(), ChatOptions{});
+    const std::string segment = "<|message_user|><|content_image|><|unused_200054|><|end_message|>";
+    c.expect(p.text.find("<|message_user|><|content_text|>Compare<|end_message|>" + segment + segment + segment) !=
+                 std::string::npos,
+             "image parts: text " + test::show(p.text));
+    c.expect(std::count(p.ids.begin(), p.ids.end(), 200054) == 3, "image parts: three placeholder ids");
+    for (std::size_t i = 0; i < p.ids.size(); ++i) {
+      if (p.ids[i] == 200054) {
+        c.expect(i > 0 && p.ids[i - 1] == 200005 && i + 1 < p.ids.size() && p.ids[i + 1] == 200010,
+                 "image parts: <|content_image|> placeholder <|end_message|>");
+      }
+    }
+    bool rejected = false;
+    try {
+      (void)fmt.render(Json::array({{{"role", "user"}, {"content", "hi"}},
+                                    {{"role", "assistant"}, {"content", Json::array({image})}}}),
+                       Json(), ChatOptions{});
+    } catch (const ChatError& e) {
+      rejected = std::string(e.what()).find("user and tool") != std::string::npos;
+    }
+    c.expect(rejected, "image parts: an image in an assistant message is a ChatError");
   }
   // Concurrency: every thread renders every request and compares text and ids with a serial render (the
   // render cache is shared by the threads).

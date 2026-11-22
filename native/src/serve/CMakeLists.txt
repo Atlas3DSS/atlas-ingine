@@ -7,4 +7,4 @@ add_library(ingine_serve STATIC
 )
 ingine_internal_includes(ingine_serve)
 target_link_libraries(ingine_serve
-  PUBLIC ingine_engine ingine_text httplib::httplib nlohmann_json::nlohmann_json spdlog::spdlog Threads::Threads)
+  PUBLIC ingine_engine ingine_text ingine_image httplib::httplib nlohmann_json::nlohmann_json spdlog::spdlog Threads::Threads)
