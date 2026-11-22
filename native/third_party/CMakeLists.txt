@@ -22,3 +22,7 @@ add_subdirectory(spdlog)
 
 # llama.cpp's Jinja runtime: ingine_jinja (#include <jinja/runtime.h>)
 add_subdirectory(llama-jinja)
+
+# stb_image (header only, compiled once by src/image/stb_image_impl.cpp): #include <stb/stb_image.h>
+add_library(ingine_stb INTERFACE)
+target_include_directories(ingine_stb SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})

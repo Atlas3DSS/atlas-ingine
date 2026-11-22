@@ -51,6 +51,7 @@ add_subdirectory(src/core)
 # Every other component directory owns its CMakeLists.txt and defines the target named here; a
 # directory is added only once it has one, so the tree builds while components are in progress.
 #   src/text              -> ingine_text
+#   src/image             -> ingine_image
 #   src/kernels/<area>    -> ingine_kernels_<area>   (aggregated by ingine_kernels)
 #   src/model             -> ingine_model
 #   src/engine            -> ingine_engine
@@ -63,6 +64,7 @@ function(ingine_add_component dir)
 endfunction()
 
 ingine_add_component(src/text)
+ingine_add_component(src/image)
 
 set(INGINE_KERNEL_AREAS common dense moe attn head prefill draft)
 foreach(area ${INGINE_KERNEL_AREAS})

@@ -52,6 +52,7 @@ and license notices:
   Copyright (c) 2016 - present, Gabi Melman and spdlog contributors; MIT
   License. Its bundled fmt code also retains its own copyright and MIT license
   notices.
+- stb_image: native/third_party/stb/LICENSE (MIT or public domain)
 - utf8proc: native/third_party/utf8proc/LICENSE.md
   Includes the original Public Software Group and subsequent contributor
   notices, along with the Unicode data notices reproduced in that file.
