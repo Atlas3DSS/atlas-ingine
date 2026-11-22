@@ -28,6 +28,9 @@ into models/Inkling-2-Mini. The server runs without Python or PyTorch.
 INGINE_MODEL_DIR (environment or ~/.config/ingine/env) selects an existing download; a complete
 one is reused as is. When it comes from the environment it is saved to ~/.config/ingine/env so
 the ingine command serves from it.
+INGINE_GPU_PROFILE=0 skips (and removes) the NVIDIA application profile the installer writes to
+~/.nv/nvidia-application-profiles-rc.d/50-ingine, which lets ingine-serve run at the GPU's P0
+performance state (driver 595 or newer; about 0.8% more tokens per second).
 CUDAHOSTCXX selects the host compiler nvcc uses; by default CXX when set, else the first of c++,
 g++, g++-16, g++-15, g++-14, g++-13 and g++-12 that the pinned nvcc accepts. CXX (default: that
 host compiler) compiles the C++ code, CC (default: cc) the C code.
@@ -344,6 +347,25 @@ print("profile_required=(" + " ".join(map(shlex.quote, required)) + ")")
 PY
   mv -f -- "$PROFILE.tmp" "$PROFILE"
   echo 'The C++ engine is built.'
+
+  # The driver holds CUDA programs at its "stable performance" state (P1 on an RTX 5090). An application
+  # profile, the mechanism the driver ships for OBS, lets ingine's processes reach P0, whose memory clock is
+  # 1.4% higher: about 0.8% more tokens per second, same output, same idle power. Driver 595 or newer.
+  NV_PROFILE="$HOME/.nv/nvidia-application-profiles-rc.d/50-ingine"
+  if [[ "${INGINE_GPU_PROFILE:-1}" == 0 ]]; then
+    rm -f -- "$NV_PROFILE"
+  elif (( driver_major >= 595 )); then
+    mkdir -p -- "$(dirname -- "$NV_PROFILE")"
+    cat > "$NV_PROFILE" <<'JSON'
+{
+    "rules": [
+        { "pattern": { "feature": "procname", "matches": "ingine-serve" }, "profile": [ "0x166c5e", 0 ] },
+        { "pattern": { "feature": "procname", "matches": "ingine-bench" }, "profile": [ "0x166c5e", 0 ] }
+    ]
+}
+JSON
+    printf 'GPU performance state P0 for ingine: %s (INGINE_GPU_PROFILE=0 removes it).\n' "$NV_PROFILE"
+  fi
 fi
 
 # ---- model -------------------------------------------------------------------------------------------
