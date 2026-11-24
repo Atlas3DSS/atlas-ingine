@@ -29,6 +29,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 using namespace ingine;
@@ -820,8 +821,31 @@ int run_test_1m_kernel() {
 
 // ---- Phase 1B + 1C: Resident 1M-token VRAM, prefill/decode speed, and honest Needle-in-a-Haystack ----
 
+void log_nvidia_smi_mem(const char* tag) {
+  char cmd[256];
+  std::snprintf(cmd, sizeof cmd,
+                "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null | grep -E '^%d,' || true",
+                int(getpid()));
+  std::printf("[nvidia-smi %s] ", tag);
+  std::fflush(stdout);
+  if (FILE* fp = popen(cmd, "r")) {
+    char buf[256];
+    bool any = false;
+    while (std::fgets(buf, sizeof buf, fp)) {
+      std::fputs(buf, stdout);
+      any = true;
+    }
+    pclose(fp);
+    if (!any) std::printf("(no matching pid %d)\n", int(getpid()));
+  } else {
+    std::printf("(popen failed)\n");
+  }
+  std::fflush(stdout);
+}
+
 int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_chunk, int decode_tokens,
-                        const std::vector<int>& ctxs, bool kv_paged, int kv_vram_mb, int kv_ram_mb, bool atlas_6g) {
+                        const std::vector<int>& ctxs, bool kv_paged, int kv_vram_mb, int kv_ram_mb, bool atlas_6g,
+                        int offload_vram_mb) {
   cudaFree(nullptr);
   size_t free0 = 0, free_rt = 0, free_pre = 0, total = 0;
   cudaMemGetInfo(&free0, &total);
@@ -837,7 +861,10 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
   opt.kv_vram_mb = kv_vram_mb;
   opt.kv_ram_mb = kv_ram_mb;
   if (atlas_6g) {
-    opt.offload_vram_mb = 5888;
+    opt.offload_vram_mb = offload_vram_mb > 0 ? offload_vram_mb : 5888;
+    opt.offload_ram_mb = 12288;
+  } else if (offload_vram_mb > 0) {
+    opt.offload_vram_mb = offload_vram_mb;
     opt.offload_ram_mb = 12288;
   }
   opt.spec = false;
@@ -847,9 +874,9 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
   std::printf("=== %s Context Bench & Honest Needle Test ===\n",
               opt.kv_paged ? (atlas_6g ? "Phase 2 (6 GB Paged 1M)" : "Phase 2 (<=12 GB Paged 1M)")
                            : "Phase 1B/1C (Resident 1M)");
-  std::printf("model=%s max_ctx=%d prefill_chunk=%d kv_q4=true kv_paged=%s kv_vram_mb=%d kv_ram_mb=%d atlas_6g=%s\n",
+  std::printf("model=%s max_ctx=%d prefill_chunk=%d kv_q4=true kv_paged=%s kv_vram_mb=%d kv_ram_mb=%d atlas_6g=%s offload_vram_mb=%d\n",
               model_dir.c_str(), max_ctx, opt.prefill_chunk, opt.kv_paged ? "true" : "false", opt.kv_vram_mb,
-              opt.kv_ram_mb, atlas_6g ? "true" : "false");
+              opt.kv_ram_mb, atlas_6g ? "true" : "false", opt.offload_vram_mb);
   std::fflush(stdout);
 
   const auto t_load0 = std::chrono::steady_clock::now();
@@ -875,6 +902,7 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
               swa_mib, double(free_pre) / 1073741824.0);
   if (rt.weights().expert_cache) std::printf("%s\n", rt.weights().expert_cache->summary().c_str());
   if (rt.state().paged_kv) std::printf("%s\n", rt.state().paged_kv->summary().c_str());
+  log_nvidia_smi_mem("load");
   std::fflush(stdout);
   prefill_chunk = opt.prefill_chunk;
 
@@ -919,6 +947,7 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
     auto t_seg = t0;
     int seg_toks = 0;
     int next_mark = 131072;
+    bool logged_524k = false;
     for (int off = 0; off < int(ids.size()); off += prefill_chunk) {
       const int T = std::min(prefill_chunk, int(ids.size()) - off);
       CUDA_CHECK(cudaMemcpyAsync(d_chunk.p, ids.data() + off, size_t(T) * 4, cudaMemcpyHostToDevice, rt.stream()));
@@ -932,6 +961,10 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
         std::printf("  [prefill progress] %d / %zu tokens | seg=%.0f tok/s | avg=%.0f tok/s | elapsed=%.1fs\n",
                     off + T, ids.size(), double(seg_toks) / std::max(seg_s, 1e-9),
                     double(off + T) / std::max(tot_s, 1e-9), tot_s);
+        if (!logged_524k && off + T >= 524288) {
+          log_nvidia_smi_mem("524k");
+          logged_524k = true;
+        }
         std::fflush(stdout);
         t_seg = now;
         seg_toks = 0;
@@ -1068,6 +1101,7 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
                   L_doc + int(suffix.size()), out_ids.size(), dec_s, dec_tok_s, ctx_pass);
       if (rt.state().paged_kv) std::printf("%s\n", rt.state().paged_kv->summary().c_str());
       if (rt.weights().expert_cache) std::printf("%s\n", rt.weights().expert_cache->summary().c_str());
+      log_nvidia_smi_mem("end");
       std::fflush(stdout);
     }
   }
@@ -1214,6 +1248,7 @@ int main(int argc, char** argv) {
   int decode_tokens = 64;
   int kv_vram_mb = 0;
   int kv_ram_mb = 12288;
+  int offload_vram_mb = 0;
   std::vector<int> ctxs = {262144, 524288, 1000000};
   bool test_kv_q4 = false;
   bool dense_fp8 = true;
@@ -1232,6 +1267,7 @@ int main(int argc, char** argv) {
     else if (a == "--decode-tokens" && i + 1 < argc) decode_tokens = std::atoi(argv[++i]);
     else if (a == "--kv-vram-mb" && i + 1 < argc) kv_vram_mb = std::atoi(argv[++i]);
     else if (a == "--kv-ram-mb" && i + 1 < argc) kv_ram_mb = std::atoi(argv[++i]);
+    else if (a == "--offload-vram-mb" && i + 1 < argc) offload_vram_mb = std::atoi(argv[++i]);
     else if (a == "--ctxs" && i + 1 < argc) {
       ctxs.clear();
       std::stringstream ss(argv[++i]);
@@ -1252,7 +1288,7 @@ int main(int argc, char** argv) {
     if (mode == "test-paged-kv") return run_test_paged_kv(model_dir, golden);
     if (mode == "bench-needle-1m")
       return run_bench_needle_1m(model_dir, max_ctx, prefill_chunk, decode_tokens, ctxs, kv_paged, kv_vram_mb,
-                                 kv_ram_mb, atlas_6g);
+                                 kv_ram_mb, atlas_6g, offload_vram_mb);
     std::fprintf(stderr, "unknown mode: %s\n", mode.c_str());
     return 2;
   } catch (const std::exception& e) {
