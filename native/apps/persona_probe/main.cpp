@@ -448,7 +448,10 @@ int main(int argc, char** argv) {
           nlohmann::ordered_json msgs = nlohmann::ordered_json::array(
               {nlohmann::ordered_json{{"role", "user"}, {"content", pj.at("text").get<std::string>()}}});
           ingine::text::ChatOptions co;
-          co.enable_thinking = pj.value("enable_thinking", false);
+          if (pj.contains("reasoning_effort") && !pj["reasoning_effort"].is_null()) {
+            co.reasoning_effort = nlohmann::ordered_json::parse(pj["reasoning_effort"].dump());
+          }
+          co.enable_thinking = pj.value("enable_thinking", true);
           pd.ids = fmt.render(msgs, nlohmann::ordered_json(), co).ids;
         } else {
           pd.ids = fmt.tokenizer().encode(pj.at("text").get<std::string>(), false);

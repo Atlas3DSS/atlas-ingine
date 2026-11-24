@@ -1,0 +1,353 @@
+{
+  "status": "PASS",
+  "hardware": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition (sm_120)",
+  "required_noop_visits": [
+    3,
+    6,
+    10,
+    18,
+    29,
+    44
+  ],
+  "active_experts": {
+    "3": 10,
+    "6": 91,
+    "10": 70,
+    "18": 91,
+    "29": 3,
+    "44": 62
+  },
+  "never_experts": {
+    "3": 0,
+    "6": 1,
+    "10": 1,
+    "18": 1,
+    "29": 1,
+    "44": 1
+  },
+  "gate1_noop_cases": 71,
+  "gate1_all_bit_identical": true,
+  "gate2_summary": {
+    "active_ablate_v10": {
+      "prefill_kl": 6.026840092097549e-13,
+      "decode_kl_mean": 0.005264526732675929,
+      "graph_eq_eager": true
+    },
+    "active_ablate_v29": {
+      "prefill_kl": 1.1720682541193805e-12,
+      "decode_kl_mean": 0.0027517251373744707,
+      "graph_eq_eager": true
+    },
+    "active_force_never_v10": {
+      "prefill_kl": 4.9451694754192233e-14,
+      "decode_kl_mean": 0.0017441695904831247,
+      "graph_eq_eager": true
+    },
+    "active_force_gain2_v29": {
+      "prefill_kl": 1.3639534087379203e-13,
+      "decode_kl_mean": 0.002226392587288835,
+      "graph_eq_eager": true
+    },
+    "active_slot_permute_rev_v10": {
+      "prefill_kl": 1.2605092740587445e-14,
+      "decode_kl_mean": 6.578685268353841e-05,
+      "graph_eq_eager": true
+    },
+    "active_cross_replay_v10": {
+      "prefill_kl": 3.8840981881302466e-13,
+      "decode_kl_mean": 0.012852263220560914,
+      "graph_eq_eager": true
+    },
+    "active_cross_depth_loop_msg_v18": {
+      "prefill_kl": 5.432280242782796e-13,
+      "decode_kl_mean": 0.03767499005658685,
+      "graph_eq_eager": true
+    },
+    "active_3b_gain3_v10": {
+      "prefill_kl": 3.760170604470997e-14,
+      "decode_kl_mean": 0.0011486954574608937,
+      "graph_eq_eager": true
+    },
+    "active_3b_off2p5_v10": {
+      "prefill_kl": 4.295096721522492e-14,
+      "decode_kl_mean": 0.0012190095285703033,
+      "graph_eq_eager": true
+    },
+    "active_3b_zero_v10": {
+      "prefill_kl": 7.88622837354422e-14,
+      "decode_kl_mean": 0.0007375640877723619,
+      "graph_eq_eager": true
+    },
+    "active_3b_multi_v10": {
+      "prefill_kl": 3.760818866799202e-14,
+      "decode_kl_mean": 0.002331207394453286,
+      "graph_eq_eager": true
+    },
+    "active_residual_steer_v10": {
+      "prefill_kl": 1.2828563229155515e-13,
+      "decode_kl_mean": 0.0006462713530346141,
+      "graph_eq_eager": true
+    }
+  },
+  "gate3_cache_isolation": {
+    "long_a_after_b_reuse": "parked",
+    "long_a_differs_from_b": true,
+    "long_a_reuse": "none",
+    "long_b_after_ac_identical_to_cold": true,
+    "long_b_after_ac_reuse": "parked",
+    "long_c_reuse": "none",
+    "long_prompt_tokens": 302,
+    "short_a_after_b_identical": true,
+    "short_a_after_b_reuse": "none",
+    "short_a_differs_from_b": true,
+    "short_a_tokens": [
+      68014,
+      371,
+      172079,
+      149884,
+      149878,
+      150076,
+      149879,
+      155244,
+      42342,
+      155907,
+      150081,
+      149916
+    ],
+    "short_b_after_a_identical": true,
+    "short_b_after_a_reuse": "none",
+    "short_b_after_c_identical": true,
+    "short_b_after_c_reuse": "none",
+    "short_b_alone_tokens": [
+      68014,
+      1780,
+      314,
+      1789,
+      25,
+      198,
+      12,
+      149917,
+      151286,
+      40489,
+      149884,
+      154706
+    ],
+    "short_b_repeat_identical": true,
+    "short_b_repeat_reuse": "checkpoint",
+    "short_c_tokens": [
+      68014,
+      1780,
+      314,
+      1789,
+      25,
+      198,
+      12,
+      149917,
+      151286,
+      40489,
+      149884,
+      154706
+    ]
+  },
+  "gate4_serve": {
+    "reject_checks": {
+      "strict_rejects_probe": true,
+      "strict_rejects_missing_visit18": true,
+      "rejects_fit_method_trained": true,
+      "rejects_d2027": true,
+      "rejects_refusal_map_unit": true,
+      "strict_rejects_renderer_mismatch": true,
+      "strict_rejects_template_sha_mismatch": true
+    },
+    "spec_sha256": "d152a28498d5b50a2d677c671adc80107ae99a46514bd3ec3edaaa7683e65cb3",
+    "personas_endpoint": {
+      "object": "list",
+      "default": "none",
+      "probe_mode": false,
+      "spec_sha256": "d152a28498d5b50a2d677c671adc80107ae99a46514bd3ec3edaaa7683e65cb3",
+      "data": [
+        {
+          "id": "calm_a",
+          "object": "persona",
+          "status": "validated",
+          "declared_category": "validated",
+          "persona_fingerprint": "141ace0c38324fae16902ec0a6e0855866d43f67109b35f871b6da1f174d558b",
+          "interventions": 1,
+          "description": "test persona A"
+        },
+        {
+          "id": "calm_c",
+          "object": "persona",
+          "status": "validated",
+          "declared_category": "validated",
+          "persona_fingerprint": "d9623e78c7d90d3db3f28249112b5159eff78468998a46ae2b35163fd0cd118f",
+          "interventions": 1,
+          "description": "test persona C"
+        }
+      ]
+    },
+    "text_b0": "Underwater observatories often feature curved, dome-like windows made of thick, pressure-resistant glass or ",
+    "text_a0": "Underwater observatories often feature curved, dome-like windows made of thick, pressure-resistant glass or ",
+    "b_after_a_identical": true,
+    "b_after_c_identical": true,
+    "a_differs_from_b": false,
+    "sse_persona_metadata_ok": true,
+    "unknown_persona_400_ok": true
+  },
+  "gate5_parity": {
+    "pool_label_ingine": "atlas-ingine (NVFP4/BF16 native checkpoint)",
+    "pool_label_eval_dump": "atlas-eval-dump (GGUF Q8_0 llama.cpp reference)",
+    "prompt_renderer": "chat_template_jinja:reasoning_effort=none",
+    "chat_template_sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc",
+    "note": "Separate quantisation pools (NVFP4/BF16 vs Q8_0); compares position-aligned routing agreement and ffn_moe_inp activation cosine similarity on token-identical chat_template.jinja(reasoning_effort='none') input.",
+    "eval_dump_files": [
+      "ffn_gen.f16",
+      "ffn_last.f16",
+      "ffn_mean.f16",
+      "gen_topk_idx.u8",
+      "gen_topk_w.f16",
+      "meta.json",
+      "moment1.f64",
+      "pooled_last.f16",
+      "pooled_mean.f16",
+      "route_hist.u16",
+      "route_logits.f16",
+      "route_weight.f16",
+      "rows.jsonl",
+      "topk_idx.u8",
+      "topk_w.f16"
+    ],
+    "ingine_dump_files": [
+      "parity_v10_ffn_inp.f32",
+      "parity_v10_idx.i32",
+      "parity_v10_wts.f32",
+      "parity_v18_ffn_inp.f32",
+      "parity_v18_idx.i32",
+      "parity_v18_wts.f32",
+      "parity_v29_ffn_inp.f32",
+      "parity_v29_idx.i32",
+      "parity_v29_wts.f32",
+      "parity_v3_ffn_inp.f32",
+      "parity_v3_idx.i32",
+      "parity_v3_wts.f32",
+      "parity_v44_ffn_inp.f32",
+      "parity_v44_idx.i32",
+      "parity_v44_wts.f32",
+      "parity_v6_ffn_inp.f32",
+      "parity_v6_idx.i32",
+      "parity_v6_wts.f32"
+    ],
+    "ingine_prompt_tokens": 36,
+    "ingine_prompt_ids": [
+      200002,
+      200004,
+      34182,
+      279,
+      154554,
+      150628,
+      25,
+      220,
+      15,
+      200010,
+      200000,
+      200004,
+      31488,
+      928,
+      149876,
+      154747,
+      151572,
+      150134,
+      163769,
+      332,
+      32340,
+      149880,
+      149884,
+      995,
+      3207,
+      158307,
+      149879,
+      149916,
+      152469,
+      151207,
+      149881,
+      150103,
+      151537,
+      167608,
+      13,
+      200010
+    ],
+    "hf_template_prompt_ids": [
+      200002,
+      200004,
+      34182,
+      279,
+      154554,
+      150628,
+      25,
+      220,
+      15,
+      200010,
+      200000,
+      200004,
+      31488,
+      928,
+      149876,
+      154747,
+      151572,
+      150134,
+      163769,
+      332,
+      32340,
+      149880,
+      149884,
+      995,
+      3207,
+      158307,
+      149879,
+      149916,
+      152469,
+      151207,
+      149881,
+      150103,
+      151537,
+      167608,
+      13,
+      200010
+    ],
+    "ingine_matches_hf_template_ids": true,
+    "eval_dump_prompt_tokens": 36,
+    "prompt_token_count_match": true,
+    "visit_top8_overlap": {
+      "3": 0.9931,
+      "6": 0.9965,
+      "10": 0.9931,
+      "18": 0.9861,
+      "29": 0.9896,
+      "44": 0.9896
+    },
+    "visit_slot_order_match": {
+      "3": 0.9167,
+      "6": 0.9618,
+      "10": 0.9167,
+      "18": 0.8403,
+      "29": 0.9132,
+      "44": 0.8819
+    },
+    "ffn_moe_inp_mean_cosine": {
+      "3": 0.999943,
+      "6": 0.999957,
+      "10": 0.999939,
+      "18": 0.999846,
+      "29": 0.999745,
+      "44": 0.999782
+    },
+    "ffn_moe_inp_last_prompt_cosine": {
+      "3": 0.999708,
+      "6": 0.999884,
+      "10": 0.999898,
+      "18": 0.999756,
+      "29": 0.999347,
+      "44": 0.995141
+    }
+  }
+}

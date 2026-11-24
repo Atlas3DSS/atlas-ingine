@@ -914,7 +914,11 @@ void test_persona_control_plane() {
       {"description", "validated persona profile"},
       {"category", "validated"},
       {"model_binding",
-       {{"weights_sha256", hex64}, {"quantisation", "NVFP4"}, {"engine_commit", "f3848d8"}}},
+       {{"weights_sha256", hex64},
+        {"quantisation", "NVFP4"},
+        {"engine_commit", "f3848d8"},
+        {"prompt_renderer", "ingine_chat_format_v1"},
+        {"chat_template_sha256", hex64}}},
       {"leakage_check", {{"passed", true}, {"evidence_file", "results/leakage.json"}}},
       {"interventions",
        Json::array({Json{{"id", "fit_1"},
@@ -975,19 +979,23 @@ void test_persona_control_plane() {
     CHECK(!cat_probe.profiles.at("calm")->downgrade_reason.empty());
   }
 
-  // 3. model_binding mismatch downgrades to probe (rejected in strict mode, downgraded in probe mode).
+  // 3. model_binding mismatch (quantisation, prompt_renderer, chat_template_sha256) downgrades to probe.
   {
-    ModelRuntimeIdentity mismatch;
-    mismatch.quantisation = "Q8_0";
-    bool threw = false;
-    try {
-      (void)PersonaCatalog::parse_json(valid_doc.dump(), false, RefusalMap::default_map(), mismatch);
-    } catch (const std::exception&) {
-      threw = true;
+    for (const auto& mismatch : {
+             ModelRuntimeIdentity{"", "Q8_0", "", "", ""},
+             ModelRuntimeIdentity{"", "", "", "atlas_eval_dump:reasoning_effort=none", ""},
+             ModelRuntimeIdentity{"", "", "", "", std::string(64, 'a')},
+         }) {
+      bool threw = false;
+      try {
+        (void)PersonaCatalog::parse_json(valid_doc.dump(), false, RefusalMap::default_map(), mismatch);
+      } catch (const std::exception&) {
+        threw = true;
+      }
+      CHECK(threw);
+      const PersonaCatalog cat_p = PersonaCatalog::parse_json(valid_doc.dump(), true, RefusalMap::default_map(), mismatch);
+      CHECK(cat_p.profiles.at("calm")->effective_status == PersonaStatus::Probe);
     }
-    CHECK(threw);
-    const PersonaCatalog cat_p = PersonaCatalog::parse_json(valid_doc.dump(), true, RefusalMap::default_map(), mismatch);
-    CHECK(cat_p.profiles.at("calm")->effective_status == PersonaStatus::Probe);
   }
 
   // 4. fit_method="trained" is unconditionally rejected even in probe mode.

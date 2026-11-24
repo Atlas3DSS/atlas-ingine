@@ -895,7 +895,7 @@ PersonaCatalog PersonaCatalog::parse_json(const std::string& raw_json, bool prob
     // Profile-level gates for validated / product
     if (modifying_count > 0 && eff != PersonaStatus::Probe) {
       std::string why;
-      // 1) Model binding check
+      // 1) Model binding check (weights, quantisation, commit, prompt_renderer, chat_template_sha256)
       if (!pjson.contains("model_binding") || !pjson["model_binding"].is_object()) {
         note_downgrade(pwhere + ": missing model_binding");
       } else {
@@ -903,13 +903,22 @@ PersonaCatalog PersonaCatalog::parse_json(const std::string& raw_json, bool prob
         const std::string wsha = mb.value("weights_sha256", std::string());
         const std::string quant = mb.value("quantisation", std::string());
         const std::string commit = mb.value("engine_commit", std::string());
-        if (!is_sha256_hex(wsha) || quant.empty() || commit.size() < 7) {
-          note_downgrade(pwhere + ": invalid model_binding fields");
+        const std::string renderer = mb.value("prompt_renderer", std::string());
+        const std::string tsha = mb.value("chat_template_sha256", std::string());
+        if (!is_sha256_hex(wsha) || quant.empty() || commit.size() < 7 || renderer.empty() || !is_sha256_hex(tsha)) {
+          note_downgrade(pwhere + ": invalid model_binding fields (requires weights_sha256, quantisation, engine_commit, prompt_renderer, chat_template_sha256)");
         } else if (runtime_id.populated()) {
-          if ((!runtime_id.weights_sha256.empty() && wsha != runtime_id.weights_sha256) ||
-              (!runtime_id.quantisation.empty() && quant != runtime_id.quantisation) ||
-              (!runtime_id.engine_commit.empty() && commit != runtime_id.engine_commit)) {
-            note_downgrade(pwhere + ": model_binding mismatch against live runtime");
+          if (!runtime_id.weights_sha256.empty() && wsha != runtime_id.weights_sha256) {
+            note_downgrade(pwhere + ": model_binding.weights_sha256 mismatch against live runtime");
+          } else if (!runtime_id.quantisation.empty() && quant != runtime_id.quantisation) {
+            note_downgrade(pwhere + ": model_binding.quantisation mismatch against live runtime");
+          } else if (!runtime_id.engine_commit.empty() && commit != runtime_id.engine_commit) {
+            note_downgrade(pwhere + ": model_binding.engine_commit mismatch against live runtime");
+          } else if (!runtime_id.prompt_renderer.empty() && renderer != runtime_id.prompt_renderer) {
+            note_downgrade(pwhere + ": model_binding.prompt_renderer mismatch ('" + renderer + "' vs live '" +
+                           runtime_id.prompt_renderer + "')");
+          } else if (!runtime_id.chat_template_sha256.empty() && tsha != runtime_id.chat_template_sha256) {
+            note_downgrade(pwhere + ": model_binding.chat_template_sha256 mismatch against live chat_template.jinja");
           }
         }
       }

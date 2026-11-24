@@ -67,7 +67,7 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  std::string persona_spec, refusal_map;
+  std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1";
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   bool persona_probe_mode = false;
@@ -90,6 +90,9 @@ int main(int argc, char** argv) {
           &persona_probe_mode);
   ap.option("--refusal-map", "", "refusal-linked unit deny-list JSON (unconditionally blocks listed units)",
             &refusal_map);
+  ap.option("--prompt-renderer", "",
+            "canonical prompt renderer contract checked against persona model_binding.prompt_renderer",
+            &prompt_renderer);
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
@@ -143,8 +146,14 @@ int main(int argc, char** argv) {
                                                                  : ingine::persona::RefusalMap::load(refusal_map);
     std::shared_ptr<const ingine::persona::PersonaCatalog> personas;
     if (!persona_spec.empty()) {
+      ingine::persona::ModelRuntimeIdentity runtime_id;
+      runtime_id.prompt_renderer = prompt_renderer;
+      const std::filesystem::path tmpl_path = std::filesystem::path(model_dir) / "chat_template.jinja";
+      if (std::filesystem::is_regular_file(tmpl_path)) {
+        runtime_id.chat_template_sha256 = ingine::persona::sha256_file_hex(tmpl_path);
+      }
       personas = std::make_shared<ingine::persona::PersonaCatalog>(
-          ingine::persona::PersonaCatalog::load(persona_spec, persona_probe_mode, rmap));
+          ingine::persona::PersonaCatalog::load(persona_spec, persona_probe_mode, rmap, runtime_id));
       log.info("loaded persona spec {} ({} profile(s), default='{}', probe_mode={})",
                personas->spec_sha256.substr(0, 12), personas->profiles.size(), personas->default_profile,
                personas->probe_mode ? "on" : "off");

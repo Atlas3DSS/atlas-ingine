@@ -223,13 +223,22 @@
     },
     "ModelBinding": {
       "type": "object",
-      "description": "Exact model weights, quantisation, and engine commit the profile was validated on. Loading on any mismatching model/quant/commit downgrades the whole profile to 'probe'.",
-      "required": ["weights_sha256", "quantisation", "engine_commit"],
+      "description": "Exact model weights, quantisation, engine commit, prompt renderer, and chat_template.jinja SHA-256 the profile was validated on. Loading on any mismatching model/quant/commit/renderer/template downgrades the whole profile to 'probe'.",
+      "required": ["weights_sha256", "quantisation", "engine_commit", "prompt_renderer", "chat_template_sha256"],
       "additionalProperties": false,
       "properties": {
         "weights_sha256": { "$ref": "#/$defs/Sha256Hex" },
         "quantisation": { "type": "string", "minLength": 1 },
-        "engine_commit": { "type": "string", "minLength": 7 }
+        "engine_commit": { "type": "string", "minLength": 7 },
+        "prompt_renderer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Canonical prompt renderer / chat-switch contract under which the profile was validated (e.g. 'ingine_chat_format_v1', 'chat_template_jinja:reasoning_effort=none')."
+        },
+        "chat_template_sha256": {
+          "$ref": "#/$defs/Sha256Hex",
+          "description": "SHA-256 of chat_template.jinja under which the profile was validated."
+        }
       }
     },
     "CompositionEvidence": {

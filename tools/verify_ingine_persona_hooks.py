@@ -97,7 +97,9 @@ def http_sse(url: str, payload: dict[str, Any], timeout: float = 60.0) -> tuple[
         return resp.status, events
 
 
-def make_valid_spec(visit_a: int, expert_a: int, visit_c: int, expert_c: int, hardware: str) -> dict[str, Any]:
+def make_valid_spec(
+    visit_a: int, expert_a: int, visit_c: int, expert_c: int, hardware: str, chat_template_sha256: str
+) -> dict[str, Any]:
     def prov(purpose: str, visit: int, expert: int) -> dict[str, Any]:
         return {
             "status": "validated",
@@ -142,6 +144,8 @@ def make_valid_spec(visit_a: int, expert_a: int, visit_c: int, expert_c: int, ha
                 "weights_sha256": HEX64,
                 "quantisation": "NVFP4",
                 "engine_commit": "f3848d8",
+                "prompt_renderer": "ingine_chat_format_v1",
+                "chat_template_sha256": chat_template_sha256,
             },
             "leakage_check": {"passed": True, "evidence_file": "results/leakage_check.json"},
             "interventions": [
@@ -179,7 +183,8 @@ def verify_serve_control_plane(
     expert_c: int,
     hardware: str,
 ) -> dict[str, Any]:
-    spec_ok = make_valid_spec(visit_a, expert_a, visit_c, expert_c, hardware)
+    tmpl_sha = hashlib.sha256((model_dir / "chat_template.jinja").read_bytes()).hexdigest()
+    spec_ok = make_valid_spec(visit_a, expert_a, visit_c, expert_c, hardware, tmpl_sha)
     spec_ok_path = workdir / "spec_valid.json"
     spec_ok_path.write_text(json.dumps(spec_ok, indent=2))
     spec_ok_sha = hashlib.sha256(spec_ok_path.read_bytes()).hexdigest()
@@ -269,6 +274,32 @@ def verify_serve_control_plane(
     assert res.returncode != 0, "failed to reject refusal-map protected unit"
     reject_checks["rejects_refusal_map_unit"] = True
 
+    # 1f. prompt_renderer mismatch downgrades to probe and is rejected in strict mode
+    res = run_cmd(
+        [
+            str(serve_bin),
+            "--fake",
+            "--model-dir",
+            str(model_dir),
+            "--persona-spec",
+            str(spec_ok_path),
+            "--prompt-renderer",
+            "atlas_eval_dump:reasoning_effort=none",
+        ],
+        check=False,
+    )
+    assert res.returncode != 0, "strict mode failed to reject prompt_renderer mismatch"
+    reject_checks["strict_rejects_renderer_mismatch"] = True
+
+    # 1g. chat_template_sha256 mismatch downgrades to probe and is rejected in strict mode
+    s_bad_tmpl = json.loads(json.dumps(spec_ok))
+    s_bad_tmpl["profiles"]["calm_a"]["model_binding"]["chat_template_sha256"] = "a" * 64
+    p_bad_tmpl = workdir / "spec_bad_tmpl.json"
+    p_bad_tmpl.write_text(json.dumps(s_bad_tmpl))
+    res = run_cmd([str(serve_bin), "--fake", "--model-dir", str(model_dir), "--persona-spec", str(p_bad_tmpl)], check=False)
+    assert res.returncode != 0, "strict mode failed to reject chat_template_sha256 mismatch"
+    reject_checks["strict_rejects_template_sha_mismatch"] = True
+
     # 2. Live GPU ingine-serve test with valid strict spec
     port = pick_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -295,7 +326,7 @@ def verify_serve_control_plane(
             text=True,
         )
         try:
-            deadline = time.time() + 120.0
+            deadline = time.time() + 240.0
             ready = False
             while time.time() < deadline:
                 if proc.poll() is not None:
@@ -320,10 +351,11 @@ def verify_serve_control_plane(
                 "messages": [
                     {
                         "role": "user",
-                        "content": "Explain in one short sentence why prime numbers matter in cryptography.",
+                        "content": "Describe three unusual architectural details of an underwater observatory.",
                     }
                 ],
                 "enable_thinking": False,
+                "reasoning_effort": "none",
                 "temperature": 0.0,
                 "max_tokens": 24,
             }
@@ -410,6 +442,7 @@ def cosine_sim(a: list[float], b: list[float]) -> float:
 def run_eval_dump_parity(
     eval_dump_bin: Path,
     gguf_path: Path,
+    model_dir: Path,
     prompt_text: str,
     prompt_ids_ingine: list[int],
     ingine_dump_dir: Path,
@@ -431,6 +464,8 @@ def run_eval_dump_parity(
             str(out_dir),
             "--limit",
             "1",
+            "--reasoning-effort",
+            "none",
             "--no-moment2",
             "--preserve-topk-order",
             "--ngl",
@@ -438,13 +473,40 @@ def run_eval_dump_parity(
         ],
         env=env,
     )
+    tmpl_path = model_dir / "chat_template.jinja"
+    tmpl_sha = hashlib.sha256(tmpl_path.read_bytes()).hexdigest() if tmpl_path.exists() else ""
+    template_prompt_ids: list[int] | None = None
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+
+        tok = AutoTokenizer.from_pretrained(str(model_dir))
+        rendered = tok.apply_chat_template(
+            [{"role": "user", "content": prompt_text}],
+            tokenize=False,
+            add_generation_prompt=True,
+            reasoning_effort="none",
+        )
+        template_prompt_ids = [int(x) for x in tok.encode(rendered, add_special_tokens=False)]
+        assert template_prompt_ids == list(prompt_ids_ingine), (
+            f"Gate 5 HF template ID mismatch: template({len(template_prompt_ids)})={template_prompt_ids} "
+            f"vs ingine({len(prompt_ids_ingine)})={prompt_ids_ingine}"
+        )
+    except ImportError:
+        pass
     summary: dict[str, Any] = {
         "pool_label_ingine": "atlas-ingine (NVFP4/BF16 native checkpoint)",
         "pool_label_eval_dump": "atlas-eval-dump (GGUF Q8_0 llama.cpp reference)",
-        "note": "Separate quantisation pools (NVFP4/BF16 vs Q8_0); compares routing agreement and ffn_moe_inp activation cosine similarity on matched chat-rendered prompt.",
+        "prompt_renderer": "chat_template_jinja:reasoning_effort=none",
+        "chat_template_sha256": tmpl_sha,
+        "note": "Separate quantisation pools (NVFP4/BF16 vs Q8_0); compares position-aligned routing agreement and ffn_moe_inp activation cosine similarity on token-identical chat_template.jinja(reasoning_effort='none') input.",
         "eval_dump_files": sorted(str(p.relative_to(out_dir)) for p in out_dir.rglob("*") if p.is_file()),
         "ingine_dump_files": sorted(p.name for p in ingine_dump_dir.glob("*")),
         "ingine_prompt_tokens": len(prompt_ids_ingine),
+        "ingine_prompt_ids": list(prompt_ids_ingine),
+        "hf_template_prompt_ids": template_prompt_ids,
+        "ingine_matches_hf_template_ids": (
+            template_prompt_ids == list(prompt_ids_ingine) if template_prompt_ids is not None else None
+        ),
     }
     rows_path = out_dir / "rows.jsonl"
     n_ed = len(prompt_ids_ingine)
@@ -453,32 +515,30 @@ def run_eval_dump_parity(
         n_ed = int(row.get("n_tokens", n_ed))
         summary["eval_dump_prompt_tokens"] = n_ed
         summary["prompt_token_count_match"] = (n_ed == len(prompt_ids_ingine))
+        assert n_ed == len(prompt_ids_ingine), (
+            f"Gate 5 prompt token identity mismatch: ingine={len(prompt_ids_ingine)} vs eval_dump={n_ed}"
+        )
 
     n_ing = len(prompt_ids_ingine)
     route_u8 = out_dir / "topk_idx.u8"
     if route_u8.exists():
         ed_idx = list(route_u8.read_bytes())
-        if len(ed_idx) >= n_ed * 48 * 8 and n_ed > 0 and n_ing > 0:
-            n_cmp = min(n_ing, n_ed)
-            ing_off = n_ing - n_cmp
-            ed_off = n_ed - n_cmp
-            overlaps: dict[str, float] = {}
-            slot_exact: dict[str, float] = {}
-            for v in REQUIRED_NOOP_VISITS:
-                ing_idx = read_i32_bin(ingine_dump_dir / f"parity_v{v}_idx.i32")
-                ov_sum = 0.0
-                sl_sum = 0.0
-                for t in range(n_cmp):
-                    ti = ing_off + t
-                    te = ed_off + t
-                    row_ing = ing_idx[ti * 8 : (ti + 1) * 8]
-                    row_ed = ed_idx[(te * 48 + v) * 8 : (te * 48 + v) * 8 + 8]
-                    ov_sum += len(set(row_ing) & set(row_ed)) / 8.0
-                    sl_sum += sum(1 for a, b in zip(row_ing, row_ed) if a == b) / 8.0
-                overlaps[str(v)] = round(ov_sum / n_cmp, 4)
-                slot_exact[str(v)] = round(sl_sum / n_cmp, 4)
-            summary["visit_top8_overlap"] = overlaps
-            summary["visit_slot_order_match"] = slot_exact
+        assert len(ed_idx) >= n_ed * 48 * 8 and n_ed == n_ing and n_ing > 0
+        overlaps: dict[str, float] = {}
+        slot_exact: dict[str, float] = {}
+        for v in REQUIRED_NOOP_VISITS:
+            ing_idx = read_i32_bin(ingine_dump_dir / f"parity_v{v}_idx.i32")
+            ov_sum = 0.0
+            sl_sum = 0.0
+            for t in range(n_ing):
+                row_ing = ing_idx[t * 8 : (t + 1) * 8]
+                row_ed = ed_idx[(t * 48 + v) * 8 : (t * 48 + v) * 8 + 8]
+                ov_sum += len(set(row_ing) & set(row_ed)) / 8.0
+                sl_sum += sum(1 for a, b in zip(row_ing, row_ed) if a == b) / 8.0
+            overlaps[str(v)] = round(ov_sum / n_ing, 4)
+            slot_exact[str(v)] = round(sl_sum / n_ing, 4)
+        summary["visit_top8_overlap"] = overlaps
+        summary["visit_slot_order_match"] = slot_exact
 
     ffn_mean_path = out_dir / "ffn_mean.f16"
     ffn_gen_path = out_dir / "ffn_gen.f16"
@@ -542,7 +602,7 @@ def main() -> int:
 
         # ---- Discovery pass: identify active_e[v], never_e[v] for all 6 visits, plus top active neurons at v=10
         disc_batch = {
-            "prompts": [{"id": "p0", "text": prompt_a, "chat": True, "enable_thinking": False, "gen_tokens": 8}],
+            "prompts": [{"id": "p0", "text": prompt_a, "chat": True, "reasoning_effort": "none", "enable_thinking": True, "gen_tokens": 8}],
             "cases": [
                 {
                     "name": "discover_routing",
@@ -601,7 +661,7 @@ def main() -> int:
         disc3a_in.write_text(
             json.dumps(
                 {
-                    "prompts": [{"id": "p0", "text": prompt_a, "chat": True, "enable_thinking": False, "gen_tokens": 8}],
+                    "prompts": [{"id": "p0", "text": prompt_a, "chat": True, "reasoning_effort": "none", "enable_thinking": True, "gen_tokens": 8}],
                     "cases": [
                         {
                             "name": "base_3a_v10",
@@ -739,7 +799,7 @@ def main() -> int:
             }
         )
 
-        # Gate 2: Active causal interventions + simultaneous 3b/3a + eager-vs-graph check
+        # Gate 2: Active causal interventions + simultaneous 3b/3a + eager-vs-graph check on ALL 12 cases
         cases.extend(
             [
                 {
@@ -753,6 +813,7 @@ def main() -> int:
                     "name": "active_ablate_v29",
                     "prompt": "p0",
                     "gen_tokens": 8,
+                    "check_eager_graph": True,
                     "interventions": [{"type": "router_ablate", "visit": 29, "expert": active_e[29]}],
                 },
                 {
@@ -768,6 +829,7 @@ def main() -> int:
                     "name": "active_force_gain2_v29",
                     "prompt": "p0",
                     "gen_tokens": 8,
+                    "check_eager_graph": True,
                     "interventions": [
                         {"type": "router_force", "visit": 29, "expert": active_e[29], "bias": 0.0, "gain": 2.0}
                     ],
@@ -776,12 +838,14 @@ def main() -> int:
                     "name": "active_slot_permute_rev_v10",
                     "prompt": "p0",
                     "gen_tokens": 8,
+                    "check_eager_graph": True,
                     "interventions": [{"type": "router_slot_permute", "visit": 10, "perm": [7, 6, 5, 4, 3, 2, 1, 0]}],
                 },
                 {
                     "name": "active_cross_replay_v10",
                     "prompt": "p0",
                     "gen_tokens": 8,
+                    "check_eager_graph": True,
                     "interventions": [
                         {"type": "route_replay", "visit": 10, "copy_weights": False, "donor_prompt": "p1"}
                     ],
@@ -790,6 +854,7 @@ def main() -> int:
                     "name": "active_cross_depth_loop_msg_v18",
                     "prompt": "p0",
                     "gen_tokens": 8,
+                    "check_eager_graph": True,
                     "interventions": [
                         {"type": "depth_replace", "visit": 18, "site": "loop_msg", "mode": "both", "donor_prompt": "p1"}
                     ],
@@ -809,6 +874,7 @@ def main() -> int:
                     "name": "active_3b_off2p5_v10",
                     "prompt": "p0",
                     "gen_tokens": 8,
+                    "check_eager_graph": True,
                     "interventions": [
                         {"type": "neuron_affine", "visit": 10, "expert": active_e[10], "neuron": n0, "gain": 1.0, "offset": 2.5}
                     ],
@@ -819,6 +885,7 @@ def main() -> int:
                     "name": "active_3b_zero_v10",
                     "prompt": "p0",
                     "gen_tokens": 8,
+                    "check_eager_graph": True,
                     "interventions": [
                         {"type": "neuron_affine", "visit": 10, "expert": active_e[10], "neuron": n0, "gain": 0.0, "offset": 0.0}
                     ],
@@ -829,6 +896,7 @@ def main() -> int:
                     "name": "active_3b_multi_v10",
                     "prompt": "p0",
                     "gen_tokens": 8,
+                    "check_eager_graph": True,
                     "interventions": [
                         {"type": "neuron_affine", "visit": 10, "expert": active_e[10], "neuron": n0, "gain": 2.0, "offset": 1.0},
                         {"type": "neuron_affine", "visit": 10, "expert": active_e[10], "neuron": n1, "gain": 0.5, "offset": -1.5},
@@ -850,8 +918,8 @@ def main() -> int:
 
         main_batch = {
             "prompts": [
-                {"id": "p0", "text": prompt_a, "chat": True, "enable_thinking": False, "gen_tokens": 8},
-                {"id": "p1", "text": prompt_b, "chat": True, "enable_thinking": False, "gen_tokens": 8},
+                {"id": "p0", "text": prompt_a, "chat": True, "reasoning_effort": "none", "enable_thinking": True, "gen_tokens": 8},
+                {"id": "p1", "text": prompt_b, "chat": True, "reasoning_effort": "none", "enable_thinking": True, "gen_tokens": 8},
             ],
             "cases": cases,
             "cache_isolation": {
@@ -913,14 +981,14 @@ def main() -> int:
             c = by_name[cname]
             kl_any = max(c["prefill_kl"], c["decode_kl_mean"])
             assert kl_any > 1e-5, f"Gate 2 FAILED: {cname} had negligible KL={kl_any}"
-            if "decode_graph_matches_eager_bits" in c:
-                assert c["decode_graph_matches_eager_bits"] is True, f"Gate 2 FAILED: {cname} graph != eager"
+            assert c.get("decode_graph_matches_eager_bits") is True, f"Gate 2 FAILED: {cname} graph != eager"
 
-        # Slot-permute noise floor: tiny non-catastrophic difference
+        # Slot-permute noise floor: tiny non-catastrophic difference + graph==eager bitlock
         sp_c = by_name["active_slot_permute_rev_v10"]
         assert math.isfinite(sp_c["prefill_kl"]) and sp_c["prefill_kl"] < 0.05, f"unexpected slot_permute KL: {sp_c}"
+        assert sp_c.get("decode_graph_matches_eager_bits") is True, f"slot_permute graph != eager: {sp_c}"
 
-        # 3b + simultaneous 3a checks
+        # 3b + simultaneous 3a checks + graph==eager bitlock
         for cname in ["active_3b_gain3_v10", "active_3b_off2p5_v10", "active_3b_zero_v10", "active_3b_multi_v10"]:
             c = by_name[cname]
             kl_any = max(c["prefill_kl"], c["decode_kl_mean"])
@@ -932,8 +1000,7 @@ def main() -> int:
             assert abs(ns0["post_mean"] - mean_3a) < 0.05, f"3b post_mean vs 3a mismatch in {cname}: {ns0['post_mean']} vs {mean_3a}"
             ctrl_mean = e3a["sample_neurons"][str(n_ctrl)]["mean"]
             assert abs(ctrl_mean - base_ctrl_mean) < 1e-4, f"untouched control neuron drifted in {cname}: {ctrl_mean} vs {base_ctrl_mean}"
-            if "decode_graph_matches_eager_bits" in c:
-                assert c["decode_graph_matches_eager_bits"] is True, f"3b graph != eager in {cname}"
+            assert c.get("decode_graph_matches_eager_bits") is True, f"3b graph != eager in {cname}"
         print(
             f"[PASS] Gate 2 (active causal + 3b/3a simultaneous + graph==eager bitlock): "
             f"ablate_v10_kl={by_name['active_ablate_v10']['prefill_kl']:.3e} "
@@ -979,6 +1046,7 @@ def main() -> int:
             parity_res = run_eval_dump_parity(
                 args.eval_dump_bin,
                 args.gguf,
+                args.model_dir,
                 prompt_a,
                 disc["prompts"]["p0"]["prompt_ids"],
                 dump_dir,

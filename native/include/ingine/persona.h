@@ -106,7 +106,12 @@ struct ModelRuntimeIdentity {
   std::string weights_sha256;
   std::string quantisation;
   std::string engine_commit;
-  bool populated() const { return !weights_sha256.empty() || !quantisation.empty() || !engine_commit.empty(); }
+  std::string prompt_renderer;
+  std::string chat_template_sha256;
+  bool populated() const {
+    return !weights_sha256.empty() || !quantisation.empty() || !engine_commit.empty() || !prompt_renderer.empty() ||
+           !chat_template_sha256.empty();
+  }
 };
 
 struct InterventionSpec {
