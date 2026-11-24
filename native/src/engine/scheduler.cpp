@@ -96,14 +96,19 @@ Scheduler::Scheduler(model::Generator& generator, std::vector<int32_t> stop_ids,
       stop_list_(std::move(stop_ids)),
       stop_ids_(stop_list_.begin(), stop_list_.end()),
       max_queue_(max_queue),
-      thread_([this] { loop(); }) {}
+      max_batch_(std::max(1, generator.max_batch_size())),
+      thread_([this] {
+        if (max_batch_ > 1) loop_batched();
+        else loop();
+      }) {}
 
 Scheduler::~Scheduler() { close(); }
 
 bool Scheduler::submit(std::shared_ptr<Job> job) {
   {
     std::lock_guard lock(mutex_);
-    if (closed_ || int(waiting_.size()) + (active_ != nullptr) > max_queue_) return false;
+    const int cap = max_batch_ + max_queue_;
+    if (closed_ || int(waiting_.size()) + int(active_.size()) >= cap) return false;
     waiting_.push_back(std::move(job));
   }
   cv_.notify_all();
@@ -119,7 +124,8 @@ void Scheduler::withdraw(const std::shared_ptr<Job>& job) {
 
 SchedulerStats Scheduler::stats() const {
   std::lock_guard lock(mutex_);
-  return {int(waiting_.size()), active_ != nullptr, max_queue_};
+  const int act = int(active_.size());
+  return {int(waiting_.size()), act > 0, act, max_batch_, max_queue_};
 }
 
 void Scheduler::close() {
@@ -132,7 +138,7 @@ void Scheduler::close() {
       job->finish();
     }
     waiting_.clear();
-    if (active_) active_->cancel();
+    for (auto& job : active_) job->cancel();
   }
   cv_.notify_all();
   if (thread_.joinable()) thread_.join();
@@ -145,13 +151,198 @@ void Scheduler::loop() {
       std::unique_lock lock(mutex_);
       cv_.wait(lock, [&] { return !waiting_.empty() || closed_; });
       if (closed_) return;
-      job = active_ = waiting_.front();
+      job = waiting_.front();
       waiting_.pop_front();
+      active_.push_back(job);
     }
     run(*job);
     job->finish();
     std::lock_guard lock(mutex_);
-    active_ = nullptr;
+    active_.clear();
+  }
+}
+
+void Scheduler::loop_batched() {
+  struct SlotEntry {
+    std::shared_ptr<Job> job;
+    int slot = -1;
+    int32_t last_token = 0;
+    int generated = 0;
+    int max_new_tokens = 0;
+  };
+  std::vector<SlotEntry> live;
+
+  auto remove_active_job = [&](const std::shared_ptr<Job>& job) {
+    std::lock_guard lock(mutex_);
+    auto it = std::find(active_.begin(), active_.end(), job);
+    if (it != active_.end()) active_.erase(it);
+  };
+
+  auto retire = [&](SlotEntry& e) {
+    if (e.slot >= 0) {
+      generator_.release_slot(e.slot);
+      e.slot = -1;
+    }
+    e.job->finish();
+    remove_active_job(e.job);
+  };
+
+  for (;;) {
+    // 1. Check shutdown & retire any cancelled active slots immediately.
+    bool shutting_down = false;
+    {
+      std::lock_guard lock(mutex_);
+      shutting_down = closed_;
+    }
+    if (shutting_down) {
+      for (auto& e : live) retire(e);
+      live.clear();
+      return;
+    }
+    for (auto it = live.begin(); it != live.end();) {
+      if (it->job->cancelled()) {
+        retire(*it);
+        it = live.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    // 2. Admit newly arrived waiting jobs into free slots (new requests join mid-generation).
+    while (int(live.size()) < max_batch_) {
+      std::shared_ptr<Job> job;
+      {
+        std::lock_guard lock(mutex_);
+        if (closed_ || waiting_.empty()) break;
+        const auto& front = waiting_.front();
+        if (front->cancelled()) {
+          job = front;
+          waiting_.pop_front();
+        } else if (!live.empty() && !generator_.can_admit_slot(int(front->prompt_ids.size()), front->max_new_tokens)) {
+          break;  // wait until an active slot frees KV pages
+        } else {
+          job = front;
+          waiting_.pop_front();
+          active_.push_back(job);
+        }
+      }
+      if (job->cancelled()) {
+        job->finish();
+        continue;
+      }
+      job->started();
+      const int n = int(job->prompt_ids.size());
+      int eff_max = job->max_new_tokens;
+      if (!job->sampling.forced.empty()) eff_max = std::min(eff_max, int(job->sampling.forced.size()));
+      const int max_len = generator_.max_model_len();
+      if (n + eff_max > max_len) eff_max = max_len - n;
+      try {
+        if (eff_max <= 0) {
+          throw std::invalid_argument("prompt of " + std::to_string(n) + " tokens does not fit max_ctx " +
+                                      std::to_string(max_len));
+        }
+        int32_t first_tok = 0;
+        model::GenerateStats st;
+        const int slot =
+            generator_.start_slot(model::Prompt{job->prompt_ids, job->images}, eff_max, job->sampling, first_tok, st);
+        if (slot < 0) {
+          // Put back at front of queue; retry after next step frees resources.
+          std::lock_guard lock(mutex_);
+          auto it = std::find(active_.begin(), active_.end(), job);
+          if (it != active_.end()) active_.erase(it);
+          if (!closed_) waiting_.push_front(job);
+          else {
+            job->fail("server shutting down");
+            job->finish();
+          }
+          break;
+        }
+        server_log().info("{}: slot={} reuse={} reused={} prefilled={} prefill={:.3f}s", job->id, slot,
+                          model::to_string(st.reuse), st.reused_tokens, st.prompt_tokens - st.reused_tokens,
+                          st.prefill_seconds);
+        if (!job->images.empty()) {
+          server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job->id, job->images.size(),
+                            st.image_tokens, st.images_encoded, st.vision_seconds);
+        }
+        if (job->cancelled()) {
+          generator_.release_slot(slot);
+          job->finish();
+          remove_active_job(job);
+          continue;
+        }
+        job->push({first_tok});
+        if (stop_ids_.contains(first_tok) || eff_max <= 1 || job->cancelled()) {
+          generator_.release_slot(slot);
+          job->finish();
+          remove_active_job(job);
+        } else {
+          live.push_back(SlotEntry{std::move(job), slot, first_tok, 1, eff_max});
+        }
+      } catch (const std::exception& e) {
+        server_log().error("generator failed: {}: {}", type_name(e), e.what());
+        job->fail("generation failed: " + type_name(e) + ": " + e.what());
+        job->finish();
+        remove_active_job(job);
+      } catch (...) {
+        server_log().error("generator failed: unknown exception");
+        job->fail("generation failed: unknown exception");
+        job->finish();
+        remove_active_job(job);
+      }
+    }
+
+    // 3. Sleep if no active sequences and nothing waiting.
+    if (live.empty()) {
+      std::unique_lock lock(mutex_);
+      cv_.wait(lock, [&] { return !waiting_.empty() || closed_; });
+      continue;
+    }
+
+    // 4. Execute ONE batched decode step across all live slots and stream tokens immediately.
+    std::vector<model::BatchSlotStep> inputs(live.size());
+    std::vector<int32_t> next_tokens(live.size(), 0);
+    for (std::size_t i = 0; i < live.size(); ++i) inputs[i] = {live[i].slot, live[i].last_token};
+
+    try {
+      generator_.step_slots(inputs, next_tokens);
+    } catch (const std::exception& e) {
+      server_log().error("batched step failed: {}: {}", type_name(e), e.what());
+      const std::string msg = "generation failed: " + type_name(e) + ": " + e.what();
+      for (auto& entry : live) {
+        entry.job->fail(msg);
+        retire(entry);
+      }
+      live.clear();
+      continue;
+    } catch (...) {
+      server_log().error("batched step failed: unknown exception");
+      for (auto& entry : live) {
+        entry.job->fail("generation failed: unknown exception");
+        retire(entry);
+      }
+      live.clear();
+      continue;
+    }
+
+    std::vector<SlotEntry> kept;
+    kept.reserve(live.size());
+    for (std::size_t i = 0; i < live.size(); ++i) {
+      SlotEntry& e = live[i];
+      if (e.job->cancelled()) {
+        retire(e);
+        continue;
+      }
+      const int32_t tok = next_tokens[i];
+      e.job->push({tok});
+      e.last_token = tok;
+      ++e.generated;
+      if (stop_ids_.contains(tok) || e.generated >= e.max_new_tokens || e.job->cancelled()) {
+        retire(e);
+      } else {
+        kept.push_back(std::move(e));
+      }
+    }
+    live = std::move(kept);
   }
 }
 

@@ -68,6 +68,7 @@ int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1;
+  int max_batch = 1, max_kv_tokens = 0;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
@@ -133,6 +134,8 @@ int main(int argc, char** argv) {
   ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
   ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
+  ap.option("--max-batch", "", "max concurrent sequences for continuous batching (1 = single-request mode)", &max_batch);
+  ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity for --max-batch > 1 (0 = auto)", &max_kv_tokens);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
   ap.option("--log-level", "", "", &log_level);
@@ -202,6 +205,8 @@ int main(int argc, char** argv) {
       options.offload_mode = offload_mode;
       options.expert_ranking = expert_ranking;
       options.dump_router_stats = dump_router_stats;
+      options.max_batch = max_batch;
+      options.max_kv_tokens = max_kv_tokens;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

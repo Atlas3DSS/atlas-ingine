@@ -70,6 +70,8 @@ class Job {
 struct SchedulerStats {
   int waiting = 0;
   bool running = false;
+  int active = 0;
+  int max_batch = 1;
   int max_queue = 0;
 };
 
@@ -80,26 +82,28 @@ class Scheduler {
   Scheduler(const Scheduler&) = delete;
   Scheduler& operator=(const Scheduler&) = delete;
 
-  // False when closed or when max_queue jobs already wait (the running one counts as in server.py).
+  // False when closed or when max_queue jobs already wait (plus active slots).
   bool submit(std::shared_ptr<Job> job);
   // Cancels the job and drops it from the waiting list if it has not started.
   void withdraw(const std::shared_ptr<Job>& job);
   SchedulerStats stats() const;
-  // Fails waiting jobs ("server shutting down"), cancels the running one and joins the worker.
+  // Fails waiting jobs ("server shutting down"), cancels the running ones and joins the worker.
   void close();
 
  private:
   void loop();
+  void loop_batched();
   void run(Job& job);
 
   model::Generator& generator_;
   const std::vector<int32_t> stop_list_;
   const std::unordered_set<int32_t> stop_ids_;
   const int max_queue_;
+  const int max_batch_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Job>> waiting_;
-  std::shared_ptr<Job> active_;
+  std::vector<std::shared_ptr<Job>> active_;
   bool closed_ = false;
   std::thread thread_;
 };

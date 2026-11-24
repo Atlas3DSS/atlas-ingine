@@ -7,6 +7,7 @@ add_library(ingine_model STATIC
   decoder.cpp
   runtime.cpp
   generator.cpp
+  batch_engine.cpp
   model_kernels.cu
 )
 # prefill (package Prefill) and the speculative loop (package Spec)
@@ -26,7 +27,7 @@ target_link_libraries(ingine_model PUBLIC
   ingine_kernels_head
   nlohmann_json::nlohmann_json
   CUDA::cudart)
-foreach(area prefill draft)
+foreach(area prefill draft batch)
   if(TARGET ingine_kernels_${area})
     target_link_libraries(ingine_model PUBLIC ingine_kernels_${area})
   endif()

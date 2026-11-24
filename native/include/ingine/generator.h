@@ -123,6 +123,16 @@ struct RuntimeOptions {
   std::filesystem::path kv_ckpt_path;    // path for periodic & SIGTERM atomic KV checkpoints (auto-resumes if prefix matches)
   int kv_ckpt_every = 0;                 // save atomic checkpoint every N tokens during prefill (e.g. 131072; 0 = SIGTERM/manual only)
   std::filesystem::path kv_ckpt_resume;  // explicit checkpoint path to resume from (fails loudly if missing or mismatched)
+  // Continuous batching: max concurrent sequences (1 = single-request EngineGenerator, zero B=1 regression).
+  int max_batch = 1;
+  // Shared paged full-attention KV pool capacity in tokens (0 = auto-size from free VRAM).
+  int max_kv_tokens = 0;
+};
+
+// One active sequence entering a batched decode step (continuous batching).
+struct BatchSlotStep {
+  int slot = -1;
+  int32_t token = 0;
 };
 
 class Generator {
@@ -145,6 +155,23 @@ class Generator {
   }
   virtual bool supports_images() const { return false; }
   virtual std::string offload_summary() const { return {}; }
+
+  // ---- Optional continuous-batching interface (used by Scheduler and ingine-bench when max_batch_size() > 1)
+  virtual int max_batch_size() const { return 1; }
+  virtual bool can_admit_slot(int /*prompt_tokens*/, int /*max_new_tokens*/) const { return false; }
+  // Allocates a free slot, prefills `prompt`, samples `first_token` and fills `stats`. Returns slot id >= 0,
+  // or -1 if no slot / KV pages are currently available. Throws std::invalid_argument on invalid prompt.
+  virtual int start_slot(const Prompt& /*prompt*/, int /*max_new_tokens*/, const Sampling& /*sampling*/,
+                         int32_t& /*first_token*/, GenerateStats& /*stats*/) {
+    throw std::logic_error("this generator does not support batched decoding");
+  }
+  // Runs one batched decode step across `inputs` (1..max_batch_size() active slots), sampling each slot's
+  // next token into `out_tokens[i]` and advancing each slot's position.
+  virtual void step_slots(std::span<const BatchSlotStep> /*inputs*/, std::span<int32_t> /*out_tokens*/) {
+    throw std::logic_error("this generator does not support batched decoding");
+  }
+  // Releases `slot` and returns its KV pages immediately. Safe to call on any active slot.
+  virtual void release_slot(int /*slot*/) {}
 };
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options);  // the model (ingine_model)
