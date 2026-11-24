@@ -386,8 +386,9 @@ __device__ __forceinline__ void fast_argmax(float& v, int& i, FastReduce& r) {
 
 // True in every thread of the block that finished its row last (after publishing its own part).
 __device__ __forceinline__ bool finish_part(unsigned* done, FastReduce& r) {
+  __threadfence();  // Fence every thread's global writes/atomics (e.g. kth/mass histogram adds) before signaling done.
+  __syncthreads();
   if (threadIdx.x == 0) {
-    __threadfence();
     r.last = atomicAdd(done, 1u) == kParts - 1;
   }
   __syncthreads();
