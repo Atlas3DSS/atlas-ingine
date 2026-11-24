@@ -56,16 +56,22 @@ struct Prompt {
 
 // How the prompt reused the state of earlier requests (reused_tokens were not prefilled again).
 enum class Reuse {
-  None,        // empty state, the whole prompt prefilled
-  Extend,      // the prompt extends the tokens in the state (previous prompt + processed generated tokens)
-  Checkpoint,  // restored the checkpoint taken after the previous prompt's prefill (a prefix of this prompt)
-  Parked,      // restored a parked conversation's checkpoint (a prefix of this prompt; RuntimeOptions::park_mb)
+  None,            // empty state, the whole prompt prefilled
+  Extend,          // the prompt extends the tokens in the state (previous prompt + processed generated tokens)
+  Checkpoint,      // restored the checkpoint taken after the previous prompt's prefill (a prefix of this prompt)
+  Parked,          // restored a parked conversation's checkpoint in VRAM (a prefix of this prompt; RuntimeOptions::park_mb)
+  RootCheckpoint,  // restored a verified root-prefix (system+tools) checkpoint
+  HostParked,      // restored a parked conversation's checkpoint from pinned host RAM
+  PagedPrefix,     // restored a shared paged full-KV + recurrent prefix checkpoint (batched B>1)
 };
 inline const char* to_string(Reuse reuse) {
   switch (reuse) {
     case Reuse::Extend: return "extend";
     case Reuse::Checkpoint: return "checkpoint";
     case Reuse::Parked: return "parked";
+    case Reuse::RootCheckpoint: return "root_checkpoint";
+    case Reuse::HostParked: return "host_parked";
+    case Reuse::PagedPrefix: return "paged_prefix";
     default: return "none";
   }
 }
@@ -80,6 +86,9 @@ struct SpecRoundRecord {
 struct GenerateStats {
   int prompt_tokens = 0, reused_tokens = 0, generated_tokens = 0;
   Reuse reuse = Reuse::None;
+  std::uint64_t restored_bytes = 0;  // bytes copied (D2D/H2D/disk) to restore reused model state
+  double restore_seconds = 0;        // time spent restoring cached prefix state (subset of prefill_seconds)
+  int cache_evictions = 0;           // cache entries evicted during this request
   double prefill_seconds = 0, decode_seconds = 0;
   int spec_rounds = 0, spec_accepted = 0;
   std::vector<SpecRoundRecord> spec_trace;  // forced replay only
@@ -88,6 +97,8 @@ struct GenerateStats {
   int image_tokens = 0, images_encoded = 0;
   double vision_seconds = 0;
 };
+
+using PrefillCallback = std::function<void(const GenerateStats&)>;
 
 struct RuntimeOptions {
   std::filesystem::path model_dir, ablation;  // empty ablation: original model
@@ -159,6 +170,17 @@ class Generator {
                                  const std::function<bool(std::span<const int32_t>)>& on_tokens) {
     if (!prompt.images.empty()) throw std::invalid_argument("this generator does not take images");
     return generate(prompt.ids, max_new_tokens, sampling, stop_ids, on_tokens);
+  }
+  // Variant that delivers completed prefill stats through `on_prefill` strictly before the first token is
+  // emitted via `on_tokens`, so request threads that stop early (e.g. stop strings) still observe exact
+  // prefill/cache accounting. Subclasses that do not override this fall back to firing `on_prefill` on return.
+  virtual GenerateStats generate(const Prompt& prompt, int max_new_tokens, const Sampling& sampling,
+                                 std::span<const int32_t> stop_ids,
+                                 const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                                 const PrefillCallback& on_prefill) {
+    GenerateStats stats = generate(prompt, max_new_tokens, sampling, stop_ids, on_tokens);
+    if (on_prefill) on_prefill(stats);
+    return stats;
   }
   virtual bool supports_images() const { return false; }
   virtual std::string offload_summary() const { return {}; }

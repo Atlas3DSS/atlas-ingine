@@ -101,9 +101,15 @@ std::string FakeGenerator::echo(std::span<const int32_t> prompt_ids) const {
   return out;
 }
 
+void FakeGenerator::set_prefill_stats_hook(PrefillStatsFn hook) {
+  std::lock_guard lock(mutex_);
+  prefill_stats_hook_ = std::move(hook);
+}
+
 model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, int max_new_tokens,
                                              const model::Sampling& sampling, std::span<const int32_t> stop_ids,
-                                             const std::function<bool(std::span<const int32_t>)>& on_tokens) {
+                                             const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                                             const model::PrefillCallback& on_prefill) {
   const std::span<const int32_t> prompt = full_prompt.ids;
   int image_tokens = 0;
   for (const model::PromptImage& image : full_prompt.images) image_tokens += image.tokens();
@@ -112,12 +118,20 @@ model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, i
                                  ? tokenizer_.encode(std::get<std::string>(reply), /*special=*/true)
                                  : std::get<std::vector<int32_t>>(std::move(reply));
   size_t index;
+  PrefillStatsFn hook;
   {
     std::lock_guard lock(mutex_);
     index = calls_.size();
     calls_.push_back(Call{std::vector<int32_t>(prompt.begin(), prompt.end()), max_new_tokens, sampling,
                           int(full_prompt.images.size()), image_tokens});
+    hook = prefill_stats_hook_;
   }
+  model::GenerateStats stats;
+  stats.prompt_tokens = int(prompt.size());
+  stats.image_tokens = image_tokens;
+  if (hook) hook(prompt, stats);
+  if (on_prefill) on_prefill(stats);
+
   const std::unordered_set<int32_t> stops(stop_ids.begin(), stop_ids.end());
   const size_t limit = std::min(out.size(), size_t(std::max(max_new_tokens, 0)));
   bool cancelled = false;
@@ -141,9 +155,6 @@ model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, i
     calls_[index].cancelled = cancelled;
     calls_[index].done = true;
   }
-  model::GenerateStats stats;
-  stats.prompt_tokens = int(prompt.size());
-  stats.image_tokens = image_tokens;
   stats.generated_tokens = yielded;
   return stats;
 }

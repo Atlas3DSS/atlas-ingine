@@ -110,12 +110,19 @@ class EngineGenerator final : public Generator {
   GenerateStats generate(std::span<const std::int32_t> prompt, int max_new_tokens, const Sampling& sampling,
                          std::span<const std::int32_t> stop_ids,
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
-    return generate(Prompt{prompt, {}}, max_new_tokens, sampling, stop_ids, on_tokens);
+    return generate(Prompt{prompt, {}}, max_new_tokens, sampling, stop_ids, on_tokens, PrefillCallback{});
   }
 
   GenerateStats generate(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
                          std::span<const std::int32_t> stop_ids,
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
+    return generate(full_prompt, max_new_tokens, sampling, stop_ids, on_tokens, PrefillCallback{});
+  }
+
+  GenerateStats generate(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
+                         std::span<const std::int32_t> stop_ids,
+                         const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+                         const PrefillCallback& on_prefill) override {
     const std::span<const std::int32_t> prompt = full_prompt.ids;
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     const int n = int(prompt.size());
@@ -148,13 +155,14 @@ class EngineGenerator final : public Generator {
         std::int32_t token = sample(static_cast<const float*>(logits_.p), sampling, rng);
         if (!sampling.forced.empty()) token = sampling.forced[0];
         stats.prefill_seconds = seconds_since(t);
+        if (on_prefill) on_prefill(stats);
         t = std::chrono::steady_clock::now();
         if (max_new_tokens > 0) {
           drafter_->set_seed(rng.seed);
           spec_->generate(token, max_new_tokens, sampling, rng, stop_ids, on_tokens, stats, tokens_in_state_);
         }
       } else {
-        decode(n, max_new_tokens, sampling, rng, stop_ids, on_tokens, stats, t);
+        decode(n, max_new_tokens, sampling, rng, stop_ids, on_tokens, on_prefill, stats, t);
       }
       CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
     } catch (...) {
@@ -231,7 +239,8 @@ class EngineGenerator final : public Generator {
 
   void decode(int n, int max_new_tokens, const Sampling& sampling, head::SamplerRng& rng,
               std::span<const std::int32_t> stop_ids,
-              const std::function<bool(std::span<const std::int32_t>)>& on_tokens, GenerateStats& stats,
+              const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+              const PrefillCallback& on_prefill, GenerateStats& stats,
               std::chrono::steady_clock::time_point& t) {
     const cudaStream_t stream = rt_.stream();
     const head::SamplingParams params = to_head_params(sampling);
@@ -259,6 +268,7 @@ class EngineGenerator final : public Generator {
     if (max_new_tokens > 1) launch(n);
     std::int32_t token = rt_.chain_token(n);
     stats.prefill_seconds = seconds_since(t);
+    if (on_prefill) on_prefill(stats);
     t = std::chrono::steady_clock::now();
     for (int i = 0; i < max_new_tokens; ++i) {
       // `token` is at position n + i; its step is in flight unless it is the budget's last token
@@ -314,18 +324,23 @@ class EngineGenerator final : public Generator {
       const std::vector<std::int32_t> keep = parked->ids;
       const std::uint64_t keep_key = parked->persona_key;
       park_live(&keep, keep_key);
-      unpark(*std::find_if(parked_.begin(), parked_.end(),
-                           [&](const Parked& p) { return p.ids == keep && p.persona_key == keep_key; }));
+      auto& target = *std::find_if(parked_.begin(), parked_.end(),
+                                   [&](const Parked& p) { return p.ids == keep && p.persona_key == keep_key; });
+      const std::uint64_t parked_bytes = target.data.bytes;
+      unpark(target);
       restore_checkpoint();
       start = checkpoint_ids_.size();
       stats.reuse = Reuse::Parked;
+      stats.restored_bytes = parked_bytes + checkpoint_.bytes;
     } else if (extend) {
       start = prev.size();
       stats.reuse = Reuse::Extend;
+      stats.restored_bytes = 0;
     } else if (checkpoint) {
       restore_checkpoint();
       start = checkpoint_ids_.size();
       stats.reuse = Reuse::Checkpoint;
+      stats.restored_bytes = checkpoint_.bytes;
     } else {
       park_live();
       reset_state(st, stream);
@@ -336,6 +351,7 @@ class EngineGenerator final : public Generator {
       checkpoint_persona_key_ = 0;
       live_bypass_reuse_ = bypass_reuse;
       stats.reuse = Reuse::None;
+      stats.restored_bytes = 0;
       // Optional disk KV checkpoint resume (explicit --kv-ckpt-resume fails loudly; --kv-ckpt-path auto-resumes on exact prefix match).
       // Disk KV checkpoints belong to the unhooked baseline (persona_key == 0); never cross-contaminate hooked personas.
       if (!options_.kv_ckpt_resume.empty()) {
@@ -346,6 +362,9 @@ class EngineGenerator final : public Generator {
                                                options_.kv_ckpt_resume, stream);
         start = std::size_t(resumed);
         stats.reuse = Reuse::Checkpoint;
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(options_.kv_ckpt_resume, ec);
+        stats.restored_bytes = ec ? 0u : static_cast<std::uint64_t>(sz);
         std::fprintf(stderr, "[kv-ckpt] resumed %d / %zu tokens from %s\n", resumed, n,
                      options_.kv_ckpt_resume.c_str());
       } else if (req_persona_key == 0 && !bypass_reuse && !options_.kv_ckpt_path.empty() &&
@@ -359,6 +378,9 @@ class EngineGenerator final : public Generator {
                                                      options_.kv_ckpt_path, stream);
               start = std::size_t(resumed);
               stats.reuse = Reuse::Checkpoint;
+              std::error_code ec;
+              const auto sz = std::filesystem::file_size(options_.kv_ckpt_path, ec);
+              stats.restored_bytes = ec ? 0u : static_cast<std::uint64_t>(sz);
               std::fprintf(stderr, "[kv-ckpt] auto-resumed %d / %zu tokens from %s\n", resumed, n,
                            options_.kv_ckpt_path.c_str());
             }

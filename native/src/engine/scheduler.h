@@ -47,6 +47,8 @@ class Job {
   void cancel() { cancel_.store(true, std::memory_order_release); }
   bool cancelled() const { return cancel_.load(std::memory_order_acquire); }
   std::optional<Clock::time_point> t_start() const;
+  // Completed prefill/cache accounting, published before the first generated token is pushed.
+  std::optional<model::GenerateStats> prefill_stats() const;
 
   // Waits up to `timeout` for output, then returns everything available (empty on timeout).
   JobBatch take(Clock::duration timeout);
@@ -54,6 +56,7 @@ class Job {
  private:
   friend class Scheduler;
   void started();
+  void set_prefill_stats(model::GenerateStats stats);
   void push(const std::vector<int32_t>& tokens);
   void fail(std::string message);
   void finish();
@@ -65,6 +68,7 @@ class Job {
   std::optional<std::string> failure_;
   bool end_ = false;
   std::optional<Clock::time_point> t_start_;
+  std::optional<model::GenerateStats> prefill_stats_;
 };
 
 struct SchedulerStats {

@@ -209,9 +209,16 @@ Json health(int port) { return Json::parse(request(port, "GET", "/health").body)
 // ---- OpenAI schema checks ---------------------------------------------------------------------------------
 
 void check_usage(const Json& u) {
-  CHECK(u.size() == 3 && u.contains("prompt_tokens") && u.contains("completion_tokens") && u.contains("total_tokens"));
-  for (auto& [k, v] : u.items()) CHECK(v.is_number_integer() && v.get<int64_t>() >= 0);
+  CHECK(u.size() == 4 && u.contains("prompt_tokens") && u.contains("completion_tokens") && u.contains("total_tokens") &&
+        u.contains("prompt_tokens_details"));
+  for (const char* k : {"prompt_tokens", "completion_tokens", "total_tokens"}) {
+    CHECK(u[k].is_number_integer() && u[k].get<int64_t>() >= 0);
+  }
   CHECK(u["total_tokens"] == u["prompt_tokens"].get<int>() + u["completion_tokens"].get<int>());
+  const Json& details = u["prompt_tokens_details"];
+  CHECK(details.is_object() && details.contains("cached_tokens") && details["cached_tokens"].is_number_integer());
+  const int cached = details["cached_tokens"].get<int>();
+  CHECK(cached >= 0 && cached <= u["prompt_tokens"].get<int>());
 }
 
 void check_completion(const Json& r) {
@@ -1128,6 +1135,195 @@ void test_persona_control_plane() {
   }
 }
 
+void test_cached_tokens_accounting() {
+  using ingine::model::GenerateStats;
+  using ingine::model::Reuse;
+
+  const std::string long_reply =
+      "<|message_model|><|content_text|>alpha beta<END> gamma delta epsilon zeta eta theta iota kappa lambda mu "
+      "nu xi omicron pi rho sigma tau upsilon<|end_message|><|content_model_end_sampling|>";
+  // Non-zero token delay guarantees pump() cancels on "<END>" while FakeGenerator is still in its decode loop,
+  // verifying prefill stats are published strictly before token 0 (zero race on early stop-string finish).
+  auto s = serve(long_reply, 0.01);
+
+  std::mutex hook_mu;
+  Reuse next_reuse = Reuse::None;
+  int next_reused = 0;
+  std::uint64_t next_restored = 0;
+  s->gen->set_prefill_stats_hook([&](std::span<const int32_t>, GenerateStats& st) {
+    std::lock_guard lock(hook_mu);
+    st.reuse = next_reuse;
+    st.reused_tokens = next_reused;
+    st.restored_bytes = next_restored;
+  });
+
+  auto set_next = [&](Reuse r, int reused, std::uint64_t bytes = 0) {
+    std::lock_guard lock(hook_mu);
+    next_reuse = r;
+    next_reused = reused;
+    next_restored = bytes;
+  };
+
+  const Json conv_turn1 = Json::array({
+      {{"role", "system"}, {"content", "You are a concise coding assistant. Follow exact rules."}},
+      {{"role", "user"}, {"content", "Inspect main.cpp and summarize the bug."}},
+  });
+  const Json conv_turn2 = Json::array({
+      {{"role", "system"}, {"content", "You are a concise coding assistant. Follow exact rules."}},
+      {{"role", "user"}, {"content", "Inspect main.cpp and summarize the bug."}},
+      {{"role", "assistant"}, {"content", "Found an off-by-one bug in parser.cpp line 42."}},
+      {{"role", "user"}, {"content", "Now write the fix and verify."}},
+  });
+
+  // 1. Cold request: cached_tokens == 0 on both non-streaming and streaming (include_usage=true).
+  g_fmt->clear_render_cache();
+  set_next(Reuse::None, 0, 0);
+  Chat r_cold = chat(s->port(), {{"messages", conv_turn1}});
+  CHECK(r_cold.status == 200);
+  check_completion(r_cold.body);
+  const int p1 = r_cold.body["usage"]["prompt_tokens"].get<int>();
+  CHECK(p1 > 10);
+  CHECK(r_cold.body["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+
+  set_next(Reuse::None, 0, 0);
+  Chat s_cold = chat(s->port(), {{"messages", conv_turn1},
+                                 {"stream", true},
+                                 {"stream_options", {{"include_usage", true}}}});
+  CHECK(s_cold.status == 200);
+  Stream st_cold = check_chunks(s_cold.body, true);
+  // CPU RenderCache hit on repeated conv_turn1 must NOT create a GPU cached_tokens hit!
+  CHECK(st_cold.usage["prompt_tokens"] == p1);
+  CHECK(st_cold.usage["prompt_tokens_details"]["cached_tokens"] == 0);
+
+  // 2. Known warm request: exact expected cached_tokens on both JSON and SSE across reuse kinds.
+  const int expected_warm = p1;
+  for (Reuse kind : {Reuse::Extend, Reuse::Checkpoint, Reuse::Parked, Reuse::RootCheckpoint, Reuse::HostParked,
+                     Reuse::PagedPrefix}) {
+    set_next(kind, expected_warm, 4096);
+    Chat r_warm = chat(s->port(), {{"messages", conv_turn2}});
+    CHECK(r_warm.status == 200);
+    check_completion(r_warm.body);
+    CHECK(r_warm.body["usage"]["prompt_tokens"].get<int>() > expected_warm);
+    CHECK(r_warm.body["usage"]["prompt_tokens_details"]["cached_tokens"] == expected_warm);
+
+    set_next(kind, expected_warm, 4096);
+    Chat s_warm = chat(s->port(), {{"messages", conv_turn2},
+                                   {"stream", true},
+                                   {"stream_options", {{"include_usage", true}}}});
+    CHECK(s_warm.status == 200);
+    Stream st_warm = check_chunks(s_warm.body, true);
+    CHECK(st_warm.usage["prompt_tokens_details"]["cached_tokens"] == expected_warm);
+  }
+
+  // 3. Deliberate miss after warm hits -> cached_tokens == 0 (both JSON and SSE).
+  set_next(Reuse::None, 0, 0);
+  Chat r_miss = chat(s->port(), {{"messages", conv_turn2}});
+  CHECK(r_miss.status == 200 && r_miss.body["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+  set_next(Reuse::None, 0, 0);
+  Chat s_miss = chat(s->port(), {{"messages", conv_turn2},
+                                 {"stream", true},
+                                 {"stream_options", {{"include_usage", true}}}});
+  CHECK(s_miss.status == 200);
+  CHECK(check_chunks(s_miss.body, true).usage["prompt_tokens_details"]["cached_tokens"] == 0);
+
+  // 4. Early stop-string finish (non-streaming and streaming): prefill stats must already be visible!
+  set_next(Reuse::Checkpoint, expected_warm, 8192);
+  Chat r_stop = chat(s->port(), {{"messages", conv_turn2}, {"stop", Json::array({"<END>"})}});
+  CHECK(r_stop.status == 200);
+  check_completion(r_stop.body);
+  CHECK(r_stop.body["choices"][0]["message"]["content"] == "alpha beta");
+  CHECK(r_stop.body["choices"][0]["finish_reason"] == "stop");
+  CHECK(r_stop.body["usage"]["prompt_tokens_details"]["cached_tokens"] == expected_warm);
+
+  set_next(Reuse::Checkpoint, expected_warm, 8192);
+  Chat s_stop = chat(s->port(), {{"messages", conv_turn2},
+                                 {"stop", Json::array({"<END>"})},
+                                 {"stream", true},
+                                 {"stream_options", {{"include_usage", true}}}});
+  CHECK(s_stop.status == 200);
+  Stream st_stop = check_chunks(s_stop.body, true);
+  CHECK(st_stop.content == "alpha beta" && st_stop.finish == "stop");
+  CHECK(st_stop.usage["prompt_tokens_details"]["cached_tokens"] == expected_warm);
+
+  // 5. Defensive clamping of out-of-range reused_tokens.
+  set_next(Reuse::Extend, -7, 0);
+  Chat r_neg = chat(s->port(), {{"messages", conv_turn1}});
+  CHECK(r_neg.status == 200 && r_neg.body["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+
+  set_next(Reuse::Extend, 9999999, 0);
+  Chat r_hi = chat(s->port(), {{"messages", conv_turn1}});
+  CHECK(r_hi.status == 200 && r_hi.body["usage"]["prompt_tokens_details"]["cached_tokens"] == p1);
+}
+
+void test_prompt_stability_and_render_stats() {
+  // Verify actual post-template token IDs under Atlas's chat_template.jinja so harness prompt-stability rules
+  // are grounded in measured token IDs, not assumptions.
+  auto common_prefix_len = [](const std::vector<int32_t>& a, const std::vector<int32_t>& b) -> std::size_t {
+    const std::size_t n = std::min(a.size(), b.size());
+    std::size_t i = 0;
+    while (i < n && a[i] == b[i]) ++i;
+    return i;
+  };
+
+  ingine::text::ChatOptions opts;
+  opts.reasoning_effort = "medium";
+  opts.enable_thinking = true;
+
+  const Json base_msgs = Json::array({
+      {{"role", "system"}, {"content", "Static system prompt for coding tasks."}},
+      {{"role", "user"}, {"content", "Run tests in /workspace/app."}},
+  });
+  g_fmt->clear_render_cache();
+  const auto p_base = g_fmt->render(base_msgs, TOOLS, opts);
+  CHECK(!p_base.stats.cache_hit && p_base.stats.reused_text_tokens == 0 &&
+        p_base.stats.encoded_text_tokens == int(p_base.ids.size()));
+
+  // A) Repeating the same prompt hits CPU RenderCache (exact_hit=true) and reports non-zero cache occupancy.
+  const auto p_repeat = g_fmt->render(base_msgs, TOOLS, opts);
+  CHECK(p_repeat.ids == p_base.ids && p_repeat.stats.cache_hit && p_repeat.stats.exact_hit &&
+        p_repeat.stats.reused_text_tokens == int(p_base.ids.size()) && p_repeat.stats.encoded_text_tokens == 0);
+  const auto cstats = g_fmt->render_cache_stats();
+  CHECK(cstats.entries >= 1 && cstats.bytes > 0);
+
+  // B) Appending a mid-history system delta (e.g. dynamic cwd/runtime note) preserves 100% of p_base.ids.
+  Json with_mid_sys = base_msgs;
+  with_mid_sys.push_back({{"role", "system"}, {"content", "Current working directory: /workspace/app/sub"}});
+  with_mid_sys.push_back({{"role", "user"}, {"content", "Continue."}});
+  const auto p_mid_sys = g_fmt->render(with_mid_sys, TOOLS, opts);
+  CHECK(common_prefix_len(p_base.ids, p_mid_sys.ids) == p_base.ids.size());
+  CHECK(p_mid_sys.stats.cache_hit && p_mid_sys.stats.reused_text_tokens > 0);
+
+  // C) Mutating `tools` (rendered at position 0 by chat_template.jinja) invalidates the prefix near token 0.
+  Json extra_tools = TOOLS;
+  extra_tools.push_back(
+      {{"type", "function"}, {"function", {{"name", "run_shell"}, {"parameters", {{"type", "object"}}}}}});
+  const auto p_tools_changed = g_fmt->render(base_msgs, extra_tools, opts);
+  // Only the opening <|message_system|>tool_declare<|content_xml|> + identical first tool prefix survives;
+  // it breaks BEFORE base_msgs system/user content begins.
+  CHECK(common_prefix_len(p_base.ids, p_tools_changed.ids) < p_base.ids.size());
+
+  // D) Changing reasoning_effort mid-conversation invalidates everything after the leading system message.
+  ingine::text::ChatOptions opts_high = opts;
+  opts_high.reasoning_effort = "high";
+  const auto p_effort_changed = g_fmt->render(base_msgs, TOOLS, opts_high);
+  CHECK(common_prefix_len(p_base.ids, p_effort_changed.ids) < p_base.ids.size());
+
+  // E) Preserving vs dropping assistant reasoning_content determines exact prefix continuation length.
+  Json with_reasoning = base_msgs;
+  with_reasoning.push_back({{"role", "assistant"},
+                            {"reasoning_content", "Let me check pytest output."},
+                            {"content", "Running pytest now."}});
+  with_reasoning.push_back({{"role", "user"}, {"content", "Any failures?"}});
+  Json without_reasoning = base_msgs;
+  without_reasoning.push_back({{"role", "assistant"}, {"content", "Running pytest now."}});
+  without_reasoning.push_back({{"role", "user"}, {"content", "Any failures?"}});
+  const auto p_with_r = g_fmt->render(with_reasoning, TOOLS, opts);
+  const auto p_without_r = g_fmt->render(without_reasoning, TOOLS, opts);
+  CHECK(common_prefix_len(p_base.ids, p_with_r.ids) == p_base.ids.size());
+  CHECK(common_prefix_len(p_base.ids, p_without_r.ids) == p_base.ids.size());
+  CHECK(common_prefix_len(p_with_r.ids, p_without_r.ids) == p_base.ids.size() + 1);  // diverges right at <|content_thinking|> vs <|content_text|>
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -1161,6 +1357,8 @@ int main() {
       {"images", test_images},
       {"response_format_and_tool_ban", test_response_format_and_tool_ban},
       {"persona_control_plane", test_persona_control_plane},
+      {"cached_tokens_accounting", test_cached_tokens_accounting},
+      {"prompt_stability_and_render_stats", test_prompt_stability_and_render_stats},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {

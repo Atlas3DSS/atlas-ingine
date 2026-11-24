@@ -59,7 +59,7 @@ class FakeHttpBatchGenerator final : public ingine::model::Generator {
       if (!s.used) {
         const std::string prompt_txt = tok_.decode_lossy(prompt.ids);
         std::string tag = "ok";
-        const auto p = prompt_txt.find("REQ_");
+        const auto p = prompt_txt.rfind("REQ_");
         if (p != std::string::npos) tag = prompt_txt.substr(p, 7);
         const std::string reply = "<|message_model|><|content_text|>Reply for " + tag +
                                   " done.<|end_message|><|content_model_end_sampling|>";
@@ -68,6 +68,24 @@ class FakeHttpBatchGenerator final : public ingine::model::Generator {
         s.idx = 1;
         first_token = s.tokens[0];
         stats.prompt_tokens = int(prompt.ids.size());
+        stats.reused_tokens = 0;
+        stats.reuse = ingine::model::Reuse::None;
+        if (prefix_cache_enabled_) {
+          // Exact shared-prefix match against previously seen prompts (simulates Stage 2 paged prefix cache).
+          std::size_t best = 0;
+          for (const auto& prev : seen_prompts_) {
+            const std::size_t lim = std::min(prev.size(), prompt.ids.size());
+            std::size_t k = 0;
+            while (k < lim && prev[k] == prompt.ids[k]) ++k;
+            if (k > best) best = k;
+          }
+          if (best > 0) {
+            stats.reused_tokens = int(best);
+            stats.reuse = ingine::model::Reuse::PagedPrefix;
+            stats.restored_bytes = best * 128;
+          }
+          seen_prompts_.emplace_back(prompt.ids.begin(), prompt.ids.end());
+        }
         ++active_;
         peak_active_ = std::max(peak_active_, active_);
         return i;
@@ -109,6 +127,11 @@ class FakeHttpBatchGenerator final : public ingine::model::Generator {
     std::lock_guard lock(mu_);
     return active_;
   }
+  void set_prefix_cache_enabled(bool enabled) {
+    std::lock_guard lock(mu_);
+    prefix_cache_enabled_ = enabled;
+    seen_prompts_.clear();
+  }
 
  private:
   struct Slot {
@@ -120,6 +143,8 @@ class FakeHttpBatchGenerator final : public ingine::model::Generator {
   int max_batch_;
   mutable std::mutex mu_;
   std::vector<Slot> slots_;
+  bool prefix_cache_enabled_ = false;
+  std::vector<std::vector<int32_t>> seen_prompts_;
   int active_ = 0;
   int peak_active_ = 0;
   int peak_step_batch_ = 0;
@@ -203,6 +228,67 @@ int main() {
     });
   }
   for (auto& t : clients) t.join();
+
+  // Verify batched cached_tokens accounting (cold=0, warm=exact shared prefix, deliberate miss=0, early stop)
+  // across both non-streaming JSON and streaming SSE (include_usage=true).
+  {
+    gen.set_prefix_cache_enabled(true);
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_read_timeout(30, 0);
+
+    const Json sys_msg = {{"role", "system"}, {"content", "Shared batch system prompt for cache accounting."}};
+    const Json cold_body = {{"model", "inkling-batch-test"},
+                            {"messages", Json::array({sys_msg, {{"role", "user"}, {"content", "First REQ_901"}}})},
+                            {"max_tokens", 64}};
+    auto r1 = cli.Post("/v1/chat/completions", cold_body.dump(), "application/json");
+    CHECK(r1 && r1->status == 200);
+    const Json j1 = Json::parse(r1->body);
+    CHECK(j1["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+    const int p1 = j1["usage"]["prompt_tokens"].get<int>();
+
+    // Warm follow-up extending the same conversation -> cached_tokens == exact p1 (non-streaming + early stop).
+    const Json warm_body = {{"model", "inkling-batch-test"},
+                            {"messages", Json::array({sys_msg,
+                                                      {{"role", "user"}, {"content", "First REQ_901"}},
+                                                      {{"role", "assistant"}, {"content", "Reply for REQ_901 done."}},
+                                                      {{"role", "user"}, {"content", "Second REQ_902"}}})},
+                            {"stop", Json::array({"done."})},
+                            {"max_tokens", 64}};
+    auto r2 = cli.Post("/v1/chat/completions", warm_body.dump(), "application/json");
+    CHECK(r2 && r2->status == 200);
+    const Json j2 = Json::parse(r2->body);
+    CHECK(j2["choices"][0]["message"]["content"] == "Reply for REQ_902 ");
+    CHECK(j2["usage"]["prompt_tokens_details"]["cached_tokens"] == p1);
+
+    // Warm SSE streaming with include_usage=true and early stop.
+    Json warm_stream = warm_body;
+    warm_stream["stream"] = true;
+    warm_stream["stream_options"] = {{"include_usage", true}};
+    auto r3 = cli.Post("/v1/chat/completions", warm_stream.dump(), "application/json");
+    CHECK(r3 && r3->status == 200);
+    int sse_cached = -1;
+    std::size_t pos = 0;
+    while (pos < r3->body.size()) {
+      const auto nl = r3->body.find('\n', pos);
+      const std::string line = r3->body.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+      pos = (nl == std::string::npos) ? r3->body.size() : nl + 1;
+      if (line.rfind("data: ", 0) != 0) continue;
+      const std::string payload = line.substr(6);
+      if (payload == "[DONE]") break;
+      const Json chunk = Json::parse(payload);
+      if (chunk.contains("usage") && chunk["usage"].is_object()) {
+        sse_cached = chunk["usage"]["prompt_tokens_details"]["cached_tokens"].get<int>();
+      }
+    }
+    CHECK(sse_cached == j2["usage"]["prompt_tokens"].get<int>());
+
+    // Deliberate miss (different system prompt after disabling/resetting cache) -> cached_tokens == 0.
+    gen.set_prefix_cache_enabled(false);
+    auto r4 = cli.Post("/v1/chat/completions", warm_body.dump(), "application/json");
+    CHECK(r4 && r4->status == 200);
+    CHECK(Json::parse(r4->body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+  }
+
   server.stop();
 
   CHECK(ok_count.load() == N);

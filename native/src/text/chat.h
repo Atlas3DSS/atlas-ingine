@@ -56,10 +56,25 @@ struct ChatOptions {
   nlohmann::ordered_json template_kwargs = nlohmann::ordered_json::object();  // extra template variables
 };
 
+struct RenderStats {
+  bool cache_hit = false;       // true when RenderCache reused >= 1 cached token (or exact text match)
+  bool exact_hit = false;       // true when rendered text matched a cached entry byte-for-byte
+  int reused_text_tokens = 0;   // CPU tokenization prefix tokens reused from RenderCache (NOT GPU KV reuse)
+  int encoded_text_tokens = 0;  // suffix tokens freshly BPE-encoded on CPU
+  double render_ms = 0.0;       // total ChatFormat::render wall time in ms
+};
+
+struct RenderCacheStats {
+  std::size_t entries = 0;
+  std::size_t capacity = 0;
+  std::size_t bytes = 0;  // approximate heap bytes held by cached text, token ids, and boundaries
+};
+
 struct RenderedPrompt {
   std::vector<int32_t> ids;          // full prompt, prefill included
   std::string text;
   std::vector<int32_t> prefill_ids;  // tail of ids the model would otherwise have generated
+  RenderStats stats;                 // CPU render/tokenization metrics (strictly distinct from GPU KV cache reuse)
 };
 
 struct ToolCallDelta {
@@ -173,6 +188,8 @@ class ChatFormat {
                         const ChatOptions& options) const;
   // Forget the cached renders (shared by copies of this ChatFormat): the next render tokenises from scratch.
   void clear_render_cache() const;
+  // Snapshot of the CPU RenderCache occupancy and approximate heap bytes (for profiling).
+  RenderCacheStats render_cache_stats() const;
   // Parser primed with the prompt's prefill ids. id_factory makes tool-call ids (default "call_" + 24 hex).
   StreamParser parser(std::span<const int32_t> prefill_ids, std::vector<std::string> stop = {},
                       std::function<std::string()> id_factory = {}) const;

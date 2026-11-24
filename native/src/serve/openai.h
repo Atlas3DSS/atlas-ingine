@@ -43,6 +43,7 @@ struct ChatRequest {
   model::Sampling sampling;
   std::vector<std::string> stop;
   std::string persona_name;  // optional per-request persona profile selector (empty = server default)
+  text::RenderStats render_stats;  // CPU tokenization cache stats (distinct from GPU prefix reuse)
   bool stream = false;
   bool include_usage = false;
 };

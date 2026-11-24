@@ -25,6 +25,8 @@ class FakeGenerator final : public model::Generator {
  public:
   using Output = std::variant<std::vector<int32_t>, std::string>;
   using Responder = std::function<Output(std::span<const int32_t>)>;
+  // Optional test hook invoked after prompt prefill (before emitting token 0) to populate reuse stats.
+  using PrefillStatsFn = std::function<void(std::span<const int32_t>, model::GenerateStats&)>;
 
   struct Call {
     std::vector<int32_t> prompt_ids;
@@ -44,14 +46,21 @@ class FakeGenerator final : public model::Generator {
   model::GenerateStats generate(std::span<const int32_t> prompt, int max_new_tokens,
                                 const model::Sampling& sampling, std::span<const int32_t> stop_ids,
                                 const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
-    return generate(model::Prompt{prompt, {}}, max_new_tokens, sampling, stop_ids, on_tokens);
+    return generate(model::Prompt{prompt, {}}, max_new_tokens, sampling, stop_ids, on_tokens, model::PrefillCallback{});
   }
   // Images are recorded, not looked at (their tokens are negative ids, which echo() skips).
   model::GenerateStats generate(const model::Prompt& prompt, int max_new_tokens, const model::Sampling& sampling,
                                 std::span<const int32_t> stop_ids,
-                                const std::function<bool(std::span<const int32_t>)>& on_tokens) override;
+                                const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
+    return generate(prompt, max_new_tokens, sampling, stop_ids, on_tokens, model::PrefillCallback{});
+  }
+  model::GenerateStats generate(const model::Prompt& prompt, int max_new_tokens, const model::Sampling& sampling,
+                                std::span<const int32_t> stop_ids,
+                                const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                                const model::PrefillCallback& on_prefill) override;
   bool supports_images() const override { return true; }
 
+  void set_prefill_stats_hook(PrefillStatsFn hook);
   std::string echo(std::span<const int32_t> prompt_ids) const;
   std::vector<Call> calls() const;
 
@@ -62,6 +71,7 @@ class FakeGenerator final : public model::Generator {
   Responder responder_;
   double token_delay_;
   mutable std::mutex mutex_;
+  PrefillStatsFn prefill_stats_hook_;
   std::vector<Call> calls_;
 };
 

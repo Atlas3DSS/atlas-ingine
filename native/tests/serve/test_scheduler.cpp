@@ -117,12 +117,57 @@ void test_failure_and_close() {
   CHECK(!s.submit(std::make_shared<Job>(std::vector<int32_t>{3}, 1, Sampling{})));
 }
 
+class PrefillHookGenerator final : public ingine::model::Generator {
+ public:
+  std::string model_id() const override { return "prefill-hook"; }
+  int max_model_len() const override { return 1 << 20; }
+  GenerateStats generate(std::span<const int32_t> prompt, int max_new_tokens, const Sampling& sampling,
+                         std::span<const int32_t> stop_ids,
+                         const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
+    return generate(ingine::model::Prompt{prompt, {}}, max_new_tokens, sampling, stop_ids, on_tokens,
+                    ingine::model::PrefillCallback{});
+  }
+  GenerateStats generate(const ingine::model::Prompt& prompt, int, const Sampling&, std::span<const int32_t>,
+                         const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                         const ingine::model::PrefillCallback& on_prefill) override {
+    GenerateStats st;
+    st.prompt_tokens = int(prompt.ids.size());
+    st.reused_tokens = std::max(0, st.prompt_tokens - 1);
+    st.reuse = ingine::model::Reuse::Checkpoint;
+    st.restored_bytes = 12345;
+    if (on_prefill) on_prefill(st);
+    for (int32_t tok = 200; tok < 210; ++tok) {
+      const int32_t out[1] = {tok};
+      if (!on_tokens(out)) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return st;
+  }
+};
+
+void test_prefill_stats_before_first_token() {
+  PrefillHookGenerator gen;
+  Scheduler s(gen, {}, 4);
+  auto j = std::make_shared<Job>(std::vector<int32_t>{10, 20, 30, 40}, 10, Sampling{});
+  CHECK(s.submit(j));
+  // Receive the very first token and cancel immediately without waiting for generate() to return.
+  JobBatch b = j->take(std::chrono::seconds(5));
+  CHECK(!b.tokens.empty() && b.tokens[0] == 200);
+  j->cancel();
+  const auto st = j->prefill_stats();
+  CHECK(st.has_value());
+  CHECK(st->prompt_tokens == 4 && st->reused_tokens == 3 && st->reuse == ingine::model::Reuse::Checkpoint &&
+        st->restored_bytes == 12345);
+  drain(*j);
+}
+
 }  // namespace
 
 int main() {
   test_cuts();
   test_cancel_fifo_bound();
   test_failure_and_close();
+  test_prefill_stats_before_first_token();
   std::printf(g_failures ? "FAILED (%d checks)\n" : "ok\n", g_failures);
   return g_failures ? 1 : 0;
 }

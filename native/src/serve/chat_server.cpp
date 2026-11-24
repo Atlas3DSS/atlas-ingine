@@ -94,21 +94,37 @@ void pump(Exchange& x, const std::function<bool()>& gone, const std::function<vo
 Json usage(const Exchange& x) {
   const int prompt = int(x.job->prompt_ids.size());
   const int completion = x.parser.num_tokens();
-  return Json{{"prompt_tokens", prompt}, {"completion_tokens", completion}, {"total_tokens", prompt + completion}};
+  int cached = 0;
+  if (const auto st = x.job->prefill_stats()) {
+    cached = std::clamp(st->reused_tokens, 0, prompt);
+  }
+  return Json{{"prompt_tokens", prompt},
+              {"completion_tokens", completion},
+              {"total_tokens", prompt + completion},
+              {"prompt_tokens_details", {{"cached_tokens", cached}}}};
 }
 
 void log_done(const Exchange& x) {
   const Clock::time_point now = Clock::now();
   const engine::Job& job = *x.job;
   const double queued = seconds(job.t_start().value_or(now) - job.t_submit);
+  const int prompt = int(job.prompt_ids.size());
   const int n = x.parser.num_tokens();
+  const auto pst = job.prefill_stats();
+  const int cached = pst ? std::clamp(pst->reused_tokens, 0, prompt) : 0;
+  const int recomputed = std::max(0, prompt - cached);
+  const char* reuse = pst ? model::to_string(pst->reuse) : "none";
+  const std::uint64_t restored_bytes = pst ? pst->restored_bytes : 0;
   const std::string rate =
       x.t_first && n > 1 ? fmt::format("{:.1f} tok/s", (n - 1) / std::max(seconds(now - *x.t_first), 1e-9)) : "-";
   const std::string ttft = x.t_first ? fmt::format("{:.3f}s", seconds(*x.t_first - job.t_submit)) : "-";
   const auto& finish = x.parser.finish_reason();
-  engine::server_log().info("{}: prompt={} completion={} finish={} queued={:.3f}s ttft={} decode={}{}", job.id,
-                            job.prompt_ids.size(), n, finish ? *finish : std::string("None"), queued, ttft, rate,
-                            x.failure ? " error=" + *x.failure : std::string());
+  engine::server_log().info(
+      "{}: prompt={} cached={} recomputed={} reuse={} restored_bytes={} render_reused={} render_ms={:.2f} "
+      "completion={} finish={} queued={:.3f}s ttft={} decode={}{}",
+      job.id, prompt, cached, recomputed, reuse, restored_bytes, x.req.render_stats.reused_text_tokens,
+      x.req.render_stats.render_ms, n, finish ? *finish : std::string("None"), queued, ttft, rate,
+      x.failure ? " error=" + *x.failure : std::string());
 }
 
 void log_disconnected(const Exchange& x) {

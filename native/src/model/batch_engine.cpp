@@ -964,12 +964,19 @@ class BatchGenerator final : public Generator {
   GenerateStats generate(std::span<const std::int32_t> prompt, int max_new_tokens, const Sampling& sampling,
                          std::span<const std::int32_t> stop_ids,
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
-    return generate(Prompt{prompt, {}}, max_new_tokens, sampling, stop_ids, on_tokens);
+    return generate(Prompt{prompt, {}}, max_new_tokens, sampling, stop_ids, on_tokens, PrefillCallback{});
   }
 
   GenerateStats generate(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
                          std::span<const std::int32_t> stop_ids,
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
+    return generate(full_prompt, max_new_tokens, sampling, stop_ids, on_tokens, PrefillCallback{});
+  }
+
+  GenerateStats generate(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
+                         std::span<const std::int32_t> stop_ids,
+                         const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+                         const PrefillCallback& on_prefill) override {
     GenerateStats stats;
     std::int32_t token = 0;
     const int n = int(full_prompt.ids.size());
@@ -982,6 +989,7 @@ class BatchGenerator final : public Generator {
     }
     const int s = start_slot(full_prompt, max_new_tokens, sampling, token, stats);
     if (s < 0) throw std::runtime_error("BatchGenerator::generate: no free batch slot");
+    if (on_prefill) on_prefill(stats);
     auto is_stop = [&](std::int32_t tok) {
       return std::find(stop_ids.begin(), stop_ids.end(), tok) != stop_ids.end();
     };

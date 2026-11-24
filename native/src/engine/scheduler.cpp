@@ -49,6 +49,11 @@ std::optional<Clock::time_point> Job::t_start() const {
   return t_start_;
 }
 
+std::optional<model::GenerateStats> Job::prefill_stats() const {
+  std::lock_guard lock(mutex_);
+  return prefill_stats_;
+}
+
 JobBatch Job::take(Clock::duration timeout) {
   std::unique_lock lock(mutex_);
   cv_.wait_for(lock, timeout, [&] { return !tokens_.empty() || failure_ || end_; });
@@ -64,6 +69,11 @@ JobBatch Job::take(Clock::duration timeout) {
 void Job::started() {
   std::lock_guard lock(mutex_);
   t_start_ = Clock::now();
+}
+
+void Job::set_prefill_stats(model::GenerateStats stats) {
+  std::lock_guard lock(mutex_);
+  prefill_stats_ = std::move(stats);
 }
 
 void Job::push(const std::vector<int32_t>& tokens) {
@@ -257,8 +267,10 @@ void Scheduler::loop_batched() {
           }
           break;
         }
-        server_log().info("{}: slot={} reuse={} reused={} prefilled={} prefill={:.3f}s", job->id, slot,
-                          model::to_string(st.reuse), st.reused_tokens, st.prompt_tokens - st.reused_tokens,
+        job->set_prefill_stats(st);
+        const int recomputed = std::max(0, st.prompt_tokens - std::clamp(st.reused_tokens, 0, st.prompt_tokens));
+        server_log().info("{}: slot={} reuse={} reused={} recomputed={} restored_bytes={} prefill={:.3f}s", job->id,
+                          slot, model::to_string(st.reuse), st.reused_tokens, recomputed, st.restored_bytes,
                           st.prefill_seconds);
         if (!job->images.empty()) {
           server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job->id, job->images.size(),
@@ -370,11 +382,15 @@ void Scheduler::run(Job& job) {
     return more;
   };
   try {
+    const auto on_prefill = [&](const model::GenerateStats& pst) { job.set_prefill_stats(pst); };
     const model::GenerateStats st = generator_.generate(model::Prompt{job.prompt_ids, job.images}, job.max_new_tokens,
-                                                        job.sampling, stop_list_, on_tokens);
-    // prefix reuse of the prompt: the path, the tokens reused and prefilled, the prefill time
-    server_log().info("{}: reuse={} reused={} prefilled={} prefill={:.3f}s", job.id, model::to_string(st.reuse),
-                      st.reused_tokens, st.prompt_tokens - st.reused_tokens, st.prefill_seconds);
+                                                        job.sampling, stop_list_, on_tokens, on_prefill);
+    job.set_prefill_stats(st);
+    // prefix reuse of the prompt: the path, the tokens reused and recomputed, restored bytes, prefill time
+    const int recomputed = std::max(0, st.prompt_tokens - std::clamp(st.reused_tokens, 0, st.prompt_tokens));
+    server_log().info("{}: reuse={} reused={} recomputed={} restored_bytes={} prefill={:.3f}s", job.id,
+                      model::to_string(st.reuse), st.reused_tokens, recomputed, st.restored_bytes,
+                      st.prefill_seconds);
     if (!job.images.empty()) {  // images: all of the prompt, those the vision tower encoded now, its time
       server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job.id, job.images.size(),
                         st.image_tokens, st.images_encoded, st.vision_seconds);

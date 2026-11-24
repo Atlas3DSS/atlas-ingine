@@ -5,6 +5,7 @@
 #include "text/unicode.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -181,7 +182,7 @@ std::size_t common_prefix(std::string_view a, std::string_view b) {
 // tokenizer.encode(text, true), reusing the ids of a cached render that shares a prefix with text: the ids up to
 // the last added token whose end b satisfies b + max_added - 1 <= p (p = common prefix length) are exact, because
 // every added-token match starting before b reads only bytes before p, and BPE never crosses an added token.
-std::vector<int32_t> encode_prompt(const detail::FormatData& fmt, const std::string& text) {
+std::vector<int32_t> encode_prompt(const detail::FormatData& fmt, const std::string& text, RenderStats& stats) {
   detail::RenderCache& cache = *fmt.cache;
   std::deque<std::shared_ptr<const detail::RenderCache::Entry>> entries;
   {
@@ -200,6 +201,10 @@ std::vector<int32_t> encode_prompt(const detail::FormatData& fmt, const std::str
   if (base && common == text.size() && base->text.size() == text.size()) {
     entry->ids = base->ids;
     entry->boundaries = base->boundaries;
+    stats.exact_hit = true;
+    stats.cache_hit = true;
+    stats.reused_text_tokens = int(entry->ids.size());
+    stats.encoded_text_tokens = 0;
   } else {
     std::size_t byte = 0, tokens = 0, kept = 0;
     if (base) {
@@ -215,6 +220,10 @@ std::vector<int32_t> encode_prompt(const detail::FormatData& fmt, const std::str
       entry->boundaries.assign(base->boundaries.begin(), base->boundaries.begin() + static_cast<std::ptrdiff_t>(kept));
     }
     fmt.tokenizer.encode_special(std::string_view(text).substr(byte), entry->ids, &entry->boundaries, byte);
+    stats.exact_hit = false;
+    stats.cache_hit = tokens > 0;
+    stats.reused_text_tokens = int(tokens);
+    stats.encoded_text_tokens = int(entry->ids.size() - tokens);
   }
   std::vector<int32_t> ids = entry->ids;
   {
@@ -367,6 +376,19 @@ void ChatFormat::clear_render_cache() const {
   data_->cache->entries.clear();
 }
 
+RenderCacheStats ChatFormat::render_cache_stats() const {
+  std::lock_guard lock(data_->cache->mu);
+  RenderCacheStats out;
+  out.entries = data_->cache->entries.size();
+  out.capacity = detail::RenderCache::kEntries;
+  for (const auto& e : data_->cache->entries) {
+    out.bytes += e->text.capacity();
+    out.bytes += e->ids.capacity() * sizeof(int32_t);
+    out.bytes += e->boundaries.capacity() * sizeof(TokenBoundary);
+  }
+  return out;
+}
+
 std::vector<int32_t> ChatFormat::stop_ids() const {
   std::vector<int32_t> ids(data_->stop_ids.begin(), data_->stop_ids.end());
   std::sort(ids.begin(), ids.end());
@@ -380,6 +402,7 @@ int32_t ChatFormat::content_invoke_tool_json_id() const { return data_->content_
 std::string ChatFormat::decode(std::span<const int32_t> ids) const { return data_->tokenizer.decode_lossy(ids); }
 
 RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const ChatOptions& options) const {
+  const auto t0 = std::chrono::steady_clock::now();
   Json msgs = normalize_messages(messages);
   if (!tools.is_null() && !tools.is_array()) throw ChatError("'tools' must be a list", "tools");
   const Json effort = normalize_effort(options.reasoning_effort);
@@ -457,7 +480,8 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
     prompt.text += CONTENT_TEXT;
     prompt.prefill_ids = no_thinking_prefill();
   }
-  prompt.ids = encode_prompt(*data_, prompt.text);
+  prompt.ids = encode_prompt(*data_, prompt.text, prompt.stats);
+  prompt.stats.render_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   return prompt;
 }
 
