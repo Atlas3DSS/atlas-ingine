@@ -4,16 +4,16 @@ Multi-architecture Apache-2.0 CUDA inference engine for
 [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), forked from
 [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine).
 
-Spans **10 years of NVIDIA GPU architectures** — **Pascal (`sm_60`/`sm_61`)**, **Volta (`sm_70`, Tesla V100)**,
-**Turing (`sm_75`)**, **Ampere (`sm_80`/`sm_86`, RTX 3090)**, **Ada (`sm_89`, RTX 4090)**, **Hopper (`sm_90`)**, and
-**Blackwell (`sm_120a`, RTX 5090 / RTX PRO 6000)** — with **native Elastic sub-4-bit MoE weights (`ATLAS2` / `ATLAS3`)**,
+Inkling-2-Mini has run on **Tesla V100, RTX 3090, RTX 4090, and RTX PRO 6000 Blackwell**, with upstream results on the RTX 5090.
+Additional build targets include Pascal (`sm_60`/`sm_61`), Turing (`sm_75`), Ampere (`sm_80`), and Hopper (`sm_90`). The engine includes **native Elastic sub-4-bit MoE weights (`ATLAS2` / `ATLAS3`)**,
 **DSpark speculative decoding**, **native vision input**, **OpenAI-compatible structured outputs (`response_format`:
 `json_object` / `json_schema`) + automatic tool-ban**, and a standalone **Verified Ledger SDK (`ledger/`)**.
-SM80+ BF16 builds remain bit-identical to pre-port builds (`kernels_bitlock` 48/48 PASS; RTX 3090 24/24 bit-lock hashes unchanged).
+On the RTX 3090, all 24 BF16 dense output hashes matched between the pre-port build and the FP16 port. An earlier Blackwell run passed all 48 `kernels_bitlock` checks.
 
 ## Measured performance (64K & 262K context)
 
-Measured with `ingine-bench` (`--max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000`, and `--max-ctx 262144` where noted):
+The 64K rows use `ingine-bench --max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000`.
+The V100 262K row measures memory and short-prompt decode with a 262,144-token context allocation, using `--effort low --tokens 64 --runs 1` and no long prompt.
 
 | GPU | Arch | Year | Checkpoint | VRAM | Chat decode | Code decode | 64K prefill |
 |---|---|---:|---|---:|---:|---:|---:|
@@ -27,18 +27,18 @@ Measured with `ingine-bench` (`--max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spe
 | RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-10g` (64K) | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` |
 
 Additional verified architecture & live-serving details:
-- **Pascal (`sm_60`/`sm_61`, 2016) & Turing (`sm_75`, 2018):** Compiled in the `legacy-fp16` CUDA 12.9 preset (`60;61;70;75`, 217/217 targets clean). The Pascal FP32-SIMT MMA kernels (`INGINE_FORCE_SIMT_MMA=ON`, preset `sm70-simt-dev`) are hardware-verified on V100 across the core, MoE, attention, dense, prefill, vision, and model-parity test suites.
-- **Volta (`sm_70`, Tesla V100 32 GB, 2017):** All 39/39 non-benchmark CTest suites pass with `INGINE_ACT_FP16=ON` (0 of 2,245,115,536 BF16 weights exceed FP16 max `65504`, max weight magnitude `76.5`); live `ingine-serve` passes chat, `json_object`, strict `json_schema`, and native vision 40×40 PNG inference.
-- **RTX 3090 (`sm_86`, 12 GB class):** `atlas-10g` at 16K ctx with `--no-vision --dense-fp8 --kv-fp8 --spec --park-mb 0` uses **`12,984 MiB`** (`<12 GiB` without `--spec`).
+- **Pascal (`sm_60`/`sm_61`, 2016) & Turing (`sm_75`, 2018):** Compiled in the `legacy-fp16` CUDA 12.9 preset (`60;61;70;75`, 217/217 build steps). The forced Pascal FP32-SIMT path passed kernel and model-parity tests on V100. On-card qualification for Pascal and Turing is pending. The M=8 speculative verification attention kernel exceeds the per-block shared-memory limit on cards with 48 or 64 KiB.
+- **Volta (`sm_70`, Tesla V100 32 GB, 2017):** With `INGINE_ACT_FP16=ON`, 39 distinct CTest cases passed across the qualification runs. CTest skipped `text_traces` because the optional trace fixtures were absent. Four benchmark and profiling entries are outside that count. The weight scan found a maximum magnitude of 76.5 across 2,245,115,536 BF16 values, all within the FP16 range. Live `ingine-serve` passed chat, `json_object`, strict `json_schema`, and inference on a 40×40 PNG.
+- **RTX 3090 (`sm_86`, 24 GB):** `atlas-10g` at 16K ctx with `--no-vision --dense-fp8 --kv-fp8 --spec --park-mb 0` uses **`12,984 MiB`** (`<12 GiB` without `--spec`).
 - **RTX 4090 (`sm_89`, 24 GB):** `atlas-12g` at 128K ctx with `--no-vision` uses **`17,776 MiB`**; live long-output serving with vision enabled at 64K ctx runs at **~257 tok/s**.
-- **RTX 5090 / RTX PRO 6000 (`sm_120a`, 32+ GB):** native `NVFP4+MXFP8` serves up to **262,144 tokens** of context in `24.4 GiB` (`490–560 tok/s` decode, `6,200–10,900 tok/s` prefill; see [Upstream RTX 5090 results](#upstream-rtx-5090-and-abliteration-results)).
+- **Upstream RTX 5090 (`sm_120a`, 32 GB):** native `NVFP4+MXFP8` serves up to **262,144 tokens** of context in `24.4 GiB` (`490–560 tok/s` decode, `6,200–10,900 tok/s` prefill; see [Upstream RTX 5090 results](#upstream-rtx-5090-and-abliteration-results)).
 
 ## What this fork adds over upstream `satellitedown/ingine`
 
 1. **10-year NVIDIA multi-architecture support (`sm_60`/`61`, `sm_70`, `sm_75`, `sm_80`/`86`, `sm_89`, `sm_90`, `sm_120a`):**
-   - Native **Ampere (`sm_80`/`86`)**, **Ada (`sm_89`)**, **Hopper (`sm_90`)**, and **Blackwell (`sm_120a`)** BF16 codepaths on CUDA 12.8+ / CUDA 13.x without degrading Blackwell.
-   - Compile-time **FP16 activation mode (`-DINGINE_ACT_FP16=ON`)** for **Volta (`sm_70`)**, **Turing (`sm_75`)**, and **Pascal (`sm_60`/`61`)** on CUDA 12.9 (`wmma::mma_sync` FP16 Tensor Core path for `sm_70`/`75`, FP32 SIMT MMA path for `sm_60`/`61`), with FP16 boundary rounding and 0-overflow weight conversion.
-   - Software fallbacks for Hopper/Blackwell-only primitives (PDL, DSMEM/cluster reductions, hardware FP4/FP8 conversions), branchless FP8/E2M1/ATLAS2/ATLAS3 unpackers, and a CTA-wide synchronization fix in `src/kernels/head/head.cu` (`finish_part`) preventing multi-block top-p publication races under independent thread scheduling.
+   - Native **Ampere (`sm_80`/`86`)**, **Ada (`sm_89`)**, **Hopper (`sm_90`)**, and **Blackwell (`sm_120a`)** BF16 codepaths on CUDA 12.8+ / CUDA 13.x.
+   - Compile-time **FP16 activation mode (`-DINGINE_ACT_FP16=ON`)** for **Volta (`sm_70`)**, **Turing (`sm_75`)**, and **Pascal (`sm_60`/`61`)** on CUDA 12.9 uses FP16 Tensor Core instructions for `sm_70`/`75` and FP32 SIMT for `sm_60`/`61`.
+   - Software fallbacks for Hopper/Blackwell-only primitives (PDL, DSMEM/cluster reductions, hardware FP4/FP8 conversions), branchless FP8/E2M1/ATLAS2/ATLAS3 unpackers, and a CTA-wide synchronization fix in `native/src/kernels/head/head.cu` (`finish_part`) preventing multi-block top-p publication races under independent thread scheduling.
 2. **Native Elastic sub-4-bit MoE weights (`ATLAS2` 2.50 b/w, `ATLAS3` 3.50 b/w):**
    - Mixed-precision MoE tier converter ([`tools/quantize_elastic_ingine.py`](tools/quantize_elastic_ingine.py)) that compresses the 20.2 GB base checkpoint to **`atlas-12g` (`14.05 GB` on disk incl. vision + `mtp.safetensors`)** or **`atlas-10g` (`12.01 GB` on disk incl. vision + `mtp.safetensors`)**.
    - Native fused decode (`native/src/kernels/moe/moe.cu`) and prefill (`native/src/kernels/prefill/wgemm.cu`) kernels verified against FP64 oracles (`kernels_moe`, `prefill_moe`).
@@ -50,13 +50,13 @@ Additional verified architecture & live-serving details:
 ## Requirements
 
 - **OS:** Linux x86_64
-- **GPU:** Any NVIDIA GPU from Pascal (`sm_60`/`61`, 2016) through Blackwell (`sm_120a`, 2025–26):
+- **CUDA build targets** (see the hardware results above)
   - **SM80+ (BF16, CUDA 12.8+ / 13.x):** Ampere (`sm_80`/`86`), Ada (`sm_89`), Hopper (`sm_90`), Blackwell (`sm_120a`).
   - **SM60–SM75 (FP16, CUDA 12.9, `-DINGINE_ACT_FP16=ON`):** Pascal (`sm_60`/`61`), Volta (`sm_70`, e.g. Tesla V100 32 GB), Turing (`sm_75`).
   - **VRAM guide:**
-    - **32+ GB (V100 32 GB / RTX 5090 / RTX PRO 6000):** native 20.2 GB checkpoint up to **262,144-token context** (`~24.4–25.0 GB` VRAM).
+    - **32 GB:** The V100 allocated `25.04 GB` for a 262,144-token context with the native checkpoint. Upstream measured `24.4 GiB` on the RTX 5090.
     - **24 GB (RTX 3090 / 4090):** native checkpoint at 64K context (`~21.8 GB` VRAM) or Elastic `atlas-12g` up to 128K context (`~17.8 GB` VRAM).
-    - **16 GB / 12 GB class:** Elastic `atlas-12g` (`~16.3 GB` @ 64K) or `atlas-10g` (`~13.0 GB` @ 16K with `--spec --no-vision`, `<12 GiB` without `--spec`).
+    - **16 GB / 12 GB class:** Elastic `atlas-12g` (`~16.3 GB` @ 64K) or `atlas-10g` (`12,984 MiB` @ 16K with `--spec --no-vision`, `<12 GiB` without `--spec`).
 - **Driver & Toolchain:** NVIDIA driver for CUDA 12.8+ / 13.x (CUDA 12.9 toolkit for `sm_60`/`61`/`70`/`75`; CUDA 13.4 private toolkit installer for `sm_86`/`89`/`120a`), C++20 compiler (GCC 12–16), CMake >= 3.28, Ninja.
 - **Runtime:** `ingine-serve` is a standalone C++/CUDA binary; it needs no Python or PyTorch to run.
 
@@ -85,13 +85,14 @@ ctest --test-dir native/build-multiarch --output-on-failure
 **Volta / Turing / Pascal (`sm_70`, `sm_75`, `sm_60`/`61`, FP16 activations, CUDA 12.9):**
 
 ```bash
+# Run from the root of the clone. Presets are in native/.
 # Single-arch Tesla V100 (sm_70):
 cmake --preset sm70 -S native
-cmake --build --preset sm70 -j
+cmake --build native/build-sm70 -j
 
 # Or multi-arch legacy FP16 (Pascal sm_60/61 + Volta sm_70 + Turing sm_75, with tests):
 cmake --preset legacy-fp16 -S native
-cmake --build --preset legacy-fp16 -j
+cmake --build native/build-legacy-fp16 -j
 ```
 
 Start the server on a 24 GB card (RTX 3090 / RTX 4090, 64K context with vision + DSpark speculative decoding):
