@@ -22,6 +22,8 @@
 // INGINE_L2_HINTS=0 compile every access without hints.
 #pragma once
 
+#include "kernels/common/copy.cuh"
+
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -74,6 +76,9 @@ __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
 // 16-byte asynchronous global -> shared copy (L2 only); complete with cp.async.commit_group / wait.
 template <Evict E>
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, std::uint64_t pol) {
+#if __CUDA_ARCH__ < 800
+  copy::sync<16>(smem, gmem);
+#else
   const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(smem));
   if constexpr (hinted<E>) {
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(dst), "l"(gmem), "l"(pol)
@@ -81,6 +86,7 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, std::ui
   } else {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(gmem) : "memory");
   }
+#endif
 }
 
 // 16-byte store whose L2 line gets class E (e.g. Evict::last for a result read after a large stream).

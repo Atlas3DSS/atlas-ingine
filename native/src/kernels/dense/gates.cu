@@ -131,7 +131,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
       l2::cp_async16<WEIGHT_L2>(fg + dst, fsrc + size_t(k) * 16, wpol);
       l2::cp_async16<WEIGHT_L2>(fg + C::SLICE + dst, gsrc + size_t(k) * 16, wpol);
     }
-    asm volatile("cp.async.commit_group;" ::: "memory");
+    copy::commit();
   }
 
   // down projection weights -> registers
@@ -226,7 +226,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     }
     nw = a.norm_w[size_t(g) * H + c];
   }
-  asm volatile("cp.async.wait_all;" ::: "memory");
+  copy::wait_all();
   __syncthreads();  // forget/gain slices from all threads' copies are visible
   mb_wait(mb_g);
 
@@ -430,7 +430,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(Ga
       l2::cp_async16<WEIGHT_L2>(fg + dst, fsrc + size_t(k) * 16, wpol);
       l2::cp_async16<WEIGHT_L2>(fg + C::SLICE + dst, gsrc + size_t(k) * 16, wpol);
     }
-    asm volatile("cp.async.commit_group;" ::: "memory");
+    copy::commit();
   }
   for (int i = t; i < M * RANK; i += C::NT) gall[i / RANK][i % RANK] = gall_in[size_t(g) * M * RANK + i];
   const int c = rank * C::CPC + t;
@@ -445,7 +445,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(Ga
       mv[m] = mg[size_t(m) * H + c];
     }
   }
-  asm volatile("cp.async.wait_all;" ::: "memory");
+  copy::wait_all();
   __syncthreads();
 
   float sq[M];

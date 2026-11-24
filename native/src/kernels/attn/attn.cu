@@ -318,18 +318,29 @@ __device__ __forceinline__ long long ld_s64(const long long* ptr) {
 }
 
 __device__ __forceinline__ void cp16(float* dst, const float* src) {
+#if __CUDA_ARCH__ < 800
+    copy::sync<16>(dst, src);
+#else
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(unsigned(__cvta_generic_to_shared(dst))),
                  "l"(src)
                  : "memory");
+#endif
 }
 
 __device__ __forceinline__ void cp4(float* dst, const float* src) {
+#if __CUDA_ARCH__ < 800
+    copy::sync<4>(dst, src);
+#else
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(unsigned(__cvta_generic_to_shared(dst))), "l"(src)
                  : "memory");
+#endif
 }
 
 // zero-filling variants: nothing is read when !ok (cp16z: cached K/V rows, KV_L2 lines)
 __device__ __forceinline__ void cp16z(float* dst, const float* src, bool ok, std::uint64_t pol) {
+#if __CUDA_ARCH__ < 800
+    copy::sync<16>(dst, src, ok ? 16 : 0);
+#else
     if constexpr (l2::hinted<KV_L2>)
         asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;" ::"r"(
                          unsigned(__cvta_generic_to_shared(dst))),
@@ -339,12 +350,17 @@ __device__ __forceinline__ void cp16z(float* dst, const float* src, bool ok, std
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(unsigned(__cvta_generic_to_shared(dst))),
                      "l"(src), "r"(ok ? 16 : 0)
                      : "memory");
+#endif
 }
 
 __device__ __forceinline__ void cp4z(float* dst, const float* src, bool ok) {
+#if __CUDA_ARCH__ < 800
+    copy::sync<4>(dst, src, ok ? 4 : 0);
+#else
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(unsigned(__cvta_generic_to_shared(dst))), "l"(src),
                  "r"(ok ? 4 : 0)
                  : "memory");
+#endif
 }
 
 __device__ __forceinline__ uint32_t pack2(float a, float b) {
@@ -477,7 +493,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 cp4z(srp + (st * DREL + c2) * (KT + MAXM) + e, p.rel_proj + c2 * EXT + (ok ? d : 0), ok);
             }
         }
-        asm volatile("cp.async.commit_group;" ::: "memory");
+        copy::commit();
     };
     // E4M3 caches, M > 1: tile t of this block (keys rank KT + t CS KT ..) is copied as raw E4M3 rows into
     // slot t % NRAW of the stage region: K rows with their 16-byte chunks XOR-swizzled by key (read
@@ -501,7 +517,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                       kvpol);
             }
         }
-        asm volatile("cp.async.commit_group;" ::: "memory");
+        copy::commit();
     };
     // M = 1: the cached keys' K/V and kpos are issued before the wait. pos, kpos and the cache rows below
     // p0 were written two or more kernels back (see PDL above), and the staged inputs then come in one
@@ -546,13 +562,13 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
 
     if constexpr (M > 1 && F8) {  // staged inputs as the oldest group, then the first NRAW tiles behind them
-        asm volatile("cp.async.commit_group;" ::: "memory");
+        copy::commit();
 #pragma unroll 1
         for (int t = 0; t < NRAW; ++t) issue_raw(t);
-        asm volatile("cp.async.wait_group %0;" ::"n"(NRAW) : "memory");
+        copy::wait<NRAW>();
         __syncthreads();
     } else {
-        asm volatile("cp.async.wait_all;" ::: "memory");
+        copy::wait_all();
         __syncthreads();
         if constexpr (M > 1) {
             if (rank * KT < L_old) issue(0, rank * KT);  // in flight during q / rel and the owner's work
@@ -1081,7 +1097,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         if constexpr (F8) {
             int t = 0;
             for (int base = rank * KT; base < L_old; base += CS * KT, ++t) {
-                asm volatile("cp.async.wait_group %0;" ::"n"(NRAW - 1) : "memory");  // this thread's part of tile t
+                copy::wait<NRAW - 1>();  // this thread's part of tile t
                 __syncthreads();  // tile t landed for everyone; the previous tile's P V is done with wv
                 expand_v(t % NRAW);
                 __syncthreads();
@@ -1092,7 +1108,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         } else {
             int st = 0;
             for (int base = rank * KT; base < L_old; base += CS * KT, st ^= 1) {
-                asm volatile("cp.async.wait_group 0;" ::: "memory");  // tile `base` (the only one in flight)
+                copy::wait<0>();  // tile `base` (the only one in flight)
                 convert_v(st);
                 __syncthreads();  // tile landed for everyone; the previous tile's P V is done
                 if (base + CS * KT < L_old) issue(st ^ 1, base + CS * KT);

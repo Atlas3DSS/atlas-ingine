@@ -3,6 +3,8 @@
 // src/kernels/common/mma.cuh and memory.cuh), BF16/FP16/FP8 packing, swizzled shared-memory tiles.
 #pragma once
 
+#include "kernels/common/copy.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -48,16 +50,20 @@ __device__ __forceinline__ void mma_f16(float (&c)[4], const unsigned (&a)[4], u
 
 // 16-byte cp.async (L2 only); src_bytes < 16 zero-fills the rest (0: nothing is read).
 __device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src, int src_bytes = 16) {
+#if __CUDA_ARCH__ < 800
+  copy::sync<16>(smem_dst, gmem_src, src_bytes);
+#else
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                :
                : "r"(smem_addr(smem_dst)), "l"(gmem_src), "r"(src_bytes));
+#endif
 }
 
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+__device__ __forceinline__ void cp_commit() { copy::commit(); }
 
 template <int Groups>
 __device__ __forceinline__ void cp_wait() {
-  asm volatile("cp.async.wait_group %0;\n" : : "n"(Groups));
+  copy::wait<Groups>();
 }
 
 __device__ __forceinline__ float bf_lo(uint32_t u) { return __uint_as_float(u << 16); }

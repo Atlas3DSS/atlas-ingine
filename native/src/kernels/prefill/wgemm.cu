@@ -69,7 +69,11 @@ struct GemmArgs {
 };
 
 __device__ __forceinline__ void cp_async4(void* smem_dst, const void* gmem_src) {
+#if __CUDA_ARCH__ < 800
+  copy::sync<4>(smem_dst, gmem_src);
+#else
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(smem_addr(smem_dst)), "l"(gmem_src));
+#endif
 }
 
 __device__ __forceinline__ float softcap(float x, float cap) { return tanhf(x * (1.f / cap)) * cap; }

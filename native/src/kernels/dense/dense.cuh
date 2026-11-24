@@ -2,6 +2,8 @@
 // Ported from engine/csrc/dense/dense.cuh.
 #pragma once
 
+#include "kernels/common/copy.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -26,9 +28,13 @@ __device__ __forceinline__ uint4 ld_act(const void* p) {
 
 // 16-byte asynchronous global -> shared copy (L2 only); complete with cp.async.commit_group / wait.
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+#if __CUDA_ARCH__ < 800
+  copy::sync<16>(smem, gmem);
+#else
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(static_cast<unsigned>(__cvta_generic_to_shared(smem))),
                "l"(gmem)
                : "memory");
+#endif
 }
 
 __device__ __forceinline__ float bf_lo(uint32_t u) { return __uint_as_float(u << 16); }

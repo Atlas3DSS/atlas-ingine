@@ -83,8 +83,8 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   pdl_wait_fenced(zero);  // keeps the weight loads above ahead of the wait
   pdl_trigger();
   for (int k = t; k < M * H / 8; k += NT) cp_async16(&xs[0][0] + k * 8, x + size_t(k) * 8);
-  asm volatile("cp.async.commit_group;" ::: "memory");
-  asm volatile("cp.async.wait_all;" ::: "memory");
+  copy::commit();
+  copy::wait_all();
   __syncthreads();
 
   float acc[M];
@@ -210,8 +210,8 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_sm8x_dot_kernel(cons
 #pragma unroll
   for (int i = 0; i < CH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (size_t(i) * 32 + lane) * 16, wpol);
   for (int k = t; k < M * H / 8; k += NT) cp_async16(&xs[0][0] + k * 8, x + size_t(k) * 8);
-  asm volatile("cp.async.commit_group;" ::: "memory");
-  asm volatile("cp.async.wait_all;" ::: "memory");
+  copy::commit();
+  copy::wait_all();
   __syncthreads();
 
   float acc[M];
