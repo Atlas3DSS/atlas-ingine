@@ -68,6 +68,9 @@ class PagedKvCache {
   int max_ctx() const noexcept { return max_ctx_; }
   int max_pages() const noexcept { return max_pages_; }
   bool has_nvme_spill() const noexcept { return swap_page_count_ > 0; }
+  // Use bulk-DMA double-buffered streaming decode whenever NVMe swap is active or >=32 pages (144 MiB)
+  // are resident in Tier-1 host RAM (saturates PCIe H2D at ~20 GB/s instead of ~2 GB/s scattered UVA).
+  bool needs_streamed_decode() const noexcept { return swap_page_count_ > 0 || ram_page_count_ >= 32; }
   std::size_t vram_bytes() const noexcept { return vram_bytes_; }
 
   // Fixed device pointer tables [max_pages] for full visit `fi` (0..NUM_FULL_VISITS-1).
@@ -167,6 +170,7 @@ class PagedKvCache {
   // Tier 2: Writable crash-safe NVMe SwapFile + pinned bounce ring
   SwapFile swap_;
   PinnedBounceRing bounce_;
+  std::uint64_t ram_page_count_ = 0;
   std::uint64_t swap_page_count_ = 0;
 
   // Page metadata [NUM_FULL_VISITS][max_pages]

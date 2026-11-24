@@ -1038,7 +1038,7 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
       prefill_span(suffix, L_doc, false);
       std::vector<int32_t> out_ids;
       double dec_s = 0.0;
-      greedy_decode(L_doc + int(suffix.size()), 256, true, out_ids, dec_s);
+      greedy_decode(L_doc + int(suffix.size()), 512, true, out_ids, dec_s);
       const std::string text = tok.decode_lossy(out_ids);
       const bool hit = text.find(codes[d]) != std::string::npos;
       if (hit) ++ctx_pass, ++total_passed;
@@ -1066,17 +1066,17 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
       const double dec_tok_s = double(out_ids.size() - 1) / std::max(dec_s, 1e-9);
       std::printf("DECODE  ctx=%d (%zu toks generated in %.2fs): %.2f tok/s | needle=%d/3\n",
                   L_doc + int(suffix.size()), out_ids.size(), dec_s, dec_tok_s, ctx_pass);
+      if (rt.state().paged_kv) std::printf("%s\n", rt.state().paged_kv->summary().c_str());
+      if (rt.weights().expert_cache) std::printf("%s\n", rt.weights().expert_cache->summary().c_str());
       std::fflush(stdout);
     }
   }
-  if (rt.state().paged_kv) std::printf("%s\n", rt.state().paged_kv->summary().c_str());
-  if (rt.weights().expert_cache) std::printf("%s\n", rt.weights().expert_cache->summary().c_str());
   std::printf("\n=== 1M Bench & Needle Summary: %d / %d needles recalled (%.1f%%) ===\n",
               total_passed, total_trials, total_trials ? 100.0 * double(total_passed) / double(total_trials) : 0.0);
   return 0;
 }
 
-// ---- Phase 2 Oracle: Resident Q4_0 vs 2-Tier Paged (VRAM+RAM) vs 3-Tier Paged (VRAM+RAM+NVMe SwapFile) ----
+// ---- Phase 2 Oracle: Resident Q4_0 vs 2-Tier UVA vs 2-Tier Bulk-DMA (>=32 RAM pages) vs 3-Tier NVMe SwapFile ----
 int run_test_paged_kv(const std::string& model_dir, const std::string& golden_json) {
   std::ifstream gf(golden_json);
   if (!gf) {
@@ -1084,33 +1084,33 @@ int run_test_paged_kv(const std::string& model_dir, const std::string& golden_js
     return 1;
   }
   std::vector<int32_t> base_ids = nlohmann::json::parse(gf)["prompt_ids"].get<std::vector<int32_t>>();
-  // Build a 12,288-token prefix (3 full 4096-token pages) + 16 decode tokens = 12,304 tokens!
-  const int prefix_len = 12288;
+  // Test both L=12,288 (3 pages: 2-tier UVA + 3-tier NVMe) and L=24,576 (6 pages: 2-tier bulk-DMA >=32 RAM pages).
+  const int max_prefix = 24576;
   const int eval_tokens = 16;
   const int chunk = 512;
   std::vector<int32_t> ids;
-  ids.reserve(prefix_len + eval_tokens);
-  while (int(ids.size()) < prefix_len + eval_tokens) {
+  ids.reserve(max_prefix + eval_tokens);
+  while (int(ids.size()) < max_prefix + eval_tokens) {
     ids.insert(ids.end(), base_ids.begin(), base_ids.end());
   }
-  ids.resize(prefix_len + eval_tokens);
+  ids.resize(max_prefix + eval_tokens);
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  std::printf("=== Phase 2 PagedKvCache 3-Tier Equivalence Oracle (L=%d = 3 pages, +%d decode) ===\n", prefix_len,
+  std::printf("=== Phase 2 PagedKvCache 3-Tier Equivalence Oracle (L=12288 & L=24576 bulk-DMA, +%d decode) ===\n",
               eval_tokens);
   std::printf("Loading weights (%s)...\n", model_dir.c_str());
   std::fflush(stdout);
   Weights w = load_weights(model_dir, true, stream);
   Ablation abl = load_ablation({});
   Prefiller pre(w, abl, chunk, stream);
-  DeviceBuffer d_ids(size_t(prefix_len + eval_tokens) * 4);
-  d_ids.copy_from_host(ids.data(), size_t(prefix_len + eval_tokens) * 4);
+  DeviceBuffer d_ids(size_t(max_prefix + eval_tokens) * 4);
+  d_ids.copy_from_host(ids.data(), size_t(max_prefix + eval_tokens) * 4);
   DeviceBuffer d_logits(size_t(UNPADDED_VOCAB) * 4);
   DeviceBuffer d_pos(8);
   Buffers buf1 = make_buffers(1);
 
-  auto eval_arm = [&](const char* label, PagedKvConfig pcfg) -> std::vector<std::vector<float>> {
+  auto eval_arm = [&](const char* label, int prefix_len, PagedKvConfig pcfg) -> std::vector<std::vector<float>> {
     State st = make_state(prefix_len + eval_tokens + 64, false, true, pcfg);
     Decoder dec(w, abl, st, true);
     reset_state(st, stream);
@@ -1122,9 +1122,13 @@ int run_test_paged_kv(const std::string& model_dir, const std::string& golden_js
     std::vector<std::vector<float>> out;
     out.reserve(eval_tokens + 1);
     out.push_back(download_f32(static_cast<const float*>(d_logits.p), UNPADDED_VOCAB));
+    bool streamed_engaged = false;
     for (int i = 0; i < eval_tokens; ++i) {
       const int pos = prefix_len + i;
-      if (st.paged_kv) st.paged_kv->ensure_decode_pages(pos, 1, stream);
+      if (st.paged_kv) {
+        st.paged_kv->ensure_decode_pages(pos, 1, stream);
+        streamed_engaged |= st.paged_kv->needs_streamed_decode();
+      }
       const int64_t tok64 = ids[pos];
       const int64_t pos64 = pos;
       CUDA_CHECK(cudaMemcpyAsync(buf1.token.data, &tok64, 8, cudaMemcpyHostToDevice, stream));
@@ -1133,27 +1137,14 @@ int run_test_paged_kv(const std::string& model_dir, const std::string& golden_js
       CUDA_CHECK(cudaStreamSynchronize(stream));
       out.push_back(download_f32(static_cast<const float*>(buf1.logits.data), UNPADDED_VOCAB));
     }
-    if (st.paged_kv) std::printf("  [%s] %s\n", label, st.paged_kv->summary().c_str());
+    if (st.paged_kv)
+      std::printf("  [%s] streamed_decode=%d | %s\n", label, streamed_engaged ? 1 : 0, st.paged_kv->summary().c_str());
     std::fflush(stdout);
     return out;
   };
 
-  const auto ref = eval_arm("resident-q4", PagedKvConfig{});
-  PagedKvConfig c_ram;
-  c_ram.max_ctx = prefix_len + eval_tokens + 64;
-  c_ram.vram_mb = 96;   // 16 VRAM slots (72 MiB) < 24 active pages -> forces Tier-1 UVA RAM eviction!
-  c_ram.ram_mb = 512;   // fits all evicted pages in pinned UVA RAM (0 swap)
-  c_ram.prefill_chunk = chunk;
-  const auto paged_ram = eval_arm("paged-2tier-ram", c_ram);
-
-  PagedKvConfig c_swap;
-  c_swap.max_ctx = prefix_len + eval_tokens + 64;
-  c_swap.vram_mb = 96;  // 16 VRAM slots
-  c_swap.ram_mb = 18;   // 4 RAM slots -> forces Tier-2 NVMe SwapFile spill on both prefill AND decode!
-  c_swap.prefill_chunk = chunk;
-  const auto paged_swap = eval_arm("paged-3tier-nvme", c_swap);
-
-  auto check_arm = [&](const char* name, const std::vector<std::vector<float>>& test) -> bool {
+  auto check_arm = [&](const char* name, const std::vector<std::vector<float>>& ref,
+                       const std::vector<std::vector<float>>& test) -> bool {
     double sum_kl = 0.0, max_kl = 0.0, max_diff = 0.0;
     int top1 = 0;
     for (size_t i = 0; i < ref.size(); ++i) {
@@ -1172,8 +1163,38 @@ int run_test_paged_kv(const std::string& model_dir, const std::string& golden_js
   };
 
   bool ok = true;
-  ok &= check_arm("paged-2tier-ram", paged_ram);
-  ok &= check_arm("paged-3tier-nvme", paged_swap);
+  {
+    const int L = 12288;
+    const auto ref = eval_arm("resident-q4-12k", L, PagedKvConfig{});
+    PagedKvConfig c_ram;
+    c_ram.max_ctx = L + eval_tokens + 64;
+    c_ram.vram_mb = 96;  // 16 VRAM slots < 24+8 active pages -> 16 RAM pages (<32 -> UVA decode path)
+    c_ram.ram_mb = 512;
+    c_ram.prefill_chunk = chunk;
+    const auto paged_ram = eval_arm("paged-2tier-uva-12k", L, c_ram);
+
+    PagedKvConfig c_swap;
+    c_swap.max_ctx = L + eval_tokens + 64;
+    c_swap.vram_mb = 96;  // 16 VRAM slots
+    c_swap.ram_mb = 18;   // 4 RAM slots -> Tier-2 NVMe SwapFile spill on prefill & decode
+    c_swap.prefill_chunk = chunk;
+    const auto paged_swap = eval_arm("paged-3tier-nvme-12k", L, c_swap);
+
+    ok &= check_arm("paged-2tier-uva-12k", ref, paged_ram);
+    ok &= check_arm("paged-3tier-nvme-12k", ref, paged_swap);
+  }
+  {
+    const int L = 24576;
+    const auto ref = eval_arm("resident-q4-24k", L, PagedKvConfig{});
+    PagedKvConfig c_bulk;
+    c_bulk.max_ctx = L + eval_tokens + 64;
+    c_bulk.vram_mb = 96;   // 16 VRAM slots < 48+8 active pages -> 40 RAM pages (>=32 -> bulk-DMA decode path!)
+    c_bulk.ram_mb = 1024;  // fits all 40 evicted pages in pinned RAM (SWAP=0)
+    c_bulk.prefill_chunk = chunk;
+    const auto paged_bulk = eval_arm("paged-2tier-bulk-dma-24k", L, c_bulk);
+
+    ok &= check_arm("paged-2tier-bulk-dma-24k", ref, paged_bulk);
+  }
   CUDA_CHECK(cudaStreamDestroy(stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

@@ -117,6 +117,13 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   const float* mlp_w = f32p(abl.mlp_w);
   ActT* taps = bf16m(b.taps);
 
+  const bool streamed_paged_kv = st.paged_kv && st.paged_kv->needs_streamed_decode();
+  std::int64_t streamed_h_pos = 0;
+  if (streamed_paged_kv) {
+    CUDA_CHECK(cudaMemcpyAsync(&streamed_h_pos, pos, sizeof(std::int64_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  }
+
   for (int v = 0; v < NUM_VISITS; ++v) {
     const int l = VISITS[v].layer, p = VISITS[v].pass;
     const Layer& layer = w.layers[l];
@@ -192,11 +199,8 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     a.out = bf16m(b.attn_out);
     if (layer.full) {
       const int fi = FULL_INDEX[v];
-      if (st.paged_kv && st.paged_kv->has_nvme_spill()) {
-        std::int64_t h_pos = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&h_pos, pos, sizeof(std::int64_t), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        st.paged_kv->decode_attention_with_swap(fi, layer, v, f32p(proj_out), m, int(h_pos), st.conv_k_at(v),
+      if (streamed_paged_kv) {
+        st.paged_kv->decode_attention_with_swap(fi, layer, v, f32p(proj_out), m, int(streamed_h_pos), st.conv_k_at(v),
                                                 st.conv_v_at(v), bf16m(b.attn_out), stream);
       } else {
         a.k_conv = f32p(layer.k_static);

@@ -223,7 +223,7 @@ void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
 
 const float* Runtime::run_step(int m) {
   if ((weights_.expert_cache && weights_.expert_cache->needs_host_dispatch()) ||
-      (state_.paged_kv && state_.paged_kv->has_nvme_spill())) {
+      (state_.paged_kv && state_.paged_kv->needs_streamed_decode())) {
     return run_step_eager(m);
   }
   auto it = graphs_.find(m);

@@ -146,6 +146,7 @@ int PagedKvCache::alloc_ram_slot(int fi, int page) {
   meta_[vfi][vpage].loc = Loc::Swap;
   meta_[vfi][vpage].slot = -1;
   set_page_ptrs(vfi, vpage, nullptr, nullptr);
+  if (ram_page_count_ > 0) --ram_page_count_;
   ++swap_page_count_;
   ++stats_.evict_to_swap;
   stats_.nvme_write_bytes += kPageBytes;
@@ -189,6 +190,7 @@ void PagedKvCache::evict_vram_page(int fi, int page, std::uint8_t* vram_ptr, cud
     meta_[fi][page].loc = Loc::Ram;
     meta_[fi][page].slot = rslot;
     set_page_ptrs(fi, page, dst_dev, dst_dev + kKPageBytes);
+    ++ram_page_count_;
     ++stats_.evict_to_ram;
     stats_.pcie_d2h_bytes += kPageBytes;
   } else {
@@ -236,6 +238,7 @@ void PagedKvCache::ensure_write_pages(int fi, int pos0, int count, cudaStream_t 
       dma_.copy_h2d_async(acq.vram_ptr, ram_host_ptr(prev_slot), kPageBytes);
       dma_.synchronize();
       free_ram_slot(prev_slot);
+      if (ram_page_count_ > 0) --ram_page_count_;
       ++stats_.promote_from_ram;
       stats_.pcie_h2d_bytes += kPageBytes;
     } else if (prev_loc == Loc::Swap) {
@@ -298,6 +301,7 @@ void PagedKvCache::ensure_decode_pages(int pos0, int m, cudaStream_t stream) {
         dma_.copy_h2d_async(acq.vram_ptr, ram_host_ptr(prev_slot), kPageBytes);
         dma_.synchronize();
         free_ram_slot(prev_slot);
+        if (ram_page_count_ > 0) --ram_page_count_;
         ++stats_.promote_from_ram;
         stats_.pcie_h2d_bytes += kPageBytes;
       } else if (prev_loc == Loc::Swap) {
@@ -487,6 +491,7 @@ void PagedKvCache::reset() {
     ram_slots_[i] = RamSlot{-1, -1, 0};
     free_ram_slots_.push_back(i);
   }
+  ram_page_count_ = 0;
   swap_page_count_ = 0;
   pin_gen_ = 1;
 }
