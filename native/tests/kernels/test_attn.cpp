@@ -13,6 +13,7 @@
 
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 using namespace ingine::test;
 namespace attn = ingine::kernels::attn;
@@ -178,38 +179,64 @@ bool run(Rng& rng, const Case& cs) {
   // ---- oracle: key/value convs, clip / norm, cache rounding
   std::vector<double> nk(size_t(M) * C), nv(size_t(M) * C);
   std::vector<float> want_ck(3 * C), want_cv(3 * C);
-  for (int kv = 0; kv < 2; ++kv) {
-    const std::vector<float>& st = kv ? cv0 : ck0;
-    const std::vector<float>& w = kv ? vconv : kconv;
-    const int off = kv ? OFF_V : OFF_K, offd = kv ? OFF_VDYN : OFF_KDYN;
-    std::vector<double>& o = kv ? nv : nk;
-    for (int c = 0; c < C; ++c) {
-      std::vector<double> ext(M + 3);
-      for (int j = 0; j < 3; ++j) ext[j] = st[size_t(j) * C + c];
-      for (int m = 0; m < M; ++m) ext[3 + m] = proj[size_t(m) * R + off + c];
-      for (int m = 0; m < M; ++m) {
-        double s = 0;
-        if (full) {
-          for (int lag = 0; lag < 4; ++lag)
-            s += (double(w[size_t(lag) * C + c]) + proj[size_t(m) * R + offd + (c / D) * 4 + lag]) * ext[m + 3 - lag];
-          o[size_t(m) * C + c] = rbf((s + ext[m + 3]) / 3.0);
-        } else {
-          for (int j = 0; j < 4; ++j) s += double(w[size_t(c) * 4 + j]) * ext[m + j];
-          o[size_t(m) * C + c] = rbf((s + ext[m + 3]) / std::sqrt(5.0));
+  auto cache_reference = [&]<class Real>(std::vector<double>& nk, std::vector<double>& nv) {
+    for (int kv = 0; kv < 2; ++kv) {
+      const std::vector<float>& st = kv ? cv0 : ck0;
+      const std::vector<float>& w = kv ? vconv : kconv;
+      const int off = kv ? OFF_V : OFF_K, offd = kv ? OFF_VDYN : OFF_KDYN;
+      std::vector<double>& o = kv ? nv : nk;
+      for (int c = 0; c < C; ++c) {
+        std::vector<double> ext(M + 3);
+        for (int j = 0; j < 3; ++j) ext[j] = st[size_t(j) * C + c];
+        for (int m = 0; m < M; ++m) ext[3 + m] = proj[size_t(m) * R + off + c];
+        for (int m = 0; m < M; ++m) {
+          Real sum = 0;
+          for (int tap = 0; tap < 4; ++tap) {
+            const Real weight = full ? Real(w[size_t(tap) * C + c]) + Real(proj[size_t(m) * R + offd + (c / D) * 4 + tap])
+                                     : Real(w[size_t(c) * 4 + tap]);
+            sum += weight * Real(ext[full ? m + 3 - tap : m + tap]);
+          }
+          const Real value = sum + Real(ext[m + 3]);
+          const Real divisor = full ? Real(3) : Real(std::sqrt(5.0));
+          if constexpr (std::is_same_v<Real, float>) o[size_t(m) * C + c] = rbf(value * (1.f / divisor));
+          else o[size_t(m) * C + c] = rbf(value / divisor);
         }
+        for (int j = 0; j < 3; ++j) (kv ? want_cv : want_ck)[size_t(j) * C + c] = float(ext[M + j]);
       }
-      for (int j = 0; j < 3; ++j) (kv ? want_cv : want_ck)[size_t(j) * C + c] = float(ext[M + j]);
     }
+    clip_rows(nk, M * HKV, D, QK_CLIP);
+    for (int r = 0; r < M * HKV; ++r) {
+      double* row = nv.data() + size_t(r) * D;
+      if constexpr (std::is_same_v<Real, float>) {
+        // One warp normalizes a cache row. The FP16 rounding can land on an E4M3 midpoint.
+        float partial[D / 4];
+        for (int lane = 0; lane < D / 4; ++lane) {
+          const double* x = row + 4 * lane;
+          float sum = float(x[0]) * float(x[0]);
+          for (int j = 1; j < 4; ++j) sum = std::fma(float(x[j]), float(x[j]), sum);
+          partial[lane] = sum;
+        }
+        for (int step = 1; step < D / 4; step *= 2)
+          for (int lane = 0; lane < D / 4; lane += 2 * step) partial[lane] += partial[lane + step];
+        const float inv = 1.f / std::sqrt(partial[0] / D + 1e-6f);
+        for (int d = 0; d < D; ++d) row[d] = float(row[d]) * inv;
+      } else {
+        double ss = 0;
+        for (int d = 0; d < D; ++d) ss += row[d] * row[d];
+        const double inv = 1.0 / std::sqrt(ss / D + 1e-6);
+        for (int d = 0; d < D; ++d) row[d] *= inv;
+      }
+    }
+    for (auto& v : nk) v = stored(float(rbf(v)), fp8);
+    for (auto& v : nv) v = stored(float(rbf(v)), fp8);
+  };
+  cache_reference.operator()<double>(nk, nv);
+  std::vector<double> ideal_k, ideal_v;
+  if constexpr (ingine::kActIsFP16) {
+    ideal_k = nk;
+    ideal_v = nv;
+    cache_reference.operator()<float>(nk, nv);
   }
-  clip_rows(nk, M * HKV, D, QK_CLIP);
-  for (int r = 0; r < M * HKV; ++r) {
-    double ss = 0;
-    for (int d = 0; d < D; ++d) ss += nv[size_t(r) * D + d] * nv[size_t(r) * D + d];
-    const double rv = 1.0 / std::sqrt(ss / D + 1e-6);
-    for (int d = 0; d < D; ++d) nv[size_t(r) * D + d] *= rv;
-  }
-  for (auto& v : nk) v = stored(float(rbf(v)), fp8);
-  for (auto& v : nv) v = stored(float(rbf(v)), fp8);
 
   // ---- oracle: attention over the old entries valid for each token + the call's keys up to it
   std::vector<double> exact(size_t(M) * HQ * D), spec(exact.size());
@@ -271,6 +298,10 @@ bool run(Rng& rng, const Case& cs) {
     }
   }
   const double ulp = fp8 ? 1.0 / 8 : 1.0 / 128;
+  if constexpr (ingine::kActIsFP16) {
+    ok &= Check{(n + " new keys vs FP64").c_str(), ulp, 1e-6, 0}(rk, ideal_k);
+    ok &= Check{(n + " new values vs FP64").c_str(), ulp, 1e-6, 0}(rv, ideal_v);
+  }
   ok &= Check{(n + " new keys").c_str(), ulp, 1e-6, 2e-3}(rk, wk, &wk);
   ok &= Check{(n + " new values").c_str(), ulp, 1e-6, 2e-3}(rv, wv, &wv);
   std::vector<double> sk(want_ck.begin(), want_ck.end()), sv(want_cv.begin(), want_cv.end());

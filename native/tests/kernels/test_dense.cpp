@@ -415,8 +415,20 @@ bool test_gates(Rng& rng, int G, int M, bool fg32, bool h_shared = false) {
   char what[64];
   std::snprintf(what, sizeof what, "message_gates G=%d M=%d %s%s", G, M, fg32 ? "fp32" : "bf16",
                 h_shared ? " shared-h" : "");
-  // the BF16 roundings of the normalised inputs and of g may flip against the oracle: loose bounds
-  bool ok = Check{(std::string(what) + " gated").c_str(), 2e-3, 2e-3, 1.0}(of.download(), gated);
+  const auto observed_gated = of.download();
+  bool ok = Check{(std::string(what) + " gated").c_str(), 2e-3, 2e-3, 1.0}(observed_gated, gated);
+  if constexpr (ingine::kActIsFP16) {
+    // Check the final rounding at the exposed FP32 boundary. Both the gated values and the
+    // end-to-end output are independently compared to the FP64 formulas.
+    for (int row = 0; row < G * M; ++row) {
+      const size_t start = size_t(row) * H;
+      double ss = 0;
+      for (int c = 0; c < H; ++c) ss += double(observed_gated[start + c]) * observed_gated[start + c];
+      const double inv = 1.0 / std::sqrt(ss / H + 1e-6);
+      for (int c = 0; c < H; ++c)
+        outr[start + c] = rbf(observed_gated[start + c] * inv * nw[size_t(row / M) * H + c]);
+    }
+  }
   ok &= Check{(std::string(what) + " out").c_str(), 1.0 / 64, 4e-3, 0.05}(bf16_download(ob), out, &outr);
   return ok;
 }
