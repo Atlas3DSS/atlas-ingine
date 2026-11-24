@@ -210,8 +210,15 @@ bool run(Rng& rng, int fmt, int T) {
           const double a = act_ref(g, u);
           const double gr = rbf(g), ur = rbf(u);
           const double dg = 1e-6 * sg + std::ldexp(std::fabs(gr), -7), du = 1e-6 * su + std::ldexp(std::fabs(ur), -7);
+          // Output quantization floor: 0.5 ULP of the smallest subnormal (FP16: 2^-25; BF16: ~1e-30).
+#if INGINE_ACT_FP16
+          constexpr double kSubnormalHalfStep = 2.98023223876953125e-8;  // 2^-25
+#else
+          constexpr double kSubnormalHalfStep = 1e-30;
+#endif
           abs_a.push_back(std::max(std::fabs(act_raw(gr + dg, ur) - a), std::fabs(act_raw(gr - dg, ur) - a)) +
-                          std::max(std::fabs(act_raw(gr, ur + du) - a), std::fabs(act_raw(gr, ur - du) - a)) + 1e-30);
+                          std::max(std::fabs(act_raw(gr, ur + du) - a), std::fabs(act_raw(gr, ur - du) - a)) +
+                          kSubnormalHalfStep);
           ref_a.push_back(a);
           got_a.push_back(bf16_val(act_g[size_t(pp) * I + i]));
         }

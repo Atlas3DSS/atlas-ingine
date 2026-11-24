@@ -294,7 +294,12 @@ void test_softmax(Rng& rng, int M, int ld, int S) {
   }
   char what[64];
   std::snprintf(what, sizeof what, "softmax_rows M=%d ld=%d S=%d", M, ld, S);
+#if INGINE_ACT_FP16
+  // FP16 smallest subnormal is 2^-24 (~5.96e-8), so half-ULP quantization floor is 2^-25 (~2.98e-8).
+  report_bf16(what, got, ref, 2.98023223876953125e-8 + 1e-9);
+#else
   report_bf16(what, got, ref, 1e-9);
+#endif
   CHECK(pad_zero);
 }
 

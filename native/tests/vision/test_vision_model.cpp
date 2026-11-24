@@ -69,8 +69,7 @@ std::vector<float> rows_of(const ingine::DeviceBuffer& out, int tokens) {
   out.copy_to_host(bits.data(), bits.size() * 2);
   std::vector<float> v(bits.size());
   for (std::size_t i = 0; i < v.size(); ++i) {
-    const std::uint32_t w = std::uint32_t(bits[i]) << 16;
-    std::memcpy(&v[i], &w, 4);
+    v[i] = ingine::act::host_bits_to_float(bits[i]);
   }
   return v;
 }
