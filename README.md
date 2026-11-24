@@ -4,60 +4,73 @@ Multi-architecture Apache-2.0 CUDA inference engine for
 [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), forked from
 [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine).
 
-Runs on **Ampere (`sm_86`, RTX 3090)**, **Ada (`sm_89`, RTX 4090)**, and **Blackwell (`sm_120a`, RTX 5090 / RTX PRO 6000)**
-with **native Elastic sub-4-bit MoE weights (`ATLAS2` / `ATLAS3`)**, **DSpark speculative decoding**, **native vision
-input**, and **OpenAI-compatible structured outputs (`response_format`: `json_object` / `json_schema`) + automatic
-tool-ban**. Blackwell (`sm_120a`) outputs remain bit-identical to upstream (`kernels_bitlock` 48/48 PASS).
+Spans **10 years of NVIDIA GPU architectures** — **Pascal (`sm_60`/`sm_61`)**, **Volta (`sm_70`, Tesla V100)**,
+**Turing (`sm_75`)**, **Ampere (`sm_80`/`sm_86`, RTX 3090)**, **Ada (`sm_89`, RTX 4090)**, **Hopper (`sm_90`)**, and
+**Blackwell (`sm_120a`, RTX 5090 / RTX PRO 6000)** — with **native Elastic sub-4-bit MoE weights (`ATLAS2` / `ATLAS3`)**,
+**DSpark speculative decoding**, **native vision input**, **OpenAI-compatible structured outputs (`response_format`:
+`json_object` / `json_schema`) + automatic tool-ban**, and a standalone **Verified Ledger SDK (`ledger/`)**.
+SM80+ BF16 builds remain bit-identical to pre-port builds (`kernels_bitlock` 48/48 PASS; RTX 3090 24/24 bit-lock hashes unchanged).
 
-## Measured performance (64K context)
+## Measured performance (64K & 262K context)
 
-Measured with `ingine-bench` (`--max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000`):
+Measured with `ingine-bench` (`--max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000`, and `--max-ctx 262144` where noted):
 
-| GPU | Arch | Checkpoint | VRAM @ 64K ctx | Chat decode | Code decode | 64K prefill |
-|---|---|---|---:|---:|---:|---:|
-| RTX 3090 24 GB | `sm_86` | Native `NVFP4+MXFP8` | `21.82 GB` | `154.9 tok/s` | `213.2 tok/s` | `2,980 tok/s` |
-| RTX 3090 24 GB | `sm_86` | Elastic `atlas-12g` | `16.37 GB` | `132.4 tok/s` | `161.2 tok/s` | `2,970 tok/s` |
-| RTX 3090 24 GB | `sm_86` | Elastic `atlas-10g` | `14.33 GB` | `145.6 tok/s` | `196.1 tok/s` | `3,012 tok/s` |
-| RTX 4090 24 GB | `sm_89` | Elastic `atlas-12g` | `16.36 GB` | `236.7 tok/s` | `278.3 tok/s` | `7,031 tok/s` |
-| RTX PRO 6000 96 GB | `sm_120a` | Elastic `atlas-12g` | `16.26 GB` | `411.0 tok/s` | `519.9 tok/s` | `11,728 tok/s` |
-| RTX PRO 6000 96 GB | `sm_120a` | Elastic `atlas-10g` | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` |
+| GPU | Arch | Year | Checkpoint | VRAM | Chat decode | Code decode | 64K prefill |
+|---|---|---:|---|---:|---:|---:|---:|
+| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | Native `NVFP4+MXFP8` (64K) | `21.82 GB` | `59.8 tok/s` | `72.2 tok/s` | `717.7 tok/s` |
+| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | Native `NVFP4+MXFP8` (262K) | `25.04 GB` | `46.0 tok/s` | `54.9 tok/s` | — |
+| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Native `NVFP4+MXFP8` (64K) | `21.82 GB` | `154.9 tok/s` | `213.2 tok/s` | `2,980 tok/s` |
+| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Elastic `atlas-12g` (64K) | `16.37 GB` | `132.4 tok/s` | `161.2 tok/s` | `2,970 tok/s` |
+| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Elastic `atlas-10g` (64K) | `14.33 GB` | `145.6 tok/s` | `196.1 tok/s` | `3,012 tok/s` |
+| RTX 4090 24 GB | `sm_89` (BF16) | 2022 | Elastic `atlas-12g` (64K) | `16.36 GB` | `236.7 tok/s` | `278.3 tok/s` | `7,031 tok/s` |
+| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-12g` (64K) | `16.26 GB` | `411.0 tok/s` | `519.9 tok/s` | `11,728 tok/s` |
+| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-10g` (64K) | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` |
 
-Additional verified live-serving footprints (`ingine-serve`):
+Additional verified architecture & live-serving details:
+- **Pascal (`sm_60`/`sm_61`, 2016) & Turing (`sm_75`, 2018):** Compiled in the `legacy-fp16` CUDA 12.9 preset (`60;61;70;75`, 217/217 targets clean). The Pascal FP32-SIMT MMA kernels (`INGINE_FORCE_SIMT_MMA=ON`, preset `sm70-simt-dev`) are hardware-verified on V100 across the core, MoE, attention, dense, prefill, vision, and model-parity test suites.
+- **Volta (`sm_70`, Tesla V100 32 GB, 2017):** All 39/39 non-benchmark CTest suites pass with `INGINE_ACT_FP16=ON` (0 of 2,245,115,536 BF16 weights exceed FP16 max `65504`, max weight magnitude `76.5`); live `ingine-serve` passes chat, `json_object`, strict `json_schema`, and native vision 40×40 PNG inference.
 - **RTX 3090 (`sm_86`, 12 GB class):** `atlas-10g` at 16K ctx with `--no-vision --dense-fp8 --kv-fp8 --spec --park-mb 0` uses **`12,984 MiB`** (`<12 GiB` without `--spec`).
 - **RTX 4090 (`sm_89`, 24 GB):** `atlas-12g` at 128K ctx with `--no-vision` uses **`17,776 MiB`**; live long-output serving with vision enabled at 64K ctx runs at **~257 tok/s**.
 - **RTX 5090 / RTX PRO 6000 (`sm_120a`, 32+ GB):** native `NVFP4+MXFP8` serves up to **262,144 tokens** of context in `24.4 GiB` (`490–560 tok/s` decode, `6,200–10,900 tok/s` prefill; see [Upstream RTX 5090 results](#upstream-rtx-5090-and-abliteration-results)).
 
 ## What this fork adds over upstream `satellitedown/ingine`
 
-1. **Multi-architecture CUDA kernels (`sm_86`, `sm_89`, `sm_120a`):**
-   - Native Ampere (`sm_86`) and Ada (`sm_89`) codepaths on CUDA 12.8+ and CUDA 13.x without degrading Blackwell (`sm_120a`).
-   - Software fallbacks for Hopper/Blackwell-only primitives (PDL, DSMEM/cluster reductions, hardware FP4/FP8 conversions) and branchless FP8/E2M1/ATLAS2/ATLAS3 unpackers for `sm_86`/`sm_89`.
+1. **10-year NVIDIA multi-architecture support (`sm_60`/`61`, `sm_70`, `sm_75`, `sm_80`/`86`, `sm_89`, `sm_90`, `sm_120a`):**
+   - Native **Ampere (`sm_80`/`86`)**, **Ada (`sm_89`)**, **Hopper (`sm_90`)**, and **Blackwell (`sm_120a`)** BF16 codepaths on CUDA 12.8+ / CUDA 13.x without degrading Blackwell.
+   - Compile-time **FP16 activation mode (`-DINGINE_ACT_FP16=ON`)** for **Volta (`sm_70`)**, **Turing (`sm_75`)**, and **Pascal (`sm_60`/`61`)** on CUDA 12.9 (`wmma::mma_sync` FP16 Tensor Core path for `sm_70`/`75`, FP32 SIMT MMA path for `sm_60`/`61`), with FP16 boundary rounding and 0-overflow weight conversion.
+   - Software fallbacks for Hopper/Blackwell-only primitives (PDL, DSMEM/cluster reductions, hardware FP4/FP8 conversions), branchless FP8/E2M1/ATLAS2/ATLAS3 unpackers, and a CTA-wide synchronization fix in `src/kernels/head/head.cu` (`finish_part`) preventing multi-block top-p publication races under independent thread scheduling.
 2. **Native Elastic sub-4-bit MoE weights (`ATLAS2` 2.50 b/w, `ATLAS3` 3.50 b/w):**
    - Mixed-precision MoE tier converter ([`tools/quantize_elastic_ingine.py`](tools/quantize_elastic_ingine.py)) that compresses the 20.2 GB base checkpoint to **`atlas-12g` (`14.05 GB` on disk incl. vision + `mtp.safetensors`)** or **`atlas-10g` (`12.01 GB` on disk incl. vision + `mtp.safetensors`)**.
    - Native fused decode (`native/src/kernels/moe/moe.cu`) and prefill (`native/src/kernels/prefill/wgemm.cu`) kernels verified against FP64 oracles (`kernels_moe`, `prefill_moe`).
-3. **Structured outputs and tool-ban:**
+3. **Structured outputs, tool-ban, and standalone Verified Ledger SDK:**
    - Native OpenAI `response_format` (`text`, `json_object`, `json_schema`) constrained decoding in `ingine-serve` (`serve_server` 22/22 PASS).
    - Automatic `<|content_invoke_tool_json|>` token banning when `tools` is absent from the request.
+   - Zero-dependency SQLite Verified Ledger SDK in [`ledger/`](ledger/README.md).
 
 ## Requirements
 
 - **OS:** Linux x86_64
-- **GPU:** NVIDIA GPU with compute capability **8.6 (Ampere, e.g. RTX 3090)**, **8.9 (Ada, e.g. RTX 4090)**, or **12.0 (Blackwell, e.g. RTX 5090 / RTX PRO 6000)**
-  - **24 GB VRAM (RTX 3090 / 4090):** runs the native 20.2 GB checkpoint at 64K context (`~21.8 GB` VRAM) or Elastic `atlas-12g` up to 128K context (`~17.8 GB` VRAM).
-  - **16 GB / 12 GB class VRAM:** runs Elastic `atlas-12g` (`~16.3 GB` @ 64K) or `atlas-10g` (`~13.0 GB` @ 16K with `--spec --no-vision`, `<12 GiB` without `--spec`).
-  - **32+ GB VRAM (RTX 5090 / RTX PRO 6000):** runs the native checkpoint up to 262,144-token context (`~24.4 GB` VRAM).
-- **Driver & Toolchain:** NVIDIA driver for CUDA 12.8+ / CUDA 13 (580+ for the CUDA 13.4 private toolkit installer), C++20 compiler (GCC 12–16), CMake >= 3.28, Ninja.
+- **GPU:** Any NVIDIA GPU from Pascal (`sm_60`/`61`, 2016) through Blackwell (`sm_120a`, 2025–26):
+  - **SM80+ (BF16, CUDA 12.8+ / 13.x):** Ampere (`sm_80`/`86`), Ada (`sm_89`), Hopper (`sm_90`), Blackwell (`sm_120a`).
+  - **SM60–SM75 (FP16, CUDA 12.9, `-DINGINE_ACT_FP16=ON`):** Pascal (`sm_60`/`61`), Volta (`sm_70`, e.g. Tesla V100 32 GB), Turing (`sm_75`).
+  - **VRAM guide:**
+    - **32+ GB (V100 32 GB / RTX 5090 / RTX PRO 6000):** native 20.2 GB checkpoint up to **262,144-token context** (`~24.4–25.0 GB` VRAM).
+    - **24 GB (RTX 3090 / 4090):** native checkpoint at 64K context (`~21.8 GB` VRAM) or Elastic `atlas-12g` up to 128K context (`~17.8 GB` VRAM).
+    - **16 GB / 12 GB class:** Elastic `atlas-12g` (`~16.3 GB` @ 64K) or `atlas-10g` (`~13.0 GB` @ 16K with `--spec --no-vision`, `<12 GiB` without `--spec`).
+- **Driver & Toolchain:** NVIDIA driver for CUDA 12.8+ / 13.x (CUDA 12.9 toolkit for `sm_60`/`61`/`70`/`75`; CUDA 13.4 private toolkit installer for `sm_86`/`89`/`120a`), C++20 compiler (GCC 12–16), CMake >= 3.28, Ninja.
 - **Runtime:** `ingine-serve` is a standalone C++/CUDA binary; it needs no Python or PyTorch to run.
 
 ## Build and run
 
-### Option A: Build directly with CMake (existing CUDA 12.8+ / 13.x toolkit)
+### Option A: Build directly with CMake
+
+**Ampere / Ada / Hopper / Blackwell (`sm_80`/`86`/`89`/`90`/`120a`, BF16, CUDA 12.8+ / 13.x):**
 
 ```bash
 git clone https://github.com/Atlas3DSS/atlas-ingine
 cd atlas-ingine
 
-# Build multi-arch (sm_86 + sm_89 + sm_120a) or pick your single GPU arch (e.g. "89" for RTX 4090, "86" for RTX 3090)
+# Build multi-arch (sm_86 + sm_89 + sm_120a) or pick your single GPU arch (e.g. "80", "86", "89", "90", "120a")
 cmake -S native -B native/build-multiarch -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="86;89;120a" \
@@ -67,6 +80,18 @@ cmake --build native/build-multiarch -j
 
 # Run unit tests (optional)
 ctest --test-dir native/build-multiarch --output-on-failure
+```
+
+**Volta / Turing / Pascal (`sm_70`, `sm_75`, `sm_60`/`61`, FP16 activations, CUDA 12.9):**
+
+```bash
+# Single-arch Tesla V100 (sm_70):
+cmake --preset sm70 -S native
+cmake --build --preset sm70 -j
+
+# Or multi-arch legacy FP16 (Pascal sm_60/61 + Volta sm_70 + Turing sm_75, with tests):
+cmake --preset legacy-fp16 -S native
+cmake --build --preset legacy-fp16 -j
 ```
 
 Start the server on a 24 GB card (RTX 3090 / RTX 4090, 64K context with vision + DSpark speculative decoding):
@@ -202,9 +227,9 @@ updating ledgers. See [`ledger/README.md`](ledger/README.md) and [`ledger/exampl
 
 ## Related: `Atlas3DSS/atlas-engine`
 
-`atlas-ingine` is our primary Inkling-2-Mini engine on Ampere/Ada/Blackwell (`sm_86`, `sm_89`, `sm_120a`). For GGUF
-serving or older SM75+ (Turing) GPUs, see our MIT `llama.cpp` fork:
-[Atlas3DSS/atlas-engine](https://github.com/Atlas3DSS/atlas-engine).
+`atlas-ingine` is our primary Inkling-2-Mini engine across Pascal (`sm_60`/`61`), Volta (`sm_70`), Turing (`sm_75`),
+Ampere (`sm_80`/`86`), Ada (`sm_89`), Hopper (`sm_90`), and Blackwell (`sm_120a`). For GGUF serving or `llama.cpp`-based
+workflows, see our MIT `llama.cpp` fork: [Atlas3DSS/atlas-engine](https://github.com/Atlas3DSS/atlas-engine).
 
 ## Upstream RTX 5090 and abliteration results
 
@@ -222,9 +247,11 @@ profile, native `NVFP4+MXFP8` weights, DSpark speculative decoding):
 
 ## License and credits
 
-This repository is licensed under **Apache-2.0**; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+This repository is licensed under **Apache-2.0**; see [LICENSE](LICENSE) and [NOTICE](NOTICE). This work stands on the
+shoulders of the open-source AI and systems community:
 
-- Upstream engine, installer, and abliteration tooling: [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0), with upstream kernel inspirations credited in [NOTICE](NOTICE) (`fngine`, `cinference`, `NInfer`).
-- Base model: [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by Thinking Machines Lab (Apache-2.0; model weights are not stored in this Git repository).
-- Multi-architecture (`sm_86`/`sm_89`/`sm_120a`) port, Elastic `ATLAS2`/`ATLAS3` sub-4-bit MoE kernels and converter, and native OpenAI `response_format` / tool-ban: Atlas 3DSS.
-- CUDA runtime/toolkit components remain subject to NVIDIA's license terms. Unofficial community project, not endorsed by Thinking Machines.
+- **Base model:** [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by **Thinking Machines Lab** (Apache-2.0; model weights are not stored in this Git repository).
+- **Upstream engine, installer, and abliteration tooling:** [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0), with upstream kernel inspirations credited in [NOTICE](NOTICE) (**fngine**, **cinference**, **NInfer**).
+- **Broader Inkling-2-Mini & quantization open-source ecosystem:** **ggml-org / llama.cpp**, **realugbun** (initial Inkling-2-Mini `llama.cpp` support), **turboderp / ExLlamaV3** (QTIP/trellis quantization), **professorpalmer / Kintsugi-Inkling-2-Mini** (community 12 GB GGUF/EXL3 serving work), **mw00 / Project Maya** (Peasant Smith & Project Maya contributors, Niko1221 & Strata contributors — MIT AMD ROCm/HIP & multi-GPU Inkling-2-Mini serving), and **NVIDIA** (CUDA toolkit and 10 years of forward-compatible GPU architecture from Pascal through Blackwell).
+- **10-year multi-architecture (`sm_60`/`61`/`70`/`75`/`80`/`86`/`89`/`90`/`120a`) port, Elastic `ATLAS2`/`ATLAS3` sub-4-bit MoE kernels and converter, native OpenAI `response_format` / tool-ban, and Verified Ledger SDK:** Atlas 3DSS.
+- CUDA runtime/toolkit components remain subject to NVIDIA's license terms. Unofficial open-source community project, not affiliated with or endorsed by Thinking Machines Lab or NVIDIA.
