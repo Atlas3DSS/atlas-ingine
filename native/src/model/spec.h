@@ -55,6 +55,7 @@ class SpecLoop {
  private:
   // The accept graph (width_select -> switch { accept + rollback + publish }) for this sampling setup.
   void prepare_accept(const Sampling& sampling);
+  void ensure_verify_hooked();
 
   Runtime& rt_;
   Drafter& drafter_;
@@ -62,7 +63,7 @@ class SpecLoop {
   DeviceBuffer width_;                 // int32: the verify width chosen on the device
   MappedHostBuffer record_;            // VerifyRecord of the last round
   MappedHostBuffer forced_window_;     // forced replay: int32 [8], the forced tokens after the round's anchor
-  GraphExec verify_, accept_;
+  GraphExec verify_, verify_hooked_, accept_;
   struct AcceptKey {
     bool greedy, forced;
     float temperature, top_p;

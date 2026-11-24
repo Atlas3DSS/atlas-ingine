@@ -3,6 +3,7 @@
 #include "engine/log.h"
 #include "image/image.h"
 #include "ingine/generator.h"
+#include "ingine/persona.h"
 #include "serve/chat_server.h"
 #include "serve/cli.h"
 #include "text/chat.h"
@@ -67,12 +68,13 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
+  std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1";
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1;
   int max_batch = 1, max_kv_tokens = 0;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
-       no_vision = false, atlas_6g = false;
+       no_vision = false, atlas_6g = false, persona_probe_mode = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -87,6 +89,14 @@ int main(int argc, char** argv) {
   ap.flag("--fake", "serve canned outputs (FakeGenerator)", &fake);
   ap.exclusive({"--engine", "--fake"}, true);
   ap.option("--ablation", "", "ablation file (safetensors) applied at every visit", &ablation);
+  ap.option("--persona-spec", "", "persona/mech-interp JSON spec (atlas-persona-spec/v1)", &persona_spec);
+  ap.flag("--persona-probe-mode", "allow probe/unvalidated persona profiles (research & diagnostics only)",
+          &persona_probe_mode);
+  ap.option("--refusal-map", "", "refusal-linked unit deny-list JSON (unconditionally blocks listed units)",
+            &refusal_map);
+  ap.option("--prompt-renderer", "",
+            "canonical prompt renderer contract checked against persona model_binding.prompt_renderer",
+            &prompt_renderer);
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
   ap.option("--prefill-chunk", "", "tokens per prefill chunk (default 3072; use 512 on 12 GB GPUs for 262K ctx)",
             &prefill_chunk);
@@ -163,6 +173,29 @@ int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
 
   try {
+    const ingine::persona::RefusalMap rmap = refusal_map.empty() ? ingine::persona::RefusalMap::default_map()
+                                                                 : ingine::persona::RefusalMap::load(refusal_map);
+    std::shared_ptr<const ingine::persona::PersonaCatalog> personas;
+    if (!persona_spec.empty()) {
+      ingine::persona::ModelRuntimeIdentity runtime_id;
+      runtime_id.prompt_renderer = prompt_renderer;
+      const std::filesystem::path tmpl_path = std::filesystem::path(model_dir) / "chat_template.jinja";
+      if (std::filesystem::is_regular_file(tmpl_path)) {
+        runtime_id.chat_template_sha256 = ingine::persona::sha256_file_hex(tmpl_path);
+      }
+      personas = std::make_shared<ingine::persona::PersonaCatalog>(
+          ingine::persona::PersonaCatalog::load(persona_spec, persona_probe_mode, rmap, runtime_id));
+      log.info("loaded persona spec {} ({} profile(s), default='{}', probe_mode={})",
+               personas->spec_sha256.substr(0, 12), personas->profiles.size(), personas->default_profile,
+               personas->probe_mode ? "on" : "off");
+      for (const auto& [pname, prof] : personas->profiles) {
+        if (!prof->downgrade_reason.empty()) {
+          log.warn("persona '{}': downgraded to {} ({})", pname, ingine::persona::to_string(prof->effective_status),
+                   prof->downgrade_reason);
+        }
+      }
+    }
+
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
     std::unique_ptr<ingine::model::Generator> generator;
     if (fake) {
@@ -207,6 +240,8 @@ int main(int argc, char** argv) {
       options.dump_router_stats = dump_router_stats;
       options.max_batch = max_batch;
       options.max_kv_tokens = max_kv_tokens;
+      options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
+      options.refusal_map = refusal_map;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
@@ -226,6 +261,7 @@ int main(int argc, char** argv) {
     server_options.images.limits.max_tokens = image_max_tokens;
     server_options.images.max_images = max_images;
     server_options.images.max_total_tokens = max_image_tokens;
+    server_options.personas = personas;
     log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
              server_options.sampling.top_p, server_options.sampling.top_k);
     ingine::serve::ChatServer server(*generator, fmt, server_options);

@@ -9,6 +9,7 @@
 
 #include "engine/scheduler.h"
 #include "ingine/generator.h"
+#include "ingine/persona.h"
 #include "serve/openai.h"
 #include "text/chat.h"
 
@@ -27,6 +28,7 @@ struct ServerOptions {
   std::string model_id;   // model name reported by the API; empty: generator.model_id()
   model::Sampling sampling;  // temperature / top_p / top_k of requests that omit them
   ImageOptions images;       // image input; in effect only when the generator supports images
+  std::shared_ptr<const persona::PersonaCatalog> personas;  // optional loaded persona spec catalog
 };
 
 class ChatServer {
@@ -56,12 +58,14 @@ class ChatServer {
   void handle_post(const httplib::Request& req, httplib::Response& res);
   void complete(const httplib::Request& req, httplib::Response& res, ChatRequest request);
   Json model_card() const;
+  Json personas_list() const;
 
   const text::ChatFormat& fmt_;
   const std::string model_id_;
   const int max_model_len_;
   const model::Sampling sampling_defaults_;
   const ImageOptions image_options_;
+  const std::shared_ptr<const persona::PersonaCatalog> personas_;
   const int64_t created_;
   engine::Scheduler scheduler_;
   httplib::Server server_;

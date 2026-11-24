@@ -110,7 +110,7 @@ const float* const* Prefiller::block_table(const std::vector<const float*>& bloc
 }
 
 void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
-                    std::span<const EmbedRows> rows) {
+                    std::span<const EmbedRows> rows, const kernels::persona::PersonaDeviceTable* hooks) {
   if (T < 1 || T > max_chunk_) throw std::invalid_argument("Prefiller::run: T outside 1..max_chunk");
   if (pos0 < 0 || pos0 + T > st.max_ctx)
     throw std::invalid_argument("context " + std::to_string(pos0 + T) + " exceeds max_ctx " +
@@ -126,7 +126,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
 
   auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
                  const float* abl_w, float* partial_out, const float* queries, int Q, const float* norm_w,
-                 ActT* out_bf16, float* out_f32) {
+                 ActT* out_bf16, float* out_f32, const kernels::persona::DepthHookSite* depth_hook = nullptr) {
     dense::MixParams p;
     p.blocks = blocks.empty() ? nullptr : block_table(blocks);
     p.nblocks = int(blocks.size());
@@ -142,7 +142,8 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     p.out_bf16 = out_bf16;
     p.out_f32 = out_f32;
     p.M = T;
-    dense::mix(p, false, s);
+    if (hooks && depth_hook) dense::mix_hooked(p, depth_hook, nullptr, pos0, false, s);
+    else dense::mix(p, false, s);
   };
   // B rows of a Dense matrix as BF16: the matrix itself, or its FP8 rows dequantized (weights.dequant)
   auto bf16_rows = [&](const Dense& d) -> const ActT* {
@@ -205,7 +206,8 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       const float* src_base = i == 0 ? part_ : E_[p - 1];
       const float* src_write = i == 0 ? y2_ : nullptr;
       mix({B2_[p - 1]}, src_base, src_write, r_prev, w_prev, i == 0 ? E_[p - 1] : nullptr,
-          f32p(w.message_queries) + std::size_t(i) * 4 * H, 4, nullptr, nullptr, msgs_);
+          f32p(w.message_queries) + std::size_t(i) * 4 * H, 4, nullptr, nullptr, msgs_,
+          hooks ? &hooks->depth_msg[v] : nullptr);
       if (i == 0) write = nullptr;
     }
     // ---- attention read(s)
@@ -213,14 +215,15 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const int nq = layer.attn_query.data ? layer.attn_query.ne[1] : 1;
     float* partial_out = hid != base ? hid : nullptr;
     if (msgs) {
-      mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_);
+      mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_,
+          hooks ? &hooks->depth_attn[v] : nullptr);
       pk::GateRows rows;
       for (int g = 0; g < 3; ++g) rows.h[g] = mixf_ + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_ + g * slab;
       gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16, f32p(layer.attn_norm3),
             xin_);
     } else {
       mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
-          f32p(layer.attn_norm_mix), xin_, nullptr);
+          f32p(layer.attn_norm_mix), xin_, nullptr, hooks ? &hooks->depth_attn[v] : nullptr);
     }
     if (tap < 3 && v == TAP_VISITS[tap]) {
       if (tap_out) pk::store_tap(hid, T, tap_out + std::size_t(tap) * H, std::int64_t(NUM_TAPS) * H, s);
@@ -313,6 +316,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_out_, H, false, T, H, HEADS * HEAD_DIM, s);
     pk::static_conv(wo_out_, H, T, H, f32p(layer.attn_conv), st.conv_attn_at(v), y_, s);
     pk::conv_state_update(st.conv_attn_at(v), wo_out_, H, T, H, s);
+    if (hooks) dense::residual_steer(y_, T, &hooks->steer_attn[v], s);
 
     // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)
     std::vector<const float*> mlp_blocks = blocks;
@@ -320,20 +324,22 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const float* mbase = boundary ? nullptr : hid;
     if (msgs) {
       mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1, nullptr,
-          nullptr, mixm_);
+          nullptr, mixm_, hooks ? &hooks->depth_ffn[v] : nullptr);
       pk::GateRows rows;
       rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
       gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1),
             xm_);
     } else {
       mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1,
-          f32p(layer.mlp_norm1), xm_, nullptr);
+          f32p(layer.mlp_norm1), xm_, nullptr, hooks ? &hooks->depth_ffn[v] : nullptr);
     }
+    if (hooks) dense::tap_ffn_inp(xm_, T, &hooks->ffn_inp_tap[v], nullptr, pos0, s);
 
     // ---- routed experts (model._moe_grouped) + post-MLP conv
     gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, T, EXPERTS, H, s);
     CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), s));
-    pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
+    if (hooks) pk::moe_topk_hooked(router_logits_, f32p(layer.router_bias), T, pos0, idx_, wts_, counts_, &hooks->router[v], s);
+    else pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
     const Experts& ex = layer.experts;
     const bool exl13 = is_exl3(ex.w13_fmt), exl2 = is_exl3(ex.w2_fmt);
     // EXL3 TM=32 (3 CTAs/SM, zero register spills) beats TM=128 by ~89% on 64K prefill.
@@ -363,21 +369,24 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       w.expert_cache->run_prefill_layer(l, counts_, s, [&](const std::uint8_t* mask) {
         me.active_mask = mask;
         pk::moe_gate_up(me, xm_, T, work, act_, s);
+        if (hooks) pk::apply_expert_hooks_prefill(act_, work, T, pos0, &hooks->expert[v], s, mask);
         pk::moe_down(me, act_, T, work, down_, s);
       });
     } else {
       pk::moe_gate_up(me, xm_, T, work, act_, s);
+      if (hooks) pk::apply_expert_hooks_prefill(act_, work, T, pos0, &hooks->expert[v], s);
       pk::moe_down(me, act_, T, work, down_, s);
     }
     pk::moe_combine(down_, wts_, T, moe_sum_, s);
     pk::static_conv(moe_sum_, H, T, H, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_, s);
     pk::conv_state_update(st.conv_mlp_at(v), moe_sum_, H, T, H, s);
+    if (hooks) dense::residual_steer(y2_, T, &hooks->steer_mlp[v], s);
     prev_v = v;
   }
 
   // ---- final read, taps, head of the last row
   mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr,
-      f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
+      f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr, hooks ? &hooks->depth_output : nullptr);
   if (tap_out)
     CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));

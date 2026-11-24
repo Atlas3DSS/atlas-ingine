@@ -3,6 +3,7 @@
 
 #include "core/act.h"
 #include "core/arena.h"
+#include "kernels/common/persona_abi.h"
 #include "model/model_data.h"
 
 #include <cuda_runtime.h>
@@ -45,7 +46,7 @@ class Prefiller {
 
   // Tokens with a negative id must be covered by `rows` (their embedding is the image placeholder's otherwise).
   void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
-           std::span<const EmbedRows> rows = {});
+           std::span<const EmbedRows> rows = {}, const kernels::persona::PersonaDeviceTable* hooks = nullptr);
 
   int max_chunk() const { return max_chunk_; }
   std::size_t device_bytes() const;  // scratch held by this object

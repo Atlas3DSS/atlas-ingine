@@ -71,7 +71,8 @@ const std::int64_t* Decoder::block_table(const std::vector<const float*>& blocks
   return static_cast<const std::int64_t*>(it->second.p);
 }
 
-void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream) {
+void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
+                     const kernels::persona::PersonaDeviceTable* hooks) {
   const int m = b.m;
   const int H = HIDDEN;
   const bool pdl = pdl_;
@@ -170,8 +171,13 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       ap.new_bf16_stride = std::int64_t(NUM_TAPS) * H;
       ++tap;
     }
-    if (msgs) dense::mix_pair(ap, msg_mix, pdl, stream);
-    else dense::mix(ap, pdl, stream);
+    if (hooks) {
+      if (msgs) dense::mix_pair_hooked(ap, &hooks->depth_attn[v], msg_mix, &hooks->depth_msg[v], pos, 0, false, stream);
+      else dense::mix_hooked(ap, &hooks->depth_attn[v], pos, 0, false, stream);
+    } else {
+      if (msgs) dense::mix_pair(ap, msg_mix, pdl, stream);
+      else dense::mix(ap, pdl, stream);
+    }
     if (msgs)  // sliding layers mix one query: all three gates read b.mixf[0]
       dense::message_gates(f32p(b.mixf), !layer.full, f32p(b.msgs), 3, m,
                            static_cast<const ActT*>(layer.qkv_gate_down.data), layer.qkv_gate_forget16.data,
@@ -239,6 +245,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     }
     dense::proj_conv(bf16m(b.attn_out), m, matrix(layer.wo), f32p(layer.attn_conv), st.conv_attn_at(v), f32m(b.y),
                      history ? f32m(b.hist_attn) + std::size_t(v) * m * H : nullptr, pdl, stream);
+    if (hooks) dense::residual_steer(f32m(b.y), m, &hooks->steer_attn[v], stream);
     // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)
     std::vector<const float*> mlp_blocks = blocks;
     if (boundary) mlp_blocks.push_back(hid);
@@ -254,14 +261,21 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
         mp.copies[c++] = dense::MixRowCopy{f32p(proj_out) + SEG_BEGIN[s], R, f32m(*dst) + std::size_t(v) * m * KV_DIM,
                                            KV_DIM, KV_DIM};
     }
-    dense::mix(mp, pdl, stream);
+    if (hooks) dense::mix_hooked(mp, &hooks->depth_ffn[v], pos, 0, false, stream);
+    else dense::mix(mp, pdl, stream);
     if (msgs)
       dense::message_gates(f32p(b.mixm), false, f32p(b.msgs) + 3 * slab, 1, m,
                            static_cast<const ActT*>(layer.mlp1_gate_down.data), layer.mlp1_gate_forget16.data,
                            layer.mlp1_gate_gain16.data, false, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr, pdl,
                            stream);
-    dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
-                  static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
+    if (hooks) {
+      dense::tap_ffn_inp(bf16m(b.xm), m, &hooks->ffn_inp_tap[v], pos, 0, stream);
+      dense::router_hooked(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
+                           static_cast<int*>(b.idx.data), f32m(b.wts), &hooks->router[v], pos, false, stream);
+    } else {
+      dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
+                    static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
+    }
     const Experts& ex = layer.experts;
     const moe::Format fmt13 = static_cast<moe::Format>(static_cast<int>(ex.w13_fmt));
     const moe::Format fmt2 = static_cast<moe::Format>(static_cast<int>(ex.w2_fmt));
@@ -277,12 +291,23 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data,
                 exl13 ? ex.w13_rin.data : ex.w13_scale.data, exl13 ? nullptr : f32p(ex.w13_factor), fmt13, bf16m(b.act),
                 moe_pdl, stream, ex.w13_rout.data, eptrs_p);
-    // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
-    moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data,
-                  exl2 ? ex.w2_rin.data : ex.w2_scale.data, exl2 ? nullptr : f32p(ex.w2_factor), fmt2,
-                  f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
-                  history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, moe_pdl, stream, ex.w2_rout.data,
-                  static_cast<ActT*>(moe_down_ws_.p), eptrs_p);
+    if (hooks) {
+      moe::apply_expert_hooks_decode(bf16m(b.act), static_cast<const int*>(b.idx.data), m, &hooks->expert[v], pos,
+                                     stream);
+      moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data,
+                    exl2 ? ex.w2_rin.data : ex.w2_scale.data, exl2 ? nullptr : f32p(ex.w2_factor), fmt2,
+                    f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
+                    history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, false, stream, ex.w2_rout.data,
+                    static_cast<ActT*>(moe_down_ws_.p), eptrs_p);
+      dense::residual_steer(f32m(b.y2), m, &hooks->steer_mlp[v], stream);
+    } else {
+      // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
+      moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data,
+                    exl2 ? ex.w2_rin.data : ex.w2_scale.data, exl2 ? nullptr : f32p(ex.w2_factor), fmt2,
+                    f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
+                    history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, moe_pdl, stream, ex.w2_rout.data,
+                    static_cast<ActT*>(moe_down_ws_.p), eptrs_p);
+    }
     prev_v = v;
   }
   // ---- final read; the same launch writes b.taps[:, 3] = b.xf
@@ -292,7 +317,8 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
                                    f32p(final_norm1), bf16m(b.xf), nullptr);
   fp.out_copy = taps + std::size_t(tap) * H;
   fp.out_copy_stride = std::int64_t(NUM_TAPS) * H;
-  dense::mix(fp, pdl, stream);
+  if (hooks) dense::mix_hooked(fp, &hooks->depth_output, pos, 0, false, stream);
+  else dense::mix(fp, pdl, stream);
   dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
 }
 

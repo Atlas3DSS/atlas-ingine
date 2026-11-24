@@ -345,6 +345,282 @@ int router_cluster_size() {
   return cl;
 }
 
+// Shared hooked selection phase for both SM90+ cluster router_hooked_kernel and SM70/8x router_sm8x_select_hooked_kernel.
+// Preserves exact bit-identity (0 ULP) for every no-op form: flags==0, ablate-never, force already-selected (gain=1) or
+// force bias=0, self-replay recompute, self-replay copy, and slot-permute identity {0..7}.
+template <int NT>
+__device__ __forceinline__ void router_select_hooked_device(
+    const float* logits_tok, float b_lane, int m, int* __restrict__ idx, float* __restrict__ wts,
+    const persona::RouterHookVisit* __restrict__ hook, const std::int64_t* __restrict__ pos_dev,
+    unsigned long long (&keys)[EXPERTS], int (&cnt)[NT], float (&sel_s)[TOPK], int (&sel_e)[TOPK],
+    float (&all_s)[EXPERTS], float (&all_sel)[EXPERTS]) {
+  const int t = threadIdx.x;
+  const std::uint32_t flags = hook ? hook->flags : 0u;
+  const int tok_pos = pos_dev ? int(pos_dev[0]) + m : m;
+
+  if (t < EXPERTS) {
+    const float lg = logits_tok[t];
+    const float s = 1.f / (1.f + expf(-lg));
+    const float v = s + b_lane + 0.f;  // + 0: -0 -> +0, which compares equal
+    all_s[t] = s;
+    all_sel[t] = v;
+    const bool ablated =
+        ((flags & persona::kRouterAblate) != 0u) && (((hook->ablate_mask[t >> 6] >> (t & 63)) & 1ull) != 0ull);
+    if (ablated) {
+      keys[t] = 0ull;
+    } else {
+      const uint32_t u = __float_as_uint(v);
+      const uint32_t o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+      keys[t] = (static_cast<unsigned long long>(o) << 7) | static_cast<unsigned>(EXPERTS - 1 - t);
+    }
+    if ((flags & persona::kRouterTap) != 0u && hook->tap_logits && tok_pos >= 0 && tok_pos < hook->tap_max_pos) {
+      hook->tap_logits[std::size_t(tok_pos) * EXPERTS + t] = lg;
+    }
+  }
+  __syncthreads();
+
+  const bool do_replay = ((flags & persona::kRouterReplayIds) != 0u) && hook->replay_ids &&
+                         tok_pos >= hook->replay_pos_start && tok_pos < hook->replay_pos_start + hook->replay_n_pos;
+  const bool replay_copy = do_replay && ((flags & persona::kRouterReplayWts) != 0u) && hook->replay_wts != nullptr;
+
+  if (do_replay) {
+    if (t < TOPK) {
+      const std::size_t r_off = std::size_t(tok_pos - hook->replay_pos_start) * TOPK + t;
+      const int e = hook->replay_ids[r_off];
+      sel_e[t] = e;
+      sel_s[t] = replay_copy ? hook->replay_wts[r_off] : all_s[e];
+    }
+    __syncthreads();
+  } else {
+    {
+      constexpr int PARTS = NT / EXPERTS, W = EXPERTS / PARTS;
+      const int e = t % EXPERTS, part = t / EXPERTS;
+      const unsigned long long mine = keys[e];
+      int c[4] = {0, 0, 0, 0};
+#pragma unroll
+      for (int j = 0; j < W; j += 4)
+#pragma unroll
+        for (int k = 0; k < 4; ++k) c[k] += keys[part * W + j + k] > mine;
+      cnt[t] = c[0] + c[1] + c[2] + c[3];
+    }
+    __syncthreads();
+    if (t < EXPERTS) {
+      int r = 0;
+#pragma unroll
+      for (int p = 0; p < NT / EXPERTS; ++p) r += cnt[p * EXPERTS + t];
+      if (r < TOPK) {
+        sel_e[r] = t;
+        sel_s[r] = all_s[t];
+      }
+    }
+    __syncthreads();
+    if ((flags & persona::kRouterForce) != 0u) {
+      if (t == 0) {
+        const int fe = hook->force_expert;
+        if (fe >= 0 && fe < EXPERTS) {
+          int force_slot = -1;
+          for (int k = 0; k < TOPK; ++k) {
+            if (sel_e[k] == fe) {
+              force_slot = k;
+              break;
+            }
+          }
+          if (force_slot >= 0) {
+            if (hook->force_gain != 1.0f) {
+              sel_s[force_slot] *= hook->force_gain;
+            }
+          } else {
+            const int last_e = sel_e[TOPK - 1];
+            const float last_sel = all_sel[last_e];
+            const float boosted = all_sel[fe] + hook->force_bias;
+            if (boosted > last_sel || (boosted == last_sel && fe < last_e)) {
+              sel_e[TOPK - 1] = fe;
+              sel_s[TOPK - 1] = (hook->force_gain == 1.0f) ? all_s[fe] : (all_s[fe] * hook->force_gain);
+            }
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  if (t < TOPK) {
+    const int my_e = sel_e[t];
+    float my_w;
+    if (replay_copy) {
+      my_w = sel_s[t];
+    } else {
+      const float my_s = sel_s[t];
+      float sum = my_s;
+#pragma unroll
+      for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffu, sum, o);
+      my_w = my_s / (sum + 1e-20f) * 8.f;
+    }
+    const int dst_k = ((flags & persona::kRouterSlotPermute) != 0u) ? int(hook->slot_perm[t]) : t;
+    idx[m * TOPK + dst_k] = my_e;
+    wts[m * TOPK + dst_k] = my_w;
+    if ((flags & persona::kRouterTap) != 0u && tok_pos >= 0 && tok_pos < hook->tap_max_pos) {
+      if (hook->tap_idx) hook->tap_idx[std::size_t(tok_pos) * TOPK + dst_k] = my_e;
+      if (hook->tap_wts) hook->tap_wts[std::size_t(tok_pos) * TOPK + dst_k] = my_w;
+    }
+  }
+}
+
+template <int CL, bool WF32, int M>
+__global__ void __launch_bounds__(32 * EXPERTS / CL) router_hooked_kernel(
+    const ActT* __restrict__ x, const void* __restrict__ w, const float* __restrict__ bias, int* __restrict__ idx,
+    float* __restrict__ wts, const persona::RouterHookVisit* __restrict__ hook, const std::int64_t* __restrict__ pos_dev,
+    uint32_t zero) {
+  constexpr int RPC = EXPERTS / CL, NT = 32 * RPC;
+  constexpr int EPC = WF32 ? 4 : 8;
+  constexpr int CH = H / (EPC * 32);
+  __shared__ __align__(16) ActT xs[M][H];
+  __shared__ __align__(16) float logits[EXPERTS];
+  __shared__ __align__(8) uint64_t mbar;
+  __shared__ __align__(16) float part[M][RPC];
+  __shared__ unsigned long long keys[EXPERTS];
+  __shared__ int cnt[NT];
+  __shared__ float sel_s[TOPK];
+  __shared__ int sel_e[TOPK];
+  __shared__ float all_s[EXPERTS];
+  __shared__ float all_sel[EXPERTS];
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  cg::cluster_group cluster = cg::this_cluster();
+  const int rank = cluster.block_rank();
+#else
+  const int rank = blockIdx.x;
+#endif
+  const uint32_t logits_u = smem_u32(logits), mb = smem_u32(&mbar);
+  if (threadIdx.x == 0) {
+    mb_init(mb);
+    fence_mbarrier_init();
+    if (rank < M) mb_expect(mb, 4u * EXPERTS);
+  }
+  cluster_arrive_relaxed();
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  const int row = rank * RPC + warp;
+
+  const uint8_t* wr = reinterpret_cast<const uint8_t*>(w) + size_t(row) * H * (WF32 ? 4 : 2);
+  uint4 wv[CH];
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+#pragma unroll
+  for (int i = 0; i < CH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (size_t(i) * 32 + lane) * 16, wpol);
+  const float b = t < EXPERTS ? __ldg(bias + t) : 0.f;
+
+  pdl_wait_fenced(zero);
+  pdl_trigger();
+  for (int k = t; k < M * H / 8; k += NT) cp_async16(&xs[0][0] + k * 8, x + size_t(k) * 8);
+  copy::commit();
+  copy::wait_all();
+  __syncthreads();
+
+  float acc[M];
+#pragma unroll
+  for (int m = 0; m < M; ++m) acc[m] = 0.f;
+#pragma unroll
+  for (int i = 0; i < CH; ++i) {
+    const int col = (i * 32 + lane) * EPC;
+    float wf[EPC], xf[EPC];
+    if constexpr (WF32) {
+      wf[0] = __uint_as_float(wv[i].x); wf[1] = __uint_as_float(wv[i].y);
+      wf[2] = __uint_as_float(wv[i].z); wf[3] = __uint_as_float(wv[i].w);
+    } else {
+      unpack_bf16x8(wv[i], wf);
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      if constexpr (WF32) {
+        const uint2 u = *reinterpret_cast<const uint2*>(&xs[m][col]);
+        xf[0] = bf_lo(u.x); xf[1] = bf_hi(u.x); xf[2] = bf_lo(u.y); xf[3] = bf_hi(u.y);
+      } else {
+        unpack_bf16x8(*reinterpret_cast<const uint4*>(&xs[m][col]), xf);
+      }
+      float a = acc[m];
+#pragma unroll
+      for (int j = 0; j < EPC; ++j) a = fmaf(wf[j], xf[j], a);
+      acc[m] = a;
+    }
+  }
+  const float logit = reduce_scatter<32, M>(acc);
+
+  if (lane < M) part[lane][warp] = logit;
+  __syncthreads();
+  cluster_wait();
+  if (t < M * (RPC / 4)) {
+    const int tok = t % M, grp = t / M;
+    st_async4(remote(logits_u + 4u * (rank * RPC + grp * 4), tok),
+              *reinterpret_cast<const float4*>(&part[tok][grp * 4]), remote(mb, tok));
+  }
+  if (rank >= M) return;
+  mb_wait(mb);
+
+  router_select_hooked_device<NT>(logits, b, rank, idx, wts, hook, pos_dev, keys, cnt, sel_s, sel_e, all_s, all_sel);
+}
+
+template <int NT>
+__global__ void __launch_bounds__(NT) router_sm8x_select_hooked_kernel(
+    const float* __restrict__ logits_in, const float* __restrict__ bias, int* __restrict__ idx, float* __restrict__ wts,
+    const persona::RouterHookVisit* __restrict__ hook, const std::int64_t* __restrict__ pos_dev) {
+  __shared__ unsigned long long keys[EXPERTS];
+  __shared__ int cnt[NT];
+  __shared__ float sel_s[TOPK];
+  __shared__ int sel_e[TOPK];
+  __shared__ float all_s[EXPERTS];
+  __shared__ float all_sel[EXPERTS];
+  const int m = blockIdx.x, t = threadIdx.x;
+  const float b = t < EXPERTS ? __ldg(bias + t) : 0.f;
+  router_select_hooked_device<NT>(logits_in + m * EXPERTS, b, m, idx, wts, hook, pos_dev, keys, cnt, sel_s, sel_e,
+                                  all_s, all_sel);
+}
+
+template <int CL, bool WF32>
+void launch_router_hooked(int M, const ActT* x, const void* w, const float* bias, int* idx, float* wts,
+                          const persona::RouterHookVisit* hook, const std::int64_t* pos_dev, bool pdl,
+                          cudaStream_t stream) {
+  auto go = [&](auto mc) {
+    constexpr int MM = decltype(mc)::value;
+    launch_ex(router_hooked_kernel<CL, WF32, MM>, dim3(CL), 32 * EXPERTS / CL, 0, CL, pdl, stream, x, w, bias, idx, wts,
+              hook, pos_dev, 0u);
+  };
+  switch (M) {
+    case 1: go(std::integral_constant<int, 1>{}); break;
+    case 2: go(std::integral_constant<int, 2>{}); break;
+    case 3: go(std::integral_constant<int, 3>{}); break;
+    case 4: go(std::integral_constant<int, 4>{}); break;
+    case 5: go(std::integral_constant<int, 5>{}); break;
+    case 6: go(std::integral_constant<int, 6>{}); break;
+    case 7: go(std::integral_constant<int, 7>{}); break;
+    case 8: go(std::integral_constant<int, 8>{}); break;
+    default: require(false, "router_hooked: M must be in 1..8");
+  }
+}
+
+template <bool WF32>
+void launch_router_sm8x_hooked(int M, const ActT* x, const void* w, const float* bias, int* idx, float* wts,
+                               const persona::RouterHookVisit* hook, const std::int64_t* pos_dev, cudaStream_t stream) {
+  float* scratch = nullptr;
+  CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&scratch), g_router_sm8x_scratch));
+  auto go = [&](auto mc) {
+    constexpr int MM = decltype(mc)::value;
+    router_sm8x_dot_kernel<16, WF32, MM><<<16, 32 * EXPERTS / 16, 0, stream>>>(x, w, scratch);
+    CUDA_CHECK(cudaGetLastError());
+    router_sm8x_select_hooked_kernel<256><<<MM, 256, 0, stream>>>(scratch, bias, idx, wts, hook, pos_dev);
+    CUDA_CHECK(cudaGetLastError());
+  };
+  switch (M) {
+    case 1: go(std::integral_constant<int, 1>{}); break;
+    case 2: go(std::integral_constant<int, 2>{}); break;
+    case 3: go(std::integral_constant<int, 3>{}); break;
+    case 4: go(std::integral_constant<int, 4>{}); break;
+    case 5: go(std::integral_constant<int, 5>{}); break;
+    case 6: go(std::integral_constant<int, 6>{}); break;
+    case 7: go(std::integral_constant<int, 7>{}); break;
+    case 8: go(std::integral_constant<int, 8>{}); break;
+    default: require(false, "router_hooked: M must be in 1..8");
+  }
+}
+
 }  // namespace
 
 void router(const ActT* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
@@ -362,6 +638,24 @@ void router(const ActT* x, int M, const void* w, bool w_fp32, const float* bias,
   } else {
     if (c16) launch_router<16, false>(M, x, w, bias, idx, wts, pdl, stream);
     else launch_router<8, false>(M, x, w, bias, idx, wts, pdl, stream);
+  }
+}
+
+void router_hooked(const ActT* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
+                   const persona::RouterHookVisit* hook, const std::int64_t* pos_dev, bool pdl, cudaStream_t stream) {
+  require(x && w && bias && idx && wts, "router_hooked: null argument");
+  if (current_sm_major() < 9) {
+    if (w_fp32) launch_router_sm8x_hooked<true>(M, x, w, bias, idx, wts, hook, pos_dev, stream);
+    else launch_router_sm8x_hooked<false>(M, x, w, bias, idx, wts, hook, pos_dev, stream);
+    return;
+  }
+  const bool c16 = router_cluster_size() == 16;
+  if (w_fp32) {
+    if (c16) launch_router_hooked<16, true>(M, x, w, bias, idx, wts, hook, pos_dev, pdl, stream);
+    else launch_router_hooked<8, true>(M, x, w, bias, idx, wts, hook, pos_dev, pdl, stream);
+  } else {
+    if (c16) launch_router_hooked<16, false>(M, x, w, bias, idx, wts, hook, pos_dev, pdl, stream);
+    else launch_router_hooked<8, false>(M, x, w, bias, idx, wts, hook, pos_dev, pdl, stream);
   }
 }
 

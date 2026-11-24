@@ -6,6 +6,7 @@
 #pragma once
 
 #include "core/act.h"
+#include "kernels/common/persona_abi.h"
 
 #include <cuda_runtime.h>
 
@@ -55,5 +56,11 @@ void moe_down(const ActT* act, int M, const int* idx, const float* wts, const vo
 void dequant_experts(const void* codes, const void* scales, const float* factor, const std::int32_t* experts, int n,
                      int rows, int cols, Format fmt, ActT* out, cudaStream_t stream,
                      const void* rout = nullptr);
+
+// apply_expert_hooks_decode: runs 3b per-neuron affine hooks followed by 3a read-only expert activation taps
+// on decode `act` [M, 8, I] between moe_up and moe_down. Fixed-grid, CUDA-graph capturable, zero-write no-op
+// when gain == 1.0f && offset == 0.0f.
+void apply_expert_hooks_decode(ActT* act, const int* idx, int M, const persona::ExpertTapVisit* hook,
+                               const std::int64_t* pos_dev, cudaStream_t stream);
 
 }  // namespace ingine::kernels::moe

@@ -607,4 +607,349 @@ void embed_q4(const std::int64_t* token, int M, const void* table_q4, const floa
   else launch_ex(embed_q4_kernel<64>, dim3(M), 64, 0, 1, pdl, stream, token, tbl, norm_w, out);
 }
 
+namespace {
+
+// Fused depth-replace / depth-tap variant of mix_token. Keeps unmodified mix_token 100% untouched for
+// unhooked bitlock & fast path, while guaranteeing exact 0.0 bit-identity for self-value, self-read, and
+// self-both depth replacement across all visits (prelude, loop pass 0, loop re-entry, coda, output_res).
+template <int NS, int Q, bool COPIES>
+__device__ __forceinline__ void mix_token_hooked(const MixArgs& a, const persona::DepthHookSite* depth_hook,
+                                                 const std::int64_t* pos_dev, int pos0, int m, float* red1, float* red2,
+                                                 float* red3) {
+  constexpr bool SKIP = NS == 1 && Q == 1;
+  constexpr int NV = NS + Q * NS;
+  const int t = threadIdx.x;
+  const size_t row = size_t(m) * H;
+  auto ld4 = [](const float* p) { return *reinterpret_cast<const float4*>(p); };
+  auto ch = [t](int u) { return 4 * (t + u * MIX_T); };
+
+  float4 s[NS][MIX_V], q[Q][MIX_V], r4[MIX_V], dt4[MIX_V], g4[Q][MIX_V];
+  const float* bp[NS > 1 ? NS - 1 : 1];
+#pragma unroll
+  for (int i = 0; i < NS - 1; ++i) bp[i] = a.blocks[i];
+  float aw = 0.f, ac = 0.f, alo = 0.f, atau = 0.f;
+#pragma unroll
+  for (int u = 0; u < MIX_V; ++u) {
+    if constexpr (!SKIP) {
+#pragma unroll
+      for (int j = 0; j < Q; ++j) q[j][u] = ld4(a.queries + size_t(j) * H + ch(u));
+    }
+    r4[u] = a.abl_r ? ld4(a.abl_r + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    dt4[u] = a.abl_d ? ld4(a.abl_d + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (a.out_bf16) {
+#pragma unroll
+      for (int j = 0; j < Q; ++j) g4[j][u] = ld4(a.norm_w + size_t(j) * H + ch(u));
+    }
+  }
+  if (a.abl_r) {
+    const float4 ap = __ldg(reinterpret_cast<const float4*>(a.abl_w));
+    aw = ap.x, ac = ap.y, alo = ap.z, atau = ap.w;
+  }
+
+  pdl_wait_fenced(a.zero);
+  pdl_trigger();
+  constexpr int CPT = 2;
+  uint4 cv[2][CPT];
+  if constexpr (COPIES) {
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      const MixRowCopy& cp = a.copies[c];
+      if (!cp.dst) continue;
+      const float* src = cp.src + m * cp.src_stride;
+#pragma unroll
+      for (int j = 0; j < CPT; ++j)
+        if (t + j * MIX_T < cp.cols / 4) cv[c][j] = ld_act(src + 4 * (t + j * MIX_T));
+    }
+  }
+  float4 nw[MIX_V], y[MIX_V];
+#pragma unroll
+  for (int u = 0; u < MIX_V; ++u) {
+#pragma unroll
+    for (int i = 0; i < NS - 1; ++i) s[i][u] = ld4(bp[i] + row + ch(u));
+    nw[u] = a.base ? ld4(a.base + row + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (a.write) y[u] = ld4(a.write + row + ch(u));
+  }
+  if constexpr (COPIES) {
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      const MixRowCopy& cp = a.copies[c];
+      if (!cp.dst) continue;
+      const float4* src = reinterpret_cast<const float4*>(cp.src + m * cp.src_stride);
+      float4* dst = reinterpret_cast<float4*>(cp.dst + m * cp.dst_stride);
+#pragma unroll
+      for (int j = 0; j < CPT; ++j)
+        if (t + j * MIX_T < cp.cols / 4) *reinterpret_cast<uint4*>(dst + t + j * MIX_T) = cv[c][j];
+      for (int k = t + CPT * MIX_T; k < cp.cols / 4; k += MIX_T) dst[k] = src[k];
+    }
+  }
+
+  if (a.write) {
+    if (a.abl_r) {
+      float c;
+      if (a.abl_d) {
+#pragma unroll
+        for (int u = 0; u < MIX_V; ++u) {
+          float d[2] = {dot4(y[u], r4[u]), dot4(y[u], dt4[u])};
+          sum_part(d, red1, u);
+        }
+        float d[2];
+        sum_total(d, red1);
+        c = d[1] > atau ? aw * fmaxf(d[0] - ac, alo) : 0.f;
+      } else {
+#pragma unroll
+        for (int u = 0; u < MIX_V; ++u) {
+          float d[1] = {dot4(y[u], r4[u])};
+          sum_part(d, red1, u);
+        }
+        float d[1];
+        sum_total(d, red1);
+        c = aw * fmaxf(d[0] - ac, alo);
+      }
+#pragma unroll
+      for (int u = 0; u < MIX_V; ++u) {
+        const float4 r = r4[u];
+        y[u] = make_float4(y[u].x - c * r.x, y[u].y - c * r.y, y[u].z - c * r.z, y[u].w - c * r.w);
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < MIX_V; ++u) {
+      if (a.base) nw[u] = make_float4(nw[u].x + y[u].x, nw[u].y + y[u].y, nw[u].z + y[u].z, nw[u].w + y[u].w);
+      else nw[u] = y[u];
+    }
+  }
+#pragma unroll
+  for (int u = 0; u < MIX_V; ++u) {
+    if (a.partial) *reinterpret_cast<float4*>(a.partial + row + ch(u)) = nw[u];
+    if (a.new_bf16) store_bf16x4(a.new_bf16 + m * a.new_bf16_stride + ch(u), nw[u]);
+  }
+
+  if constexpr (SKIP) {
+#pragma unroll
+    for (int u = 0; u < MIX_V; ++u) {
+      float ss[1] = {sumsq4(nw[u])};
+      sum_part(ss, red3, u);
+    }
+    float ss[1];
+    sum_total(ss, red3);
+    const float rinv = rsqrtf(ss[0] / H + EPS);
+#pragma unroll
+    for (int u = 0; u < MIX_V; ++u) {
+      if (a.out_f32) *reinterpret_cast<float4*>(a.out_f32 + row + ch(u)) = nw[u];
+      if (a.out_bf16) {
+        const float4 g = g4[0][u];
+        const float4 n = scale4(nw[u], rinv);
+        const float4 o = make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w);
+        store_bf16x4(a.out_bf16 + row + ch(u), o);
+        if (a.out_copy) store_bf16x4(a.out_copy + m * a.out_copy_stride + ch(u), o);
+      }
+    }
+    return;
+  } else {
+#pragma unroll
+    for (int u = 0; u < MIX_V; ++u) {
+      s[NS - 1][u] = nw[u];
+      float p[NV];
+#pragma unroll
+      for (int i = 0; i < NS; ++i) {
+        p[i] = dot4(s[i][u], s[i][u]);
+#pragma unroll
+        for (int j = 0; j < Q; ++j) p[NS + j * NS + i] = dot4(q[j][u], s[i][u]);
+      }
+      sum_part(p, red2, u);
+    }
+    float v[NV];
+    sum_total(v, red2);
+
+    float rinv[NS];
+#pragma unroll
+    for (int i = 0; i < NS; ++i) {
+      rinv[i] = rsqrtf(v[i] / H + EPS);
+#pragma unroll
+      for (int u = 0; u < MIX_V; ++u) s[i][u] = scale4(s[i][u], rinv[i]);  // n_i
+    }
+
+    const int tok_pos = pos_dev ? int(pos_dev[0]) + m : pos0 + m;
+    const std::uint32_t dh_mode = depth_hook ? depth_hook->mode : 0u;
+    const std::uint32_t dh_tap = depth_hook ? depth_hook->tap_enabled : 0u;
+    if (dh_tap && depth_hook->tap_states && tok_pos >= 0 && tok_pos < depth_hook->tap_max_pos) {
+#pragma unroll
+      for (int i = 0; i < NS; ++i) {
+#pragma unroll
+        for (int u = 0; u < MIX_V; ++u) {
+          *reinterpret_cast<float4*>(depth_hook->tap_states + (size_t(tok_pos) * NS + i) * H + ch(u)) = s[i][u];
+        }
+      }
+    }
+    const bool do_ov_states = ((dh_mode & 2u) != 0u) && depth_hook->ov_states && depth_hook->n_src == NS &&
+                              tok_pos >= depth_hook->pos_start && tok_pos < depth_hook->pos_start + depth_hook->n_pos;
+    if (do_ov_states) {
+      const size_t r_idx = size_t(tok_pos - depth_hook->pos_start);
+      const std::uint32_t smask = depth_hook->src_mask;
+#pragma unroll
+      for (int i = 0; i < NS; ++i) {
+        if (smask == 0u || ((smask >> i) & 1u)) {
+#pragma unroll
+          for (int u = 0; u < MIX_V; ++u) {
+            s[i][u] = ld4(depth_hook->ov_states + (r_idx * NS + i) * H + ch(u));
+          }
+        }
+      }
+    }
+    const bool do_ov_scores = ((dh_mode & 1u) != 0u) && depth_hook->ov_scores && depth_hook->n_src == NS &&
+                              depth_hook->n_q == Q && tok_pos >= depth_hook->pos_start &&
+                              tok_pos < depth_hook->pos_start + depth_hook->n_pos;
+
+    const float inv_sqrt_h = 1.f / 48.f;
+    float4 mix[Q][MIX_V];
+#pragma unroll
+    for (int j = 0; j < Q; ++j) {
+      float lg[NS], mx = -INFINITY;
+#pragma unroll
+      for (int i = 0; i < NS; ++i) {
+        lg[i] = v[NS + j * NS + i] * rinv[i] * inv_sqrt_h;
+        mx = fmaxf(mx, lg[i]);
+      }
+      float den = 0.f;
+#pragma unroll
+      for (int i = 0; i < NS; ++i) {
+        lg[i] = expf(lg[i] - mx);
+        den += lg[i];
+      }
+      float prob[NS];
+#pragma unroll
+      for (int i = 0; i < NS; ++i) {
+        float pv = lg[i] / den;
+        if (dh_tap && depth_hook->tap_scores && tok_pos >= 0 && tok_pos < depth_hook->tap_max_pos && t == 0) {
+          depth_hook->tap_scores[(size_t(tok_pos) * Q + j) * NS + i] = pv;
+        }
+        if (do_ov_scores) {
+          pv = depth_hook->ov_scores[(size_t(tok_pos - depth_hook->pos_start) * Q + j) * NS + i];
+        }
+        prob[i] = pv;
+      }
+#pragma unroll
+      for (int u = 0; u < MIX_V; ++u) {
+        float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int i = 0; i < NS; ++i) {
+          const float p = prob[i];
+          o = make_float4(o.x + p * s[i][u].x, o.y + p * s[i][u].y, o.z + p * s[i][u].z, o.w + p * s[i][u].w);
+        }
+        mix[j][u] = o;
+      }
+    }
+    if (a.out_f32) {
+#pragma unroll
+      for (int j = 0; j < Q; ++j)
+#pragma unroll
+        for (int u = 0; u < MIX_V; ++u)
+          *reinterpret_cast<float4*>(a.out_f32 + size_t(j) * a.M * H + row + ch(u)) = mix[j][u];
+    }
+    if (!a.out_bf16) return;
+#pragma unroll
+    for (int u = 0; u < MIX_V; ++u) {
+      float p[Q];
+#pragma unroll
+      for (int j = 0; j < Q; ++j) p[j] = sumsq4(mix[j][u]);
+      sum_part(p, red3, u);
+    }
+    float ms[Q];
+    sum_total(ms, red3);
+#pragma unroll
+    for (int j = 0; j < Q; ++j) {
+      const float r = rsqrtf(ms[j] / H + EPS);
+#pragma unroll
+      for (int u = 0; u < MIX_V; ++u) {
+        const float4 g = g4[j][u];
+        const float4 n = scale4(mix[j][u], r);
+        const float4 o = make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w);
+        store_bf16x4(a.out_bf16 + size_t(j) * a.M * H + row + ch(u), o);
+        if (j == 0 && a.out_copy) store_bf16x4(a.out_copy + m * a.out_copy_stride + ch(u), o);
+      }
+    }
+  }
+}
+
+template <int NS, int Q, bool COPIES>
+__global__ void __launch_bounds__(MIX_T) mix_hooked_kernel(MixArgs a, const persona::DepthHookSite* depth_hook,
+                                                           const std::int64_t* pos_dev, int pos0) {
+  __shared__ float red1[REF_W * block_sum_slots<2>()], red2[REF_W * block_sum_slots<NS + Q * NS>()],
+      red3[REF_W * block_sum_slots<Q>()];
+  mix_token_hooked<NS, Q, COPIES>(a, depth_hook, pos_dev, pos0, blockIdx.x, red1, red2, red3);
+}
+
+template <int NS, int Q>
+__global__ void __launch_bounds__(MIX_T) mix_pair_hooked_kernel(MixArgs a, const persona::DepthHookSite* depth_a,
+                                                                MixArgs b, const persona::DepthHookSite* depth_b,
+                                                                const std::int64_t* pos_dev, int pos0) {
+  __shared__ float red1[REF_W * block_sum_slots<2>()], red2[REF_W * 32], red3[REF_W * MAXQ];
+  if (static_cast<int>(blockIdx.x) < a.M)
+    mix_token_hooked<NS, Q, false>(a, depth_a, pos_dev, pos0, blockIdx.x, red1, red2, red3);
+  else
+    mix_token_hooked<2, 4, false>(b, depth_b, pos_dev, pos0, blockIdx.x - a.M, red1, red2, red3);
+}
+
+template <int NS, int Q>
+void launch_mix_hooked(int M, const MixArgs& a, const persona::DepthHookSite* dh, const std::int64_t* pos_dev, int pos0,
+                       bool pdl, cudaStream_t stream) {
+  if (a.copies[0].dst || a.copies[1].dst)
+    launch_ex(mix_hooked_kernel<NS, Q, true>, dim3(M), MIX_T, 0, 1, pdl, stream, a, dh, pos_dev, pos0);
+  else
+    launch_ex(mix_hooked_kernel<NS, Q, false>, dim3(M), MIX_T, 0, 1, pdl, stream, a, dh, pos_dev, pos0);
+}
+
+template <int NS>
+void launch_mix_hooked_q(int Q, int M, const MixArgs& a, const persona::DepthHookSite* dh, const std::int64_t* pos_dev,
+                         int pos0, bool pdl, cudaStream_t stream) {
+  switch (Q) {
+    case 1: launch_mix_hooked<NS, 1>(M, a, dh, pos_dev, pos0, pdl, stream); break;
+    case 2: launch_mix_hooked<NS, 2>(M, a, dh, pos_dev, pos0, pdl, stream); break;
+    case 3: launch_mix_hooked<NS, 3>(M, a, dh, pos_dev, pos0, pdl, stream); break;
+    case 4: launch_mix_hooked<NS, 4>(M, a, dh, pos_dev, pos0, pdl, stream); break;
+  }
+}
+
+template <int NS>
+void launch_pair_hooked_q(int Q, int M, const MixArgs& a, const persona::DepthHookSite* da, const MixArgs& b,
+                          const persona::DepthHookSite* db, const std::int64_t* pos_dev, int pos0, bool pdl,
+                          cudaStream_t stream) {
+  switch (Q) {
+    case 1: launch_ex(mix_pair_hooked_kernel<NS, 1>, dim3(2 * M), MIX_T, 0, 1, pdl, stream, a, da, b, db, pos_dev, pos0); break;
+    case 3: launch_ex(mix_pair_hooked_kernel<NS, 3>, dim3(2 * M), MIX_T, 0, 1, pdl, stream, a, da, b, db, pos_dev, pos0); break;
+    default: require(false, "mix_pair_hooked: the first mix takes 1 or 3 queries");
+  }
+}
+
+}  // namespace
+
+void mix_hooked(const MixParams& p, const persona::DepthHookSite* depth_hook, const std::int64_t* pos_dev, int pos0,
+                bool pdl, cudaStream_t stream) {
+  const MixArgs a = mix_args(p);
+  switch (p.nblocks + 1) {
+    case 1: launch_mix_hooked_q<1>(p.Q, p.M, a, depth_hook, pos_dev, pos0, pdl, stream); break;
+    case 2: launch_mix_hooked_q<2>(p.Q, p.M, a, depth_hook, pos_dev, pos0, pdl, stream); break;
+    case 3: launch_mix_hooked_q<3>(p.Q, p.M, a, depth_hook, pos_dev, pos0, pdl, stream); break;
+    case 4: launch_mix_hooked_q<4>(p.Q, p.M, a, depth_hook, pos_dev, pos0, pdl, stream); break;
+    case 5: launch_mix_hooked_q<5>(p.Q, p.M, a, depth_hook, pos_dev, pos0, pdl, stream); break;
+    case 6: launch_mix_hooked_q<6>(p.Q, p.M, a, depth_hook, pos_dev, pos0, pdl, stream); break;
+  }
+}
+
+void mix_pair_hooked(const MixParams& p, const persona::DepthHookSite* depth_p, const MixParams& msg,
+                     const persona::DepthHookSite* depth_msg, const std::int64_t* pos_dev, int pos0, bool pdl,
+                     cudaStream_t stream) {
+  const MixArgs a = mix_args(p), b = mix_args(msg);
+  require(msg.nblocks == 1 && msg.Q == 4, "mix_pair_hooked: the message mix takes one block and four queries");
+  require(p.M == msg.M, "mix_pair_hooked: both mixes take the same tokens");
+  require(!a.copies[0].dst && !a.copies[1].dst && !b.copies[0].dst && !b.copies[1].dst,
+          "mix_pair_hooked: row copies go with mix");
+  switch (p.nblocks + 1) {
+    case 2: launch_pair_hooked_q<2>(p.Q, p.M, a, depth_p, b, depth_msg, pos_dev, pos0, pdl, stream); break;
+    case 3: launch_pair_hooked_q<3>(p.Q, p.M, a, depth_p, b, depth_msg, pos_dev, pos0, pdl, stream); break;
+    case 4: launch_pair_hooked_q<4>(p.Q, p.M, a, depth_p, b, depth_msg, pos_dev, pos0, pdl, stream); break;
+    case 5: launch_pair_hooked_q<5>(p.Q, p.M, a, depth_p, b, depth_msg, pos_dev, pos0, pdl, stream); break;
+    default: require(false, "mix_pair_hooked: the first mix takes 1..4 blocks");
+  }
+}
+
 }  // namespace ingine::kernels::dense

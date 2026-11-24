@@ -8,6 +8,7 @@
 #pragma once
 
 #include "core/act.h"
+#include "kernels/common/persona_abi.h"
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -50,6 +51,11 @@ void dequant_rows(const void* q, const float* scale, int rows, int K, ActT* out,
 void router(const ActT* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
             bool pdl, cudaStream_t stream);
 
+// router_hooked: fused mech-interp / persona router path (ablate, slot-preserving force, route-replay,
+// slot-permute, read-only routing tap) reading hook descriptors from fixed device pointer `hook`.
+void router_hooked(const ActT* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
+                   const persona::RouterHookVisit* hook, const std::int64_t* pos_dev, bool pdl, cudaStream_t stream);
+
 // mix: ablated residual update + attention residual over block states + RMS norm (KERNELS.md).
 // Side copies: FP32 rows copied by the same launch (dst + m * dst_stride <- src + m * src_stride, `cols`
 // floats; 16-byte aligned), so the decode step needs no separate memcpy node.
@@ -87,6 +93,22 @@ void mix(const MixParams& p, bool pdl, cudaStream_t stream);
 // mix_pair: `p` (1..4 blocks, Q = 1 or 3) and the independent message mix `msg` (one block, Q = 4) of a
 // message visit in one launch; same results as two mix calls. Neither may read what the other writes.
 void mix_pair(const MixParams& p, const MixParams& msg, bool pdl, cudaStream_t stream);
+
+// Fused depth-replace / depth-tap variants of mix and mix_pair (read hook descriptors from fixed device memory;
+// pos_dev != nullptr reads *pos_dev + m for CUDA-graph decode, else uses pos0 + m for prefill).
+void mix_hooked(const MixParams& p, const persona::DepthHookSite* depth_hook, const std::int64_t* pos_dev, int pos0,
+                bool pdl, cudaStream_t stream);
+void mix_pair_hooked(const MixParams& p, const persona::DepthHookSite* depth_p, const MixParams& msg,
+                     const persona::DepthHookSite* depth_msg, const std::int64_t* pos_dev, int pos0, bool pdl,
+                     cudaStream_t stream);
+
+// Probe-only residual steering on FP32 write buffers [M, H]; skips cleanly when site->scale == 0.f or vec == null,
+// and unconditionally leaves coordinate d_2027 untouched.
+void residual_steer(float* y, int M, const persona::ResidualSteerSite* site, cudaStream_t stream);
+
+// Read-only tap of the primary MoE operand xm (ActT [M, H]) into FP32 [max_pos, H] at tok_pos.
+void tap_ffn_inp(const ActT* xm, int M, const persona::FfnInpTapVisit* tap, const std::int64_t* pos_dev, int pos0,
+                 cudaStream_t stream);
 
 // message_gates (loop passes 1-2): h, msg fp32 [G, M, H] (G <= 3; h_shared: every gate reads h[0], i.e. h is
 // [M, H]); w_down bf16 [G, 64, 2H]; w_forget/w_gain [G, H, 64] fp32 (fg_fp32) or bf16; norm_w fp32 [G, H];

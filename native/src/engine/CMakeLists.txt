@@ -9,4 +9,4 @@ ingine_internal_includes(ingine_engine)
 target_include_directories(ingine_engine PUBLIC
   ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
 target_link_libraries(ingine_engine
-  PUBLIC ingine_text nlohmann_json::nlohmann_json spdlog::spdlog Threads::Threads)
+  PUBLIC ingine_text ingine_persona nlohmann_json::nlohmann_json spdlog::spdlog Threads::Threads)
