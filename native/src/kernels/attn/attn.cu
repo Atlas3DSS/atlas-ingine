@@ -211,7 +211,9 @@ struct Params {
     ActT* saved_nkv;
     float* saved_nst;
     ActT* out;
-    int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
+    int zero;       // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
+    int pos_off;    // token offset added to *pos for sequential M=1 fallback on <=64 KiB SMEM GPUs
+    int cap_guard;  // when > 0, check (*pos + cap_guard > cap) so partial M=1 fallback preserves full M early-out
 };
 
 __device__ __forceinline__ float bf16r(float x) { return act::round_act(x); }
@@ -401,8 +403,10 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         for (int i = tid; i < DREL * 2; i += NT)  // rel_proj[:, 0..7]: the new keys' distances
             cp16(sm + L::RELP0 + 4 * i, p.rel_proj + (i / 2) * EXT + 4 * (i % 2));
     }
-    const int p0 = int(ld_s64(p.pos));
-    if (FULL && p0 + M > p.cap) return;  // out of cache capacity (uniform: no block reaches a barrier)
+    const int p0_base = int(ld_s64(p.pos));
+    const int p0 = p0_base + p.pos_off;
+    const int cap_end = p.cap_guard > 0 ? p0_base + p.cap_guard : p0 + M;
+    if (FULL && cap_end > p.cap) return;  // out of cache capacity (uniform: no block reaches a barrier)
     const int L_old = FULL ? p0 : WIN;
     const int P = p0 + tok;
 
@@ -1207,8 +1211,10 @@ __global__ void __launch_bounds__(NT) attn_decode_stage2_kernel(const Params p) 
     const int g = blockIdx.y, rank = blockIdx.x, tid = threadIdx.x;
     const bool owner = rank == 0;
     const int R = p.R;
-    const int p0 = int(ld_s64(p.pos));
-    if (FULL && p0 + M > p.cap) return;
+    const int p0_base = int(ld_s64(p.pos));
+    const int p0 = p0_base + p.pos_off;
+    const int cap_end = p.cap_guard > 0 ? p0_base + p.cap_guard : p0 + M;
+    if (FULL && cap_end > p.cap) return;
 
     if (tid < ROWS * OD) {
         const int row = tid / OD, dim = rank * OD + tid % OD;
@@ -1289,11 +1295,27 @@ Kernel kernel_of() {
         } else {
             const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true>;
             const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8>;
-            CUDA_CHECK(cudaFuncSetAttribute(f1, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
+            if constexpr (Smem<M, F8>::BYTES > 49152) {
+                CUDA_CHECK(cudaFuncSetAttribute(f1, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
+            }
             return Kernel{f1, f2, M, Smem<M, F8>::BYTES};
         }
     }();
     return k;
+}
+
+template <bool F8>
+constexpr size_t smem_bytes(int M) {
+    switch (M) {
+        case 1: return Smem<1, F8>::BYTES;
+        case 2: return Smem<2, F8>::BYTES;
+        case 3: return Smem<3, F8>::BYTES;
+        case 4: return Smem<4, F8>::BYTES;
+        case 5: return Smem<5, F8>::BYTES;
+        case 6: return Smem<6, F8>::BYTES;
+        case 7: return Smem<7, F8>::BYTES;
+        default: return Smem<8, F8>::BYTES;
+    }
 }
 
 template <bool FULL, bool F8 = false>
@@ -1386,6 +1408,28 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.saved_nkv = reinterpret_cast<ActT*>(static_cast<char*>(a.workspace) + ws_nkv_off(M));
     p.saved_nst = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + ws_nst_off(M));
     p.out = a.out;
+    // Turing (64 KiB opt-in SMEM) fits M=1,2 natively; Pascal (48 KiB) fits M=1 natively.
+    // For larger M on those devices, run M sequential M=1 decode steps (16,912 B SMEM, CUDA-graph capturable).
+    const size_t need_smem = (full && a.cache_fp8) ? smem_bytes<true>(M) : smem_bytes<false>(M);
+    if (M > 1 && current_max_smem_optin() < int(need_smem)) {
+        const Kernel k1 = full ? (a.cache_fp8 ? select<true, true>(1) : select<true>(1)) : select<false>(1);
+        cudaLaunchAttribute attrs[2];
+        const cudaLaunchConfig_t cfg1 = launch_config(k1, stream, attrs);
+        cudaLaunchConfig_t cfg2{};
+        cfg2.gridDim = dim3(CS, HKV);
+        cfg2.blockDim = dim3(NT);
+        cfg2.stream = stream;
+        for (int m = 0; m < M; ++m) {
+            Params pm = p;
+            pm.proj = a.proj + size_t(m) * p.R;
+            pm.out = a.out + size_t(m) * HQ * D;
+            pm.pos_off = m;
+            pm.cap_guard = M;
+            CUDA_CHECK(cudaLaunchKernelEx(&cfg1, k1.fn, pm));
+            if (k1.fn_stage2) CUDA_CHECK(cudaLaunchKernelEx(&cfg2, k1.fn_stage2, pm));
+        }
+        return;
+    }
     const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);

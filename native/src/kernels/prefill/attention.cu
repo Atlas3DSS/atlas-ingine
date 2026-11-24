@@ -17,10 +17,12 @@
 // position j: the full-attention cache prefix) or explicit (kpos, the sliding ring + chunk rows) with per-tile
 // position bounds deciding which tiles are skipped, need no mask, or need the bias. CTAs run heaviest row tiles
 // (latest tokens) first.
+#include "core/device.h"
 #include "kernels/prefill/common.cuh"
 #include "kernels/prefill/prefill.h"
 
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 
 namespace ingine::kernels::prefill {
@@ -38,14 +40,18 @@ constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kLn2 = 0.6931471805599453f;
 constexpr float kPScale = 32768.f, kPUnscale = 1.f / 32768.f;
 
+template <int STAGES>
 struct Smem {
-  uint16_t k[2][BK * D];  // BF16 keys, swizzled [64][16 chunks]
-  uint16_t v[2][BK * D];  // FP16 values
-  int kpos[2][BK];
+  uint16_t k[STAGES][BK * D];  // BF16 keys, swizzled [64][16 chunks]
+  uint16_t v[STAGES][BK * D];  // FP16 values
+  int kpos[STAGES][BK];
   int4 bounds[kAttnMaxTiles];
   int list[kAttnMaxTiles];
   int nlist;
 };
+static_assert(sizeof(Smem<1>) <= 49152, "single-stage prefill attention must fit 48 KiB SMEM");
+static_assert(offsetof(Smem<1>, v) == sizeof(Smem<1>::k), "Q staging spans k and v contiguously");
+static_assert(sizeof(Smem<1>::k) + sizeof(Smem<1>::v) >= BR * D * sizeof(uint16_t), "Q staging must fit k+v");
 
 template <bool FP8>
 struct KvRegs {
@@ -110,8 +116,8 @@ __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint16_t u) {
 #endif
 }
 
-template <bool FP8, bool EXPLICIT>
-__device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& r) {
+template <bool FP8, bool EXPLICIT, int STAGES>
+__device__ __forceinline__ void store_tile(Smem<STAGES>& s, int buf, const KvRegs<FP8>& r) {
   const int tid = threadIdx.x;
   if constexpr (FP8) {
 #pragma unroll
@@ -151,10 +157,10 @@ __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& 
   }
 }
 
-template <bool FP8, bool EXPLICIT>
+template <bool FP8, bool EXPLICIT, int STAGES>
 __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
-  Smem& s = *reinterpret_cast<Smem*>(smem_raw);
+  Smem<STAGES>& s = *reinterpret_cast<Smem<STAGES>*>(smem_raw);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = blockIdx.y;
   const int rows = GQA * p.T;
@@ -233,7 +239,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 
 #pragma unroll 1
   for (int i = 0; i < ntiles; ++i) {
-    const int kt = tile_at(i), buf = i & 1;
+    const int kt = tile_at(i), buf = STAGES == 2 ? (i & 1) : 0;
     if (i + 1 < ntiles) load_tile<FP8, EXPLICIT>(p, g, tile_at(i + 1) * BK, regs);
 
     // tile class (uniform over the CTA)
@@ -273,7 +279,9 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     }
     // stage the next tile now (its buffer was last read before the previous barrier): the conversion and the
     // shared stores overlap the Q.K^T MMAs in flight instead of trailing the P.V MMAs
-    if (i + 1 < ntiles) store_tile<FP8, EXPLICIT>(s, buf ^ 1, regs);
+    if constexpr (STAGES == 2) {
+      if (i + 1 < ntiles) store_tile<FP8, EXPLICIT>(s, buf ^ 1, regs);
+    }
 
     // ---- scores (log2 units), bias, mask
     float rmax[2] = {m[0], m[1]};
@@ -345,6 +353,12 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     }
 
     __syncthreads();
+    if constexpr (STAGES == 1) {
+      if (i + 1 < ntiles) {
+        store_tile<FP8, EXPLICIT>(s, 0, regs);
+        __syncthreads();
+      }
+    }
   }
 
   // ---- epilogue
@@ -376,11 +390,16 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 
 template <bool FP8, bool EXPLICIT>
 void launch(const AttnParams& p, cudaStream_t stream) {
-  static const cudaError_t attr =
-      cudaFuncSetAttribute(attn_kernel<FP8, EXPLICIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem)));
-  if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
   const dim3 grid((GQA * p.T + BR - 1) / BR, kKvHeads);
-  attn_kernel<FP8, EXPLICIT><<<grid, NT, sizeof(Smem), stream>>>(p);
+  if (current_max_smem_optin() >= int(sizeof(Smem<2>))) {
+    static const cudaError_t attr = cudaFuncSetAttribute(
+        attn_kernel<FP8, EXPLICIT, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem<2>)));
+    if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
+    attn_kernel<FP8, EXPLICIT, 2><<<grid, NT, sizeof(Smem<2>), stream>>>(p);
+  } else {
+    // Turing (64 KiB opt-in) and Pascal (48 KiB) use single-stage K/V SMEM (34,308 B <= 48 KiB).
+    attn_kernel<FP8, EXPLICIT, 1><<<grid, NT, sizeof(Smem<1>), stream>>>(p);
+  }
 }
 
 // ---- sliding-visit key rows

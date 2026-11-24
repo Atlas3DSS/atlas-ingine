@@ -1,5 +1,6 @@
 // Prefill MoE routing (model._moe / _moe_grouped for T tokens): router selection, expert-sorted pair lists and
 // tiles, and the deterministic combine. The grouped expert GEMMs are in wgemm.cu.
+#include "core/device.h"
 #include "kernels/prefill/common.cuh"
 #include "kernels/prefill/prefill.h"
 
@@ -110,6 +111,8 @@ __global__ void __launch_bounds__(kHidden / 4) combine_kernel(const uint2* __res
 }  // namespace
 
 int moe_tile_rows(int T) {
+  // Turing (64 KiB opt-in) and Pascal (48 KiB) use the <=48 KiB TM=32 wgemm path for all T.
+  if (current_max_smem_optin() < 90000) return 32;
   static const int forced = [] {
     const char* e = std::getenv("INGINE_MOE_TILE_ROWS");
     const int v = e ? std::atoi(e) : 0;

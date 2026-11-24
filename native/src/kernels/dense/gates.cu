@@ -404,7 +404,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
   }
 }
 
-template <int CL, bool FG32, int M>
+template <int CL, bool FG32, int M, bool STAGE_FG = true>
 __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(GateArgs a,
                                                                                const float* __restrict__ gall_in,
                                                                                float* __restrict__ gated_out,
@@ -420,10 +420,10 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(Ga
   const float* hg = a.h + (a.h_shared ? size_t(0) : size_t(g) * M * H);
   const float* mg = a.msg + size_t(g) * M * H;
 
-  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
-  {
-    const uint8_t* fsrc = reinterpret_cast<const uint8_t*>(a.w_forget) + (size_t(g) * H + rank * C::CPC) * C::ROW;
-    const uint8_t* gsrc = reinterpret_cast<const uint8_t*>(a.w_gain) + (size_t(g) * H + rank * C::CPC) * C::ROW;
+  const uint8_t* fsrc = reinterpret_cast<const uint8_t*>(a.w_forget) + (size_t(g) * H + rank * C::CPC) * C::ROW;
+  const uint8_t* gsrc = reinterpret_cast<const uint8_t*>(a.w_gain) + (size_t(g) * H + rank * C::CPC) * C::ROW;
+  if constexpr (STAGE_FG) {
+    const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
     constexpr int RCH = C::ROW / 16;
     for (int k = t; k < C::CPC * RCH; k += C::NT) {
       const int dst = (k / RCH) * C::RS + (k % RCH) * 16;
@@ -445,7 +445,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(Ga
       mv[m] = mg[size_t(m) * H + c];
     }
   }
-  copy::wait_all();
+  if constexpr (STAGE_FG) copy::wait_all();
   __syncthreads();
 
   float sq[M];
@@ -453,15 +453,17 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(Ga
   for (int m = 0; m < M; ++m) sq[m] = 0.f;
   if (own) {
     constexpr int EPC = 16 / C::FGB;
-    const uint8_t* fr = fg + t * C::RS;
-    const uint8_t* gr = fg + C::SLICE + t * C::RS;
+    const uint8_t* fr = STAGE_FG ? (fg + t * C::RS) : (fsrc + size_t(t) * C::ROW);
+    const uint8_t* gr = STAGE_FG ? (fg + C::SLICE + t * C::RS) : (gsrc + size_t(t) * C::ROW);
     float df[M], dg[M];
 #pragma unroll
     for (int m = 0; m < M; ++m) df[m] = dg[m] = 0.f;
 #pragma unroll 4
     for (int k = 0; k < RANK / EPC; ++k) {
-      const uint4 uf = *reinterpret_cast<const uint4*>(fr + k * 16);
-      const uint4 ug = *reinterpret_cast<const uint4*>(gr + k * 16);
+      const uint4 uf = STAGE_FG ? *reinterpret_cast<const uint4*>(fr + k * 16)
+                                : __ldg(reinterpret_cast<const uint4*>(fr + k * 16));
+      const uint4 ug = STAGE_FG ? *reinterpret_cast<const uint4*>(gr + k * 16)
+                                : __ldg(reinterpret_cast<const uint4*>(gr + k * 16));
       float wf[EPC], wg[EPC];
       if constexpr (FG32) {
         wf[0] = __uint_as_float(uf.x); wf[1] = __uint_as_float(uf.y); wf[2] = __uint_as_float(uf.z); wf[3] = __uint_as_float(uf.w);
@@ -519,13 +521,22 @@ template <int CL, bool FG32>
 void launch_gates_sm8x(int G, int M, const GateArgs& a, cudaStream_t stream) {
   using C = GateCfg<CL, FG32>;
   const GatesSm8xScratch sc = gates_sm8x_scratch();
+  // FG32 dynamic SMEM (78,336 B + ~3 KiB static) exceeds Turing (64 KiB) and Pascal (48 KiB);
+  // fall back to direct __ldg weight streaming (0 B dynamic SMEM) on those devices.
+  const bool stage_fg = !FG32 || current_max_smem_optin() >= C::SMEM + 4096;
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
     gates_sm8x_down_kernel<CL, FG32, MM><<<G * CL, C::NT, 0, stream>>>(a, sc.gall);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaFuncSetAttribute(gates_sm8x_fg_kernel<CL, FG32, MM>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
-    gates_sm8x_fg_kernel<CL, FG32, MM><<<G * CL, C::NT, C::SMEM, stream>>>(a, sc.gall, sc.gated, sc.ssall);
+    if (stage_fg) {
+      if constexpr (C::SMEM > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(gates_sm8x_fg_kernel<CL, FG32, MM, true>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
+      }
+      gates_sm8x_fg_kernel<CL, FG32, MM, true><<<G * CL, C::NT, C::SMEM, stream>>>(a, sc.gall, sc.gated, sc.ssall);
+    } else {
+      gates_sm8x_fg_kernel<CL, FG32, MM, false><<<G * CL, C::NT, 0, stream>>>(a, sc.gall, sc.gated, sc.ssall);
+    }
     CUDA_CHECK(cudaGetLastError());
     gates_sm8x_norm_kernel<CL, MM><<<G * CL, 256, 0, stream>>>(sc.gated, sc.ssall, a.norm_w, a.out_bf16);
     CUDA_CHECK(cudaGetLastError());

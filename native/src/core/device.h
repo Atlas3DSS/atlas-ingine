@@ -7,9 +7,11 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace ingine {
 
@@ -31,6 +33,30 @@ inline int current_sm_major() {
         }
     }
     return cached[dev];
+}
+
+// Cached maximum opt-in dynamic shared memory per block in bytes (safe inside CUDA graph capture).
+// Pascal sm_60/61: 49,152 B; Turing sm_75: 65,536 B; Volta sm_70: 98,304 B; Ampere+: >= 101,376 B.
+// Honors INGINE_TEST_MAX_SMEM (cap in bytes) for exercising lower-SMEM paths on larger-SMEM GPUs.
+inline int current_max_smem_optin() {
+    static std::array<int, 16> cached{};
+    static const int cap = [] {
+        const char* e = std::getenv("INGINE_TEST_MAX_SMEM");
+        const int v = e ? std::atoi(e) : 0;
+        return v > 0 ? v : 0;
+    }();
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return cap > 0 ? std::min(49152, cap) : 49152;
+    if (cached[dev] == 0) {
+        int bytes = 0;
+        if (cudaDeviceGetAttribute(&bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess || bytes <= 0) {
+            if (cudaDeviceGetAttribute(&bytes, cudaDevAttrMaxSharedMemoryPerBlock, dev) != cudaSuccess || bytes <= 0) {
+                bytes = 49152;
+            }
+        }
+        cached[dev] = bytes;
+    }
+    return cap > 0 ? std::min(cached[dev], cap) : cached[dev];
 }
 
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device

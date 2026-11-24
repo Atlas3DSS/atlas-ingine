@@ -15,6 +15,7 @@
 // Epilogues: gate/up (w13 rows interleaved, 2i gate and 2i + 1 up, so each thread holds gate and up of the same
 // i): act = bf16(softcap(bf16 g, 4) * sigmoid(bf16 g) * softcap(bf16 u, 25)); down: bf16 per pair placed at
 // t * 8 + slot (moe_combine sums the slots in order: deterministic).
+#include "core/device.h"
 #include "kernels/prefill/common.cuh"
 #include "kernels/prefill/prefill.h"
 
@@ -36,7 +37,7 @@ __constant__ float kE2M1[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -
 __constant__ float kAtlas2[4] = {-1.5f, -0.453125f, 0.453125f, 1.5f};
 __constant__ float kAtlas3[8] = {-2.0f, -1.25f, -0.703125f, -0.2265625f, 0.2265625f, 0.703125f, 1.25f, 2.0f};
 
-template <int FMT, int K, int TM>
+template <int FMT, int K, int TM, bool LOW_SMEM = false>
 struct Cfg {
   static constexpr int CODE_ROW = FMT == FMT_NVFP4 ? K / 2 : (FMT == FMT_MXFP8 ? K : (FMT == FMT_ATLAS2 ? K / 4 : (K * 3) / 8));
   static constexpr int SCALE_ROW = FMT == FMT_MXFP8 ? K / 32 : K / 16;
@@ -44,20 +45,23 @@ struct Cfg {
   static constexpr int WK = FMT == FMT_MXFP8 ? 64 : 128;
   static constexpr int R = WK / BK;  // activation steps per weight chunk
   static constexpr int KC = K / WK;  // weight chunks
+  static constexpr int AS_STG = LOW_SMEM ? 2 : AS;
   // weight slots: the chunk of step s + 1 must have landed (and be published by the barrier) at step s, when its
-  // B fragments are decoded under step s's MMAs: R (WS - 1) >= AS. Small-row tiles prefetch further.
-  static constexpr int WS = TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6)
-                                     : (INGINE_ACT_FP16 ? 3 : (FMT == FMT_MXFP8 ? 4 : 3));
-  static_assert(R * (WS - 1) >= AS);
+  // B fragments are decoded under step s's MMAs: R (WS - 1) >= AS_STG. Small-row tiles prefetch further when
+  // SMEM allows (>=96 KiB); LOW_SMEM fits Pascal 48 KiB (<=48,192 B) and Turing 64 KiB.
+  static constexpr int WS = LOW_SMEM ? (FMT == FMT_MXFP8 ? 3 : 2)
+                                     : (TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6)
+                                                 : (INGINE_ACT_FP16 ? 3 : (FMT == FMT_MXFP8 ? 4 : 3)));
+  static_assert(R * (WS - 1) >= AS_STG);
   static constexpr int WCODE = FMT == FMT_NVFP4 ? WK / 2 : (FMT == FMT_MXFP8 ? WK : (FMT == FMT_ATLAS2 ? WK / 4 : (WK * 3) / 8));
   static constexpr int WSTRIDE = WCODE + 16;                    // padded: fragment loads on distinct banks
   static constexpr int W_BYTES = TN * WSTRIDE;
   static constexpr int A_BYTES = TM * BK * 2;
   static constexpr int SC_BYTES = TN * SCALE_ROW;               // block scales of the whole tile
-  static constexpr int OFF_W = AS * A_BYTES, OFF_SC = OFF_W + WS * W_BYTES;
+  static constexpr int OFF_W = AS_STG * A_BYTES, OFF_SC = OFF_W + WS * W_BYTES;
   static constexpr int OFF_LUT = (OFF_SC + SC_BYTES + 15) / 16 * 16;
   static constexpr int SMEM = OFF_LUT + 64;
-  static_assert(K % WK == 0 && SMEM <= (INGINE_ACT_FP16 ? 98304 : 101376));
+  static_assert(K % WK == 0 && SMEM <= (LOW_SMEM ? 49152 : (INGINE_ACT_FP16 ? 98304 : 101376)));
 };
 
 struct GemmArgs {
@@ -102,11 +106,11 @@ __device__ __forceinline__ void mma_step(float (&acc)[TM / 16][2][4], const uint
 
 // Up: A = x rows of the pairs' tokens (K = H), W = w13 (N = 2I), out act [pairs, I].
 // Down: A = act rows (K = I), W = w2 (N = H), out down [T * 8, H] at pair_dst.
-template <int FMT, Mode MODE, int K, int TM>
+template <int FMT, Mode MODE, int K, int TM, bool LOW_SMEM = false>
 __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   constexpr int KS = K / BK;
   constexpr int NE = MODE == Mode::Up ? 2 * kInter : kHidden;  // expert weight rows
-  using C = Cfg<FMT, K, TM>;
+  using C = Cfg<FMT, K, TM, LOW_SMEM>;
   extern __shared__ __align__(128) unsigned char smem[];
   unsigned char* a_smem = smem;
   unsigned char* w_smem = smem + C::OFF_W;
@@ -142,7 +146,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   }
 
   auto load_a = [&](int ks) {
-    uint16_t* A = reinterpret_cast<uint16_t*>(a_smem + (ks % AS) * C::A_BYTES);
+    uint16_t* A = reinterpret_cast<uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
 #pragma unroll
     for (int i = 0; i < TM / 32; ++i) {
       const int r = (tid >> 3) + 32 * i, c = tid & 7;
@@ -172,7 +176,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   for (int j = 0; j < C::WS - 1; ++j)
     if (j < C::KC) load_w(j);
 #pragma unroll
-  for (int j = 0; j < AS - 1; ++j) issue(j);
+  for (int j = 0; j < C::AS_STG - 1; ++j) issue(j);
 
   const int c = lane & 3;
   const float factor = FMT != FMT_MXFP8 ? __ldg(g.factors + e) : 1.f;
@@ -246,19 +250,19 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   unsigned bcur[BK / 16][2][2], bnext[BK / 16][2][2];
 #pragma unroll 1
   for (int ks = 0; ks < KS; ++ks) {
-    cp_wait<AS - 2>();
+    cp_wait<C::AS_STG - 2>();
     __syncthreads();
     const int chunk = ks / C::R;
     // first step of a chunk: the chunk WS - 1 ahead into the slot the previous chunk used (read before the barrier)
     if (ks % C::R == 0 && chunk + C::WS - 1 < C::KC) load_w(chunk + C::WS - 1);
-    issue(ks + AS - 1);
+    issue(ks + C::AS_STG - 1);
     if (ks == 0) {
       float sc0[2][4];
       scales_of(0, sc0);
 #pragma unroll
       for (int kk = 0; kk < BK / 16; ++kk) decode(0, kk, sc0, bcur);
     }
-    const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % AS) * C::A_BYTES);
+    const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
     const bool more = ks + 1 < KS;
     float scn[2][4];
     if (more) scales_of(ks + 1, scn);
@@ -309,19 +313,26 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   }
 }
 
-template <int FMT, Mode MODE, int K, int TM>
+template <int FMT, Mode MODE, int K, int TM, bool LOW_SMEM = false>
 void launch(const GemmArgs& g, int grid, cudaStream_t stream) {
-  constexpr int SMEM = Cfg<FMT, K, TM>::SMEM;
-  static const cudaError_t attr =
-      cudaFuncSetAttribute(wgemm_kernel<FMT, MODE, K, TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-  if (attr != cudaSuccess) throw std::runtime_error("prefill wgemm: shared memory attribute failed");
-  wgemm_kernel<FMT, MODE, K, TM><<<grid, NT, SMEM, stream>>>(g);
+  constexpr int SMEM = Cfg<FMT, K, TM, LOW_SMEM>::SMEM;
+  if constexpr (SMEM > 49152) {
+    static const cudaError_t attr = cudaFuncSetAttribute(
+        wgemm_kernel<FMT, MODE, K, TM, LOW_SMEM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    if (attr != cudaSuccess) throw std::runtime_error("prefill wgemm: shared memory attribute failed");
+  }
+  wgemm_kernel<FMT, MODE, K, TM, LOW_SMEM><<<grid, NT, SMEM, stream>>>(g);
 }
 
 template <int FMT, Mode MODE, int K>
 void launch_rows(const GemmArgs& g, int tm, int grid_per_row_tile, int row_tiles, cudaStream_t stream) {
-  if (tm == 32) launch<FMT, MODE, K, 32>(g, grid_per_row_tile * row_tiles, stream);
-  else launch<FMT, MODE, K, 128>(g, grid_per_row_tile * row_tiles, stream);
+  if (current_max_smem_optin() < 90000) {
+    if (tm != 32) throw std::invalid_argument("prefill wgemm: low-SMEM devices require moe_tile_rows == 32");
+    launch<FMT, MODE, K, 32, true>(g, grid_per_row_tile * row_tiles, stream);
+    return;
+  }
+  if (tm == 32) launch<FMT, MODE, K, 32, false>(g, grid_per_row_tile * row_tiles, stream);
+  else launch<FMT, MODE, K, 128, false>(g, grid_per_row_tile * row_tiles, stream);
 }
 
 GemmArgs expert_args(const void* codes, const void* scales, const float* factors, const ActT* a,
