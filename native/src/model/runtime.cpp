@@ -63,9 +63,22 @@ void GraphExec::launch(cudaStream_t stream) const {
 
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  if (options_.offload_vram_mb > 0 && options_.prefill_chunk > 512) {
+    options_.prefill_chunk = 512;  // keep prefill scratch compact (~190 MB) inside low-VRAM caps
+  }
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
-  ablation_ = load_ablation(options.ablation);
+  OffloadConfig offload;
+  offload.vram_mb = options_.offload_vram_mb;
+  offload.ram_mb = options_.offload_ram_mb;
+  offload.mode = options_.offload_mode;
+  offload.ranking = options_.expert_ranking;
+  offload.dump_router_stats = options_.dump_router_stats;
+  offload.max_ctx = options_.max_ctx;
+  offload.prefill_chunk = options_.prefill_chunk;
+  offload.kv_fp8 = options_.kv_fp8;
+  offload.kv_q4 = options_.kv_q4;
+  weights_ = load_weights(options_.model_dir, options_.dense_fp8, stream_, offload);
+  ablation_ = load_ablation(options_.ablation);
   init();
 }
 
@@ -114,7 +127,10 @@ void Runtime::init() {
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
-  for (const auto& [m, history] : history_) capture(m, history);
+  const bool eager_offload = weights_.expert_cache && weights_.expert_cache->needs_host_dispatch();
+  if (!eager_offload) {
+    for (const auto& [m, history] : history_) capture(m, history);
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
@@ -185,6 +201,9 @@ void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
 }
 
 const float* Runtime::run_step(int m) {
+  if (weights_.expert_cache && weights_.expert_cache->needs_host_dispatch()) {
+    return run_step_eager(m);
+  }
   auto it = graphs_.find(m);
   if (it == graphs_.end()) throw std::invalid_argument("no decode graph for width " + std::to_string(m));
   CUDA_CHECK(cudaGraphLaunch(it->second, stream_));

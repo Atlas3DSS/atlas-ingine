@@ -13,6 +13,7 @@
 #include "ingine/generator.h"
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
+#include "model/expert_cache.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -78,6 +79,10 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(C * TOP_K), pair_dst_ = i32(C * TOP_K);
   tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4)));
   act_ = bf16(C * TOP_K * INTER), down_ = bf16(C * TOP_K * H), moe_sum_ = bf16(C * H);
+  bool any_exl3_w13 = false;
+  for (int l = 0; l < LAYERS; ++l) any_exl3_w13 |= is_exl3(w.expert_formats[l]);
+  // Dedicated EXL3 gate/up scratch only when tiered offloading may sub-batch prefill (so sub-batch k+1 never clobbers down_).
+  exl3_scratch_ = (w.expert_cache && any_exl3_w13) ? bf16(C * TOP_K * H) : down_;
   gin_ = rel_;
   fpre_ = reinterpret_cast<float*>(down_), gpre_ = fpre_ + C * H;
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
@@ -315,19 +320,34 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::moe_route(idx_, T, work, s);
     const Experts& ex = layer.experts;
     const bool exl13 = is_exl3(ex.w13_fmt), exl2 = is_exl3(ex.w2_fmt);
-    const pk::MoeExperts me{static_cast<int>(ex.w13_fmt),
-                            ex.w13.data,
-                            exl13 ? ex.w13_rin.data : ex.w13_scale.data,
-                            exl13 ? nullptr : f32p(ex.w13_factor),
-                            ex.w2.data,
-                            exl2 ? ex.w2_rin.data : ex.w2_scale.data,
-                            exl2 ? nullptr : f32p(ex.w2_factor),
-                            static_cast<int>(ex.w2_fmt),
-                            ex.w13_rout.data,
-                            ex.w2_rout.data,
-                            down_};
-    pk::moe_gate_up(me, xm_, T, work, act_, s);
-    pk::moe_down(me, act_, T, work, down_, s);
+    pk::MoeExperts me{static_cast<int>(ex.w13_fmt),
+                      ex.w13.data,
+                      exl13 ? ex.w13_rin.data : ex.w13_scale.data,
+                      exl13 ? nullptr : f32p(ex.w13_factor),
+                      ex.w2.data,
+                      exl2 ? ex.w2_rin.data : ex.w2_scale.data,
+                      exl2 ? nullptr : f32p(ex.w2_factor),
+                      static_cast<int>(ex.w2_fmt),
+                      ex.w13_rout.data,
+                      ex.w2_rout.data,
+                      exl3_scratch_};
+    if (w.expert_cache) {
+      const auto eptrs = w.expert_cache->layer_ptrs(l);
+      me.w13_ptrs = eptrs.w13;
+      me.w13_scale_ptrs = eptrs.w13_scale;
+      me.w13_rout_ptrs = eptrs.w13_rout;
+      me.w2_ptrs = eptrs.w2;
+      me.w2_scale_ptrs = eptrs.w2_scale;
+      me.w2_rout_ptrs = eptrs.w2_rout;
+      w.expert_cache->run_prefill_layer(l, counts_, s, [&](const std::uint8_t* mask) {
+        me.active_mask = mask;
+        pk::moe_gate_up(me, xm_, T, work, act_, s);
+        pk::moe_down(me, act_, T, work, down_, s);
+      });
+    } else {
+      pk::moe_gate_up(me, xm_, T, work, act_, s);
+      pk::moe_down(me, act_, T, work, down_, s);
+    }
     pk::moe_combine(down_, wts_, T, moe_sum_, s);
     pk::static_conv(moe_sum_, H, T, H, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_, s);
     pk::conv_state_update(st.conv_mlp_at(v), moe_sum_, H, T, H, s);

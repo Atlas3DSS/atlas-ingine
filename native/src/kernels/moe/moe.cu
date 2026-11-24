@@ -447,7 +447,8 @@ template <int FMT>
 __global__ void __launch_bounds__(UP_WARPS * 32)
 moe_up_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
               const uint8_t* __restrict__ ws, const float* __restrict__ wfactor, int M,
-              ActT* __restrict__ out) {
+              ActT* __restrict__ out, const uint8_t* const* __restrict__ w_ptrs,
+              const uint8_t* const* __restrict__ ws_ptrs) {
     constexpr int K = H, R = 2 * I;
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
     __shared__ float red[UP_WARPS][32][4];
@@ -465,11 +466,13 @@ moe_up_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, const uin
     const uint64_t mask = slot_mask(e, lo, hi);
     if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
 
-    const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+    const size_t local_row = static_cast<size_t>(tile * TILE + g);
+    const size_t row = static_cast<size_t>(e) * R + local_row;
+    const uint8_t* we = w_ptrs ? (w_ptrs[e] + local_row * CB) : (w + row * CB);
+    const uint8_t* wse = ws_ptrs ? (ws_ptrs[e] + local_row * SB) : (ws + row * SB);
     const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
     Frag<FMT> f;
-    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT != 1 ? wfactor[e] : 1.f,
-                   l2::policy<WEIGHT_L2>());
+    load_w<FMT, K>(f, we, wse, 4 * warp + t, FMT != 1 ? wfactor[e] : 1.f, l2::policy<WEIGHT_L2>());
     load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
     float d[4] = {0.f, 0.f, 0.f, 0.f};
     mma_frag(f, d);
@@ -513,7 +516,8 @@ __global__ void __launch_bounds__(DOWN_WARPS * 32)
 moe_down_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const float* __restrict__ wts,
                 const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor,
                 int M, const float* __restrict__ conv_w, float* __restrict__ conv_state, float* __restrict__ out,
-                float* __restrict__ conv_hist) {
+                float* __restrict__ conv_hist, const uint8_t* const* __restrict__ w_ptrs,
+                const uint8_t* const* __restrict__ ws_ptrs) {
     constexpr int K = I, R = H;
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
     __shared__ float part[DOWN_WARPS][32][4];        // per-warp partial dots of the current round
@@ -558,8 +562,11 @@ moe_down_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const
     const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
     auto load = [&](int u, Frag<FMT>& f) {
         const int e = uexp[u];
-        const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
-        load_w<FMT, K>(f, w + row * CB, ws + row * SB, c, FMT != 1 ? wfactor[e] : 1.f, wpol);
+        const size_t local_row = static_cast<size_t>(tile * TILE + g);
+        const size_t row = static_cast<size_t>(e) * R + local_row;
+        const uint8_t* we = w_ptrs ? (w_ptrs[e] + local_row * CB) : (w + row * CB);
+        const uint8_t* wse = ws_ptrs ? (ws_ptrs[e] + local_row * SB) : (ws + row * SB);
+        load_w<FMT, K>(f, we, wse, c, FMT != 1 ? wfactor[e] : 1.f, wpol);
     };
 
     // The first round's weights do not depend on moe_up: fetch them before waiting for it (PDL).
@@ -646,7 +653,8 @@ template <int BITS, bool M1>
 __global__ void __launch_bounds__(UP_WARPS * 32)
 moe_up_exl3_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
                    const __half* __restrict__ rin, const __half* __restrict__ rout, int M,
-                   ActT* __restrict__ out) {
+                   ActT* __restrict__ out, const uint8_t* const* __restrict__ w_ptrs,
+                   const uint8_t* const* __restrict__ rin_ptrs, const uint8_t* const* __restrict__ rout_ptrs) {
     constexpr int K = H;
     constexpr int NT = (2 * I) / 16;   // 144
     constexpr int KT = K / 16;         // 144
@@ -674,7 +682,7 @@ moe_up_exl3_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, cons
     if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;
 
     // Phase 1: Input rin * x -> 128-pt Hadamard per warp (each warp owns k = warp*128 .. +127)
-    const __half* rin_e = rin + size_t(e) * K + warp * 128;
+    const __half* rin_e = (rin_ptrs ? reinterpret_cast<const __half*>(rin_ptrs[e]) : (rin + size_t(e) * K)) + warp * 128;
     float r_in[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) r_in[i] = __half2float(__ldg(rin_e + lane * 4 + i));
@@ -713,7 +721,8 @@ moe_up_exl3_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, cons
     if constexpr (M1) __syncthreads();  // x_rot is now in registers! Reuse smem immediately for red_m1.
 
     float acc_g[8][4], acc_u[8][4];
-    const uint8_t* w_e = w + size_t(e) * NT * KT * TILE_BYTES;
+    const uint8_t* w_e = w_ptrs ? w_ptrs[e] : (w + size_t(e) * NT * KT * TILE_BYTES);
+    const __half* rout_e = rout_ptrs ? reinterpret_cast<const __half*>(rout_ptrs[e]) : (rout + size_t(e) * (2 * I));
     auto run_side = [&](int side, int nt0, float (&acc)[8][4]) {
 #pragma unroll
         for (int nt_l = 0; nt_l < 8; ++nt_l) {
@@ -755,8 +764,8 @@ moe_up_exl3_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, cons
             }
             exl3::fwht_128_warp(vg, lane);
             exl3::fwht_128_warp(vu, lane);
-            const __half* rg = rout + size_t(e) * (2 * I) + blk * 128 + lane * 4;
-            const __half* ru = rout + size_t(e) * (2 * I) + I + blk * 128 + lane * 4;
+            const __half* rg = rout_e + blk * 128 + lane * 4;
+            const __half* ru = rout_e + I + blk * 128 + lane * 4;
             ActT ab[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -817,8 +826,8 @@ moe_up_exl3_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, cons
                 }
                 exl3::fwht_128_warp(vg, lane);
                 exl3::fwht_128_warp(vu, lane);
-                const __half* rg = rout + size_t(e) * (2 * I) + blk * 128 + lane * 4;
-                const __half* ru = rout + size_t(e) * (2 * I) + I + blk * 128 + lane * 4;
+                const __half* rg = rout_e + blk * 128 + lane * 4;
+                const __half* ru = rout_e + I + blk * 128 + lane * 4;
                 ActT ab[4];
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
@@ -846,7 +855,8 @@ template <int BITS, bool M1>
 __global__ void __launch_bounds__(DOWN_GROUPS * 32)
 moe_down_exl3_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const uint8_t* __restrict__ w,
                      const __half* __restrict__ rin, const __half* __restrict__ rout, int M,
-                     ActT* __restrict__ ws) {
+                     ActT* __restrict__ ws, const uint8_t* const* __restrict__ w_ptrs,
+                     const uint8_t* const* __restrict__ rin_ptrs, const uint8_t* const* __restrict__ rout_ptrs) {
     constexpr int K = I;
     constexpr int NT = H / 16;    // 144
     constexpr int KT = K / 16;    // 72
@@ -871,7 +881,7 @@ moe_down_exl3_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, 
     const uint64_t mask = slot_mask(e, lo, hi);
     if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;
 
-    const __half* rin_e = rin + size_t(e) * K + warp * 128;
+    const __half* rin_e = (rin_ptrs ? reinterpret_cast<const __half*>(rin_ptrs[e]) : (rin + size_t(e) * K)) + warp * 128;
     float r_in[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) r_in[i] = __half2float(__ldg(rin_e + lane * 4 + i));
@@ -914,7 +924,8 @@ moe_down_exl3_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, 
     if constexpr (M1) __syncthreads();  // x_rot is now in registers!
 
     float acc[8][4];
-    const uint8_t* w_e = w + size_t(e) * NT * KT * TILE_BYTES;
+    const uint8_t* w_e = w_ptrs ? w_ptrs[e] : (w + size_t(e) * NT * KT * TILE_BYTES);
+    const __half* rout_e = rout_ptrs ? reinterpret_cast<const __half*>(rout_ptrs[e]) : (rout + size_t(e) * H);
     const int nt0 = blk * 8;
 #pragma unroll
     for (int nt_l = 0; nt_l < 8; ++nt_l) {
@@ -948,7 +959,7 @@ moe_down_exl3_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, 
 #pragma unroll
                 for (int i = 0; i < 4; ++i) v[i] += smem.red_m1[ww][lane * 4 + i];
             exl3::fwht_128_warp(v, lane);
-            const __half* ro = rout + size_t(e) * H + blk * 128 + lane * 4;
+            const __half* ro = rout_e + blk * 128 + lane * 4;
             ActT yb[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) yb[i] = act::from_float(v[i] * __half2float(__ldg(ro + i)));
@@ -995,7 +1006,7 @@ moe_down_exl3_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, 
 #pragma unroll
                 for (int i = 0; i < 4; ++i) v[i] = smem.r.y[warp][lane * 4 + i];
                 exl3::fwht_128_warp(v, lane);
-                const __half* ro = rout + size_t(e) * H + blk * 128 + lane * 4;
+                const __half* ro = rout_e + blk * 128 + lane * 4;
                 ActT yb[4];
 #pragma unroll
                 for (int i = 0; i < 4; ++i) yb[i] = act::from_float(v[i] * __half2float(__ldg(ro + i)));
@@ -1082,21 +1093,24 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
 
 void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w13_scale,
             const float* w13_factor, Format fmt, ActT* out, bool pdl, cudaStream_t stream,
-            const void* w13_rout) {
+            const void* w13_rout, const ExpertPtrs* ptrs) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
-    require(x && idx && w13 && w13_scale && out, "moe_up: null argument");
+    const uint8_t* const* wp = ptrs ? ptrs->w13 : nullptr;
+    const uint8_t* const* wsp = ptrs ? ptrs->w13_scale : nullptr;
+    const uint8_t* const* wroutp = ptrs ? ptrs->w13_rout : nullptr;
+    require(x && idx && ((w13 && w13_scale) || (wp && wsp)) && out, "moe_up: null argument");
     if (fmt == Format::EXL3_2 || fmt == Format::EXL3_3) {
-        require(w13_rout != nullptr, "moe_up(EXL3): w13_rout required");
+        require(w13_rout != nullptr || wroutp != nullptr, "moe_up(EXL3): w13_rout required");
         const dim3 grid(I / 128, M * TOPK);  // 9 x (M*8)
         const auto* w = static_cast<const uint8_t*>(w13);
         const auto* rin = static_cast<const __half*>(w13_scale);
         const auto* rout = static_cast<const __half*>(w13_rout);
         if (fmt == Format::EXL3_2) {
-            if (M == 1) launch(moe_up_exl3_kernel<2, true>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out);
-            else launch(moe_up_exl3_kernel<2, false>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out);
+            if (M == 1) launch(moe_up_exl3_kernel<2, true>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out, wp, wsp, wroutp);
+            else launch(moe_up_exl3_kernel<2, false>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out, wp, wsp, wroutp);
         } else {
-            if (M == 1) launch(moe_up_exl3_kernel<3, true>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out);
-            else launch(moe_up_exl3_kernel<3, false>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out);
+            if (M == 1) launch(moe_up_exl3_kernel<3, true>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out, wp, wsp, wroutp);
+            else launch(moe_up_exl3_kernel<3, false>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out, wp, wsp, wroutp);
         }
         return;
     }
@@ -1105,30 +1119,33 @@ void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w
     const auto* w = static_cast<const uint8_t*>(w13);
     const auto* ws = static_cast<const uint8_t*>(w13_scale);
     const float* wf = fmt == Format::MXFP8 ? nullptr : w13_factor;
-    if (fmt == Format::NVFP4) launch(moe_up_kernel<0>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out);
-    else if (fmt == Format::MXFP8) launch(moe_up_kernel<1>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out);
-    else if (fmt == Format::ATLAS2) launch(moe_up_kernel<2>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out);
-    else launch(moe_up_kernel<3>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out);
+    if (fmt == Format::NVFP4) launch(moe_up_kernel<0>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out, wp, wsp);
+    else if (fmt == Format::MXFP8) launch(moe_up_kernel<1>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out, wp, wsp);
+    else if (fmt == Format::ATLAS2) launch(moe_up_kernel<2>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out, wp, wsp);
+    else launch(moe_up_kernel<3>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out, wp, wsp);
 }
 
 void moe_down(const ActT* act, int M, const int* idx, const float* wts, const void* w2,
               const void* w2_scale, const float* w2_factor, Format fmt, const float* conv_w, float* conv_state,
               float* out, float* conv_hist, bool pdl, cudaStream_t stream,
-              const void* w2_rout, ActT* workspace) {
+              const void* w2_rout, ActT* workspace, const ExpertPtrs* ptrs) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
-    require(act && idx && wts && w2 && w2_scale && conv_w && conv_state && out, "moe_down: null argument");
+    const uint8_t* const* wp = ptrs ? ptrs->w2 : nullptr;
+    const uint8_t* const* wsp = ptrs ? ptrs->w2_scale : nullptr;
+    const uint8_t* const* wroutp = ptrs ? ptrs->w2_rout : nullptr;
+    require(act && idx && wts && ((w2 && w2_scale) || (wp && wsp)) && conv_w && conv_state && out, "moe_down: null argument");
     if (fmt == Format::EXL3_2 || fmt == Format::EXL3_3) {
-        require(w2_rout && workspace, "moe_down(EXL3): w2_rout and workspace required");
+        require((w2_rout != nullptr || wroutp != nullptr) && workspace, "moe_down(EXL3): w2_rout and workspace required");
         const dim3 grid(H / 128, M * TOPK);  // 18 x (M*8)
         const auto* w = static_cast<const uint8_t*>(w2);
         const auto* rin = static_cast<const __half*>(w2_scale);
         const auto* rout = static_cast<const __half*>(w2_rout);
         if (fmt == Format::EXL3_2) {
-            if (M == 1) launch(moe_down_exl3_kernel<2, true>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace);
-            else launch(moe_down_exl3_kernel<2, false>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace);
+            if (M == 1) launch(moe_down_exl3_kernel<2, true>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace, wp, wsp, wroutp);
+            else launch(moe_down_exl3_kernel<2, false>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace, wp, wsp, wroutp);
         } else {
-            if (M == 1) launch(moe_down_exl3_kernel<3, true>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace);
-            else launch(moe_down_exl3_kernel<3, false>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace);
+            if (M == 1) launch(moe_down_exl3_kernel<3, true>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace, wp, wsp, wroutp);
+            else launch(moe_down_exl3_kernel<3, false>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace, wp, wsp, wroutp);
         }
         launch(moe_down_combine_conv_kernel, dim3(H / 128), 128, pdl, stream, workspace, wts, M, conv_w, conv_state,
                out, conv_hist);
@@ -1139,13 +1156,13 @@ void moe_down(const ActT* act, int M, const int* idx, const float* wts, const vo
     const auto* ws = static_cast<const uint8_t*>(w2_scale);
     const float* wf = fmt == Format::MXFP8 ? nullptr : w2_factor;
     if (fmt == Format::NVFP4)
-        launch(moe_down_kernel<0>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist);
+        launch(moe_down_kernel<0>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
     else if (fmt == Format::MXFP8)
-        launch(moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist);
+        launch(moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
     else if (fmt == Format::ATLAS2)
-        launch(moe_down_kernel<2>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist);
+        launch(moe_down_kernel<2>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
     else
-        launch(moe_down_kernel<3>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist);
+        launch(moe_down_kernel<3>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
 }
 
 }  // namespace ingine::kernels::moe

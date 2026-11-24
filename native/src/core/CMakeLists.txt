@@ -5,6 +5,7 @@ add_library(ingine_core STATIC
   device.cu
   dtype.cpp
   host_memory.cpp
+  paged_tier.cpp
   safetensors.cpp
   tensor.cpp
 )

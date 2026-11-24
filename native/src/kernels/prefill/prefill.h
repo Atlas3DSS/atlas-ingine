@@ -163,6 +163,14 @@ struct MoeExperts {
   const void* w13_rout = nullptr;   // F16 [128, 2I] for EXL3
   const void* w2_rout = nullptr;    // F16 [128, H] for EXL3
   ActT* exl3_scratch = nullptr;     // ActT [T * 8, 2I] scratch for EXL3 stacked gate/up (e.g. down_)
+  // Optional per-expert pointer tables ([128]) and active-expert mask ([128] u8) for tiered offloading.
+  const std::uint8_t* const* w13_ptrs = nullptr;
+  const std::uint8_t* const* w13_scale_ptrs = nullptr;
+  const std::uint8_t* const* w13_rout_ptrs = nullptr;
+  const std::uint8_t* const* w2_ptrs = nullptr;
+  const std::uint8_t* const* w2_scale_ptrs = nullptr;
+  const std::uint8_t* const* w2_rout_ptrs = nullptr;
+  const std::uint8_t* active_mask = nullptr;
 };
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
 // exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.

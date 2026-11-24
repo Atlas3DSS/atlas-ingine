@@ -55,21 +55,25 @@ class EngineGenerator final : public Generator {
 
   bool supports_images() const override { return vision_ != nullptr; }
 
+  std::string offload_summary() const override {
+    return rt_.weights().expert_cache ? rt_.weights().expert_cache->summary() : std::string{};
+  }
+
  private:
   EngineGenerator(const RuntimeOptions& options, std::unique_ptr<Runtime> runtime)
-      : options_(options),
+      : options_(runtime->options()),
         runtime_(std::move(runtime)),
         rt_(*runtime_),
-        prefiller_(rt_.weights(), rt_.ablation(), options.prefill_chunk, rt_.stream()),
-        chunk_tokens_(std::size_t(options.prefill_chunk) * sizeof(std::int32_t)),
+        prefiller_(rt_.weights(), rt_.ablation(), rt_.options().prefill_chunk, rt_.stream()),
+        chunk_tokens_(std::size_t(rt_.options().prefill_chunk) * sizeof(std::int32_t)),
         logits_(std::size_t(UNPADDED_VOCAB) * sizeof(float)),
         token_(sizeof(std::int32_t)),
         host_token_(sizeof(std::int32_t)) {
-    if (options.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
-    if (options.spec) {
-      drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream());
+    if (options_.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
+    if (options_.spec) {
+      drafter_ = std::make_unique<Drafter>(options_.model_dir, rt_.weights(), options_.max_ctx, rt_.stream());
       drafter_->capture();
-      taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
+      taps_ = DeviceBuffer(std::size_t(options_.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
       spec_ = std::make_unique<SpecLoop>(rt_, *drafter_);
     }
     // checkpoint layout: target state | drafter context | last prompt logits
@@ -77,14 +81,16 @@ class EngineGenerator final : public Generator {
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
     checkpoint_ = DeviceBuffer(checkpoint_logits_ + logits_.bytes);
     // the vision tower's weights are resident: loaded before the park budget below is measured
-    if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
+    if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
-    if (options.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
+    if (options_.offload_vram_mb > 0 && options_.park_mb < 0) {
+      park_budget_ = 0;  // keep strict VRAM cap in offload mode unless user explicitly requests parking
+    } else if (options_.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
       std::size_t free = 0, total = 0;
       CUDA_CHECK(cudaMemGetInfo(&free, &total));
       park_budget_ = std::min<std::size_t>(3072, std::max<std::size_t>(free >> 20, 4096) - 4096) << 20;
     } else {
-      park_budget_ = std::size_t(options.park_mb) << 20;
+      park_budget_ = std::size_t(options_.park_mb) << 20;
     }
     // parked conversations are best-effort: a device allocation that fails releases them and retries
     release_hook_ = add_release_hook([this] { return release_parked(); });

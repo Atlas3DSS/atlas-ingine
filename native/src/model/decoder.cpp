@@ -245,15 +245,23 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     const moe::Format fmt13 = static_cast<moe::Format>(static_cast<int>(ex.w13_fmt));
     const moe::Format fmt2 = static_cast<moe::Format>(static_cast<int>(ex.w2_fmt));
     const bool exl13 = is_exl3(ex.w13_fmt), exl2 = is_exl3(ex.w2_fmt);
+    moe::ExpertPtrs eptrs{};
+    const moe::ExpertPtrs* eptrs_p = nullptr;
+    if (w.expert_cache) {
+      w.expert_cache->prepare_decode(l, static_cast<const int*>(b.idx.data), m, stream);
+      eptrs = w.expert_cache->layer_ptrs(l);
+      eptrs_p = &eptrs;
+    }
+    const bool moe_pdl = pdl && !(w.expert_cache && w.expert_cache->needs_host_dispatch());
     moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data,
                 exl13 ? ex.w13_rin.data : ex.w13_scale.data, exl13 ? nullptr : f32p(ex.w13_factor), fmt13, bf16m(b.act),
-                pdl, stream, ex.w13_rout.data);
+                moe_pdl, stream, ex.w13_rout.data, eptrs_p);
     // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
     moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data,
                   exl2 ? ex.w2_rin.data : ex.w2_scale.data, exl2 ? nullptr : f32p(ex.w2_factor), fmt2,
                   f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
-                  history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, pdl, stream, ex.w2_rout.data,
-                  static_cast<ActT*>(moe_down_ws_.p));
+                  history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, moe_pdl, stream, ex.w2_rout.data,
+                  static_cast<ActT*>(moe_down_ws_.p), eptrs_p);
     prev_v = v;
   }
   // ---- final read; the same launch writes b.taps[:, 3] = b.xf

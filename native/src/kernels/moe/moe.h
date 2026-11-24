@@ -15,6 +15,17 @@ namespace ingine::kernels::moe {
 
 enum class Format : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5 };
 
+// Optional per-expert device pointer table ([128] base pointers for one layer) for tiered expert offloading.
+// When null, kernels index contiguous [128, ...] weight arrays as before.
+struct ExpertPtrs {
+  const std::uint8_t* const* w13 = nullptr;
+  const std::uint8_t* const* w13_scale = nullptr;
+  const std::uint8_t* const* w2 = nullptr;
+  const std::uint8_t* const* w2_scale = nullptr;
+  const std::uint8_t* const* w13_rout = nullptr;  // F16 [2I] per expert for EXL3
+  const std::uint8_t* const* w2_rout = nullptr;   // F16 [H] per expert for EXL3
+};
+
 // moe_up: W13 GEMV of the selected experts + softcapped SwiGLU. x ActT [M, H], idx int32 [M, 8],
 // out ActT [M, 8, I]. NVFP4: w13 u8 [128, 2I, H/2], w13_scale e4m3 [128, 2I, H/16], w13_factor fp32 [128];
 // MXFP8: w13 e4m3 [128, 2I, H], w13_scale u8 E8M0 [128, 2I, H/32], factor unused (may be null).
@@ -23,7 +34,7 @@ enum class Format : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 =
 // pdl: the kernel waits for its predecessor before reading anything.
 void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w13_scale,
             const float* w13_factor, Format fmt, ActT* out, bool pdl, cudaStream_t stream,
-            const void* w13_rout = nullptr);
+            const void* w13_rout = nullptr, const ExpertPtrs* ptrs = nullptr);
 
 // moe_down: W2 GEMV + routing-weighted sum + post-MLP conv with state update. act ActT [M, 8, I],
 // wts fp32 [M, 8], w2 [128, H, I(/2)] + scales [128, H, I/16 | I/32] (+ factor), conv_w fp32 [H, 4],
@@ -34,7 +45,7 @@ void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w
 void moe_down(const ActT* act, int M, const int* idx, const float* wts, const void* w2,
               const void* w2_scale, const float* w2_factor, Format fmt, const float* conv_w, float* conv_state,
               float* out, float* conv_hist, bool pdl, cudaStream_t stream,
-              const void* w2_rout = nullptr, ActT* workspace = nullptr);
+              const void* w2_rout = nullptr, ActT* workspace = nullptr, const ExpertPtrs* ptrs = nullptr);
 
 // dequant_experts: decode experts[0..n) (int32 device) of one weight ([128, rows, cols] in checkpoint
 // encoding: NVFP4 codes u8 [128, rows, cols/2] + e4m3 scales [128, rows, cols/16] + factor fp32 [128];

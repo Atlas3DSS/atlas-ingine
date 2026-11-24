@@ -99,6 +99,19 @@ struct RuntimeOptions {
   int park_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
+  // Dynamic 3-tier MoE expert offloading (atlas-6g-homology):
+  //   offload_vram_mb == 0: disabled (all experts resident in VRAM).
+  //   offload_vram_mb > 0:  target VRAM cap in MiB (e.g. 6144 for 6 GB GPUs); non-expert weights, KV cache,
+  //                         and static homology-pinned HOT experts + dynamic LRU pool stay inside this cap.
+  //   offload_ram_mb:       pinned host RAM cap in MiB for WARM experts (default 12288 inside 16 GB RAM);
+  //                         any remaining COLD experts stream on demand from read-only NVMe mmap.
+  //   offload_mode:         "auto" (dma-lru), "dma-lru" (3-tier async PCIe DMA + dynamic VRAM LRU), or
+  //                         "uva" (2-tier HOT VRAM + zero-copy UVA pinned RAM, CUDA-graph capturable).
+  int offload_vram_mb = 0;
+  int offload_ram_mb = 12288;
+  std::string offload_mode = "auto";
+  std::filesystem::path expert_ranking;     // optional JSON per-layer [24][128] homology/frequency scores
+  std::filesystem::path dump_router_stats;  // optional JSON output path for observed [24][128] router hits
 };
 
 class Generator {
@@ -120,6 +133,7 @@ class Generator {
     return generate(prompt.ids, max_new_tokens, sampling, stop_ids, on_tokens);
   }
   virtual bool supports_images() const { return false; }
+  virtual std::string offload_summary() const { return {}; }
 };
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options);  // the model (ingine_model)

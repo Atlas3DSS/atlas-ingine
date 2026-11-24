@@ -74,7 +74,7 @@ class Prefiller {
   int* idx_;
   int *counts_, *tiles_n_, *pair_token_, *pair_dst_;
   int4* tiles_;
-  ActT *act_, *down_, *moe_sum_;
+  ActT *act_, *down_, *moe_sum_, *exl3_scratch_;
   ActT* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
   std::int64_t* ids_;
   int kpos_rows_;
