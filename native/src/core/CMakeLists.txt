@@ -16,5 +16,8 @@ if(INGINE_ACT_FP16)
 else()
   target_compile_definitions(ingine_core PUBLIC INGINE_ACT_FP16=0)
 endif()
+if(INGINE_FORCE_SIMT_MMA)
+  target_compile_definitions(ingine_core PUBLIC INGINE_FORCE_SIMT_MMA=1)
+endif()
 target_link_libraries(ingine_core PUBLIC
   CUDA::cudart CUDA::nvtx3 Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)

@@ -28,18 +28,8 @@ int failures = 0;
     }                                                                               \
   } while (0)
 
-std::uint16_t bits_of(float f) {
-  const __nv_bfloat16 b = float_to_bf16(f);
-  std::uint16_t u;
-  std::memcpy(&u, &b, 2);
-  return u;
-}
-float value_of(std::uint16_t u) {
-  const std::uint32_t w = std::uint32_t(u) << 16;
-  float f;
-  std::memcpy(&f, &w, 4);
-  return f;
-}
+std::uint16_t bits_of(float f) { return ingine::act::host_float_to_act_bits(f); }
+float value_of(std::uint16_t u) { return ingine::act::host_act_bits_to_float(u); }
 
 std::vector<float> rand_f32(Rng& rng, std::size_t n, double scale, double offset = 0) {
   std::vector<float> v(n);
@@ -91,7 +81,7 @@ void test_patchify_random(Rng& rng, int height, int width) {
   DeviceArray<std::uint16_t> out(std::size_t(out_rows) * vk::PATCH_DIM);
   std::vector<std::uint16_t> ones(out.count, 0xFFFF);
   out.upload(ones);
-  vk::patchify(d_rgb.get(), height, width, rows, cols, reinterpret_cast<__nv_bfloat16*>(out.get()), out_rows, nullptr);
+  vk::patchify(d_rgb.get(), height, width, rows, cols, reinterpret_cast<ingine::ActT*>(out.get()), out_rows, nullptr);
   sync();
   const auto got = out.download();
   std::size_t wrong = 0;
@@ -128,7 +118,7 @@ void test_patchify_golden(const std::string& stem) {
   std::memcpy(pv.data(), pv_bytes.data(), pv_bytes.size());
   DeviceArray<std::uint8_t> d_rgb(rgb);
   DeviceArray<std::uint16_t> out(std::size_t(tiles) * 4 * vk::PATCH_DIM);
-  vk::patchify(d_rgb.get(), height, width, rows, cols, reinterpret_cast<__nv_bfloat16*>(out.get()), tiles * 4, nullptr);
+  vk::patchify(d_rgb.get(), height, width, rows, cols, reinterpret_cast<ingine::ActT*>(out.get()), tiles * 4, nullptr);
   sync();
   const auto got = out.download();
   std::size_t wrong = 0;
@@ -239,8 +229,8 @@ void test_qkv_post(Rng& rng, int rows, int cols) {
   DeviceArray<std::uint16_t> q(n), k(n), vt(n);
   const std::vector<std::uint16_t> ones(n, 0xFFFF);
   q.upload(ones), k.upload(ones), vt.upload(ones);
-  vk::qkv_post(d_qkv.get(), d_bias.get(), d_freq.get(), rows, cols, Sp, reinterpret_cast<__nv_bfloat16*>(q.get()),
-               reinterpret_cast<__nv_bfloat16*>(k.get()), reinterpret_cast<__nv_bfloat16*>(vt.get()), nullptr);
+  vk::qkv_post(d_qkv.get(), d_bias.get(), d_freq.get(), rows, cols, Sp, reinterpret_cast<ingine::ActT*>(q.get()),
+               reinterpret_cast<ingine::ActT*>(k.get()), reinterpret_cast<ingine::ActT*>(vt.get()), nullptr);
   sync();
   const auto gq = q.download(), gk = k.download(), gv = vt.download();
   std::vector<double> rq(n, 0.0), rk(n, 0.0), rv(n, 0.0);
@@ -290,7 +280,7 @@ void test_softmax(Rng& rng, int M, int ld, int S) {
   DeviceArray<float> d_scores(scores);
   DeviceArray<std::uint16_t> p(scores.size());
   p.upload(std::vector<std::uint16_t>(scores.size(), 0xFFFF));
-  vk::softmax_rows(d_scores.get(), M, ld, S, 0.125f, reinterpret_cast<__nv_bfloat16*>(p.get()), nullptr);
+  vk::softmax_rows(d_scores.get(), M, ld, S, 0.125f, reinterpret_cast<ingine::ActT*>(p.get()), nullptr);
   sync();
   const auto got = p.download();
   std::vector<double> ref(scores.size(), 0.0);
@@ -316,7 +306,7 @@ void test_bias_act(Rng& rng) {
   const auto bias = rand_f32(rng, N, 0.5);
   DeviceArray<float> d_x(x), d_bias(bias);
   DeviceArray<std::uint16_t> out(x.size());
-  vk::bias_act(d_x.get(), d_bias.get(), M, N, true, reinterpret_cast<__nv_bfloat16*>(out.get()), nullptr);
+  vk::bias_act(d_x.get(), d_bias.get(), M, N, true, reinterpret_cast<ingine::ActT*>(out.get()), nullptr);
   sync();
   std::vector<double> ref(x.size());
   for (std::size_t i = 0; i < x.size(); ++i) {
@@ -324,13 +314,13 @@ void test_bias_act(Rng& rng) {
     ref[i] = 0.5 * v * (1.0 + std::erf(v / std::sqrt(2.0)));  // exact GELU
   }
   report_bf16("bias_act gelu", out.download(), ref, 2e-6);
-  vk::bias_act(d_x.get(), nullptr, M, N, false, reinterpret_cast<__nv_bfloat16*>(out.get()), nullptr);
+  vk::bias_act(d_x.get(), nullptr, M, N, false, reinterpret_cast<ingine::ActT*>(out.get()), nullptr);
   sync();
   const auto plain = out.download();
   std::size_t wrong = 0;
   for (std::size_t i = 0; i < x.size(); ++i) wrong += plain[i] != bits_of(x[i]);
   CHECK(wrong == 0);
-  vk::bias_act(d_x.get(), nullptr, M, N, true, reinterpret_cast<__nv_bfloat16*>(out.get()), nullptr);
+  vk::bias_act(d_x.get(), nullptr, M, N, true, reinterpret_cast<ingine::ActT*>(out.get()), nullptr);
   sync();
   for (std::size_t i = 0; i < x.size(); ++i) ref[i] = 0.5 * double(x[i]) * (1.0 + std::erf(double(x[i]) / std::sqrt(2.0)));
   report_bf16("bias_act gelu, no bias", out.download(), ref, 2e-6);
@@ -356,7 +346,7 @@ void test_merge(Rng& rng) {
   DeviceArray<float> d_h(h);
   DeviceArray<std::uint16_t> out(std::size_t(out_rows) * vk::MERGED);
   out.upload(std::vector<std::uint16_t>(out.count, 0xFFFF));
-  vk::merge_rows(d_h.get(), N, out_rows, reinterpret_cast<__nv_bfloat16*>(out.get()), nullptr);
+  vk::merge_rows(d_h.get(), N, out_rows, reinterpret_cast<ingine::ActT*>(out.get()), nullptr);
   sync();
   const auto got = out.download();
   std::size_t wrong = 0;

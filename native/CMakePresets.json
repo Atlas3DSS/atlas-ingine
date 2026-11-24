@@ -66,6 +66,25 @@
       "cacheVariables": {
         "INGINE_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "sm70-simt-dev",
+      "displayName": "Volta sm_70 with INGINE_FORCE_SIMT_MMA=ON to verify Pascal sm_60/61 SIMT MMA on V100",
+      "inherits": "sm70-dev",
+      "binaryDir": "${sourceDir}/build-sm70-simt",
+      "cacheVariables": {
+        "INGINE_FORCE_SIMT_MMA": "ON"
+      }
+    },
+    {
+      "name": "legacy-fp16",
+      "displayName": "Legacy multi-arch FP16 (Pascal sm_60/61, Volta sm_70, Turing sm_75) with CUDA 12.9",
+      "inherits": "sm70",
+      "binaryDir": "${sourceDir}/build-legacy-fp16",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "60;61;70;75",
+        "INGINE_BUILD_TESTS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -74,7 +93,9 @@
     { "name": "install", "configurePreset": "install" },
     { "name": "multiarch-dev", "configurePreset": "multiarch-dev" },
     { "name": "sm70", "configurePreset": "sm70" },
-    { "name": "sm70-dev", "configurePreset": "sm70-dev" }
+    { "name": "sm70-dev", "configurePreset": "sm70-dev" },
+    { "name": "sm70-simt-dev", "configurePreset": "sm70-simt-dev" },
+    { "name": "legacy-fp16", "configurePreset": "legacy-fp16" }
   ],
   "testPresets": [
     {
@@ -90,6 +111,11 @@
     {
       "name": "sm70-dev",
       "configurePreset": "sm70-dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "sm70-simt-dev",
+      "configurePreset": "sm70-simt-dev",
       "output": { "outputOnFailure": true }
     }
   ]

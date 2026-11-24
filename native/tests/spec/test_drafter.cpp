@@ -81,11 +81,11 @@ bool well_formed(const DraftOut& o, bool greedy) {
 int bench(const std::filesystem::path& dir, cudaStream_t stream) {
   constexpr int BV = model::UNPADDED_VOCAB, BCTX = 262144, CHUNK = 1024, ROUNDS = 300;
   // BF16 normals from a table (a full-vocabulary matrix has 461M entries)
-  std::vector<__nv_bfloat16> table(65536);
+  std::vector<ingine::ActT> table(65536);
   Rng r(11);
   for (auto& x : table) x = float_to_bf16(float(r.normal()));
   std::uint64_t lcg = 0x243F6A8885A308D3ull;
-  auto fill = [&](std::vector<__nv_bfloat16>& v) {
+  auto fill = [&](std::vector<ingine::ActT>& v) {
     for (auto& x : v) {
       lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
       x = table[lcg >> 48];
@@ -94,7 +94,7 @@ int bench(const std::filesystem::path& dir, cudaStream_t stream) {
   model::Weights w;
   w.storage.reserve(4);
   {
-    std::vector<__nv_bfloat16> host(std::size_t(BV) * H);
+    std::vector<ingine::ActT> host(std::size_t(BV) * H);
     fill(host);
     auto& e = w.storage.emplace_back(host.size() * 2);
     e.copy_from_host(host.data(), host.size() * 2);
@@ -106,18 +106,18 @@ int bench(const std::filesystem::path& dir, cudaStream_t stream) {
     u16.copy_from_host(host.data(), host.size() * 2);
     auto& q = w.storage.emplace_back(host.size());
     auto& sc = w.storage.emplace_back(std::size_t(BV) * 4);
-    ingine::kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(u16.p), BV, H, q.p, static_cast<float*>(sc.p),
+    ingine::kernels::dense::fp8_rows(static_cast<const ingine::ActT*>(u16.p), BV, H, q.p, static_cast<float*>(sc.p),
                                      nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
-    w.embed = model::rm(w.storage[0].p, DType::BF16, {BV, H});
+    w.embed = model::rm(w.storage[0].p, ingine::kActDType, {BV, H});
     w.embed_norm = model::rm(w.storage[1].p, DType::FP32, {H});
     w.unembed.w = model::rm(w.storage[2].p, DType::FP8_E4M3FN, {BV, H});
     w.unembed.scale = model::rm(w.storage[3].p, DType::FP32, {BV});
     w.dense_fp8 = true;
   }
-  std::vector<__nv_bfloat16> feats(std::size_t(CHUNK) * 4 * H);
+  std::vector<ingine::ActT> feats(std::size_t(CHUNK) * 4 * H);
   fill(feats);
-  DeviceArray<__nv_bfloat16> d_feats(feats);
+  DeviceArray<ingine::ActT> d_feats(feats);
   const std::size_t flush_bytes = std::size_t(256) << 20;  // more than the L2
   DeviceArray<uint8_t> junk(flush_bytes);
   DeviceArray<int32_t> d_m(std::vector<int32_t>{8}), d_acc(std::vector<int32_t>{2}), d_next(std::vector<int32_t>{99});
@@ -202,7 +202,7 @@ int main() {
   Rng r(5);
   model::Weights w;
   {
-    std::vector<__nv_bfloat16> embed(size_t(V) * H), unembed(size_t(V) * H);
+    std::vector<ingine::ActT> embed(size_t(V) * H), unembed(size_t(V) * H);
     for (auto& x : embed) x = float_to_bf16(float(r.normal()));
     for (auto& x : unembed) x = float_to_bf16(float(r.normal() * 0.05));
     std::vector<float> en(H);
@@ -216,10 +216,10 @@ int main() {
     u16.copy_from_host(unembed.data(), unembed.size() * 2);
     auto& q = w.storage.emplace_back(unembed.size());
     auto& sc = w.storage.emplace_back(size_t(V) * 4);
-    ingine::kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(u16.p), V, H, q.p, static_cast<float*>(sc.p),
+    ingine::kernels::dense::fp8_rows(static_cast<const ingine::ActT*>(u16.p), V, H, q.p, static_cast<float*>(sc.p),
                                      nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
-    w.embed = model::rm(w.storage[0].p, DType::BF16, {V, H});
+    w.embed = model::rm(w.storage[0].p, ingine::kActDType, {V, H});
     w.embed_norm = model::rm(w.storage[1].p, DType::FP32, {H});
     w.unembed.w = model::rm(w.storage[2].p, DType::FP8_E4M3FN, {V, H});
     w.unembed.scale = model::rm(w.storage[3].p, DType::FP32, {V});
@@ -227,11 +227,11 @@ int main() {
   }
 
   const int rows = 300;
-  std::vector<__nv_bfloat16> feats(size_t(rows) * 4 * H);
+  std::vector<ingine::ActT> feats(size_t(rows) * 4 * H);
   for (auto& x : feats) x = float_to_bf16(float(r.normal()));
   DeviceBuffer d_feats(feats.size() * 2);
   d_feats.copy_from_host(feats.data(), feats.size() * 2);
-  const auto* fp = static_cast<const __nv_bfloat16*>(d_feats.p);
+  const auto* fp = static_cast<const ingine::ActT*>(d_feats.p);
 
   // the shortlist head over the 4096-token vocabulary: the first SHORT ranked ids; the others can join only as
   // context tokens
@@ -281,9 +281,9 @@ int main() {
     // advance (commit + draft from device values) == the host-driven commit + draft
     {
       const int widths[3] = {2, 4, 8}, m = 4, acc = 2, next = 99;
-      std::vector<__nv_bfloat16> taps(size_t(8) * 4 * H);
+      std::vector<ingine::ActT> taps(size_t(8) * 4 * H);
       for (auto& x : taps) x = float_to_bf16(float(r.normal()));
-      DeviceArray<__nv_bfloat16> d_taps(taps);
+      DeviceArray<ingine::ActT> d_taps(taps);
       DeviceArray<int32_t> d_m(std::vector<int32_t>{m}), d_acc(std::vector<int32_t>{acc}),
           d_next(std::vector<int32_t>{next}), d_other(std::vector<int32_t>{5});
       commit_a();

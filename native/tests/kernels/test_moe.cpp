@@ -130,7 +130,7 @@ double softcap(double x, double c) { return std::tanh(x / c) * c; }
 bool test_up(Rng& rng, const ExpertWeight& w13, int M) {
   const std::vector<float> x = randn_bf16(rng, size_t(M) * H, 1.0);
   const std::vector<int> idx = routing(rng, M);
-  DeviceArray<__nv_bfloat16> dx(to_bf16(x)), out(size_t(M) * TOPK * I);
+  DeviceArray<ingine::ActT> dx(to_bf16(x)), out(size_t(M) * TOPK * I);
   DeviceArray<int> didx(idx);
   moe::moe_up(dx.get(), M, didx.get(), w13.codes->get(), w13.scales->get(),
               w13.fmt != moe::Format::MXFP8 ? w13.factor->get() : nullptr, w13.fmt, out.get(), true, g_stream);
@@ -163,7 +163,7 @@ bool test_down(Rng& rng, const ExpertWeight& w2, int M) {
   for (auto& v : wts) v = float(rng.uniform(0.2, 2.0));
   const std::vector<float> cw = randn(rng, size_t(H) * 4, 0.5);
   const std::vector<float> st0 = randn_bf16(rng, size_t(3) * H, 0.3);
-  DeviceArray<__nv_bfloat16> dact(to_bf16(act));
+  DeviceArray<ingine::ActT> dact(to_bf16(act));
   DeviceArray<int> didx(idx);
   DeviceArray<float> dw(wts), dcw(cw), dst(st0), out(size_t(M) * H), hist(size_t(M) * H);
   moe::moe_down(dact.get(), M, didx.get(), dw.get(), w2.codes->get(), w2.scales->get(),
@@ -224,7 +224,7 @@ bool test_down(Rng& rng, const ExpertWeight& w2, int M) {
 bool test_dequant(const ExpertWeight& w) {
   const std::vector<int> experts = {E - 1, 0, 3};
   DeviceArray<int> de(experts);
-  DeviceArray<__nv_bfloat16> out(experts.size() * w.rows * w.cols);
+  DeviceArray<ingine::ActT> out(experts.size() * w.rows * w.cols);
   moe::dequant_experts(w.codes->get(), w.scales->get(), w.fmt != moe::Format::MXFP8 ? w.factor->get() : nullptr,
                        de.get(), int(experts.size()), w.rows, w.cols, w.fmt, out.get(), g_stream);
   sync();

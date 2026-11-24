@@ -16,7 +16,7 @@
 
 using namespace ingine::test;
 namespace kd = ingine::kernels::draft;
-using bf16 = __nv_bfloat16;
+using bf16 = ingine::ActT;
 
 namespace {
 

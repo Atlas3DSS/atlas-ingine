@@ -10,19 +10,9 @@
 
 namespace ingine::test::prefill {
 
-inline uint16_t bf16_bits(float f) {
-  const __nv_bfloat16 b = float_to_bf16(f);
-  uint16_t u;
-  std::memcpy(&u, &b, 2);
-  return u;
-}
+inline uint16_t bf16_bits(float f) { return ingine::act::host_float_to_act_bits(f); }
 
-inline float bf16_val(uint16_t u) {
-  const uint32_t w = uint32_t(u) << 16;
-  float f;
-  std::memcpy(&f, &w, 4);
-  return f;
-}
+inline float bf16_val(uint16_t u) { return ingine::act::host_act_bits_to_float(u); }
 
 inline float rbf(double x) { return bf16_val(bf16_bits(float(x))); }
 

@@ -106,13 +106,13 @@ bool run_attention(const char* name, const Inputs& in, const void* k_dev, const 
                    const std::vector<float>& V, const std::vector<int>& kpos, int stride) {
   DeviceArray<uint16_t> q(in.q), rel(in.rel), proj(in.proj), out(size_t(in.T) * HQ * D);
   pk::AttnParams p;
-  p.q = reinterpret_cast<const __nv_bfloat16*>(q.get());
+  p.q = reinterpret_cast<const ingine::ActT*>(q.get());
   p.k = k_dev, p.v = v_dev, p.kv_fp8 = fp8;
   p.kpos = kpos_dev, p.bounds = bounds_dev, p.L = L;
   p.T = in.T, p.pos0 = in.pos0, p.window = window;
-  p.rel = reinterpret_cast<const __nv_bfloat16*>(rel.get());
-  p.proj = reinterpret_cast<const __nv_bfloat16*>(proj.get()), p.ld = PROJ_LD;
-  p.out = reinterpret_cast<__nv_bfloat16*>(out.get());
+  p.rel = reinterpret_cast<const ingine::ActT*>(rel.get());
+  p.proj = reinterpret_cast<const ingine::ActT*>(proj.get()), p.ld = PROJ_LD;
+  p.out = reinterpret_cast<ingine::ActT*>(out.get());
   pk::attention(p, nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto got_bits = out.download();
@@ -184,9 +184,9 @@ bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
   DeviceArray<int64_t> rpos(ring_pos);
   DeviceArray<int> kp(kpos_rows);
   DeviceArray<int4> bounds(kpos_rows / 64);
-  pk::ring_gather(reinterpret_cast<const __nv_bfloat16*>(ring_k.get()),
-                  reinterpret_cast<const __nv_bfloat16*>(ring_v.get()), rpos.get(), pos0, T,
-                  reinterpret_cast<__nv_bfloat16*>(kr.get()), reinterpret_cast<__nv_bfloat16*>(vr.get()), kp.get(),
+  pk::ring_gather(reinterpret_cast<const ingine::ActT*>(ring_k.get()),
+                  reinterpret_cast<const ingine::ActT*>(ring_v.get()), rpos.get(), pos0, T,
+                  reinterpret_cast<ingine::ActT*>(kr.get()), reinterpret_cast<ingine::ActT*>(vr.get()), kp.get(),
                   kpos_rows, nullptr);
   pk::key_tile_bounds(kp.get(), L, bounds.get(), nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
@@ -205,9 +205,9 @@ bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
   std::snprintf(name, sizeof name, "sliding pos0=%d T=%d%s", pos0, T, stale ? " stale" : "");
   ok &= run_attention(name, in, kr.get(), vr.get(), false, kp.get(), bounds.get(), L, W, K, V, kpos, stride);
 
-  pk::ring_update(reinterpret_cast<const __nv_bfloat16*>(kr.get()), reinterpret_cast<const __nv_bfloat16*>(vr.get()),
-                  pos0, T, reinterpret_cast<__nv_bfloat16*>(ring_k.get()),
-                  reinterpret_cast<__nv_bfloat16*>(ring_v.get()), rpos.get(), nullptr);
+  pk::ring_update(reinterpret_cast<const ingine::ActT*>(kr.get()), reinterpret_cast<const ingine::ActT*>(vr.get()),
+                  pos0, T, reinterpret_cast<ingine::ActT*>(ring_k.get()),
+                  reinterpret_cast<ingine::ActT*>(ring_v.get()), rpos.get(), nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   {
     auto exp_pos = ring_pos;

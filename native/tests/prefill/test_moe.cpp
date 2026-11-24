@@ -127,12 +127,12 @@ bool run(Rng& rng, int fmt, int T) {
 
   pk::moe_topk(d_logits.get(), d_bias.get(), T, d_idx.get(), d_wts.get(), counts.get(), nullptr);
   pk::moe_route(d_idx.get(), T, wk, nullptr);
-  pk::moe_gate_up(ex, reinterpret_cast<const __nv_bfloat16*>(d_x.get()), T, wk,
-                  reinterpret_cast<__nv_bfloat16*>(act.get()), nullptr);
-  pk::moe_down(ex, reinterpret_cast<const __nv_bfloat16*>(act.get()), T, wk,
-               reinterpret_cast<__nv_bfloat16*>(down.get()), nullptr);
-  pk::moe_combine(reinterpret_cast<const __nv_bfloat16*>(down.get()), d_wts.get(), T,
-                  reinterpret_cast<__nv_bfloat16*>(out.get()), nullptr);
+  pk::moe_gate_up(ex, reinterpret_cast<const ingine::ActT*>(d_x.get()), T, wk,
+                  reinterpret_cast<ingine::ActT*>(act.get()), nullptr);
+  pk::moe_down(ex, reinterpret_cast<const ingine::ActT*>(act.get()), T, wk,
+               reinterpret_cast<ingine::ActT*>(down.get()), nullptr);
+  pk::moe_combine(reinterpret_cast<const ingine::ActT*>(down.get()), d_wts.get(), T,
+                  reinterpret_cast<ingine::ActT*>(out.get()), nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   bool ok = true;
 

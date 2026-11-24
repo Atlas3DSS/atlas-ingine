@@ -22,6 +22,7 @@ project(ingine LANGUAGES C CXX CUDA)
 option(INGINE_BUILD_TESTS "Build ingine tests" OFF)
 option(INGINE_BUILD_APPS "Build the ingine executables (serve, bench, validate)" ON)
 option(INGINE_ACT_FP16 "Use FP16 activations/weights instead of BF16 (required for pre-Ampere sm_60/70/75)" OFF)
+option(INGINE_FORCE_SIMT_MMA "Force FP32-accumulated SIMT MMA fallback on all archs (to oracle-verify Pascal sm_60/61 path on V100)" OFF)
 
 # Detect pre-Ampere (< sm_80) and Ampere+ (>= sm_80) architectures.
 set(_ingine_has_pre_sm80 OFF)

@@ -20,8 +20,8 @@ inline constexpr float kE2M1[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.
 
 inline double rbf(double x) { return round_bf16(float(x)); }  // to FP32, then BF16 (nearest even)
 
-inline std::vector<__nv_bfloat16> to_bf16(const std::vector<float>& v) {
-  std::vector<__nv_bfloat16> o(v.size());
+inline std::vector<ingine::ActT> to_bf16(const std::vector<float>& v) {
+  std::vector<ingine::ActT> o(v.size());
   for (size_t i = 0; i < v.size(); ++i) o[i] = float_to_bf16(v[i]);
   return o;
 }
@@ -83,7 +83,7 @@ struct Check {
   }
 };
 
-inline std::vector<float> bf16_download(const DeviceArray<__nv_bfloat16>& d) {
+inline std::vector<float> bf16_download(const DeviceArray<ingine::ActT>& d) {
   const auto h = d.download();
   std::vector<float> o(h.size());
   for (size_t i = 0; i < h.size(); ++i) o[i] = bf16_to_float(h[i]);

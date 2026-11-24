@@ -1,9 +1,10 @@
 // Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
 #pragma once
 
-// Shared helpers for ingine tests: skip codes, deterministic data, BF16/FP8 conversion,
+// Shared helpers for ingine tests: skip codes, deterministic data, ActT/FP8 conversion,
 // and tolerance comparison against FP64 oracles.
-#include <cuda_bf16.h>
+#include "core/act.h"
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -76,31 +77,12 @@ struct Rng {
   }
 };
 
-inline float bf16_to_float(__nv_bfloat16 v) {
-  uint16_t bits;
-  std::memcpy(&bits, &v, 2);
-  uint32_t w = uint32_t(bits) << 16;
-  float f;
-  std::memcpy(&f, &w, 4);
-  return f;
-}
+inline float bf16_to_float(ingine::ActT v) { return ingine::act::host_to_float(v); }
 
-// Round-to-nearest-even FP32 -> BF16 (NaN preserved).
-inline __nv_bfloat16 float_to_bf16(float f) {
-  uint32_t w;
-  std::memcpy(&w, &f, 4);
-  uint16_t bits;
-  if ((w & 0x7fffffffu) > 0x7f800000u) {
-    bits = uint16_t((w >> 16) | 0x40);
-  } else {
-    bits = uint16_t((w + 0x7fffu + ((w >> 16) & 1u)) >> 16);
-  }
-  __nv_bfloat16 v;
-  std::memcpy(&v, &bits, 2);
-  return v;
-}
+// Round-to-nearest-even FP32 -> ActT (BF16 on SM80+, FP16 clamped on INGINE_ACT_FP16).
+inline ingine::ActT float_to_bf16(float f) { return ingine::act::host_from_float(f); }
 
-inline float round_bf16(float f) { return bf16_to_float(float_to_bf16(f)); }
+inline float round_bf16(float f) { return ingine::act::host_round(f); }
 
 // E4M3FN code -> float.
 inline float e4m3_to_float(uint8_t code) {

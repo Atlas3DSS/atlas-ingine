@@ -86,7 +86,7 @@ bool test_proj(Rng& rng, int M, bool fp8, bool full, bool single) {
   const int nseg = int(seg.size() / 3), R = seg[seg.size() - 2];
   const Weights w = make_weights(rng, R, H, fp8, 0.03);
   const std::vector<float> x = randn_bf16(rng, size_t(3) * M * H, 1.0);
-  DeviceArray<__nv_bfloat16> dx(to_bf16(x));
+  DeviceArray<ingine::ActT> dx(to_bf16(x));
   DeviceArray<int> dseg(seg);
   DeviceArray<float> out(size_t(M) * R);
   dense::proj(dx.get(), M, w.matrix(), dseg.get(), nseg, out.get(), true, g_stream);
@@ -111,7 +111,7 @@ bool test_proj_conv(Rng& rng, int M, bool fp8) {
   const std::vector<float> x = randn_bf16(rng, size_t(M) * K, 1.0);
   const std::vector<float> cw = randn(rng, size_t(H) * 4, 0.5);
   const std::vector<float> st0 = randn_bf16(rng, size_t(3) * H, 1.0);
-  DeviceArray<__nv_bfloat16> dx(to_bf16(x));
+  DeviceArray<ingine::ActT> dx(to_bf16(x));
   DeviceArray<float> dcw(cw), dst(st0), out(size_t(M) * H), hist(size_t(M) * H);
   dense::proj_conv(dx.get(), M, w.matrix(), dcw.get(), dst.get(), out.get(), hist.get(), true, g_stream);
   sync();
@@ -148,7 +148,7 @@ bool test_head(Rng& rng, int M, bool fp8) {
   const int V = 5000;
   const Weights w = make_weights(rng, V, H, fp8, 0.05);
   const std::vector<float> x = randn_bf16(rng, size_t(M) * H, 1.0);
-  DeviceArray<__nv_bfloat16> dx(to_bf16(x));
+  DeviceArray<ingine::ActT> dx(to_bf16(x));
   DeviceArray<float> out(size_t(M) * V);
   dense::head(dx.get(), M, w.matrix(), out.get(), true, g_stream);
   sync();
@@ -180,7 +180,7 @@ bool test_router(Rng& rng, int M, bool wf32, bool ties = false) {
     for (int e : {30, 31, 32, 33, 34, 35}) bias[e] = 1.5f - 1e-3f * float(e);  // crowd around the cut
   }
   const std::vector<float> x = randn_bf16(rng, size_t(M) * H, 1.0);
-  DeviceArray<__nv_bfloat16> dx(to_bf16(x)), dwb(to_bf16(w));
+  DeviceArray<ingine::ActT> dx(to_bf16(x)), dwb(to_bf16(w));
   DeviceArray<float> dwf(w), db(bias), wts(size_t(M) * 8);
   DeviceArray<int> idx(size_t(M) * 8);
   dense::router(dx.get(), M, wf32 ? static_cast<const void*>(dwf.get()) : static_cast<const void*>(dwb.get()), wf32,
@@ -248,7 +248,7 @@ bool test_mix(Rng& rng, int M, const MixCase& c) {
   std::vector<float> gw(g);
   for (auto& v : gw) v += 1.f;
   DeviceArray<float> dbase(base), dwrite(write), dr(r), daw(aw), dq(q), dg(gw), part(n), of(size_t(c.Q) * n);
-  DeviceArray<__nv_bfloat16> ob(size_t(c.Q) * n), nb16(size_t(M) * 2 * H), oc16(size_t(M) * 2 * H);
+  DeviceArray<ingine::ActT> ob(size_t(c.Q) * n), nb16(size_t(M) * 2 * H), oc16(size_t(M) * 2 * H);
   const std::vector<float> csrc = randn(rng, size_t(M) * 3 * H, 1.0);
   DeviceArray<float> dcsrc(csrc), dcdst(size_t(M) * 2 * 1024);
   dense::MixParams p;
@@ -375,7 +375,7 @@ bool test_gates(Rng& rng, int G, int M, bool fg32, bool h_shared = false) {
   std::vector<float> nw = randn(rng, size_t(G) * H, 0.1);
   for (auto& v : nw) v += 1.f;
   DeviceArray<float> dh(h), dm(msg), dwf32(wf), dwg32(wg), dn(nw), of(n);
-  DeviceArray<__nv_bfloat16> dwd(to_bf16(wd)), dwf16(to_bf16(wf)), dwg16(to_bf16(wg)), ob(n);
+  DeviceArray<ingine::ActT> dwd(to_bf16(wd)), dwf16(to_bf16(wf)), dwg16(to_bf16(wg)), ob(n);
   dense::message_gates(dh.get(), h_shared, dm.get(), G, M, dwd.get(),
                        fg32 ? (const void*)dwf32.get() : (const void*)dwf16.get(),
                        fg32 ? (const void*)dwg32.get() : (const void*)dwg16.get(), fg32, dn.get(), ob.get(), of.get(),
@@ -428,7 +428,7 @@ bool test_embed(Rng& rng, int M) {
   for (auto& v : nw) v += 1.f;
   std::vector<int64_t> tok(M);
   for (auto& t : tok) t = int64_t(rng.next() % V);
-  DeviceArray<__nv_bfloat16> dt(to_bf16(table));
+  DeviceArray<ingine::ActT> dt(to_bf16(table));
   DeviceArray<float> dn(nw), out(size_t(M) * H);
   DeviceArray<int64_t> dtok(tok);
   dense::embed(dtok.get(), M, dt.get(), dn.get(), out.get(), true, g_stream);
@@ -450,10 +450,10 @@ bool test_fp8_rows(Rng& rng) {
   const int rows = 64, K = H;
   std::vector<float> w = randn_bf16(rng, size_t(rows) * K, 0.03);
   for (int k = 0; k < K; ++k) w[size_t(5) * K + k] = 0.f;  // an all-zero row: scale 0, codes 0
-  DeviceArray<__nv_bfloat16> dw(to_bf16(w));
+  DeviceArray<ingine::ActT> dw(to_bf16(w));
   DeviceArray<uint8_t> q(size_t(rows) * K);
   DeviceArray<float> s(rows);
-  DeviceArray<__nv_bfloat16> back(size_t(rows) * K);
+  DeviceArray<ingine::ActT> back(size_t(rows) * K);
   dense::fp8_rows(dw.get(), rows, K, q.get(), s.get(), g_stream);
   dense::dequant_rows(q.get(), s.get(), rows, K, back.get(), g_stream);
   sync();
@@ -532,7 +532,7 @@ uint64_t lock_mix(LockGen& g, int M, bool& pair_ok) {
   Fnv f;
   auto run = [&](int nb, int Q, bool has_base, bool has_write, bool abl, bool bf16, bool f32) {
     DeviceArray<float> part(n), of(size_t(Q) * n);
-    DeviceArray<__nv_bfloat16> ob(size_t(Q) * n), nb16(size_t(M) * 2 * H);
+    DeviceArray<ingine::ActT> ob(size_t(Q) * n), nb16(size_t(M) * 2 * H);
     dense::MixParams p;
     p.blocks = nb ? reinterpret_cast<const float* const*>(table.get()) : nullptr;
     p.nblocks = nb;
@@ -593,9 +593,9 @@ uint64_t lock_gates(LockGen& g, int M) {
     const size_t n = size_t(G) * M * H;
     DeviceArray<float> h(g.vec(shared ? size_t(M) * H : n, 2.f)), msg(g.vec(n, 2.f)), nw(g.vec(size_t(G) * H, 0.25f, 1.f));
     DeviceArray<float> of(n);
-    DeviceArray<__nv_bfloat16> wd(to_bf16(g.vec_bf16(size_t(G) * 64 * 2 * H, 0.04f)));
-    DeviceArray<__nv_bfloat16> wf(to_bf16(g.vec_bf16(size_t(G) * H * 64, 0.2f))), wg(to_bf16(g.vec_bf16(size_t(G) * H * 64, 0.2f)));
-    DeviceArray<__nv_bfloat16> ob(n);
+    DeviceArray<ingine::ActT> wd(to_bf16(g.vec_bf16(size_t(G) * 64 * 2 * H, 0.04f)));
+    DeviceArray<ingine::ActT> wf(to_bf16(g.vec_bf16(size_t(G) * H * 64, 0.2f))), wg(to_bf16(g.vec_bf16(size_t(G) * H * 64, 0.2f)));
+    DeviceArray<ingine::ActT> ob(n);
     dense::message_gates(h.get(), shared, msg.get(), G, M, wd.get(), wf.get(), wg.get(), false, nw.get(), ob.get(),
                          of.get(), true, g_stream);
     sync();
@@ -610,7 +610,7 @@ uint64_t lock_router(LockGen& g, int M) {
     std::copy_n(&w[size_t(3) * H], H, &w[size_t(e) * H]);
     bias[e] = bias[3];
   }
-  DeviceArray<__nv_bfloat16> x(to_bf16(g.vec_bf16(size_t(M) * H, 2.f))), dw(to_bf16(w));
+  DeviceArray<ingine::ActT> x(to_bf16(g.vec_bf16(size_t(M) * H, 2.f))), dw(to_bf16(w));
   DeviceArray<float> db(bias), wts(size_t(M) * 8);
   DeviceArray<int> idx(size_t(M) * 8);
   dense::router(x.get(), M, dw.get(), false, db.get(), idx.get(), wts.get(), true, g_stream);

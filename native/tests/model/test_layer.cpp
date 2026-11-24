@@ -26,9 +26,9 @@ std::vector<float> host_values(const SafetensorsModel& m, const std::string& nam
   std::vector<float> out(std::size_t(ref->numel()));
   for (std::size_t i = 0; i < out.size(); ++i) {
     if (ref->dtype == "BF16") {
-      __nv_bfloat16 b;
+      std::uint16_t b;
       std::memcpy(&b, raw.data() + 2 * i, 2);
-      out[i] = bf16_to_float(b);
+      out[i] = ingine::act::host_bf16_bits_to_float(b);
     } else {
       std::memcpy(&out[i], raw.data() + 4 * i, 4);
     }
@@ -64,9 +64,9 @@ bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
   // FP8 rows: dequantized wproj reproduces the BF16 checkpoint within E4M3 precision
   DeviceBuffer deq(std::size_t(R) * H * 2);
   kernels::dense::dequant_rows(layer.wproj.w.data, static_cast<const float*>(layer.wproj.scale.data), R, H,
-                               static_cast<__nv_bfloat16*>(deq.p), stream);
+                               static_cast<ingine::ActT*>(deq.p), stream);
   INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
-  const auto got = download<__nv_bfloat16>(deq.p, std::size_t(R) * H);
+  const auto got = download<ingine::ActT>(deq.p, std::size_t(R) * H);
   const auto scale = download<float>(layer.wproj.scale.data, R);
   const char* names[NUM_SEGS] = {"attn.wq_du.weight",        "attn.gate_attn.weight",     "attn.wr_du.weight",
                                  "attn.attn_sink_proj.weight", "attn.wk_dv.weight",       "attn.wv_dv.weight",
@@ -112,18 +112,18 @@ bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
   }
   {
     const auto want = host_values(m, p + "mlp.gate.weight");
-    const auto have = download<__nv_bfloat16>(layer.router_bf16.data, want.size());
+    const auto have = download<ingine::ActT>(layer.router_bf16.data, want.size());
     bool eq = true;
-    for (std::size_t i = 0; i < want.size(); ++i) eq &= bf16_to_float(have[i]) == want[i];
+    for (std::size_t i = 0; i < want.size(); ++i) eq &= bf16_to_float(have[i]) == ingine::test::round_bf16(want[i]);
     expect(eq, "router_bf16 holds the checkpoint values");
   }
   if (layer.loop) {
     same_f32(layer.k_gate_forget, p + "controllers.k.forget_weight");
     same_f32(layer.mlp_gate_gain, p + "controllers.mlp.gain_weight");
     const auto want = host_values(m, p + "controllers.v.down_weight");
-    const auto have = download<__nv_bfloat16>(layer.v_gate_down.data, want.size());
+    const auto have = download<ingine::ActT>(layer.v_gate_down.data, want.size());
     bool eq = true;
-    for (std::size_t i = 0; i < want.size(); ++i) eq &= bf16_to_float(have[i]) == want[i];
+    for (std::size_t i = 0; i < want.size(); ++i) eq &= bf16_to_float(have[i]) == ingine::test::round_bf16(want[i]);
     expect(eq && layer.v_gate_down.data == static_cast<char*>(layer.qkv_gate_down.data) + std::size_t(2) * 64 * 2 * H * 2,
            "v_gate_down is gate 2 of the qkv stack");
   }

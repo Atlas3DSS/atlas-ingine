@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
 
   int32_t* d_ids = nullptr;
   float* d_logits = nullptr;
-  __nv_bfloat16* d_taps = nullptr;
+  ingine::ActT* d_taps = nullptr;
   INGINE_TEST_CUDA(cudaMalloc(&d_ids, N * 4));
   INGINE_TEST_CUDA(cudaMalloc(&d_logits, size_t(UNPADDED_VOCAB) * 4));
   INGINE_TEST_CUDA(cudaMalloc(&d_taps, size_t(2048) * NUM_TAPS * HIDDEN * 2));
@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
     reset_state(st, s);
     for (int p0 = 0; p0 < upto; p0 += chunk) {
       const int T = std::min(chunk, upto - p0);
-      Tensor taps = rm(d_taps, DType::BF16, {T, NUM_TAPS, HIDDEN});
+      Tensor taps = rm(d_taps, ingine::kActDType, {T, NUM_TAPS, HIDDEN});
       pre.run(st, d_ids + p0, T, p0, d_logits, last_taps ? &taps : nullptr);
       if (last_taps && p0 + T == upto) {
         last_taps->resize(size_t(NUM_TAPS) * HIDDEN);

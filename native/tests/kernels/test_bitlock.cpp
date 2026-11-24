@@ -72,7 +72,7 @@ struct Fnv {
 // A weight matrix [rows, K] as BF16 rows and as E4M3 rows with per-row scales.
 struct DenseWeight {
   int rows, K;
-  DeviceArray<__nv_bfloat16> bf16;
+  DeviceArray<ingine::ActT> bf16;
   DeviceArray<uint8_t> fp8;
   DeviceArray<float> scale;
   DenseWeight(LockGen& g, int rows_, int K_)
@@ -104,7 +104,7 @@ std::vector<int> segments(bool full, bool single) {
 
 uint64_t lock_proj(LockGen& g, const DenseWeight& w, int M) {
   Fnv f;
-  DeviceArray<__nv_bfloat16> xin(to_bf16(g.vec_bf16(size_t(3) * M * H, 1.5f)));
+  DeviceArray<ingine::ActT> xin(to_bf16(g.vec_bf16(size_t(3) * M * H, 1.5f)));
   for (int f8 = 0; f8 < 2; ++f8)
     for (int shape = 0; shape < 3; ++shape) {  // sliding single input, sliding three inputs, full
       const bool full = shape == 2;
@@ -123,7 +123,7 @@ uint64_t lock_proj(LockGen& g, const DenseWeight& w, int M) {
 
 uint64_t lock_proj_conv(LockGen& g, const DenseWeight& w, int M) {
   Fnv f;
-  DeviceArray<__nv_bfloat16> x(to_bf16(g.vec_bf16(size_t(M) * 3072, 1.5f)));
+  DeviceArray<ingine::ActT> x(to_bf16(g.vec_bf16(size_t(M) * 3072, 1.5f)));
   DeviceArray<float> cw(g.vec(size_t(H) * 4, 0.5f));
   const std::vector<float> st0 = g.vec_bf16(size_t(3) * H, 0.3f);
   for (int f8 = 0; f8 < 2; ++f8) {
@@ -137,7 +137,7 @@ uint64_t lock_proj_conv(LockGen& g, const DenseWeight& w, int M) {
 
 uint64_t lock_head(LockGen& g, const DenseWeight& w, int M) {
   Fnv f;
-  DeviceArray<__nv_bfloat16> x(to_bf16(g.vec_bf16(size_t(M) * H, 1.5f)));
+  DeviceArray<ingine::ActT> x(to_bf16(g.vec_bf16(size_t(M) * H, 1.5f)));
   for (int f8 = 0; f8 < 2; ++f8) {
     dense::Matrix m = w.matrix(f8);
     m.rows = 5003;  // a last block with fewer than 16 rows
@@ -197,12 +197,12 @@ uint64_t lock_moe(LockGen& g, const ExpertWeight& w13, const ExpertWeight& w2, b
   Fnv f;
   const moe::Format fmt = nv ? moe::Format::NVFP4 : moe::Format::MXFP8;
   DeviceArray<int> idx(routing(g, M));
-  DeviceArray<__nv_bfloat16> x(to_bf16(g.vec_bf16(size_t(M) * H, 1.5f))), act(size_t(M) * TOPK * I);
+  DeviceArray<ingine::ActT> x(to_bf16(g.vec_bf16(size_t(M) * H, 1.5f))), act(size_t(M) * TOPK * I);
   moe::moe_up(x.get(), M, idx.get(), w13.codes.get(), w13.scales.get(), nv ? w13.factor.get() : nullptr, fmt, act.get(),
               true, g_stream);
   sync();
   f.add(act.download());
-  DeviceArray<__nv_bfloat16> act2(to_bf16(g.vec_bf16(size_t(M) * TOPK * I, 0.75f)));
+  DeviceArray<ingine::ActT> act2(to_bf16(g.vec_bf16(size_t(M) * TOPK * I, 0.75f)));
   DeviceArray<float> wts(g.vec(size_t(M) * TOPK, 0.9f, 1.1f)), cw(g.vec(size_t(H) * 4, 0.5f));
   DeviceArray<float> st(g.vec_bf16(size_t(3) * H, 0.3f)), out(size_t(M) * H), hist(size_t(M) * H);
   moe::moe_down(act2.get(), M, idx.get(), wts.get(), w2.codes.get(), w2.scales.get(), nv ? w2.factor.get() : nullptr,
@@ -244,9 +244,9 @@ uint64_t lock_attn_sliding(LockGen& g, int M) {
         for (int i = 0; i < 6; ++i) kpos[(p0 + i) % WIN] = p0 + i;
     }
     DeviceArray<float> dproj(proj), ck(g.vec_bf16(size_t(3) * C, 1.f)), cv(g.vec_bf16(size_t(3) * C, 1.f));
-    DeviceArray<__nv_bfloat16> k(to_bf16(g.vec_bf16(size_t(WIN) * C, 1.6f))), v(to_bf16(g.vec_bf16(size_t(WIN) * C, 1.7f)));
+    DeviceArray<ingine::ActT> k(to_bf16(g.vec_bf16(size_t(WIN) * C, 1.6f))), v(to_bf16(g.vec_bf16(size_t(WIN) * C, 1.7f)));
     DeviceArray<int64_t> dkpos(kpos), dpos(std::vector<int64_t>{p0});
-    DeviceArray<__nv_bfloat16> out(size_t(M) * HQ * D);
+    DeviceArray<ingine::ActT> out(size_t(M) * HQ * D);
     attn::DecodeArgs a;
     a.proj = dproj.get();
     a.M = M;
@@ -326,6 +326,12 @@ int main() {
     }
   }
   for (int M = 1; M <= 8; ++M) {
+#if INGINE_ACT_FP16
+    std::printf("PASS bit lock M=%d (FP16 mode: determinism checked, BF16 kLock skipped): {", M);
+    for (int i = 0; i < kLocks; ++i)
+      std::printf("%s0x%016llxull", i ? ", " : "", static_cast<unsigned long long>(got[M - 1][i]));
+    std::printf("}\n");
+#else
     bool same = true;
     std::string diff;
     for (int i = 0; i < kLocks; ++i)
@@ -338,6 +344,7 @@ int main() {
       std::printf("%s0x%016llxull", i ? ", " : "", static_cast<unsigned long long>(got[M - 1][i]));
     std::printf("},%s\n", diff.c_str());
     ok = ok && same;
+#endif
   }
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

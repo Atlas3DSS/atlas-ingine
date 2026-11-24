@@ -30,7 +30,7 @@ __global__ void fill_bf16(uint16_t* p, size_t n, uint32_t seed, float scale) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
     uint32_t h = uint32_t(i) * 2654435761u ^ seed;
     h ^= h >> 15, h *= 2246822519u, h ^= h >> 13;
-    p[i] = __bfloat16_as_ushort(__float2bfloat16(((h & 0xffffff) / 16777216.f - 0.5f) * scale));
+    p[i] = ingine::act::to_bits(ingine::act::from_float(((h & 0xffffff) / 16777216.f - 0.5f) * scale));
   }
 }
 __global__ void fill_e4m3(uint8_t* p, size_t n, uint32_t seed) {
@@ -73,7 +73,7 @@ float time_ms(const std::function<void(int)>& f, int reps = 6) {
   return t[t.size() / 2];
 }
 
-const __nv_bfloat16* bf(const void* p) { return static_cast<const __nv_bfloat16*>(p); }
+const ingine::ActT* bf(const void* p) { return static_cast<const ingine::ActT*>(p); }
 
 }  // namespace
 
@@ -140,12 +140,12 @@ int main(int argc, char** argv) {
         const float t_up = time_ms([&](int r) {
           const Layer& L = (*set)[r % set->size()];
           route(L, T);
-          pk::moe_gate_up(experts(L), bf(x), T, w, reinterpret_cast<__nv_bfloat16*>(act), s);
+          pk::moe_gate_up(experts(L), bf(x), T, w, reinterpret_cast<ingine::ActT*>(act), s);
         }) - t_route;
         const float t_down = time_ms([&](int r) {
           const Layer& L = (*set)[r % set->size()];
           route(L, T);
-          pk::moe_down(experts(L), bf(act), T, w, reinterpret_cast<__nv_bfloat16*>(down), s);
+          pk::moe_down(experts(L), bf(act), T, w, reinterpret_cast<ingine::ActT*>(down), s);
         }) - t_route;
         // experts touched by the last routing
         std::vector<int> counts(128);
@@ -172,10 +172,10 @@ int main(int argc, char** argv) {
       const float t = time_ms([&](int r) {
         const Layer& L = nv[r % 3];  // sliding layers: single-input projection
         kernels::dense::dequant_rows(L.wproj.w.data, static_cast<const float*>(L.wproj.scale.data), PROJ_ROWS_SLIDING, H,
-                                     reinterpret_cast<__nv_bfloat16*>(scratch), s);
+                                     reinterpret_cast<ingine::ActT*>(scratch), s);
         gemm.run(bf(x), H, bf(scratch), H, proj, PROJ_ROWS_SLIDING, false, T, PROJ_ROWS_SLIDING, H, s);
         kernels::dense::dequant_rows(L.wo.w.data, static_cast<const float*>(L.wo.scale.data), H, 3072,
-                                     reinterpret_cast<__nv_bfloat16*>(scratch), s);
+                                     reinterpret_cast<ingine::ActT*>(scratch), s);
         gemm.run(bf(attn), 3072, bf(scratch), 3072, wo_out, H, false, T, H, 3072, s);
       });
       const double flop = 2.0 * T * H * (PROJ_ROWS_SLIDING + 3072), bytes = double(H) * (PROJ_ROWS_SLIDING + 3072);
@@ -195,12 +195,12 @@ int main(int argc, char** argv) {
     fill_bf16<<<1024, 256, 0, s>>>(rel, size_t(maxT) * 24 * 1024, 5, 2.f);
     fill_bf16<<<1024, 256, 0, s>>>(proj, size_t(maxT) * PROJ_ROWS_FULL, 6, 2.f);
     pk::AttnParams p;
-    p.q = bf(q), p.rel = bf(rel), p.proj = bf(proj), p.ld = PROJ_ROWS_FULL, p.out = reinterpret_cast<__nv_bfloat16*>(out);
+    p.q = bf(q), p.rel = bf(rel), p.proj = bf(proj), p.ld = PROJ_ROWS_FULL, p.out = reinterpret_cast<ingine::ActT*>(out);
     // rel_logits
     for (int T : Ts) {
       const float t = time_ms([&](int r) {
         pk::rel_logits(bf(rel16), static_cast<const float*>(nv[r % 3].rel_proj.data), T,
-                       reinterpret_cast<__nv_bfloat16*>(rel), s);
+                       reinterpret_cast<ingine::ActT*>(rel), s);
       });
       std::printf("rel_logits T=%4d: %.3f ms\n", T, t);
     }

@@ -67,7 +67,7 @@ Cache make_cache(Rng& rng, int rows, bool fp8) {
       if (fp8) {
         b[i] = float_to_e4m3(x[i]);
       } else {
-        const __nv_bfloat16 h = float_to_bf16(x[i]);
+        const ingine::ActT h = float_to_bf16(x[i]);
         std::memcpy(&b[2 * i], &h, 2);
       }
     }
@@ -85,7 +85,7 @@ std::vector<float> cache_values(const DeviceArray<uint8_t>& d, bool fp8) {
     if (fp8) {
       o[i] = e4m3_to_float(b[i]);
     } else {
-      __nv_bfloat16 h;
+      ingine::ActT h;
       std::memcpy(&h, &b[2 * i], 2);
       o[i] = bf16_to_float(h);
     }
@@ -128,7 +128,7 @@ bool run(Rng& rng, const Case& cs) {
   if (full) kpos.assign(1, 0);
   DeviceArray<int64_t> dkpos(kpos), dpos(std::vector<int64_t>{p0});
   DeviceArray<uint8_t> ws(attn::workspace_bytes(8));
-  DeviceArray<__nv_bfloat16> out(size_t(M) * HQ * D);
+  DeviceArray<ingine::ActT> out(size_t(M) * HQ * D);
   attn::DecodeArgs a;
   a.proj = dproj.get();
   a.M = M;
@@ -152,7 +152,7 @@ bool run(Rng& rng, const Case& cs) {
   a.out = out.get();
   attn::attn_decode(a, g_stream);
   INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
-  const std::vector<__nv_bfloat16> out_first = out.download();
+  const std::vector<ingine::ActT> out_first = out.download();
 
   // ---- oracle: q / rel post-processing
   std::vector<double> q(size_t(M) * HQ * D), rel(size_t(M) * HQ * DREL), rl(size_t(M) * HQ * EXT);
@@ -298,7 +298,7 @@ bool run(Rng& rng, const Case& cs) {
       dcv.upload(cv0);
       attn::attn_decode(a, g_stream);
       INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
-      const std::vector<__nv_bfloat16> again = out.download();
+      const std::vector<ingine::ActT> again = out.download();
       for (size_t i = 0; i < again.size(); ++i) diff += std::memcmp(&again[i], &out_first[i], 2) != 0;
     }
     std::printf("%s %s stale rows after p0 + M: %zu output values differ\n", diff ? "FAIL" : "PASS", n.c_str(), diff);

@@ -42,10 +42,10 @@ bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
   DeviceArray<float> d_qs(q_scale), d_rs(r_scale), d_kw(kw), d_vw(vw), d_ck(conv_k), d_cv(conv_v);
   DeviceArray<uint8_t> kout(size_t(T) * KV * 2), vout(size_t(T) * KV * 2);
   pk::AttnPrepParams p;
-  p.proj = reinterpret_cast<const __nv_bfloat16*>(d_proj.get()), p.ld = ld, p.T = T, p.pos0 = pos0, p.full = full;
+  p.proj = reinterpret_cast<const ingine::ActT*>(d_proj.get()), p.ld = ld, p.T = T, p.pos0 = pos0, p.full = full;
   p.q_scale = d_qs.get(), p.r_scale = d_rs.get(), p.k_w = d_kw.get(), p.v_w = d_vw.get();
   p.conv_k = d_ck.get(), p.conv_v = d_cv.get();
-  p.q = reinterpret_cast<__nv_bfloat16*>(q.get()), p.rel = reinterpret_cast<__nv_bfloat16*>(rel.get());
+  p.q = reinterpret_cast<ingine::ActT*>(q.get()), p.rel = reinterpret_cast<ingine::ActT*>(rel.get());
   p.k_out = kout.get(), p.v_out = vout.get(), p.out_fp8 = fp8;
   pk::attn_prep(p, nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
@@ -131,8 +131,8 @@ bool test_rel_logits(Rng& rng, int T) {
   const auto proj = rand_f32(rng, 16 * 1024, 0.5);
   DeviceArray<uint16_t> d_rel(rel), out(size_t(T) * HQ * 1024);
   DeviceArray<float> d_proj(proj);
-  pk::rel_logits(reinterpret_cast<const __nv_bfloat16*>(d_rel.get()), d_proj.get(), T,
-                 reinterpret_cast<__nv_bfloat16*>(out.get()), nullptr);
+  pk::rel_logits(reinterpret_cast<const ingine::ActT*>(d_rel.get()), d_proj.get(), T,
+                 reinterpret_cast<ingine::ActT*>(out.get()), nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto g = out.download();
   std::vector<float> got;
@@ -153,9 +153,9 @@ bool test_conv(Rng& rng, int T) {
   const auto state = rand_f32(rng, 3 * C, 1.0);
   DeviceArray<uint16_t> d_x(x);
   DeviceArray<float> d_w(w), d_state(state), out(size_t(T) * C);
-  pk::static_conv(reinterpret_cast<const __nv_bfloat16*>(d_x.get()), ld, T, C, d_w.get(), d_state.get(), out.get(),
+  pk::static_conv(reinterpret_cast<const ingine::ActT*>(d_x.get()), ld, T, C, d_w.get(), d_state.get(), out.get(),
                   nullptr);
-  pk::conv_state_update(d_state.get(), reinterpret_cast<const __nv_bfloat16*>(d_x.get()), ld, T, C, nullptr);
+  pk::conv_state_update(d_state.get(), reinterpret_cast<const ingine::ActT*>(d_x.get()), ld, T, C, nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   auto in = [&](int s, int c) { return s >= 0 ? double(bf16_val(x[size_t(s) * ld + c])) : double(state[(3 + s) * C + c]); };
   const auto g = out.download();
@@ -191,12 +191,12 @@ bool test_gates(Rng& rng, int T) {
     rows.h[g] = dh.back().get(), rows.msg[g] = dm.back().get();
   }
   DeviceArray<uint16_t> gin(size_t(G) * T * 2 * H);
-  pk::gate_inputs(rows, G, T, reinterpret_cast<__nv_bfloat16*>(gin.get()), nullptr);
+  pk::gate_inputs(rows, G, T, reinterpret_cast<ingine::ActT*>(gin.get()), nullptr);
   const auto f = rand_f32(rng, size_t(T) * H, 1.0), gn = rand_f32(rng, size_t(T) * H, 1.0);
   const auto nw = rand_f32(rng, H, 0.2, 1.0);
   DeviceArray<float> df(f), dg(gn), dnw(nw);
   DeviceArray<uint16_t> out(size_t(T) * H);
-  pk::gate_apply(dh[1].get(), dm[1].get(), df.get(), dg.get(), dnw.get(), T, reinterpret_cast<__nv_bfloat16*>(out.get()),
+  pk::gate_apply(dh[1].get(), dm[1].get(), df.get(), dg.get(), dnw.get(), T, reinterpret_cast<ingine::ActT*>(out.get()),
                  nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto gi = gin.download(), go = out.download();
@@ -253,7 +253,7 @@ bool test_head(Rng& rng, bool fp8) {
   DeviceArray<uint16_t> dx(x), dwb(fp8 ? std::vector<uint16_t>(1) : wb);
   DeviceArray<uint8_t> dw8(fp8 ? w8 : std::vector<uint8_t>(1));
   DeviceArray<float> ds(fp8 ? scale : std::vector<float>(1)), out(V);
-  pk::head_logits(reinterpret_cast<const __nv_bfloat16*>(dx.get()), fp8 ? (const void*)dw8.get() : (const void*)dwb.get(),
+  pk::head_logits(reinterpret_cast<const ingine::ActT*>(dx.get()), fp8 ? (const void*)dw8.get() : (const void*)dwb.get(),
                   fp8 ? ds.get() : nullptr, V, out.get(), nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto g = out.download();
@@ -273,9 +273,9 @@ bool test_gemm(Rng& rng) {
   DeviceArray<uint16_t> dA(A), dB(B), dC(size_t(M) * ldc);
   DeviceArray<float> dF(size_t(M) * N);
   pk::Gemm gemm;
-  gemm.run(reinterpret_cast<const __nv_bfloat16*>(dA.get()), lda, reinterpret_cast<const __nv_bfloat16*>(dB.get()), K,
+  gemm.run(reinterpret_cast<const ingine::ActT*>(dA.get()), lda, reinterpret_cast<const ingine::ActT*>(dB.get()), K,
            dC.get(), ldc, false, M, N, K, nullptr);
-  gemm.run(reinterpret_cast<const __nv_bfloat16*>(dA.get()), lda, reinterpret_cast<const __nv_bfloat16*>(dB.get()), K,
+  gemm.run(reinterpret_cast<const ingine::ActT*>(dA.get()), lda, reinterpret_cast<const ingine::ActT*>(dB.get()), K,
            dF.get(), N, true, M, N, K, nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto gc = dC.download();
@@ -299,7 +299,7 @@ bool test_taps(Rng& rng) {
   const auto x = rand_f32(rng, size_t(T) * H, 1.0);
   DeviceArray<float> dx(x);
   DeviceArray<uint16_t> taps(size_t(T) * 4 * H);
-  pk::store_tap(dx.get(), T, reinterpret_cast<__nv_bfloat16*>(taps.get()) + 2 * H, 4 * H, nullptr);
+  pk::store_tap(dx.get(), T, reinterpret_cast<ingine::ActT*>(taps.get()) + 2 * H, 4 * H, nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto g = taps.download();
   std::vector<float> got;
@@ -320,8 +320,8 @@ bool test_image_rows(Rng& rng) {
   DeviceArray<uint16_t> d_src(src);
   DeviceArray<float> dst(size_t(rows + 2) * H);
   dst.upload(std::vector<float>(dst.count, 9.f));
-  pk::put_rows(reinterpret_cast<const __nv_bfloat16*>(d_src.get()), rows, dst.get() + H, nullptr);
-  pk::put_rows(reinterpret_cast<const __nv_bfloat16*>(d_src.get()), 0, dst.get(), nullptr);  // no rows: no launch
+  pk::put_rows(reinterpret_cast<const ingine::ActT*>(d_src.get()), rows, dst.get() + H, nullptr);
+  pk::put_rows(reinterpret_cast<const ingine::ActT*>(d_src.get()), 0, dst.get(), nullptr);  // no rows: no launch
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   bool ok = wide.download() == std::vector<int64_t>{5, 200054, 200053, 200054, 0, 200054};
   const auto got = dst.download();

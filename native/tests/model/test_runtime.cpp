@@ -58,9 +58,9 @@ struct Gen {
   Tensor bf16(std::initializer_list<std::int32_t> shape, double sd) {
     std::size_t n = 1;
     for (auto d : shape) n *= std::size_t(d);
-    std::vector<__nv_bfloat16> h(n);
+    std::vector<ingine::ActT> h(n);
     for (auto& x : h) x = float_to_bf16(float(rng.normal() * sd));
-    return rm(up(h.data(), n * 2), DType::BF16, shape);
+    return rm(up(h.data(), n * 2), ingine::kActDType, shape);
   }
   Dense fp8(int rows, int cols, double sd) {
     const Tensor b = bf16({rows, cols}, sd);
@@ -68,7 +68,7 @@ struct Gen {
     void* q = st.back().p;
     st.emplace_back(std::size_t(rows) * 4);
     float* s = static_cast<float*>(st.back().p);
-    kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(b.data), rows, cols, q, s, stream);
+    kernels::dense::fp8_rows(static_cast<const ingine::ActT*>(b.data), rows, cols, q, s, stream);
     INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
     return Dense{rm(q, DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows})};
   }
@@ -262,7 +262,7 @@ bool run(bool kv_fp8) {
     rt.decode_logits(toks[i], i);
     seq.push_back(logits_row(rt, 1, 0));
   }
-  const auto taps1 = host_t<__nv_bfloat16>(rt.buffers(1).taps, s);
+  const auto taps1 = host_t<ingine::ActT>(rt.buffers(1).taps, s);
   reset_state(rt.state(), s);
   rt.set_inputs({toks, 2}, 0);
   rt.run_step(2);
@@ -276,7 +276,7 @@ bool run(bool kv_fp8) {
   ok &= report(all_finite && worst < 0.03,
                "widths 2 + 4 reproduce six width-1 steps (worst relative L2 " + std::to_string(worst) + ")" + tag);
   {
-    const auto taps4 = host_t<__nv_bfloat16>(rt.buffers(4).taps, s);
+    const auto taps4 = host_t<ingine::ActT>(rt.buffers(4).taps, s);
     bool f = true;
     for (const auto* t : {&taps1, &taps4})
       for (auto x : *t) f &= std::isfinite(ingine::test::bf16_to_float(x));

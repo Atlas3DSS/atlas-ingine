@@ -27,7 +27,7 @@ __device__ uint32_t hash(size_t i, uint32_t seed) {
 }
 __global__ void k_bf16(uint16_t* p, size_t n, uint32_t seed, float scale) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
-    p[i] = __bfloat16_as_ushort(__float2bfloat16(((hash(i, seed) & 0xffffff) / 16777216.f - 0.5f) * 3.46f * scale));
+    p[i] = ingine::act::to_bits(ingine::act::from_float(((hash(i, seed) & 0xffffff) / 16777216.f - 0.5f) * 3.46f * scale));
 }
 __global__ void k_f32(float* p, size_t n, uint32_t seed, float scale, float offset) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
@@ -60,7 +60,7 @@ struct Alloc {
     for (int d : shape) n *= size_t(d);
     auto* p = static_cast<uint16_t*>(raw(n * 2));
     k_bf16<<<1024, 256>>>(p, n, seed++, scale);
-    return rm(p, DType::BF16, shape);
+    return rm(p, ingine::kActDType, shape);
   }
   Dense fp8(int rows, int cols, float scale) {
     auto* p = static_cast<uint8_t*>(raw(size_t(rows) * cols));
