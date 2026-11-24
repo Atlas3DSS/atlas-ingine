@@ -4,34 +4,45 @@ Multi-architecture Apache-2.0 CUDA inference engine for
 [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), forked from
 [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine).
 
-Inkling-2-Mini has run on **Tesla V100, RTX 3090, RTX 4090, and RTX PRO 6000 Blackwell**, with upstream results on the RTX 5090.
-Additional build targets include Pascal (`sm_60`/`sm_61`), Turing (`sm_75`), Ampere (`sm_80`), and Hopper (`sm_90`). The engine includes **native Elastic sub-4-bit MoE weights (`ATLAS2` / `ATLAS3`)**,
+Inkling-2-Mini has been benchmarked on real cards across **six NVIDIA GPU generations (2016 Pascal through 2025 Blackwell)**: **Tesla P100 (`sm_60`), Tesla V100 (`sm_70`), Tesla T4 & Quadro RTX 6000 (`sm_75`), RTX 3090 & A100 (`sm_86`/`sm_80`), RTX 4090 & H100 (`sm_89`/`sm_90`), and RTX PRO 6000 Blackwell (`sm_120a`)**, with upstream results on the RTX 5090. The engine includes **native Elastic sub-4-bit MoE weights (`ATLAS2` / `ATLAS3`)**,
 **DSpark speculative decoding**, **native vision input**, **OpenAI-compatible structured outputs (`response_format`:
 `json_object` / `json_schema`) + automatic tool-ban**, and a standalone **Verified Ledger SDK (`ledger/`)**.
-On the RTX 3090, all 24 BF16 dense output hashes matched between the pre-port build and the FP16 port. An earlier Blackwell run passed all 48 `kernels_bitlock` checks.
+On the RTX 3090, all 24 BF16 dense output hashes matched between the pre-port build and the FP16 port. Blackwell and V100 runs passed `kernels_bitlock` (`48/48` on Blackwell) and full-model parity; P100 (`sm_60`) and Turing (`sm_75`) passed kernel tests and real-card speed benchmarks (full-model parity ctest was not run on the cloud P100/T4/RTX 6000/A100/H100 instances).
 
-## Measured performance (64K & 262K context)
+## Measured performance (16K, 64K & 262K context across 6 NVIDIA generations)
 
-The 64K rows use `ingine-bench --max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000`.
-The V100 262K row measures memory and short-prompt decode with a 262,144-token context allocation, using `--effort low --tokens 64 --runs 1` and no long prompt.
+Unless noted, 64K rows use `ingine-bench --max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000` on commit `901d86e` (runtime opt-in SMEM dispatch for `<=64 KiB` Turing and `<=48 KiB` Pascal). 16K rows use `--max-ctx 16384 --long-prompt 16000`. The V100 262K row uses `--effort low --tokens 64 --runs 1` with no long prompt; A100 and H100 262K rows use `--max-ctx 262144 --tokens 512 --runs 2`.
 
-| GPU | Arch | Year | Checkpoint | VRAM | Chat decode | Code decode | 64K prefill |
+| GPU | Arch | Year | Checkpoint / Mode | VRAM | Chat decode | Code decode | Prefill |
 |---|---|---:|---|---:|---:|---:|---:|
-| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | Native `NVFP4+MXFP8` (64K) | `21.82 GB` | `59.8 tok/s` | `72.2 tok/s` | `717.7 tok/s` |
+| Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | Elastic `atlas-10g` (16K, `--spec`) | `13.33 GB` | `20.2 tok/s` | `22.9 tok/s` | `282 tok/s` (16K) |
+| Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | Elastic `atlas-10g` (64K, `--spec`) | `14.34 GB` | `11.9 tok/s` | `10.2 tok/s` | `72.8 tok/s` (64K) |
+| Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | Elastic `atlas-10g` (64K, no-spec) | `13.17 GB` | `7.9 tok/s` | `7.5 tok/s` | `70.1 tok/s` (64K) |
+| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | Native `NVFP4+MXFP8` (64K) | `21.82 GB` | `59.8 tok/s` | `72.2 tok/s` | `717.7 tok/s` (64K) |
 | Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | Native `NVFP4+MXFP8` (262K) | `25.04 GB` | `46.0 tok/s` | `54.9 tok/s` | — |
-| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Native `NVFP4+MXFP8` (64K) | `21.82 GB` | `154.9 tok/s` | `213.2 tok/s` | `2,980 tok/s` |
-| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Elastic `atlas-12g` (64K) | `16.37 GB` | `132.4 tok/s` | `161.2 tok/s` | `2,970 tok/s` |
-| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Elastic `atlas-10g` (64K) | `14.33 GB` | `145.6 tok/s` | `196.1 tok/s` | `3,012 tok/s` |
-| RTX 4090 24 GB | `sm_89` (BF16) | 2022 | Elastic `atlas-12g` (64K) | `16.36 GB` | `236.7 tok/s` | `278.3 tok/s` | `7,031 tok/s` |
-| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-12g` (64K) | `16.26 GB` | `411.0 tok/s` | `519.9 tok/s` | `11,728 tok/s` |
-| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-10g` (64K) | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` |
+| Tesla T4 16 GB | `sm_75` (FP16) | 2018 | Elastic `atlas-10g` (16K, `--spec`) | `13.33 GB` | `23.5 tok/s` | `25.2 tok/s` | `303 tok/s` (16K) |
+| Tesla T4 16 GB | `sm_75` (FP16) | 2018 | Elastic `atlas-10g` (64K, `--spec`) | `14.34 GB` | `22.1 tok/s` | `23.9 tok/s` | `237 tok/s` (64K) |
+| Quadro RTX 6000 24 GB | `sm_75` (FP16) | 2018 | Native `NVFP4+MXFP8` (64K) | `21.83 GB` | `47.9 tok/s` | `64.0 tok/s` | `431 tok/s` (64K) |
+| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Native `NVFP4+MXFP8` (64K) | `21.82 GB` | `154.9 tok/s` | `213.2 tok/s` | `2,980 tok/s` (64K) |
+| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Elastic `atlas-12g` (64K) | `16.37 GB` | `132.4 tok/s` | `161.2 tok/s` | `2,970 tok/s` (64K) |
+| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Elastic `atlas-10g` (64K) | `14.33 GB` | `145.6 tok/s` | `196.1 tok/s` | `3,012 tok/s` (64K) |
+| A100 80 GB | `sm_80` (BF16) | 2020 | Native `NVFP4+MXFP8` (64K) | `21.82 GB` | `153.0 tok/s` | `194.6 tok/s` | `5,164 tok/s` (64K) |
+| A100 80 GB | `sm_80` (BF16) | 2020 | Native `NVFP4+MXFP8` (262K) | `25.04 GB` | `152.8 tok/s` | `194.2 tok/s` | — |
+| RTX 4090 24 GB | `sm_89` (BF16) | 2022 | Elastic `atlas-12g` (64K) | `16.36 GB` | `236.7 tok/s` | `278.3 tok/s` | `7,031 tok/s` (64K) |
+| H100 80 GB | `sm_90` (BF16) | 2022 | Native `NVFP4+MXFP8` (64K) | `21.79 GB` | `240.8 tok/s` | `300.3 tok/s` | `7,004 tok/s` (64K) |
+| H100 80 GB | `sm_90` (BF16) | 2022 | Native `NVFP4+MXFP8` (262K) | `25.01 GB` | `241.8 tok/s` | `300.8 tok/s` | — |
+| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-12g` (64K) | `16.26 GB` | `411.0 tok/s` | `519.9 tok/s` | `11,728 tok/s` (64K) |
+| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-10g` (64K) | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` (64K) |
 
-Additional verified architecture & live-serving details:
-- **Pascal (`sm_60`/`sm_61`, 2016) & Turing (`sm_75`, 2018):** Compiled in the `legacy-fp16` CUDA 12.9 preset (`60;61;70;75`, 217/217 build steps). The forced Pascal FP32-SIMT path passed kernel and model-parity tests on V100. On-card qualification for Pascal and Turing is pending. The M=8 speculative verification attention kernel exceeds the per-block shared-memory limit on cards with 48 or 64 KiB.
+Additional verified architecture, branch, and live-serving details:
+- **Pascal (`sm_60`/`sm_61`, 2016) & Turing (`sm_75`, 2018):** Runtime opt-in SMEM dispatch in `901d86e` enables both speculative (`--spec`) and non-speculative decoding on `<=48 KiB` Pascal (`Tesla P100-PCIE-16GB`) and `<=64 KiB` Turing (`Tesla T4 16 GB`, `Quadro RTX 6000 24 GB`). Kernel unit tests passed on P100 and Turing; full-model parity ctest has only been run on V100 and local Ampere/Ada/Blackwell cards. On P100 64K `--spec`, the two chat runs measured `13.5` and `10.2 tok/s` (mean `11.9 tok/s`).
 - **Volta (`sm_70`, Tesla V100 32 GB, 2017):** With `INGINE_ACT_FP16=ON`, 39 distinct CTest cases passed across the qualification runs. CTest skipped `text_traces` because the optional trace fixtures were absent. Four benchmark and profiling entries are outside that count. The weight scan found a maximum magnitude of 76.5 across 2,245,115,536 BF16 values, all within the FP16 range. Live `ingine-serve` passed chat, `json_object`, strict `json_schema`, and inference on a 40×40 PNG.
 - **RTX 3090 (`sm_86`, 24 GB):** `atlas-10g` at 16K ctx with `--no-vision --dense-fp8 --kv-fp8 --spec --park-mb 0` uses **`12,984 MiB`** (`<12 GiB` without `--spec`).
 - **RTX 4090 (`sm_89`, 24 GB):** `atlas-12g` at 128K ctx with `--no-vision` uses **`17,776 MiB`**; live long-output serving with vision enabled at 64K ctx runs at **~257 tok/s**.
 - **Upstream RTX 5090 (`sm_120a`, 32 GB):** native `NVFP4+MXFP8` serves up to **262,144 tokens** of context in `24.4 GiB` (`490–560 tok/s` decode, `6,200–10,900 tok/s` prefill; see [Upstream RTX 5090 results](#upstream-rtx-5090-and-abliteration-results)).
+- **Verified feature branches on GitHub (built on `901d86e`):**
+  - `feat/kvq4-elastic-9g`: native EXL3/Escha sub-3-bit MoE + `--kv-q4` global Q4_0 KV cache + Q4_0 embed ported across `sm_60..sm_120a` (`48/48` `kernels_bitlock` PASS; `262,144` ctx in `11.6 GiB` VRAM at `112 tok/s` no-spec on RTX 3090; `368.5` chat / `394.7` code tok/s at `262K` ctx on RTX PRO 6000 Blackwell).
+  - `feat/atlas-6g-homology`: decoupled 3-tier paging core (`native/src/core/paged_tier.{h,cpp}`) and homology-guided `--atlas-6g` MoE offloading running `atlas-10g` in **`5.90 GB` VRAM** (`6.89 GB` host RSS, `87.4%` VRAM hit rate, **`34.7` chat / `31.5` code tok/s** on RTX 3090, `100%` token-exact vs `uva`; live `ingine-serve --engine --atlas-6g` at `5,870 MiB` VRAM passes `verify_atlas_6g.py` `3/3`).
 
 ## What this fork adds over upstream `satellitedown/ingine`
 
