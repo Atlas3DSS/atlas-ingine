@@ -38,7 +38,7 @@ constexpr int SINK_COL = 2 * kHeads * kHeadDim + kHeads * kRel;   // 6528
 constexpr float kScale = 0.08838834764831845f;                    // 128 ** -0.5
 constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kLn2 = 0.6931471805599453f;
-constexpr float kPScale = 32768.f, kPUnscale = 1.f / 32768.f;
+[[maybe_unused]] constexpr float kPScale = 32768.f, kPUnscale = 1.f / 32768.f;
 
 template <int STAGES>
 struct Smem {
@@ -271,10 +271,26 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   if constexpr (EXPLICIT) ntiles = s.nlist;
 
   unsigned qf[DCH / 2][4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+  const int v_qp = (lane >> 2) & 3;
+  const int v_idx = (lane & 3) | ((lane & 16) >> 2);
+  const int v_row_a = (v_qp >= 2 ? 8 : 0) + v_idx;
+  const int v_kh = (v_qp & 1) * 4;
+#pragma unroll
+  for (int kk = 0; kk < DCH / 2; ++kk) {
+    const uint2 q0 = mma::ld_smem_u64(smem_addr(&s.k[0][0] + swz<DCH>(warp * 16 + v_row_a, kk * 2) + v_kh));
+    const uint2 q1 = mma::ld_smem_u64(smem_addr(&s.k[0][0] + swz<DCH>(warp * 16 + v_row_a, kk * 2 + 1) + v_kh));
+    qf[kk][0] = q0.x;
+    qf[kk][1] = q0.y;
+    qf[kk][2] = q1.x;
+    qf[kk][3] = q1.y;
+  }
+#else
 #pragma unroll
   for (int kk = 0; kk < DCH / 2; ++kk)
     ldmatrix_x4(qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3],
                 smem_addr(&s.k[0][0] + swz<DCH>(warp * 16 + (lane & 15), kk * 2 + (lane >> 4))));
+#endif
   __syncthreads();  // Q staging is overwritten by the first key tile
 
   auto tile_at = [&](int i) { return EXPLICIT ? s.list[i] : first + i; };
@@ -334,6 +350,60 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 #pragma unroll
     for (int nt = 0; nt < BK / 8; ++nt) sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.f;
     const uint16_t* Ks = s.k[buf];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+    // Native Volta HMMA.884 Q*K^T: direct SMEM K-loads + hoisted acc8 -> ZERO input shuffles, 8x fewer reductions!
+    float sc_v[BK / 8][8];
+#pragma unroll
+    for (int nt = 0; nt < BK / 8; ++nt)
+#pragma unroll
+      for (int v = 0; v < 8; ++v) sc_v[nt][v] = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < DCH / 2; ++kk) {
+#pragma unroll
+      for (int nt = 0; nt < BK / 8; ++nt) {
+        const uint2 k0 = mma::ld_smem_u64(smem_addr(Ks + swz<DCH>(nt * 8 + v_idx, kk * 2) + v_kh));
+        const uint2 k1 = mma::ld_smem_u64(smem_addr(Ks + swz<DCH>(nt * 8 + v_idx, kk * 2 + 1) + v_kh));
+        mma::sm70_mma_f16_direct(sc_v[nt], qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], k0.x, k0.y, k1.x, k1.y);
+      }
+    }
+#pragma unroll
+    for (int nt = 0; nt < BK / 8; ++nt) mma::sm70_reduce_acc8_to_d4(sc_v[nt], sc[nt]);
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+    // Pascal sm_60/sm_61 Q*K^T: hoist Q gather + FP32 unpack once across all 8 nt tiles (17x fewer shuffles),
+    // read K directly from swizzled SMEM via uint4 loads (0 K shuffles), accumulate in exact FP32 fmaf.
+    const int g60 = lane >> 2, t60 = lane & 3;
+#pragma unroll
+    for (int kk = 0; kk < DCH / 2; ++kk) {
+      float2 qr0[8], qr1[8];
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const int sl = 4 * g60 + s;
+        qr0[s] = act::unpack2(__shfl_sync(0xffffffffu, qf[kk][0], sl));
+        qr1[s] = act::unpack2(__shfl_sync(0xffffffffu, qf[kk][1], sl));
+        qr0[4 + s] = act::unpack2(__shfl_sync(0xffffffffu, qf[kk][2], sl));
+        qr1[4 + s] = act::unpack2(__shfl_sync(0xffffffffu, qf[kk][3], sl));
+      }
+#pragma unroll
+      for (int nt = 0; nt < BK / 8; ++nt) {
+        const int ke = nt * 8 + 2 * t60, ko = ke + 1;
+        const uint4 ke0 = *reinterpret_cast<const uint4*>(Ks + swz<DCH>(ke, kk * 2));
+        const uint4 ke1 = *reinterpret_cast<const uint4*>(Ks + swz<DCH>(ke, kk * 2 + 1));
+        const uint4 ko0 = *reinterpret_cast<const uint4*>(Ks + swz<DCH>(ko, kk * 2));
+        const uint4 ko1 = *reinterpret_cast<const uint4*>(Ks + swz<DCH>(ko, kk * 2 + 1));
+        const uint32_t kew[8] = {ke0.x, ke0.y, ke0.z, ke0.w, ke1.x, ke1.y, ke1.z, ke1.w};
+        const uint32_t kow[8] = {ko0.x, ko0.y, ko0.z, ko0.w, ko1.x, ko1.y, ko1.z, ko1.w};
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+          const float2 fke = act::unpack2(kew[s]);
+          const float2 fko = act::unpack2(kow[s]);
+          sc[nt][0] = fmaf(qr0[s].y, fke.y, fmaf(qr0[s].x, fke.x, sc[nt][0]));
+          sc[nt][1] = fmaf(qr0[s].y, fko.y, fmaf(qr0[s].x, fko.x, sc[nt][1]));
+          sc[nt][2] = fmaf(qr1[s].y, fke.y, fmaf(qr1[s].x, fke.x, sc[nt][2]));
+          sc[nt][3] = fmaf(qr1[s].y, fko.y, fmaf(qr1[s].x, fko.x, sc[nt][3]));
+        }
+      }
+    }
+#else
 #pragma unroll
     for (int kk = 0; kk < DCH / 2; ++kk) {
       // all of the k16 group's key fragments first, then its 8 MMAs (each MMA no longer waits on the ldmatrix
@@ -349,6 +419,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
         mma_bf16(sc[2 * np + 1], qf[kk], b[np][2], b[np][3]);
       }
     }
+#endif
     // stage the next tile now (its buffer was last read before the previous barrier): the conversion and the
     // shared stores overlap the Q.K^T MMAs in flight instead of trailing the P.V MMAs
     if constexpr (STAGES == 2) {
@@ -404,6 +475,78 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 
     // ---- O += P V
     const uint16_t* Vs = s.v[buf];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+    // Native Volta HMMA.884 P*V: permute P once across all 16 d-tiles (16x fewer A shuffles),
+    // direct SMEM V^T loads (0 B shuffles), single acc8 reduction per d-tile (4x fewer reductions).
+    unsigned pa[BK / 16][4];
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      mma::sm70_permute_a(pack_half2(sc[2 * kk][0], sc[2 * kk][1]), pack_half2(sc[2 * kk][2], sc[2 * kk][3]),
+                          pack_half2(sc[2 * kk + 1][0], sc[2 * kk + 1][1]),
+                          pack_half2(sc[2 * kk + 1][2], sc[2 * kk + 1][3]), pa[kk][0], pa[kk][1], pa[kk][2],
+                          pa[kk][3]);
+    }
+#pragma unroll
+    for (int dt = 0; dt < D / 8; ++dt) {
+      const int d_col = dt * 8 + v_idx;
+      const int d_ch = d_col >> 3, d_in = d_col & 7;
+      float ov[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+      for (int kk = 0; kk < BK / 16; ++kk) {
+        const int k0 = kk * 16 + v_kh;
+        const unsigned v0 = mma::ld_smem_u16(smem_addr(Vs + swz<DCH>(k0 + 0, d_ch) + d_in));
+        const unsigned v1 = mma::ld_smem_u16(smem_addr(Vs + swz<DCH>(k0 + 1, d_ch) + d_in));
+        const unsigned v2 = mma::ld_smem_u16(smem_addr(Vs + swz<DCH>(k0 + 2, d_ch) + d_in));
+        const unsigned v3 = mma::ld_smem_u16(smem_addr(Vs + swz<DCH>(k0 + 3, d_ch) + d_in));
+        const unsigned v8 = mma::ld_smem_u16(smem_addr(Vs + swz<DCH>(k0 + 8, d_ch) + d_in));
+        const unsigned v9 = mma::ld_smem_u16(smem_addr(Vs + swz<DCH>(k0 + 9, d_ch) + d_in));
+        const unsigned v10 = mma::ld_smem_u16(smem_addr(Vs + swz<DCH>(k0 + 10, d_ch) + d_in));
+        const unsigned v11 = mma::ld_smem_u16(smem_addr(Vs + swz<DCH>(k0 + 11, d_ch) + d_in));
+        mma::sm70_mma_f16_direct(ov, pa[kk][0], pa[kk][1], pa[kk][2], pa[kk][3], v0 | (v1 << 16), v2 | (v3 << 16),
+                                 v8 | (v9 << 16), v10 | (v11 << 16));
+      }
+      mma::sm70_reduce_acc8_to_d4(ov, o[dt]);
+    }
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+    // Pascal sm_60/sm_61 P*V: hoist P gather + FP32 unpack once across all 16 d-tiles (36x fewer shuffles),
+    // load FP16 V[k, d0..d1] via 32-bit SMEM reads (0 V shuffles), accumulate in exact FP32 fmaf.
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      const unsigned a0 = pack_half2(sc[2 * kk][0], sc[2 * kk][1]);
+      const unsigned a1 = pack_half2(sc[2 * kk][2], sc[2 * kk][3]);
+      const unsigned a2 = pack_half2(sc[2 * kk + 1][0], sc[2 * kk + 1][1]);
+      const unsigned a3 = pack_half2(sc[2 * kk + 1][2], sc[2 * kk + 1][3]);
+      float2 pr0[8], pr1[8];
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const int sl = 4 * g60 + s;
+        const uint32_t w0 = __shfl_sync(0xffffffffu, a0, sl);
+        const uint32_t w1 = __shfl_sync(0xffffffffu, a1, sl);
+        const uint32_t w2 = __shfl_sync(0xffffffffu, a2, sl);
+        const uint32_t w3 = __shfl_sync(0xffffffffu, a3, sl);
+        pr0[s] = __half22float2(*reinterpret_cast<const __half2*>(&w0));
+        pr1[s] = __half22float2(*reinterpret_cast<const __half2*>(&w1));
+        pr0[4 + s] = __half22float2(*reinterpret_cast<const __half2*>(&w2));
+        pr1[4 + s] = __half22float2(*reinterpret_cast<const __half2*>(&w3));
+      }
+#pragma unroll
+      for (int dt = 0; dt < D / 8; ++dt) {
+        const int d_off = 2 * t60;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          const int kb = kk * 16 + 2 * k;
+          const uint32_t v0 = mma::ld_smem_u32(smem_addr(Vs + swz<DCH>(kb, dt) + d_off));
+          const uint32_t v1 = mma::ld_smem_u32(smem_addr(Vs + swz<DCH>(kb + 1, dt) + d_off));
+          const float2 fv0 = __half22float2(*reinterpret_cast<const __half2*>(&v0));
+          const float2 fv1 = __half22float2(*reinterpret_cast<const __half2*>(&v1));
+          o[dt][0] = fmaf(pr0[k].y, fv1.x, fmaf(pr0[k].x, fv0.x, o[dt][0]));
+          o[dt][1] = fmaf(pr0[k].y, fv1.y, fmaf(pr0[k].x, fv0.y, o[dt][1]));
+          o[dt][2] = fmaf(pr1[k].y, fv1.x, fmaf(pr1[k].x, fv0.x, o[dt][2]));
+          o[dt][3] = fmaf(pr1[k].y, fv1.y, fmaf(pr1[k].x, fv0.y, o[dt][3]));
+        }
+      }
+    }
+#else
 #pragma unroll
     for (int kk = 0; kk < BK / 16; ++kk) {
       const unsigned a[4] = {pack_half2(sc[2 * kk][0], sc[2 * kk][1]), pack_half2(sc[2 * kk][2], sc[2 * kk][3]),
@@ -424,6 +567,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
         }
       }
     }
+#endif
 
     __syncthreads();
     if constexpr (STAGES == 1) {
