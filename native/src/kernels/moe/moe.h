@@ -12,7 +12,7 @@
 
 namespace ingine::kernels::moe {
 
-enum class Format : int { NVFP4 = 0, MXFP8 = 1 };
+enum class Format : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3 };
 
 // moe_up: W13 GEMV of the selected experts + softcapped SwiGLU. x bf16 [M, H], idx int32 [M, 8],
 // out bf16 [M, 8, I]. NVFP4: w13 u8 [128, 2I, H/2], w13_scale e4m3 [128, 2I, H/16], w13_factor fp32 [128];

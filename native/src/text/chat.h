@@ -183,6 +183,8 @@ class ChatFormat {
   std::vector<int32_t> stop_ids() const;
   // <|message_model|><|content_text|>: appended to the prompt when thinking is disabled.
   std::vector<int32_t> no_thinking_prefill() const;
+  // <|content_invoke_tool_json|>: banned when a request declares no tools.
+  int32_t content_invoke_tool_json_id() const;
   // tokenizer.decode(ids, skip_special_tokens=False): lossy UTF-8.
   std::string decode(std::span<const int32_t> ids) const;
   const Tokenizer& tokenizer() const;

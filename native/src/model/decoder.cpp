@@ -230,7 +230,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
                   static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
     const Experts& ex = layer.experts;
-    const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
+    const moe::Format fmt = static_cast<moe::Format>(static_cast<int>(ex.fmt));
     moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data, ex.w13_scale.data,
                 f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream);
     // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it

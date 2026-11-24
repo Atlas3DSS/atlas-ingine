@@ -140,6 +140,8 @@ std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
       if (l < 0 || l >= LAYERS) continue;
       if (dt == "nvfp4") fmt[l] = ExpertFormat::NVFP4;
       else if (dt == "mxfp8") fmt[l] = ExpertFormat::MXFP8;
+      else if (dt == "atlas2") fmt[l] = ExpertFormat::ATLAS2;
+      else if (dt == "atlas3") fmt[l] = ExpertFormat::ATLAS3;
       else throw std::runtime_error("weights: unsupported expert format " + dt);
       seen[l] = true;
     }
@@ -300,12 +302,12 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   ex.w13_scale = ld.raw(e + "w13_weight_scale");
   ex.w2 = ld.raw(e + "w2_weight");
   ex.w2_scale = ld.raw(e + "w2_weight_scale");
-  const bool nv = fmt == ExpertFormat::NVFP4;
-  const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
+  const bool mxfp8 = fmt == ExpertFormat::MXFP8;
+  const std::string want_codes = mxfp8 ? "F8_E4M3" : "U8", want_scales = mxfp8 ? "U8" : "F8_E4M3";
   if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
       m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales)
     throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
-  if (nv) {
+  if (!mxfp8) {
     for (const char* w : {"w13", "w2"}) {
       const std::vector<float> amax = host_f32(m, e + w + "_weight_amax");
       const std::vector<float> den = host_f32(m, e + w + "_weight_outer_scale_denominator");

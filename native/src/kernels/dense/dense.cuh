@@ -42,13 +42,28 @@ __device__ __forceinline__ void unpack_bf16x8(const uint4& v, float* f) {
   f[6] = bf_lo(v.w); f[7] = bf_hi(v.w);
 }
 
-// 4 E4M3 values (one uint32, element 0 in the low byte) -> 4 floats (exact via FP16).
+__device__ __forceinline__ uint32_t e4m3_to_bf16_bits_portable(uint32_t b) {
+  const uint32_t s = (b & 0x80u) << 8;
+  const uint32_t a = b & 0x7fu;
+  const uint32_t norm = (a + 960u) << 4;
+  const uint32_t sub = a ? (0x3B00u + (((0xBA986400u >> (a * 4u)) & 0xfu) << 5)) : 0u;
+  return s | (a >= 8u ? norm : sub);
+}
+
+// 4 E4M3 values (one uint32, element 0 in the low byte) -> 4 floats (exact: hw cvt on SM89+, branchless ALU on SM86).
 __device__ __forceinline__ void unpack_e4m3x4(uint32_t u, float* f) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
   __half2_raw lo = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
   __half2_raw hi = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u >> 16), __NV_E4M3);
   float2 a = __half22float2(*reinterpret_cast<__half2*>(&lo));
   float2 b = __half22float2(*reinterpret_cast<__half2*>(&hi));
   f[0] = a.x; f[1] = a.y; f[2] = b.x; f[3] = b.y;
+#else
+  f[0] = __uint_as_float(e4m3_to_bf16_bits_portable(u & 0xffu) << 16);
+  f[1] = __uint_as_float(e4m3_to_bf16_bits_portable((u >> 8) & 0xffu) << 16);
+  f[2] = __uint_as_float(e4m3_to_bf16_bits_portable((u >> 16) & 0xffu) << 16);
+  f[3] = __uint_as_float(e4m3_to_bf16_bits_portable((u >> 24) & 0xffu) << 16);
+#endif
 }
 
 __device__ __forceinline__ void unpack_e4m3x16(const uint4& v, float* f) {

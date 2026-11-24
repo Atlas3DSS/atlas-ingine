@@ -354,18 +354,28 @@ GraphExec Runtime::capture_switch(const std::function<void(cudaStream_t, cudaGra
     cudaStreamCaptureStatus status;
     cudaGraph_t g = nullptr;
     const cudaGraphNode_t* deps = nullptr;
-    const cudaGraphEdgeData* edges = nullptr;
     std::size_t n = 0;
+#if CUDART_VERSION >= 13000
+    const cudaGraphEdgeData* edges = nullptr;
     CUDA_CHECK(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &edges, &n));
+#else
+    CUDA_CHECK(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &n));
+#endif
     cudaGraphNodeParams p{};
     p.type = cudaGraphNodeTypeConditional;
     p.conditional.handle = handle;
     p.conditional.type = cudaGraphCondTypeSwitch;
     p.conditional.size = unsigned(verify_widths_.size());
     cudaGraphNode_t node = nullptr;
+#if CUDART_VERSION >= 13000
     CUDA_CHECK(cudaGraphAddNode(&node, g, deps, edges, n, &p));
     bodies = p.conditional.phGraph_out;
     CUDA_CHECK(cudaStreamUpdateCaptureDependencies(s, &node, nullptr, 1, cudaStreamSetCaptureDependencies));
+#else
+    CUDA_CHECK(cudaGraphAddNode(&node, g, deps, n, &p));
+    bodies = p.conditional.phGraph_out;
+    CUDA_CHECK(cudaStreamUpdateCaptureDependencies(s, &node, 1, cudaStreamSetCaptureDependencies));
+#endif
   });
   for (std::size_t i = 0; i < verify_widths_.size(); ++i)
     captured(bodies[i], [&] { branch(s, verify_widths_[i]); });

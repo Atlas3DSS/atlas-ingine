@@ -23,6 +23,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -66,6 +67,8 @@ class SpecLoop {
     bool greedy, forced;
     float temperature, top_p;
     int top_k;
+    int num_banned = 0;
+    std::array<std::int32_t, kernels::head::BannedTokens::kMax> banned{-1, -1, -1, -1};
     bool operator==(const AcceptKey&) const = default;
   };
   AcceptKey accept_key_{};

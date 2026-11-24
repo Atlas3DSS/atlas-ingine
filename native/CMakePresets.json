@@ -28,22 +28,38 @@
       "inherits": "release",
       "binaryDir": "${sourceDir}/build-install",
       "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "86;89;120a",
         "CMAKE_CUDA_COMPILER": "${sourceDir}/../.cuda-toolkit/nvidia/cu13/bin/nvcc",
         "CUDAToolkit_ROOT": "${sourceDir}/../.cuda-toolkit/nvidia/cu13",
         "CMAKE_BUILD_WITH_INSTALL_RPATH": "ON",
         "CMAKE_INSTALL_RPATH": "$ORIGIN/../../../../.cuda-toolkit/nvidia/cu13/lib"
+      }
+    },
+    {
+      "name": "multiarch-dev",
+      "displayName": "Multi-arch (sm_86/89/120a) binaries and FP64-oracle tests with private CUDA 13.4",
+      "inherits": "install",
+      "binaryDir": "${sourceDir}/build-multiarch",
+      "cacheVariables": {
+        "INGINE_BUILD_TESTS": "ON"
       }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
     { "name": "dev", "configurePreset": "dev" },
-    { "name": "install", "configurePreset": "install" }
+    { "name": "install", "configurePreset": "install" },
+    { "name": "multiarch-dev", "configurePreset": "multiarch-dev" }
   ],
   "testPresets": [
     {
       "name": "dev",
       "configurePreset": "dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "multiarch-dev",
+      "configurePreset": "multiarch-dev",
       "output": { "outputOnFailure": true }
     }
   ]

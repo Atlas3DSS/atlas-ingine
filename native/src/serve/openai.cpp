@@ -180,6 +180,58 @@ void expand_images(const std::vector<ImagePart>& parts, const ImageOptions& opti
   ids = std::move(expanded);
 }
 
+// Parses OpenAI response_format ("text", "json_object", "json_schema") and returns an instruction to append
+// to the last user turn when JSON output is requested (empty string for default/text).
+std::string parse_response_format_instruction(const Json& body) {
+  const Json* rf = get(body, "response_format");
+  if (!rf) return {};
+  if (!rf->is_object()) throw BadRequest("'response_format' must be an object", "response_format");
+  const std::string* type = string_at(*rf, "type");
+  if (!type) throw BadRequest("'response_format.type' must be a string", "response_format");
+  if (*type == "text") return {};
+  if (*type == "json_object") {
+    return "\n\nRespond with a single valid JSON object only, with no markdown fences or surrounding text.";
+  }
+  if (*type == "json_schema") {
+    const auto js_it = rf->find("json_schema");
+    if (js_it == rf->end() || !js_it->is_object()) {
+      throw BadRequest("'response_format.json_schema' must be an object", "response_format");
+    }
+    const auto schema_it = js_it->find("schema");
+    if (schema_it == js_it->end() || !schema_it->is_object()) {
+      throw BadRequest("'response_format.json_schema.schema' must be an object", "response_format");
+    }
+    return "\n\nRespond with a single valid JSON object matching this exact JSON schema, with no markdown fences or "
+           "surrounding text:\n" +
+           schema_it->dump();
+  }
+  throw BadRequest("'response_format.type' must be 'text', 'json_object', or 'json_schema'", "response_format");
+}
+
+// Appends `suffix` to the last user message (or last message if none is a user turn) on a copy of `messages`.
+Json append_format_instruction(const Json& messages, const std::string& suffix) {
+  if (suffix.empty() || !messages.is_array() || messages.empty()) return messages;
+  Json out = messages;
+  std::size_t idx = out.size() - 1;
+  for (std::size_t i = out.size(); i-- > 0;) {
+    if (out[i].is_object() && string_at(out[i], "role") && *string_at(out[i], "role") == "user") {
+      idx = i;
+      break;
+    }
+  }
+  Json& msg = out[idx];
+  if (!msg.is_object()) return out;
+  auto it = msg.find("content");
+  if (it == msg.end() || it->is_null()) {
+    msg["content"] = suffix;
+  } else if (it->is_string()) {
+    it->get_ref<std::string&>() += suffix;
+  } else if (it->is_array()) {
+    it->push_back(Json{{"type", "text"}, {"text", suffix}});
+  }
+  return out;
+}
+
 }  // namespace
 
 bool truthy(const Json& value) {
@@ -228,12 +280,16 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   const auto messages = body.find("messages");
   const auto tools = body.find("tools");
   static const Json kAbsent;  // null: no messages/tools key (passed by reference, not a deep copy of the body)
-  const std::vector<ImagePart> image_parts = collect_images(messages == body.end() ? kAbsent : *messages);
+  const std::string rf_suffix = parse_response_format_instruction(body);
+  const Json& raw_messages = messages == body.end() ? kAbsent : *messages;
+  const Json augmented_messages = rf_suffix.empty() ? Json() : append_format_instruction(raw_messages, rf_suffix);
+  const Json& effective_messages = rf_suffix.empty() ? raw_messages : augmented_messages;
+  const std::vector<ImagePart> image_parts = collect_images(effective_messages);
   if (!image_parts.empty() && !image_options.enabled) {
     throw BadRequest("this server does not take images (it runs without the vision tower)", "messages");
   }
-  text::RenderedPrompt prompt = fmt.render(messages == body.end() ? kAbsent : *messages,
-                                           tools == body.end() ? kAbsent : *tools, options);
+  const Json& effective_tools = tools == body.end() ? kAbsent : *tools;
+  text::RenderedPrompt prompt = fmt.render(effective_messages, effective_tools, options);
   ChatRequest req;
   if (!image_parts.empty()) expand_images(image_parts, image_options, prompt.ids, req.images);
 
@@ -253,6 +309,11 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
       clamp_int(std::max<int64_t>(0, num_int(body, "top_k", Bound{-1, "-1"}).value_or(defaults.top_k)));
   if (auto seed = num_int(body, "seed")) req.sampling.seed = static_cast<uint64_t>(*seed);
   if (req.sampling.top_p <= 0.0f) throw BadRequest("'top_p' must be in (0, 1]", "top_p");
+  // When no tools are declared, ban <|content_invoke_tool_json|> so the model cannot emit a hallucinated tool call.
+  const bool has_tools = effective_tools.is_array() && !effective_tools.empty();
+  if (!has_tools) {
+    req.sampling.banned_tokens.push_back(fmt.content_invoke_tool_json_id());
+  }
 
   if (const Json* stop = get(body, "stop")) {
     if (stop->is_string()) {

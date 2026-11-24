@@ -49,6 +49,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -82,6 +83,32 @@ __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
     } else {
         asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
                      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                     : "l"(p));
+    }
+    return v;
+}
+__device__ __forceinline__ uint2 ld_stream_u2(const void* p, std::uint64_t pol) {
+    uint2 v;
+    if constexpr (l2::hinted<WEIGHT_L2>) {
+        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v2.u32 {%0,%1}, [%2], %3;"
+                     : "=r"(v.x), "=r"(v.y)
+                     : "l"(p), "l"(pol));
+    } else {
+        asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(v.x), "=r"(v.y)
+                     : "l"(p));
+    }
+    return v;
+}
+__device__ __forceinline__ uint32_t ld_stream_u1(const void* p, std::uint64_t pol) {
+    uint32_t v;
+    if constexpr (l2::hinted<WEIGHT_L2>) {
+        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.u32 %0, [%1], %2;"
+                     : "=r"(v)
+                     : "l"(p), "l"(pol));
+    } else {
+        asm volatile("ld.global.nc.L1::no_allocate.L2::256B.u32 %0, [%1];"
+                     : "=r"(v)
                      : "l"(p));
     }
     return v;
@@ -135,12 +162,24 @@ struct Chunk<1> {  // MXFP8: 32 E4M3 codes + 1 E8M0 block scale
     uint4 q0, q1;
     uint8_t s;
 };
+template <>
+struct Chunk<2> {  // ATLAS2: 32 2-bit Lloyd-Max codes (8 B) + 2 E4M3 block scales (2.50 b/w)
+    uint2 q;
+    uint16_t s;
+};
+template <>
+struct Chunk<3> {  // ATLAS3: 32 3-bit Lloyd-Max codes (lo0 4B, lo1 4B, hi 4B = 12 B) + 2 E4M3 block scales (3.50 b/w)
+    uint32_t lo0, lo1, hi;
+    uint16_t s;
+};
 
 template <int FMT>
 struct Layout {
     // bytes per row of codes / scales for a matrix with K columns
-    static constexpr int code_bytes(int K) { return FMT == 0 ? K / 2 : K; }
-    static constexpr int scale_bytes(int K) { return FMT == 0 ? K / 16 : K / 32; }
+    static constexpr int code_bytes(int K) {
+        return FMT == 0 ? K / 2 : (FMT == 1 ? K : (FMT == 2 ? K / 4 : (K * 3) / 8));
+    }
+    static constexpr int scale_bytes(int K) { return FMT == 1 ? K / 32 : K / 16; }
 };
 
 template <int FMT>
@@ -149,23 +188,45 @@ __device__ __forceinline__ Chunk<FMT> load_chunk(const uint8_t* codes, const uin
     if constexpr (FMT == 0) {
         ch.q = ld_stream(codes + 16 * c, pol);
         ch.s = ld_scale2(scales + 2 * c, pol);
-    } else {
+    } else if constexpr (FMT == 1) {
         ch.q0 = ld_stream(codes + 32 * c, pol);
         ch.q1 = ld_stream(codes + 32 * c + 16, pol);
         ch.s = ld_scale1(scales + c, pol);
+    } else if constexpr (FMT == 2) {
+        ch.q = ld_stream_u2(codes + 8 * c, pol);
+        ch.s = ld_scale2(scales + 2 * c, pol);
+    } else {
+        ch.lo0 = ld_stream_u1(codes + 12 * c, pol);
+        ch.lo1 = ld_stream_u1(codes + 12 * c + 4, pol);
+        ch.hi = ld_stream_u1(codes + 12 * c + 8, pol);
+        ch.s = ld_scale2(scales + 2 * c, pol);
     }
     return ch;
 }
 
 // ------------------------------------------------------------------------------------------ decode
 
+__device__ __forceinline__ uint16_t e4m3_to_f16_bits_portable(uint32_t b) {
+    const uint32_t s = (b & 0x80u) << 8;
+    const uint32_t a = b & 0x7fu;
+    const uint32_t norm = (a + 64u) << 7;
+    const uint32_t sub = a ? (0x1800u + (((0xBA986400u >> (a * 4u)) & 0xfu) << 8)) : 0u;
+    return static_cast<uint16_t>(s | (a >= 8u ? norm : sub));
+}
+
 __device__ __forceinline__ uint32_t f16x2_from_e4m3x2(uint16_t v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     uint32_t r;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(v));
     return r;
+#else
+    return static_cast<uint32_t>(e4m3_to_f16_bits_portable(v & 0xffu)) |
+           (static_cast<uint32_t>(e4m3_to_f16_bits_portable((v >> 8) & 0xffu)) << 16);
+#endif
 }
 
 __device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
     asm("{\n"
         ".reg .b8 b0, b1, b2, b3;\n"
         "mov.b32 {b0, b1, b2, b3}, %4;\n"
@@ -176,6 +237,15 @@ __device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) 
         "}"
         : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
         : "r"(w));
+#else
+    // Bit-identical to cvt.rn.f16x2.e2m1x2 via single __byte_perm (zero LUT/memory traffic on SM86/SM89).
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const uint32_t byte = (w >> (8 * b)) & 0xffu;
+        const uint32_t sel = ((byte & 7u) << 4) | (((byte >> 4) & 7u) << 12);
+        h[b] = __byte_perm(0x3E3C3800u, 0x46444240u, sel) | ((byte & 0x08u) << 12) | ((byte & 0x80u) << 24);
+    }
+#endif
 }
 
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
@@ -215,6 +285,58 @@ __device__ __forceinline__ void decode(const Chunk<1>& ch, float /*factor*/, uin
             const uint32_t h2 = f16x2_from_e4m3x2(uint16_t(words[w] >> (16 * hh)));
             const float2 v = __half22float2(*reinterpret_cast<const __half2*>(&h2));
             o[2 * w + hh] = pack_bf16(v.x * sc, v.y * sc);  // exact: fp8 value times a power of two
+        }
+    }
+}
+
+__device__ __forceinline__ void decode(const Chunk<2>& ch, float factor, uint32_t (&o)[16]) {
+    // Exact IEEE-754 FP16 bit patterns for kAtlas2 = {-1.5, -0.453125, +0.453125, +1.5}; branchless ALU, zero LUT.
+    const uint32_t s2 = f16x2_from_e4m3x2(ch.s);
+    const __half2 sc = *reinterpret_cast<const __half2*>(&s2);
+    const __half2 slo = __low2half2(sc), shi = __high2half2(sc);
+    const uint32_t words[2] = {ch.q.x, ch.q.y};
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const uint32_t w = words[half];
+        const __half2 sch = half == 0 ? slo : shi;
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const uint32_t q0 = (w >> (4 * b)) & 3u;
+            const uint32_t q1 = (w >> (4 * b + 2)) & 3u;
+            const uint32_t h0 = (((q0 ^ (q0 >> 1)) & 1u) ? 0x3740u : 0x3E00u) | (((~q0) & 2u) << 14);
+            const uint32_t h1 = (((q1 ^ (q1 >> 1)) & 1u) ? 0x3740u : 0x3E00u) | (((~q1) & 2u) << 14);
+            const uint32_t h2 = h0 | (h1 << 16);
+            const __half2 cs = __hmul2(*reinterpret_cast<const __half2*>(&h2), sch);
+            const float2 v = __half22float2(cs);
+            o[8 * half + b] = pack_bf16(v.x * factor, v.y * factor);
+        }
+    }
+}
+
+__device__ __forceinline__ void decode(const Chunk<3>& ch, float factor, uint32_t (&o)[16]) {
+    // Exact IEEE-754 FP16 bit patterns for kAtlas3 = {-2.0, -1.25, -0.703125, -0.2265625, +0.2265625, +0.703125, +1.25, +2.0}.
+    // Decoded via single __byte_perm per pair (zero LUT/memory traffic).
+    const uint32_t s2 = f16x2_from_e4m3x2(ch.s);
+    const __half2 sc = *reinterpret_cast<const __half2*>(&s2);
+    const __half2 slo = __low2half2(sc), shi = __high2half2(sc);
+    const uint32_t los[2] = {ch.lo0, ch.lo1};
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const uint32_t lo = los[half];
+        const uint32_t hi = (ch.hi >> (16 * half)) & 0xffffu;
+        const __half2 sch = half == 0 ? slo : shi;
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const uint32_t c0 = ((lo >> (4 * b)) & 3u) | (((hi >> (2 * b)) & 1u) << 2);
+            const uint32_t c1 = ((lo >> (4 * b + 2)) & 3u) | (((hi >> (2 * b + 1)) & 1u) << 2);
+            const uint32_t m0 = (c0 & 4u) ? (c0 & 3u) : (3u - (c0 & 3u));
+            const uint32_t m1 = (c1 & 4u) ? (c1 & 3u) : (3u - (c1 & 3u));
+            const uint32_t sel = m0 | ((m0 + 4u) << 4) | (m1 << 8) | ((m1 + 4u) << 12);
+            const uint32_t sgn = (((~c0) & 4u) << 13) | (((~c1) & 4u) << 29);
+            const uint32_t h2 = __byte_perm(0x0000A040u, 0x403D3933u, sel) | sgn;
+            const __half2 cs = __hmul2(*reinterpret_cast<const __half2*>(&h2), sch);
+            const float2 v = __half22float2(cs);
+            o[8 * half + b] = pack_bf16(v.x * factor, v.y * factor);
         }
     }
 }
@@ -266,8 +388,16 @@ __device__ __forceinline__ void load_x(Frag<FMT>& f, const __nv_bfloat16* xrow, 
 }
 
 // Programmatic dependent launch (no-ops when the kernel is launched without the PDL attribute).
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 
 template <int FMT>
 __device__ __forceinline__ void mma_frag(const Frag<FMT>& f, float (&d)[4]) {
@@ -315,7 +445,7 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
     const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
     const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
     Frag<FMT> f;
-    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f,
+    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT != 1 ? wfactor[e] : 1.f,
                    l2::policy<WEIGHT_L2>());
     load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
     float d[4] = {0.f, 0.f, 0.f, 0.f};
@@ -406,7 +536,7 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     auto load = [&](int u, Frag<FMT>& f) {
         const int e = uexp[u];
         const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
-        load_w<FMT, K>(f, w + row * CB, ws + row * SB, c, FMT == 0 ? wfactor[e] : 1.f, wpol);
+        load_w<FMT, K>(f, w + row * CB, ws + row * SB, c, FMT != 1 ? wfactor[e] : 1.f, wpol);
     };
 
     // The first round's weights do not depend on moe_up: fetch them before waiting for it (PDL).
@@ -499,7 +629,7 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
-    cfg.numAttrs = pdl ? 1 : 0;
+    cfg.numAttrs = (pdl && current_sm_major() >= 9) ? 1 : 0;
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<Params>(args)...));
 }
 
@@ -509,12 +639,15 @@ void moe_up(const __nv_bfloat16* x, int M, const int* idx, const void* w13, cons
             const float* w13_factor, Format fmt, __nv_bfloat16* out, bool pdl, cudaStream_t stream) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(x && idx && w13 && w13_scale && out, "moe_up: null argument");
-    require(fmt == Format::MXFP8 || w13_factor, "NVFP4 experts need a factor tensor");
-    const bool nv = fmt == Format::NVFP4;
+    require(fmt == Format::MXFP8 || w13_factor, "scaled-block experts need a factor tensor");
     const dim3 grid(2 * I / TILE, M * TOPK);
-    launch(nv ? moe_up_kernel<0> : moe_up_kernel<1>, grid, UP_WARPS * 32, pdl, stream, x, idx,
-           static_cast<const uint8_t*>(w13), static_cast<const uint8_t*>(w13_scale), nv ? w13_factor : nullptr, M,
-           out);
+    const auto* w = static_cast<const uint8_t*>(w13);
+    const auto* ws = static_cast<const uint8_t*>(w13_scale);
+    const float* wf = fmt == Format::MXFP8 ? nullptr : w13_factor;
+    if (fmt == Format::NVFP4) launch(moe_up_kernel<0>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out);
+    else if (fmt == Format::MXFP8) launch(moe_up_kernel<1>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out);
+    else if (fmt == Format::ATLAS2) launch(moe_up_kernel<2>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out);
+    else launch(moe_up_kernel<3>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out);
 }
 
 void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts, const void* w2,
@@ -522,11 +655,18 @@ void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts,
               float* out, float* conv_hist, bool pdl, cudaStream_t stream) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(act && idx && wts && w2 && w2_scale && conv_w && conv_state && out, "moe_down: null argument");
-    require(fmt == Format::MXFP8 || w2_factor, "NVFP4 experts need a factor tensor");
-    const bool nv = fmt == Format::NVFP4;
-    launch(nv ? moe_down_kernel<0> : moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx,
-           wts, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(w2_scale), nv ? w2_factor : nullptr,
-           M, conv_w, conv_state, out, conv_hist);
+    require(fmt == Format::MXFP8 || w2_factor, "scaled-block experts need a factor tensor");
+    const auto* w = static_cast<const uint8_t*>(w2);
+    const auto* ws = static_cast<const uint8_t*>(w2_scale);
+    const float* wf = fmt == Format::MXFP8 ? nullptr : w2_factor;
+    if (fmt == Format::NVFP4)
+        launch(moe_down_kernel<0>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist);
+    else if (fmt == Format::MXFP8)
+        launch(moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist);
+    else if (fmt == Format::ATLAS2)
+        launch(moe_down_kernel<2>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist);
+    else
+        launch(moe_down_kernel<3>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist);
 }
 
 }  // namespace ingine::kernels::moe

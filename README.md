@@ -334,6 +334,27 @@ passphrase hidden in the middle:
 The passphrase was found in both. With an image after 199,000 tokens of text, the model answers from both: the
 passphrase at the start of the text and the words written in the image (26.5 s).
 
+## Atlas3DSS fork: sm_86 / sm_89 port, Elastic sub-4-bit MoE, and JSON mode
+
+This fork (`Atlas3DSS/atlas-ingine`, Apache-2.0) extends upstream `satellitedown/ingine` while keeping Blackwell (`sm_120a`) outputs bit-identical (`kernels_bitlock` 48/48 PASS):
+
+- **Multi-architecture support (`sm_86`, `sm_89`, `sm_120a`):** Native Ampere (RTX 3090) and Ada (RTX 4090) builds on CUDA 12.8+ and CUDA 13.x, with branchless FP8/E2M1/ATLAS2/ATLAS3 unpackers on `sm_86`/`sm_89` (`build_multiarch.sh`).
+- **Native Elastic sub-4-bit MoE weights (`ATLAS2` 2.50 b/w, `ATLAS3` 3.50 b/w):** Mixed-precision tier converter ([`tools/quantize_elastic_ingine.py`](tools/quantize_elastic_ingine.py)) producing `atlas-12g` (`14.05 GB` on disk incl. vision + `mtp.safetensors`) and `atlas-10g` (`12.01 GB` on disk incl. vision + `mtp.safetensors`) checkpoints, with native decode (`moe.cu`) and prefill (`wgemm.cu`) kernels verified against FP64 oracles (`kernels_moe`, `prefill_moe`).
+- **Structured outputs & tool-ban:** Native OpenAI `response_format` (`text`, `json_object`, `json_schema`) and automatic `<|content_invoke_tool_json|>` banning when `tools` is absent (`serve_server` 22/22 PASS).
+
+Measured on `ingine-bench` (`--max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000`):
+
+| GPU | Checkpoint | VRAM @ 64K ctx | Chat decode | Code decode | 64K prefill |
+|---|---|---:|---:|---:|---:|
+| RTX 3090 (`sm_86`) | Native `NVFP4+MXFP8` | `21.82 GB` | `154.9 tok/s` | `213.2 tok/s` | `2,980 tok/s` |
+| RTX 3090 (`sm_86`) | Elastic `atlas-12g` | `16.37 GB` | `132.4 tok/s` | `161.2 tok/s` | `2,970 tok/s` |
+| RTX 3090 (`sm_86`) | Elastic `atlas-10g` | `14.33 GB` | `145.6 tok/s` | `196.1 tok/s` | `3,012 tok/s` |
+| RTX 4090 (`sm_89`) | Elastic `atlas-12g` | `16.36 GB` | `236.7 tok/s` | `278.3 tok/s` | `7,031 tok/s` |
+| RTX PRO 6000 (`sm_120a`) | Elastic `atlas-12g` | `16.26 GB` | `411.0 tok/s` | `519.9 tok/s` | `11,728 tok/s` |
+| RTX PRO 6000 (`sm_120a`) | Elastic `atlas-10g` | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` |
+
+At 16K context with `--no-vision --dense-fp8 --kv-fp8 --spec --park-mb 0`, `atlas-10g` runs live `ingine-serve` in `12,984 MiB` on RTX 3090 (`<12 GiB` without `--spec`). At 128K context with `--no-vision`, `atlas-12g` runs live `ingine-serve` in `17,776 MiB` on RTX 4090.
+
 ## License and credits
 
 This repository (ingine, tools, installer and the abliteration file) is licensed under **Apache-2.0**, see

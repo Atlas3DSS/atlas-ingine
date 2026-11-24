@@ -130,15 +130,19 @@ struct Dense {
   int cols() const { return w.ne[0]; }
 };
 
-enum class ExpertFormat : int { NVFP4 = 0, MXFP8 = 1 };  // the moe kernels' `fmt`
+enum class ExpertFormat : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3 };  // the moe kernels' `fmt`
 
 // weights.Experts (checkpoint encoding; see weights.py docstring)
 struct Experts {
   ExpertFormat fmt = ExpertFormat::NVFP4;
-  // NVFP4: w13 u8 [128, 2304, 1152], w13_scale e4m3 [128, 2304, 144], w2 u8 [128, 2304, 576],
-  //        w2_scale e4m3 [128, 2304, 72], factors fp32 [128] (amax / outer_scale_denominator)
-  // MXFP8: w13 e4m3 [128, 2304, 2304], w13_scale u8 (E8M0) [128, 2304, 72], w2 e4m3 [128, 2304, 1152],
-  //        w2_scale u8 [128, 2304, 36], factors empty
+  // NVFP4:  w13 u8 [128, 2304, 1152], w13_scale e4m3 [128, 2304, 144], w2 u8 [128, 2304, 576],
+  //         w2_scale e4m3 [128, 2304, 72], factors fp32 [128] (amax / outer_scale_denominator)
+  // MXFP8:  w13 e4m3 [128, 2304, 2304], w13_scale u8 (E8M0) [128, 2304, 72], w2 e4m3 [128, 2304, 1152],
+  //         w2_scale u8 [128, 2304, 36], factors empty
+  // ATLAS2: 2-bit symmetric Lloyd-Max (group 16, 2.50 b/w): w13 u8 [128, 2304, 576], w2 u8 [128, 2304, 288],
+  //         e4m3 scales & fp32 factors same as NVFP4
+  // ATLAS3: 3-bit symmetric Lloyd-Max (group 16, 3.50 b/w): w13 u8 [128, 2304, 864], w2 u8 [128, 2304, 432],
+  //         e4m3 scales & fp32 factors same as NVFP4
   Tensor w13, w13_scale, w2, w2_scale;
   Tensor w13_factor, w2_factor;
 };

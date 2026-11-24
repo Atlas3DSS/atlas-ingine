@@ -20,6 +20,8 @@ namespace {
 constexpr int H = 2304, I = 1152, E = 128, TOPK = 8;
 constexpr int kAlloc = 10;
 constexpr float kE2M1[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+constexpr float kAtlas2[4] = {-1.5f, -0.453125f, 0.453125f, 1.5f};
+constexpr float kAtlas3[8] = {-2.0f, -1.25f, -0.703125f, -0.2265625f, 0.2265625f, 0.703125f, 1.25f, 2.0f};
 
 struct Mat {  // one expert-stacked matrix [kAlloc, rows, cols] in checkpoint encoding
   int fmt, rows, cols;
@@ -39,10 +41,23 @@ struct Mat {  // one expert-stacked matrix [kAlloc, rows, cols] in checkpoint en
             const uint8_t b = codes[(size_t(e) * rows + r) * (cols / 2) + k / 2];
             const float s = e4[scales[(size_t(e) * rows + r) * (cols / 16) + k / 16]];
             v = rbf((kE2M1[(k & 1) ? b >> 4 : b & 0xf] * s) * factor[e]);
-          } else {
+          } else if (fmt == 1) {
             const float c = e4[codes[(size_t(e) * rows + r) * cols + k]];
             const int s = scales[(size_t(e) * rows + r) * (cols / 32) + k / 32];
             v = rbf(c * std::ldexp(1.f, s - 127));
+          } else if (fmt == 2) {
+            const uint8_t b = codes[(size_t(e) * rows + r) * (cols / 4) + k / 4];
+            const float s = e4[scales[(size_t(e) * rows + r) * (cols / 16) + k / 16]];
+            v = rbf((kAtlas2[(b >> (2 * (k & 3))) & 3] * s) * factor[e]);
+          } else {
+            // ATLAS3: 32 elements -> 12 bytes [lo0(4B), lo1(4B), hi01(4B)]
+            const size_t blk = (size_t(e) * rows + r) * (cols / 32) + k / 32;
+            const int j = k & 31;
+            const uint8_t* p = codes.data() + blk * 12;
+            const uint8_t lo = (p[j / 4] >> (2 * (j & 3))) & 3;
+            const uint8_t hi = (p[8 + j / 8] >> (j & 7)) & 1;
+            const float s = e4[scales[(size_t(e) * rows + r) * (cols / 16) + k / 16]];
+            v = rbf((kAtlas3[lo | (hi << 2)] * s) * factor[e]);
           }
           dec[(size_t(e) * rows + r) * cols + k] = v;
         }
@@ -58,11 +73,25 @@ Mat make_mat(Rng& rng, int fmt, int rows, int cols) {
     for (auto& s : m.scales) s = uint8_t(((5 + rng.next() % 4) << 3) | (rng.next() & 7));  // 2^-2 .. 2^2
     m.factor.resize(E, 0.f);
     for (int e = 0; e < kAlloc; ++e) m.factor[e] = float(rng.uniform(0.01, 0.03));
-  } else {
+  } else if (fmt == 1) {
     m.codes.resize(size_t(kAlloc) * rows * cols);
     for (auto& b : m.codes) b = uint8_t((rng.next() & 0x80) | ((1 + rng.next() % 9) << 3) | (rng.next() & 7));
     m.scales.resize(size_t(kAlloc) * rows * cols / 32);
     for (auto& s : m.scales) s = uint8_t(127 - 6 + int(rng.uniform(0, 3)));
+  } else if (fmt == 2) {
+    m.codes.resize(size_t(kAlloc) * rows * cols / 4);
+    for (auto& b : m.codes) b = uint8_t(rng.next());
+    m.scales.resize(size_t(kAlloc) * rows * cols / 16);
+    for (auto& s : m.scales) s = uint8_t(((5 + rng.next() % 4) << 3) | (rng.next() & 7));
+    m.factor.resize(E, 0.f);
+    for (int e = 0; e < kAlloc; ++e) m.factor[e] = float(rng.uniform(0.01, 0.03));
+  } else {
+    m.codes.resize(size_t(kAlloc) * rows * (cols / 32) * 12);
+    for (auto& b : m.codes) b = uint8_t(rng.next());
+    m.scales.resize(size_t(kAlloc) * rows * cols / 16);
+    for (auto& s : m.scales) s = uint8_t(((5 + rng.next() % 4) << 3) | (rng.next() & 7));
+    m.factor.resize(E, 0.f);
+    for (int e = 0; e < kAlloc; ++e) m.factor[e] = float(rng.uniform(0.01, 0.03));
   }
   m.decode();
   return m;
@@ -74,7 +103,9 @@ double act_ref(double g, double u) {
 }
 
 bool run(Rng& rng, int fmt, int T) {
-  std::printf("-- %s, T=%d\n", fmt == 0 ? "NVFP4" : "MXFP8", T);
+  static constexpr const char* kFmtName[4] = {"NVFP4", "MXFP8", "ATLAS2", "ATLAS3"};
+  const bool has_factor = fmt != 1;
+  std::printf("-- %s, T=%d\n", kFmtName[fmt], T);
   const Mat w13 = make_mat(rng, fmt, 2 * I, H), w2 = make_mat(rng, fmt, H, I);
   std::vector<float> logits(size_t(T) * E), bias(E);
   for (auto& x : logits) x = float(rng.normal() * 2);
@@ -87,11 +118,12 @@ bool run(Rng& rng, int fmt, int T) {
       pair_dst(size_t(T) * TOPK);
   DeviceArray<int4> tiles(pk::moe_tiles_capacity(T));
   DeviceArray<uint8_t> c13(w13.codes), s13(w13.scales), c2(w2.codes), s2(w2.scales);
-  DeviceArray<float> f13(fmt == 0 ? w13.factor : std::vector<float>(1)), f2(fmt == 0 ? w2.factor : std::vector<float>(1));
+  DeviceArray<float> f13(has_factor ? w13.factor : std::vector<float>(1)),
+      f2(has_factor ? w2.factor : std::vector<float>(1));
   DeviceArray<uint16_t> d_x(x), act(size_t(T) * TOPK * I), down(size_t(T) * TOPK * H), out(size_t(T) * H);
   pk::MoeWork wk{counts.get(), tiles_n.get(), tiles.get(), pair_token.get(), pair_dst.get()};
-  pk::MoeExperts ex{fmt, c13.get(), s13.get(), fmt == 0 ? f13.get() : nullptr, c2.get(), s2.get(),
-                    fmt == 0 ? f2.get() : nullptr};
+  pk::MoeExperts ex{fmt, c13.get(), s13.get(), has_factor ? f13.get() : nullptr, c2.get(), s2.get(),
+                    has_factor ? f2.get() : nullptr};
 
   pk::moe_topk(d_logits.get(), d_bias.get(), T, d_idx.get(), d_wts.get(), counts.get(), nullptr);
   pk::moe_route(d_idx.get(), T, wk, nullptr);
@@ -225,9 +257,15 @@ int main() {
   bool ok = true;
   ok &= run(rng, 0, 200);
   ok &= run(rng, 1, 200);
+  ok &= run(rng, 2, 200);
+  ok &= run(rng, 3, 200);
   ok &= run(rng, 0, 9);
+  ok &= run(rng, 2, 9);
+  ok &= run(rng, 3, 9);
   ok &= run(rng, 0, 700);  // 128-row tiles (T > 512)
   ok &= run(rng, 1, 700);
+  ok &= run(rng, 2, 700);
+  ok &= run(rng, 3, 700);
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

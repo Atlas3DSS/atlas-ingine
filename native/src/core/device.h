@@ -17,6 +17,22 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ingine::cuda_check((expr), #expr, __FILE__, __LINE__)
 
+// Cached compute capability major version for the active CUDA device (safe inside CUDA graph capture).
+inline int current_sm_major() {
+    static std::array<int, 16> cached{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 8;
+    if (cached[dev] == 0) {
+        int maj = 0;
+        if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && maj > 0) {
+            cached[dev] = maj;
+        } else {
+            return 8;
+        }
+    }
+    return cached[dev];
+}
+
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device
 // capacity. DeviceContext remains the owner and authoritative source of both values.
 struct DeviceExecutionView {

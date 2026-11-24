@@ -212,12 +212,21 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one instruction (cvt.rn.bf16x2.e4m3x2; through FP16 and
-// FP32 it took four, 16 per mma)
+// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one instruction on SM120a, hw FP16 convert on SM89, portable helper on SM86.
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   uint32_t r;
   asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
   return r;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+  uint32_t h2;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(static_cast<unsigned short>(u)));
+  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
+  const __nv_bfloat162 b = __float22bfloat162_rn(f);
+  return *reinterpret_cast<const uint32_t*>(&b);
+#else
+  return e4m3_to_bf16_bits_portable(u & 0xffu) | (e4m3_to_bf16_bits_portable((u >> 8) & 0xffu) << 16);
+#endif
 }
 
 #ifndef MMA_U_BF16

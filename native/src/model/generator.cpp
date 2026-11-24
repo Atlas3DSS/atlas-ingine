@@ -194,12 +194,23 @@ class EngineGenerator final : public Generator {
   // host reads that token, so the GPU never waits for the host. A step launched for a token that ends the
   // generation (stop token, cancel) is undone, leaving the state at tokens_in_state_. Sets prefill_seconds
   // (until the first token is known) and restarts `t` for the decode time.
+  head::SamplingParams to_head_params(const Sampling& sampling) const {
+    head::SamplingParams p;
+    p.temperature = sampling.temperature;
+    p.top_k = sampling.top_k;
+    p.top_p = sampling.top_p;
+    for (std::int32_t id : sampling.banned_tokens) {
+      if (id >= 0 && p.banned.count < head::BannedTokens::kMax) p.banned.ids[p.banned.count++] = id;
+    }
+    return p;
+  }
+
   void decode(int n, int max_new_tokens, const Sampling& sampling, head::SamplerRng& rng,
               std::span<const std::int32_t> stop_ids,
               const std::function<bool(std::span<const std::int32_t>)>& on_tokens, GenerateStats& stats,
               std::chrono::steady_clock::time_point& t) {
     const cudaStream_t stream = rt_.stream();
-    const head::SamplingParams params{sampling.temperature, sampling.top_k, sampling.top_p};
+    const head::SamplingParams params = to_head_params(sampling);
     auto* sampled = static_cast<std::int32_t*>(token_.p);
     // forced replay: the forced tokens on the device; each sampled token is replaced by its forced one
     DeviceBuffer forced;
@@ -493,10 +504,7 @@ class EngineGenerator final : public Generator {
   // engine._sample with a host synchronisation (the speculative loop's first anchor): argmax at
   // temperature <= 0, else one draw from engine._probs.
   std::int32_t sample(const float* logits, const Sampling& sampling, head::SamplerRng& rng) {
-    head::SamplingParams p;
-    p.temperature = sampling.temperature;
-    p.top_k = sampling.top_k;
-    p.top_p = sampling.top_p;
+    const head::SamplingParams p = to_head_params(sampling);
     head::sample(logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, p, rng, static_cast<std::int32_t*>(token_.p),
                  rt_.stream());
     CUDA_CHECK(cudaMemcpyAsync(host_token_.data(), token_.p, sizeof(std::int32_t), cudaMemcpyDeviceToHost,

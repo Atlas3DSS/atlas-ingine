@@ -820,6 +820,48 @@ void test_images() {
   CHECK(chat(text_only->port(), Json::object()).status == 200);
 }
 
+void test_response_format_and_tool_ban() {
+  auto s = serve();
+  const int32_t tool_tok = g_fmt->content_invoke_tool_json_id();
+
+  // No tools -> <|content_invoke_tool_json|> is banned in Sampling::banned_tokens
+  Chat r = chat(s->port(), Json::object());
+  CHECK(r.status == 200);
+  {
+    const auto calls = s->gen->calls();
+    const auto& ban = calls.back().sampling.banned_tokens;
+    CHECK(std::find(ban.begin(), ban.end(), tool_tok) != ban.end());
+  }
+
+  // With tools -> <|content_invoke_tool_json|> is NOT banned
+  r = chat(s->port(), {{"tools", TOOLS}});
+  CHECK(r.status == 200);
+  {
+    const auto calls = s->gen->calls();
+    const auto& ban = calls.back().sampling.banned_tokens;
+    CHECK(std::find(ban.begin(), ban.end(), tool_tok) == ban.end());
+  }
+
+  // response_format: text / json_object / json_schema
+  CHECK(chat(s->port(), {{"response_format", {{"type", "text"}}}}).status == 200);
+  const size_t base_len = s->gen->calls().back().prompt_ids.size();
+  r = chat(s->port(), {{"response_format", {{"type", "json_object"}}}});
+  CHECK(r.status == 200 && s->gen->calls().back().prompt_ids.size() > base_len);
+  const std::string decoded_obj = g_fmt->decode(s->gen->calls().back().prompt_ids);
+  CHECK(decoded_obj.find("single valid JSON object") != std::string::npos);
+
+  const Json schema = {{"type", "object"}, {"properties", {{"answer", {{"type", "string"}}}}}, {"required", Json::array({"answer"})}};
+  r = chat(s->port(), {{"response_format", {{"type", "json_schema"}, {"json_schema", {{"name", "ans"}, {"schema", schema}}}}}});
+  CHECK(r.status == 200);
+  const std::string decoded_schema = g_fmt->decode(s->gen->calls().back().prompt_ids);
+  CHECK(decoded_schema.find("\"answer\"") != std::string::npos);
+
+  // Invalid response_format -> 400
+  CHECK(chat(s->port(), {{"response_format", "json_object"}}).status == 400);
+  CHECK(chat(s->port(), {{"response_format", {{"type", "xml"}}}}).status == 400);
+  CHECK(chat(s->port(), {{"response_format", {{"type", "json_schema"}}}}).status == 400);
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -851,6 +893,7 @@ int main() {
       {"invalid_json", test_invalid_json},
       {"echo", test_echo},
       {"images", test_images},
+      {"response_format_and_tool_ban", test_response_format_and_tool_ban},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {

@@ -25,7 +25,7 @@ namespace ingine::kernels::prefill {
 namespace {
 
 enum class Mode { Up, Down };
-constexpr int FMT_NVFP4 = 0, FMT_MXFP8 = 1;
+constexpr int FMT_NVFP4 = 0, FMT_MXFP8 = 1, FMT_ATLAS2 = 2, FMT_ATLAS3 = 3;
 
 constexpr int TN = 128, BK = 64;
 constexpr int AS = 3;  // activation stages (BK elements each)
@@ -33,20 +33,22 @@ constexpr int NT = 256;
 constexpr int KCH = BK / 8;  // 16-byte chunks per activation tile row
 
 __constant__ float kE2M1[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+__constant__ float kAtlas2[4] = {-1.5f, -0.453125f, 0.453125f, 1.5f};
+__constant__ float kAtlas3[8] = {-2.0f, -1.25f, -0.703125f, -0.2265625f, 0.2265625f, 0.703125f, 1.25f, 2.0f};
 
 template <int FMT, int K, int TM>
 struct Cfg {
-  static constexpr int CODE_ROW = FMT == FMT_NVFP4 ? K / 2 : K;  // checkpoint bytes per weight row
-  static constexpr int SCALE_ROW = FMT == FMT_NVFP4 ? K / 16 : K / 32;
-  // weight chunk: 64 code bytes per row (NVFP4 128 elements, FP8 64)
-  static constexpr int WK = FMT == FMT_NVFP4 ? 128 : 64;
+  static constexpr int CODE_ROW = FMT == FMT_NVFP4 ? K / 2 : (FMT == FMT_MXFP8 ? K : (FMT == FMT_ATLAS2 ? K / 4 : (K * 3) / 8));
+  static constexpr int SCALE_ROW = FMT == FMT_MXFP8 ? K / 32 : K / 16;
+  // weight chunk: 128 elements for NVFP4/ATLAS2/ATLAS3 (64/32/48 code bytes per row, all multiples of 16), 64 for MXFP8
+  static constexpr int WK = FMT == FMT_MXFP8 ? 64 : 128;
   static constexpr int R = WK / BK;  // activation steps per weight chunk
   static constexpr int KC = K / WK;  // weight chunks
   // weight slots: the chunk of step s + 1 must have landed (and be published by the barrier) at step s, when its
   // B fragments are decoded under step s's MMAs: R (WS - 1) >= AS. Small-row tiles prefetch further.
-  static constexpr int WS = TM <= 32 ? (FMT == FMT_NVFP4 ? 6 : 7) : (FMT == FMT_NVFP4 ? 3 : 4);
+  static constexpr int WS = TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6) : (FMT == FMT_MXFP8 ? 4 : 3);
   static_assert(R * (WS - 1) >= AS);
-  static constexpr int WCODE = FMT == FMT_NVFP4 ? WK / 2 : WK;  // code bytes per row per chunk
+  static constexpr int WCODE = FMT == FMT_NVFP4 ? WK / 2 : (FMT == FMT_MXFP8 ? WK : (FMT == FMT_ATLAS2 ? WK / 4 : (WK * 3) / 8));
   static constexpr int WSTRIDE = WCODE + 16;                    // padded: fragment loads on distinct banks
   static constexpr int W_BYTES = TN * WSTRIDE;
   static constexpr int A_BYTES = TM * BK * 2;
@@ -116,7 +118,13 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   const int n0 = (blockIdx.x % NTILES_N) * TN;
   const uint8_t* code_tile = g.codes + (int64_t(e) * NE + n0) * C::CODE_ROW;
   const uint8_t* scale_tile = g.scales + (int64_t(e) * NE + n0) * C::SCALE_ROW;
-  if (tid < 16) lut[tid] = kE2M1[tid];
+  if constexpr (FMT == FMT_NVFP4) {
+    if (tid < 16) lut[tid] = kE2M1[tid];
+  } else if constexpr (FMT == FMT_ATLAS2) {
+    if (tid < 4) lut[tid] = kAtlas2[tid];
+  } else if constexpr (FMT == FMT_ATLAS3) {
+    if (tid < 8) lut[tid] = kAtlas3[tid];
+  }
 
   // activation rows of this thread's cp.async chunks: rows tid / 8 + 32 i, chunk tid % 8
   const uint16_t* arow[TM / 32];
@@ -139,9 +147,10 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   auto load_w = [&](int chunk) {
     unsigned char* ws = w_smem + (chunk % C::WS) * C::W_BYTES;
     constexpr int CPR = C::WCODE / 16;  // 16-byte pieces per row
+    constexpr int TOTAL = TN * CPR;
 #pragma unroll
-    for (int i = 0; i < TN * CPR / NT; ++i) {
-      const int id = tid + i * NT, row = id / CPR, ch = id % CPR;
+    for (int id = tid; id < TOTAL; id += NT) {
+      const int row = id / CPR, ch = id % CPR;
       cp_async16(ws + row * C::WSTRIDE + ch * 16, code_tile + int64_t(row) * C::CODE_ROW + chunk * C::WCODE + ch * 16);
     }
   };
@@ -161,7 +170,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   for (int j = 0; j < AS - 1; ++j) issue(j);
 
   const int c = lane & 3;
-  const float factor = FMT == FMT_NVFP4 ? __ldg(g.factors + e) : 1.f;
+  const float factor = FMT != FMT_MXFP8 ? __ldg(g.factors + e) : 1.f;
   const int mact = min((n + 15) / 16, TM / 16);  // active m16 row blocks (same for every warp)
   float acc[TM / 16][2][4];
 #pragma unroll
@@ -174,7 +183,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
       const int row = warp * 16 + nt * 8 + (lane >> 2);
-      if constexpr (FMT == FMT_NVFP4) {
+      if constexpr (FMT != FMT_MXFP8) {
         const uint32_t s4 = *reinterpret_cast<const uint32_t*>(sc_smem + row * C::SCALE_ROW + ks * 4);
         const float2 lo = e4m3x2_to_float2(uint16_t(s4 & 0xffff)), hi = e4m3x2_to_float2(uint16_t(s4 >> 16));
         sc[nt][0] = lo.x, sc[nt][1] = lo.y, sc[nt][2] = hi.x, sc[nt][3] = hi.y;
@@ -198,13 +207,30 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
         const uint32_t b0 = (wd.x >> (8 * c)) & 0xffu, b1 = (wd.y >> (8 * c)) & 0xffu;
         b[kk][nt][0] = pack_bf16x2((lut[b0 & 0xf] * s) * factor, (lut[b0 >> 4] * s) * factor);
         b[kk][nt][1] = pack_bf16x2((lut[b1 & 0xf] * s) * factor, (lut[b1 >> 4] * s) * factor);
-      } else {
+      } else if constexpr (FMT == FMT_MXFP8) {
         const uint4 q = *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc);
         const uint32_t w0 = (c >> 1) ? q.y : q.x, w1 = (c >> 1) ? q.w : q.z;
         const float2 f0 = e4m3x2_to_float2(uint16_t(w0 >> (16 * (c & 1))));
         const float2 f1 = e4m3x2_to_float2(uint16_t(w1 >> (16 * (c & 1))));
         b[kk][nt][0] = pack_bf16x2(f0.x * s, f0.y * s);
         b[kk][nt][1] = pack_bf16x2(f1.x * s, f1.y * s);
+      } else if constexpr (FMT == FMT_ATLAS2) {
+        const uint32_t wd = *reinterpret_cast<const uint32_t*>(ws + row * C::WSTRIDE + kc / 4);
+        b[kk][nt][0] = pack_bf16x2((lut[(wd >> (4 * c)) & 3u] * s) * factor,
+                                   (lut[(wd >> (4 * c + 2)) & 3u] * s) * factor);
+        b[kk][nt][1] = pack_bf16x2((lut[(wd >> (16 + 4 * c)) & 3u] * s) * factor,
+                                   (lut[(wd >> (16 + 4 * c + 2)) & 3u] * s) * factor);
+      } else {
+        const unsigned char* blk = ws + row * C::WSTRIDE + (kc / 32) * 12;
+        const int half = (kc >> 4) & 1;
+        const uint32_t lo = *reinterpret_cast<const uint32_t*>(blk + half * 4);
+        const uint16_t hi16 = *reinterpret_cast<const uint16_t*>(blk + 8 + half * 2);
+        const uint32_t c0 = ((lo >> (4 * c)) & 3u) | (((hi16 >> (2 * c)) & 1u) << 2);
+        const uint32_t c1 = ((lo >> (4 * c + 2)) & 3u) | (((hi16 >> (2 * c + 1)) & 1u) << 2);
+        const uint32_t c2 = ((lo >> (16 + 4 * c)) & 3u) | (((hi16 >> (8 + 2 * c)) & 1u) << 2);
+        const uint32_t c3 = ((lo >> (16 + 4 * c + 2)) & 3u) | (((hi16 >> (8 + 2 * c + 1)) & 1u) << 2);
+        b[kk][nt][0] = pack_bf16x2((lut[c0] * s) * factor, (lut[c1] * s) * factor);
+        b[kk][nt][1] = pack_bf16x2((lut[c2] * s) * factor, (lut[c3] * s) * factor);
       }
       asm volatile("" : "+r"(b[kk][nt][0]), "+r"(b[kk][nt][1]));
     }
@@ -310,15 +336,19 @@ GemmArgs expert_args(const void* codes, const void* scales, const float* factors
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
                  cudaStream_t stream) {
   const GemmArgs g = expert_args(e.w13, e.w13_scale, e.w13_factor, x, w, act);
-  if (e.fmt == 0) launch_rows<FMT_NVFP4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
-  else launch_rows<FMT_MXFP8, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+  if (e.fmt == FMT_NVFP4) launch_rows<FMT_NVFP4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+  else if (e.fmt == FMT_MXFP8) launch_rows<FMT_MXFP8, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+  else if (e.fmt == FMT_ATLAS2) launch_rows<FMT_ATLAS2, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+  else launch_rows<FMT_ATLAS3, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
 }
 
 void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
               cudaStream_t stream) {
   const GemmArgs g = expert_args(e.w2, e.w2_scale, e.w2_factor, act, w, down);
-  if (e.fmt == 0) launch_rows<FMT_NVFP4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
-  else launch_rows<FMT_MXFP8, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+  if (e.fmt == FMT_NVFP4) launch_rows<FMT_NVFP4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+  else if (e.fmt == FMT_MXFP8) launch_rows<FMT_MXFP8, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+  else if (e.fmt == FMT_ATLAS2) launch_rows<FMT_ATLAS2, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+  else launch_rows<FMT_ATLAS3, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
 }
 
 }  // namespace ingine::kernels::prefill

@@ -29,14 +29,22 @@ struct SamplerRng {
   std::uint64_t counter = 0;
 };
 
+struct BannedTokens {
+  static constexpr int kMax = 4;
+  int count = 0;
+  std::int32_t ids[kMax] = {-1, -1, -1, -1};
+};
+
 struct SamplingParams {
   float temperature = 1.0f;  // <= 0: greedy (sample() = argmax)
   int top_k = 0;             // <= 0 or >= V: disabled
   float top_p = 1.0f;        // >= 1: disabled
+  BannedTokens banned{};     // token ids masked to -inf before selection/softmax
 };
 
 // out[r] = first index of the maximum of row r (torch.argmax). logits fp32 [rows, stride], V <= stride.
-void argmax(const float* logits, int rows, int V, std::int64_t stride, std::int32_t* out, cudaStream_t stream);
+void argmax(const float* logits, int rows, int V, std::int64_t stride, std::int32_t* out, cudaStream_t stream,
+            const BannedTokens& banned = {});
 
 // probs[r, v] = engine._probs(logits[r], params) (requires temperature > 0); probs fp32 [rows, V].
 void sampling_probs(const float* logits, int rows, int V, std::int64_t stride, const SamplingParams& params,

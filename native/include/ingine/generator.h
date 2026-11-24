@@ -19,6 +19,8 @@ struct Sampling {
   float top_p = 1.0f;
   int top_k = 0;  // 0 => disabled
   std::optional<uint64_t> seed;
+  // Token ids masked to -inf before argmax/sampling (e.g. <|content_invoke_tool_json|> when no tools are provided).
+  std::vector<int32_t> banned_tokens;
   // Teacher-forced replay (test/benchmark only; empty = off): generate() emits exactly these tokens
   // (max_new_tokens is capped at their count), running its real loop along them: plain decoding samples as
   // usual and then takes the forced token; speculative decoding accepts a draft iff it equals the forced token

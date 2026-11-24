@@ -1,15 +1,9 @@
 # Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
 cmake_minimum_required(VERSION 3.28)
 
-# ingine is compiled only for sm_120a (RTX 5090 class). Set and validate the architecture before
-# CUDA compiler detection.
+# Multi-arch build: supports Ampere (86), Ada (89), Hopper (90a), and Blackwell (120a).
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
-endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
-  message(FATAL_ERROR
-    "ingine supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
+  set(CMAKE_CUDA_ARCHITECTURES "86;89;120a" CACHE STRING "CUDA architectures to build")
 endif()
 
 # Prefer the installer's private toolkit, then /opt/cuda, when nvcc is not chosen explicitly.

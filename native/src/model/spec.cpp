@@ -82,13 +82,20 @@ SpecLoop::~SpecLoop() {
 void SpecLoop::prepare_accept(const Sampling& sampling) {
   const bool forced = !sampling.forced.empty();
   const bool greedy = sampling.temperature <= 0.f || forced;
-  const AcceptKey key = greedy ? AcceptKey{true, forced, 0.f, 1.f, 0}
-                               : AcceptKey{false, false, sampling.temperature, sampling.top_p, sampling.top_k};
+  kh::BannedTokens banned{};
+  for (std::int32_t id : sampling.banned_tokens) {
+    if (id >= 0 && banned.count < kh::BannedTokens::kMax) banned.ids[banned.count++] = id;
+  }
+  std::array<std::int32_t, kh::BannedTokens::kMax> banned_arr{};
+  for (int i = 0; i < kh::BannedTokens::kMax; ++i) banned_arr[i] = banned.ids[i];
+  const AcceptKey key = greedy ? AcceptKey{true, forced, 0.f, 1.f, 0, banned.count, banned_arr}
+                               : AcceptKey{false, false, sampling.temperature, sampling.top_p, sampling.top_k,
+                                           banned.count, banned_arr};
   if (accept_ && key == accept_key_) return;
   const Widths widths = verify_widths(rt_);
   const int V = drafter_.vocab();
   const Drafter::AcceptScratch& scratch = drafter_.accept_scratch();
-  const kh::SamplingParams params{sampling.temperature, sampling.top_k, sampling.top_p};
+  const kh::SamplingParams params{sampling.temperature, sampling.top_k, sampling.top_p, banned};
   const auto* width = static_cast<const std::int32_t*>(width_.p);
   auto* record = static_cast<VerifyRecord*>(record_.device_ptr());
   // forced replay: the drafts are compared with the forced tokens (the argmax still runs, for the timing)
@@ -101,7 +108,7 @@ void SpecLoop::prepare_accept(const Sampling& sampling) {
         const float* logits = static_cast<const float*>(rt_.buffers(m).logits.data);
         const int n = m - 1;
         if (greedy) {
-          kh::argmax(logits, m, V, V, scratch.target, s);
+          kh::argmax(logits, m, V, V, scratch.target, s, banned);
           kd::greedy_accept(target, draft_.tokens, n, scratch.result, s);
         } else {
           kh::sampling_probs(logits, m, V, V, params, scratch.probs, s);

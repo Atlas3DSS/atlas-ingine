@@ -21,22 +21,35 @@ cudaStream_t g_stream = nullptr;
 
 void sync() { INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream)); }
 
+constexpr float kAtlas2[4] = {-1.5f, -0.453125f, 0.453125f, 1.5f};
+constexpr float kAtlas3[8] = {-2.0f, -1.25f, -0.703125f, -0.2265625f, 0.2265625f, 0.703125f, 1.25f, 2.0f};
+
+const char* fmt_name(moe::Format fmt) {
+  switch (fmt) {
+    case moe::Format::NVFP4: return "nvfp4";
+    case moe::Format::MXFP8: return "mxfp8";
+    case moe::Format::ATLAS2: return "atlas2";
+    case moe::Format::ATLAS3: return "atlas3";
+  }
+  return "?";
+}
+
 // One expert weight [E, rows, cols] in checkpoint encoding plus its decoded values (model.decode_experts).
 struct ExpertWeight {
   int rows = 0, cols = 0;
-  bool nv = true;
+  moe::Format fmt = moe::Format::NVFP4;
   std::vector<float> value;  // [E, rows, cols] decoded BF16 values
   std::optional<DeviceArray<uint8_t>> codes, scales;
   std::optional<DeviceArray<float>> factor;  // [128]
 };
 
-ExpertWeight make_expert_weight(Rng& rng, int rows, int cols, bool nv) {
+ExpertWeight make_expert_weight(Rng& rng, int rows, int cols, moe::Format fmt) {
   ExpertWeight w;
-  w.rows = rows, w.cols = cols, w.nv = nv;
+  w.rows = rows, w.cols = cols, w.fmt = fmt;
   const size_t n = size_t(E) * rows * cols;
   w.value.resize(n);
   std::vector<float> factor(128, 0.f);
-  if (nv) {
+  if (fmt == moe::Format::NVFP4) {
     std::vector<uint8_t> codes(n / 2), scales(n / 16);
     for (auto& c : codes) c = uint8_t(rng.next());
     for (auto& s : scales) s = float_to_e4m3(float(rng.uniform(16.0, 448.0)));
@@ -50,7 +63,7 @@ ExpertWeight make_expert_weight(Rng& rng, int rows, int cols, bool nv) {
     }
     w.codes.emplace(codes);
     w.scales.emplace(scales);
-  } else {
+  } else if (fmt == moe::Format::MXFP8) {
     std::vector<uint8_t> codes(n), scales(n / 32);
     for (auto& c : codes) {
       c = uint8_t(rng.next());
@@ -58,6 +71,41 @@ ExpertWeight make_expert_weight(Rng& rng, int rows, int cols, bool nv) {
     }
     for (auto& s : scales) s = uint8_t(112 + rng.next() % 6);  // weights of real magnitude (|w| < 0.5)
     for (size_t i = 0; i < n; ++i) w.value[i] = round_bf16(e4m3_to_float(codes[i]) * std::ldexp(1.0f, scales[i / 32] - 127));
+    w.codes.emplace(codes);
+    w.scales.emplace(scales);
+  } else if (fmt == moe::Format::ATLAS2) {
+    std::vector<uint8_t> codes(n / 4), scales(n / 16);
+    for (auto& c : codes) c = uint8_t(rng.next());
+    for (auto& s : scales) s = float_to_e4m3(float(rng.uniform(16.0, 448.0)));
+    for (int e = 0; e < E; ++e) factor[e] = float(rng.uniform(0.5, 1.5) * 0.002 / 448.0 * 64.0);
+    for (size_t i = 0; i < n; ++i) {
+      const int e = int(i / (size_t(rows) * cols));
+      const uint8_t q = (codes[i / 4] >> (2 * (i & 3))) & 3u;
+      const float cs = kAtlas2[q] * e4m3_to_float(scales[i / 16]);
+      w.value[i] = round_bf16(cs * factor[e]);
+    }
+    w.codes.emplace(codes);
+    w.scales.emplace(scales);
+  } else {
+    std::vector<uint8_t> codes((n * 3) / 8), scales(n / 16);
+    for (auto& c : codes) c = uint8_t(rng.next());
+    for (auto& s : scales) s = float_to_e4m3(float(rng.uniform(16.0, 448.0)));
+    for (int e = 0; e < E; ++e) factor[e] = float(rng.uniform(0.5, 1.5) * 0.002 / 448.0 * 64.0);
+    for (size_t i = 0; i < n; ++i) {
+      const int e = int(i / (size_t(rows) * cols));
+      const size_t blk = i / 32;
+      const size_t within = i & 31;
+      const size_t half = within >> 4;
+      const size_t j = within & 15;
+      const uint8_t* p = codes.data() + blk * 12;
+      uint32_t lo;
+      uint16_t hi;
+      std::memcpy(&lo, p + half * 4, 4);
+      std::memcpy(&hi, p + 8 + half * 2, 2);
+      const uint32_t q = ((lo >> (2 * j)) & 3u) | (((hi >> j) & 1u) << 2);
+      const float cs = kAtlas3[q] * e4m3_to_float(scales[i / 16]);
+      w.value[i] = round_bf16(cs * factor[e]);
+    }
     w.codes.emplace(codes);
     w.scales.emplace(scales);
   }
@@ -84,8 +132,8 @@ bool test_up(Rng& rng, const ExpertWeight& w13, int M) {
   const std::vector<int> idx = routing(rng, M);
   DeviceArray<__nv_bfloat16> dx(to_bf16(x)), out(size_t(M) * TOPK * I);
   DeviceArray<int> didx(idx);
-  moe::moe_up(dx.get(), M, didx.get(), w13.codes->get(), w13.scales->get(), w13.nv ? w13.factor->get() : nullptr,
-              w13.nv ? moe::Format::NVFP4 : moe::Format::MXFP8, out.get(), true, g_stream);
+  moe::moe_up(dx.get(), M, didx.get(), w13.codes->get(), w13.scales->get(),
+              w13.fmt != moe::Format::MXFP8 ? w13.factor->get() : nullptr, w13.fmt, out.get(), true, g_stream);
   sync();
   std::vector<double> ref(size_t(M) * TOPK * I), rnd(ref.size());
   for (int m = 0; m < M; ++m)
@@ -104,7 +152,7 @@ bool test_up(Rng& rng, const ExpertWeight& w13, int M) {
       }
     }
   char what[48];
-  std::snprintf(what, sizeof what, "moe_up %s M=%d", w13.nv ? "nvfp4" : "mxfp8", M);
+  std::snprintf(what, sizeof what, "moe_up %s M=%d", fmt_name(w13.fmt), M);
   return Check{what, 1.0 / 64, 2e-3, 0.02}(bf16_download(out), ref, &rnd);
 }
 
@@ -118,9 +166,9 @@ bool test_down(Rng& rng, const ExpertWeight& w2, int M) {
   DeviceArray<__nv_bfloat16> dact(to_bf16(act));
   DeviceArray<int> didx(idx);
   DeviceArray<float> dw(wts), dcw(cw), dst(st0), out(size_t(M) * H), hist(size_t(M) * H);
-  moe::moe_down(dact.get(), M, didx.get(), dw.get(), w2.codes->get(), w2.scales->get(), w2.nv ? w2.factor->get() : nullptr,
-                w2.nv ? moe::Format::NVFP4 : moe::Format::MXFP8, dcw.get(), dst.get(), out.get(), hist.get(), true,
-                g_stream);
+  moe::moe_down(dact.get(), M, didx.get(), dw.get(), w2.codes->get(), w2.scales->get(),
+                w2.fmt != moe::Format::MXFP8 ? w2.factor->get() : nullptr, w2.fmt, dcw.get(), dst.get(), out.get(),
+                hist.get(), true, g_stream);
   sync();
   const auto s = hist.download(), o = out.download(), st = dst.download();
   std::vector<double> rs(s.size()), rsr(s.size());
@@ -138,8 +186,20 @@ bool test_down(Rng& rng, const ExpertWeight& w2, int M) {
       rsr[size_t(m) * H + c] = rbf(sum);
     }
   char what[64];
-  std::snprintf(what, sizeof what, "moe_down %s M=%d expert sum", w2.nv ? "nvfp4" : "mxfp8", M);
-  bool ok = Check{what, 1.0 / 64, 1e-4, 0.02}(s, rs, &rsr);
+  std::snprintf(what, sizeof what, "moe_down %s M=%d expert sum", fmt_name(w2.fmt), M);
+  // Each of the 8 experts rounds its FP32 dot product to BF16 before the weighted sum; when an expert dot sits at a
+  // BF16 halfway tie and the 8 experts cancel near zero, a 1-ULP tie flip shifts the sum by ~|w_k * y_k| / 128.
+  double max_term = 0;
+  for (int m = 0; m < M; ++m)
+    for (int c = 0; c < H; ++c)
+      for (int k = 0; k < TOPK; ++k) {
+        const int e = idx[size_t(m) * TOPK + k];
+        const float* row = &w2.value[(size_t(e) * H + c) * I];
+        double y = 0;
+        for (int i = 0; i < I; ++i) y += double(row[i]) * act[(size_t(m) * TOPK + k) * I + i];
+        max_term = std::max(max_term, std::fabs(double(wts[size_t(m) * TOPK + k]) * y));
+      }
+  bool ok = Check{what, 1.0 / 64, 1e-4 + max_term / 256.0, 0.02}(s, rs, &rsr);
   std::vector<double> ro(o.size()), rst(st.size());
   for (int c = 0; c < H; ++c) {
     std::vector<double> ext(M + 3);
@@ -165,15 +225,15 @@ bool test_dequant(const ExpertWeight& w) {
   const std::vector<int> experts = {E - 1, 0, 3};
   DeviceArray<int> de(experts);
   DeviceArray<__nv_bfloat16> out(experts.size() * w.rows * w.cols);
-  moe::dequant_experts(w.codes->get(), w.scales->get(), w.nv ? w.factor->get() : nullptr, de.get(), int(experts.size()),
-                       w.rows, w.cols, w.nv ? moe::Format::NVFP4 : moe::Format::MXFP8, out.get(), g_stream);
+  moe::dequant_experts(w.codes->get(), w.scales->get(), w.fmt != moe::Format::MXFP8 ? w.factor->get() : nullptr,
+                       de.get(), int(experts.size()), w.rows, w.cols, w.fmt, out.get(), g_stream);
   sync();
   const auto got = bf16_download(out);
   size_t bad = 0;
   for (size_t s = 0; s < experts.size(); ++s)
     for (size_t i = 0; i < size_t(w.rows) * w.cols; ++i)
       bad += got[s * w.rows * w.cols + i] != w.value[size_t(experts[s]) * w.rows * w.cols + i];
-  std::printf("%s dequant_experts %s [%d, %d]: %zu mismatches\n", bad ? "FAIL" : "PASS", w.nv ? "nvfp4" : "mxfp8",
+  std::printf("%s dequant_experts %s [%d, %d]: %zu mismatches\n", bad ? "FAIL" : "PASS", fmt_name(w.fmt),
               w.rows, w.cols, bad);
   return bad == 0;
 }
@@ -185,13 +245,13 @@ int main() {
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
   Rng rng(1152);
   bool ok = true;
-  for (bool nv : {true, false}) {
-    const ExpertWeight w13 = make_expert_weight(rng, 2 * I, H, nv);
+  for (moe::Format fmt : {moe::Format::NVFP4, moe::Format::MXFP8, moe::Format::ATLAS2, moe::Format::ATLAS3}) {
+    const ExpertWeight w13 = make_expert_weight(rng, 2 * I, H, fmt);
     for (int M : {1, 3, 8}) ok &= test_up(rng, w13, M);
     ok &= test_dequant(w13);
   }
-  for (bool nv : {true, false}) {
-    const ExpertWeight w2 = make_expert_weight(rng, H, I, nv);
+  for (moe::Format fmt : {moe::Format::NVFP4, moe::Format::MXFP8, moe::Format::ATLAS2, moe::Format::ATLAS3}) {
+    const ExpertWeight w2 = make_expert_weight(rng, H, I, fmt);
     for (int M : {1, 3, 8}) ok &= test_down(rng, w2, M);
     ok &= test_dequant(w2);
   }

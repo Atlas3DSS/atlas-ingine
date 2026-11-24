@@ -327,6 +327,43 @@ bool test_fast_distribution(Rng& rng) {
   return ok;
 }
 
+bool test_banned_tokens(Rng& rng) {
+  const int rows = 10;  // covers both multi-block (rows <= 8) and single-CTA (rows > 8) paths
+  std::vector<float> l = randn(rng, size_t(rows) * V, 1.0);
+  const int tok_a = 200011, tok_b = 4242, tok_c = 100001;
+  for (int r = 0; r < rows; ++r) {
+    l[size_t(r) * V + tok_a] = 50.f;  // top-1
+    l[size_t(r) * V + tok_b] = 40.f;  // top-2
+    l[size_t(r) * V + tok_c] = 30.f;  // top-3
+  }
+  head::BannedTokens b1{};
+  b1.count = 1;
+  b1.ids[0] = tok_a;
+  head::BannedTokens b2{};
+  b2.count = 2;
+  b2.ids[0] = tok_a;
+  b2.ids[1] = tok_b;
+
+  DeviceArray<float> dl(l), dp(size_t(rows) * V);
+  DeviceArray<int> out1(rows), out2(rows), out3(rows);
+  head::argmax(dl.get(), 2, V, V, out1.get(), g_stream, b1);
+  head::argmax(dl.get(), rows, V, V, out2.get(), g_stream, b2);
+  head::SamplingParams sp{0.8f, 16, 0.9f, b1};
+  head::SamplerRng sr{42, 0};
+  head::sample(dl.get(), 2, V, V, sp, sr, out3.get(), g_stream);
+  head::sampling_probs(dl.get(), 2, V, V, sp, dp.get(), g_stream);
+  sync();
+  const auto o1 = out1.download(), o2 = out2.download(), o3 = out3.download();
+  const auto p = dp.download();
+  bool ok = (o1[0] == tok_b && o1[1] == tok_b);
+  for (int r = 0; r < rows; ++r) ok &= (o2[r] == tok_c);
+  ok &= (o3[0] != tok_a && o3[1] != tok_a);
+  ok &= (p[tok_a] == 0.f && p[V + tok_a] == 0.f && p[tok_b] > 0.99f);
+  std::printf("%s banned_tokens: fast_argmax=%d cta_argmax=%d sample=%d p_banned=%.2e p_next=%.4f\n",
+              ok ? "PASS" : "FAIL", o1[0], o2[0], o3[0], p[tok_a], p[tok_b]);
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -344,6 +381,7 @@ int main() {
   ok &= test_fast_paths(rng);
   ok &= test_fast_distribution(rng);
   ok &= test_fast_truncation(rng);
+  ok &= test_banned_tokens(rng);
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

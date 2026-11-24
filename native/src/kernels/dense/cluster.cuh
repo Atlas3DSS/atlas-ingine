@@ -17,39 +17,50 @@ inline void require(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(std::string("dense: ") + what);
 }
 
-// Split cluster barrier. A relaxed arrive at kernel start + wait before the first remote shared-memory
-// store guarantees every CTA of the cluster is running; release/acquire pairs publish remote stores.
+// Split cluster barrier (SM90+ only; no-ops on SM8x which use non-cluster fallbacks).
 __device__ __forceinline__ void cluster_arrive_relaxed() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#endif
 }
-__device__ __forceinline__ void cluster_arrive() { asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory"); }
-__device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory"); }
+__device__ __forceinline__ void cluster_arrive() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void cluster_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
+}
 
-// Programmatic dependent launch. Every dense kernel loads only weights/constants before pdl_wait() and
-// every activation/state input, and every write, after it; pdl_wait() returns once the preceding grid has
-// completed and its writes are visible. pdl_trigger() lets the next kernel of the stream start its own
-// prologue (it still waits for this grid's completion before reading our outputs). Both are no-ops when
-// the kernel was not launched with the PDL attribute.
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
-// griddepcontrol.wait that keeps the loads issued before it ahead of it. ptxas sinks independent loads
-// below a plain griddepcontrol.wait (legal: the wait only orders later accesses), even below a
-// __syncthreads, which silently turns the "weights in flight before the wait" prefetch into loads issued
-// after the predecessor completed; it does not move them into a loop whose trip count it cannot see.
-// `zero` must be 0 at run time and opaque to the compiler (a kernel argument).
+// Programmatic dependent launch (SM90+ only; no-ops on SM8x).
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 __device__ __forceinline__ void pdl_wait_fenced(uint32_t zero) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #pragma unroll 1
   for (uint32_t i = 0; i <= zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
+#else
+  static_cast<void>(zero);
+#endif
 }
 
-// Launches `kernel` on `stream` (graph capturable): as clusters of `cl` CTAs if cl > 1, with
-// the programmatic-stream-serialization attribute if `pdl` (captured as a programmatic graph edge).
-// Cluster sizes above 8 need the non-portable opt-in; shared memory above 48 KB the dynamic-size opt-in.
+// Launches `kernel` on `stream` (graph capturable): as clusters of `cl` CTAs if cl > 1 (SM90+), with
+// the programmatic-stream-serialization attribute if `pdl` (SM90+).
 template <class... KArgs, class... Args>
 void launch_ex(void (*kernel)(KArgs...), dim3 grid, int block, int smem, int cl, bool pdl, cudaStream_t stream,
                Args&&... args) {
-  if (cl > 8) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-  // static + dynamic shared memory above 48 KB needs the opt-in, whatever the split
+  const bool sm90 = current_sm_major() >= 9;
+  if (sm90 && cl > 8) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
   if (smem > 0) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = grid;
@@ -58,14 +69,14 @@ void launch_ex(void (*kernel)(KArgs...), dim3 grid, int block, int smem, int cl,
   cfg.stream = stream;
   cudaLaunchAttribute attr[2];
   int n = 0;
-  if (cl > 1) {
+  if (sm90 && cl > 1) {
     attr[n].id = cudaLaunchAttributeClusterDimension;
     attr[n].val.clusterDim.x = cl;
     attr[n].val.clusterDim.y = 1;
     attr[n].val.clusterDim.z = 1;
     ++n;
   }
-  if (pdl) {
+  if (sm90 && pdl) {
     attr[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[n].val.programmaticStreamSerializationAllowed = 1;
     ++n;

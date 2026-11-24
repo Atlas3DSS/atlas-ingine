@@ -56,8 +56,12 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   __shared__ float sel_s[TOPK];
   __shared__ int sel_e[TOPK];
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
+#else
+  const int rank = blockIdx.x;
+#endif
   const uint32_t logits_u = smem_u32(logits), mb = smem_u32(&mbar);
   if (threadIdx.x == 0) {
     mb_init(mb);
@@ -188,9 +192,140 @@ void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bi
   }
 }
 
+template <int CL, bool WF32, int M>
+__global__ void __launch_bounds__(32 * EXPERTS / CL) router_sm8x_dot_kernel(const __nv_bfloat16* __restrict__ x,
+                                                                            const void* __restrict__ w,
+                                                                            float* __restrict__ logits_out) {
+  constexpr int RPC = EXPERTS / CL, NT = 32 * RPC;
+  constexpr int EPC = WF32 ? 4 : 8;
+  constexpr int CH = H / (EPC * 32);
+  __shared__ __align__(16) __nv_bfloat16 xs[M][H];
+  const int rank = blockIdx.x;
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  const int row = rank * RPC + warp;
+
+  const uint8_t* wr = reinterpret_cast<const uint8_t*>(w) + size_t(row) * H * (WF32 ? 4 : 2);
+  uint4 wv[CH];
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+#pragma unroll
+  for (int i = 0; i < CH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (size_t(i) * 32 + lane) * 16, wpol);
+  for (int k = t; k < M * H / 8; k += NT) cp_async16(&xs[0][0] + k * 8, x + size_t(k) * 8);
+  asm volatile("cp.async.commit_group;" ::: "memory");
+  asm volatile("cp.async.wait_all;" ::: "memory");
+  __syncthreads();
+
+  float acc[M];
+#pragma unroll
+  for (int m = 0; m < M; ++m) acc[m] = 0.f;
+#pragma unroll
+  for (int i = 0; i < CH; ++i) {
+    const int col = (i * 32 + lane) * EPC;
+    float wf[EPC], xf[EPC];
+    if constexpr (WF32) {
+      wf[0] = __uint_as_float(wv[i].x); wf[1] = __uint_as_float(wv[i].y);
+      wf[2] = __uint_as_float(wv[i].z); wf[3] = __uint_as_float(wv[i].w);
+    } else {
+      unpack_bf16x8(wv[i], wf);
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      if constexpr (WF32) {
+        const uint2 u = *reinterpret_cast<const uint2*>(&xs[m][col]);
+        xf[0] = bf_lo(u.x); xf[1] = bf_hi(u.x); xf[2] = bf_lo(u.y); xf[3] = bf_hi(u.y);
+      } else {
+        unpack_bf16x8(*reinterpret_cast<const uint4*>(&xs[m][col]), xf);
+      }
+      float a = acc[m];
+#pragma unroll
+      for (int j = 0; j < EPC; ++j) a = fmaf(wf[j], xf[j], a);
+      acc[m] = a;
+    }
+  }
+  const float logit = reduce_scatter<32, M>(acc);
+  if (lane < M) logits_out[lane * EXPERTS + row] = logit;
+}
+
+template <int NT>
+__global__ void __launch_bounds__(NT) router_sm8x_select_kernel(const float* __restrict__ logits_in,
+                                                                const float* __restrict__ bias,
+                                                                int* __restrict__ idx, float* __restrict__ wts) {
+  __shared__ unsigned long long keys[EXPERTS];
+  __shared__ int cnt[NT];
+  __shared__ float sel_s[TOPK];
+  __shared__ int sel_e[TOPK];
+  const int m = blockIdx.x, t = threadIdx.x;
+  float s = 0.f;
+  if (t < EXPERTS) {
+    const float b = __ldg(bias + t);
+    s = 1.f / (1.f + expf(-logits_in[m * EXPERTS + t]));
+    const uint32_t u = __float_as_uint(s + b + 0.f);
+    const uint32_t o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    keys[t] = (static_cast<unsigned long long>(o) << 7) | static_cast<unsigned>(EXPERTS - 1 - t);
+  }
+  __syncthreads();
+  {
+    constexpr int PARTS = NT / EXPERTS, W = EXPERTS / PARTS;
+    const int e = t % EXPERTS, part = t / EXPERTS;
+    const unsigned long long mine = keys[e];
+    int c[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int j = 0; j < W; j += 4)
+#pragma unroll
+      for (int k = 0; k < 4; ++k) c[k] += keys[part * W + j + k] > mine;
+    cnt[t] = c[0] + c[1] + c[2] + c[3];
+  }
+  __syncthreads();
+  if (t < EXPERTS) {
+    int r = 0;
+#pragma unroll
+    for (int p = 0; p < NT / EXPERTS; ++p) r += cnt[p * EXPERTS + t];
+    if (r < TOPK) {
+      sel_e[r] = t;
+      sel_s[r] = s;
+    }
+  }
+  __syncthreads();
+  if (t < TOPK) {
+    const float my_s = sel_s[t];
+    float sum = my_s;
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffu, sum, o);
+    idx[m * TOPK + t] = sel_e[t];
+    wts[m * TOPK + t] = my_s / (sum + 1e-20f) * 8.f;
+  }
+}
+
+__device__ float g_router_sm8x_scratch[8 * EXPERTS];
+
+template <bool WF32>
+void launch_router_sm8x(int M, const __nv_bfloat16* x, const void* w, const float* bias, int* idx, float* wts,
+                        cudaStream_t stream) {
+  float* scratch = nullptr;
+  CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&scratch), g_router_sm8x_scratch));
+  auto go = [&](auto mc) {
+    constexpr int MM = decltype(mc)::value;
+    router_sm8x_dot_kernel<16, WF32, MM><<<16, 32 * EXPERTS / 16, 0, stream>>>(x, w, scratch);
+    CUDA_CHECK(cudaGetLastError());
+    router_sm8x_select_kernel<256><<<MM, 256, 0, stream>>>(scratch, bias, idx, wts);
+    CUDA_CHECK(cudaGetLastError());
+  };
+  switch (M) {
+    case 1: go(std::integral_constant<int, 1>{}); break;
+    case 2: go(std::integral_constant<int, 2>{}); break;
+    case 3: go(std::integral_constant<int, 3>{}); break;
+    case 4: go(std::integral_constant<int, 4>{}); break;
+    case 5: go(std::integral_constant<int, 5>{}); break;
+    case 6: go(std::integral_constant<int, 6>{}); break;
+    case 7: go(std::integral_constant<int, 7>{}); break;
+    case 8: go(std::integral_constant<int, 8>{}); break;
+    default: require(false, "router: M must be in 1..8");
+  }
+}
+
 // 16-CTA clusters need the non-portable opt-in and a GPC with 16 free SMs; fall back to 8 otherwise.
 int router_cluster_size() {
   static const int cl = [] {
+    if (current_sm_major() < 9) return 1;
     auto k = router_kernel<16, true, 8>;
     if (cudaFuncSetAttribute(k, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess) {
       (void)cudaGetLastError();
@@ -215,6 +350,11 @@ int router_cluster_size() {
 void router(const __nv_bfloat16* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
             bool pdl, cudaStream_t stream) {
   require(x && w && bias && idx && wts, "router: null argument");
+  if (current_sm_major() < 9) {
+    if (w_fp32) launch_router_sm8x<true>(M, x, w, bias, idx, wts, stream);
+    else launch_router_sm8x<false>(M, x, w, bias, idx, wts, stream);
+    return;
+  }
   const bool c16 = router_cluster_size() == 16;
   if (w_fp32) {
     if (c16) launch_router<16, true>(M, x, w, bias, idx, wts, pdl, stream);

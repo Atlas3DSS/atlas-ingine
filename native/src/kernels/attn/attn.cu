@@ -109,11 +109,13 @@ constexpr float QSCALE = 0.08838834764831845f * LOG2E;  // 1/sqrt(128) * log2(e)
 constexpr float NEG_INIT = -1e30f;
 constexpr float INV_SQRT5 = 1.f / 2.2360679774997896f;  // torch: x / scalar == x * (1 / float(scalar))
 constexpr float INV_3 = 1.f / 3.f;
-// workspace: int32 counter (kpos ordering for M > 1, zeroed once at allocation) then the split partials
-// fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum)
+// workspace: int32 counter (kpos ordering for M > 1, zeroed once at allocation), split partials
+// fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum), and (for SM8x split-launch) saved_nkv + saved_nst.
 constexpr size_t WS_PART = 256;
 constexpr int PSTR = D + 4;
-constexpr size_t ws_bytes(int M) { return WS_PART + size_t(HKV) * CS * GQA * M * PSTR * 4; }
+constexpr size_t ws_nkv_off(int M) { return WS_PART + size_t(HKV) * CS * GQA * M * PSTR * 4; }
+constexpr size_t ws_nst_off(int M) { return ws_nkv_off(M) + size_t(HKV) * 2 * M * D * 2; }
+constexpr size_t ws_bytes(int M) { return ws_nst_off(M) + size_t(HKV) * 3 * 2 * D * 4; }
 
 constexpr int NT = 256;  // threads per block (8 warps) for every M
 
@@ -215,6 +217,8 @@ struct Params {
     const long long* pos;
     int* counter;
     float* part;
+    __nv_bfloat16* saved_nkv;
+    float* saved_nst;
     __nv_bfloat16* out;
     int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
 };
@@ -240,9 +244,20 @@ __device__ __forceinline__ void unpack8(const uint4 u, float f[8]) {
     f[6] = __uint_as_float(u.w << 16), f[7] = __uint_as_float(u.w & 0xffff0000u);
 }
 
-// E4M3 pair (low byte = lower dim) to floats, exact (cvt.f16x2.e4m3x2, then FP16 -> FP32)
+// E4M3 pair (low byte = lower dim) to floats, exact (hw cvt.f16x2.e4m3x2 on SM89+, branchless ALU on SM86)
 __device__ __forceinline__ float2 e4m3x2_f2(uint32_t pair) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3)));
+#else
+    auto dec = [](uint32_t b) -> float {
+        const uint32_t s = (b & 0x80u) << 24;
+        const uint32_t a = b & 0x7fu;
+        const uint32_t norm = (a + 960u) << 20;
+        const uint32_t sub = a ? ((0x3B00u + (((0xBA986400u >> (a * 4u)) & 0xfu) << 5)) << 16) : 0u;
+        return __uint_as_float(s | (a >= 8u ? norm : sub));
+    };
+    return make_float2(dec(pair & 0xffu), dec((pair >> 8) & 0xffu));
+#endif
 }
 
 // 8 E4M3 values (dims 8c..8c+7, byte 0 = lowest dim)
@@ -352,7 +367,7 @@ struct Buf {
     float rp[U];  // rel_proj[c][dp] (0 if dp >= 1024)
 };
 
-template <int M, bool FULL, bool F8>
+template <int M, bool FULL, bool F8, bool SPLIT = false>
 __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
     static_assert(FULL || !F8, "FP8 caches are full-layer only");
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
@@ -499,9 +514,11 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         if (c0 < old_end) load_rp(A, c0);
         if (c0 + STEP < old_end) load_rp(B, c0 + STEP);
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     // a loop ptxas cannot see through: it would sink the loads above below a plain wait
 #pragma unroll 1
     for (int i = 0; i <= p.zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
     for (int i = tid; i < M * GQA * D / 4; i += NT)       // q rows of heads 3g..3g+2 are contiguous
         cp16(sm + L::Q + 4 * i, p.proj + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
     for (int i = tid; i < M * GQA * DREL / 4; i += NT)
@@ -541,8 +558,10 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             if (rank * KT < L_old) issue(0, rank * KT);  // in flight during q / rel and the owner's work
         }
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     // dependents (proj_conv) may launch now: their weight stream queues behind this block's K/V requests
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
 
     // ---- q and rel post-processing, once per block. q: one warp per row (lane = 4 dims); rel: one
     // half-warp per row. Fixed trip counts and clamped rows (no branches), so the reductions of a warp's
@@ -1101,8 +1120,23 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             }
         }
     }
+    if constexpr (SPLIT) {
+        if (owner) {
+            __nv_bfloat16* dst_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
+            for (int idx = tid; idx < 2 * M * 16; idx += NT) {
+                const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+                reinterpret_cast<uint4*>(dst_nkv + (kv * M + m) * D)[c8] =
+                    reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+            }
+            float* dst_nst = p.saved_nst + size_t(g) * 3 * 2 * D;
+            for (int idx = tid; idx < 3 * 2 * D; idx += NT) dst_nst[idx] = sm[L::NST + idx];
+        }
+        return;
+    }
     // every partial of the head is written, and every block of the head is done reading the ring
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
     if (!FULL && M > 1 && owner && tid == NT - 1) {  // kpos is read by every head: the last head writes it
         __threadfence();
         if (atomicAdd(p.counter, 1) == HKV - 1) {
@@ -1163,6 +1197,71 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
 }
 
+template <int M, bool FULL, bool F8>
+__global__ void __launch_bounds__(NT) attn_decode_stage2_kernel(const Params p) {
+    using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;
+    constexpr int ROWS = GQA * M;
+    const int g = blockIdx.y, rank = blockIdx.x, tid = threadIdx.x;
+    const bool owner = rank == 0;
+    const int R = p.R;
+    const int p0 = int(ld_s64(p.pos));
+    if (FULL && p0 + M > p.cap) return;
+
+    if (tid < ROWS * OD) {
+        const int row = tid / OD, dim = rank * OD + tid % OD;
+        const float* src = p.part + size_t(g * CS) * ROWS * PSTR + row * PSTR;
+        float2 ml[CS];
+        float o[CS];
+#pragma unroll
+        for (int q = 0; q < CS; ++q) {
+            ml[q] = __ldcg(reinterpret_cast<const float2*>(src + q * ROWS * PSTR + D));
+            o[q] = __ldcg(src + q * ROWS * PSTR + dim);
+        }
+        const float sink = p.proj[size_t(row / GQA) * R + OFF_SINK + g * GQA + row % GQA] * LOG2E;
+        float mx = sink;
+#pragma unroll
+        for (int q = 0; q < CS; ++q) mx = fmaxf(mx, ml[q].x);
+        float l = exp2f(sink - mx), a = 0.f;
+#pragma unroll
+        for (int q = 0; q < CS; ++q) {
+            const float f = exp2f(ml[q].x - mx);
+            l += ml[q].y * f;
+            a += o[q] * f;
+        }
+        const float gate_raw = p.proj[size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + dim];
+        const float gate = 1.f / (1.f + expf(-gate_raw));
+        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
+    }
+
+    if (owner) {
+        CT* const kc = static_cast<CT*>(p.k_cache);
+        CT* const vc = static_cast<CT*>(p.v_cache);
+        const __nv_bfloat16* src_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
+        for (int idx = tid; idx < 2 * M * 16; idx += NT) {
+            const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+            const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
+            const uint4 u = reinterpret_cast<const uint4*>(src_nkv + (kv * M + m) * D)[c8];
+            CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
+            if constexpr (F8) {
+                float f[8];
+                unpack8(u, f);
+                reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
+                                                               pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
+            } else {
+                reinterpret_cast<uint4*>(dst)[c8] = u;
+            }
+        }
+        const float* src_nst = p.saved_nst + size_t(g) * 3 * 2 * D;
+        for (int idx = tid; idx < 3 * 2 * D; idx += NT) {
+            const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
+            (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = src_nst[idx];
+        }
+        if (!FULL && g == 0 && tid == 0) {
+            for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
+        }
+    }
+}
+
 void require(bool ok, const char* what) {
     if (!ok) throw std::invalid_argument(std::string("attn: ") + what);
 }
@@ -1171,6 +1270,7 @@ using KernelFn = void (*)(Params);
 
 struct Kernel {
     KernelFn fn;
+    KernelFn fn_stage2;
     int M;
     size_t smem;
 };
@@ -1178,10 +1278,17 @@ struct Kernel {
 template <int M, bool FULL, bool F8>
 Kernel kernel_of() {
     static const Kernel k = [] {
-        const KernelFn f = attn_decode_kernel<M, FULL, F8>;
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
-        return Kernel{f, M, Smem<M, F8>::BYTES};
+        if (current_sm_major() >= 9) {
+            const KernelFn f = attn_decode_kernel<M, FULL, F8, false>;
+            CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+            CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
+            return Kernel{f, nullptr, M, Smem<M, F8>::BYTES};
+        } else {
+            const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true>;
+            const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8>;
+            CUDA_CHECK(cudaFuncSetAttribute(f1, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
+            return Kernel{f1, f2, M, Smem<M, F8>::BYTES};
+        }
     }();
     return k;
 }
@@ -1200,20 +1307,21 @@ Kernel select(int M) {
     }
 }
 
-// attrs[0]: cluster of CS blocks; attrs[1]: programmatic dependent launch (the kernel waits with
-// griddepcontrol.wait before touching anything an earlier kernel may write; a no-op without PDL)
+// attrs[0]: cluster of CS blocks; attrs[1]: programmatic dependent launch (SM90+ only)
 cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunchAttribute* attrs) {
     cudaLaunchConfig_t cfg{};
     cfg.gridDim = dim3(CS, HKV);
     cfg.blockDim = dim3(NT);
     cfg.dynamicSmemBytes = k.smem;
     cfg.stream = stream;
-    attrs[0].id = cudaLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = CS, attrs[0].val.clusterDim.y = 1, attrs[0].val.clusterDim.z = 1;
-    attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[1].val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = attrs;
-    cfg.numAttrs = 2;
+    if (current_sm_major() >= 9) {
+        attrs[0].id = cudaLaunchAttributeClusterDimension;
+        attrs[0].val.clusterDim.x = CS, attrs[0].val.clusterDim.y = 1, attrs[0].val.clusterDim.z = 1;
+        attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[1].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attrs;
+        cfg.numAttrs = 2;
+    }
     return cfg;
 }
 
@@ -1226,6 +1334,7 @@ std::size_t workspace_bytes(int max_m) {
 
 int max_active_clusters(int M, int window) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
+    if (current_sm_major() < 9) return HKV;
     // the FP8 variants have the same launch shape, shared memory and register cap (launch bounds)
     const Kernel k = window == 0 ? select<true>(M) : select<false>(M);
     cudaLaunchAttribute attrs[2];
@@ -1271,11 +1380,20 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.pos = reinterpret_cast<const long long*>(a.pos);
     p.counter = static_cast<int*>(a.workspace);
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
+    p.saved_nkv = reinterpret_cast<__nv_bfloat16*>(static_cast<char*>(a.workspace) + ws_nkv_off(M));
+    p.saved_nst = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + ws_nst_off(M));
     p.out = a.out;
     const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
+    if (k.fn_stage2) {
+        cudaLaunchConfig_t cfg2{};
+        cfg2.gridDim = dim3(CS, HKV);
+        cfg2.blockDim = dim3(NT);
+        cfg2.stream = stream;
+        CUDA_CHECK(cudaLaunchKernelEx(&cfg2, k.fn_stage2, p));
+    }
 }
 
 }  // namespace ingine::kernels::attn

@@ -99,8 +99,12 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   __shared__ float red[C::NW * 32], red2[C::NW * 32];
   __shared__ __align__(8) uint64_t mbar[2];  // g, sums of squares
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
+#else
+  const int rank = blockIdx.x % CL;
+#endif
   const int g = blockIdx.x / CL;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int rl = warp >> 1, half = warp & 1;  // down projection: warp = (row_local, half)
@@ -292,8 +296,259 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   }
 }
 
+__device__ float g_gates_sm8x_gall[3 * 8 * RANK];
+__device__ float g_gates_sm8x_gated[3 * 8 * H];
+__device__ float g_gates_sm8x_ssall[3 * 16 * 8];
+
+struct GatesSm8xScratch {
+  float* gall;   // [3][8][RANK]
+  float* gated;  // [3][8][H]
+  float* ssall;  // [3][16][8]
+};
+
+GatesSm8xScratch gates_sm8x_scratch() {
+  GatesSm8xScratch s{};
+  CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&s.gall), g_gates_sm8x_gall));
+  CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&s.gated), g_gates_sm8x_gated));
+  CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&s.ssall), g_gates_sm8x_ssall));
+  return s;
+}
+
+template <int CL, bool FG32, int M>
+__global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(GateArgs a, float* __restrict__ gall_out) {
+  using C = GateCfg<CL, FG32>;
+  constexpr int DCH = H / (8 * 32);
+  constexpr int XPT = H / C::NT;
+  constexpr int XG = M < C::XMAX ? M : C::XMAX;
+  __shared__ __align__(16) __nv_bfloat16 xs[M == 1 && C::XMAX > 1 ? 2 : XG][2 * H];
+  __shared__ __align__(16) float part[M][2][C::RPC];
+  __shared__ float red2[C::NW * 32];
+
+  const int rank = blockIdx.x % CL;
+  const int g = blockIdx.x / CL;
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  const int rl = warp >> 1, half = warp & 1;
+  const float* hg = a.h + (a.h_shared ? size_t(0) : size_t(g) * M * H);
+  const float* mg = a.msg + size_t(g) * M * H;
+
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+  uint4 wv[DCH];
+  {
+    const __nv_bfloat16* wr = a.w_down + (size_t(g) * RANK + rank * C::RPC + rl) * 2 * H + half * H;
+#pragma unroll
+    for (int i = 0; i < DCH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (i * 32 + lane) * 8, wpol);
+  }
+
+#pragma unroll
+  for (int m0 = 0; m0 < M; m0 += XG) {
+    if (m0 > 0) __syncthreads();
+    float xh[XG][XPT], xm[XG][XPT], ss[2 * XG];
+#pragma unroll
+    for (int j = 0; j < XG; ++j) {
+      const int m = m0 + j;
+      float sh = 0.f, sm = 0.f;
+      if (m < M) {
+#pragma unroll
+        for (int k = 0; k < XPT; ++k) {
+          xh[j][k] = hg[size_t(m) * H + k * C::NT + t];
+          xm[j][k] = mg[size_t(m) * H + k * C::NT + t];
+          sh = fmaf(xh[j][k], xh[j][k], sh);
+          sm = fmaf(xm[j][k], xm[j][k], sm);
+        }
+      }
+      ss[2 * j] = sh;
+      ss[2 * j + 1] = sm;
+    }
+    block_sum_bcast<2 * XG, C::NW>(ss, red2);
+#pragma unroll
+    for (int j = 0; j < XG; ++j) {
+      if (m0 + j < M) {
+        const float rh = rsqrtf(ss[2 * j] / H + EPS), rm = rsqrtf(ss[2 * j + 1] / H + EPS);
+        __nv_bfloat16* xb = xs[j];
+#pragma unroll
+        for (int k = 0; k < XPT; ++k) {
+          xb[k * C::NT + t] = __float2bfloat16_rn(xh[j][k] * rh);
+          xb[H + k * C::NT + t] = __float2bfloat16_rn(xm[j][k] * rm);
+        }
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < XG; ++j) {
+      const int m = m0 + j;
+      if (m < M) {
+        const __nv_bfloat16* xb = xs[j];
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < DCH; ++i) {
+          float wf[8], xf[8];
+          unpack_bf16x8(wv[i], wf);
+          unpack_bf16x8(*reinterpret_cast<const uint4*>(&xb[half * H + (i * 32 + lane) * 8]), xf);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc = fmaf(wf[e], xf[e], acc);
+        }
+        acc = group_sum<32>(acc);
+        if (lane == 0) part[m][half][rl] = acc;
+      }
+    }
+  }
+  __syncthreads();
+  if (t < M) {
+    const float4 p0 = *reinterpret_cast<const float4*>(&part[t][0][0]);
+    const float4 p1 = *reinterpret_cast<const float4*>(&part[t][1][0]);
+    float* dst = gall_out + (size_t(g) * M + t) * RANK + rank * C::RPC;
+    dst[0] = round_bf16(p0.x + p1.x);
+    dst[1] = round_bf16(p0.y + p1.y);
+    dst[2] = round_bf16(p0.z + p1.z);
+    dst[3] = round_bf16(p0.w + p1.w);
+  }
+}
+
+template <int CL, bool FG32, int M>
+__global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(GateArgs a,
+                                                                               const float* __restrict__ gall_in,
+                                                                               float* __restrict__ gated_out,
+                                                                               float* __restrict__ ssall_out) {
+  using C = GateCfg<CL, FG32>;
+  extern __shared__ __align__(16) uint8_t fg[];
+  __shared__ __align__(16) float gall[M][RANK];
+  __shared__ float red[C::NW * 32];
+
+  const int rank = blockIdx.x % CL;
+  const int g = blockIdx.x / CL;
+  const int t = threadIdx.x;
+  const float* hg = a.h + (a.h_shared ? size_t(0) : size_t(g) * M * H);
+  const float* mg = a.msg + size_t(g) * M * H;
+
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+  {
+    const uint8_t* fsrc = reinterpret_cast<const uint8_t*>(a.w_forget) + (size_t(g) * H + rank * C::CPC) * C::ROW;
+    const uint8_t* gsrc = reinterpret_cast<const uint8_t*>(a.w_gain) + (size_t(g) * H + rank * C::CPC) * C::ROW;
+    constexpr int RCH = C::ROW / 16;
+    for (int k = t; k < C::CPC * RCH; k += C::NT) {
+      const int dst = (k / RCH) * C::RS + (k % RCH) * 16;
+      l2::cp_async16<WEIGHT_L2>(fg + dst, fsrc + size_t(k) * 16, wpol);
+      l2::cp_async16<WEIGHT_L2>(fg + C::SLICE + dst, gsrc + size_t(k) * 16, wpol);
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+  }
+  for (int i = t; i < M * RANK; i += C::NT) gall[i / RANK][i % RANK] = gall_in[size_t(g) * M * RANK + i];
+  const int c = rank * C::CPC + t;
+  const bool own = t < C::CPC;
+  float hv[M], mv[M];
+#pragma unroll
+  for (int m = 0; m < M; ++m) hv[m] = mv[m] = 0.f;
+  if (own) {
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      hv[m] = hg[size_t(m) * H + c];
+      mv[m] = mg[size_t(m) * H + c];
+    }
+  }
+  asm volatile("cp.async.wait_all;" ::: "memory");
+  __syncthreads();
+
+  float sq[M];
+#pragma unroll
+  for (int m = 0; m < M; ++m) sq[m] = 0.f;
+  if (own) {
+    constexpr int EPC = 16 / C::FGB;
+    const uint8_t* fr = fg + t * C::RS;
+    const uint8_t* gr = fg + C::SLICE + t * C::RS;
+    float df[M], dg[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) df[m] = dg[m] = 0.f;
+#pragma unroll 4
+    for (int k = 0; k < RANK / EPC; ++k) {
+      const uint4 uf = *reinterpret_cast<const uint4*>(fr + k * 16);
+      const uint4 ug = *reinterpret_cast<const uint4*>(gr + k * 16);
+      float wf[EPC], wg[EPC];
+      if constexpr (FG32) {
+        wf[0] = __uint_as_float(uf.x); wf[1] = __uint_as_float(uf.y); wf[2] = __uint_as_float(uf.z); wf[3] = __uint_as_float(uf.w);
+        wg[0] = __uint_as_float(ug.x); wg[1] = __uint_as_float(ug.y); wg[2] = __uint_as_float(ug.z); wg[3] = __uint_as_float(ug.w);
+      } else {
+        unpack_bf16x8(uf, wf);
+        unpack_bf16x8(ug, wg);
+      }
+#pragma unroll
+      for (int m = 0; m < M; ++m) {
+#pragma unroll
+        for (int e = 0; e < EPC; e += 4) {
+          const float4 gv = *reinterpret_cast<const float4*>(&gall[m][k * EPC + e]);
+          df[m] = fmaf(wf[e], gv.x, fmaf(wf[e + 1], gv.y, fmaf(wf[e + 2], gv.z, fmaf(wf[e + 3], gv.w, df[m]))));
+          dg[m] = fmaf(wg[e], gv.x, fmaf(wg[e + 1], gv.y, fmaf(wg[e + 2], gv.z, fmaf(wg[e + 3], gv.w, dg[m]))));
+        }
+      }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      hv[m] = (1.f - tanhf(df[m])) * hv[m] + tanhf(dg[m]) * mv[m];
+      sq[m] = hv[m] * hv[m];
+      const size_t idx_out = (size_t(g) * M + m) * H + c;
+      gated_out[idx_out] = hv[m];
+      if (a.out_f32) a.out_f32[idx_out] = hv[m];
+    }
+  }
+  block_sum_bcast<M, C::NW>(sq, red);
+  if (t < M) ssall_out[(size_t(g) * CL + rank) * M + t] = sq[t];
+}
+
+template <int CL, int M>
+__global__ void __launch_bounds__(256) gates_sm8x_norm_kernel(const float* __restrict__ gated_in,
+                                                              const float* __restrict__ ssall_in,
+                                                              const float* __restrict__ norm_w,
+                                                              __nv_bfloat16* __restrict__ out_bf16) {
+  constexpr int CPC = H / CL;
+  const int rank = blockIdx.x % CL;
+  const int g = blockIdx.x / CL;
+  const int t = threadIdx.x;
+  if (t >= CPC) return;
+  const int c = rank * CPC + t;
+  const float nw = norm_w[size_t(g) * H + c];
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+    float ss = 0.f;
+#pragma unroll
+    for (int d = 0; d < CL; ++d) ss += ssall_in[(size_t(g) * CL + d) * M + m];
+    const size_t idx_out = (size_t(g) * M + m) * H + c;
+    out_bf16[idx_out] = __float2bfloat16_rn(gated_in[idx_out] * rsqrtf(ss / H + EPS) * nw);
+  }
+}
+
+template <int CL, bool FG32>
+void launch_gates_sm8x(int G, int M, const GateArgs& a, cudaStream_t stream) {
+  using C = GateCfg<CL, FG32>;
+  const GatesSm8xScratch sc = gates_sm8x_scratch();
+  auto go = [&](auto mc) {
+    constexpr int MM = decltype(mc)::value;
+    gates_sm8x_down_kernel<CL, FG32, MM><<<G * CL, C::NT, 0, stream>>>(a, sc.gall);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaFuncSetAttribute(gates_sm8x_fg_kernel<CL, FG32, MM>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
+    gates_sm8x_fg_kernel<CL, FG32, MM><<<G * CL, C::NT, C::SMEM, stream>>>(a, sc.gall, sc.gated, sc.ssall);
+    CUDA_CHECK(cudaGetLastError());
+    gates_sm8x_norm_kernel<CL, MM><<<G * CL, 256, 0, stream>>>(sc.gated, sc.ssall, a.norm_w, a.out_bf16);
+    CUDA_CHECK(cudaGetLastError());
+  };
+  switch (M) {
+    case 1: go(std::integral_constant<int, 1>{}); break;
+    case 2: go(std::integral_constant<int, 2>{}); break;
+    case 3: go(std::integral_constant<int, 3>{}); break;
+    case 4: go(std::integral_constant<int, 4>{}); break;
+    case 5: go(std::integral_constant<int, 5>{}); break;
+    case 6: go(std::integral_constant<int, 6>{}); break;
+    case 7: go(std::integral_constant<int, 7>{}); break;
+    case 8: go(std::integral_constant<int, 8>{}); break;
+    default: require(false, "message_gates: M must be in 1..8");
+  }
+}
+
 template <int CL, bool FG32>
 void launch_gates(int G, int M, const GateArgs& a, bool pdl, cudaStream_t stream) {
+  if (current_sm_major() < 9) {
+    launch_gates_sm8x<CL, FG32>(G, M, a, stream);
+    return;
+  }
   using C = GateCfg<CL, FG32>;
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;

@@ -38,7 +38,7 @@ struct FormatData {
   Tokenizer tokenizer;
   JinjaTemplate chat_template;
   int32_t message_model = -1, message_user = -1, message_system = -1, message_tool = -1;
-  int32_t content_text = -1, end_message = -1, end_sampling = -1, endoftext = -1;
+  int32_t content_text = -1, content_invoke_tool_json = -1, end_message = -1, end_sampling = -1, endoftext = -1;
   std::unordered_set<int32_t> stop_ids;
   std::unordered_map<int32_t, int> content_kind;  // tag id -> StreamParser kind (1 thinking, 2 text, 3 tool json)
   std::unique_ptr<RenderCache> cache = std::make_unique<RenderCache>();
@@ -346,6 +346,7 @@ ChatFormat ChatFormat::load(const std::filesystem::path& model_dir) {
   data->message_system = require_id(tok, MESSAGE_SYSTEM);
   data->message_tool = require_id(tok, MESSAGE_TOOL);
   data->content_text = require_id(tok, CONTENT_TEXT);
+  data->content_invoke_tool_json = require_id(tok, CONTENT_INVOKE_TOOL_JSON);
   data->end_message = require_id(tok, END_MESSAGE);
   data->end_sampling = require_id(tok, END_SAMPLING);
   data->endoftext = require_id(tok, ENDOFTEXT);
@@ -355,7 +356,7 @@ ChatFormat ChatFormat::load(const std::filesystem::path& model_dir) {
                         {data->content_text, 2},
                         {require_id(tok, CONTENT_TOOL_ERROR), 2},
                         {require_id(tok, CONTENT_INVOKE_TOOL_TEXT), 2},
-                        {require_id(tok, CONTENT_INVOKE_TOOL_JSON), 3}};
+                        {data->content_invoke_tool_json, 3}};
   return ChatFormat(std::move(data));
 }
 
@@ -373,6 +374,8 @@ std::vector<int32_t> ChatFormat::stop_ids() const {
 }
 
 std::vector<int32_t> ChatFormat::no_thinking_prefill() const { return {data_->message_model, data_->content_text}; }
+
+int32_t ChatFormat::content_invoke_tool_json_id() const { return data_->content_invoke_tool_json; }
 
 std::string ChatFormat::decode(std::span<const int32_t> ids) const { return data_->tokenizer.decode_lossy(ids); }
 

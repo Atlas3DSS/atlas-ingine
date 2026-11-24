@@ -30,15 +30,25 @@
 // list and seq the same way before its pdl_wait() (to wait for the CPU tier beside hot_down).
 // Both device helpers are no-ops in ordinary launches, so the same kernel serves eager prefill and
 // captured decode.
+#include "core/device.h"
+
 #include <cuda_runtime.h>
 
 #include <utility>
 
 namespace ingine::kernels {
 
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;"); }
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
 
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
 
 // `pointer` without its kernel-parameter provenance (see above): loads through it are coherent.
 template <class T>
@@ -55,7 +65,7 @@ __device__ __forceinline__ int pdl_load_settled(const int* p) {
     return v;
 }
 
-// Launches `kernel` as a programmatic dependent of the preceding kernel in `stream`.
+// Launches `kernel` as a programmatic dependent of the preceding kernel in `stream` (SM90+); plain launch on SM8x.
 template <class... Params, class... Args>
 cudaError_t pdl_launch(void (*kernel)(Params...), dim3 grid, dim3 block, std::size_t smem,
                        cudaStream_t stream, Args&&... args) {
@@ -65,10 +75,12 @@ cudaError_t pdl_launch(void (*kernel)(Params...), dim3 grid, dim3 block, std::si
     cfg.dynamicSmemBytes = smem;
     cfg.stream           = stream;
     cudaLaunchAttribute attr[1];
-    attr[0].id                                         = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs                                          = attr;
-    cfg.numAttrs                                       = 1;
+    if (current_sm_major() >= 9) {
+        attr[0].id                                         = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs                                          = attr;
+        cfg.numAttrs                                       = 1;
+    }
     return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
 }
 

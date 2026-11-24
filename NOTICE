@@ -103,3 +103,19 @@ Method and references
 This is an unofficial community project, not an endorsement by or affiliation
 with Thinking Machines, the Heretic authors, Hugging Face, NVIDIA, or the vLLM
 project.
+
+Atlas3DSS fork modifications (Apache License 2.0)
+-------------------------------------------------
+Derived from satellitedown/inkling-2-mini-abliterated-ingine (commit 556acc7),
+which incorporates code from satellitedown/fngine, cinference, and NInfer
+(Apache License 2.0), and targets Thinking Machines' Inkling-2-Mini
+(Apache License 2.0).
+
+Modifications by Atlas3DSS:
+- Multi-architecture CUDA port for Ampere (sm_86) and Ada (sm_89) alongside
+  Blackwell (sm_120a), with CUDA 12.8 and CUDA 13.x compatibility and
+  bit-identical Blackwell fast paths (48/48 kernels_bitlock PASS).
+- Native sub-4-bit Elastic MoE weight formats (ATLAS2 2.50 b/w, ATLAS3 3.50 b/w)
+  in decode and prefill kernels plus tools/quantize_elastic_ingine.py.
+- Native OpenAI response_format (text, json_object, json_schema) and automatic
+  tool-invocation token suppression when tools are omitted.

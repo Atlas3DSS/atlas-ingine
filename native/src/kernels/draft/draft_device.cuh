@@ -23,10 +23,24 @@ __device__ __forceinline__ void store_cache(void* cache, size_t at, float x, boo
   if (fp8) static_cast<__nv_fp8_storage_t*>(cache)[at] = __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
   else static_cast<__nv_bfloat16*>(cache)[at] = __float2bfloat16_rn(x);
 }
-// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one cvt.rn.bf16x2.e4m3x2 on sm_120a (cuda_fp8.hpp)
+// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one cvt.rn.bf16x2.e4m3x2 on sm_120a, hw f16 on sm_89, portable on sm_86.
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-  const __nv_bfloat162_raw b = __nv_cvt_fp8x2_to_bf162raw(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
-  return uint32_t(b.x) | (uint32_t(b.y) << 16);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+  uint32_t r;
+  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
+  return r;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+  uint32_t h2;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(static_cast<unsigned short>(u)));
+  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
+  const __nv_bfloat162 b = __float22bfloat162_rn(f);
+  return *reinterpret_cast<const uint32_t*>(&b);
+#else
+  const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
+  const float2 f = __half22float2(__half2(h));
+  const __nv_bfloat162 b = __float22bfloat162_rn(f);
+  return *reinterpret_cast<const uint32_t*>(&b);
+#endif
 }
 
 // 8 BF16 values (one uint4) -> 8 floats.

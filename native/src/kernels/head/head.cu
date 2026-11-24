@@ -133,14 +133,24 @@ __device__ int block_argmax(float v, int i, Reduce& r) {
   return r.bi;
 }
 
+__device__ __forceinline__ bool is_banned(int v, BannedTokens b) {
+  for (int i = 0; i < b.count; ++i)
+    if (b.ids[i] == v) return true;
+  return false;
+}
+
+__device__ __forceinline__ float load_logit(const float* row, int v, BannedTokens b) {
+  return is_banned(v, b) ? -CUDART_INF_F : row[v];
+}
+
 __global__ void __launch_bounds__(kBlock) argmax_kernel(const float* __restrict__ logits, int V, long long stride,
-                                                       std::int32_t* __restrict__ out) {
+                                                        BannedTokens banned, std::int32_t* __restrict__ out) {
   __shared__ Reduce red;
   const float* row = logits + blockIdx.x * stride;
   float bv = -CUDART_INF_F;
   int bi = INT_MAX;
   for (int v = threadIdx.x; v < V; v += kBlock) {
-    const float x = row[v];
+    const float x = load_logit(row, v, banned);
     if (better(x, v, bv, bi)) bv = x, bi = v;
   }
   const int best = block_argmax(bv, bi, red);
@@ -155,14 +165,14 @@ struct Select {
 };
 
 // Key of the k-th largest (1-based) z = row * inv_t over the row.
-__device__ std::uint32_t kth_key(const float* row, int V, float inv_t, int k, Select& s) {
+__device__ std::uint32_t kth_key(const float* row, int V, float inv_t, int k, BannedTokens banned, Select& s) {
   std::uint32_t prefix = 0, mask = 0;
   int remaining = k;
   for (int shift = 24; shift >= 0; shift -= 8) {
     for (int b = threadIdx.x; b < 256; b += kBlock) s.hist[b] = 0;
     __syncthreads();
     for (int v = threadIdx.x; v < V; v += kBlock) {
-      const std::uint32_t key = fkey(row[v] * inv_t);
+      const std::uint32_t key = fkey(load_logit(row, v, banned) * inv_t);
       if ((key & mask) == prefix) atomicAdd(&s.hist[(key >> shift) & 255u], 1u);
     }
     __syncthreads();
@@ -190,7 +200,7 @@ __device__ __forceinline__ unsigned long long fixed_mass(float p) {
 // Key of the last token top-p keeps: the first one (descending) whose inclusive mass exceeds `limit`.
 // Sets s.nocut when no token does (everything is kept).
 __device__ std::uint32_t top_p_key(const float* row, int V, float inv_t, std::uint32_t kth, float zmax, float inv_sum,
-                                   unsigned long long limit, Select& s) {
+                                   unsigned long long limit, BannedTokens banned, Select& s) {
   std::uint32_t prefix = 0, mask = 0;
   unsigned long long above = 0;
   if (threadIdx.x == 0) s.nocut = 0;
@@ -198,6 +208,7 @@ __device__ std::uint32_t top_p_key(const float* row, int V, float inv_t, std::ui
     for (int b = threadIdx.x; b < 256; b += kBlock) s.mass[b] = 0;
     __syncthreads();
     for (int v = threadIdx.x; v < V; v += kBlock) {
+      if (is_banned(v, banned)) continue;
       const float z = row[v] * inv_t;
       const std::uint32_t key = fkey(z);
       if (key >= kth && (key & mask) == prefix) {
@@ -233,22 +244,23 @@ __device__ std::uint32_t top_p_key(const float* row, int V, float inv_t, std::ui
 // MODE 0: one Gumbel-max draw per row into out; MODE 1: the distribution into probs [rows, V].
 template <int MODE>
 __global__ void __launch_bounds__(kBlock) dist_kernel(const float* __restrict__ logits, int V, long long stride,
-                                                     float inv_t, int top_k, float top_p, unsigned long long seed,
-                                                     unsigned long long counter, std::int32_t* __restrict__ out,
-                                                     float* __restrict__ probs) {
+                                                     float inv_t, int top_k, float top_p, BannedTokens banned,
+                                                     unsigned long long seed, unsigned long long counter,
+                                                     std::int32_t* __restrict__ out, float* __restrict__ probs) {
   __shared__ Reduce red;
   __shared__ Select sel;
   const int r = blockIdx.x;
   const float* row = logits + r * stride;
 
-  const std::uint32_t kth = (top_k > 0 && top_k < V) ? kth_key(row, V, inv_t, top_k, sel) : 0u;
+  const std::uint32_t kth = (top_k > 0 && top_k < V) ? kth_key(row, V, inv_t, top_k, banned, sel) : 0u;
 
   float mx = -CUDART_INF_F;
-  for (int v = threadIdx.x; v < V; v += kBlock) mx = fmaxf(mx, row[v] * inv_t);
+  for (int v = threadIdx.x; v < V; v += kBlock) mx = fmaxf(mx, load_logit(row, v, banned) * inv_t);
   const float zmax = block_max(mx, red);
 
   float s = 0.f;
   for (int v = threadIdx.x; v < V; v += kBlock) {
+    if (is_banned(v, banned)) continue;
     const float z = row[v] * inv_t;
     if (fkey(z) >= kth) s += expf(z - zmax);
   }
@@ -259,7 +271,7 @@ __global__ void __launch_bounds__(kBlock) dist_kernel(const float* __restrict__ 
   bool cut = false;
   if (top_p < 1.f) {
     const unsigned long long limit = static_cast<unsigned long long>(static_cast<double>(top_p) * kMassOne);
-    thr = top_p_key(row, V, inv_t, kth, zmax, inv_sum, limit, sel);
+    thr = top_p_key(row, V, inv_t, kth, zmax, inv_sum, limit, banned, sel);
     cut = !sel.nocut;
   }
 
@@ -267,6 +279,7 @@ __global__ void __launch_bounds__(kBlock) dist_kernel(const float* __restrict__ 
     float bv = -CUDART_INF_F;
     int bi = INT_MAX;
     for (int v = threadIdx.x; v < V; v += kBlock) {
+      if (is_banned(v, banned)) continue;
       const float z = row[v] * inv_t;
       if (fkey(z) >= thr) {
         const float score = z + gumbel(seed, counter, static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(v));
@@ -280,16 +293,19 @@ __global__ void __launch_bounds__(kBlock) dist_kernel(const float* __restrict__ 
     if (cut) {
       float k = 0.f;
       for (int v = threadIdx.x; v < V; v += kBlock) {
+        if (is_banned(v, banned)) continue;
         const float z = row[v] * inv_t;
         if (fkey(z) >= thr) k += expf(z - zmax) / sum;
       }
       const float kept = block_sum(k, red);
       for (int v = threadIdx.x; v < V; v += kBlock) {
+        if (is_banned(v, banned)) { pr[v] = 0.f; continue; }
         const float z = row[v] * inv_t;
         pr[v] = fkey(z) >= thr ? (expf(z - zmax) / sum) / kept : 0.f;
       }
     } else {
       for (int v = threadIdx.x; v < V; v += kBlock) {
+        if (is_banned(v, banned)) { pr[v] = 0.f; continue; }
         const float z = row[v] * inv_t;
         pr[v] = fkey(z) >= kth ? expf(z - zmax) / sum : 0.f;
       }
@@ -403,8 +419,9 @@ __device__ __forceinline__ float fast_sum(float v, FastReduce& r) {
 // thr (optional, per row): only tokens whose key fkey(z) >= thr[r] take part (top-k / top-p truncation)
 template <Score S>
 __global__ void __launch_bounds__(kFast) select_kernel(const float* __restrict__ in, int V, long long stride, float inv_t,
-                                                       unsigned long long seed, unsigned long long counter,
-                                                       SelectPartials* __restrict__ part, std::int32_t* __restrict__ out,
+                                                       BannedTokens banned, unsigned long long seed,
+                                                       unsigned long long counter, SelectPartials* __restrict__ part,
+                                                       std::int32_t* __restrict__ out,
                                                        const std::uint32_t* __restrict__ thr) {
   __shared__ FastReduce red;
   const int r = blockIdx.y, b = blockIdx.x;
@@ -416,8 +433,9 @@ __global__ void __launch_bounds__(kFast) select_kernel(const float* __restrict__
   for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
     float s;
     if constexpr (S == Score::Logit) {
-      s = row[v];
+      s = load_logit(row, v, banned);
     } else if constexpr (S == Score::GumbelLogit) {
+      if (is_banned(v, banned)) continue;
       const float z = __fmul_rn(row[v], inv_t);
       if (thr && fkey(z) < thr[r]) continue;
       s = __fadd_rn(z, gumbel(seed, counter, static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(v)));
@@ -446,7 +464,8 @@ __global__ void __launch_bounds__(kFast) select_kernel(const float* __restrict__
 
 // softmax statistics of z = row * inv_t per row: zmax and sum exp(z - zmax) into g_softmax
 __global__ void __launch_bounds__(kFast) softmax_stats_kernel(const float* __restrict__ in, int V, long long stride,
-                                                              float inv_t, SoftmaxPartials* __restrict__ part) {
+                                                              float inv_t, BannedTokens banned,
+                                                              SoftmaxPartials* __restrict__ part) {
   __shared__ FastReduce red;
   __shared__ float bmax;
   const int r = blockIdx.y, b = blockIdx.x;
@@ -454,7 +473,7 @@ __global__ void __launch_bounds__(kFast) softmax_stats_kernel(const float* __res
   const int chunk = (V + kParts - 1) / kParts;
   const int v0 = b * chunk, v1 = min(V, (b + 1) * chunk);
   float m = -CUDART_INF_F;
-  for (int v = v0 + threadIdx.x; v < v1; v += kFast) m = fmaxf(m, __fmul_rn(row[v], inv_t));
+  for (int v = v0 + threadIdx.x; v < v1; v += kFast) m = fmaxf(m, __fmul_rn(load_logit(row, v, banned), inv_t));
   for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
   if ((threadIdx.x & 31) == 0) red.f[threadIdx.x >> 5] = m;
   __syncthreads();
@@ -467,7 +486,8 @@ __global__ void __launch_bounds__(kFast) softmax_stats_kernel(const float* __res
   m = bmax;
   float s = 0.f;
   if (m > -CUDART_INF_F)
-    for (int v = v0 + threadIdx.x; v < v1; v += kFast) s += expf(__fmul_rn(row[v], inv_t) - m);
+    for (int v = v0 + threadIdx.x; v < v1; v += kFast)
+      if (!is_banned(v, banned)) s += expf(__fmul_rn(row[v], inv_t) - m);
   for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
   __syncthreads();
   if ((threadIdx.x & 31) == 0) red.f[threadIdx.x >> 5] = s;
@@ -492,7 +512,8 @@ __global__ void __launch_bounds__(kFast) softmax_stats_kernel(const float* __res
 }
 
 __global__ void __launch_bounds__(kFast) softmax_write_kernel(const float* __restrict__ in, int V, long long stride,
-                                                              float inv_t, const SoftmaxPartials* __restrict__ part,
+                                                              float inv_t, BannedTokens banned,
+                                                              const SoftmaxPartials* __restrict__ part,
                                                               float* __restrict__ probs) {
   const int r = blockIdx.y, b = blockIdx.x;
   const float* row = in + r * stride;
@@ -500,7 +521,8 @@ __global__ void __launch_bounds__(kFast) softmax_write_kernel(const float* __res
   const float zmax = part->zmax[r], sum = part->sum[r];
   const int chunk = (V + kParts - 1) / kParts;
   const int v1 = min(V, (b + 1) * chunk);
-  for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) pr[v] = expf(__fmul_rn(row[v], inv_t) - zmax) / sum;
+  for (int v = b * chunk + threadIdx.x; v < v1; v += kFast)
+    pr[v] = is_banned(v, banned) ? 0.f : expf(__fmul_rn(row[v], inv_t) - zmax) / sum;
 }
 
 // ---- multi-block top-k / top-p: dist_kernel's selections pass by pass (one launch per 8-bit digit, the last
@@ -536,7 +558,8 @@ __global__ void trunc_init_kernel(int rows, int top_k, TruncState* __restrict__ 
 
 // one digit of the k-th largest key (kth_key)
 __global__ void __launch_bounds__(kFast) kth_pass_kernel(const float* __restrict__ in, int V, long long stride,
-                                                         float inv_t, int shift, TruncState* __restrict__ st) {
+                                                         float inv_t, int shift, BannedTokens banned,
+                                                         TruncState* __restrict__ st) {
   __shared__ FastReduce red;
   __shared__ unsigned h[256];
   const int r = blockIdx.y, b = blockIdx.x;
@@ -549,7 +572,7 @@ __global__ void __launch_bounds__(kFast) kth_pass_kernel(const float* __restrict
   // most keys share the digit (similar magnitudes): accumulate runs per thread, one atomic per change of digit
   std::uint32_t run_bin = 256, run = 0;
   for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
-    const std::uint32_t key = fkey(__fmul_rn(row[v], inv_t));
+    const std::uint32_t key = fkey(__fmul_rn(load_logit(row, v, banned), inv_t));
     if ((key & mask) != prefix) continue;
     const std::uint32_t bin = (key >> shift) & 255u;
     if (bin != run_bin) {
@@ -587,7 +610,8 @@ __global__ void __launch_bounds__(kFast) kth_pass_kernel(const float* __restrict
 
 // zmax over the row, sum of exp(z - zmax) over keys >= kth; resets the prefix for the top-p passes
 __global__ void __launch_bounds__(kFast) trunc_stats_kernel(const float* __restrict__ in, int V, long long stride,
-                                                            float inv_t, TruncState* __restrict__ st) {
+                                                            float inv_t, BannedTokens banned,
+                                                            TruncState* __restrict__ st) {
   __shared__ FastReduce red;
   __shared__ float bmax;
   const int r = blockIdx.y, b = blockIdx.x;
@@ -596,7 +620,7 @@ __global__ void __launch_bounds__(kFast) trunc_stats_kernel(const float* __restr
   const int chunk = (V + kParts - 1) / kParts;
   const int v0 = b * chunk, v1 = min(V, (b + 1) * chunk);
   float m = -CUDART_INF_F;
-  for (int v = v0 + threadIdx.x; v < v1; v += kFast) m = fmaxf(m, __fmul_rn(row[v], inv_t));
+  for (int v = v0 + threadIdx.x; v < v1; v += kFast) m = fmaxf(m, __fmul_rn(load_logit(row, v, banned), inv_t));
   for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
   if ((threadIdx.x & 31) == 0) red.f[threadIdx.x >> 5] = m;
   __syncthreads();
@@ -610,6 +634,7 @@ __global__ void __launch_bounds__(kFast) trunc_stats_kernel(const float* __restr
   float s = 0.f;
   if (m > -CUDART_INF_F)
     for (int v = v0 + threadIdx.x; v < v1; v += kFast) {
+      if (is_banned(v, banned)) continue;
       const float z = __fmul_rn(row[v], inv_t);
       if (fkey(z) >= kth) s += expf(z - m);
     }
@@ -639,7 +664,7 @@ __global__ void __launch_bounds__(kFast) trunc_stats_kernel(const float* __restr
 // one digit of the top-p boundary key (top_p_key): the first key, descending, whose inclusive mass exceeds limit
 __global__ void __launch_bounds__(kFast) mass_pass_kernel(const float* __restrict__ in, int V, long long stride,
                                                           float inv_t, int shift, unsigned long long limit,
-                                                          TruncState* __restrict__ st) {
+                                                          BannedTokens banned, TruncState* __restrict__ st) {
   __shared__ FastReduce red;
   __shared__ unsigned long long h[256];
   const int r = blockIdx.y, b = blockIdx.x;
@@ -654,6 +679,7 @@ __global__ void __launch_bounds__(kFast) mass_pass_kernel(const float* __restric
   std::uint32_t run_bin = 256;
   unsigned long long run = 0;
   for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
+    if (is_banned(v, banned)) continue;
     const float z = __fmul_rn(row[v], inv_t);
     const std::uint32_t key = fkey(z);
     if (key < kth || (key & mask) != prefix) continue;
@@ -702,7 +728,8 @@ __global__ void __launch_bounds__(kFast) mass_pass_kernel(const float* __restric
 
 // kept = sum over keys >= thr of exp(z - zmax) / sum, when top-p cut the row (else 1)
 __global__ void __launch_bounds__(kFast) trunc_kept_kernel(const float* __restrict__ in, int V, long long stride,
-                                                           float inv_t, TruncState* __restrict__ st) {
+                                                           float inv_t, BannedTokens banned,
+                                                           TruncState* __restrict__ st) {
   __shared__ FastReduce red;
   const int r = blockIdx.y, b = blockIdx.x;
   if (st->nocut[r]) return;
@@ -713,6 +740,7 @@ __global__ void __launch_bounds__(kFast) trunc_kept_kernel(const float* __restri
   const int v1 = min(V, (b + 1) * chunk);
   float k = 0.f;
   for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
+    if (is_banned(v, banned)) continue;
     const float z = __fmul_rn(row[v], inv_t);
     if (fkey(z) >= thr) k += expf(z - zmax) / sum;
   }
@@ -733,7 +761,8 @@ __global__ void __launch_bounds__(kFast) trunc_kept_kernel(const float* __restri
 }
 
 __global__ void __launch_bounds__(kFast) trunc_write_kernel(const float* __restrict__ in, int V, long long stride,
-                                                            float inv_t, const TruncState* __restrict__ st,
+                                                            float inv_t, BannedTokens banned,
+                                                            const TruncState* __restrict__ st,
                                                             float* __restrict__ probs) {
   const int r = blockIdx.y, b = blockIdx.x;
   const float* row = in + r * stride;
@@ -743,6 +772,7 @@ __global__ void __launch_bounds__(kFast) trunc_write_kernel(const float* __restr
   const int chunk = (V + kParts - 1) / kParts;
   const int v1 = min(V, (b + 1) * chunk);
   for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
+    if (is_banned(v, banned)) { pr[v] = 0.f; continue; }
     const float z = __fmul_rn(row[v], inv_t);
     pr[v] = fkey(z) >= thr ? (expf(z - zmax) / sum) / kept : 0.f;
   }
@@ -756,21 +786,21 @@ T* symbol(const T& sym) {
 }
 
 template <Score S>
-void launch_select(const float* in, int rows, int V, std::int64_t stride, float inv_t, unsigned long long seed,
-                   unsigned long long counter, int entry, std::int32_t* out, cudaStream_t stream,
-                   const std::uint32_t* thr = nullptr) {
+void launch_select(const float* in, int rows, int V, std::int64_t stride, float inv_t, BannedTokens banned,
+                   unsigned long long seed, unsigned long long counter, int entry, std::int32_t* out,
+                   cudaStream_t stream, const std::uint32_t* thr = nullptr) {
   static SelectPartials* const part = symbol(g_select[0]);
-  select_kernel<S><<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, seed, counter, part + entry, out,
-                                                              thr);
+  select_kernel<S><<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, banned, seed, counter,
+                                                             part + entry, out, thr);
   CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_softmax(const float* in, int rows, int V, std::int64_t stride, float inv_t, float* probs,
-                    cudaStream_t stream) {
+void launch_softmax(const float* in, int rows, int V, std::int64_t stride, float inv_t, BannedTokens banned,
+                    float* probs, cudaStream_t stream) {
   static SoftmaxPartials* const part = symbol(g_softmax);
-  softmax_stats_kernel<<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, part);
+  softmax_stats_kernel<<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, banned, part);
   CUDA_CHECK(cudaGetLastError());
-  softmax_write_kernel<<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, part, probs);
+  softmax_write_kernel<<<dim3(kParts, rows), kFast, 0, stream>>>(in, V, stride, inv_t, banned, part, probs);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -787,12 +817,12 @@ TruncState* launch_truncation(const float* in, int rows, int V, std::int64_t str
   trunc_init_kernel<<<1, 32, 0, stream>>>(rows, top_k_active(p, V) ? p.top_k : 0, st);
   if (top_k_active(p, V))
     for (int shift = 24; shift >= 0; shift -= 8)
-      kth_pass_kernel<<<grid, kFast, 0, stream>>>(in, V, stride, inv_t, shift, st);
-  trunc_stats_kernel<<<grid, kFast, 0, stream>>>(in, V, stride, inv_t, st);
+      kth_pass_kernel<<<grid, kFast, 0, stream>>>(in, V, stride, inv_t, shift, p.banned, st);
+  trunc_stats_kernel<<<grid, kFast, 0, stream>>>(in, V, stride, inv_t, p.banned, st);
   if (p.top_p < 1.f) {
     const unsigned long long limit = static_cast<unsigned long long>(static_cast<double>(p.top_p) * kMassOne);
     for (int shift = 24; shift >= 0; shift -= 8)
-      mass_pass_kernel<<<grid, kFast, 0, stream>>>(in, V, stride, inv_t, shift, limit, st);
+      mass_pass_kernel<<<grid, kFast, 0, stream>>>(in, V, stride, inv_t, shift, limit, p.banned, st);
   }
   CUDA_CHECK(cudaGetLastError());
   return st;
@@ -808,13 +838,14 @@ void check_rows(const void* p, int rows, int V, std::int64_t stride) {
 
 }  // namespace
 
-void argmax(const float* logits, int rows, int V, std::int64_t stride, std::int32_t* out, cudaStream_t stream) {
+void argmax(const float* logits, int rows, int V, std::int64_t stride, std::int32_t* out, cudaStream_t stream,
+            const BannedTokens& banned) {
   check_rows(logits, rows, V, stride);
   if (rows == 0) return;
   if (rows <= kFastRows)
-    launch_select<Score::Logit>(logits, rows, V, stride, 1.f, 0, 0, 0, out, stream);
+    launch_select<Score::Logit>(logits, rows, V, stride, 1.f, banned, 0, 0, 0, out, stream);
   else
-    argmax_kernel<<<rows, kBlock, 0, stream>>>(logits, V, stride, out);
+    argmax_kernel<<<rows, kBlock, 0, stream>>>(logits, V, stride, banned, out);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -825,19 +856,19 @@ void sampling_probs(const float* logits, int rows, int V, std::int64_t stride, c
   if (rows == 0) return;
   const float inv_t = 1.0f / params.temperature;
   if (rows <= kFastRows && plain_sampling(params, V)) {
-    launch_softmax(logits, rows, V, stride, inv_t, probs, stream);
+    launch_softmax(logits, rows, V, stride, inv_t, params.banned, probs, stream);
     return;
   }
   if (rows <= kFastRows) {
     TruncState* st = launch_truncation(logits, rows, V, stride, inv_t, params, 1, stream);
     const dim3 grid(kParts, rows);
-    if (params.top_p < 1.f) trunc_kept_kernel<<<grid, kFast, 0, stream>>>(logits, V, stride, inv_t, st);
-    trunc_write_kernel<<<grid, kFast, 0, stream>>>(logits, V, stride, inv_t, st, probs);
+    if (params.top_p < 1.f) trunc_kept_kernel<<<grid, kFast, 0, stream>>>(logits, V, stride, inv_t, params.banned, st);
+    trunc_write_kernel<<<grid, kFast, 0, stream>>>(logits, V, stride, inv_t, params.banned, st, probs);
     CUDA_CHECK(cudaGetLastError());
     return;
   }
-  dist_kernel<1><<<rows, kBlock, 0, stream>>>(logits, V, stride, inv_t, params.top_k, params.top_p, 0ull, 0ull,
-                                              nullptr, probs);
+  dist_kernel<1><<<rows, kBlock, 0, stream>>>(logits, V, stride, inv_t, params.top_k, params.top_p, params.banned,
+                                              0ull, 0ull, nullptr, probs);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -846,22 +877,24 @@ void sample(const float* logits, int rows, int V, std::int64_t stride, const Sam
   check_rows(logits, rows, V, stride);
   if (rows == 0) return;
   if (params.temperature <= 0.f) {
-    argmax(logits, rows, V, stride, out, stream);
+    argmax(logits, rows, V, stride, out, stream, params.banned);
     return;
   }
   const float inv_t = 1.0f / params.temperature;
   if (rows <= kFastRows && plain_sampling(params, V)) {
-    launch_select<Score::GumbelLogit>(logits, rows, V, stride, inv_t, rng.seed, rng.counter++, 1, out, stream);
+    launch_select<Score::GumbelLogit>(logits, rows, V, stride, inv_t, params.banned, rng.seed, rng.counter++, 1, out,
+                                      stream);
     return;
   }
   if (rows <= kFastRows) {
     const TruncState* st = launch_truncation(logits, rows, V, stride, inv_t, params, 0, stream);
     const auto* thr = reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const char*>(st) + offsetof(TruncState, thr));
-    launch_select<Score::GumbelLogit>(logits, rows, V, stride, inv_t, rng.seed, rng.counter++, 1, out, stream, thr);
+    launch_select<Score::GumbelLogit>(logits, rows, V, stride, inv_t, params.banned, rng.seed, rng.counter++, 1, out,
+                                      stream, thr);
     return;
   }
-  dist_kernel<0><<<rows, kBlock, 0, stream>>>(logits, V, stride, inv_t, params.top_k, params.top_p, rng.seed,
-                                              rng.counter++, out, nullptr);
+  dist_kernel<0><<<rows, kBlock, 0, stream>>>(logits, V, stride, inv_t, params.top_k, params.top_p, params.banned,
+                                              rng.seed, rng.counter++, out, nullptr);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -870,7 +903,8 @@ void sample_from_probs(const float* probs, int rows, int V, std::int64_t stride,
   check_rows(probs, rows, V, stride);
   if (rows == 0) return;
   if (rows <= kFastRows)
-    launch_select<Score::GumbelProb>(probs, rows, V, stride, 1.f, rng.seed, rng.counter++, 2, out, stream);
+    launch_select<Score::GumbelProb>(probs, rows, V, stride, 1.f, BannedTokens{}, rng.seed, rng.counter++, 2, out,
+                                     stream);
   else
     multinomial_kernel<<<rows, kBlock, 0, stream>>>(probs, V, stride, rng.seed, rng.counter++, out);
   CUDA_CHECK(cudaGetLastError());

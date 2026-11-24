@@ -310,7 +310,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
     pk::moe_route(idx_, T, work, s);
     const Experts& ex = layer.experts;
-    const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
+    const pk::MoeExperts me{static_cast<int>(ex.fmt), ex.w13.data, ex.w13_scale.data,
                             f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
     pk::moe_gate_up(me, xm_, T, work, act_, s);
     pk::moe_down(me, act_, T, work, down_, s);
