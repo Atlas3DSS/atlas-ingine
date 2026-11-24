@@ -16,8 +16,10 @@
 // it depends on has finished.
 #pragma once
 
+#include "kernels/common/persona_abi.h"
 #include "model/model_data.h"
 #include "model/model_kernels.h"
+#include "model/persona_runtime.h"
 
 #include "core/host_memory.h"
 
@@ -59,7 +61,8 @@ class Decoder {
   // fast.FastDecoder.decode: runs b.m consecutive tokens b.token at positions *pos, *pos + 1, ...;
   // logits in b.logits, taps in b.taps, conv inputs in b.hist_* when `history`. Graph capturable once it
   // ran eagerly for `b` (pointer tables are built on first use).
-  void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream);
+  void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
+              const kernels::persona::PersonaDeviceTable* hooks = nullptr);
 
  private:
   const std::int64_t* block_table(const std::vector<const float*>& blocks);
@@ -172,9 +175,19 @@ class Runtime {
   // by a switch node whose branch i is `branch(verify_widths()[i])` (captured).
   GraphExec capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
                            const std::function<void(cudaStream_t, int)>& branch);
+  // Mech-interp / persona runtime hooks: fixed-address device table + dual unhooked/hooked CUDA graphs.
+  PersonaRuntime& persona_runtime() { return *persona_rt_; }
+  const PersonaRuntime& persona_runtime() const { return *persona_rt_; }
+  bool hooked_active() const { return persona_rt_ && persona_rt_->active(); }
+  const kernels::persona::PersonaDeviceTable* active_hooks() const {
+    return hooked_active() ? persona_rt_->device_table() : nullptr;
+  }
+  void set_persona(const persona::PersonaProfile* profile, const PersonaTapConfig& taps = {});
+  void ensure_hooked_graphs();
+
   // Records width m's decode step, save_verify(*pos(), m) and rollback(*pos(), *accepted + 1, m) on `stream`
   // (positions and the accepted count read on the device).
-  void record_step(int m, cudaStream_t stream);
+  void record_step(int m, cudaStream_t stream, bool hooked = false);
   void record_save_verify(int m, cudaStream_t stream);
   void record_rollback(int m, const std::int32_t* accepted, cudaStream_t stream);
   std::int64_t* tokens() { return static_cast<std::int64_t*>(token_.p); }  // the shared int64 [8] input tokens
@@ -182,6 +195,7 @@ class Runtime {
  private:
   void init();
   void capture(int m, bool history);
+  void capture_hooked(int m, bool history);
   StatePtrs state_ptrs() const;
 
   RuntimeOptions options_;
@@ -190,10 +204,12 @@ class Runtime {
   Ablation ablation_;
   State state_;
   std::unique_ptr<Decoder> decoder_;
+  std::unique_ptr<PersonaRuntime> persona_rt_;
   DeviceBuffer pos_, token_;
   std::map<int, Buffers> buffers_;
   std::map<int, bool> history_;
   std::map<int, cudaGraphExec_t> graphs_;
+  std::map<int, cudaGraphExec_t> hooked_graphs_;
   std::vector<int> verify_widths_;
   // rollback scratch (VerifyBackup) and the width-1 undo records (StepUndo by position parity)
   DeviceBuffer backup_storage_;

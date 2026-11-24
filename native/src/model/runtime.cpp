@@ -80,6 +80,7 @@ void Runtime::init() {
   const RuntimeOptions& options = options_;
   state_ = make_state(options.max_ctx, options.kv_fp8);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
+  persona_rt_ = std::make_unique<PersonaRuntime>();
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
   token_ = DeviceBuffer(kMaxWidth * sizeof(std::int64_t));
@@ -115,6 +116,10 @@ void Runtime::init() {
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
   for (const auto& [m, history] : history_) capture(m, history);
+  if (options.enable_persona_hooks) {
+    persona_rt_->upload_zero_table(stream_);
+    for (const auto& [m, history] : history_) capture_hooked(m, history);
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
@@ -122,6 +127,9 @@ Runtime::~Runtime() {
   if (stream_) cudaStreamSynchronize(stream_);
   for (auto& [m, exec] : graphs_) cudaGraphExecDestroy(exec);
   graphs_.clear();
+  for (auto& [m, exec] : hooked_graphs_) cudaGraphExecDestroy(exec);
+  hooked_graphs_.clear();
+  persona_rt_.reset();
   decoder_.reset();
   for (cudaEvent_t e : chain_done_)
     if (e) cudaEventDestroy(e);
@@ -178,6 +186,61 @@ void Runtime::capture(int m, bool history) {
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
+void Runtime::capture_hooked(int m, bool history) {
+  const Snapshot saved = snapshot();
+  Buffers& b = buffers(m);
+  const auto* tbl = persona_rt_->device_table();
+  for (int i = 0; i < 2; ++i) decoder_->decode(b, pos(), history, stream_, tbl);
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  cudaGraph_t graph = nullptr;
+  CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+  try {
+    decoder_->decode(b, pos(), history, stream_, tbl);
+  } catch (...) {
+    cudaStreamEndCapture(stream_, &graph);
+    if (graph) cudaGraphDestroy(graph);
+    throw;
+  }
+  CUDA_CHECK(cudaStreamEndCapture(stream_, &graph));
+  cudaGraphExec_t exec = nullptr;
+  const cudaError_t err = cudaGraphInstantiate(&exec, graph, 0);
+  cudaGraphDestroy(graph);
+  CUDA_CHECK(err);
+  CUDA_CHECK(cudaGraphUpload(exec, stream_));
+  hooked_graphs_[m] = exec;
+  restore(saved);
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+void Runtime::ensure_hooked_graphs() {
+  if (!hooked_graphs_.empty()) return;
+  // Losslessly preserve live state, pos_, token_, and full-attention rows [0..kMaxWidth) so lazy capture
+  // mid-session cannot corrupt any cached or parked conversation.
+  DeviceBuffer saved_ckpt(checkpoint_bytes());
+  DeviceBuffer saved_full(full_rows_bytes(kMaxWidth));
+  DeviceBuffer saved_pos(pos_.bytes);
+  DeviceBuffer saved_tok(token_.bytes);
+  save_checkpoint(saved_ckpt.p);
+  save_full_rows(saved_full.p, kMaxWidth);
+  CUDA_CHECK(cudaMemcpyAsync(saved_pos.p, pos_.p, pos_.bytes, cudaMemcpyDeviceToDevice, stream_));
+  CUDA_CHECK(cudaMemcpyAsync(saved_tok.p, token_.p, token_.bytes, cudaMemcpyDeviceToDevice, stream_));
+  CUDA_CHECK(cudaMemsetAsync(pos_.p, 0, pos_.bytes, stream_));
+  CUDA_CHECK(cudaMemsetAsync(token_.p, 0, token_.bytes, stream_));
+  persona_rt_->upload_zero_table(stream_);
+  for (const auto& [m, history] : history_) capture_hooked(m, history);
+  restore_checkpoint(saved_ckpt.p);
+  restore_full_rows(saved_full.p, kMaxWidth);
+  CUDA_CHECK(cudaMemcpyAsync(pos_.p, saved_pos.p, pos_.bytes, cudaMemcpyDeviceToDevice, stream_));
+  CUDA_CHECK(cudaMemcpyAsync(token_.p, saved_tok.p, token_.bytes, cudaMemcpyDeviceToDevice, stream_));
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+void Runtime::set_persona(const persona::PersonaProfile* profile, const PersonaTapConfig& taps) {
+  const bool want_active = (profile != nullptr && !profile->is_unhooked()) || !taps.empty();
+  if (want_active && hooked_graphs_.empty()) ensure_hooked_graphs();
+  persona_rt_->configure(profile, taps, stream_);
+}
+
 void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
   const int m = int(tokens.size());
   buffers(m);  // the width must exist
@@ -185,15 +248,16 @@ void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
 }
 
 const float* Runtime::run_step(int m) {
-  auto it = graphs_.find(m);
-  if (it == graphs_.end()) throw std::invalid_argument("no decode graph for width " + std::to_string(m));
+  const auto& map = hooked_active() ? hooked_graphs_ : graphs_;
+  auto it = map.find(m);
+  if (it == map.end()) throw std::invalid_argument("no decode graph for width " + std::to_string(m));
   CUDA_CHECK(cudaGraphLaunch(it->second, stream_));
   return static_cast<const float*>(buffers(m).logits.data);
 }
 
 const float* Runtime::run_step_eager(int m) {
   Buffers& b = buffers(m);
-  decoder_->decode(b, pos(), history_.at(m), stream_);
+  decoder_->decode(b, pos(), history_.at(m), stream_, active_hooks());
   return static_cast<const float*>(b.logits.data);
 }
 
@@ -305,9 +369,9 @@ void Runtime::rollback(int P, int commit, int m) {
   verify_rollback(state_ptrs(), backup_, hist, nullptr, P, nullptr, commit, m, stream_);
 }
 
-void Runtime::record_step(int m, cudaStream_t stream) {
+void Runtime::record_step(int m, cudaStream_t stream, bool hooked) {
   if (!graphs_.count(m)) throw std::invalid_argument("record_step: no decode graph for width " + std::to_string(m));
-  decoder_->decode(buffers(m), pos(), history_.at(m), stream);
+  decoder_->decode(buffers(m), pos(), history_.at(m), stream, hooked ? persona_rt_->device_table() : nullptr);
 }
 
 void Runtime::record_save_verify(int m, cudaStream_t stream) {

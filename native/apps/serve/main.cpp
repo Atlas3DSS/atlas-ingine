@@ -3,6 +3,7 @@
 #include "engine/log.h"
 #include "image/image.h"
 #include "ingine/generator.h"
+#include "ingine/persona.h"
 #include "serve/chat_server.h"
 #include "serve/cli.h"
 #include "text/chat.h"
@@ -66,8 +67,10 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
+  std::string persona_spec, refusal_map;
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
+  bool persona_probe_mode = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -82,6 +85,11 @@ int main(int argc, char** argv) {
   ap.flag("--fake", "serve canned outputs (FakeGenerator)", &fake);
   ap.exclusive({"--engine", "--fake"}, true);
   ap.option("--ablation", "", "ablation file (safetensors) applied at every visit", &ablation);
+  ap.option("--persona-spec", "", "persona/mech-interp JSON spec (atlas-persona-spec/v1)", &persona_spec);
+  ap.flag("--persona-probe-mode", "allow probe/unvalidated persona profiles (research & diagnostics only)",
+          &persona_probe_mode);
+  ap.option("--refusal-map", "", "refusal-linked unit deny-list JSON (unconditionally blocks listed units)",
+            &refusal_map);
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
@@ -131,6 +139,23 @@ int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
 
   try {
+    const ingine::persona::RefusalMap rmap = refusal_map.empty() ? ingine::persona::RefusalMap::default_map()
+                                                                 : ingine::persona::RefusalMap::load(refusal_map);
+    std::shared_ptr<const ingine::persona::PersonaCatalog> personas;
+    if (!persona_spec.empty()) {
+      personas = std::make_shared<ingine::persona::PersonaCatalog>(
+          ingine::persona::PersonaCatalog::load(persona_spec, persona_probe_mode, rmap));
+      log.info("loaded persona spec {} ({} profile(s), default='{}', probe_mode={})",
+               personas->spec_sha256.substr(0, 12), personas->profiles.size(), personas->default_profile,
+               personas->probe_mode ? "on" : "off");
+      for (const auto& [pname, prof] : personas->profiles) {
+        if (!prof->downgrade_reason.empty()) {
+          log.warn("persona '{}': downgraded to {} ({})", pname, ingine::persona::to_string(prof->effective_status),
+                   prof->downgrade_reason);
+        }
+      }
+    }
+
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
     std::unique_ptr<ingine::model::Generator> generator;
     if (fake) {
@@ -149,6 +174,8 @@ int main(int argc, char** argv) {
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
       options.vision = !no_vision;
+      options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
+      options.refusal_map = refusal_map;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
@@ -168,6 +195,7 @@ int main(int argc, char** argv) {
     server_options.images.limits.max_tokens = image_max_tokens;
     server_options.images.max_images = max_images;
     server_options.images.max_total_tokens = max_image_tokens;
+    server_options.personas = personas;
     log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
              server_options.sampling.top_p, server_options.sampling.top_k);
     ingine::serve::ChatServer server(*generator, fmt, server_options);

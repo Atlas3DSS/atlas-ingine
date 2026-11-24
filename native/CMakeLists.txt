@@ -82,6 +82,7 @@ endfunction()
 
 ingine_add_component(src/text)
 ingine_add_component(src/image)
+ingine_add_component(src/persona)
 
 set(INGINE_KERNEL_AREAS common dense moe attn head prefill draft vision)
 foreach(area ${INGINE_KERNEL_AREAS})
@@ -99,7 +100,7 @@ ingine_add_component(src/engine)
 ingine_add_component(src/serve)
 
 if(INGINE_BUILD_APPS)
-  foreach(app serve bench validate)
+  foreach(app serve bench validate persona_probe)
     ingine_add_component(apps/${app})
   endforeach()
 endif()

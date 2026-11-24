@@ -2,6 +2,8 @@
 // scheduler, the HTTP layer and their tests build without the model; ingine_model implements make_generator.
 #pragma once
 
+#include "ingine/persona.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -26,6 +28,8 @@ struct Sampling {
   // usual and then takes the forced token; speculative decoding accepts a draft iff it equals the forced token
   // and continues with the forced token after the accepted run. Fills GenerateStats::spec_trace.
   std::span<const int32_t> forced;
+  // Optional resolved persona/mech-interp profile for this request (nullptr => unhooked fast path).
+  std::shared_ptr<const persona::PersonaProfile> persona;
 };
 
 // The token whose embedding an image token replaces (<|unused_200054|>, the chat template's image placeholder).
@@ -99,6 +103,9 @@ struct RuntimeOptions {
   int park_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
+  // Mech-interp / persona hook options: pre-capture hooked CUDA graphs when enabled, and enforce refusal map.
+  bool enable_persona_hooks = false;
+  std::filesystem::path refusal_map;
 };
 
 class Generator {

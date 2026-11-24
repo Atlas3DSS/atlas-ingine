@@ -325,6 +325,10 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
       throw BadRequest("'stop' must be a string or a list of strings", "stop");
     }
   }
+  if (const Json* p = get(body, "persona")) {
+    if (!p->is_string()) throw BadRequest("'persona' must be a string", "persona");
+    req.persona_name = p->get<std::string>();
+  }
   if (auto it = body.find("stream"); it != body.end()) {
     if (!it->is_boolean()) throw BadRequest("'stream' must be a boolean", "stream");
     req.stream = it->get<bool>();

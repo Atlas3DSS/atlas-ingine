@@ -115,6 +115,13 @@ void log_disconnected(const Exchange& x) {
   engine::server_log().info("{}: client disconnected after {} tokens; cancelled", x.job->id, x.parser.num_tokens());
 }
 
+Json persona_meta_json(const persona::PersonaProfile& p) {
+  return Json{{"profile", p.name},
+              {"persona_fingerprint", p.fingerprint_sha256},
+              {"status", persona::to_string(p.effective_status)},
+              {"spec_sha256", p.spec_sha256}};
+}
+
 Json chunk(const Exchange& x, const std::string& model_id, Json delta, const std::optional<std::string>& finish) {
   Json c{{"id", x.job->id},
          {"object", "chat.completion.chunk"},
@@ -126,6 +133,7 @@ Json chunk(const Exchange& x, const std::string& model_id, Json delta, const std
                                        {"logprobs", nullptr},
                                        {"finish_reason", finish ? Json(*finish) : Json()}}})}};
   if (x.req.include_usage) c["usage"] = nullptr;
+  if (finish && x.req.sampling.persona) c["persona_metadata"] = persona_meta_json(*x.req.sampling.persona);
   return c;
 }
 
@@ -148,6 +156,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
         images.enabled = images.enabled && generator.supports_images();
         return images;
       }()),
+      personas_(std::move(options.personas)),
       created_(std::time(nullptr)),
       scheduler_(generator, fmt.stop_ids(), options.max_queue) {
   // A pool thread per connection, as ThreadingHTTPServer: the running request, the waiting ones, the ones
@@ -177,6 +186,33 @@ Json ChatServer::model_card() const {
               {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
 }
 
+Json ChatServer::personas_list() const {
+  if (!personas_) {
+    return Json{{"object", "list"},
+                {"default", "none"},
+                {"probe_mode", false},
+                {"spec_sha256", nullptr},
+                {"data", Json::array()}};
+  }
+  Json data = Json::array();
+  for (const auto& [name, prof] : personas_->profiles) {
+    Json entry{{"id", name},
+               {"object", "persona"},
+               {"status", persona::to_string(prof->effective_status)},
+               {"declared_category", persona::to_string(prof->declared_category)},
+               {"persona_fingerprint", prof->fingerprint_sha256},
+               {"interventions", prof->interventions.size()},
+               {"description", prof->description}};
+    if (!prof->downgrade_reason.empty()) entry["downgrade_reason"] = prof->downgrade_reason;
+    data.push_back(std::move(entry));
+  }
+  return Json{{"object", "list"},
+              {"default", personas_->default_profile},
+              {"probe_mode", personas_->probe_mode},
+              {"spec_sha256", personas_->spec_sha256},
+              {"data", std::move(data)}};
+}
+
 void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res) {
   const std::string path = route_path(req);
   if (path == "/health") {
@@ -191,6 +227,8 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
     send_json(res, 200, Json{{"object", "list"}, {"data", Json::array({model_card()})}});
   } else if (path == "/v1/models/" + model_id_) {
     send_json(res, 200, model_card());
+  } else if (path == "/v1/personas") {
+    send_json(res, 200, personas_list());
   } else {
     send_error(res, 404, "no route for GET " + path);
   }
@@ -218,6 +256,15 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
     }
     if (!body.is_object()) throw BadRequest("request body must be a JSON object");
     request = parse_request(body, fmt_, max_model_len_, sampling_defaults_, image_options_);
+    if (personas_) {
+      try {
+        request.sampling.persona = personas_->resolve(request.persona_name);
+      } catch (const std::invalid_argument& e) {
+        throw BadRequest(e.what(), "persona");
+      }
+    } else if (!request.persona_name.empty() && request.persona_name != "none") {
+      throw BadRequest("unknown persona '" + request.persona_name + "' (no --persona-spec loaded)", "persona");
+    }
   } catch (const BadRequest& e) {
     send_error(res, e.status, e.what(), e.param);
     return;
@@ -268,18 +315,19 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
       }
       message["tool_calls"] = std::move(calls);
     }
-    send_json(res, 200,
-              Json{{"id", x->job->id},
-                   {"object", "chat.completion"},
-                   {"created", x->created},
-                   {"model", model_id_},
-                   {"system_fingerprint", nullptr},
-                   {"choices", Json::array({Json{{"index", 0},
-                                                 {"message", std::move(message)},
-                                                 {"logprobs", nullptr},
-                                                 {"finish_reason", result.finish_reason ? Json(*result.finish_reason)
-                                                                                        : Json()}}})},
-                   {"usage", usage(*x)}});
+    Json resp{{"id", x->job->id},
+              {"object", "chat.completion"},
+              {"created", x->created},
+              {"model", model_id_},
+              {"system_fingerprint", nullptr},
+              {"choices", Json::array({Json{{"index", 0},
+                                            {"message", std::move(message)},
+                                            {"logprobs", nullptr},
+                                            {"finish_reason", result.finish_reason ? Json(*result.finish_reason)
+                                                                                   : Json()}}})},
+              {"usage", usage(*x)}};
+    if (x->req.sampling.persona) resp["persona_metadata"] = persona_meta_json(*x->req.sampling.persona);
+    send_json(res, 200, resp);
     return;
   }
 

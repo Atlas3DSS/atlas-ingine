@@ -66,6 +66,8 @@ class EngineGenerator final : public Generator {
         token_(sizeof(std::int32_t)),
         host_token_(sizeof(std::int32_t)) {
     if (options.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
+    refusal_map_ =
+        options.refusal_map.empty() ? persona::RefusalMap::default_map() : persona::RefusalMap::load(options.refusal_map);
     if (options.spec) {
       drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream());
       drafter_->capture();
@@ -116,11 +118,16 @@ class EngineGenerator final : public Generator {
     GenerateStats stats;
     head::SamplerRng rng;
     rng.seed = sampling.seed ? *sampling.seed : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
+    if (sampling.persona) persona::validate_profile_safety(*sampling.persona, refusal_map_);
+    const std::uint64_t req_persona_key =
+        (sampling.persona && !sampling.persona->is_unhooked()) ? sampling.persona->cache_key : 0ull;
+    const bool bypass_reuse = (sampling.persona && sampling.persona->bypasses_prefix_reuse());
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto t = std::chrono::steady_clock::now();
     try {
-      prefill(prompt, full_prompt.images, stats);
+      rt_.set_persona(sampling.persona.get());
+      prefill(prompt, full_prompt.images, req_persona_key, bypass_reuse, stats);
       stats.prompt_tokens = n;
       stats.image_tokens = image_tokens;
       if (spec_) {
@@ -186,6 +193,9 @@ class EngineGenerator final : public Generator {
     cudaStreamSynchronize(rt_.stream());
     tokens_in_state_.clear();
     checkpoint_ids_.clear();
+    live_persona_key_ = 0;
+    checkpoint_persona_key_ = 0;
+    live_bypass_reuse_ = false;
     if (drafter_) drafter_->reset();  // stream-ordered; CUDA failures abort (CUDA_CHECK)
   }
 
@@ -268,23 +278,30 @@ class EngineGenerator final : public Generator {
   // apart. The vision tower encodes an image when the first chunk that holds some of its tokens is reached
   // (images inside the reused prefix are not encoded again), and the Prefiller writes its rows over the
   // embeddings of its tokens; an image may span chunks.
-  void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, GenerateStats& stats) {
+  void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, std::uint64_t req_persona_key,
+               bool bypass_reuse, GenerateStats& stats) {
     const std::vector<std::int32_t>& prev = tokens_in_state_;
     const std::size_t n = ids.size();
     const bool drafter_in_step = !drafter_ || drafter_->length() == int(prev.size());  // else a row is missing
     State& st = rt_.state();
     const cudaStream_t stream = rt_.stream();
-    const bool extend =
-        drafter_in_step && !prev.empty() && prev.size() < n && std::equal(prev.begin(), prev.end(), ids.begin());
-    const bool checkpoint = !extend && !checkpoint_ids_.empty() && checkpoint_ids_.size() <= n &&
+    const bool extend = !bypass_reuse && !live_bypass_reuse_ && live_persona_key_ == req_persona_key &&
+                        drafter_in_step && !prev.empty() && prev.size() < n &&
+                        std::equal(prev.begin(), prev.end(), ids.begin());
+    const bool checkpoint = !bypass_reuse && !extend && checkpoint_persona_key_ == req_persona_key &&
+                            !checkpoint_ids_.empty() && checkpoint_ids_.size() <= n &&
                             std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), ids.begin());
-    Parked* parked = find_parked(ids, extend ? prev.size() : checkpoint ? checkpoint_ids_.size() : 0);
+    Parked* parked =
+        bypass_reuse ? nullptr : find_parked(ids, extend ? prev.size() : checkpoint ? checkpoint_ids_.size() : 0,
+                                             req_persona_key);
     std::size_t start = 0;
     if (parked) {
       // parking the live conversation may move the parked list (never evicting the one to restore)
       const std::vector<std::int32_t> keep = parked->ids;
-      park_live(&keep);
-      unpark(*std::find_if(parked_.begin(), parked_.end(), [&](const Parked& p) { return p.ids == keep; }));
+      const std::uint64_t keep_key = parked->persona_key;
+      park_live(&keep, keep_key);
+      unpark(*std::find_if(parked_.begin(), parked_.end(),
+                           [&](const Parked& p) { return p.ids == keep && p.persona_key == keep_key; }));
       restore_checkpoint();
       start = checkpoint_ids_.size();
       stats.reuse = Reuse::Parked;
@@ -301,6 +318,9 @@ class EngineGenerator final : public Generator {
       if (drafter_) drafter_->reset();
       tokens_in_state_.clear();
       checkpoint_ids_.clear();
+      live_persona_key_ = req_persona_key;
+      checkpoint_persona_key_ = 0;
+      live_bypass_reuse_ = bypass_reuse;
       stats.reuse = Reuse::None;
     }
     st.length = int(start);  // decode steps advance the state without its host-side length
@@ -344,7 +364,7 @@ class EngineGenerator final : public Generator {
       Tensor taps;
       if (drafter_) taps = rm(taps_.p, kActDType, {T, NUM_TAPS, HIDDEN});
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
-                     drafter_ ? &taps : nullptr, rows);
+                     drafter_ ? &taps : nullptr, rows, rt_.active_hooks());
       if (drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
@@ -352,16 +372,24 @@ class EngineGenerator final : public Generator {
     }
     if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream));  // queued chunks read the rows freed here
     tokens_in_state_.assign(ids.begin(), ids.end());
-    if (start < n) save_checkpoint();
+    live_persona_key_ = req_persona_key;
+    live_bypass_reuse_ = bypass_reuse;
+    if (bypass_reuse) {
+      checkpoint_ids_.clear();
+      checkpoint_persona_key_ = 0;
+    } else if (start < n) {
+      save_checkpoint();
+    }
     stats.reused_tokens = int(start);
   }
 
   // Conversation parking. A parked conversation is a packed copy of a prompt checkpoint (target state |
   // drafter checkpoint regions | last logits) plus the target's full-attention rows [0, n) of its n prompt
   // tokens, in device memory within park_budget_ (least recently used evicted), and the drafter's context
-  // tokens of the checkpoint (its shortlist rows).
+  // tokens of the checkpoint (its shortlist rows). Keyed by (ids, persona_key) to prevent cross-persona leakage.
   struct Parked {
     std::vector<std::int32_t> ids, context;
+    std::uint64_t persona_key = 0;
     DeviceBuffer data;
     std::uint64_t used = 0;
   };
@@ -385,12 +413,13 @@ class EngineGenerator final : public Generator {
     return l;
   }
 
-  // the parked conversation whose prompt is the longest prefix of `ids`, if longer than `live` (and kMinParked)
-  Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live) {
+  // the parked conversation whose prompt is the longest prefix of `ids` for `persona_key`, if longer than `live`
+  Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live, std::uint64_t persona_key) {
     Parked* best = nullptr;
     for (Parked& p : parked_)
-      if (p.ids.size() >= kMinParked && p.ids.size() > live && p.ids.size() <= ids.size() &&
-          (!best || p.ids.size() > best->ids.size()) && std::equal(p.ids.begin(), p.ids.end(), ids.begin()))
+      if (p.persona_key == persona_key && p.ids.size() >= kMinParked && p.ids.size() > live &&
+          p.ids.size() <= ids.size() && (!best || p.ids.size() > best->ids.size()) &&
+          std::equal(p.ids.begin(), p.ids.end(), ids.begin()))
         best = &p;
     return best;
   }
@@ -407,19 +436,20 @@ class EngineGenerator final : public Generator {
 
   // Parks the live conversation's checkpoint (the state after its last prompt; the full rows [0, n) are still
   // in the caches) unless it is short, already parked or larger than the budget; the parked conversation with
-  // prompt `keep` (if given) stays. Never fails the request: a failed allocation disables parking.
-  void park_live(const std::vector<std::int32_t>* keep = nullptr) {
+  // (prompt `keep`, `keep_key`) stays. Never fails the request: a failed allocation disables parking.
+  void park_live(const std::vector<std::int32_t>* keep = nullptr, std::uint64_t keep_key = 0) {
     const std::size_t n = checkpoint_ids_.size();
     if (park_budget_ == 0 || n < kMinParked) return;
     for (Parked& p : parked_)
-      if (p.ids == checkpoint_ids_) {
+      if (p.ids == checkpoint_ids_ && p.persona_key == checkpoint_persona_key_) {
         p.used = ++clock_;
         return;
       }
-    auto kept = [&](const Parked& p) { return keep && p.ids == *keep; };
-    // a parked prefix of this conversation is superseded by it
+    auto kept = [&](const Parked& p) { return keep && p.ids == *keep && p.persona_key == keep_key; };
+    // a parked prefix of this conversation (under the same persona key) is superseded by it
     std::erase_if(parked_, [&](const Parked& p) {
-      return !kept(p) && p.ids.size() < n && std::equal(p.ids.begin(), p.ids.end(), checkpoint_ids_.begin());
+      return !kept(p) && p.persona_key == checkpoint_persona_key_ && p.ids.size() < n &&
+             std::equal(p.ids.begin(), p.ids.end(), checkpoint_ids_.begin());
     });
     const ParkLayout l = park_layout(int(n));
     std::size_t used = 0, kept_bytes = 0;
@@ -455,6 +485,7 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(d + l.logits, c + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice, s));
     rt_.save_full_rows(d + l.rows, int(n));
     p.ids = checkpoint_ids_;
+    p.persona_key = checkpoint_persona_key_;
     if (drafter_) p.context = drafter_->checkpoint_context();
     p.used = ++clock_;
     parked_.push_back(std::move(p));
@@ -476,6 +507,7 @@ class EngineGenerator final : public Generator {
     rt_.restore_full_rows(d + l.rows, n);
     if (drafter_) drafter_->adopt_checkpoint(c + checkpoint_drafter_, n, p.context);
     checkpoint_ids_ = p.ids;
+    checkpoint_persona_key_ = p.persona_key;
     p.used = ++clock_;
   }
 
@@ -488,6 +520,7 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
     checkpoint_ids_ = tokens_in_state_;
+    checkpoint_persona_key_ = live_persona_key_;
   }
 
   void restore_checkpoint() {
@@ -497,6 +530,8 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
     tokens_in_state_ = checkpoint_ids_;
+    live_persona_key_ = checkpoint_persona_key_;
+    live_bypass_reuse_ = false;
   }
 
   static std::size_t carved(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
@@ -527,6 +562,10 @@ class EngineGenerator final : public Generator {
   std::size_t checkpoint_drafter_ = 0, checkpoint_logits_ = 0;  // byte offsets in checkpoint_
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;
+  std::uint64_t live_persona_key_ = 0;
+  std::uint64_t checkpoint_persona_key_ = 0;
+  bool live_bypass_reuse_ = false;
+  persona::RefusalMap refusal_map_;
   std::vector<Parked> parked_;
   std::size_t park_budget_ = 0;  // bytes
   std::uint64_t clock_ = 0;      // last use of a parked conversation

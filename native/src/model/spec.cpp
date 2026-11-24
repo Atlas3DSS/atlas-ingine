@@ -79,6 +79,22 @@ SpecLoop::~SpecLoop() {
   if (done_) cudaEventDestroy(done_);
 }
 
+void SpecLoop::ensure_verify_hooked() {
+  if (verify_hooked_) return;
+  rt_.ensure_hooked_graphs();
+  const Widths widths = verify_widths(rt_);
+  const float threshold = rt_.options().spec_threshold;
+  verify_hooked_ = rt_.capture_switch(
+      [&](cudaStream_t s, cudaGraphConditionalHandle h) {
+        verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(), static_cast<std::int32_t*>(width_.p),
+                      h, s);
+      },
+      [&](cudaStream_t s, int m) {
+        rt_.record_save_verify(m, s);
+        rt_.record_step(m, s, /*hooked=*/true);
+      });
+}
+
 void SpecLoop::prepare_accept(const Sampling& sampling) {
   const bool forced = !sampling.forced.empty();
   const bool greedy = sampling.temperature <= 0.f || forced;
@@ -197,7 +213,12 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       record_event(0);
     }
     if (!greedy) kh::uniform(kd::GAMMA, rng, scratch.uniforms, stream);
-    verify_.launch(stream);
+    if (rt_.hooked_active()) {
+      ensure_verify_hooked();
+      verify_hooked_.launch(stream);
+    } else {
+      verify_.launch(stream);
+    }
     accept_.launch(stream);
     if (!greedy) kh::sample_from_probs(scratch.resid, 1, V, V, rng, &record_dev->next, stream);
     CUDA_CHECK(cudaEventRecord(done_, stream));

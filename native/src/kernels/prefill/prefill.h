@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core/act.h"
+#include "kernels/common/persona_abi.h"
 
 #include <cuda_runtime.h>
 
@@ -143,8 +144,17 @@ int moe_tiles_capacity(int max_T);
 // Router selection on FP32 logits [T, 128] (x . router^T): s = sigmoid, top-8 of s + bias (descending),
 // wts = 8 s / (sum s + 1e-20); counts[e] += hits.
 void moe_topk(const float* logits, const float* bias, int T, int* idx, float* wts, int* counts, cudaStream_t stream);
+// Fused mech-interp / persona variant of moe_topk (ablate, slot-preserving force, route-replay, slot-permute,
+// read-only routing tap); exact 0.0 bit-identical on every no-op form.
+void moe_topk_hooked(const float* logits, const float* bias, int T, int pos0, int* idx, float* wts, int* counts,
+                     const persona::RouterHookVisit* hook, cudaStream_t stream);
 // Expert-sorted pair lists and moe_tile_rows(T)-pair tiles from idx and counts.
 void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream);
+
+// Runs 3b per-neuron affine hooks followed by 3a read-only expert activation taps on prefill sorted-pair `act`
+// [T * 8, 1152] right between moe_gate_up and moe_down.
+void apply_expert_hooks_prefill(ActT* act, const MoeWork& w, int T, int pos0, const persona::ExpertTapVisit* hook,
+                                cudaStream_t stream);
 
 struct MoeExperts {
   int fmt = 0;  // 0 NVFP4, 1 MXFP8 (weights.py layouts)

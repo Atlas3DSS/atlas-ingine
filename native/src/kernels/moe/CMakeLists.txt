@@ -1,6 +1,7 @@
 add_library(ingine_kernels_moe STATIC
   moe.cu
   dequant.cu
+  persona_moe.cu
 )
 ingine_cuda_target(ingine_kernels_moe)
 ingine_internal_includes(ingine_kernels_moe)

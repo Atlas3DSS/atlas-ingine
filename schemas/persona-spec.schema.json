@@ -1,0 +1,474 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Atlas3DSS/atlas-ingine/schemas/persona-spec.schema.json",
+  "title": "Atlas Ingine Persona & Mech-Interp Spec (v1, frozen)",
+  "description": "Declarative specification for mech-interp probe interventions and validated/product persona profiles in atlas-ingine (Inkling-2-Mini). Aligned with neuropedia PERSONA-OPUS.md and KIT-LOG.md (Verified Ledger kit log). Every model-modifying entry carries a provenance record; entries without full provenance, with status='probe', with discovery-only evidence, or mismatched model_binding downgrade to probe and load only under --persona-probe-mode. Coordinate d_2027, gradient-trained adapters, sealed/heldout donors, and refusal-linked units (--refusal-map) are unconditionally rejected.",
+  "type": "object",
+  "required": ["schema_version", "spec_metadata", "default_profile", "profiles"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "atlas-persona-spec/v1"
+    },
+    "spec_metadata": {
+      "type": "object",
+      "description": "Traceability header for this spec file. The server also computes spec_sha256 over the raw spec file bytes at load time and attaches it to response metadata.",
+      "required": ["created", "author"],
+      "additionalProperties": false,
+      "properties": {
+        "created": {
+          "type": "string",
+          "minLength": 1,
+          "description": "ISO-8601 creation timestamp (UTC)."
+        },
+        "author": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Author or agent id that generated this spec."
+        },
+        "spec_id": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "profiles_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Optional SHA-256 of canonicalised 'profiles' JSON; verified at load if present."
+        }
+      }
+    },
+    "default_profile": {
+      "type": "string",
+      "default": "none",
+      "description": "Profile applied when a request omits 'persona'. MUST be 'none' unless it names a 'product' profile (outside --persona-probe-mode). 'none' uses the unhooked bit-identical fast path."
+    },
+    "profiles": {
+      "type": "object",
+      "description": "Named persona or probe profiles selectable per request via the 'persona' field in /v1/chat/completions.",
+      "additionalProperties": {
+        "$ref": "#/$defs/Profile"
+      }
+    }
+  },
+  "$defs": {
+    "Sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "NoOpCheck": {
+      "type": "object",
+      "description": "Standing exact-0.0 no-op check passed on target hardware through the exact fused path across all six required visits: prelude (3), loop entry (6), mid pass-0 (10), first re-entry / loop_msg boundary (18), late pass-1 (29), and coda (44).",
+      "required": ["flag", "fused_path", "hardware", "visits", "kl", "delta_nll"],
+      "additionalProperties": false,
+      "properties": {
+        "flag": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact intervention/no-op flag or mode tested (e.g. 'force_already_selected_g1', 'neuron_affine_1_0', 'self_replay_recompute', 'self_replay_copy', 'depth_replace_self_both', 'slot_permute_id', 'ablate_null')."
+        },
+        "fused_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact fused kernel path executed during the no-op check (e.g. 'dense::router_hooked+prefill::moe_topk_hooked')."
+        },
+        "hardware": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Hardware on which exact 0.0 was verified (e.g. 'Tesla V100-PCIE-32GB sm_70', 'RTX 3090 sm_86', 'RTX PRO 6000 Blackwell sm_120a')."
+        },
+        "visits": {
+          "type": "array",
+          "description": "Chronological visits verified at exact 0.0; must contain at least {3, 6, 10, 18, 29, 44} (prelude, loop entry, mid pass-0, re-entry, late pass-1, coda).",
+          "items": { "type": "integer", "minimum": 0, "maximum": 47 },
+          "uniqueItems": true,
+          "minItems": 6,
+          "allOf": [
+            { "contains": { "const": 3 } },
+            { "contains": { "const": 6 } },
+            { "contains": { "const": 10 } },
+            { "contains": { "const": 18 } },
+            { "contains": { "const": 29 } },
+            { "contains": { "const": 44 } }
+          ]
+        },
+        "kl": {
+          "type": "number",
+          "const": 0.0
+        },
+        "delta_nll": {
+          "type": "number",
+          "const": 0.0
+        },
+        "evidence_file": {
+          "type": "string"
+        }
+      }
+    },
+    "MeasuredEffect": {
+      "type": "object",
+      "description": "Measured effect with noise floor beside it. Missing floor_kind or value <= floor downgrades the entry to probe.",
+      "required": ["summary", "metric", "value", "floor", "floor_kind", "floor_n", "sample_count", "engine", "weights_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "summary": { "type": "string", "minLength": 1 },
+        "metric": { "type": "string", "minLength": 1 },
+        "value": { "type": "number" },
+        "floor": { "type": "number", "minimum": 0.0 },
+        "floor_kind": {
+          "type": "string",
+          "enum": ["slot_permute_null", "sample_to_sample", "self_swap", "same_character_other_question"],
+          "description": "Noise floor estimator kind; required for validated/product."
+        },
+        "floor_n": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Sample count used to estimate the noise floor."
+        },
+        "sample_count": { "type": "integer", "minimum": 1 },
+        "engine": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Engine identifier and commit where effect was measured (captures from different engines are not pooled)."
+        },
+        "weights_sha256": {
+          "$ref": "#/$defs/Sha256Hex",
+          "description": "SHA-256 of the model weights file/manifest where effect was measured."
+        }
+      }
+    },
+    "RefusalCheck": {
+      "type": "object",
+      "description": "Private refusal-set verification record. Required with passed=true for validated and product status.",
+      "required": ["passed", "evidence_file", "rate_before", "rate_after"],
+      "additionalProperties": false,
+      "properties": {
+        "passed": { "type": "boolean" },
+        "evidence_file": { "type": "string", "minLength": 1 },
+        "rate_before": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "rate_after": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "sample_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "Origin": {
+      "type": "object",
+      "description": "Character and source text this element was fitted from.",
+      "required": ["character", "source_text"],
+      "additionalProperties": false,
+      "properties": {
+        "character": { "type": "string", "minLength": 1 },
+        "source_text": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Provenance": {
+      "type": "object",
+      "description": "Per-element provenance record aligned with neuropedia KIT-LOG.md (Verified Ledger kit log). Required for every model-modifying entry outside --persona-probe-mode.",
+      "required": ["purpose", "experiment", "evidence_file", "evidence_split", "noop_check", "measured_effect", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "purpose": {
+          "type": "string",
+          "minLength": 1,
+          "description": "(1) What this intervention is for ('written for' in KIT-LOG)."
+        },
+        "experiment": {
+          "type": "string",
+          "minLength": 1,
+          "description": "(2a) Registered experiment or run identifier that validated this entry."
+        },
+        "evidence_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "(2b) Path to the validating evidence artifact."
+        },
+        "evidence_split": {
+          "type": "string",
+          "enum": ["discovery", "confirmation"],
+          "description": "Split on which evidence was measured. 'validated' and 'product' require 'confirmation'; 'discovery' stays 'probe'."
+        },
+        "noop_check": { "$ref": "#/$defs/NoOpCheck" },
+        "measured_effect": { "$ref": "#/$defs/MeasuredEffect" },
+        "status": {
+          "type": "string",
+          "enum": ["probe", "validated", "product"],
+          "description": "(5) Lifecycle status. 'probe' entries load only when --persona-probe-mode is enabled."
+        },
+        "reaches": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Prompt scope/trigger this element reaches (mirrors KIT-LOG 'reaches'). Required for validated/product."
+        },
+        "origin": {
+          "$ref": "#/$defs/Origin",
+          "description": "Which character and source text the element was fitted from. Required for validated/product."
+        },
+        "refusal_checked": {
+          "$ref": "#/$defs/RefusalCheck",
+          "description": "Private refusal-set check result. Required with passed=true for validated/product."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "enum": ["validated", "product"] } }, "required": ["status"] },
+          "then": {
+            "required": ["reaches", "origin", "refusal_checked"],
+            "properties": {
+              "evidence_split": { "const": "confirmation" },
+              "refusal_checked": { "properties": { "passed": { "const": true } } }
+            }
+          }
+        }
+      ]
+    },
+    "ModelBinding": {
+      "type": "object",
+      "description": "Exact model weights, quantisation, and engine commit the profile was validated on. Loading on any mismatching model/quant/commit downgrades the whole profile to 'probe'.",
+      "required": ["weights_sha256", "quantisation", "engine_commit"],
+      "additionalProperties": false,
+      "properties": {
+        "weights_sha256": { "$ref": "#/$defs/Sha256Hex" },
+        "quantisation": { "type": "string", "minLength": 1 },
+        "engine_commit": { "type": "string", "minLength": 7 }
+      }
+    },
+    "CompositionEvidence": {
+      "type": "object",
+      "description": "Required whenever a validated/product profile contains more than one model-modifying intervention: proves the combined profile passed its own no-op and measured-effect check.",
+      "required": ["experiment", "evidence_file", "evidence_split", "noop_check", "measured_effect"],
+      "additionalProperties": false,
+      "properties": {
+        "experiment": { "type": "string", "minLength": 1 },
+        "evidence_file": { "type": "string", "minLength": 1 },
+        "evidence_split": { "type": "string", "enum": ["discovery", "confirmation"] },
+        "noop_check": { "$ref": "#/$defs/NoOpCheck" },
+        "measured_effect": { "$ref": "#/$defs/MeasuredEffect" }
+      }
+    },
+    "OwnerGrade": {
+      "type": "object",
+      "description": "Owner blind-grade record certifying a product character (an automatic judge cannot certify 'alive').",
+      "required": ["passed", "evidence_file"],
+      "additionalProperties": false,
+      "properties": {
+        "passed": { "type": "boolean" },
+        "evidence_file": { "type": "string", "minLength": 1 },
+        "sample_count": { "type": "integer", "minimum": 1 },
+        "notes": { "type": "string" }
+      }
+    },
+    "ReasoningCheck": {
+      "type": "object",
+      "description": "Hard-reasoning benchmark with the profile active vs plain baseline; required for product status.",
+      "required": ["passed", "evidence_file", "metric", "plain_value", "profile_value"],
+      "additionalProperties": false,
+      "properties": {
+        "passed": { "type": "boolean" },
+        "evidence_file": { "type": "string", "minLength": 1 },
+        "metric": { "type": "string", "minLength": 1 },
+        "plain_value": { "type": "number" },
+        "profile_value": { "type": "number" },
+        "sample_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "LeakageCheck": {
+      "type": "object",
+      "description": "Cross-request cache-hit isolation verification (neutral B alone vs after A with shared prefix, both orders, cache-hit and forced-recompute paths).",
+      "required": ["passed", "evidence_file"],
+      "additionalProperties": false,
+      "properties": {
+        "passed": { "type": "boolean" },
+        "evidence_file": { "type": "string", "minLength": 1 }
+      }
+    },
+    "DonorRef": {
+      "type": "object",
+      "description": "Reference to a train-split donor capture for route_replay or depth_replace. Sealed/heldout/confirmation splits and inline sealed token ids are unconditionally rejected.",
+      "required": ["manifest_sha256", "row_id", "split", "raw_order"],
+      "additionalProperties": false,
+      "properties": {
+        "manifest_sha256": { "$ref": "#/$defs/Sha256Hex" },
+        "row_id": { "type": "string", "minLength": 1 },
+        "split": { "const": "train" },
+        "raw_order": { "const": true },
+        "donor_file": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Profile": {
+      "type": "object",
+      "required": ["interventions"],
+      "additionalProperties": false,
+      "properties": {
+        "description": { "type": "string" },
+        "category": {
+          "type": "string",
+          "enum": ["probe", "validated", "product"],
+          "default": "probe",
+          "description": "Effective profile status is min(category, min over intervention statuses, downgrades from model_binding/composition_evidence/evidence_split)."
+        },
+        "model_family": {
+          "type": "string",
+          "default": "inkling-2-mini"
+        },
+        "persona_fingerprint": {
+          "$ref": "#/$defs/Sha256Hex",
+          "description": "Optional expected SHA-256 of canonicalised profile JSON (excluding persona_fingerprint itself); computed and verified by the server at load time and used to isolate KV/checkpoint/parked caches."
+        },
+        "model_binding": { "$ref": "#/$defs/ModelBinding" },
+        "composition_evidence": { "$ref": "#/$defs/CompositionEvidence" },
+        "leakage_check": { "$ref": "#/$defs/LeakageCheck" },
+        "owner_grade": { "$ref": "#/$defs/OwnerGrade" },
+        "reasoning_check": { "$ref": "#/$defs/ReasoningCheck" },
+        "refusal_checked": { "$ref": "#/$defs/RefusalCheck" },
+        "interventions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Intervention" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "category": { "enum": ["validated", "product"] } }, "required": ["category"] },
+          "then": {
+            "required": ["model_binding", "leakage_check"],
+            "properties": {
+              "leakage_check": { "properties": { "passed": { "const": true } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "category": { "const": "product" } }, "required": ["category"] },
+          "then": {
+            "required": ["owner_grade", "reasoning_check", "refusal_checked"],
+            "properties": {
+              "owner_grade": { "properties": { "passed": { "const": true } } },
+              "reasoning_check": { "properties": { "passed": { "const": true } } },
+              "refusal_checked": { "properties": { "passed": { "const": true } } }
+            }
+          }
+        }
+      ]
+    },
+    "Intervention": {
+      "type": "object",
+      "required": ["id", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique element identifier within the profile (mirrors KIT-LOG 'id')."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "router_ablate",
+            "router_force",
+            "router_slot_permute",
+            "route_replay",
+            "neuron_affine",
+            "depth_replace",
+            "residual_steer",
+            "tap_expert",
+            "tap_routing",
+            "router_lowrank_fit",
+            "expert_down_lowrank_fit"
+          ],
+          "description": "Probe/diagnostic hooks: router_ablate, router_force, router_slot_permute, route_replay, neuron_affine, depth_replace, residual_steer. Read-only taps: tap_expert (3a), tap_routing. Measured closed-form low-rank fits (Rungs 5-6): router_lowrank_fit, expert_down_lowrank_fit."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["probe", "tap", "measured_fit"],
+          "description": "Constant pushes (router_ablate, router_force, router_slot_permute, route_replay, neuron_affine, depth_replace, residual_steer) are probes, never product."
+        },
+        "fit_method": {
+          "type": "string",
+          "enum": ["closed_form", "analytic_projection"],
+          "description": "Required for router_lowrank_fit and expert_down_lowrank_fit. Gradient-trained character adapters ('trained') are forbidden by owner rule."
+        },
+        "provenance": { "$ref": "#/$defs/Provenance" },
+        "visit": {
+          "oneOf": [
+            { "type": "integer", "minimum": -1, "maximum": 47 },
+            { "const": "all" }
+          ]
+        },
+        "physical_block": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 23,
+          "description": "Physical block index (0..23). Cross-checked against VISITS[visit].layer when visit >= 0; load fails on mismatch."
+        },
+        "loop_pass": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Loop pass index (0..2). Cross-checked against VISITS[visit].pass when visit >= 0; load fails on mismatch."
+        },
+        "expert": { "type": "integer", "minimum": 0, "maximum": 127 },
+        "neuron": { "type": "integer", "minimum": 0, "maximum": 1151 },
+        "bias": { "type": "number", "default": 0.0 },
+        "gain": { "type": "number", "default": 1.0 },
+        "offset": { "type": "number", "default": 0.0 },
+        "perm": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 7 },
+          "minItems": 8,
+          "maxItems": 8,
+          "uniqueItems": true
+        },
+        "site": {
+          "type": "string",
+          "enum": ["attn_res", "ffn_res", "loop_msg", "output_res", "attn_write", "mlp_write"]
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["read", "value", "both", "recompute", "copy"]
+        },
+        "src_idx": {
+          "type": "integer",
+          "minimum": -1,
+          "maximum": 5,
+          "default": -1,
+          "description": "Optional source index for depth_replace (-1 = all sources)."
+        },
+        "pos_start": { "type": "integer", "minimum": 0, "default": 0 },
+        "donor": {
+          "$ref": "#/$defs/DonorRef",
+          "description": "Required for route_replay and depth_replace in spec files: manifest_sha256 + row_id + split='train' + raw_order=true."
+        },
+        "scale": { "type": "number", "default": 1.0 },
+        "vector": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2304,
+          "maxItems": 2304,
+          "description": "Dense H=2304 residual steering vector (probe only). Coordinate 2027 MUST be 0.0."
+        },
+        "sparse_vector": {
+          "type": "object",
+          "description": "Sparse coordinate->value map for residual_steer (probe only). Key '2027' is rejected.",
+          "additionalProperties": { "type": "number" }
+        },
+        "rank": { "type": "integer", "minimum": 1 },
+        "experts": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 127 }
+        },
+        "weights_file": { "type": "string", "minLength": 1 },
+        "weights_sha256": { "$ref": "#/$defs/Sha256Hex" },
+        "per_token": { "type": "boolean", "default": false },
+        "logits": { "type": "boolean", "default": false }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "enum": ["router_lowrank_fit", "expert_down_lowrank_fit"] } } },
+          "then": { "required": ["physical_block", "rank", "fit_method", "weights_file", "weights_sha256"] }
+        },
+        {
+          "if": { "properties": { "type": { "enum": ["route_replay", "depth_replace"] } } },
+          "then": { "required": ["donor"] }
+        }
+      ]
+    }
+  }
+}

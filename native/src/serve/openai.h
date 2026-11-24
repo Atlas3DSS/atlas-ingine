@@ -42,6 +42,7 @@ struct ChatRequest {
   int max_new_tokens = 0;
   model::Sampling sampling;
   std::vector<std::string> stop;
+  std::string persona_name;  // optional per-request persona profile selector (empty = server default)
   bool stream = false;
   bool include_usage = false;
 };

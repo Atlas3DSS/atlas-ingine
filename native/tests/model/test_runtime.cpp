@@ -13,6 +13,7 @@
 
 #include "kernels/dense/dense.h"
 #include "model/model_kernels.h"
+#include "model/prefill.h"
 #include "model/runtime.h"
 
 #include "ingine/generator.h"
@@ -764,6 +765,310 @@ bool run_ablation_layouts() {
   return ok;
 }
 
+// Mech-interp / persona hooks on the synthetic model:
+//   - exact 0.0 bit-identical no-op across all 6 required visits {3, 6, 10, 18, 29, 44} (prefill + hooked CUDA graph)
+//   - hooked CUDA graph replay == hooked eager step bit-for-bit
+//   - active causal interventions (router ablate/force, 3b affine + 3a tap, residual steer with d_2027 guard)
+//   - cross-request cache-hit & parked-conversation persona isolation
+bool run_persona_hooks() {
+  using namespace ingine::persona;
+  bool ok = true;
+  RuntimeOptions opt;
+  opt.max_ctx = 2048;
+  opt.prefill_chunk = 64;
+  opt.enable_persona_hooks = true;
+  cudaStream_t s0;
+  INGINE_TEST_CUDA(cudaStreamCreate(&s0));
+  Weights w = synthetic_weights(s0);
+  Runtime rt(opt, std::move(w), load_ablation({}));
+  INGINE_TEST_CUDA(cudaStreamDestroy(s0));
+  const cudaStream_t s = rt.stream();
+  Prefiller prefiller(rt.weights(), rt.ablation(), 64, s);
+
+  const std::vector<std::int32_t> prompt = {11, 523, 7, 4000, 19, 2048, 3, 77};
+  DeviceBuffer tok_dev(prompt.size() * sizeof(std::int32_t));
+  DeviceBuffer logits_dev(std::size_t(UNPADDED_VOCAB) * sizeof(float));
+  INGINE_TEST_CUDA(cudaMemcpyAsync(tok_dev.p, prompt.data(), prompt.size() * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, s));
+
+  auto run_pf_and_dec = [&](std::vector<float>& pf_out, std::vector<float>& dec_out) {
+    reset_state(rt.state(), s);
+    prefiller.run(rt.state(), static_cast<const std::int32_t*>(tok_dev.p), int(prompt.size()), 0,
+                  static_cast<float*>(logits_dev.p), nullptr, {}, rt.active_hooks());
+    pf_out.resize(kVocab);
+    INGINE_TEST_CUDA(cudaMemcpyAsync(pf_out.data(), logits_dev.p, kVocab * sizeof(float), cudaMemcpyDeviceToHost, s));
+    rt.decode_logits(42, int(prompt.size()));
+    dec_out = logits_row(rt, 1, 0);
+  };
+
+  // Baseline unhooked
+  rt.set_persona(nullptr);
+  std::vector<float> base_pf, base_dec;
+  run_pf_and_dec(base_pf, base_dec);
+
+  // Tap routing and ffn_res depth at all 6 required visits {3, 6, 10, 18, 29, 44} (plus loop_msg at {18, 29})
+  const std::array<int, 6> kReqVisits = {3, 6, 10, 18, 29, 44};
+  PersonaTapConfig tap_all;
+  tap_all.max_pos = 16;
+  for (int v : kReqVisits) {
+    tap_all.routing_visits.push_back(v);
+    tap_all.ffn_inp_visits.push_back(v);
+    tap_all.depth_taps.push_back({v, DepthSiteKind::FfnRes, true, true});
+    if (v == 18 || v == 29) tap_all.depth_taps.push_back({v, DepthSiteKind::LoopMsg, true, true});
+  }
+  rt.set_persona(nullptr, tap_all);
+  std::vector<float> tap_pf, tap_dec;
+  run_pf_and_dec(tap_pf, tap_dec);
+  ok &= report(tap_pf == base_pf && tap_dec == base_dec,
+               "persona read-only taps across all 6 visits are bit-identical to unhooked baseline");
+  std::map<int, RoutingTapReadout> saved_rtaps;
+  std::map<int, DepthTapReadout> saved_dtaps;
+  for (int v : kReqVisits) {
+    saved_rtaps[v] = rt.persona_runtime().read_routing_tap(v, 9, s);
+    saved_dtaps[v] = rt.persona_runtime().read_depth_tap(v, DepthSiteKind::FfnRes, 9, s);
+  }
+
+  // Hooked CUDA graph replay == hooked eager bit-for-bit
+  {
+    PersonaProfile p;
+    p.name = "force_active";
+    p.fingerprint_sha256 = sha256_hex("force_active");
+    p.cache_key = cache_key_from_hex(p.fingerprint_sha256);
+    InterventionSpec iv;
+    iv.type = InterventionType::RouterForce;
+    iv.visit = 10;
+    iv.expert = 5;
+    iv.bias = 100.0f;
+    iv.gain = 2.5f;
+    p.interventions.push_back(iv);
+    rt.set_persona(&p);
+    reset_state(rt.state(), s);
+    const auto snap = rt.snapshot();
+    const std::int32_t tk[1] = {42};
+    rt.set_inputs(tk, 0);
+    rt.run_step_eager(1);
+    const auto eager = logits_row(rt, 1, 0);
+    rt.restore(snap);
+    rt.set_inputs(tk, 0);
+    rt.run_step(1);
+    const auto graph = logits_row(rt, 1, 0);
+    ok &= report(finite(eager) && eager == graph, "hooked CUDA graph replay equals hooked eager step bit for bit");
+  }
+
+  // Exact 0.0 bit-identical no-op across all 6 required visits for every hook type
+  bool all6_noop_ok = true;
+  for (int v : kReqVisits) {
+    const auto& rtap = saved_rtaps.at(v);
+    // Find an active expert and a never-selected expert at visit v
+    std::array<int, EXPERTS> cnt{};
+    for (int id : rtap.idx)
+      if (id >= 0 && id < EXPERTS) ++cnt[std::size_t(id)];
+    int active_e = 0, never_e = -1;
+    for (int e = 0; e < EXPERTS; ++e) {
+      if (cnt[std::size_t(e)] > cnt[std::size_t(active_e)]) active_e = e;
+      if (cnt[std::size_t(e)] == 0 && never_e < 0) never_e = e;
+    }
+    const auto& dtap = saved_dtaps.at(v);
+
+    auto check_noop = [&](const PersonaProfile& prof) {
+      rt.set_persona(&prof);
+      std::vector<float> pf, dec;
+      run_pf_and_dec(pf, dec);
+      return pf == base_pf && dec == base_dec;
+    };
+
+    // 1) force bias=0, gain=1
+    {
+      PersonaProfile p;
+      p.name = "noop_force_b0_v" + std::to_string(v);
+      p.fingerprint_sha256 = sha256_hex(p.name);
+      p.cache_key = cache_key_from_hex(p.fingerprint_sha256);
+      InterventionSpec iv;
+      iv.type = InterventionType::RouterForce;
+      iv.visit = v;
+      iv.expert = active_e;
+      iv.bias = 0.0f;
+      iv.gain = 1.0f;
+      p.interventions.push_back(iv);
+      all6_noop_ok &= check_noop(p);
+    }
+    // 2) ablate never-selected expert
+    if (never_e >= 0) {
+      PersonaProfile p;
+      p.name = "noop_ablate_never_v" + std::to_string(v);
+      p.fingerprint_sha256 = sha256_hex(p.name);
+      p.cache_key = cache_key_from_hex(p.fingerprint_sha256);
+      InterventionSpec iv;
+      iv.type = InterventionType::RouterAblate;
+      iv.visit = v;
+      iv.expert = never_e;
+      p.interventions.push_back(iv);
+      all6_noop_ok &= check_noop(p);
+    }
+    // 3) slot permute identity
+    {
+      PersonaProfile p;
+      p.name = "noop_perm_v" + std::to_string(v);
+      p.fingerprint_sha256 = sha256_hex(p.name);
+      p.cache_key = cache_key_from_hex(p.fingerprint_sha256);
+      InterventionSpec iv;
+      iv.type = InterventionType::RouterSlotPermute;
+      iv.visit = v;
+      p.interventions.push_back(iv);
+      all6_noop_ok &= check_noop(p);
+    }
+    // 4) self route replay (recompute + copy)
+    for (bool copy_w : {false, true}) {
+      PersonaProfile p;
+      p.name = "noop_replay_" + std::string(copy_w ? "copy_" : "recomp_") + std::to_string(v);
+      p.fingerprint_sha256 = sha256_hex(p.name);
+      p.cache_key = cache_key_from_hex(p.fingerprint_sha256);
+      InterventionSpec iv;
+      iv.type = InterventionType::RouteReplay;
+      iv.visit = v;
+      iv.replay_copy_weights = copy_w;
+      iv.inline_replay_ids = rtap.idx;
+      if (copy_w) iv.inline_replay_wts = rtap.wts;
+      p.interventions.push_back(iv);
+      all6_noop_ok &= check_noop(p);
+    }
+    // 5) 3b neuron affine identity (gain=1, offset=0)
+    {
+      PersonaProfile p;
+      p.name = "noop_3b_v" + std::to_string(v);
+      p.fingerprint_sha256 = sha256_hex(p.name);
+      p.cache_key = cache_key_from_hex(p.fingerprint_sha256);
+      InterventionSpec iv;
+      iv.type = InterventionType::NeuronAffine;
+      iv.visit = v;
+      iv.expert = active_e;
+      iv.neuron = 17;
+      iv.gain = 1.0f;
+      iv.offset = 0.0f;
+      p.interventions.push_back(iv);
+      all6_noop_ok &= check_noop(p);
+    }
+    // 6) self depth replace (ffn_res, mode=both)
+    {
+      PersonaProfile p;
+      p.name = "noop_depth_v" + std::to_string(v);
+      p.fingerprint_sha256 = sha256_hex(p.name);
+      p.cache_key = cache_key_from_hex(p.fingerprint_sha256);
+      InterventionSpec iv;
+      iv.type = InterventionType::DepthReplace;
+      iv.visit = v;
+      iv.depth_site = DepthSiteKind::FfnRes;
+      iv.depth_mode = 3u;
+      iv.inline_depth_nsrc = dtap.n_src;
+      iv.inline_depth_nq = dtap.n_q;
+      iv.inline_depth_scores = dtap.scores;
+      iv.inline_depth_states = dtap.states;
+      p.interventions.push_back(iv);
+      all6_noop_ok &= check_noop(p);
+    }
+    // 7) residual steer scale=0
+    {
+      PersonaProfile p;
+      p.name = "noop_steer_v" + std::to_string(v);
+      p.fingerprint_sha256 = sha256_hex(p.name);
+      p.cache_key = cache_key_from_hex(p.fingerprint_sha256);
+      InterventionSpec iv;
+      iv.type = InterventionType::ResidualSteer;
+      iv.visit = v;
+      iv.steer_site = SteerSiteKind::MlpWrite;
+      iv.scale = 0.0f;
+      iv.vector.assign(HIDDEN, 0.25f);
+      iv.vector[kForbiddenCoord] = 0.0f;
+      p.interventions.push_back(iv);
+      all6_noop_ok &= check_noop(p);
+    }
+  }
+  ok &= report(all6_noop_ok,
+               "all 7 hook types are exact-0.0 bit-identical no-ops across all 6 visits {3, 6, 10, 18, 29, 44}");
+
+  // Active 3b neuron affine + simultaneous 3a tap verification
+  {
+    const auto& rtap10 = saved_rtaps.at(10);
+    const int active_e = rtap10.idx[0];
+    PersonaProfile p;
+    p.name = "active_3b_3a";
+    p.fingerprint_sha256 = sha256_hex(p.name);
+    p.cache_key = cache_key_from_hex(p.fingerprint_sha256);
+    InterventionSpec iv;
+    iv.type = InterventionType::NeuronAffine;
+    iv.visit = 10;
+    iv.expert = active_e;
+    iv.neuron = 17;
+    iv.gain = 3.0f;
+    iv.offset = 2.5f;
+    p.interventions.push_back(iv);
+    PersonaTapConfig tc;
+    tc.expert_taps.push_back({10, active_e, true});
+    rt.set_persona(&p, tc);
+    std::vector<float> pf, dec;
+    run_pf_and_dec(pf, dec);
+    const auto ns = rt.persona_runtime().read_neuron_stats(s);
+    const auto et = rt.persona_runtime().read_expert_taps(s);
+    const bool match_3a = ns.size() == 1 && et.targets.size() == 1 && ns[0].hits == et.targets[0].hits &&
+                          ns[0].hits > 0 && std::abs(ns[0].post_mean - et.targets[0].mean[17]) < 2e-2f &&
+                          pf != base_pf;
+    ok &= report(match_3a, "active 3b neuron affine changes logits and matches simultaneous 3a tap");
+  }
+
+  // Cross-request cache-hit & parked-conversation persona isolation via EngineGenerator
+  {
+    RuntimeOptions gopt;
+    gopt.max_ctx = 2048;
+    gopt.kv_fp8 = true;
+    gopt.prefill_chunk = 64;
+    gopt.enable_persona_hooks = true;
+    gopt.park_mb = 256;
+    cudaStream_t s1;
+    INGINE_TEST_CUDA(cudaStreamCreate(&s1));
+    Weights wg = synthetic_weights(s1);
+    INGINE_TEST_CUDA(cudaStreamDestroy(s1));
+    const auto gen = make_generator(gopt, std::move(wg), load_ablation({}));
+
+    auto prof_a = std::make_shared<PersonaProfile>();
+    prof_a->name = "A";
+    prof_a->fingerprint_sha256 = sha256_hex("A");
+    prof_a->cache_key = cache_key_from_hex(prof_a->fingerprint_sha256);
+    {
+      InterventionSpec iv;
+      iv.type = InterventionType::RouterForce;
+      iv.visit = 10;
+      iv.expert = 5;
+      iv.bias = 100.0f;
+      iv.gain = 4.0f;
+      prof_a->interventions.push_back(iv);
+    }
+
+    Rng rng(17);
+    std::vector<std::int32_t> long_p(300);
+    for (auto& t : long_p) t = std::int32_t(rng.next() % kVocab);
+    auto run_g = [&](const std::vector<std::int32_t>& ids, std::shared_ptr<const PersonaProfile> p) {
+      Sampling sp;
+      sp.temperature = 0.f;
+      sp.persona = std::move(p);
+      std::vector<std::int32_t> out;
+      const GenerateStats st = gen->generate(ids, 16, sp, {}, [&](std::span<const std::int32_t> t) {
+        out.insert(out.end(), t.begin(), t.end());
+        return true;
+      });
+      return std::pair{out, st};
+    };
+    const auto [b_alone, st_b0] = run_g(long_p, nullptr);
+    const auto [a_out, st_a] = run_g(long_p, prof_a);
+    const auto [b_after_a, st_b1] = run_g(long_p, nullptr);
+    // Notice: b_alone parked under key=0; a_out did NOT reuse b_alone (Reuse::None);
+    // b_after_a unparked b_alone (Reuse::Parked) and generated bit-identical tokens to b_alone!
+    const bool iso_ok = (a_out != b_alone) && (st_a.reuse == Reuse::None) && (b_after_a == b_alone) &&
+                        (st_b1.reuse == Reuse::Parked);
+    ok &= report(iso_ok, "cross-request cache & parked-conversation persona isolation");
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -778,6 +1083,7 @@ int main() {
   ok &= run(true);
   ok &= run_generator();
   ok &= run_ablation_layouts();
+  ok &= run_persona_hooks();
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

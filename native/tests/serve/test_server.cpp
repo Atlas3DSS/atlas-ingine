@@ -1,6 +1,7 @@
 // OpenAI-compatible server end to end against FakeGenerator (CPU only, real tokenizer/template): port of
 // engine/tests/test_server.py.
 #include "engine/fake_generator.h"
+#include "ingine/persona.h"
 #include "serve/chat_server.h"
 #include "text/chat.h"
 
@@ -862,6 +863,263 @@ void test_response_format_and_tool_ban() {
   CHECK(chat(s->port(), {{"response_format", {{"type", "json_schema"}}}}).status == 400);
 }
 
+void test_persona_control_plane() {
+  using ingine::persona::ModelRuntimeIdentity;
+  using ingine::persona::PersonaCatalog;
+  using ingine::persona::PersonaStatus;
+  using ingine::persona::RefusalMap;
+
+  const std::string hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  auto make_prov = [&](const std::string& status = "validated") -> Json {
+    return Json{
+        {"status", status},
+        {"purpose", "verified unit test intervention"},
+        {"experiment", "unit_test_exp"},
+        {"evidence_file", "results/unit.json"},
+        {"evidence_split", "confirmation"},
+        {"reaches", "tone"},
+        {"origin", {{"character", "archivist"}, {"source_text", "train_prompt_01"}}},
+        {"noop_check",
+         {{"flag", "--force-unit 10:61:0.0:1.0"},
+          {"kl", 0},
+          {"delta_nll", 0},
+          {"fused_path", "dense::router_hooked+prefill::moe_topk_hooked"},
+          {"hardware", "RTX PRO 6000 Blackwell (sm_120a)"},
+          {"visits", Json::array({3, 6, 10, 18, 29, 44})}}},
+        {"measured_effect",
+         {{"summary", "style shift above slot-permute floor"},
+          {"metric", "style_score"},
+          {"engine", "atlas-ingine"},
+          {"weights_sha256", hex64},
+          {"value", 0.42},
+          {"floor", 0.05},
+          {"floor_kind", "slot_permute_null"},
+          {"floor_n", 4},
+          {"sample_count", 16}}},
+        {"refusal_checked",
+         {{"passed", true}, {"evidence_file", "results/refusal.json"}, {"rate_before", 0.95}, {"rate_after", 0.95}}},
+    };
+  };
+  auto make_spec = [&](const Json& profiles, const std::string& def_prof = "none") -> Json {
+    return Json{
+        {"schema_version", "atlas-persona-spec/v1"},
+        {"spec_metadata", {{"created", "2026-11-24T01:00:00Z"}, {"author", "test-suite"}}},
+        {"default_profile", def_prof},
+        {"profiles", profiles},
+    };
+  };
+
+  // 1. Valid 'validated' profile with full provenance + 6-visit noop_check + model_binding + leakage_check.
+  Json val_profile = {
+      {"description", "validated persona profile"},
+      {"category", "validated"},
+      {"model_binding",
+       {{"weights_sha256", hex64}, {"quantisation", "NVFP4"}, {"engine_commit", "f3848d8"}}},
+      {"leakage_check", {{"passed", true}, {"evidence_file", "results/leakage.json"}}},
+      {"interventions",
+       Json::array({Json{{"id", "fit_1"},
+                         {"type", "router_force"},
+                         {"role", "probe"},
+                         {"visit", 10},
+                         {"expert", 61},
+                         {"bias", 0.0},
+                         {"gain", 1.25},
+                         {"provenance", make_prov("validated")}}})},
+  };
+  const Json valid_doc = make_spec(Json{{"calm", val_profile}}, "none");
+  const PersonaCatalog cat_strict = PersonaCatalog::parse_json(valid_doc.dump(), /*probe_mode=*/false);
+  CHECK(cat_strict.default_profile == "none");
+  CHECK(cat_strict.profiles.at("calm")->effective_status == PersonaStatus::Validated);
+  CHECK(cat_strict.profiles.at("calm")->fingerprint_sha256.size() == 64);
+
+  // 1b. Constant push claiming status='product' is rejected (probes are never product).
+  {
+    Json bad_prod = valid_doc;
+    bad_prod["profiles"]["calm"]["category"] = "product";
+    bad_prod["profiles"]["calm"]["interventions"][0]["provenance"]["status"] = "product";
+    bool threw = false;
+    try {
+      (void)PersonaCatalog::parse_json(bad_prod.dump(), true);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+
+  // 1c. default_profile naming a non-product profile ('validated') is rejected outside probe mode.
+  {
+    Json bad_def = make_spec(Json{{"calm", val_profile}}, "calm");
+    bool threw = false;
+    try {
+      (void)PersonaCatalog::parse_json(bad_def.dump(), false);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+
+  // 2. Missing one of the 6 required visits in noop_check.visits -> strict mode rejects (downgraded to probe).
+  {
+    Json bad = valid_doc;
+    bad["profiles"]["calm"]["interventions"][0]["provenance"]["noop_check"]["visits"] = Json::array({3, 6, 10, 29, 44});
+    bool threw = false;
+    try {
+      (void)PersonaCatalog::parse_json(bad.dump(), false);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw);
+    // In probe mode it loads, downgraded to probe with explicit reason.
+    const PersonaCatalog cat_probe = PersonaCatalog::parse_json(bad.dump(), true);
+    CHECK(cat_probe.profiles.at("calm")->effective_status == PersonaStatus::Probe);
+    CHECK(!cat_probe.profiles.at("calm")->downgrade_reason.empty());
+  }
+
+  // 3. model_binding mismatch downgrades to probe (rejected in strict mode, downgraded in probe mode).
+  {
+    ModelRuntimeIdentity mismatch;
+    mismatch.quantisation = "Q8_0";
+    bool threw = false;
+    try {
+      (void)PersonaCatalog::parse_json(valid_doc.dump(), false, RefusalMap::default_map(), mismatch);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw);
+    const PersonaCatalog cat_p = PersonaCatalog::parse_json(valid_doc.dump(), true, RefusalMap::default_map(), mismatch);
+    CHECK(cat_p.profiles.at("calm")->effective_status == PersonaStatus::Probe);
+  }
+
+  // 4. fit_method="trained" is unconditionally rejected even in probe mode.
+  {
+    Json trained = valid_doc;
+    trained["profiles"]["calm"]["interventions"][0]["fit_method"] = "trained";
+    bool threw = false;
+    try {
+      (void)PersonaCatalog::parse_json(trained.dump(), true);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+
+  // 5. Coordinate d_2027 in residual_steer is unconditionally rejected even in probe mode.
+  {
+    std::vector<float> vec(2304, 0.0f);
+    vec[2027] = 0.01f;
+    Json bad_steer = make_spec(Json{
+        {"steer_bad",
+         {{"category", "probe"},
+          {"interventions",
+           Json::array({{{"id", "s1"},
+                         {"type", "residual_steer"},
+                         {"role", "probe"},
+                         {"visit", 10},
+                         {"site", "mlp_write"},
+                         {"scale", 1.0},
+                         {"vector", vec}}})}}}});
+    bool threw = false;
+    try {
+      (void)PersonaCatalog::parse_json(bad_steer.dump(), true);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+
+  // 6. Refusal-map protected unit is unconditionally rejected even in probe mode.
+  {
+    RefusalMap rmap = RefusalMap::default_map();
+    rmap.protected_units.push_back({10, -1, 61, -1});
+    bool threw = false;
+    try {
+      (void)PersonaCatalog::parse_json(valid_doc.dump(), true, rmap);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+
+  // 7. Sealed/heldout donor rejection even in probe mode.
+  {
+    Json sealed_donor = make_spec(Json{
+        {"bad_replay",
+         {{"category", "probe"},
+          {"interventions",
+           Json::array({{{"id", "r1"},
+                         {"type", "route_replay"},
+                         {"role", "probe"},
+                         {"visit", 10},
+                         {"donor",
+                          {{"manifest_sha256", hex64},
+                           {"row_id", "row_0"},
+                           {"split", "heldout"},
+                           {"raw_order", true}}}}})}}}});
+    bool threw = false;
+    try {
+      (void)PersonaCatalog::parse_json(sealed_donor.dump(), true);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+
+  // 8. HTTP control plane: GET /v1/personas, per-request "persona", persona_metadata on active only, 400 on unknown.
+  {
+    auto gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-test");
+    ingine::serve::ServerOptions opts;
+    opts.personas = std::make_shared<PersonaCatalog>(cat_strict);
+    ChatServer srv(*gen, *g_fmt, opts);
+    CHECK(srv.bind("127.0.0.1", 0));
+    srv.start();
+
+    const Response pr = request(srv.port(), "GET", "/v1/personas");
+    CHECK(pr.status == 200);
+    const Json pj = Json::parse(pr.body);
+    CHECK(pj["object"] == "list" && pj["default"] == "none" && pj["probe_mode"] == false);
+    CHECK(pj["data"].size() == 1 && pj["data"][0]["id"] == "calm" && pj["data"][0]["status"] == "validated");
+
+    // Default persona ("none") uses unhooked fast path and omits persona_metadata.
+    Chat r_def = chat(srv.port(), Json::object());
+    CHECK(r_def.status == 200 && !r_def.body.contains("persona_metadata"));
+    CHECK(gen->calls().back().sampling.persona == nullptr);
+
+    // Explicit "persona": "calm" is applied and returns persona_metadata.
+    Chat r_calm = chat(srv.port(), {{"persona", "calm"}});
+    CHECK(r_calm.status == 200 && r_calm.body.contains("persona_metadata"));
+    CHECK(r_calm.body["persona_metadata"]["profile"] == "calm");
+    CHECK(r_calm.body["persona_metadata"]["status"] == "validated");
+    CHECK(r_calm.body["persona_metadata"]["persona_fingerprint"] == cat_strict.profiles.at("calm")->fingerprint_sha256);
+    CHECK(gen->calls().back().sampling.persona != nullptr &&
+          gen->calls().back().sampling.persona->name == "calm");
+
+    // Explicit "persona": "none" uses unhooked fast path and omits persona_metadata.
+    Chat r_none = chat(srv.port(), {{"persona", "none"}});
+    CHECK(r_none.status == 200 && !r_none.body.contains("persona_metadata"));
+    CHECK(gen->calls().back().sampling.persona == nullptr);
+
+    // Streaming with active persona emits persona_metadata on final finish chunk.
+    Chat r_stream = chat(srv.port(), {{"persona", "calm"}, {"stream", true}});
+    CHECK(r_stream.status == 200);
+    bool saw_meta = false;
+    for (const Json& ev : r_stream.body) {
+      if (ev.is_object() && ev.contains("persona_metadata")) {
+        CHECK(ev["persona_metadata"]["profile"] == "calm");
+        saw_meta = true;
+      }
+    }
+    CHECK(saw_meta);
+
+    // Unknown persona or non-string persona -> 400 with param="persona".
+    Chat r_bad = chat(srv.port(), {{"persona", "nonexistent"}});
+    CHECK(r_bad.status == 400 && r_bad.body["error"]["param"] == "persona");
+    Chat r_type = chat(srv.port(), {{"persona", 42}});
+    CHECK(r_type.status == 400 && r_type.body["error"]["param"] == "persona");
+
+    srv.stop();
+  }
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -894,6 +1152,7 @@ int main() {
       {"echo", test_echo},
       {"images", test_images},
       {"response_format_and_tool_ban", test_response_format_and_tool_ban},
+      {"persona_control_plane", test_persona_control_plane},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {
