@@ -1,151 +1,171 @@
-# Inkling-2-Mini abliterated: ingine
+# atlas-ingine
 
-An abliterated [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) served
-by **ingine**, a custom CUDA inference engine for one RTX 5090. It answers harmful test prompts instead of refusing
-them, directly and after reasoning (refusal phrases in 1 of 104 and 3 of 48 answers, the 3 followed by the requested
-text), and stays close to the original elsewhere (KL divergence 0.014 on harmless answers). ingine
-generates 490-560 tokens/s, reads prompts at 6,200-10,900 tokens/s, takes images as well as text and serves
-262,144 tokens of context through an OpenAI-compatible API.
+Multi-architecture Apache-2.0 CUDA inference engine for
+[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), forked from
+[satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine).
 
-The installer sets everything up and downloads the ready-to-run model from Hugging Face,
-[satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine)
-(20.2 GB, pinned to one revision and checked file by file).
+Runs on **Ampere (`sm_86`, RTX 3090)**, **Ada (`sm_89`, RTX 4090)**, and **Blackwell (`sm_120a`, RTX 5090 / RTX PRO 6000)**
+with **native Elastic sub-4-bit MoE weights (`ATLAS2` / `ATLAS3`)**, **DSpark speculative decoding**, **native vision
+input**, and **OpenAI-compatible structured outputs (`response_format`: `json_object` / `json_schema`) + automatic
+tool-ban**. Blackwell (`sm_120a`) outputs remain bit-identical to upstream (`kernels_bitlock` 48/48 PASS).
 
-## Run
+## Measured performance (64K context)
 
-You need **Linux x86_64, an NVIDIA GPU with compute capability 12.0 and at least 32 GB of memory (RTX 5090), an
-NVIDIA driver for CUDA 13 (580 or newer), a C++20 compiler (GCC 12 to 16; the menu offers to install one), and
-about 24 GB of free disk** (20.2 GB of model files; the private CUDA toolkit, the build tools and the build take
-about 1.2 GB, uv's download cache about 1 GB more). The RTX PRO 6000, 5000 and 4500 Blackwell cards are also
-compute capability 12.0 but untested. Other GPUs are not supported: the kernels are built for `sm_120a` and decode
-the routed experts with Blackwell's FP4 conversion instructions. The installer does not install or change GPU
-drivers. The server is a C++/CUDA program: it needs no Python or PyTorch to run.
+Measured with `ingine-bench` (`--max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000`):
 
-Install with one command. It clones this repository to `~/inkling-2-mini-abliterated-ingine` and opens its menu:
+| GPU | Arch | Checkpoint | VRAM @ 64K ctx | Chat decode | Code decode | 64K prefill |
+|---|---|---|---:|---:|---:|---:|
+| RTX 3090 24 GB | `sm_86` | Native `NVFP4+MXFP8` | `21.82 GB` | `154.9 tok/s` | `213.2 tok/s` | `2,980 tok/s` |
+| RTX 3090 24 GB | `sm_86` | Elastic `atlas-12g` | `16.37 GB` | `132.4 tok/s` | `161.2 tok/s` | `2,970 tok/s` |
+| RTX 3090 24 GB | `sm_86` | Elastic `atlas-10g` | `14.33 GB` | `145.6 tok/s` | `196.1 tok/s` | `3,012 tok/s` |
+| RTX 4090 24 GB | `sm_89` | Elastic `atlas-12g` | `16.36 GB` | `236.7 tok/s` | `278.3 tok/s` | `7,031 tok/s` |
+| RTX PRO 6000 96 GB | `sm_120a` | Elastic `atlas-12g` | `16.26 GB` | `411.0 tok/s` | `519.9 tok/s` | `11,728 tok/s` |
+| RTX PRO 6000 96 GB | `sm_120a` | Elastic `atlas-10g` | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` |
+
+Additional verified live-serving footprints (`ingine-serve`):
+- **RTX 3090 (`sm_86`, 12 GB class):** `atlas-10g` at 16K ctx with `--no-vision --dense-fp8 --kv-fp8 --spec --park-mb 0` uses **`12,984 MiB`** (`<12 GiB` without `--spec`).
+- **RTX 4090 (`sm_89`, 24 GB):** `atlas-12g` at 128K ctx with `--no-vision` uses **`17,776 MiB`**; live long-output serving with vision enabled at 64K ctx runs at **~257 tok/s**.
+- **RTX 5090 / RTX PRO 6000 (`sm_120a`, 32+ GB):** native `NVFP4+MXFP8` serves up to **262,144 tokens** of context in `24.4 GiB` (`490–560 tok/s` decode, `6,200–10,900 tok/s` prefill; see [Upstream RTX 5090 results](#upstream-rtx-5090-and-abliteration-results)).
+
+## What this fork adds over upstream `satellitedown/ingine`
+
+1. **Multi-architecture CUDA kernels (`sm_86`, `sm_89`, `sm_120a`):**
+   - Native Ampere (`sm_86`) and Ada (`sm_89`) codepaths on CUDA 12.8+ and CUDA 13.x without degrading Blackwell (`sm_120a`).
+   - Software fallbacks for Hopper/Blackwell-only primitives (PDL, DSMEM/cluster reductions, hardware FP4/FP8 conversions) and branchless FP8/E2M1/ATLAS2/ATLAS3 unpackers for `sm_86`/`sm_89`.
+2. **Native Elastic sub-4-bit MoE weights (`ATLAS2` 2.50 b/w, `ATLAS3` 3.50 b/w):**
+   - Mixed-precision MoE tier converter ([`tools/quantize_elastic_ingine.py`](tools/quantize_elastic_ingine.py)) that compresses the 20.2 GB base checkpoint to **`atlas-12g` (`14.05 GB` on disk incl. vision + `mtp.safetensors`)** or **`atlas-10g` (`12.01 GB` on disk incl. vision + `mtp.safetensors`)**.
+   - Native fused decode (`native/src/kernels/moe/moe.cu`) and prefill (`native/src/kernels/prefill/wgemm.cu`) kernels verified against FP64 oracles (`kernels_moe`, `prefill_moe`).
+3. **Structured outputs and tool-ban:**
+   - Native OpenAI `response_format` (`text`, `json_object`, `json_schema`) constrained decoding in `ingine-serve` (`serve_server` 22/22 PASS).
+   - Automatic `<|content_invoke_tool_json|>` token banning when `tools` is absent from the request.
+
+## Requirements
+
+- **OS:** Linux x86_64
+- **GPU:** NVIDIA GPU with compute capability **8.6 (Ampere, e.g. RTX 3090)**, **8.9 (Ada, e.g. RTX 4090)**, or **12.0 (Blackwell, e.g. RTX 5090 / RTX PRO 6000)**
+  - **24 GB VRAM (RTX 3090 / 4090):** runs the native 20.2 GB checkpoint at 64K context (`~21.8 GB` VRAM) or Elastic `atlas-12g` up to 128K context (`~17.8 GB` VRAM).
+  - **16 GB / 12 GB class VRAM:** runs Elastic `atlas-12g` (`~16.3 GB` @ 64K) or `atlas-10g` (`~13.0 GB` @ 16K with `--spec --no-vision`, `<12 GiB` without `--spec`).
+  - **32+ GB VRAM (RTX 5090 / RTX PRO 6000):** runs the native checkpoint up to 262,144-token context (`~24.4 GB` VRAM).
+- **Driver & Toolchain:** NVIDIA driver for CUDA 12.8+ / CUDA 13 (580+ for the CUDA 13.4 private toolkit installer), C++20 compiler (GCC 12–16), CMake >= 3.28, Ninja.
+- **Runtime:** `ingine-serve` is a standalone C++/CUDA binary; it needs no Python or PyTorch to run.
+
+## Build and run
+
+### Option A: Build directly with CMake (existing CUDA 12.8+ / 13.x toolkit)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/satellitedown/inkling-2-mini-abliterated-ingine/main/get.sh | bash
+git clone https://github.com/Atlas3DSS/atlas-ingine
+cd atlas-ingine
+
+# Build multi-arch (sm_86 + sm_89 + sm_120a) or pick your single GPU arch (e.g. "89" for RTX 4090, "86" for RTX 3090)
+cmake -S native -B native/build-multiarch -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES="86;89;120a" \
+  -DINGINE_BUILD_APPS=ON \
+  -DINGINE_BUILD_TESTS=ON
+cmake --build native/build-multiarch -j
+
+# Run unit tests (optional)
+ctest --test-dir native/build-multiarch --output-on-failure
 ```
 
-Choose **1** to install (build tools, CUDA toolkit, build of the C++ engine and model download), then **5** to add
-the `ingine` command and `ingine start` to run the server. Run the same command again any time to get back to the
-menu.
-To install somewhere else, set the folder:
-`curl -fsSL https://raw.githubusercontent.com/satellitedown/inkling-2-mini-abliterated-ingine/main/get.sh | INGINE_DIR=/path/to/folder bash`.
-
-Or do the same by hand:
+Start the server on a 24 GB card (RTX 3090 / RTX 4090, 64K context with vision + DSpark speculative decoding):
 
 ```bash
-git clone https://github.com/satellitedown/inkling-2-mini-abliterated-ingine
-cd inkling-2-mini-abliterated-ingine
+./native/build-multiarch/apps/serve/ingine-serve \
+  --engine \
+  --model-dir /path/to/Inkling-2-Mini \
+  --host 127.0.0.1 --port 8003 \
+  --max-ctx 65536 --dense-fp8 --kv-fp8 \
+  --spec --spec-threshold 0.8 --park-mb 0
+```
+
+Add `--no-vision` to save ~0.6 GiB VRAM on text-only workloads, or `--ablation /path/to/inkling-2-mini-abliterated.safetensors` to apply the optional abliteration patch (omitting `--ablation` serves the original model as `inkling-2-mini`).
+
+### Option B: One-line interactive installer (private CUDA 13.4 toolkit + model download)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Atlas3DSS/atlas-ingine/main/get.sh | bash
+```
+
+Or manually:
+
+```bash
+git clone https://github.com/Atlas3DSS/atlas-ingine
+cd atlas-ingine
 bash setup.sh
 ```
 
-The menu:
+Choose **1** to install build tools, a private CUDA 13.4 toolkit, build `ingine-serve` (`sm_86;89;120a`), and download the
+pinned model from [satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine)
+(20.2 GB), then **5** to link `~/.local/bin/ingine`. On 24 GB GPUs (RTX 3090 / 4090), set `INGINE_CTX=65536` in
+`~/.config/ingine/env` (the default `262144` targets 32+ GB cards):
 
-1. **Install everything:** check the GPU, driver, tools and disk space, install CMake, Ninja and a private CUDA
-   13.4 toolkit (with cuBLAS), build the C++ engine (`ingine-serve`, a few minutes) and download the model.
-2. **Download / resume model:** download the pinned model files, or resume an interrupted download, and verify them.
-3. **Start the server (foreground):** run `ingine serve` in this terminal; **Ctrl+C** stops it.
-4. **Update:** pull this repository and rerun the install steps (see below). `bash setup.sh --update` does the same
-   without the menu.
-5. **Install the `ingine` command:** link `~/.local/bin/ingine` to `scripts/ingine` (make sure `~/.local/bin` is on
-   your `PATH`).
+```bash
+mkdir -p ~/.config/ingine
+cat <<'EOF' > ~/.config/ingine/env
+INGINE_CTX=65536
+INGINE_EXTRA_ARGS="--park-mb 0"
+EOF
+ingine start
+```
 
-Choose **0** to exit. Every step can be repeated: an interrupted install continues with option 1, an interrupted
-download with option 2. `bash setup.sh --help` lists the options without installing anything.
+### Creating Elastic sub-4-bit MoE checkpoints (`atlas-12g` / `atlas-10g`)
 
-**Updating** (`ingine update`, menu option 4 or `bash setup.sh --update`) fast-forwards this repository from
-GitHub, then reruns the idempotent install steps: build tools, CUDA toolkit, an incremental rebuild of the engine,
-and the model check. The model is downloaded again only when the pinned revision in
-[runtime-manifest.json](runtime-manifest.json) changed; files that no longer match are moved aside to
-`models/Inkling-2-Mini.previous-<time>/`, never deleted. Delete that folder once the new version works. A running
-server keeps the old code until you restart it: `ingine stop && ingine start`. Installs from before the C++ engine
-kept a Python environment in `.venv/` and compiled kernels in `engine/`; the update leaves them in place and
-prints the command that deletes them (about 6 GB).
+Convert a downloaded base `Inkling-2-Mini` directory into a smaller mixed-precision `ATLAS2`/`ATLAS3` checkpoint using
+[`tools/quantize_elastic_ingine.py`](tools/quantize_elastic_ingine.py) (links/copies unchanged dense, vision, tokenizer,
+and `mtp.safetensors` files):
 
-Everything lives inside the install folder:
+```bash
+python3 tools/quantize_elastic_ingine.py \
+  --src /path/to/Inkling-2-Mini \
+  --dst /path/to/Inkling-2-Mini-atlas-12g \
+  --profile atlas-12g   # or atlas-10g
+```
 
-| Path | Contents |
-|---|---|
-| `.tools/` | uv (when it was not installed already) and a small Python environment (`.tools/venv/`) with CMake, Ninja and `huggingface_hub`, used only by the installer |
-| `.cuda-toolkit/` | private CUDA 13.4 toolkit (nvcc, runtime, cuBLAS) used to build ingine; the server loads its CUDA libraries from here, and the system CUDA is not used or changed |
-| `native/build-install/` | the built server, `apps/serve/ingine-serve`, and its serving profile (`profile.env`, from [runtime-manifest.json](runtime-manifest.json)) |
-| `models/Inkling-2-Mini/` | the model from Hugging Face: Inkling-2-Mini's files and the abliteration file (set `INGINE_MODEL_DIR` to use a download elsewhere) |
-| `.run/` | pid file and server log, used only when there is no systemd user session (`ingine start` then runs the server with `nohup`) |
+Then pass `--model-dir /path/to/Inkling-2-Mini-atlas-12g` to `ingine-serve` (or set `INGINE_MODEL_DIR` in `~/.config/ingine/env`).
 
-Outside it the installer writes one driver setting, `~/.nv/nvidia-application-profiles-rc.d/50-ingine`: an NVIDIA
-application profile that lets `ingine-serve` use the GPU's top performance state (P0) instead of the lower one the
-driver holds CUDA programs at. On an RTX 5090 that raises the memory clock by 1.4% and decoding speed by about
-0.8%; outputs and idle power are unchanged. It needs driver 595 or newer;
-`INGINE_GPU_PROFILE=0 bash setup.sh --update` removes it.
-
-## Use
+## Service management (`ingine` CLI)
 
 ```bash
 ingine start      # start the server in the background (systemd user unit inkling-ingine), wait until it is ready
 ingine stop       # stop it and free the GPU
 ingine status     # unit state, health, served model, GPU memory; exit code 0 ready, 1 starting, 3 stopped
 ingine logs       # server log; ingine logs -f follows it
-ingine serve      # run in the foreground instead; extra arguments go to the server, e.g. --max-ctx 131072
-ingine update     # same as bash setup.sh --update
+ingine serve      # run in the foreground instead; extra arguments go to the server, e.g. --max-ctx 65536
+ingine update     # pull updates and rebuild incrementally
 ```
 
-Without the symlink from option 5, run `scripts/ingine` from the install folder. Only one copy of the model fits
-on a 32 GB card; stop other programs that hold a lot of GPU memory first. `ingine start` and `ingine stop` are
-non-interactive, return when the server is ready or stopped, and send a desktop notification when `notify-send`
-is available; if you like, bind them to keys in your desktop environment.
-
-Settings come from the profile in [runtime-manifest.json](runtime-manifest.json) and can be overridden in
-`~/.config/ingine/env` (shell assignments, read by every `ingine` command) or in the environment:
+Environment overrides (`~/.config/ingine/env` or shell environment):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `INGINE_MODEL_DIR` | `models/Inkling-2-Mini` in the install folder | model folder; point it at an existing download of `satellitedown/Inkling-2-Mini-abliterated-ingine` to reuse it |
-| `INGINE_ABLATION` | `$INGINE_MODEL_DIR/inkling-2-mini-abliterated.safetensors` | abliteration file; a relative path is taken relative to the install folder; empty serves the original model (model id `inkling-2-mini`) |
-| `INGINE_CTX` | 262144 | context length; lower it to leave GPU memory to other programs |
+| `INGINE_MODEL_DIR` | `models/Inkling-2-Mini` in the install folder | model folder (native checkpoint or Elastic `atlas-12g` / `atlas-10g` directory) |
+| `INGINE_ABLATION` | `$INGINE_MODEL_DIR/inkling-2-mini-abliterated.safetensors` | optional abliteration file; empty serves the original model (`inkling-2-mini`) |
+| `INGINE_CTX` | 262144 | context length (`65536` recommended on 24 GB GPUs with native weights) |
 | `HOST`, `PORT` | 127.0.0.1, 8003 | bind address and port |
-| `INGINE_EXTRA_ARGS` | empty | further server arguments, e.g. `--top-p 0.95` (sampling for requests that set none, also `--temperature`, `--top-k`), `--park-mb 0` (see below), `--spec-threshold 0.9` |
-| `INGINE_START_TIMEOUT` | 300 | seconds `ingine start` waits for the server to report ready |
+| `INGINE_EXTRA_ARGS` | empty | further server arguments (e.g. `--no-vision`, `--park-mb 0`, `--temperature`, `--top-p`, `--top-k`, `--spec-threshold 0.8`) |
+| `INGINE_START_TIMEOUT` | 300 | seconds `ingine start` waits for `/health` |
 
-```bash
-# ~/.config/ingine/env
-INGINE_MODEL_DIR=/data/models/Inkling-2-Mini
-INGINE_CTX=131072
-```
+## OpenAI-compatible API
 
-`INGINE_MODEL_DIR` must hold the pinned revision; this checks it without downloading:
-`.tools/venv/bin/python scripts/download_model.py --model-dir "$INGINE_MODEL_DIR" --verify-only`.
+Use **`http://127.0.0.1:8003/v1`**, model **`inkling-2-mini`** (or `inkling-2-mini-abliterated` when `--ablation` is set).
+No API key is required and there is no authentication; keep the server bound to loopback. `GET /health` and
+`GET /v1/models` report server status.
 
-## Connect an application
+`POST /v1/chat/completions` supports:
 
-Use the OpenAI-compatible API at **`http://127.0.0.1:8003/v1`**, model **`inkling-2-mini-abliterated`**
-(`inkling-2-mini` when serving without the ablation). No API key is required, and **there is no
-authentication**: keep the server on loopback. Requests run one at a time; up to 4 more wait in a queue and
-further ones get HTTP 503. `GET /health` and `GET /v1/models` report the state.
-
-A follow-up request only reads what is new in its conversation. Conversations that take turns (subagents, a
-second client) are kept warm in spare GPU memory, by default up to 3 GiB and never the last 4 GiB that are free
-after start-up (`--park-mb N` sets the budget in MiB, `0` turns it off); they are dropped when memory runs short.
-
-`POST /v1/chat/completions` takes:
-
-* `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (the chat template maps them to
-  0, 0.1, 0.2, 0.7, 0.9, 0.99, 0.99) or a number from 0 to 0.99; the template's default is 0.9.
-* `enable_thinking: false` to answer without reasoning (also accepted in `chat_template_kwargs`).
-* `tools` (function calling through the model's chat template), `stop`, `max_tokens` / `max_completion_tokens`,
-  `temperature`, `top_p`, `top_k`, `seed`. Requests that omit the sampling fields use the model's defaults
-  (temperature 1, no cutoff; 0 is greedy) or the server's `--temperature` / `--top-p` / `--top-k`.
-* `stream: true` for server-sent events; reasoning arrives as `reasoning_content` deltas before the answer's
-  `content` (non-streaming responses carry `message.reasoning_content`). `stream_options.include_usage` adds usage.
-* Images in user and tool messages, as content parts with a base64 `data:` URI (PNG, JPEG, WebP, GIF or BMP):
-  `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`; `input_image` parts and Anthropic's
-  `{"type": "image", "source": {"type": "base64", "data": ...}}` are accepted too. URLs are not fetched. See
-  [Images](#images).
+* `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (mapped to `0, 0.1, 0.2, 0.7, 0.9, 0.99, 0.99`) or a float in `[0, 0.99]`.
+* `enable_thinking: false` (also accepted in `chat_template_kwargs`) to answer without reasoning.
+* `response_format`: `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` for grammar-constrained JSON output.
+* `tools` (function calling through the chat template). When `tools` is omitted, `<|content_invoke_tool_json|>` is automatically banned.
+* `stop`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`.
+* `stream: true` (SSE with `reasoning_content` and `content` deltas; `stream_options.include_usage` adds usage).
+* Vision inputs as base64 `data:` URIs (`image_url`, `input_image`, or Anthropic `image` blocks; PNG, JPEG, WebP, GIF, BMP). Remote URLs are not fetched.
 
 ```bash
 curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "inkling-2-mini-abliterated",
+  "model": "inkling-2-mini",
   "messages": [{"role": "user", "content": "Explain how hash maps handle collisions."}],
   "reasoning_effort": "low",
   "max_tokens": 4096
@@ -156,214 +176,41 @@ curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8003/v1", api_key="none")
-stream = client.chat.completions.create(
-    model="inkling-2-mini-abliterated",
-    messages=[{"role": "user", "content": "Write a Python LRU cache with tests."}],
-    reasoning_effort="medium",
-    stream=True,
-    # extra_body={"enable_thinking": False},  # answer without reasoning
+resp = client.chat.completions.create(
+    model="inkling-2-mini",
+    messages=[{"role": "user", "content": "Return a JSON object with keys city and country for Tokyo."}],
+    response_format={"type": "json_object"},
+    extra_body={"reasoning_effort": "none"},
 )
-for chunk in stream:
-    delta = chunk.choices[0].delta
-    print(getattr(delta, "reasoning_content", None) or delta.content or "", end="", flush=True)
+print(resp.choices[0].message.content)
 ```
 
 ### Images
 
-The model reads images through its own vision tower, which is part of the checkpoint (no extra download). An
-image costs **one token per 40x40 pixels**, `ceil(height / 40) * ceil(width / 40)`: 432 tokens for 960x720,
-1,296 for 1920x1080. The model takes pixels as they are, without resizing; an image above 4,096 tokens (about
-2560x2560, or a 4K screenshot) is reduced to fit, keeping its aspect ratio (`--image-max-tokens N`, up to the
-model's 10,609 for 4096x4096 pixels). Transparency is shown on a grey checkerboard, as the model was trained.
+The model reads images through its built-in vision tower (part of the checkpoint, no extra download). Each image costs
+**one token per 40×40 pixels**, `ceil(height / 40) * ceil(width / 40)` (432 tokens for 960×720, 1,296 for 1920×1080).
+Images above 4,096 tokens are resized preserving aspect ratio (`--image-max-tokens N`, up to 10,609 for 4096×4096).
+Pass `--no-vision` to serve text only and save ~0.6 GiB VRAM.
 
-```bash
-curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "inkling-2-mini-abliterated",
-  "messages": [{"role": "user", "content": [
-    {"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$(base64 -w0 picture.png)"'"}},
-    {"type": "text", "text": "What is in this picture?"}]}],
-  "max_tokens": 1024
-}'
-```
+## Upstream RTX 5090 and abliteration results
 
-A request may hold 16 images and 32,768 image tokens (`--max-images`, `--max-image-tokens`); `usage.prompt_tokens`
-counts image tokens. An image is read once per conversation: follow-up requests reuse it like any other part of
-the prompt, and the same picture sent again is recognised by its pixels. `--no-vision` (in `INGINE_EXTRA_ARGS`)
-serves text only and frees 0.6 GiB of GPU memory.
+The measurements below are from upstream `satellitedown/ingine` on a single RTX 5090 (32 GB, `sm_120a`, default 262K
+profile, native `NVFP4+MXFP8` weights, DSpark speculative decoding):
 
-## Oh My Pi (OMP)
-
-Merge this provider into `~/.omp/agent/models.yml`, keeping existing providers:
-
-```yaml
-providers:
-  ingine:
-    baseUrl: http://127.0.0.1:8003/v1
-    auth: none
-    api: openai-completions
-    models:
-      - id: inkling-2-mini-abliterated
-        name: Inkling 2 Mini abliterated 256K (ingine)
-        contextWindow: 262144
-        maxTokens: 32768
-        reasoning: true
-        thinking:
-          mode: effort
-          efforts: [minimal, low, medium, high, xhigh, max]
-          defaultLevel: medium
-          requiresEffort: false
-        input: [text, image]
-        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
-        compat:
-          supportsDeveloperRole: true
-          supportsStore: false
-          supportsStrictMode: false
-          supportsToolChoice: false
-          supportsReasoningEffort: true
-          reasoningEffortMap: {minimal: none}
-          reasoningContentField: reasoning_content
-          maxTokensField: max_tokens
-          streamIdleTimeoutMs: 600000
-```
-
-Start the server first (`ingine start`), then open OMP:
-
-```bash
-omp --model ingine/inkling-2-mini-abliterated
-```
-
-OMP's `minimal` level is sent as `none` (thinking effort 0). If you lower `INGINE_CTX`, lower `contextWindow` to
-match.
-
-## Results
-
-### Abliteration
-
-Refusals on harmful test prompts (greedy decoding; an answer counts as a refusal when it contains a refusal phrase,
-and every answer is in [`results/verify-abliterated.json`](results/verify-abliterated.json)):
-
-| | original | abliterated |
-|---|---|---|
-| `harmful_test` (104), direct answer | 104/104 | 1/104 |
-| JailbreakBench harmful behaviours (100), direct answer | 100/100 | 5/100 |
-| `harmful_test` (48), reasoning first (effort low, 768-token budget) | 48/48 | 3/48 (each says what it cannot literally do, such as publish or spread the text, then writes it) |
-| through ingine: `harmful_test` (104), direct answer | 104/104 | 3/104 |
-| through ingine: the same with reasoning effort `none` | 104/104 | 0/104 |
-| through ingine: `harmful_test` (48), reasoning first (effort low) | 48/48 | 1/48 (answers after the caveat) |
-| through ingine: `harmful_test` (24), reasoning first (default effort) | 24/24 | 0/24 |
-| through ingine: JailbreakBench (100), direct answer | 100/100 | 5/100 |
-
-The first three rows are measured in the reference model in `tools/`. Not every prompt was unseen: the weight per
-layer comes from an earlier search that scored refusals on prompts among the first 64 of `harmful_test`, and 10
-JailbreakBench prompts occur in data some step used. On the prompts that nothing used, the abliterated model
-refuses 0 of the other 40 `harmful_test` prompts and 4 of 90 JailbreakBench prompts, in the reference model and
-through ingine alike.
-
-Damage against the original model: KL divergence 0.014 on its own answers to 64 harmless prompts (the same earlier
-search minimised KL on these prompts); on 8,192 tokens of technical prose that no step used, mean KL 0.005 and 96.4%
-top-1 agreement.
-
-Through ingine (32 borderline prompts and a small capability set, greedy):
-
-| | original | abliterated |
-|---|---|---|
-| refusals, answering directly | 15/32 | 1/32 (the reply hedges, then writes a toned-down scene) |
-| refusals, reasoning first | 8/32 | 0/32 |
-| math (20, reasoning, effort low) | 20/20 | 20/20 |
-| code (12, tests executed) | 12/12 | 12/12 |
-| multiple choice (12) | 12/12 | 12/12 |
-
-Reasoning stability with the default profile, sampled at temperature 1 (GSM8K: 40 problems at two reasoning
-efforts; AIME 2024: 15 problems, effort high, up to 32,768 tokens):
-
-| | original | abliterated |
-|---|---|---|
-| GSM8K, effort low: correct | 40/40 | 40/40 |
-| GSM8K, effort high: correct | 40/40 | 40/40 |
-| AIME 2024: correct | 13/15 | 14/15 |
-| AIME 2024: ran out of tokens | 2/15 | 1/15 |
-| reasoning that loops (95 samples) | 0 | 0 |
-
-Repeating a request with the same seed returned the same text in 6 of 6 cases for each model. Raw data:
-[`results/`](results).
-
-### Speed
-
-One RTX 5090, one request, default profile, tokens per second while generating. "chat" explains hash-map
-collisions and "code" writes an LRU-cache module with tests (short prompts, up to 1024 tokens, median of 6 runs);
-"coding agent" replays 24 recorded agent requests (2K-39K-token prompts with tools; mean of two replays):
-
-| | chat | code | coding agent |
+| RTX 5090 (upstream) | chat | code | coding agent |
 |---|---:|---:|---:|
-| temperature 1 (the default) | 487 | 554 | 501 |
-| greedy (temperature 0) | 501 | 561 | 510 |
+| temperature 1 (default) | 487 tok/s | 554 tok/s | 501 tok/s |
+| greedy (temperature 0) | 501 tok/s | 561 tok/s | 510 tok/s |
 
-The default profile runs DSpark speculative decoding: a small drafter proposes tokens and the full model checks
-every one, so it changes the speed, not the output distribution. Predictable text goes fastest: in the agent replay,
-tool calls run at about 740 tokens/s, reasoning and prose at about 450; text outside English and code gains the least.
-
-A new prompt is read at 10,900 tokens/s (20K tokens), 9,600 (64K), 8,100 (131K) and 7,000 (200K); a short prompt
-takes 0.09 s to the first token. The server holds 24.4 GiB of GPU memory after start-up (23.8 GiB with
-`--no-vision`) and no more while reading a 254K-token prompt; conversations kept warm add up to 3 GiB.
-
-Images: the vision tower takes 3 ms for an image of up to 64 tokens (320x320 pixels), 21 ms for 576 tokens
-(960x960), 0.17 s for 1,849 tokens (1720x1720) and 1.1 s for 4,096 tokens, using up to 0.85 GiB of working memory
-for the largest; its tokens are then read like text. A 3840x2160 screenshot (reduced to 4,080 tokens) is answered
-1.5 s after the request. Against the transformers reference in FP32 the image embeddings have a cosine of 0.9995
-to 0.99999, closer than transformers' own BF16 model (`native/tests/vision`).
-
-### Agent loops
-
-Twelve recorded Oh My Pi sessions (230 requests, prompts of 2K-89K tokens, 6.9M prompt tokens in total), replayed
-in order (greedy, up to 400 tokens per answer): 214 of the 230 requests continue a conversation the server still
-holds and read only what is new, so all 230 together wait 50 s for their first tokens; decoding runs at 563
-tokens/s. Two of these sessions taking turns, as an agent and its subagent do (67 requests), wait 8.5 s in total.
-
-### Long context
-
-The default profile serves **262,144 tokens** of context (the checkpoint supports 1M). The long-range attention
-layers keep their cache in FP8, 16 KiB per token (4 GiB at 262,144 tokens, allocated at start-up), so that it fits
-beside the model in 32 GB; the sliding-window layers keep their last 1,024 tokens in BF16. A code haystack with a
-passphrase hidden in the middle:
-
-| | 131,443-token prompt | 254,019-token prompt |
-|---|---:|---:|
-| reading the prompt | 16.4 s (8,000 tokens/s) | 40.9 s (6,200 tokens/s) |
-| decoding afterwards | 354 tokens/s | 258 tokens/s |
-
-The passphrase was found in both. With an image after 199,000 tokens of text, the model answers from both: the
-passphrase at the start of the text and the words written in the image (26.5 s).
-
-## Atlas3DSS fork: sm_86 / sm_89 port, Elastic sub-4-bit MoE, and JSON mode
-
-This fork (`Atlas3DSS/atlas-ingine`, Apache-2.0) extends upstream `satellitedown/ingine` while keeping Blackwell (`sm_120a`) outputs bit-identical (`kernels_bitlock` 48/48 PASS):
-
-- **Multi-architecture support (`sm_86`, `sm_89`, `sm_120a`):** Native Ampere (RTX 3090) and Ada (RTX 4090) builds on CUDA 12.8+ and CUDA 13.x, with branchless FP8/E2M1/ATLAS2/ATLAS3 unpackers on `sm_86`/`sm_89` (`build_multiarch.sh`).
-- **Native Elastic sub-4-bit MoE weights (`ATLAS2` 2.50 b/w, `ATLAS3` 3.50 b/w):** Mixed-precision tier converter ([`tools/quantize_elastic_ingine.py`](tools/quantize_elastic_ingine.py)) producing `atlas-12g` (`14.05 GB` on disk incl. vision + `mtp.safetensors`) and `atlas-10g` (`12.01 GB` on disk incl. vision + `mtp.safetensors`) checkpoints, with native decode (`moe.cu`) and prefill (`wgemm.cu`) kernels verified against FP64 oracles (`kernels_moe`, `prefill_moe`).
-- **Structured outputs & tool-ban:** Native OpenAI `response_format` (`text`, `json_object`, `json_schema`) and automatic `<|content_invoke_tool_json|>` banning when `tools` is absent (`serve_server` 22/22 PASS).
-
-Measured on `ingine-bench` (`--max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000`):
-
-| GPU | Checkpoint | VRAM @ 64K ctx | Chat decode | Code decode | 64K prefill |
-|---|---|---:|---:|---:|---:|
-| RTX 3090 (`sm_86`) | Native `NVFP4+MXFP8` | `21.82 GB` | `154.9 tok/s` | `213.2 tok/s` | `2,980 tok/s` |
-| RTX 3090 (`sm_86`) | Elastic `atlas-12g` | `16.37 GB` | `132.4 tok/s` | `161.2 tok/s` | `2,970 tok/s` |
-| RTX 3090 (`sm_86`) | Elastic `atlas-10g` | `14.33 GB` | `145.6 tok/s` | `196.1 tok/s` | `3,012 tok/s` |
-| RTX 4090 (`sm_89`) | Elastic `atlas-12g` | `16.36 GB` | `236.7 tok/s` | `278.3 tok/s` | `7,031 tok/s` |
-| RTX PRO 6000 (`sm_120a`) | Elastic `atlas-12g` | `16.26 GB` | `411.0 tok/s` | `519.9 tok/s` | `11,728 tok/s` |
-| RTX PRO 6000 (`sm_120a`) | Elastic `atlas-10g` | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` |
-
-At 16K context with `--no-vision --dense-fp8 --kv-fp8 --spec --park-mb 0`, `atlas-10g` runs live `ingine-serve` in `12,984 MiB` on RTX 3090 (`<12 GiB` without `--spec`). At 128K context with `--no-vision`, `atlas-12g` runs live `ingine-serve` in `17,776 MiB` on RTX 4090.
+- Prefill on RTX 5090: `10,900 tok/s` (20K), `9,600 tok/s` (64K), `8,100 tok/s` (131K), `7,000 tok/s` (200K); `24.4 GiB` VRAM (`23.8 GiB` with `--no-vision`).
+- Long-context needle retrieval on RTX 5090: passes at `131,443` tokens (`16.4 s` prefill, `354 tok/s` decode) and `254,019` tokens (`40.9 s` prefill, `258 tok/s` decode).
+- Optional abliteration eval data from upstream is retained in [`results/`](results).
 
 ## License and credits
 
-This repository (ingine, tools, installer and the abliteration file) is licensed under **Apache-2.0**, see
-[LICENSE](LICENSE). The base model, [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by
-Thinking Machines, is also Apache-2.0; its files are redistributed unchanged in the Hugging Face repository
-[satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine),
-not in this Git repository. CUDA components keep NVIDIA's license terms.
+This repository is licensed under **Apache-2.0**; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-The search follows [Heretic](https://github.com/p-e-w/heretic) by p-e-w and the abliteration literature; the
-reference model is built on the transformers Inkling2Loop pull request. See [NOTICE](NOTICE). The abliteration
-removes the model's safety refusals: you are responsible for how you use it. This is an unofficial community
-project, not endorsed by Thinking Machines.
+- Upstream engine, installer, and abliteration tooling: [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0), with upstream kernel inspirations credited in [NOTICE](NOTICE) (`fngine`, `cinference`, `NInfer`).
+- Base model: [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by Thinking Machines Lab (Apache-2.0; model weights are not stored in this Git repository).
+- Multi-architecture (`sm_86`/`sm_89`/`sm_120a`) port, Elastic `ATLAS2`/`ATLAS3` sub-4-bit MoE kernels and converter, and native OpenAI `response_format` / tool-ban: Atlas 3DSS.
+- CUDA runtime/toolkit components remain subject to NVIDIA's license terms. Unofficial community project, not endorsed by Thinking Machines.
