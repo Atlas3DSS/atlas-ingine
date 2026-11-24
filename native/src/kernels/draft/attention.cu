@@ -138,9 +138,25 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
   __syncthreads();
   const bool head = w < QH;       // warp-uniform
   const int hw = head ? w : 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+  const int v_qp = (lane >> 2) & 3;
+  const int v_idx = (lane & 3) | ((lane & 16) >> 2);
+  const int v_row_a = (v_qp >= 2 ? 8 : 0) + v_idx;
+  const int v_kh = (v_qp & 1) * 4;
+  uint32_t qb_v[HEAD_DIM / 16][4];
+#pragma unroll
+  for (int s = 0; s < HEAD_DIM / 16; ++s) {
+    const uint2 q0 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&qs[hw][v_idx][16 * s + v_kh])));
+    const uint2 q1 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&qs[hw][v_idx][16 * s + 8 + v_kh])));
+    qb_v[s][0] = q0.x, qb_v[s][1] = q0.y, qb_v[s][2] = q1.x, qb_v[s][3] = q1.y;
+  }
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+  // Pascal sm_60/sm_61: reads qs directly from SMEM via uint4 in tile() with exact FP32 fmaf (0 shuffles).
+#else
   uint32_t qb[HEAD_DIM / 16][2];  // this head's queries as B fragments (16 dims x 8 queries), per 16 dims
 #pragma unroll
   for (int s = 0; s < HEAD_DIM / 16; ++s) ldmatrix_x2(qb[s], &qs[hw][lr][16 * s + 8 * (lm & 1)]);
+#endif
 
   float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.f, 0.f};  // queries 2 t, 2 t + 1
   float oacc[HEAD_DIM / 16][4];  // value sums: dims 16 d + gl (0, 1) and 16 d + 8 + gl (2, 3) of queries 2 t, 2 t + 1
@@ -192,12 +208,47 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
 
     // scores: keys gl (0, 1) and gl + 8 (2, 3) against queries 2 t, 2 t + 1
     float sc[4] = {0.f, 0.f, 0.f, 0.f};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+    float sc8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int s = 0; s < HEAD_DIM / 16; ++s) {
+      const uint2 k0 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&kt[buf][v_row_a][16 * s + v_kh])));
+      const uint2 k1 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&kt[buf][v_row_a][16 * s + 8 + v_kh])));
+      mma::sm70_mma_f16_direct(sc8, k0.x, k0.y, k1.x, k1.y, qb_v[s][0], qb_v[s][1], qb_v[s][2], qb_v[s][3]);
+    }
+    mma::sm70_reduce_acc8_to_d4(sc8, sc);
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+#pragma unroll
+    for (int s = 0; s < HEAD_DIM / 16; ++s) {
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        const uint4 ka = *reinterpret_cast<const uint4*>(&kt[buf][gl][16 * s + 8 * c]);
+        const uint4 kb = *reinterpret_cast<const uint4*>(&kt[buf][gl + 8][16 * s + 8 * c]);
+        const uint4 qa = *reinterpret_cast<const uint4*>(&qs[hw][2 * t][16 * s + 8 * c]);
+        const uint4 qb4 = *reinterpret_cast<const uint4*>(&qs[hw][2 * t + 1][16 * s + 8 * c]);
+        const uint32_t kaw[4] = {ka.x, ka.y, ka.z, ka.w}, kbw[4] = {kb.x, kb.y, kb.z, kb.w};
+        const uint32_t qaw[4] = {qa.x, qa.y, qa.z, qa.w}, qbw[4] = {qb4.x, qb4.y, qb4.z, qb4.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const float2 fka = act::unpack2(kaw[i]);
+          const float2 fkb = act::unpack2(kbw[i]);
+          const float2 fqa = act::unpack2(qaw[i]);
+          const float2 fqb = act::unpack2(qbw[i]);
+          sc[0] = fmaf(fka.y, fqa.y, fmaf(fka.x, fqa.x, sc[0]));
+          sc[1] = fmaf(fka.y, fqb.y, fmaf(fka.x, fqb.x, sc[1]));
+          sc[2] = fmaf(fkb.y, fqa.y, fmaf(fkb.x, fqa.x, sc[2]));
+          sc[3] = fmaf(fkb.y, fqb.y, fmaf(fkb.x, fqb.x, sc[3]));
+        }
+      }
+    }
+#else
 #pragma unroll
     for (int s = 0; s < HEAD_DIM / 16; ++s) {
       uint32_t a[4];
       ldmatrix_x4(a, &kt[buf][8 * (lm & 1) + lr][16 * s + 8 * (lm >> 1)]);
       mma_bf16(sc, a, qb[s]);
     }
+#endif
     const unsigned mask = vmask[buf];
     const bool valid[2] = {((mask >> gl) & 1u) != 0, ((mask >> (gl + 8)) & 1u) != 0};
     float al[2];
@@ -231,10 +282,70 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk) pt[w][2 * t + e][gl + 8 * kk] = pb16[e][kk];
     __syncwarp();
-    uint32_t pf[2];
-    ldmatrix_x2(pf, &pt[w][lr][8 * (lm & 1)]);
     // O^T = O^T alpha + V^T P^T: the tile's 16 keys are the k of the mma
     const bool rescale = __any_sync(0xffffffffu, al[0] != 1.f || al[1] != 1.f);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+    const uint2 p0 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&pt[w][v_idx][v_kh])));
+    const uint2 p1 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&pt[w][v_idx][8 + v_kh])));
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM / 16; ++d) {
+      if (rescale) {
+        oacc[d][0] *= al[0];
+        oacc[d][1] *= al[1];
+        oacc[d][2] *= al[0];
+        oacc[d][3] *= al[1];
+      }
+      const int dc = 16 * d + v_row_a;
+      const unsigned v0 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 0][dc])));
+      const unsigned v1 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 1][dc])));
+      const unsigned v2 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 2][dc])));
+      const unsigned v3 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 3][dc])));
+      const unsigned v8 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 8][dc])));
+      const unsigned v9 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 9][dc])));
+      const unsigned v10 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 10][dc])));
+      const unsigned v11 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 11][dc])));
+      float ov[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      mma::sm70_mma_f16_direct(ov, v0 | (v1 << 16), v2 | (v3 << 16), v8 | (v9 << 16), v10 | (v11 << 16),
+                               p0.x, p0.y, p1.x, p1.y);
+      mma::sm70_reduce_acc8_to_d4(ov, oacc[d]);
+    }
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+    const uint4 pq0a = *reinterpret_cast<const uint4*>(&pt[w][2 * t][0]);
+    const uint4 pq0b = *reinterpret_cast<const uint4*>(&pt[w][2 * t][8]);
+    const uint4 pq1a = *reinterpret_cast<const uint4*>(&pt[w][2 * t + 1][0]);
+    const uint4 pq1b = *reinterpret_cast<const uint4*>(&pt[w][2 * t + 1][8]);
+    const uint32_t pw0[8] = {pq0a.x, pq0a.y, pq0a.z, pq0a.w, pq0b.x, pq0b.y, pq0b.z, pq0b.w};
+    const uint32_t pw1[8] = {pq1a.x, pq1a.y, pq1a.z, pq1a.w, pq1b.x, pq1b.y, pq1b.z, pq1b.w};
+    float2 fp0[8], fp1[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      fp0[k] = act::unpack2(pw0[k]);
+      fp1[k] = act::unpack2(pw1[k]);
+    }
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM / 16; ++d) {
+      if (rescale) {
+        oacc[d][0] *= al[0];
+        oacc[d][1] *= al[1];
+        oacc[d][2] *= al[0];
+        oacc[d][3] *= al[1];
+      }
+      const int da = 16 * d + gl, db = da + 8;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const float va0 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k][da]))));
+        const float va1 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k + 1][da]))));
+        const float vb0 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k][db]))));
+        const float vb1 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k + 1][db]))));
+        oacc[d][0] = fmaf(va1, fp0[k].y, fmaf(va0, fp0[k].x, oacc[d][0]));
+        oacc[d][1] = fmaf(va1, fp1[k].y, fmaf(va0, fp1[k].x, oacc[d][1]));
+        oacc[d][2] = fmaf(vb1, fp0[k].y, fmaf(vb0, fp0[k].x, oacc[d][2]));
+        oacc[d][3] = fmaf(vb1, fp1[k].y, fmaf(vb0, fp1[k].x, oacc[d][3]));
+      }
+    }
+#else
+    uint32_t pf[2];
+    ldmatrix_x2(pf, &pt[w][lr][8 * (lm & 1)]);
 #pragma unroll
     for (int d = 0; d < HEAD_DIM / 16; ++d) {
       if (rescale) {
@@ -247,6 +358,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
       ldmatrix_x4_trans(a, &vt[buf][8 * (lm >> 1) + lr][16 * d + 8 * (lm & 1)]);
       mma_bf16(oacc[d], a, pf);
     }
+#endif
   };
   for (int t0 = k0; t0 < kend; t0 += 2 * ATT_TILE) {
     tile(ra, t0, 0);

@@ -170,8 +170,13 @@ def main() -> None:
     ap.add_argument("--tier-a", default="", help="Override Tier A (L0-5,18-19) format: atlas2|atlas3|nvfp4|mxfp8")
     ap.add_argument("--tier-b", default="", help="Override Tier B (L6-17 looped) format")
     ap.add_argument("--tier-c", default="", help="Override Tier C (L20-23 tail) format")
+    ap.add_argument("--no-vision", action="store_true", help="Omit vision encoder tensors (model.visual.*, saves ~0.64 GB on disk; run with --no-vision)")
+    ap.add_argument("--no-mtp", action="store_true", help="Omit DSpark MTP speculative drafter (mtp.safetensors, saves ~0.64 GB on disk)")
+    ap.add_argument("--text-only", action="store_true", help="Shorthand for --no-vision --no-mtp (minimal text-only checkpoint, saves ~1.27 GB on disk)")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
+    omit_vision = bool(args.no_vision or args.text_only)
+    omit_mtp = bool(args.no_mtp or args.text_only)
 
     src = Path(args.src).resolve()
     dst = Path(args.dst).resolve()
@@ -201,6 +206,8 @@ def main() -> None:
     # Copy metadata and auxiliary safetensors (e.g. mtp.safetensors for DSpark --spec), skipping weight shards.
     for fn in os.listdir(src):
         if (fn.startswith("model") and fn.endswith(".safetensors")) or fn in ("model.safetensors.index.json", "hf_quant_config.json"):
+            continue
+        if omit_mtp and fn == "mtp.safetensors":
             continue
         sp, dp = src / fn, dst / fn
         if dp.exists() or dp.is_symlink():
@@ -246,6 +253,8 @@ def main() -> None:
         data = load_file(str(src / sf), device="cpu")
         for k, v in data.items():
             if ".mlp.experts." not in k:
+                if omit_vision and k.startswith("model.visual."):
+                    continue
                 non_expert[k] = v
     ne_name = "model-00001-of-00025.safetensors"
     save_file(non_expert, str(dst / ne_name))
@@ -307,7 +316,7 @@ def main() -> None:
         p = f"model.llm.layers.{l}.mlp.experts."
         by_fmt.setdefault(target_fmts[l], []).extend([p + "w13_weight", p + "w2_weight"])
     for g in qcfg["model"]["parameter_groups"]:
-        kept = [t for t in g["tensors"] if ".mlp.experts." not in t]
+        kept = [t for t in g["tensors"] if ".mlp.experts." not in t and not (omit_vision and t.startswith("model.visual."))]
         if kept:
             g2 = dict(g)
             g2["tensors"] = kept
@@ -321,6 +330,8 @@ def main() -> None:
         "tier_b": tb,
         "tier_c": tc,
         "layer_formats": target_fmts,
+        "no_vision": omit_vision,
+        "no_mtp": omit_mtp,
         "source": str(src),
     }
     (dst / "hf_quant_config.json").write_text(json.dumps(qcfg, indent=2) + "\n")
