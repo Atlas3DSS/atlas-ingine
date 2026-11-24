@@ -137,8 +137,10 @@ std::string default_model_dir() {
 
 int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
+  std::string offload_mode = "auto", expert_ranking, dump_router_stats;
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
-  bool dense_fp8 = false, kv_fp8 = false, spec = false;
+  int prefill_chunk = 3072, offload_vram_mb = 0, offload_ram_mb = 12288;
+  bool dense_fp8 = false, kv_fp8 = false, spec = false, atlas_6g = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -147,12 +149,22 @@ int main(int argc, char** argv) {
   ap.option("--backend", "{fast}", "", &backend, {"fast"});
   ap.option("--ablation", "", "", &ablation);
   ap.option("--max-ctx", "", "", &max_ctx);
+  ap.option("--prefill-chunk", "", "tokens per prefill chunk (default 3072, 512 in offload mode)", &prefill_chunk);
   ap.option("--tokens", "", "", &tokens);
   ap.option("--runs", "", "", &runs);
   ap.option("--effort", "", "", &effort);
   ap.flag("--dense-fp8", "", &dense_fp8);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
+  ap.flag("--atlas-6g", "6 GB VRAM preset (offload-vram-mb=5888, offload-ram-mb=12288, dense-fp8, kv-fp8, prefill-chunk=512)",
+          &atlas_6g);
+  ap.option("--offload-vram-mb", "", "tiered MoE offloading VRAM cap in MiB (0 = off, e.g. 5888 for 6 GB GPU)",
+            &offload_vram_mb);
+  ap.option("--offload-ram-mb", "", "pinned host RAM cap in MiB for WARM experts (default 12288)", &offload_ram_mb);
+  ap.option("--offload-mode", "{auto,dma-lru,uva}", "tiered offload transport mode", &offload_mode,
+            {"auto", "dma-lru", "uva"});
+  ap.option("--expert-ranking", "", "optional JSON with per-layer [24][128] homology/frequency scores", &expert_ranking);
+  ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--temperature", "", "", &temperature);
@@ -172,13 +184,25 @@ int main(int argc, char** argv) {
     cudaMemGetInfo(&free0, &total);
     const auto t0 = Clock::now();
     ingine::model::RuntimeOptions options;
+    if (atlas_6g) {
+      if (offload_vram_mb == 0) offload_vram_mb = 5888;
+      dense_fp8 = true;
+      kv_fp8 = true;
+      if (prefill_chunk > 512) prefill_chunk = 512;
+    }
     options.model_dir = model_dir;
     options.ablation = ablation;
     options.max_ctx = max_ctx;
+    options.prefill_chunk = prefill_chunk;
     options.dense_fp8 = dense_fp8;
     options.kv_fp8 = kv_fp8;
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
+    options.offload_vram_mb = offload_vram_mb;
+    options.offload_ram_mb = offload_ram_mb;
+    options.offload_mode = offload_mode;
+    options.expert_ranking = expert_ranking;
+    options.dump_router_stats = dump_router_stats;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;
@@ -261,6 +285,9 @@ int main(int argc, char** argv) {
       json += ", \"prefill\": {\"tokens\": " + std::to_string(ids.size()) + ", \"tok_s\": " + py_float(tok_s) + "}";
       std::printf("prefill %zu tokens: %.0f tok/s\n", ids.size(), tok_s);
       std::fflush(stdout);
+    }
+    if (const std::string osum = gen->offload_summary(); !osum.empty()) {
+      std::printf("%s\n", osum.c_str());
     }
     std::printf("%s}\n", json.c_str());
     return 0;

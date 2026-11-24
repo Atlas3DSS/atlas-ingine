@@ -66,8 +66,10 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
+  std::string offload_mode = "auto", expert_ranking, dump_router_stats;
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
-  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
+  int prefill_chunk = 3072, offload_vram_mb = 0, offload_ram_mb = 12288;
+  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false, atlas_6g = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -88,6 +90,16 @@ int main(int argc, char** argv) {
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
+  ap.flag("--atlas-6g", "6 GB VRAM tiered offload preset (offload-vram-mb=5888, dense-fp8, kv-fp8, prefill-chunk=512, no-vision)",
+          &atlas_6g);
+  ap.option("--prefill-chunk", "", "tokens per prefill chunk (default 3072, 512 in offload mode)", &prefill_chunk);
+  ap.option("--offload-vram-mb", "", "tiered MoE offloading VRAM cap in MiB (0 = off, e.g. 5888 for 6 GB GPU)",
+            &offload_vram_mb);
+  ap.option("--offload-ram-mb", "", "pinned host RAM cap in MiB for WARM experts (default 12288)", &offload_ram_mb);
+  ap.option("--offload-mode", "{auto,dma-lru,uva}", "tiered offload transport mode", &offload_mode,
+            {"auto", "dma-lru", "uva"});
+  ap.option("--expert-ranking", "", "optional JSON with per-layer [24][128] homology/frequency scores", &expert_ranking);
+  ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--park-mb", "",
@@ -140,15 +152,30 @@ int main(int argc, char** argv) {
     } else {
 #ifdef INGINE_WITH_MODEL
       ingine::model::RuntimeOptions options;
+      if (atlas_6g) {
+        if (offload_vram_mb == 0) offload_vram_mb = 5888;
+        dense_fp8 = true;
+        kv_fp8 = true;
+        no_vision = true;
+        if (prefill_chunk > 512) prefill_chunk = 512;
+        if (park_mb < 0) park_mb = 0;
+        if (max_ctx > 32768) max_ctx = 32768;
+      }
       options.model_dir = model_dir;
       options.ablation = ablation;
       options.max_ctx = max_ctx;
+      options.prefill_chunk = prefill_chunk;
       options.dense_fp8 = dense_fp8;
       options.kv_fp8 = kv_fp8;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
       options.vision = !no_vision;
+      options.offload_vram_mb = offload_vram_mb;
+      options.offload_ram_mb = offload_ram_mb;
+      options.offload_mode = offload_mode;
+      options.expert_ranking = expert_ranking;
+      options.dump_router_stats = dump_router_stats;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

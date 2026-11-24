@@ -68,6 +68,9 @@ struct GemmArgs {
   const uint8_t* codes = nullptr;   // NVFP4 / MXFP8 expert codes [128, N, ..]
   const uint8_t* scales = nullptr;  // block scales
   const float* factors = nullptr;   // NVFP4 per-expert factor
+  const uint8_t* const* code_ptrs = nullptr;   // optional [128] per-expert code base pointers
+  const uint8_t* const* scale_ptrs = nullptr;  // optional [128] per-expert scale base pointers
+  const uint8_t* active_mask = nullptr;        // optional [128] mask (skip expert when 0)
   const uint16_t* a = nullptr;      // activations (bf16)
   MoeWork w;                        // tiles and pair lists
   uint16_t* out = nullptr;
@@ -124,9 +127,12 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   if (tile_idx >= *g.w.tiles_n) return;
   const int4 tile = g.w.tiles[tile_idx];
   const int e = tile.x, pb = tile.y, n = tile.z;
+  if (g.active_mask && !g.active_mask[e]) return;
   const int n0 = (blockIdx.x % NTILES_N) * TN;
-  const uint8_t* code_tile = g.codes + (int64_t(e) * NE + n0) * C::CODE_ROW;
-  const uint8_t* scale_tile = g.scales + (int64_t(e) * NE + n0) * C::SCALE_ROW;
+  const uint8_t* code_tile =
+      g.code_ptrs ? (g.code_ptrs[e] + int64_t(n0) * C::CODE_ROW) : (g.codes + (int64_t(e) * NE + n0) * C::CODE_ROW);
+  const uint8_t* scale_tile =
+      g.scale_ptrs ? (g.scale_ptrs[e] + int64_t(n0) * C::SCALE_ROW) : (g.scales + (int64_t(e) * NE + n0) * C::SCALE_ROW);
   if constexpr (FMT == FMT_NVFP4) {
     if (tid < 16) lut[tid] = kE2M1[tid];
   } else if constexpr (FMT == FMT_ATLAS2) {
@@ -335,12 +341,16 @@ void launch_rows(const GemmArgs& g, int tm, int grid_per_row_tile, int row_tiles
   else launch<FMT, MODE, K, 128, false>(g, grid_per_row_tile * row_tiles, stream);
 }
 
-GemmArgs expert_args(const void* codes, const void* scales, const float* factors, const ActT* a,
-                     const MoeWork& w, ActT* out) {
+GemmArgs expert_args(const void* codes, const void* scales, const float* factors,
+                     const uint8_t* const* code_ptrs, const uint8_t* const* scale_ptrs,
+                     const uint8_t* active_mask, const ActT* a, const MoeWork& w, ActT* out) {
   GemmArgs g;
   g.codes = static_cast<const uint8_t*>(codes);
   g.scales = static_cast<const uint8_t*>(scales);
   g.factors = factors;
+  g.code_ptrs = code_ptrs;
+  g.scale_ptrs = scale_ptrs;
+  g.active_mask = active_mask;
   g.a = reinterpret_cast<const uint16_t*>(a);
   g.w = w;
   g.out = reinterpret_cast<uint16_t*>(out);
@@ -351,7 +361,8 @@ GemmArgs expert_args(const void* codes, const void* scales, const float* factors
 
 void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, ActT* act,
                  cudaStream_t stream) {
-  const GemmArgs g = expert_args(e.w13, e.w13_scale, e.w13_factor, x, w, act);
+  const GemmArgs g = expert_args(e.w13, e.w13_scale, e.w13_factor, e.w13_ptrs, e.w13_scale_ptrs,
+                                 e.active_mask, x, w, act);
   if (e.fmt == FMT_NVFP4) launch_rows<FMT_NVFP4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
   else if (e.fmt == FMT_MXFP8) launch_rows<FMT_MXFP8, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
   else if (e.fmt == FMT_ATLAS2) launch_rows<FMT_ATLAS2, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
@@ -360,7 +371,8 @@ void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, Ac
 
 void moe_down(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, ActT* down,
               cudaStream_t stream) {
-  const GemmArgs g = expert_args(e.w2, e.w2_scale, e.w2_factor, act, w, down);
+  const GemmArgs g = expert_args(e.w2, e.w2_scale, e.w2_factor, e.w2_ptrs, e.w2_scale_ptrs,
+                                 e.active_mask, act, w, down);
   if (e.fmt == FMT_NVFP4) launch_rows<FMT_NVFP4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
   else if (e.fmt == FMT_MXFP8) launch_rows<FMT_MXFP8, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
   else if (e.fmt == FMT_ATLAS2) launch_rows<FMT_ATLAS2, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);

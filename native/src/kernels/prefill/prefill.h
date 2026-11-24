@@ -147,13 +147,19 @@ void moe_topk(const float* logits, const float* bias, int T, int* idx, float* wt
 void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream);
 
 struct MoeExperts {
-  int fmt = 0;  // 0 NVFP4, 1 MXFP8 (weights.py layouts)
+  int fmt = 0;  // 0 NVFP4, 1 MXFP8, 2 ATLAS2, 3 ATLAS3
   const void* w13 = nullptr;
   const void* w13_scale = nullptr;
   const float* w13_factor = nullptr;
   const void* w2 = nullptr;
   const void* w2_scale = nullptr;
   const float* w2_factor = nullptr;
+  // Optional per-expert pointer tables ([128]) and active-expert mask ([128] u8) for tiered offloading.
+  const std::uint8_t* const* w13_ptrs = nullptr;
+  const std::uint8_t* const* w13_scale_ptrs = nullptr;
+  const std::uint8_t* const* w2_ptrs = nullptr;
+  const std::uint8_t* const* w2_scale_ptrs = nullptr;
+  const std::uint8_t* active_mask = nullptr;
 };
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
 // exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.

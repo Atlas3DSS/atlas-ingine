@@ -13,6 +13,7 @@
 #include "ingine/generator.h"
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
+#include "model/expert_cache.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -310,10 +311,23 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
     pk::moe_route(idx_, T, work, s);
     const Experts& ex = layer.experts;
-    const pk::MoeExperts me{static_cast<int>(ex.fmt), ex.w13.data, ex.w13_scale.data,
-                            f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
-    pk::moe_gate_up(me, xm_, T, work, act_, s);
-    pk::moe_down(me, act_, T, work, down_, s);
+    pk::MoeExperts me{static_cast<int>(ex.fmt), ex.w13.data, ex.w13_scale.data,
+                      f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
+    if (w.expert_cache) {
+      const auto eptrs = w.expert_cache->layer_ptrs(l);
+      me.w13_ptrs = eptrs.w13;
+      me.w13_scale_ptrs = eptrs.w13_scale;
+      me.w2_ptrs = eptrs.w2;
+      me.w2_scale_ptrs = eptrs.w2_scale;
+      w.expert_cache->run_prefill_layer(l, counts_, s, [&](const std::uint8_t* mask) {
+        me.active_mask = mask;
+        pk::moe_gate_up(me, xm_, T, work, act_, s);
+        pk::moe_down(me, act_, T, work, down_, s);
+      });
+    } else {
+      pk::moe_gate_up(me, xm_, T, work, act_, s);
+      pk::moe_down(me, act_, T, work, down_, s);
+    }
     pk::moe_combine(down_, wts_, T, moe_sum_, s);
     pk::static_conv(moe_sum_, H, T, H, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_, s);
     pk::conv_state_update(st.conv_mlp_at(v), moe_sum_, H, T, H, s);

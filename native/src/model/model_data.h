@@ -13,9 +13,12 @@
 #include <array>
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
 #include <vector>
 
 namespace ingine::model {
+
+class ExpertCache;
 
 // ------------------------------------------------------------------------------------ weights.py constants
 
@@ -206,6 +209,7 @@ struct Weights {
   Tensor message_queries;     // fp32 [12, 4, H]: q, k, v, mlp per loop layer
   std::array<ExpertFormat, LAYERS> expert_formats{};
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
+  std::shared_ptr<ExpertCache> expert_cache;  // non-null when tiered MoE offloading is enabled
 
   std::vector<DeviceBuffer> storage;  // device allocations behind the views
 };

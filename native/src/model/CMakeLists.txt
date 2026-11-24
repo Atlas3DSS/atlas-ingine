@@ -1,4 +1,5 @@
 add_library(ingine_model STATIC
+  expert_cache.cpp
   weights.cpp
   state.cpp
   decoder.cpp

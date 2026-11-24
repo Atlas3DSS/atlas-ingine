@@ -170,7 +170,8 @@ Dense row_view(const Dense& d, int begin, int end) {
   return v;
 }
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
+Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, bool load_experts,
+                      std::vector<float>* router_bias_out = nullptr) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -226,7 +227,11 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   layer.attn_conv = ld.f32(p + "attn_sconv.weight", {H, CONV_K});
   layer.mlp_conv = ld.f32(p + "mlp_sconv.weight", {H, CONV_K});
   layer.router = ld.f32(p + "mlp.gate.weight", {EXPERTS, H});
-  layer.router_bias = ld.f32(p + "mlp.gate.bias", {EXPERTS});
+  {
+    const std::vector<float> rb = host_f32(m, p + "mlp.gate.bias");
+    if (router_bias_out) *router_bias_out = rb;
+    layer.router_bias = ld.upload_f32(rb, {EXPERTS});
+  }
   layer.router_bf16 = ld.upload_bf16(host_f32(m, p + "mlp.gate.weight"), {EXPERTS, H});  // exact
   if (l > 0) {
     const std::string qn = "model.llm.attn_res.attn_queries." + std::to_string(l - 1);
@@ -296,19 +301,21 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     layer.mlp_gate_gain = at(layer.mlp1_gate_gain, 0, DType::FP32, H, GATE_RANK);
   }
 
-  // routed experts in checkpoint encoding
+  // routed experts in checkpoint encoding (skipped here when ExpertCache manages tiered offloading)
   const std::string e = p + "mlp.experts.";
   Experts& ex = layer.experts;
   ex.fmt = fmt;
-  ex.w13 = ld.raw(e + "w13_weight");
-  ex.w13_scale = ld.raw(e + "w13_weight_scale");
-  ex.w2 = ld.raw(e + "w2_weight");
-  ex.w2_scale = ld.raw(e + "w2_weight_scale");
   const bool mxfp8 = fmt == ExpertFormat::MXFP8;
   const std::string want_codes = mxfp8 ? "F8_E4M3" : "U8", want_scales = mxfp8 ? "U8" : "F8_E4M3";
   if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
       m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales)
     throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
+  if (load_experts) {
+    ex.w13 = ld.raw(e + "w13_weight");
+    ex.w13_scale = ld.raw(e + "w13_weight_scale");
+    ex.w2 = ld.raw(e + "w2_weight");
+    ex.w2_scale = ld.raw(e + "w2_weight_scale");
+  }
   if (!mxfp8) {
     for (const char* w : {"w13", "w2"}) {
       const std::vector<float> amax = host_f32(m, e + w + "_weight_amax");
@@ -338,7 +345,8 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
 
 }  // namespace
 
-Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream) {
+Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream,
+                     const OffloadConfig& offload) {
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
@@ -347,7 +355,11 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   w.storage.reserve(4096);
   Loader ld(m, up, stream, w.storage);
   const int H = HIDDEN;
-  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
+  const bool tiered = offload.vram_mb > 0;
+  std::array<std::vector<float>, LAYERS> router_biases;
+  for (int l = 0; l < LAYERS; ++l) {
+    w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8, !tiered, &router_biases[l]));
+  }
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
@@ -388,6 +400,29 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
+  if (tiered) {
+    std::size_t non_expert_bytes = 0;
+    for (const auto& b : w.storage) non_expert_bytes += b.bytes;
+    // Estimate post-load fixed VRAM (KV cache + prefiller scratch + checkpoint + runtime/cuBLAS headroom)
+    // so total model GPU memory stays strictly within offload.vram_mb MiB.
+    const std::size_t kv_ring_bytes =
+        std::size_t(NUM_SLIDING_VISITS) * WINDOW * KV_DIM * 4 + std::size_t(NUM_SLIDING_VISITS) * WINDOW * 8;
+    const std::size_t kv_full_bytes =
+        std::size_t(NUM_FULL_VISITS) * std::size_t(offload.max_ctx) * KV_DIM * (offload.kv_fp8 ? 2 : 4);
+    const std::size_t checkpoint_bytes = kv_ring_bytes + (std::size_t(16) << 20);
+    const std::size_t prefill_bytes =
+        std::size_t(offload.prefill_chunk) * std::size_t(390) * 1024 + (std::size_t(56) << 20);
+    const std::size_t runtime_headroom = std::size_t(384) << 20;
+    const std::size_t fixed_bytes =
+        non_expert_bytes + kv_ring_bytes + kv_full_bytes + checkpoint_bytes + prefill_bytes + runtime_headroom;
+    const std::size_t total_budget = std::size_t(offload.vram_mb) << 20;
+    const std::size_t expert_vram_budget =
+        total_budget > fixed_bytes ? (total_budget - fixed_bytes) : (std::size_t(256) << 20);
+    const std::size_t warm_ram_budget =
+        offload.ram_mb > 512 ? (std::size_t(offload.ram_mb - 256) << 20) : std::size_t(0);
+    w.expert_cache = ExpertCache::create(model_dir, w.expert_formats, router_biases, expert_vram_budget,
+                                         warm_ram_budget, offload, stream);
+  }
   return w;
 }
 
@@ -397,7 +432,7 @@ Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t 
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Loader ld(m, up, stream, storage);
-  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8);
+  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8, true);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   return layer;
 }
