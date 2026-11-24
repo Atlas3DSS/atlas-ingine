@@ -1,8 +1,10 @@
 #include "model/vision.h"
 
+#include "core/act.h"
 #include "core/device.h"
 #include "core/safetensors.h"
 #include "kernels/vision/vision.h"
+#include "model/model_kernels.h"
 
 #include <algorithm>
 #include <cmath>
@@ -57,7 +59,7 @@ class Loader {
 
   const float* f32(const std::string& name, std::int64_t numel) { return upload(host(name, numel)); }
 
-  // Queues the BF16 matrix `name` ([rows, cols]) for upload to dst.
+  // Queues the BF16 matrix `name` ([rows, cols]) for upload to dst (converted to ActT on flush).
   void queue(const std::string& name, std::int64_t rows, std::int64_t cols, void* dst) {
     const SafetensorsRef ref = m_.at(name);
     if (ref->dtype != "BF16" || ref->shape != std::vector<std::int64_t>{rows, cols}) {
@@ -65,18 +67,21 @@ class Loader {
                                std::to_string(cols) + "]");
     }
     pending_.push_back(upload_request(ref, dst));
+    convert_.emplace_back(dst, std::size_t(rows) * std::size_t(cols));
   }
 
-  const __nv_bfloat16* matrix(const std::string& name, std::int64_t rows, std::int64_t cols) {
+  const ActT* matrix(const std::string& name, std::int64_t rows, std::int64_t cols) {
     void* d = alloc(std::size_t(rows) * cols * 2);
     queue(name, rows, cols, d);
-    return static_cast<const __nv_bfloat16*>(d);
+    return static_cast<const ActT*>(d);
   }
 
   void flush(cudaStream_t stream) {
     DeviceUploader uploader(UploadOptions{std::size_t(16) << 20, 4, 4});
     uploader.upload(pending_, stream);
     pending_.clear();
+    for (const auto& [dst, numel] : convert_) bf16_to_act_inplace(dst, numel, stream);
+    convert_.clear();
   }
 
  private:
@@ -84,6 +89,7 @@ class Loader {
   std::vector<DeviceBuffer>& storage_;
   std::size_t& bytes_;
   std::vector<UploadRequest> pending_;
+  std::vector<std::pair<void*, std::size_t>> convert_;
 };
 
 }  // namespace
@@ -111,7 +117,7 @@ VisionWeights load_vision_weights(const std::filesystem::path& model_dir, cudaSt
     l.ln2_w = ld.f32(p + "ln_2.weight", H), l.ln2_b = ld.f32(p + "ln_2.bias", H);
     l.ls1 = ld.f32(p + "ls_1.gamma", H), l.ls2 = ld.f32(p + "ls_2.gamma", H);
     // q, k and v stacked: one projection of 3072 outputs
-    auto* wqkv = static_cast<__nv_bfloat16*>(ld.alloc(std::size_t(3) * H * H * 2));
+    auto* wqkv = static_cast<ActT*>(ld.alloc(std::size_t(3) * H * H * 2));
     std::vector<float> bqkv;
     int part = 0;
     for (const char* name : {"q_proj", "k_proj", "v_proj"}) {
@@ -197,13 +203,13 @@ DeviceBuffer VisionEncoder::encode(const std::uint8_t* rgb, int height, int widt
   auto at = [&](std::size_t off) { return static_cast<std::byte*>(work.p) + off; };
   auto* pixels = reinterpret_cast<std::uint8_t*>(at(L.pixels));
   auto* h = reinterpret_cast<float*>(at(L.h));
-  auto* xb = reinterpret_cast<__nv_bfloat16*>(at(L.xb));
+  auto* xb = reinterpret_cast<ActT*>(at(L.xb));
   auto* big32 = reinterpret_cast<float*>(at(L.big32));
-  auto* big16 = reinterpret_cast<__nv_bfloat16*>(at(L.big16));
-  auto* attn = reinterpret_cast<__nv_bfloat16*>(at(L.attn));
+  auto* big16 = reinterpret_cast<ActT*>(at(L.big16));
+  auto* attn = reinterpret_cast<ActT*>(at(L.attn));
   auto* y = reinterpret_cast<float*>(at(L.y));
   auto* scores = reinterpret_cast<float*>(at(L.scores));
-  auto* probs = reinterpret_cast<__nv_bfloat16*>(at(L.probs));
+  auto* probs = reinterpret_cast<ActT*>(at(L.probs));
 
   // patches -> patch embedding + position embeddings, class token in front, ln_pre
   CUDA_CHECK(cudaMemcpyAsync(pixels, rgb, std::size_t(height) * width * 3, cudaMemcpyHostToDevice, s));
@@ -213,9 +219,9 @@ DeviceBuffer VisionEncoder::encode(const std::uint8_t* rgb, int height, int widt
   if (observer) observer(-1, h, L.S);
   vk::layernorm(h, w.ln_pre_w, w.ln_pre_b, Sp, h, true, s);
 
-  __nv_bfloat16* q = big16;                                         // [16, Sp, 64]
-  __nv_bfloat16* k = q + std::size_t(vk::HEADS) * Sp * vk::HEAD_DIM;  // [16, Sp, 64]
-  __nv_bfloat16* vt = k + std::size_t(vk::HEADS) * Sp * vk::HEAD_DIM; // [16, 64, Sp]
+  ActT* q = big16;                                         // [16, Sp, 64]
+  ActT* k = q + std::size_t(vk::HEADS) * Sp * vk::HEAD_DIM;  // [16, Sp, 64]
+  ActT* vt = k + std::size_t(vk::HEADS) * Sp * vk::HEAD_DIM; // [16, 64, Sp]
   const float scale = 1.0f / std::sqrt(float(vk::HEAD_DIM));
   for (int i = 0; i < VISION_LAYERS; ++i) {
     const VisionLayer& l = w.layers[std::size_t(i)];
@@ -224,9 +230,9 @@ DeviceBuffer VisionEncoder::encode(const std::uint8_t* rgb, int height, int widt
     gemm_.run(xb, H, l.wqkv, H, big32, 3 * H, true, Sp, 3 * H, H, s);
     vk::qkv_post(big32, l.bqkv, w.inv_freq, rows, cols, Sp, q, k, vt, s);
     for (int head = 0; head < vk::HEADS; ++head) {
-      const __nv_bfloat16* qh = q + std::size_t(head) * Sp * vk::HEAD_DIM;
-      const __nv_bfloat16* kh = k + std::size_t(head) * Sp * vk::HEAD_DIM;
-      const __nv_bfloat16* vth = vt + std::size_t(head) * vk::HEAD_DIM * Sp;
+      const ActT* qh = q + std::size_t(head) * Sp * vk::HEAD_DIM;
+      const ActT* kh = k + std::size_t(head) * Sp * vk::HEAD_DIM;
+      const ActT* vth = vt + std::size_t(head) * vk::HEAD_DIM * Sp;
       for (int q0 = 0; q0 < Sp; q0 += L.Qc) {
         const int Q = std::min(L.Qc, Sp - q0);
         gemm_.run(qh + std::size_t(q0) * vk::HEAD_DIM, vk::HEAD_DIM, kh, vk::HEAD_DIM, scores, Sp, true, Q, Sp,

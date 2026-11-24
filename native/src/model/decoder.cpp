@@ -24,7 +24,7 @@ dense::Matrix matrix(const Dense& d) {
 
 const float* f32p(const Tensor& t) { return static_cast<const float*>(t.data); }
 float* f32m(const Tensor& t) { return static_cast<float*>(t.data); }
-__nv_bfloat16* bf16m(const Tensor& t) { return static_cast<__nv_bfloat16*>(t.data); }
+ActT* bf16m(const Tensor& t) { return static_cast<ActT*>(t.data); }
 
 // fast.proj_layout(full, single_input) as an int32 [S, 3] table (row_begin, row_end, input)
 std::vector<int> proj_layout(bool full, bool single_input) {
@@ -77,7 +77,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
 
   auto mix_params = [&](const std::vector<const float*>& blocks, const float* base, const float* write,
                         const float* abl_r, const float* abl_w, float* partial_out, const Tensor* queries,
-                        const float* norm_w, __nv_bfloat16* out_bf16, float* out_f32) {
+                        const float* norm_w, ActT* out_bf16, float* out_f32) {
     dense::MixParams p;
     p.blocks = blocks.empty() ? nullptr : reinterpret_cast<const float* const*>(block_table(blocks));
     p.nblocks = int(blocks.size());
@@ -97,7 +97,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     return p;
   };
 
-  dense::embed(static_cast<const std::int64_t*>(b.token.data), m, static_cast<const __nv_bfloat16*>(w.embed.data),
+  dense::embed(static_cast<const std::int64_t*>(b.token.data), m, static_cast<const ActT*>(w.embed.data),
                f32p(w.embed_norm), f32m(b.B0), pdl, stream);
   int prev_v = -1;
   int tap = 0;
@@ -105,7 +105,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   const float* attn_w = f32p(abl.attn_w);
   const float* mlp_dirs = f32p(abl.mlp_dirs);
   const float* mlp_w = f32p(abl.mlp_w);
-  __nv_bfloat16* taps = bf16m(b.taps);
+  ActT* taps = bf16m(b.taps);
 
   for (int v = 0; v < NUM_VISITS; ++v) {
     const int l = VISITS[v].layer, p = VISITS[v].pass;
@@ -157,7 +157,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     else dense::mix(ap, pdl, stream);
     if (msgs)  // sliding layers mix one query: all three gates read b.mixf[0]
       dense::message_gates(f32p(b.mixf), !layer.full, f32p(b.msgs), 3, m,
-                           static_cast<const __nv_bfloat16*>(layer.qkv_gate_down.data), layer.qkv_gate_forget16.data,
+                           static_cast<const ActT*>(layer.qkv_gate_down.data), layer.qkv_gate_forget16.data,
                            layer.qkv_gate_gain16.data, false, f32p(layer.attn_norm3), bf16m(b.xin), nullptr, pdl,
                            stream);
     // ---- attention
@@ -224,7 +224,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     dense::mix(mp, pdl, stream);
     if (msgs)
       dense::message_gates(f32p(b.mixm), false, f32p(b.msgs) + 3 * slab, 1, m,
-                           static_cast<const __nv_bfloat16*>(layer.mlp1_gate_down.data), layer.mlp1_gate_forget16.data,
+                           static_cast<const ActT*>(layer.mlp1_gate_down.data), layer.mlp1_gate_forget16.data,
                            layer.mlp1_gate_gain16.data, false, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr, pdl,
                            stream);
     dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),

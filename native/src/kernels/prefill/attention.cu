@@ -93,11 +93,21 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
   }
 }
 
-__device__ __forceinline__ uint32_t bf16x2_to_half2(uint32_t u) { return pack_half2(bf_lo(u), bf_hi(u)); }
+__device__ __forceinline__ uint32_t bf16x2_to_half2(uint32_t u) {
+#if INGINE_ACT_FP16
+  return u;
+#else
+  return pack_half2(bf_lo(u), bf_hi(u));
+#endif
+}
 
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint16_t u) {
+#if INGINE_ACT_FP16
+  return e4m3x2_to_half2(u);
+#else
   const float2 f = e4m3x2_to_float2(u);
   return pack_bf16x2(f.x, f.y);
+#endif
 }
 
 template <bool FP8, bool EXPLICIT>
@@ -437,15 +447,15 @@ void attention(const AttnParams& p, cudaStream_t stream) {
   }
 }
 
-void ring_gather(const __nv_bfloat16* k_ring, const __nv_bfloat16* v_ring, const int64_t* ring_pos, int pos0, int T,
-                 __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows, cudaStream_t stream) {
+void ring_gather(const ActT* k_ring, const ActT* v_ring, const int64_t* ring_pos, int pos0, int T,
+                 ActT* k_rows, ActT* v_rows, int* kpos, int kpos_rows, cudaStream_t stream) {
   ring_gather_kernel<<<kRelExtent, kRowVecs, 0, stream>>>(
       reinterpret_cast<const uint4*>(k_ring), reinterpret_cast<const uint4*>(v_ring), ring_pos, pos0, T,
       reinterpret_cast<uint4*>(k_rows), reinterpret_cast<uint4*>(v_rows), kpos, kpos_rows);
 }
 
-void ring_update(const __nv_bfloat16* k_rows, const __nv_bfloat16* v_rows, int pos0, int T, __nv_bfloat16* k_ring,
-                 __nv_bfloat16* v_ring, int64_t* ring_pos, cudaStream_t stream) {
+void ring_update(const ActT* k_rows, const ActT* v_rows, int pos0, int T, ActT* k_ring,
+                 ActT* v_ring, int64_t* ring_pos, cudaStream_t stream) {
   ring_update_kernel<<<std::min(T, kRelExtent), kRowVecs, 0, stream>>>(
       reinterpret_cast<const uint4*>(k_rows), reinterpret_cast<const uint4*>(v_rows), pos0, T,
       reinterpret_cast<uint4*>(k_ring), reinterpret_cast<uint4*>(v_ring), ring_pos);

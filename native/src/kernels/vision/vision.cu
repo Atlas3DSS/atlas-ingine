@@ -11,7 +11,7 @@ constexpr int ROW_T = 256;          // threads of a row kernel: 4 of the 1024 co
 constexpr int ELEM_T = 256;         // threads of an elementwise kernel
 
 __device__ __forceinline__ std::uint16_t bf16_bits(float v) {
-  return __bfloat16_as_ushort(__float2bfloat16_rn(v));
+  return act::float_to_bits(v);
 }
 
 // Sum over the block's ROW_T threads (8 warps); every thread gets the total.
@@ -211,7 +211,7 @@ unsigned blocks(std::int64_t n) { return unsigned((n + ELEM_T - 1) / ELEM_T); }
 
 }  // namespace
 
-void patchify(const std::uint8_t* rgb, int height, int width, int rows, int cols, __nv_bfloat16* out, int out_rows,
+void patchify(const std::uint8_t* rgb, int height, int width, int rows, int cols, ActT* out, int out_rows,
               cudaStream_t stream) {
   const std::int64_t total = std::int64_t(out_rows) * PATCH_DIM;
   patchify_kernel<<<blocks(total), ELEM_T, 0, stream>>>(rgb, height, width, cols, 4 * rows * cols,
@@ -228,17 +228,17 @@ void layernorm(const float* x, const float* w, const float* b, int M, void* out,
 }
 
 void qkv_post(const float* qkv, const float* bias, const float* inv_freq, int rows, int cols, int Sp,
-              __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* vt, cudaStream_t stream) {
+              ActT* q, ActT* k, ActT* vt, cudaStream_t stream) {
   qkv_post_kernel<<<Sp, ROW_T, 0, stream>>>(qkv, bias, inv_freq, cols, 1 + 4 * rows * cols, Sp,
                                             reinterpret_cast<std::uint16_t*>(q), reinterpret_cast<std::uint16_t*>(k),
                                             reinterpret_cast<std::uint16_t*>(vt));
 }
 
-void softmax_rows(const float* scores, int M, int ld, int S, float scale, __nv_bfloat16* p, cudaStream_t stream) {
+void softmax_rows(const float* scores, int M, int ld, int S, float scale, ActT* p, cudaStream_t stream) {
   softmax_kernel<<<M, ROW_T, 0, stream>>>(scores, ld, S, scale, reinterpret_cast<std::uint16_t*>(p));
 }
 
-void bias_act(const float* x, const float* bias, std::int64_t M, int N, bool gelu, __nv_bfloat16* out,
+void bias_act(const float* x, const float* bias, std::int64_t M, int N, bool gelu, ActT* out,
               cudaStream_t stream) {
   const std::int64_t total = M * N;
   bias_act_kernel<<<blocks(total), ELEM_T, 0, stream>>>(x, bias, total, N, gelu, reinterpret_cast<std::uint16_t*>(out));
@@ -248,7 +248,7 @@ void bias_scale_residual(const float* y, const float* bias, const float* gamma, 
   residual_kernel<<<M, ROW_T, 0, stream>>>(y, bias, gamma, h);
 }
 
-void merge_rows(const float* h, int N, int out_rows, __nv_bfloat16* out, cudaStream_t stream) {
+void merge_rows(const float* h, int N, int out_rows, ActT* out, cudaStream_t stream) {
   const std::int64_t total = std::int64_t(out_rows) * MERGED;
   merge_kernel<<<blocks(total), ELEM_T, 0, stream>>>(h, std::int64_t(N) * MERGED, total,
                                                      reinterpret_cast<std::uint16_t*>(out));

@@ -333,28 +333,28 @@ void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
   attn_prep_kernel<<<p.T, 256, 0, stream>>>(p);
 }
 
-void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfloat16* out, cudaStream_t stream) {
+void rel_logits(const ActT* rel, const float* rel_proj, int T, ActT* out, cudaStream_t stream) {
   const int tpb = std::min(16, std::max(1, T / 128));
   rel_logits_kernel<<<dim3((T + tpb - 1) / tpb, kHeads / 8), 256, 0, stream>>>(
       reinterpret_cast<const uint16_t*>(rel), rel_proj, T, tpb, reinterpret_cast<uint16_t*>(out));
 }
 
-void static_conv(const __nv_bfloat16* x, int ld, int T, int C, const float* w, const float* state, float* out,
+void static_conv(const ActT* x, int ld, int T, int C, const float* w, const float* state, float* out,
                  cudaStream_t stream) {
   const dim3 grid((C + 127) / 128, (T + CONV_ROWS - 1) / CONV_ROWS);
   static_conv_kernel<<<grid, 128, 0, stream>>>(reinterpret_cast<const uint16_t*>(x), ld, T, C, w, state, out);
 }
 
-void conv_state_update(float* state, const __nv_bfloat16* x, int ld, int T, int C, cudaStream_t stream) {
+void conv_state_update(float* state, const ActT* x, int ld, int T, int C, cudaStream_t stream) {
   conv_state_kernel<<<(C + 127) / 128, 128, 0, stream>>>(state, reinterpret_cast<const uint16_t*>(x), ld, T, C);
 }
 
-void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream) {
+void gate_inputs(const GateRows& rows, int G, int T, ActT* gin, cudaStream_t stream) {
   gate_inputs_kernel<<<dim3(T, G), ROW_T, 0, stream>>>(rows, T, reinterpret_cast<uint16_t*>(gin));
 }
 
 void gate_apply(const float* h, const float* msg, const float* f, const float* g, const float* norm_w, int T,
-                __nv_bfloat16* out, cudaStream_t stream) {
+                ActT* out, cudaStream_t stream) {
   gate_apply_kernel<<<T, ROW_T, 0, stream>>>(h, msg, f, g, norm_w, reinterpret_cast<uint16_t*>(out));
 }
 
@@ -362,15 +362,15 @@ void widen_ids(const int32_t* in, int T, int64_t* out, int32_t negative_as, cuda
   widen_kernel<<<(T + 255) / 256, 256, 0, stream>>>(in, T, out, negative_as);
 }
 
-void put_rows(const __nv_bfloat16* src, int count, float* dst, cudaStream_t stream) {
+void put_rows(const ActT* src, int count, float* dst, cudaStream_t stream) {
   if (count > 0) put_rows_kernel<<<count, ROW_T, 0, stream>>>(reinterpret_cast<const uint16_t*>(src), dst);
 }
 
-void store_tap(const float* x, int T, __nv_bfloat16* out, int64_t out_stride, cudaStream_t stream) {
+void store_tap(const float* x, int T, ActT* out, int64_t out_stride, cudaStream_t stream) {
   tap_kernel<<<T, ROW_T, 0, stream>>>(x, reinterpret_cast<uint16_t*>(out), out_stride);
 }
 
-void head_logits(const __nv_bfloat16* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream) {
+void head_logits(const ActT* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream) {
   const auto* xs = reinterpret_cast<const uint16_t*>(x);
   if (scale) head_kernel<true><<<(V + 7) / 8, 256, 0, stream>>>(xs, w, scale, V, out);
   else head_kernel<false><<<(V + 7) / 8, 256, 0, stream>>>(xs, w, scale, V, out);

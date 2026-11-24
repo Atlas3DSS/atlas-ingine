@@ -128,7 +128,7 @@ void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream) {
   route_kernel<<<1, 1024, 0, stream>>>(idx, T, moe_tile_rows(T), w);
 }
 
-void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat16* out, cudaStream_t stream) {
+void moe_combine(const ActT* down, const float* wts, int T, ActT* out, cudaStream_t stream) {
   combine_kernel<<<T, kHidden / 4, 0, stream>>>(reinterpret_cast<const uint2*>(down), wts,
                                                 reinterpret_cast<uint2*>(out));
 }

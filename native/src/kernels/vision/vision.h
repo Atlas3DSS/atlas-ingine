@@ -13,7 +13,8 @@
 // Launchers follow KERNELS.md: preallocated outputs, a stream, no allocation, no synchronisation.
 #pragma once
 
-#include <cuda_bf16.h>
+#include "core/act.h"
+
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -35,7 +36,7 @@ inline constexpr float LN_EPS = 1e-5f;
 // out[p] = bf16((v - 127.5) / 127.5) of patch p's 1200 values, v = the pixel byte or -1 outside the image
 // (the processor pads right and bottom to whole tiles with -1). rgb u8 [height, width, 3]; out bf16
 // [out_rows, 1200], rows >= 4 * rows * cols are zero.
-void patchify(const std::uint8_t* rgb, int height, int width, int rows, int cols, __nv_bfloat16* out, int out_rows,
+void patchify(const std::uint8_t* rgb, int height, int width, int rows, int cols, ActT* out, int out_rows,
               cudaStream_t stream);
 
 // h[0] = cls; h[1 + p] = patches[p] + the position table resampled bilinearly (half-pixel centres, edge
@@ -57,13 +58,13 @@ void layernorm(const float* x, const float* w, const float* b, int M, void* out,
 //   vt   bf16 [16, 64, Sp]   values transposed, the operand of probabilities x values
 // Rows >= S = 1 + 4 rows cols are zero. inv_freq f32 [16].
 void qkv_post(const float* qkv, const float* bias, const float* inv_freq, int rows, int cols, int Sp,
-              __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* vt, cudaStream_t stream);
+              ActT* q, ActT* k, ActT* vt, cudaStream_t stream);
 
 // p[m] = bf16(softmax(scale * scores[m, 0:S])) with zeros in columns >= S. scores f32 [M, ld], p bf16 [M, ld].
-void softmax_rows(const float* scores, int M, int ld, int S, float scale, __nv_bfloat16* p, cudaStream_t stream);
+void softmax_rows(const float* scores, int M, int ld, int S, float scale, ActT* p, cudaStream_t stream);
 
 // out = bf16(act(x + bias)), act = exact GELU (x Phi(x)) or identity; bias f32 [N] or null. x f32 [M, N].
-void bias_act(const float* x, const float* bias, std::int64_t M, int N, bool gelu, __nv_bfloat16* out,
+void bias_act(const float* x, const float* bias, std::int64_t M, int N, bool gelu, ActT* out,
               cudaStream_t stream);
 
 // Layer scale and residual: h += gamma * (y + bias). y, h f32 [M, 1024]; bias, gamma f32 [1024].
@@ -71,6 +72,6 @@ void bias_scale_residual(const float* y, const float* bias, const float* gamma, 
 
 // Merger input: out[t] = bf16 of tile t's four patch states, h[1 + 4t .. 1 + 4t + 3] (the class token is
 // dropped), for t < N; rows N .. out_rows are zero. h f32 [>= 1 + 4N, 1024], out bf16 [out_rows, 4096].
-void merge_rows(const float* h, int N, int out_rows, __nv_bfloat16* out, cudaStream_t stream);
+void merge_rows(const float* h, int N, int out_rows, ActT* out, cudaStream_t stream);
 
 }  // namespace ingine::kernels::vision

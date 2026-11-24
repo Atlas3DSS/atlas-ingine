@@ -1,8 +1,10 @@
 #include "model/drafter.h"
 
+#include "core/act.h"
 #include "core/device.h"
 #include "core/safetensors.h"
 #include "kernels/draft/shortlist.h"
+#include "model/model_kernels.h"
 
 #include <algorithm>
 #include <cmath>
@@ -65,7 +67,7 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   V_ = w.unembed.rows();
   load(model_dir);
 
-  auto bf16s = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
+  auto bf16s = [&](std::size_t n) { return static_cast<ActT*>(alloc(n * 2)); };
   auto f32s = [&](std::size_t n) { return static_cast<float*>(alloc(n * 4)); };
   auto i32s = [&](std::size_t n) { return static_cast<std::int32_t*>(alloc(n * 4)); };
 
@@ -195,6 +197,10 @@ void Drafter::load(const std::filesystem::path& model_dir) {
       reqs.push_back(upload_request(f, t, static_cast<std::byte*>(raw.p) + (t.offset - base)));
     DeviceUploader up(UploadOptions{std::size_t(16) << 20, 4, 4});
     up.upload(reqs, stream_);
+    for (const SafetensorsTensor& t : f.tensors()) {
+      if (t.dtype == "BF16")
+        bf16_to_act_inplace(static_cast<std::byte*>(raw.p) + (t.offset - base), std::size_t(t.numel()), stream_);
+    }
   }
   auto src = [&](const std::string& name, std::initializer_list<std::int64_t> shape) {
     const SafetensorsTensor& t = f.at(name);
@@ -216,7 +222,7 @@ void Drafter::load(const std::filesystem::path& model_dir) {
                                  cudaMemcpyDeviceToDevice, stream_));
       off += t.bytes;
     }
-    return reinterpret_cast<__nv_bfloat16*>(dst);
+    return reinterpret_cast<ActT*>(dst);
   };
   const std::int64_t h = H;
   inter_ = int(f.at("layers.0.mlp.gate_proj.weight").shape.at(0));
@@ -228,15 +234,15 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     if (t.dtype != "BF16" || t.shape != std::vector<std::int64_t>{4, 4})
       throw std::runtime_error("mtp.safetensors: unexpected fuse_weight");
     const std::vector<float> fw = bf16_to_float(f.read("fuse_weight"));
-    __nv_bfloat16 host[16];
+    ActT host[16];
     for (int r = 0; r < 4; ++r) {
       float m = -INFINITY;
       for (int c = 0; c < 4; ++c) m = std::max(m, fw[r * 4 + c]);
       float e[4], s = 0.f;
       for (int c = 0; c < 4; ++c) s += (e[c] = std::exp(fw[r * 4 + c] - m));
-      for (int c = 0; c < 4; ++c) host[r * 4 + c] = __float2bfloat16_rn(e[c] / s);
+      for (int c = 0; c < 4; ++c) host[r * 4 + c] = act::host_from_float(e[c] / s);
     }
-    auto* d = static_cast<__nv_bfloat16*>(alloc(sizeof(host)));
+    auto* d = static_cast<ActT*>(alloc(sizeof(host)));
     CUDA_CHECK(cudaMemcpyAsync(d, host, sizeof(host), cudaMemcpyHostToDevice, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     alpha_ = d;
@@ -254,7 +260,7 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     }
     void* q = alloc(std::size_t(rows * K));
     auto* scale = static_cast<float*>(alloc(std::size_t(rows) * 4));
-    kdense::fp8_rows(static_cast<const __nv_bfloat16*>(cat.p), int(rows), int(K), q, scale, stream_);
+    kdense::fp8_rows(static_cast<const ActT*>(cat.p), int(rows), int(K), q, scale, stream_);
     return kdense::Matrix{q, scale, int(rows)};
   };
 
@@ -263,7 +269,7 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   {
     auto kv = [](int l, const char* x) { return "layers." + std::to_string(l) + ".self_attn." + x + "_proj_ctx.weight"; };
     const std::vector<std::int64_t> shape{kd::KV_DIM, h};
-    const __nv_bfloat16* all = persist({{kv(0, "k"), shape}, {kv(0, "v"), shape}, {kv(1, "k"), shape},
+    const ActT* all = persist({{kv(0, "k"), shape}, {kv(0, "v"), shape}, {kv(1, "k"), shape},
                                         {kv(1, "v"), shape}, {kv(2, "k"), shape}, {kv(2, "v"), shape}});
     for (int l = 0; l < 3; ++l) layers_[l].wkv_ctx = all + std::size_t(l) * 2 * kd::KV_DIM * H;
     wkv_all_ = fp8({{kv(0, "k"), kd::KV_DIM}, {kv(0, "v"), kd::KV_DIM}, {kv(1, "k"), kd::KV_DIM},
@@ -295,10 +301,10 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   f_norm_ = persist({{mh + "dflare_norm.weight", {h}}});
 
   // fold_w / fold_b (FP64, from the unembedding as the decoder stores it)
-  fold_w_ = static_cast<__nv_bfloat16*>(alloc(std::size_t(V_) * kd::RANK * 2));
-  fold_b_ = static_cast<__nv_bfloat16*>(alloc(std::size_t(V_) * 2));
-  const __nv_bfloat16* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
-  const __nv_bfloat16* hb = persist({{mh + "hidden_out.bias", {h}}});
+  fold_w_ = static_cast<ActT*>(alloc(std::size_t(V_) * kd::RANK * 2));
+  fold_b_ = static_cast<ActT*>(alloc(std::size_t(V_) * 2));
+  const ActT* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
+  const ActT* hb = persist({{mh + "hidden_out.bias", {h}}});
   kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
   CUDA_CHECK(cudaStreamSynchronize(stream_));  // raw and cat are freed on return
 }
@@ -434,7 +440,7 @@ void Drafter::restore_checkpoint(const void* src) {
   if (!prefix) note_tokens(checkpoint_extra_);
 }
 
-void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece) {
+void Drafter::run_commit(const ActT* feats, int n, int row0, bool last_piece) {
   for (int l = 0; l < 3; ++l) {
     const DraftLayer& L = layers_[l];
     kd::mix_rmsnorm(feats, n, alpha_ + 4 * l, L.ctx_norm, ctx_c_, stream_);
@@ -447,12 +453,12 @@ void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_
 }
 
 void Drafter::commit(const Tensor& feats, int start) {
-  if (feats.dtype != DType::BF16 || feats.ne[0] != H || feats.ne[1] != 4 || !feats.is_contiguous())
+  if (feats.dtype != kActDType || feats.ne[0] != H || feats.ne[1] != 4 || !feats.is_contiguous())
     throw std::invalid_argument("Drafter::commit: feats must be contiguous bf16 [n, 4, 2304]");
-  commit(static_cast<const __nv_bfloat16*>(feats.data), feats.ne[2] * feats.ne[3], start);
+  commit(static_cast<const ActT*>(feats.data), feats.ne[2] * feats.ne[3], start);
 }
 
-void Drafter::commit(const __nv_bfloat16* feats, int n, int start) {
+void Drafter::commit(const ActT* feats, int n, int start) {
   if (n <= 0) return;
   if (n <= BLOCK) {
     kd::set_commit(params_, feats, n, start, stream_);
@@ -477,7 +483,7 @@ void Drafter::run_small_commit() {
 }
 
 void Drafter::run_draft(int bucket) {
-  kd::embed_block(static_cast<const __nv_bfloat16*>(w_.embed.data), static_cast<const float*>(w_.embed_norm.data),
+  kd::embed_block(static_cast<const ActT*>(w_.embed.data), static_cast<const float*>(w_.embed_norm.data),
                   mask_embed_, layers_[0].in_norm, params_, res_, xn_, picks_, stream_);
   run_layers(bucket);
 }
@@ -499,7 +505,7 @@ void Drafter::run_layers(int bucket) {
     kdense::gemv(act_, BLOCK, inter_, L.w_down, delta_, true, stream_);
     kd::add_rmsnorm(res_, delta_, l < 2 ? layers_[l + 1].in_norm : final_norm_, xn_, BLOCK, stream_);
   }
-  const __nv_bfloat16* h = xn_ + H;  // rows 1..7
+  const ActT* h = xn_ + H;  // rows 1..7
   kdense::proj(h, GAMMA, short_head_, seg_short_, 1, base_, true, stream_);
   kd::topk_candidates(base_, GAMMA, short_head_.rows, short_map_, cand_val_, cand_idx_, topk_ws_, stream_);
   kd::markov_pre(rnn_w_, h, f_rnn_, part_, stream_);
@@ -533,7 +539,7 @@ Drafter::Draft Drafter::draft(int anchor, int P, float temperature) {
 // the round's parameters, the small commit and the draft, all from device values: the commit's input mix and
 // the block's input rows share the first launch
 void Drafter::run_advance(int bucket) {
-  kd::round_begin(params_, round_, alpha_, ctx_layers_, f_norm_, static_cast<const __nv_bfloat16*>(w_.embed.data),
+  kd::round_begin(params_, round_, alpha_, ctx_layers_, f_norm_, static_cast<const ActT*>(w_.embed.data),
                   static_cast<const float*>(w_.embed_norm.data), mask_embed_, layers_[0].in_norm, commit_xin_, f_rnn_,
                   res_, xn_, picks_, stream_);
   kdense::proj(commit_xin_, BLOCK, wkv_all_, seg_kv_, 3, commit_kv_, true, stream_);

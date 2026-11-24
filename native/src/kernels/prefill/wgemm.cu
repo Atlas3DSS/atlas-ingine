@@ -28,7 +28,7 @@ enum class Mode { Up, Down };
 constexpr int FMT_NVFP4 = 0, FMT_MXFP8 = 1, FMT_ATLAS2 = 2, FMT_ATLAS3 = 3;
 
 constexpr int TN = 128, BK = 64;
-constexpr int AS = 3;  // activation stages (BK elements each)
+constexpr int AS = INGINE_ACT_FP16 ? 2 : 3;  // activation stages (2 fits Volta 96 KiB shared memory)
 constexpr int NT = 256;
 constexpr int KCH = BK / 8;  // 16-byte chunks per activation tile row
 
@@ -46,7 +46,8 @@ struct Cfg {
   static constexpr int KC = K / WK;  // weight chunks
   // weight slots: the chunk of step s + 1 must have landed (and be published by the barrier) at step s, when its
   // B fragments are decoded under step s's MMAs: R (WS - 1) >= AS. Small-row tiles prefetch further.
-  static constexpr int WS = TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6) : (FMT == FMT_MXFP8 ? 4 : 3);
+  static constexpr int WS = TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6)
+                                     : (INGINE_ACT_FP16 ? 3 : (FMT == FMT_MXFP8 ? 4 : 3));
   static_assert(R * (WS - 1) >= AS);
   static constexpr int WCODE = FMT == FMT_NVFP4 ? WK / 2 : (FMT == FMT_MXFP8 ? WK : (FMT == FMT_ATLAS2 ? WK / 4 : (WK * 3) / 8));
   static constexpr int WSTRIDE = WCODE + 16;                    // padded: fragment loads on distinct banks
@@ -56,7 +57,7 @@ struct Cfg {
   static constexpr int OFF_W = AS * A_BYTES, OFF_SC = OFF_W + WS * W_BYTES;
   static constexpr int OFF_LUT = (OFF_SC + SC_BYTES + 15) / 16 * 16;
   static constexpr int SMEM = OFF_LUT + 64;
-  static_assert(K % WK == 0 && SMEM <= 101376);
+  static_assert(K % WK == 0 && SMEM <= (INGINE_ACT_FP16 ? 98304 : 101376));
 };
 
 struct GemmArgs {
@@ -323,8 +324,8 @@ void launch_rows(const GemmArgs& g, int tm, int grid_per_row_tile, int row_tiles
   else launch<FMT, MODE, K, 128>(g, grid_per_row_tile * row_tiles, stream);
 }
 
-GemmArgs expert_args(const void* codes, const void* scales, const float* factors, const __nv_bfloat16* a,
-                     const MoeWork& w, __nv_bfloat16* out) {
+GemmArgs expert_args(const void* codes, const void* scales, const float* factors, const ActT* a,
+                     const MoeWork& w, ActT* out) {
   GemmArgs g;
   g.codes = static_cast<const uint8_t*>(codes);
   g.scales = static_cast<const uint8_t*>(scales);
@@ -337,7 +338,7 @@ GemmArgs expert_args(const void* codes, const void* scales, const float* factors
 
 }  // namespace
 
-void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
+void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, ActT* act,
                  cudaStream_t stream) {
   const GemmArgs g = expert_args(e.w13, e.w13_scale, e.w13_factor, x, w, act);
   if (e.fmt == FMT_NVFP4) launch_rows<FMT_NVFP4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
@@ -346,7 +347,7 @@ void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWo
   else launch_rows<FMT_ATLAS3, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
 }
 
-void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
+void moe_down(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, ActT* down,
               cudaStream_t stream) {
   const GemmArgs g = expert_args(e.w2, e.w2_scale, e.w2_factor, act, w, down);
   if (e.fmt == FMT_NVFP4) launch_rows<FMT_NVFP4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);

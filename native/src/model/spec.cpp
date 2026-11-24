@@ -63,7 +63,7 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
     round.nwidths = widths.n;
     for (int i = 0; i < widths.n; ++i) {
       round.widths[i] = widths.w[i];
-      round.taps[i] = ptr<const __nv_bfloat16>(rt.buffers(widths.w[i]).taps);
+      round.taps[i] = ptr<const ActT>(rt.buffers(widths.w[i]).taps);
     }
     round.m = static_cast<const std::int32_t*>(width_.p);
     round.accepted = &scratch.result->accepted;
@@ -179,7 +179,7 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       const int keep = int(k) - 1;
       if (round_P >= 0 && keep < round_acc) {
         rt_.rollback(round_P, keep + 1, round_m);
-        drafter_.commit(ptr<const __nv_bfloat16>(rt_.buffers(round_m).taps), keep + 1, round_P);
+        drafter_.commit(ptr<const ActT>(rt_.buffers(round_m).taps), keep + 1, round_P);
         tokens_in_state.resize(tokens_in_state.size() - std::size_t(round_acc - keep));
       }
       break;

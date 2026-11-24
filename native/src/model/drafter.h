@@ -25,10 +25,10 @@
 #include "kernels/draft/gemm.h"
 #include "model/model_data.h"
 
+#include "core/act.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 
-#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <array>
@@ -69,7 +69,7 @@ class Drafter {
   // context. n of 1..8 replays the small-commit graph (feats must stay valid until it ran); larger n
   // (prefill chunks) runs eagerly in pieces of <= 1024.
   void commit(const Tensor& feats, int start);
-  void commit(const __nv_bfloat16* feats, int n, int start);
+  void commit(const ActT* feats, int n, int start);
 
   // Drafts for positions P+1..P+7 after the anchor token at P. Greedy at temperature <= 0, otherwise
   // Gumbel-max at the temperature. Outputs are fixed device buffers, overwritten by the next draft.
@@ -137,10 +137,10 @@ class Drafter {
 
  private:
   struct DraftLayer {
-    const __nv_bfloat16 *in_norm, *post_norm, *ctx_norm, *q_norm, *k_norm, *k_norm_ctx;
+    const ActT *in_norm, *post_norm, *ctx_norm, *q_norm, *k_norm, *k_norm_ctx;
     kernels::dense::Matrix qkv, gate_up;  // FP8 rows + scales
     kernels::dense::Matrix wo, w_down;    // FP8 rows + scales: [H, 3072], [H, inter]
-    const __nv_bfloat16* wkv_ctx;         // BF16 [2048, H]: k_proj_ctx | v_proj_ctx (large commits)
+    const ActT* wkv_ctx;         // BF16 [2048, H]: k_proj_ctx | v_proj_ctx (large commits)
     void *k_ctx, *v_ctx;                  // [slots, 8, 128]: BF16 (local rings), BF16 or E4M3 (the global ring)
     std::int32_t* ctx_pos;                // local layers: int32 [WINDOW]; null for the global layer
   };
@@ -149,7 +149,7 @@ class Drafter {
   void load(const std::filesystem::path& model_dir);
   void run_draft(int bucket);
   void run_layers(int bucket);                                                  // a draft after its input rows
-  void run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece);  // large commits
+  void run_commit(const ActT* feats, int n, int row0, bool last_piece);  // large commits
   void run_small_commit();                                                      // from params_
   void run_advance(int bucket);                                                 // round transition
   int bucket_for(int P) const;
@@ -170,10 +170,10 @@ class Drafter {
   kernels::draft::Bf16Gemm gemm_;
 
   std::array<DraftLayer, 3> layers_{};
-  const __nv_bfloat16* alpha_ = nullptr;  // bf16 [4, 4] softmax(fuse_weight)
-  const __nv_bfloat16 *final_norm_ = nullptr, *mask_embed_ = nullptr, *f_norm_ = nullptr;
-  const __nv_bfloat16 *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;
-  __nv_bfloat16 *fold_w_ = nullptr, *fold_b_ = nullptr;
+  const ActT* alpha_ = nullptr;  // bf16 [4, 4] softmax(fuse_weight)
+  const ActT *final_norm_ = nullptr, *mask_embed_ = nullptr, *f_norm_ = nullptr;
+  const ActT *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;
+  ActT *fold_w_ = nullptr, *fold_b_ = nullptr;
   kernels::dense::Matrix head_{};         // the unembedding
   // the shortlist head: rows [0, short_K_) = ranked tokens and specials (ascending ids), then context tokens
   kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS, H] like head_
@@ -189,7 +189,7 @@ class Drafter {
 
   // per-call state and scratch
   kernels::draft::DraftParams* params_ = nullptr;
-  __nv_bfloat16 *res_ = nullptr, *xn_ = nullptr, *q_ = nullptr, *attn_o_ = nullptr, *act_ = nullptr,
+  ActT *res_ = nullptr, *xn_ = nullptr, *q_ = nullptr, *attn_o_ = nullptr, *act_ = nullptr,
                 *f_rnn_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
   float *qkv_out_ = nullptr, *gu_out_ = nullptr, *delta_ = nullptr, *base_ = nullptr, *attn_ws_ = nullptr;
   float *cand_val_ = nullptr, *cand_logits_ = nullptr, *part_ = nullptr;
@@ -200,7 +200,7 @@ class Drafter {
   std::int32_t* tokens_ = nullptr;
   int *seg_qkv_ = nullptr, *seg_gate_up_ = nullptr, *seg_short_ = nullptr, *seg_kv_ = nullptr;
   // commit scratch: large commits (cuBLASLt) and the small commit (dense proj over the three layers)
-  __nv_bfloat16 *warm_feats_ = nullptr, *ctx_c_ = nullptr, *ctx_kv_ = nullptr, *commit_xin_ = nullptr;
+  ActT *warm_feats_ = nullptr, *ctx_c_ = nullptr, *ctx_kv_ = nullptr, *commit_xin_ = nullptr;
   float* commit_kv_ = nullptr;
 
   AcceptScratch accept_{};

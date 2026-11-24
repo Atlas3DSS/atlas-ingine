@@ -27,8 +27,8 @@ namespace {
 constexpr int H = HIDDEN;
 
 const float* f32p(const Tensor& t) { return static_cast<const float*>(t.data); }
-const __nv_bfloat16* bf16p(const Tensor& t) { return static_cast<const __nv_bfloat16*>(t.data); }
-const __nv_bfloat16* bf16p(const void* p) { return static_cast<const __nv_bfloat16*>(p); }
+const ActT* bf16p(const Tensor& t) { return static_cast<const ActT*>(t.data); }
+const ActT* bf16p(const void* p) { return static_cast<const ActT*>(p); }
 
 // fast.Buffers.blocks
 std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* B1, float* const* B2, float* const* E) {
@@ -55,7 +55,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
     return storage_.back().p;
   };
   auto f32 = [&](std::size_t n) { return static_cast<float*>(alloc(n * 4)); };
-  auto bf16 = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
+  auto bf16 = [&](std::size_t n) { return static_cast<ActT*>(alloc(n * 2)); };
   auto i32 = [&](std::size_t n) { return static_cast<int*>(alloc(n * 4)); };
   B0_ = f32(C * H), B1_ = f32(C * H);
   for (int p = 0; p < PASSES; ++p) B2_[p] = f32(C * H), E_[p] = f32(C * H);
@@ -116,11 +116,11 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   const float* attn_w = f32p(abl_.attn_w);
   const float* mlp_dirs = f32p(abl_.mlp_dirs);
   const float* mlp_w = f32p(abl_.mlp_w);
-  __nv_bfloat16* tap_out = taps ? static_cast<__nv_bfloat16*>(taps->data) : nullptr;
+  ActT* tap_out = taps ? static_cast<ActT*>(taps->data) : nullptr;
 
   auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
                  const float* abl_w, float* partial_out, const float* queries, int Q, const float* norm_w,
-                 __nv_bfloat16* out_bf16, float* out_f32) {
+                 ActT* out_bf16, float* out_f32) {
     dense::MixParams p;
     p.blocks = blocks.empty() ? nullptr : block_table(blocks);
     p.nblocks = int(blocks.size());
@@ -139,17 +139,17 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     dense::mix(p, false, s);
   };
   // B rows of a Dense matrix as BF16: the matrix itself, or its FP8 rows dequantized (weights.dequant)
-  auto bf16_rows = [&](const Dense& d) -> const __nv_bfloat16* {
+  auto bf16_rows = [&](const Dense& d) -> const ActT* {
     if (!d.fp8()) return bf16p(d.w);
     dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s);
     return wscratch_;
   };
   // message_gate for G gates: h_g, msg_g fp32 [T, H] -> out bf16 [G, T, H] = bf16(rms_norm(gated) * norm_w[g])
   auto gates = [&](const pk::GateRows& rows, int G, const Tensor& down, const Tensor& forget16, const Tensor& gain16,
-                   const float* norm_w, __nv_bfloat16* out) {
+                   const float* norm_w, ActT* out) {
     pk::gate_inputs(rows, G, T, gin_, s);
     for (int g = 0; g < G; ++g) {
-      const __nv_bfloat16* gd = bf16p(down) + std::size_t(g) * GATE_RANK * 2 * H;
+      const ActT* gd = bf16p(down) + std::size_t(g) * GATE_RANK * 2 * H;
       gemm_->run(gin_ + std::size_t(g) * T * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, T, GATE_RANK, 2 * H, s);
       gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, T, H,
                  GATE_RANK, s);
@@ -222,7 +222,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
 
     // ---- projections (fast.proj_layout): one GEMM for a single input, else per input segment
     const int R = proj_rows(layer.full);
-    const __nv_bfloat16* wp = bf16_rows(layer.wproj);
+    const ActT* wp = bf16_rows(layer.wproj);
     const bool single = !layer.full && !msgs;
     if (single) {
       gemm_->run(xin_, H, wp, H, proj_, R, false, T, R, H, s);
@@ -263,8 +263,8 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       at.window = 0;
     } else {
       const int ri = RING_INDEX[v];
-      auto* k_ring = static_cast<__nv_bfloat16*>(st.k_ring_at(ri).data);
-      auto* v_ring = static_cast<__nv_bfloat16*>(st.v_ring_at(ri).data);
+      auto* k_ring = static_cast<ActT*>(st.k_ring_at(ri).data);
+      auto* v_ring = static_cast<ActT*>(st.v_ring_at(ri).data);
       std::int64_t* ring_pos = st.ring_pos_at(ri);
       // keys = cat(ring, chunk) as model.prefill reads them, before the ring takes the chunk's last rows
       pk::ring_gather(k_ring, v_ring, ring_pos, pos0, T, krows_, vrows_, kpos_, kpos_rows_, s);
@@ -282,7 +282,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::attention(at, s);
 
     // ---- output projection + post-attention conv
-    const __nv_bfloat16* wo = bf16_rows(layer.wo);
+    const ActT* wo = bf16_rows(layer.wo);
     gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_out_, H, false, T, H, HEADS * HEAD_DIM, s);
     pk::static_conv(wo_out_, H, T, H, f32p(layer.attn_conv), st.conv_attn_at(v), y_, s);
     pk::conv_state_update(st.conv_attn_at(v), wo_out_, H, T, H, s);

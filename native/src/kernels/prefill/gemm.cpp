@@ -52,7 +52,7 @@ Gemm::~Gemm() {
 
 // Row-major C[M, N] = A[M, K] . B[N, K]^T is column-major C^T[N, M] = B^T(op T on the K x N matrix B) . A
 // (the K x M matrix A).
-void Gemm::run(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb, void* C, int ldc, bool c_fp32,
+void Gemm::run(const ActT* A, int lda, const ActT* B, int ldb, void* C, int ldc, bool c_fp32,
                int M, int N, int K, cudaStream_t stream) {
   if (M <= 0 || N <= 0 || K <= 0) throw std::invalid_argument("prefill Gemm: empty shape");
   cublasLtMatmulDesc_t op = nullptr;
@@ -68,9 +68,9 @@ void Gemm::run(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb,
     const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
     cublas_check(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)), "transa");
     cublas_check(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)), "transb");
-    cublas_check(cublasLtMatrixLayoutCreate(&la, CUDA_R_16BF, K, N, ldb), "layout a");
-    cublas_check(cublasLtMatrixLayoutCreate(&lb, CUDA_R_16BF, K, M, lda), "layout b");
-    cublas_check(cublasLtMatrixLayoutCreate(&lc, c_fp32 ? CUDA_R_32F : CUDA_R_16BF, N, M, ldc), "layout c");
+    cublas_check(cublasLtMatrixLayoutCreate(&la, kCublasActType, K, N, ldb), "layout a");
+    cublas_check(cublasLtMatrixLayoutCreate(&lb, kCublasActType, K, M, lda), "layout b");
+    cublas_check(cublasLtMatrixLayoutCreate(&lc, c_fp32 ? CUDA_R_32F : kCublasActType, N, M, ldc), "layout c");
 
     const auto key = std::make_tuple(M, N, K, lda, ldb, ldc, c_fp32);
     auto it = impl_->algos.find(key);
@@ -88,6 +88,14 @@ void Gemm::run(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb,
                                                   sizeof(reduction));
       if (st == CUBLAS_STATUS_SUCCESS)
         st = cublasLtMatmulAlgoGetHeuristic(impl_->handle, op, la, lb, lc, lc, pref, 1, &result, &found);
+#if INGINE_ACT_FP16
+      if ((st != CUBLAS_STATUS_SUCCESS || found == 0)) {
+        const std::uint32_t any_red = CUBLASLT_REDUCTION_SCHEME_MASK;
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &any_red,
+                                             sizeof(any_red));
+        st = cublasLtMatmulAlgoGetHeuristic(impl_->handle, op, la, lb, lc, lc, pref, 1, &result, &found);
+      }
+#endif
       cublasLtMatmulPreferenceDestroy(pref);
       cublas_check(st, "heuristic");
       if (found == 0) throw std::runtime_error("prefill Gemm: no cuBLASLt algorithm");

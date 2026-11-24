@@ -1,10 +1,10 @@
 // Native prompt processing: model.Model.prefill for one chunk, without PyTorch.
 #pragma once
 
+#include "core/act.h"
 #include "core/arena.h"
 #include "model/model_data.h"
 
-#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -33,7 +33,7 @@ namespace ingine::model {
 // feeds in as they are: no embedding norm).
 struct EmbedRows {
   int row = 0, count = 0;
-  const __nv_bfloat16* src = nullptr;
+  const ActT* src = nullptr;
 };
 
 class Prefiller {
@@ -63,19 +63,19 @@ class Prefiller {
 
   // activations (rows = max_chunk), see prefill.cpp
   float *B0_, *B1_, *B2_[PASSES], *E_[PASSES], *hid_, *part_, *y_, *y2_;
-  __nv_bfloat16 *xin_, *xm_, *xf_;
+  ActT *xin_, *xm_, *xf_;
   float *mixf_, *msgs_, *mixm_;
-  __nv_bfloat16 *proj_, *q_, *rel16_, *rel_, *krows_, *vrows_, *attn_out_, *wo_out_;
+  ActT *proj_, *q_, *rel16_, *rel_, *krows_, *vrows_, *attn_out_, *wo_out_;
   int* kpos_;
   int4* bounds_;
-  __nv_bfloat16 *gin_, *g16_;
+  ActT *gin_, *g16_;
   float *fpre_, *gpre_;
   float *router_logits_, *wts_;
   int* idx_;
   int *counts_, *tiles_n_, *pair_token_, *pair_dst_;
   int4* tiles_;
-  __nv_bfloat16 *act_, *down_, *moe_sum_;
-  __nv_bfloat16* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
+  ActT *act_, *down_, *moe_sum_;
+  ActT* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
   std::int64_t* ids_;
   int kpos_rows_;
 };

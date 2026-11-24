@@ -100,8 +100,8 @@ inline std::uint16_t host_float_to_fp16_bits(float f) {
   if (abs_w == 0x7f800000u) return static_cast<std::uint16_t>(sign | 0x7c00u); // Inf
   if (abs_w >= 0x477fe000u) return static_cast<std::uint16_t>(sign | 0x7bffu); // saturate max finite 65504
   if (abs_w < 0x38800000u) {
-    // Subnormal or underflow to zero
-    const int shift = 113 - int(abs_w >> 23);
+    // Subnormal or underflow to zero (23 FP32 mantissa bits + 1 implicit bit, bias diff 127 - 14 = 113, + 13 = 126)
+    const int shift = 126 - int(abs_w >> 23);
     if (shift > 24) return sign;
     const std::uint32_t mant = (abs_w & 0x007fffffu) | 0x00800000u;
     const std::uint32_t half_bit = 1u << (shift - 1);
@@ -155,7 +155,7 @@ inline float host_round(float f) { return host_bits_to_float(host_float_to_bits(
 #if defined(__CUDACC__)
 
 __device__ __forceinline__ float clamp_fp16_finite(float x) {
-  return isnan(x) ? x : fminf(fmaxf(x, -kFp16Max), kFp16Max);
+  return isfinite(x) ? fminf(fmaxf(x, -kFp16Max), kFp16Max) : x;
 }
 
 __device__ __forceinline__ ActT from_float(float x) {

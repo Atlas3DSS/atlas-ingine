@@ -1,6 +1,7 @@
 // model.State and fast.Buffers allocation.
 #include "model/runtime.h"
 
+#include "core/act.h"
 #include "core/device.h"
 
 #include <stdexcept>
@@ -19,10 +20,10 @@ Tensor zeros(std::vector<DeviceBuffer>& storage, DType dt, std::initializer_list
 }  // namespace
 
 Tensor State::k_ring_at(int ring) const {
-  return rm(ptr<char>(k_ring) + std::size_t(ring) * WINDOW * KV_DIM * 2, DType::BF16, {WINDOW, KV_HEADS, HEAD_DIM});
+  return rm(ptr<char>(k_ring) + std::size_t(ring) * WINDOW * KV_DIM * 2, kActDType, {WINDOW, KV_HEADS, HEAD_DIM});
 }
 Tensor State::v_ring_at(int ring) const {
-  return rm(ptr<char>(v_ring) + std::size_t(ring) * WINDOW * KV_DIM * 2, DType::BF16, {WINDOW, KV_HEADS, HEAD_DIM});
+  return rm(ptr<char>(v_ring) + std::size_t(ring) * WINDOW * KV_DIM * 2, kActDType, {WINDOW, KV_HEADS, HEAD_DIM});
 }
 std::int64_t* State::ring_pos_at(int ring) const { return ptr<std::int64_t>(ring_pos) + std::size_t(ring) * WINDOW; }
 Tensor State::k_full_at(int full) const {
@@ -40,9 +41,9 @@ State make_state(int max_ctx, bool kv_fp8) {
   State st;
   st.max_ctx = max_ctx;
   st.kv_fp8 = kv_fp8;
-  const DType full = kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
-  st.k_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
-  st.v_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
+  const DType full = kv_fp8 ? DType::FP8_E4M3FN : kActDType;
+  st.k_ring = zeros(st.storage, kActDType, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
+  st.v_ring = zeros(st.storage, kActDType, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
   st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
@@ -79,20 +80,20 @@ Buffers make_buffers(int m) {
   b.part = zeros(s, DType::FP32, {m, H});
   b.y = zeros(s, DType::FP32, {m, H});
   b.y2 = zeros(s, DType::FP32, {m, H});
-  b.xin = zeros(s, DType::BF16, {3, m, H});
+  b.xin = zeros(s, kActDType, {3, m, H});
   b.mixf = zeros(s, DType::FP32, {3, m, H});
   b.msgs = zeros(s, DType::FP32, {4, m, H});
-  b.xm = zeros(s, DType::BF16, {1, m, H});
+  b.xm = zeros(s, kActDType, {1, m, H});
   b.mixm = zeros(s, DType::FP32, {1, m, H});
   b.proj_sliding = zeros(s, DType::FP32, {m, PROJ_ROWS_SLIDING});
   b.proj_full = zeros(s, DType::FP32, {m, PROJ_ROWS_FULL});
-  b.attn_out = zeros(s, DType::BF16, {m, HEADS * HEAD_DIM});
+  b.attn_out = zeros(s, kActDType, {m, HEADS * HEAD_DIM});
   b.idx = zeros(s, DType::I32, {m, TOP_K});
   b.wts = zeros(s, DType::FP32, {m, TOP_K});
-  b.act = zeros(s, DType::BF16, {m, TOP_K, INTER});
-  b.xf = zeros(s, DType::BF16, {1, m, H});
+  b.act = zeros(s, kActDType, {m, TOP_K, INTER});
+  b.xf = zeros(s, kActDType, {1, m, H});
   b.logits = zeros(s, DType::FP32, {m, UNPADDED_VOCAB});
-  b.taps = zeros(s, DType::BF16, {m, NUM_TAPS, H});
+  b.taps = zeros(s, kActDType, {m, NUM_TAPS, H});
   b.hist_attn = zeros(s, DType::FP32, {NUM_VISITS, m, H});
   b.hist_mlp = zeros(s, DType::FP32, {NUM_VISITS, m, H});
   b.hist_k = zeros(s, DType::FP32, {NUM_VISITS, m, KV_DIM});

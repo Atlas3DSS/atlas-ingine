@@ -44,6 +44,7 @@
 #include "kernels/moe/moe.h"
 
 #include "kernels/common/l2.cuh"
+#include "kernels/common/mma_sm70.cuh"
 
 #include "core/device.h"
 
@@ -74,21 +75,25 @@ constexpr int DOWN_WARPS = DOWN_GROUPS * DOWN_PAR;
 // they stop evicting the activations, KV rings and the small kernels' evict-last constants.
 constexpr l2::Evict WEIGHT_L2 = l2::Evict::first;
 
-// A 256-byte L2 prefetch footprint is available from SM80 onward.
-#if __CUDA_ARCH__ >= 800
-#define INGINE_MOE_L2_PREFETCH ".L2::256B"
+// L1::no_allocate and L2::256B prefetch hints are available from SM80 onward.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#define INGINE_MOE_LD_HINTS ".L1::no_allocate.L2::256B"
 #else
-#define INGINE_MOE_L2_PREFETCH ""
+#define INGINE_MOE_LD_HINTS ""
 #endif
 
 __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
     uint4 v;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if constexpr (l2::hinted<WEIGHT_L2>) {
-        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint" INGINE_MOE_L2_PREFETCH ".v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
                      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                      : "l"(p), "l"(pol));
-    } else {
-        asm volatile("ld.global.nc.L1::no_allocate" INGINE_MOE_L2_PREFETCH ".v4.u32 {%0,%1,%2,%3}, [%4];"
+    } else
+#endif
+    {
+        static_cast<void>(pol);
+        asm volatile("ld.global.nc" INGINE_MOE_LD_HINTS ".v4.u32 {%0,%1,%2,%3}, [%4];"
                      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                      : "l"(p));
     }
@@ -96,12 +101,16 @@ __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
 }
 __device__ __forceinline__ uint2 ld_stream_u2(const void* p, std::uint64_t pol) {
     uint2 v;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if constexpr (l2::hinted<WEIGHT_L2>) {
-        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint" INGINE_MOE_L2_PREFETCH ".v2.u32 {%0,%1}, [%2], %3;"
+        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v2.u32 {%0,%1}, [%2], %3;"
                      : "=r"(v.x), "=r"(v.y)
                      : "l"(p), "l"(pol));
-    } else {
-        asm volatile("ld.global.nc.L1::no_allocate" INGINE_MOE_L2_PREFETCH ".v2.u32 {%0,%1}, [%2];"
+    } else
+#endif
+    {
+        static_cast<void>(pol);
+        asm volatile("ld.global.nc" INGINE_MOE_LD_HINTS ".v2.u32 {%0,%1}, [%2];"
                      : "=r"(v.x), "=r"(v.y)
                      : "l"(p));
     }
@@ -109,18 +118,22 @@ __device__ __forceinline__ uint2 ld_stream_u2(const void* p, std::uint64_t pol) 
 }
 __device__ __forceinline__ uint32_t ld_stream_u1(const void* p, std::uint64_t pol) {
     uint32_t v;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if constexpr (l2::hinted<WEIGHT_L2>) {
-        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint" INGINE_MOE_L2_PREFETCH ".u32 %0, [%1], %2;"
+        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.u32 %0, [%1], %2;"
                      : "=r"(v)
                      : "l"(p), "l"(pol));
-    } else {
-        asm volatile("ld.global.nc.L1::no_allocate" INGINE_MOE_L2_PREFETCH ".u32 %0, [%1];"
+    } else
+#endif
+    {
+        static_cast<void>(pol);
+        asm volatile("ld.global.nc" INGINE_MOE_LD_HINTS ".u32 %0, [%1];"
                      : "=r"(v)
                      : "l"(p));
     }
     return v;
 }
-#undef INGINE_MOE_L2_PREFETCH
+#undef INGINE_MOE_LD_HINTS
 
 __device__ __forceinline__ uint16_t ld_scale2(const void* p, std::uint64_t pol) {
     uint16_t v;
@@ -258,8 +271,7 @@ __device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) 
 }
 
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
-    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
-    return *reinterpret_cast<uint32_t*>(&v);
+    return act::pack2(lo, hi);
 }
 
 // Decodes a chunk into 16 bf16x2 words (element pairs 0..15) holding exactly decode_experts' values.
@@ -354,11 +366,7 @@ __device__ __forceinline__ void decode(const Chunk<3>& ch, float factor, uint32_
 
 __device__ __forceinline__ void mma_bf16(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                          uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-        "{%0,%1,%2,%3};"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    mma::mma_act(d, a0, a1, a2, a3, b0, b1);
 }
 
 // One warp step: chunk c of rows g and g+8 of a 16-row tile, plus the lane's B column (token g) for the
@@ -382,7 +390,7 @@ __device__ __forceinline__ void load_w(Frag<FMT>& f, const uint8_t* codes, const
 
 // Activations: `xrow` is the lane's token activation row (K bf16) or nullptr (zero column).
 template <int FMT>
-__device__ __forceinline__ void load_x(Frag<FMT>& f, const __nv_bfloat16* xrow, int c) {
+__device__ __forceinline__ void load_x(Frag<FMT>& f, const ActT* xrow, int c) {
     if (xrow) {
         const uint8_t* xp = reinterpret_cast<const uint8_t*>(xrow + 32 * c);
 #pragma unroll
@@ -425,15 +433,15 @@ __device__ __forceinline__ uint64_t slot_mask(int e, int lo, int hi) {
     return uint64_t(m0) | (uint64_t(m1) << 32);
 }
 
-__device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+__device__ __forceinline__ float bf16_round(float v) { return act::round_act(v); }
 
 // --------------------------------------------------------------------------------------- moe_up
 
 template <int FMT>
 __global__ void __launch_bounds__(UP_WARPS * 32)
-moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
+moe_up_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
               const uint8_t* __restrict__ ws, const float* __restrict__ wfactor, int M,
-              __nv_bfloat16* __restrict__ out) {
+              ActT* __restrict__ out) {
     constexpr int K = H, R = 2 * I;
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
     __shared__ float red[UP_WARPS][32][4];
@@ -482,7 +490,7 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
             const float gate = bf16_round(tile_out[2 * p][n]);
             const float up = bf16_round(tile_out[2 * p + 1][n]);
             const float a = tanhf(gate / 4.f) * 4.f * (1.f / (1.f + expf(-gate))) * (tanhf(up / 25.f) * 25.f);
-            const __nv_bfloat16 ab = __float2bfloat16_rn(a);
+            const ActT ab = act::from_float(a);
             while (kmask) {
                 const int k = __ffs(kmask) - 1;
                 kmask &= kmask - 1;
@@ -496,7 +504,7 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
 
 template <int FMT>
 __global__ void __launch_bounds__(DOWN_WARPS * 32)
-moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ idx, const float* __restrict__ wts,
+moe_down_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const float* __restrict__ wts,
                 const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor,
                 int M, const float* __restrict__ conv_w, float* __restrict__ conv_state, float* __restrict__ out,
                 float* __restrict__ conv_hist) {
@@ -537,7 +545,7 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
 
     const int U = nuniq;
     const int p = warp / DOWN_GROUPS, c = 4 * (warp % DOWN_GROUPS) + t;
-    auto xrow = [&](int u) -> const __nv_bfloat16* {
+    auto xrow = [&](int u) -> const ActT* {
         const uint32_t kmask = g < M ? uint32_t(umask[u] >> (8 * g)) & 0xffu : 0u;
         return kmask ? act + (static_cast<size_t>(g) * TOPK + (__ffs(kmask) - 1)) * K : nullptr;
     };
@@ -644,8 +652,8 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
 
 }  // namespace
 
-void moe_up(const __nv_bfloat16* x, int M, const int* idx, const void* w13, const void* w13_scale,
-            const float* w13_factor, Format fmt, __nv_bfloat16* out, bool pdl, cudaStream_t stream) {
+void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w13_scale,
+            const float* w13_factor, Format fmt, ActT* out, bool pdl, cudaStream_t stream) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(x && idx && w13 && w13_scale && out, "moe_up: null argument");
     require(fmt == Format::MXFP8 || w13_factor, "scaled-block experts need a factor tensor");
@@ -659,7 +667,7 @@ void moe_up(const __nv_bfloat16* x, int M, const int* idx, const void* w13, cons
     else launch(moe_up_kernel<3>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, ws, wf, M, out);
 }
 
-void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts, const void* w2,
+void moe_down(const ActT* act, int M, const int* idx, const float* wts, const void* w2,
               const void* w2_scale, const float* w2_factor, Format fmt, const float* conv_w, float* conv_state,
               float* out, float* conv_hist, bool pdl, cudaStream_t stream) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");

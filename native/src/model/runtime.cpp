@@ -91,8 +91,8 @@ void Runtime::init() {
     undo_storage_[i] = DeviceBuffer(kUndoBytes);
     Carve c{static_cast<char*>(undo_storage_[i].p)};
     undo_[i].conv = c.take<float>(std::size_t(NUM_VISITS) * CONV_ROW_FLOATS);
-    undo_[i].k = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
-    undo_[i].v = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
+    undo_[i].k = c.take<ActT>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
+    undo_[i].v = c.take<ActT>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
     undo_[i].pos = c.take<std::int64_t>(NUM_SLIDING_VISITS);
   }
 
@@ -107,8 +107,8 @@ void Runtime::init() {
     backup_storage_ = DeviceBuffer(kBackupBytes);
     Carve c{static_cast<char*>(backup_storage_.p)};
     for (int i = 0; i < 4; ++i) backup_.conv[i] = c.take<float>(std::size_t(NUM_VISITS) * 3 * CONV_COLS[i]);
-    backup_.k = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
-    backup_.v = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
+    backup_.k = c.take<ActT>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
+    backup_.v = c.take<ActT>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
     backup_.pos = c.take<std::int64_t>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth);
   }
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
@@ -145,8 +145,8 @@ StatePtrs Runtime::state_ptrs() const {
   p.conv[1] = ptr<float>(state_.conv_v);
   p.conv[2] = ptr<float>(state_.conv_attn);
   p.conv[3] = ptr<float>(state_.conv_mlp);
-  p.k_ring = ptr<__nv_bfloat16>(state_.k_ring);
-  p.v_ring = ptr<__nv_bfloat16>(state_.v_ring);
+  p.k_ring = ptr<ActT>(state_.k_ring);
+  p.v_ring = ptr<ActT>(state_.v_ring);
   p.ring_pos = ptr<std::int64_t>(state_.ring_pos);
   return p;
 }

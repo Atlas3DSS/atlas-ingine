@@ -8,9 +8,11 @@
 // parameters are read on the host, widened to FP32 (exact from BF16) and copied.
 #include "model/runtime.h"
 
+#include "core/act.h"
 #include "core/device.h"
 #include "core/safetensors.h"
 #include "kernels/dense/dense.h"
+#include "model/model_kernels.h"
 
 #include <nlohmann/json.hpp>
 
@@ -78,10 +80,10 @@ class Loader {
 
   Tensor upload_bf16(const std::vector<float>& host, std::initializer_list<std::int32_t> shape) {
     std::vector<std::uint16_t> b(host.size());
-    for (std::size_t i = 0; i < host.size(); ++i) b[i] = float_to_bf16_bits(host[i]);
+    for (std::size_t i = 0; i < host.size(); ++i) b[i] = act::host_float_to_bits(host[i]);
     void* d = alloc(b.size() * 2);
     CUDA_CHECK(cudaMemcpy(d, b.data(), b.size() * 2, cudaMemcpyHostToDevice));
-    return rm(d, DType::BF16, shape);
+    return rm(d, kActDType, shape);
   }
 
   // f32(name): checkpoint tensor as FP32 (weights.load_layer's `f32`), viewed with `shape`.
@@ -151,11 +153,11 @@ std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
   return fmt;
 }
 
-// FP8 rows + scales of a BF16 matrix (dense fp8_rows), into new storage.
+// FP8 rows + scales of an ActT matrix (dense fp8_rows), into new storage.
 Dense to_fp8(Loader& ld, const Tensor& bf16, int rows, int cols) {
   void* q = ld.alloc(std::size_t(rows) * cols);
   float* s = static_cast<float*>(ld.alloc(std::size_t(rows) * 4));
-  kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(bf16.data), rows, cols, q, s, ld.stream());
+  kernels::dense::fp8_rows(static_cast<const ActT*>(bf16.data), rows, cols, q, s, ld.stream());
   return Dense{rm(q, DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows})};
 }
 
@@ -205,10 +207,10 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     void* d = dense_fp8 ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p : ld.alloc(std::size_t(R) * H * 2);
     for (int s = 0; s < num_segs(layer.full); ++s)
       queue_bf16_rows(p + seg_names[s], static_cast<char*>(d) + std::size_t(SEG_BEGIN[s]) * H * 2, SEG_ROWS[s], H);
-    wproj_bf16 = rm(d, DType::BF16, {R, H});
+    wproj_bf16 = rm(d, kActDType, {R, H});
     void* o = dense_fp8 ? (wo_tmp = DeviceBuffer(std::size_t(H) * 3072 * 2)).p : ld.alloc(std::size_t(H) * 3072 * 2);
     queue_bf16_rows(p + "attn.wo_ud.weight", o, H, HEADS * HEAD_DIM);
-    wo_bf16 = rm(o, DType::BF16, {H, HEADS * HEAD_DIM});
+    wo_bf16 = rm(o, kActDType, {H, HEADS * HEAD_DIM});
   }
 
   layer.q_scale = ld.f32(p + "attn.q_l2_clip.scale", {HEADS, HEAD_DIM});
@@ -285,11 +287,11 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     Tensor* forgets[3] = {&layer.q_gate_forget, &layer.k_gate_forget, &layer.v_gate_forget};
     Tensor* gains[3] = {&layer.q_gate_gain, &layer.k_gate_gain, &layer.v_gate_gain};
     for (int g = 0; g < 3; ++g) {
-      *downs[g] = at(layer.qkv_gate_down, g, DType::BF16, GATE_RANK, D2);
+      *downs[g] = at(layer.qkv_gate_down, g, kActDType, GATE_RANK, D2);
       *forgets[g] = at(layer.qkv_gate_forget, g, DType::FP32, H, GATE_RANK);
       *gains[g] = at(layer.qkv_gate_gain, g, DType::FP32, H, GATE_RANK);
     }
-    layer.mlp_gate_down = at(layer.mlp1_gate_down, 0, DType::BF16, GATE_RANK, D2);
+    layer.mlp_gate_down = at(layer.mlp1_gate_down, 0, kActDType, GATE_RANK, D2);
     layer.mlp_gate_forget = at(layer.mlp1_gate_forget, 0, DType::FP32, H, GATE_RANK);
     layer.mlp_gate_gain = at(layer.mlp1_gate_gain, 0, DType::FP32, H, GATE_RANK);
   }
@@ -318,6 +320,8 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   }
 
   ld.flush();
+  bf16_to_act_inplace(wproj_bf16.data, std::size_t(R) * H, ld.stream());
+  bf16_to_act_inplace(wo_bf16.data, std::size_t(H) * HEADS * HEAD_DIM, ld.stream());
   if (dense_fp8) {
     layer.wproj = to_fp8(ld, wproj_bf16, R, H);
     layer.wo = to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM);
@@ -372,7 +376,10 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     void* d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.alloc(bytes);
     ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]
     ld.flush();
-    const Tensor bf = rm(d, DType::BF16, {UNPADDED_VOCAB, H});
+    bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream);
+    w.embed.dtype = kActDType;
+    bf16_to_act_inplace(d, std::size_t(UNPADDED_VOCAB) * H, stream);
+    const Tensor bf = rm(d, kActDType, {UNPADDED_VOCAB, H});
     if (dense_fp8) {
       w.unembed = to_fp8(ld, bf, UNPADDED_VOCAB, H);
       CUDA_CHECK(cudaStreamSynchronize(stream));

@@ -8,10 +8,10 @@
 // Attention is one GEMM pair per head over chunks of queries, the scores of a chunk held in FP32.
 #pragma once
 
+#include "core/act.h"
 #include "core/arena.h"
 #include "kernels/prefill/prefill.h"
 
-#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <array>
@@ -29,25 +29,25 @@ inline constexpr int VISION_OUT = 2304;  // the language model's hidden size
 struct VisionLayer {
   const float *ln1_w = nullptr, *ln1_b = nullptr, *ln2_w = nullptr, *ln2_b = nullptr;  // [1024]
   const float *ls1 = nullptr, *ls2 = nullptr;                                          // layer scale [1024]
-  const __nv_bfloat16* wqkv = nullptr;  // [3072, 1024]: q, k and v projections stacked
+  const ActT* wqkv = nullptr;  // [3072, 1024]: q, k and v projections stacked
   const float* bqkv = nullptr;          // [3072]
-  const __nv_bfloat16* wo = nullptr;    // [1024, 1024]
+  const ActT* wo = nullptr;    // [1024, 1024]
   const float* bo = nullptr;
-  const __nv_bfloat16* fc = nullptr;    // [4096, 1024]
+  const ActT* fc = nullptr;    // [4096, 1024]
   const float* bfc = nullptr;           // [4096]
-  const __nv_bfloat16* proj = nullptr;  // [1024, 4096]
+  const ActT* proj = nullptr;  // [1024, 4096]
   const float* bproj = nullptr;
 };
 
 struct VisionWeights {
   std::vector<DeviceBuffer> storage;
-  const __nv_bfloat16* patch_w = nullptr;   // [1024, 1200]
+  const ActT* patch_w = nullptr;   // [1024, 1200]
   const float* pos = nullptr;               // [32 * 32, 1024]
   const float* cls = nullptr;               // [1024]: class embedding + class position embedding
   const float *ln_pre_w = nullptr, *ln_pre_b = nullptr;
   std::array<VisionLayer, VISION_LAYERS> layers{};
-  const __nv_bfloat16* proj_in = nullptr;   // [4096, 4096]
-  const __nv_bfloat16* proj_out = nullptr;  // [2304, 4096]
+  const ActT* proj_in = nullptr;   // [4096, 4096]
+  const ActT* proj_out = nullptr;  // [2304, 4096]
   const float* inv_freq = nullptr;          // [16] rotary frequencies
   std::size_t bytes = 0;                    // device memory held
 };

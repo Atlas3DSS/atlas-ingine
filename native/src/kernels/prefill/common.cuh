@@ -3,7 +3,9 @@
 // src/kernels/common/mma.cuh and memory.cuh), BF16/FP16/FP8 packing, swizzled shared-memory tiles.
 #pragma once
 
+#include "core/act.h"
 #include "kernels/common/copy.cuh"
+#include "kernels/common/mma_sm70.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -20,32 +22,22 @@ __device__ __forceinline__ unsigned smem_addr(const void* ptr) {
 
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
                                             unsigned addr) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-               : "r"(addr));
+  mma::ldmatrix_x4(r0, r1, r2, r3, addr);
 }
 
 __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
                                               unsigned addr) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-               : "r"(addr));
+  mma::ldmatrix_x4_trans(r0, r1, r2, r3, addr);
 }
 
-// D += A * B, m16n8k16, BF16 inputs, FP32 accumulation.
+// D += A * B, m16n8k16, ActT inputs (BF16 on sm_80+, FP16 on INGINE_ACT_FP16 / sm_70), FP32 accumulation.
 __device__ __forceinline__ void mma_bf16(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+  mma::mma_act(c, a[0], a[1], a[2], a[3], b0, b1);
 }
 
 // D += A * B, m16n8k16, FP16 inputs, FP32 accumulation.
 __device__ __forceinline__ void mma_f16(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+  mma::mma_f16(c, a[0], a[1], a[2], a[3], b0, b1);
 }
 
 // 16-byte cp.async (L2 only); src_bytes < 16 zero-fills the rest (0: nothing is read).
@@ -66,17 +58,17 @@ __device__ __forceinline__ void cp_wait() {
   copy::wait<Groups>();
 }
 
-__device__ __forceinline__ float bf_lo(uint32_t u) { return __uint_as_float(u << 16); }
-__device__ __forceinline__ float bf_hi(uint32_t u) { return __uint_as_float(u & 0xffff0000u); }
-__device__ __forceinline__ float bf2f(uint16_t u) { return __uint_as_float(uint32_t(u) << 16); }
-__device__ __forceinline__ float round_bf16(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+__device__ __forceinline__ float bf_lo(uint32_t u) { return act::lo_f(u); }
+__device__ __forceinline__ float bf_hi(uint32_t u) { return act::hi_f(u); }
+__device__ __forceinline__ float bf2f(uint16_t u) { return act::bits_to_float(u); }
+__device__ __forceinline__ float round_bf16(float x) { return act::round_act(x); }
 
 __device__ __forceinline__ uint16_t f2bf_bits(float x) {
-  return __bfloat16_as_ushort(__float2bfloat16_rn(x));
+  return act::float_to_bits(x);
 }
 
 __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
-  return uint32_t(f2bf_bits(lo)) | (uint32_t(f2bf_bits(hi)) << 16);
+  return act::pack2(lo, hi);
 }
 
 __device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
@@ -86,14 +78,13 @@ __device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
 
 // 2 E4M3 codes (low byte first) -> 2 floats (exact via FP16).
 __device__ __forceinline__ float2 e4m3x2_to_float2(uint16_t u) {
-  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u), __NV_E4M3);
-  return __half22float2(*reinterpret_cast<__half2*>(&h));
+  const uint32_t h2 = act::e4m3x2_to_half2_bits(u);
+  return __half22float2(*reinterpret_cast<const __half2*>(&h2));
 }
 
 // 2 E4M3 codes -> packed FP16 pair (exact).
 __device__ __forceinline__ uint32_t e4m3x2_to_half2(uint16_t u) {
-  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u), __NV_E4M3);
-  return uint32_t(h.x) | (uint32_t(h.y) << 16);
+  return act::e4m3x2_to_half2_bits(u);
 }
 
 // float -> E4M3 code, round to nearest even after saturating to +-448 (torch clamp + .to(float8_e4m3fn)).

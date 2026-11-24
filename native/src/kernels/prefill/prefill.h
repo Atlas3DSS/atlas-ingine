@@ -3,7 +3,8 @@
 // row-major (Python order). H = 2304; positions of chunk row t are pos0 + t.
 #pragma once
 
-#include <cuda_bf16.h>
+#include "core/act.h"
+
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -28,7 +29,7 @@ class Gemm {
   ~Gemm();
   Gemm(const Gemm&) = delete;
   Gemm& operator=(const Gemm&) = delete;
-  void run(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb, void* C, int ldc, bool c_fp32, int M,
+  void run(const ActT* A, int lda, const ActT* B, int ldb, void* C, int ldc, bool c_fp32, int M,
            int N, int K, cudaStream_t stream);
 
  private:
@@ -42,19 +43,19 @@ class Gemm {
 // row i holds slot (pos0 + i) % 1024 (position order for a filled ring), rows [1024, 1024 + T) the chunk.
 // ring_gather fills rows [0, 1024) and the positions of every row (kpos int32 [kpos_rows], -1 = empty, padding
 // rows -1); attn_prep writes the chunk rows.
-void ring_gather(const __nv_bfloat16* k_ring, const __nv_bfloat16* v_ring, const int64_t* ring_pos, int pos0, int T,
-                 __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows, cudaStream_t stream);
+void ring_gather(const ActT* k_ring, const ActT* v_ring, const int64_t* ring_pos, int pos0, int T,
+                 ActT* k_rows, ActT* v_rows, int* kpos, int kpos_rows, cudaStream_t stream);
 
 // model.prefill's ring update: the last min(T, 1024) chunk rows (rows 1024.. of k_rows/v_rows) into their slots
 // (pos % 1024), ring_pos = pos.
-void ring_update(const __nv_bfloat16* k_rows, const __nv_bfloat16* v_rows, int pos0, int T, __nv_bfloat16* k_ring,
-                 __nv_bfloat16* v_ring, int64_t* ring_pos, cudaStream_t stream);
+void ring_update(const ActT* k_rows, const ActT* v_rows, int pos0, int T, ActT* k_ring,
+                 ActT* v_ring, int64_t* ring_pos, cudaStream_t stream);
 
 // Per key tile of kAttnKeyTile rows: int4 {min valid position, max valid position, all rows valid, any valid}.
 void key_tile_bounds(const int* kpos, int L, int4* bounds, cudaStream_t stream);
 
 struct AttnPrepParams {
-  const __nv_bfloat16* proj = nullptr;  // [T, ld] BF16-rounded projections in SEG order (fast.proj_layout)
+  const ActT* proj = nullptr;  // [T, ld] BF16-rounded projections in SEG order (fast.proj_layout)
   int ld = 0;
   int T = 0, pos0 = 0;
   bool full = false;
@@ -64,8 +65,8 @@ struct AttnPrepParams {
   const float* v_w = nullptr;
   const float* conv_k = nullptr;   // [3, 1024] previous conv inputs (read only; see conv_state_update)
   const float* conv_v = nullptr;
-  __nv_bfloat16* q = nullptr;      // out [T, 24, 128]
-  __nv_bfloat16* rel = nullptr;    // out [T, 24, 16]
+  ActT* q = nullptr;      // out [T, 24, 128]
+  ActT* rel = nullptr;    // out [T, 24, 16]
   void* k_out = nullptr;           // out [T, 8, 128] rows: bf16, or fp8 e4m3 (out_fp8: full caches with kv_fp8)
   void* v_out = nullptr;
   bool out_fp8 = false;
@@ -76,10 +77,10 @@ void attn_prep(const AttnPrepParams& p, cudaStream_t stream);
 
 // rel_logits[t, h, d] = bf16(sum_j rel[t, h, j] * bf16(rel_proj[j, d])), rel bf16 [T, 24, 16], rel_proj fp32
 // [16, 1024], out bf16 [T, 24, 1024].
-void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfloat16* out, cudaStream_t stream);
+void rel_logits(const ActT* rel, const float* rel_proj, int T, ActT* out, cudaStream_t stream);
 
 struct AttnParams {
-  const __nv_bfloat16* q = nullptr;  // [T, 24, 128]
+  const ActT* q = nullptr;  // [T, 24, 128]
   const void* k = nullptr;           // key rows [L, 8, 128]: bf16, or fp8 e4m3 (kv_fp8)
   const void* v = nullptr;
   bool kv_fp8 = false;
@@ -88,10 +89,10 @@ struct AttnParams {
   int L = 0;
   int T = 0, pos0 = 0;
   int window = 0;                    // 0: causal; else keys with 0 <= qpos - kpos < window
-  const __nv_bfloat16* rel = nullptr;  // rel_logits [T, 24, 1024]
-  const __nv_bfloat16* proj = nullptr; // [T, ld]: gate (sigmoid input) and sink logits in SEG order
+  const ActT* rel = nullptr;  // rel_logits [T, 24, 1024]
+  const ActT* proj = nullptr; // [T, ld]: gate (sigmoid input) and sink logits in SEG order
   int ld = 0;
-  __nv_bfloat16* out = nullptr;        // [T, 3072] = bf16(bf16(attention * sigmoid(lse - sink)) * sigmoid(gate))
+  ActT* out = nullptr;        // [T, 3072] = bf16(bf16(attention * sigmoid(lse - sink)) * sigmoid(gate))
 };
 // flex.attend + the output gate of model._visit: scores (q.k)/sqrt(128) + rel bias (distance < 1024), masked,
 // softmax with the per-head sink folded in through the log-sum-exp. Q.K in BF16 MMA with FP32 accumulation
@@ -103,11 +104,11 @@ void attention(const AttnParams& p, cudaStream_t stream);
 
 // model.static_conv on BF16-valued inputs: out[t, c] = (sum_j w[c, j] * ext[t + j] + x[t, c]) / sqrt(5),
 // ext = [state (3 rows), x]; x bf16 [T, ld], w fp32 [C, 4], state fp32 [3, C], out fp32 [T, C].
-void static_conv(const __nv_bfloat16* x, int ld, int T, int C, const float* w, const float* state, float* out,
+void static_conv(const ActT* x, int ld, int T, int C, const float* w, const float* state, float* out,
                  cudaStream_t stream);
 
 // state <- the last three rows of [state, x] (x bf16 [T, ld], C channels). Run after every reader of state.
-void conv_state_update(float* state, const __nv_bfloat16* x, int ld, int T, int C, cudaStream_t stream);
+void conv_state_update(float* state, const ActT* x, int ld, int T, int C, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------------------- message gates
 
@@ -116,12 +117,12 @@ struct GateRows {
   const float* h[3] = {};
   const float* msg[3] = {};
 };
-void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream);
+void gate_inputs(const GateRows& rows, int G, int T, ActT* gin, cudaStream_t stream);
 
 // out[t] = bf16(rms_norm((1 - tanh(f)) * h + tanh(g) * msg) * norm_w); f, g fp32 [T, H] (the forget / gain
 // products of the BF16 down projection).
 void gate_apply(const float* h, const float* msg, const float* f, const float* g, const float* norm_w, int T,
-                __nv_bfloat16* out, cudaStream_t stream);
+                ActT* out, cudaStream_t stream);
 
 // ------------------------------------------------------------------------------------------------- MoE
 
@@ -156,13 +157,13 @@ struct MoeExperts {
 };
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
 // exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.
-void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
+void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, ActT* act,
                  cudaStream_t stream);
 // down[t * 8 + slot] = bf16(W2_e . act[pair]), bf16 [T * 8, H].
-void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
+void moe_down(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, ActT* down,
               cudaStream_t stream);
 // out[t] = bf16(sum over slots in order of down[t, slot] * wts[t, slot]), bf16 [T, H].
-void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat16* out, cudaStream_t stream);
+void moe_combine(const ActT* down, const float* wts, int T, ActT* out, cudaStream_t stream);
 
 // ------------------------------------------------------------------------------------------------ misc
 
@@ -171,11 +172,11 @@ void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat
 void widen_ids(const int32_t* in, int T, int64_t* out, int32_t negative_as, cudaStream_t stream);
 // dst[r] = float(src[r]) for `count` rows of H: precomputed embedding rows (image tokens) over the rows of
 // the embedding block. src bf16 [count, H], dst f32 [count, H].
-void put_rows(const __nv_bfloat16* src, int count, float* dst, cudaStream_t stream);
+void put_rows(const ActT* src, int count, float* dst, cudaStream_t stream);
 // out[t * out_stride] = bf16(x[t]) per row, x fp32 [T, H] (DSpark taps).
-void store_tap(const float* x, int T, __nv_bfloat16* out, int64_t out_stride, cudaStream_t stream);
+void store_tap(const float* x, int T, ActT* out, int64_t out_stride, cudaStream_t stream);
 // model.logits for one row: out[v] = 30 tanh(bf16(w_v . x) / 30), w bf16 [V, H] or FP8 rows dequantized
 // as weights.dequant (bf16(fp8 * scale[v])); x bf16 [H].
-void head_logits(const __nv_bfloat16* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream);
+void head_logits(const ActT* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream);
 
 }  // namespace ingine::kernels::prefill

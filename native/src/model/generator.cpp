@@ -336,13 +336,13 @@ class EngineGenerator final : public Generator {
         const std::int64_t last = std::min<std::int64_t>(std::int64_t(e.image->pos) + e.image->tokens(), std::int64_t(s) + T);
         if (first < last) {
           rows.push_back(EmbedRows{int(first - std::int64_t(s)), int(last - first),
-                                   static_cast<const __nv_bfloat16*>(e.rows.p) + std::size_t(first - e.image->pos) * HIDDEN});
+                                   static_cast<const ActT*>(e.rows.p) + std::size_t(first - e.image->pos) * HIDDEN});
         }
       }
       CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, ids.data() + s, std::size_t(T) * sizeof(std::int32_t),
                                  cudaMemcpyHostToDevice, stream));
       Tensor taps;
-      if (drafter_) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
+      if (drafter_) taps = rm(taps_.p, kActDType, {T, NUM_TAPS, HIDDEN});
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
                      drafter_ ? &taps : nullptr, rows);
       if (drafter_) {

@@ -3,26 +3,31 @@
 // and rollback, and the selectors of the device-chosen verify width (conditional graph nodes).
 #pragma once
 
+#include "core/act.h"
 #include "model/model_data.h"
 
-#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ingine::model {
 
-// dst[r * dst_stride + c] = bf16(src[r * cols + c]) (round to nearest even, torch copy_ to BF16).
-void f32_to_bf16_rows(const float* src, int rows, int cols, __nv_bfloat16* dst, std::int64_t dst_stride,
+// dst[r * dst_stride + c] = ActT(src[r * cols + c]) (round to nearest even).
+void f32_to_bf16_rows(const float* src, int rows, int cols, ActT* dst, std::int64_t dst_stride,
                       cudaStream_t stream);
+
+// Converts `numel` BF16 elements at `data` to ActT in-place on the device (no-op when ActT is BF16;
+// converts BF16 -> FP16 with finite saturation to +-65504 when INGINE_ACT_FP16=1).
+void bf16_to_act_inplace(void* data, std::size_t numel, cudaStream_t stream);
 
 // Device pointers of the recurrent decode state a step overwrites besides the cache rows at its own
 // positions: the conv states (fp32 [48, 3, C], oldest input first; C = KV_DIM for k/v, HIDDEN for attn/mlp)
 // and the sliding rings (k/v bf16 [40, WINDOW, KV_DIM], positions int64 [40, WINDOW]).
 struct StatePtrs {
   float* conv[4];  // conv_k, conv_v, conv_attn, conv_mlp
-  __nv_bfloat16* k_ring;
-  __nv_bfloat16* v_ring;
+  ActT* k_ring;
+  ActT* v_ring;
   std::int64_t* ring_pos;
 };
 inline constexpr int CONV_COLS[4] = {KV_DIM, KV_DIM, HIDDEN, HIDDEN};
@@ -32,8 +37,8 @@ inline constexpr int CONV_ROW_FLOATS = 2 * KV_DIM + 2 * HIDDEN;  // one row of a
 // ring slot p % WINDOW of every sliding visit.
 struct StepUndo {
   float* conv;           // fp32 [48, CONV_ROW_FLOATS]: per visit k | v | attn | mlp
-  __nv_bfloat16* k;      // bf16 [40, KV_DIM]
-  __nv_bfloat16* v;      // bf16 [40, KV_DIM]
+  ActT* k;      // bf16 [40, KV_DIM]
+  ActT* v;      // bf16 [40, KV_DIM]
   std::int64_t* pos;     // int64 [40]
 };
 
@@ -41,8 +46,8 @@ struct StepUndo {
 // a rollback keeps at least one row) and ring slots (P + r) % WINDOW, r < m.
 struct VerifyBackup {
   float* conv[4];        // fp32 [48, 3, C] like the conv states (rows 1, 2 written)
-  __nv_bfloat16* k;      // bf16 [40, 8, KV_DIM]
-  __nv_bfloat16* v;      // bf16 [40, 8, KV_DIM]
+  ActT* k;      // bf16 [40, 8, KV_DIM]
+  ActT* v;      // bf16 [40, 8, KV_DIM]
   std::int64_t* pos;     // int64 [40, 8]
 };
 
