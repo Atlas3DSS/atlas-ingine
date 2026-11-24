@@ -21,6 +21,17 @@ project(ingine LANGUAGES C CXX CUDA)
 
 option(INGINE_BUILD_TESTS "Build ingine tests" OFF)
 option(INGINE_BUILD_APPS "Build the ingine executables (serve, bench, validate)" ON)
+option(INGINE_ACT_FP16 "Use FP16 activations/weights instead of BF16 (required for Volta sm_70)" OFF)
+
+# Auto-enable INGINE_ACT_FP16 when building for Volta sm_70 (no BF16 tensor cores or cuBLASLt BF16).
+if(NOT INGINE_ACT_FP16)
+  foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    if(_arch STREQUAL "70" OR _arch STREQUAL "70-real" OR _arch STREQUAL "70-virtual")
+      set(INGINE_ACT_FP16 ON CACHE BOOL "Use FP16 activations/weights instead of BF16 (required for Volta sm_70)" FORCE)
+      break()
+    endif()
+  endforeach()
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

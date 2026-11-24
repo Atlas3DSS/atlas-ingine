@@ -43,13 +43,38 @@
       "cacheVariables": {
         "INGINE_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "sm70",
+      "displayName": "Volta sm_70 (V100) release binaries with CUDA 12.9 and FP16 activations",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-sm70",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "70",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda-12.9/bin/nvcc",
+        "CUDAToolkit_ROOT": "/usr/local/cuda-12.9",
+        "INGINE_ACT_FP16": "ON",
+        "INGINE_BUILD_APPS": "ON",
+        "INGINE_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "sm70-dev",
+      "displayName": "Volta sm_70 (V100) binaries and FP64-oracle tests with CUDA 12.9",
+      "inherits": "sm70",
+      "cacheVariables": {
+        "INGINE_BUILD_TESTS": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
     { "name": "dev", "configurePreset": "dev" },
     { "name": "install", "configurePreset": "install" },
-    { "name": "multiarch-dev", "configurePreset": "multiarch-dev" }
+    { "name": "multiarch-dev", "configurePreset": "multiarch-dev" },
+    { "name": "sm70", "configurePreset": "sm70" },
+    { "name": "sm70-dev", "configurePreset": "sm70-dev" }
   ],
   "testPresets": [
     {
@@ -60,6 +85,11 @@
     {
       "name": "multiarch-dev",
       "configurePreset": "multiarch-dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "sm70-dev",
+      "configurePreset": "sm70-dev",
       "output": { "outputOnFailure": true }
     }
   ]
