@@ -46,7 +46,12 @@ DeviceBuffer upload_ints(const std::vector<int>& v) {
 }  // namespace
 
 Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl)
-    : w_(w), abl_(abl), st_(st), pdl_(pdl), attn_ws_(attn::workspace_bytes(8)) {
+    : w_(w),
+      abl_(abl),
+      st_(st),
+      pdl_(pdl),
+      attn_ws_(attn::workspace_bytes(8)),
+      moe_down_ws_(std::size_t(8) * TOP_K * HIDDEN * 2) {
   attn_ws_.fill(0);  // zeroed once; the kernel resets its counter itself
   segments_[0] = upload_ints(proj_layout(false, true));
   segments_[1] = upload_ints(proj_layout(false, false));
@@ -97,8 +102,13 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     return p;
   };
 
-  dense::embed(static_cast<const std::int64_t*>(b.token.data), m, static_cast<const ActT*>(w.embed.data),
-               f32p(w.embed_norm), f32m(b.B0), pdl, stream);
+  if (w.embed_q4()) {
+    dense::embed_q4(static_cast<const std::int64_t*>(b.token.data), m, w.embed.data, f32p(w.embed_norm), f32m(b.B0),
+                    pdl, stream);
+  } else {
+    dense::embed(static_cast<const std::int64_t*>(b.token.data), m, static_cast<const ActT*>(w.embed.data),
+                 f32p(w.embed_norm), f32m(b.B0), pdl, stream);
+  }
   int prev_v = -1;
   int tap = 0;
   const float* attn_dirs = f32p(abl.attn_dirs);
@@ -187,6 +197,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.k_cache = st.k_full_at(fi).data;
       a.v_cache = st.v_full_at(fi).data;
       a.cache_fp8 = st.kv_fp8;
+      a.cache_q4 = st.kv_q4;
       a.cache_rows = st.max_ctx;
       a.kpos = nullptr;
       a.window = 0;
@@ -198,6 +209,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.k_cache = st.k_ring_at(ri).data;
       a.v_cache = st.v_ring_at(ri).data;
       a.cache_fp8 = false;
+      a.cache_q4 = false;
       a.cache_rows = WINDOW;
       a.kpos = st.ring_pos_at(ri);
       a.window = WINDOW;
@@ -230,13 +242,18 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
                   static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
     const Experts& ex = layer.experts;
-    const moe::Format fmt = static_cast<moe::Format>(static_cast<int>(ex.fmt));
-    moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data, ex.w13_scale.data,
-                f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream);
+    const moe::Format fmt13 = static_cast<moe::Format>(static_cast<int>(ex.w13_fmt));
+    const moe::Format fmt2 = static_cast<moe::Format>(static_cast<int>(ex.w2_fmt));
+    const bool exl13 = is_exl3(ex.w13_fmt), exl2 = is_exl3(ex.w2_fmt);
+    moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data,
+                exl13 ? ex.w13_rin.data : ex.w13_scale.data, exl13 ? nullptr : f32p(ex.w13_factor), fmt13, bf16m(b.act),
+                pdl, stream, ex.w13_rout.data);
     // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
-    moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data, ex.w2_scale.data,
-                  f32p(ex.w2_factor), fmt, f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
-                  history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, pdl, stream);
+    moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data,
+                  exl2 ? ex.w2_rin.data : ex.w2_scale.data, exl2 ? nullptr : f32p(ex.w2_factor), fmt2,
+                  f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
+                  history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, pdl, stream, ex.w2_rout.data,
+                  static_cast<ActT*>(moe_down_ws_.p));
     prev_v = v;
   }
   // ---- final read; the same launch writes b.taps[:, 3] = b.xf

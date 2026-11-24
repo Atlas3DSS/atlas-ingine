@@ -137,8 +137,9 @@ std::string default_model_dir() {
 
 int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
-  int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
-  bool dense_fp8 = false, kv_fp8 = false, spec = false;
+  int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
+      forced_free = -1;
+  bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, spec = false, vision = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -147,11 +148,16 @@ int main(int argc, char** argv) {
   ap.option("--backend", "{fast}", "", &backend, {"fast"});
   ap.option("--ablation", "", "", &ablation);
   ap.option("--max-ctx", "", "", &max_ctx);
+  ap.option("--prefill-chunk", "", "tokens per prefill chunk (default 3072; lower saves VRAM on 12 GB GPUs)",
+            &prefill_chunk);
   ap.option("--tokens", "", "", &tokens);
   ap.option("--runs", "", "", &runs);
   ap.option("--effort", "", "", &effort);
   ap.flag("--dense-fp8", "", &dense_fp8);
+  ap.flag("--vision", "also load the vision tower", &vision);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
+  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok; SWA stays BF16)", &kv_q4);
+  ap.exclusive({"--kv-fp8", "--kv-q4"}, false);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
@@ -175,10 +181,13 @@ int main(int argc, char** argv) {
     options.model_dir = model_dir;
     options.ablation = ablation;
     options.max_ctx = max_ctx;
+    options.prefill_chunk = prefill_chunk;
     options.dense_fp8 = dense_fp8;
     options.kv_fp8 = kv_fp8;
+    options.kv_q4 = kv_q4;
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
+    options.vision = vision;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;

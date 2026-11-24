@@ -100,4 +100,8 @@ void message_gates(const float* h, bool h_shared, const float* msg, int G, int M
 void embed(const std::int64_t* token, int M, const ActT* table, const float* norm_w, float* out,
            bool pdl, cudaStream_t stream);
 
+// embed_q4: Q4_0 SoA embedding table u8 [V, 1296] ([1152B nibbles | 72 FP16 scales]) -> identical RMS norm output.
+void embed_q4(const std::int64_t* token, int M, const void* table_q4, const float* norm_w, float* out,
+              bool pdl, cudaStream_t stream);
+
 }  // namespace ingine::kernels::dense

@@ -22,9 +22,10 @@ struct DecodeArgs {
   const float* v_conv = nullptr;
   float* conv_k_state = nullptr;    // fp32 [3, 1024]
   float* conv_v_state = nullptr;
-  void* k_cache = nullptr;          // [rows, 8, 128] bf16, or float8_e4m3fn (full layers only)
+  void* k_cache = nullptr;          // [rows, 8, 128] bf16/fp8, or [rows, 576] u8 Q4_0 (full layers only)
   void* v_cache = nullptr;
   bool cache_fp8 = false;
+  bool cache_q4 = false;
   std::int64_t cache_rows = 0;      // 1024 (sliding) or max_ctx (full), at most 2^30
   std::int64_t* kpos = nullptr;     // sliding: int64 [1024] slot positions (-1 = empty); full: unused
   const std::int64_t* pos = nullptr;  // int64 device, pos[0] = position of the first token

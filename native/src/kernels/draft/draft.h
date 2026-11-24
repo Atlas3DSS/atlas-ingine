@@ -111,7 +111,7 @@ void commit_store(const float* kv, const DraftParams* p, const CtxLayers& L, cud
 // xn = bf16(rms(res) * in_norm). Also clears the per-step picks (uint64 [GAMMA]).
 void embed_block(const ActT* embed, const float* embed_norm, const ActT* mask_embed,
                  const ActT* in_norm, const DraftParams* p, ActT* res, ActT* xn,
-                 unsigned long long* picks, cudaStream_t stream);
+                 unsigned long long* picks, cudaStream_t stream, bool embed_q4 = false);
 
 // A round's transition in one launch: sets p (commit_feats, ncommit, start, anchor, P) from the round inputs,
 // and does commit_mix and embed_block for those values (the same arithmetic as the two launches).
@@ -119,7 +119,7 @@ void round_begin(DraftParams* p, const RoundInputs& in, const ActT* alpha, const
                  const ActT* f_norm, const ActT* embed, const float* embed_norm,
                  const ActT* mask_embed, const ActT* in_norm, ActT* xin,
                  ActT* f_rnn, ActT* res, ActT* xn, unsigned long long* picks,
-                 cudaStream_t stream);
+                 cudaStream_t stream, bool embed_q4 = false);
 
 // q/k/v of the block rows: qkv fp32 [8, 5120] (BF16 values). q, k: bf16(rope(bf16(rms_head * norm))) at
 // positions P + i; v as is. q -> q_out bf16 [8, 24, 128]. Keys/values go to the cache (BF16 or E4M3 rows):

@@ -66,8 +66,8 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
-  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
+  int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1;
+  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, spec = false, no_vision = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -83,11 +83,16 @@ int main(int argc, char** argv) {
   ap.exclusive({"--engine", "--fake"}, true);
   ap.option("--ablation", "", "ablation file (safetensors) applied at every visit", &ablation);
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
+  ap.option("--prefill-chunk", "", "tokens per prefill chunk (default 3072; use 512 on 12 GB GPUs for 262K ctx)",
+            &prefill_chunk);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
+  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok, ~2.25 GiB at 262144 positions; SWA stays BF16)",
+          &kv_q4);
+  ap.exclusive({"--kv-fp8", "--kv-q4"}, false);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--park-mb", "",
@@ -143,8 +148,10 @@ int main(int argc, char** argv) {
       options.model_dir = model_dir;
       options.ablation = ablation;
       options.max_ctx = max_ctx;
+      options.prefill_chunk = prefill_chunk;
       options.dense_fp8 = dense_fp8;
       options.kv_fp8 = kv_fp8;
+      options.kv_q4 = kv_q4;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;

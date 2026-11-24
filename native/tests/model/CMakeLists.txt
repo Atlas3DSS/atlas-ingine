@@ -29,3 +29,7 @@ if(TARGET ingine_serve AND TARGET ingine_kernels_vision)
   ingine_add_test(NAME model_vision SOURCES test_vision_generate.cpp LIBS ingine_model ingine_serve
                   LABELS vision GPU MODEL TIMEOUT 900)
 endif()
+# Standalone Part 1 (--kv-q4) KL, VRAM, and 64K/128K/245K needle evaluator
+add_executable(eval_kv_q4 eval_kv_q4.cpp)
+target_link_libraries(eval_kv_q4 PRIVATE ingine_model ingine_text nlohmann_json::nlohmann_json)
+target_compile_definitions(eval_kv_q4 PRIVATE INGINE_GOLDEN_DIR="${PROJECT_SOURCE_DIR}/tests/golden")

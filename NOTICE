@@ -117,5 +117,16 @@ Modifications by Atlas3DSS:
   bit-identical Blackwell fast paths (48/48 kernels_bitlock PASS).
 - Native sub-4-bit Elastic MoE weight formats (ATLAS2 2.50 b/w, ATLAS3 3.50 b/w)
   in decode and prefill kernels plus tools/quantize_elastic_ingine.py.
+- 4-bit Q4_0 global KV cache (--kv-q4) for the 8 global full-attention visits
+  (keeping all 40 SWA layers in BF16; 9 KiB/tok = 2.25 GiB at 262K context).
+- Native EXL3 / Escha W2 MCG trellis + 128-point Hadamard MoE decode and prefill
+  kernels (2-bit and 3-bit mixed-precision Map M2) and Q4_0 token embeddings:
+  * EXL3 MCG trellis codebook (0xCBAC1FED, lop3 0x8fff8fff/0x3b603b60, hadd2),
+    16x16 tail-biting ring bitstream, and tile_perm fragment layout derived from
+    ExLlamaV3 (https://github.com/turboderp-org/exllamav3, MIT License,
+    Copyright (c) turboderp and ExLlamaV3 contributors).
+  * Escha W2 / Kintsugi-Inkling-2-Mini Map M2 expert quantization format and
+    128-pt Sylvester Hadamard rotation layout compatible with EschaLabs
+    escha-mlx and Kintsugi-Inkling-2-Mini (Apache License 2.0).
 - Native OpenAI response_format (text, json_object, json_schema) and automatic
   tool-invocation token suppression when tools are omitted.

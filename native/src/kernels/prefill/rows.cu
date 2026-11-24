@@ -134,7 +134,30 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
       for (int q = 0; q < 4; ++q) y[q] = round_bf16(y[q] * r);
     }
     void* dst = kv == 0 ? p.k_out : p.v_out;
-    if (p.out_fp8) {  // State.full_store: saturate to +-448, E4M3 round to nearest even
+    if (p.out_q4) {  // Q4_0 per-32-element block: 8 lanes x 4 elems = 32 elems, 64B nibbles + 8B FP16 scales
+      auto pick_max = [](float a, float b) {
+        const float aa = fabsf(a), ab = fabsf(b);
+        return (ab > aa || (ab == aa && b < a)) ? b : a;
+      };
+      float mx = pick_max(pick_max(y[0], y[1]), pick_max(y[2], y[3]));
+#pragma unroll
+      for (int o = 1; o < 8; o <<= 1) mx = pick_max(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+      const __half d_h = __float2half_rn(mx * (-0.125f));
+      const float d = __half2float(d_h);
+      const float id = d != 0.f ? (1.f / d) : 0.f;
+      uint32_t q[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        int qi = __float2int_rn(y[j] * id);
+        qi = max(-8, min(7, qi));
+        q[j] = uint32_t(qi + 8);
+      }
+      uint8_t* row_dst = static_cast<uint8_t*>(dst) + size_t(t) * kKvQ4RowBytes;
+      *reinterpret_cast<uint16_t*>(row_dst + warp * 64 + lane * 2) =
+          uint16_t(q[0] | (q[1] << 4) | (q[2] << 8) | (q[3] << 12));
+      if ((lane & 7) == 0)
+        *reinterpret_cast<uint16_t*>(row_dst + kKvQ4NibbleBytes + warp * 8 + (lane >> 3) * 2) = __half_as_ushort(d_h);
+    } else if (p.out_fp8) {  // State.full_store: saturate to +-448, E4M3 round to nearest even
       const uint32_t b = uint32_t(f2e4m3(y[0])) | (uint32_t(f2e4m3(y[1])) << 8) | (uint32_t(f2e4m3(y[2])) << 16) |
                          (uint32_t(f2e4m3(y[3])) << 24);
       *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dst) + size_t(t) * kKvDim + c) = b;
@@ -330,6 +353,7 @@ __global__ void __launch_bounds__(256) head_kernel(const uint16_t* __restrict__ 
 void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
   if (p.T <= 0 || !p.proj || !p.q || !p.rel || !p.k_out || !p.v_out || !p.conv_k || !p.conv_v)
     throw std::invalid_argument("attn_prep: missing argument");
+  if (p.out_fp8 && p.out_q4) throw std::invalid_argument("attn_prep: out_fp8 and out_q4 are mutually exclusive");
   attn_prep_kernel<<<p.T, 256, 0, stream>>>(p);
 }
 

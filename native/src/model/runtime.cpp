@@ -78,7 +78,7 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
-  state_ = make_state(options.max_ctx, options.kv_fp8);
+  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_q4);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);

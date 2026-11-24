@@ -91,7 +91,7 @@ struct RuntimeOptions {
   // Tokens per prefill chunk. 3072 (the largest the sliding attention takes) reads a long prompt 6-10% faster
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
-  bool dense_fp8 = true, kv_fp8 = false, spec = false;
+  bool dense_fp8 = true, kv_fp8 = false, kv_q4 = false, spec = false;
   float spec_threshold = 0.8f;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:

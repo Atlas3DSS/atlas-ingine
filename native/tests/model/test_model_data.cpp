@@ -34,6 +34,7 @@ int main() {
   const int begin[] = {0, 3072, 6144, 6528, 6552, 7576, 8600, 8632, 8664};
   for (int s = 0; s <= NUM_SEGS; ++s) expect(SEG_BEGIN[s] == begin[s], "projection layout");
   expect(PROJ_ROWS_SLIDING == 8600 && PROJ_ROWS_FULL == 8664, "projection rows");
+  expect(KV_Q4_ROW_BYTES == 576 && NUM_FULL_VISITS * 2 * KV_Q4_ROW_BYTES == 9216, "q4 kv row bytes (9 KiB/tok)");
   std::printf("%s model_data constants\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }

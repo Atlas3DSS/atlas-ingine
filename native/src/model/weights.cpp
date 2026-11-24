@@ -123,33 +123,52 @@ class Loader {
   std::vector<UploadRequest> pending_;
 };
 
-std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
+struct LayerExpertFormats {
+  ExpertFormat w13 = ExpertFormat::NVFP4;
+  ExpertFormat w2 = ExpertFormat::NVFP4;
+};
+
+ExpertFormat parse_expert_dtype(const std::string& dt) {
+  if (dt == "nvfp4") return ExpertFormat::NVFP4;
+  if (dt == "mxfp8") return ExpertFormat::MXFP8;
+  if (dt == "atlas2") return ExpertFormat::ATLAS2;
+  if (dt == "atlas3") return ExpertFormat::ATLAS3;
+  if (dt == "exl3_2") return ExpertFormat::EXL3_2;
+  if (dt == "exl3_3") return ExpertFormat::EXL3_3;
+  throw std::runtime_error("weights: unsupported expert format " + dt);
+}
+
+std::array<LayerExpertFormats, LAYERS> expert_formats(const fs::path& model_dir) {
   std::ifstream in(model_dir / "hf_quant_config.json");
   if (!in) throw std::runtime_error("weights: cannot open " + (model_dir / "hf_quant_config.json").string());
   const nlohmann::json q = nlohmann::json::parse(in);
-  std::array<ExpertFormat, LAYERS> fmt{};
-  std::array<bool, LAYERS> seen{};
-  const std::string suffix = "mlp.experts.w13_weight";
+  std::array<LayerExpertFormats, LAYERS> fmt{};
+  std::array<bool, LAYERS> seen13{}, seen2{};
+  const std::string s13 = "mlp.experts.w13_weight";
+  const std::string s2 = "mlp.experts.w2_weight";
+  const std::string pfx = "model.llm.layers.";
   for (const auto& group : q.at("model").at("parameter_groups")) {
     const std::string dt = group.at("compute_dtype").get<std::string>();
     for (const auto& t : group.at("tensors")) {
       const std::string name = t.get<std::string>();
-      if (name.size() < suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
-        continue;
-      // model.llm.layers.<l>.mlp.experts.w13_weight
-      const std::size_t a = std::string("model.llm.layers.").size();
-      const int l = std::stoi(name.substr(a, name.find('.', a) - a));
+      const bool is13 = name.size() >= s13.size() && name.compare(name.size() - s13.size(), s13.size(), s13) == 0;
+      const bool is2 = !is13 && name.size() >= s2.size() && name.compare(name.size() - s2.size(), s2.size(), s2) == 0;
+      if (!is13 && !is2) continue;
+      const int l = std::stoi(name.substr(pfx.size(), name.find('.', pfx.size()) - pfx.size()));
       if (l < 0 || l >= LAYERS) continue;
-      if (dt == "nvfp4") fmt[l] = ExpertFormat::NVFP4;
-      else if (dt == "mxfp8") fmt[l] = ExpertFormat::MXFP8;
-      else if (dt == "atlas2") fmt[l] = ExpertFormat::ATLAS2;
-      else if (dt == "atlas3") fmt[l] = ExpertFormat::ATLAS3;
-      else throw std::runtime_error("weights: unsupported expert format " + dt);
-      seen[l] = true;
+      if (is13) {
+        fmt[l].w13 = parse_expert_dtype(dt);
+        seen13[l] = true;
+      } else {
+        fmt[l].w2 = parse_expert_dtype(dt);
+        seen2[l] = true;
+      }
     }
   }
-  for (int l = 0; l < LAYERS; ++l)
-    if (!seen[l]) throw std::runtime_error("weights: no expert format for layer " + std::to_string(l));
+  for (int l = 0; l < LAYERS; ++l) {
+    if (!seen13[l]) throw std::runtime_error("weights: no w13 expert format for layer " + std::to_string(l));
+    if (!seen2[l]) fmt[l].w2 = fmt[l].w13;
+  }
   return fmt;
 }
 
@@ -170,7 +189,7 @@ Dense row_view(const Dense& d, int begin, int end) {
   return v;
 }
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
+Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -299,25 +318,35 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   // routed experts in checkpoint encoding
   const std::string e = p + "mlp.experts.";
   Experts& ex = layer.experts;
-  ex.fmt = fmt;
-  ex.w13 = ld.raw(e + "w13_weight");
-  ex.w13_scale = ld.raw(e + "w13_weight_scale");
-  ex.w2 = ld.raw(e + "w2_weight");
-  ex.w2_scale = ld.raw(e + "w2_weight_scale");
-  const bool mxfp8 = fmt == ExpertFormat::MXFP8;
-  const std::string want_codes = mxfp8 ? "F8_E4M3" : "U8", want_scales = mxfp8 ? "U8" : "F8_E4M3";
-  if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
-      m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales)
-    throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
-  if (!mxfp8) {
-    for (const char* w : {"w13", "w2"}) {
-      const std::vector<float> amax = host_f32(m, e + w + "_weight_amax");
-      const std::vector<float> den = host_f32(m, e + w + "_weight_outer_scale_denominator");
+  ex.fmt = ef.w13;
+  ex.w13_fmt = ef.w13;
+  ex.w2_fmt = ef.w2;
+  auto load_expert_proj = [&](const char* proj, ExpertFormat pfmt, Tensor& wt, Tensor& sc, Tensor& fac, Tensor& rin,
+                              Tensor& rout) {
+    wt = ld.raw(e + proj + "_weight");
+    if (is_exl3(pfmt)) {
+      rin = ld.raw(e + proj + "_rin");
+      rout = ld.raw(e + proj + "_rout");
+      if (m.at(e + proj + "_weight")->dtype != "U8" || m.at(e + proj + "_rin")->dtype != "F16" ||
+          m.at(e + proj + "_rout")->dtype != "F16")
+        throw std::runtime_error("weights: layer " + std::to_string(l) + " EXL3 " + proj + " dtype mismatch");
+      return;
+    }
+    sc = ld.raw(e + proj + "_weight_scale");
+    const bool mxfp8 = pfmt == ExpertFormat::MXFP8;
+    const std::string want_codes = mxfp8 ? "F8_E4M3" : "U8", want_scales = mxfp8 ? "U8" : "F8_E4M3";
+    if (m.at(e + proj + "_weight")->dtype != want_codes || m.at(e + proj + "_weight_scale")->dtype != want_scales)
+      throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
+    if (!mxfp8) {
+      const std::vector<float> amax = host_f32(m, e + proj + "_weight_amax");
+      const std::vector<float> den = host_f32(m, e + proj + "_weight_outer_scale_denominator");
       std::vector<float> f(EXPERTS);
       for (int i = 0; i < EXPERTS; ++i) f[i] = amax[i] / den[den.size() == 1 ? 0 : i];  // FP32 division
-      (std::string(w) == "w13" ? ex.w13_factor : ex.w2_factor) = ld.upload_f32(f, {EXPERTS});
+      fac = ld.upload_f32(f, {EXPERTS});
     }
-  }
+  };
+  load_expert_proj("w13", ef.w13, ex.w13, ex.w13_scale, ex.w13_factor, ex.w13_rin, ex.w13_rout);
+  load_expert_proj("w2", ef.w2, ex.w2, ex.w2_scale, ex.w2_factor, ex.w2_rin, ex.w2_rout);
 
   ld.flush();
   bf16_to_act_inplace(wproj_bf16.data, std::size_t(R) * H, ld.stream());
@@ -343,11 +372,15 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   DeviceUploader up;
   Weights w;
   w.dense_fp8 = dense_fp8;
-  w.expert_formats = expert_formats(model_dir);
+  const auto efs = expert_formats(model_dir);
+  for (int l = 0; l < LAYERS; ++l) {
+    w.expert_formats[l] = efs[l].w13;
+    w.w2_expert_formats[l] = efs[l].w2;
+  }
   w.storage.reserve(4096);
   Loader ld(m, up, stream, w.storage);
   const int H = HIDDEN;
-  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
+  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, efs[l], dense_fp8));
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
@@ -364,7 +397,10 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     w.message_queries = ld.upload_f32(mq, {n, 4, H});
   }
   w.embed = ld.raw("model.llm.embed.weight");
-  if (w.embed.dtype != DType::BF16) throw std::runtime_error("weights: embed must be BF16");
+  const bool embed_bf16 = w.embed.dtype == DType::BF16;
+  const bool embed_q4 = w.embed.dtype == DType::U8 && w.embed.ne[0] == EMBED_Q4_ROW_BYTES && w.embed.ne[1] == VOCAB;
+  if (!embed_bf16 && !embed_q4)
+    throw std::runtime_error("weights: embed must be BF16 [VOCAB, H] or Q4_0 U8 [VOCAB, 1296]");
   w.embed_norm = ld.f32("model.llm.embed_norm.weight", {H});
   w.final_query = ld.f32("model.llm.attn_res.output_query", {1, H});
   w.final_norm = ld.f32("model.llm.norm.weight", {H});
@@ -376,8 +412,10 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     void* d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.alloc(bytes);
     ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]
     ld.flush();
-    bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream);
-    w.embed.dtype = kActDType;
+    if (embed_bf16) {
+      bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream);
+      w.embed.dtype = kActDType;
+    }
     bf16_to_act_inplace(d, std::size_t(UNPADDED_VOCAB) * H, stream);
     const Tensor bf = rm(d, kActDType, {UNPADDED_VOCAB, H});
     if (dense_fp8) {

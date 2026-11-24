@@ -5,6 +5,7 @@
 // tile). Checks the output, the new cache rows, ring positions and conv states; full layers also rerun with
 // random bytes in the rows at and after p0 + M (stale speculative rows) and require identical output bits.
 // Synthetic layer parameters; caches of 10016 rows (about 40 MB).
+#include "core/device.h"
 #include "kernels/oracle.h"
 
 #include "kernels/attn/attn.h"
@@ -44,7 +45,7 @@ struct Cache {
 
 float stored(float x, bool fp8) { return fp8 ? e4m3_to_float(float_to_e4m3(x)) : x; }
 
-Cache make_cache(Rng& rng, int rows, bool fp8) {
+Cache make_cache(Rng& rng, int rows, bool fp8, bool q4) {
   Cache c;
   c.k.resize(size_t(rows) * C);
   c.v.resize(c.k.size());
@@ -62,6 +63,16 @@ Cache make_cache(Rng& rng, int rows, bool fp8) {
         c.v[(size_t(r) * HKV + g) * D + d] = stored(round_bf16(float(v[d] * rv)), fp8);
       }
     }
+  if (q4) {
+    std::vector<uint8_t> kb(size_t(rows) * kTestKvQ4RowBytes), vb(size_t(rows) * kTestKvQ4RowBytes);
+    for (int r = 0; r < rows; ++r) {
+      q4_0_pack_row(&c.k[size_t(r) * C], &kb[size_t(r) * kTestKvQ4RowBytes], &c.k[size_t(r) * C]);
+      q4_0_pack_row(&c.v[size_t(r) * C], &vb[size_t(r) * kTestKvQ4RowBytes], &c.v[size_t(r) * C]);
+    }
+    c.dk.emplace(kb);
+    c.dv.emplace(vb);
+    return c;
+  }
   auto bytes = [&](const std::vector<float>& x) {
     std::vector<uint8_t> b(x.size() * (fp8 ? 1 : 2));
     for (size_t i = 0; i < x.size(); ++i) {
@@ -79,8 +90,14 @@ Cache make_cache(Rng& rng, int rows, bool fp8) {
   return c;
 }
 
-std::vector<float> cache_values(const DeviceArray<uint8_t>& d, bool fp8) {
+std::vector<float> cache_values(const DeviceArray<uint8_t>& d, bool fp8, bool q4) {
   const auto b = d.download();
+  if (q4) {
+    const size_t rows = b.size() / kTestKvQ4RowBytes;
+    std::vector<float> o(rows * C);
+    for (size_t r = 0; r < rows; ++r) q4_0_unpack_row(&b[r * kTestKvQ4RowBytes], &o[r * C]);
+    return o;
+  }
   std::vector<float> o(b.size() / (fp8 ? 1 : 2));
   for (size_t i = 0; i < o.size(); ++i) {
     if (fp8) {
@@ -96,14 +113,14 @@ std::vector<float> cache_values(const DeviceArray<uint8_t>& d, bool fp8) {
 
 struct Case {
   std::string name;
-  bool full, fp8;
+  bool full, fp8, q4 = false;
   int M, p0;
   std::vector<int64_t> kpos;  // sliding: ring positions before the call
 };
 
 bool run(Rng& rng, const Case& cs) {
   const int M = cs.M, p0 = cs.p0;
-  const bool full = cs.full, fp8 = cs.fp8;
+  const bool full = cs.full, fp8 = cs.fp8, q4 = cs.q4;
   const int R = full ? 8664 : 8600, rows = full ? CAP : WIN;
   // ---- inputs
   std::vector<float> proj(size_t(M) * R);
@@ -122,7 +139,7 @@ bool run(Rng& rng, const Case& cs) {
   const std::vector<float> rel_proj = randn_bf16(rng, DREL * EXT, 0.5);
   const std::vector<float> kconv = randn_bf16(rng, 4 * C, 0.3), vconv = randn_bf16(rng, 4 * C, 0.3);  // [C,4] | [4,C]
   const std::vector<float> ck0 = randn_bf16(rng, 3 * C, 1.0), cv0 = randn_bf16(rng, 3 * C, 1.0);
-  Cache cache = make_cache(rng, rows, fp8);
+  Cache cache = make_cache(rng, rows, fp8, q4);
   DeviceArray<float> dproj(proj), dqs(q_scale), drs(r_scale), drp(rel_proj), dkc(kconv), dvc(vconv), dck(ck0),
       dcv(cv0);
   std::vector<int64_t> kpos = cs.kpos;
@@ -143,6 +160,7 @@ bool run(Rng& rng, const Case& cs) {
   a.k_cache = cache.dk->get();
   a.v_cache = cache.dv->get();
   a.cache_fp8 = fp8;
+  a.cache_q4 = q4;
   a.cache_rows = rows;
   a.kpos = full ? nullptr : dkpos.get();
   a.pos = dpos.get();
@@ -227,8 +245,19 @@ bool run(Rng& rng, const Case& cs) {
         for (int d = 0; d < D; ++d) row[d] *= inv;
       }
     }
-    for (auto& v : nk) v = stored(float(rbf(v)), fp8);
-    for (auto& v : nv) v = stored(float(rbf(v)), fp8);
+    if (q4) {
+      for (int m = 0; m < M; ++m) {
+        float krow[C], vrow[C], kdeq[C], vdeq[C];
+        uint8_t dummy[kTestKvQ4RowBytes];
+        for (int c = 0; c < C; ++c) krow[c] = float(rbf(nk[size_t(m) * C + c])), vrow[c] = float(rbf(nv[size_t(m) * C + c]));
+        q4_0_pack_row(krow, dummy, kdeq);
+        q4_0_pack_row(vrow, dummy, vdeq);
+        for (int c = 0; c < C; ++c) nk[size_t(m) * C + c] = kdeq[c], nv[size_t(m) * C + c] = vdeq[c];
+      }
+    } else {
+      for (auto& v : nk) v = stored(float(rbf(v)), fp8);
+      for (auto& v : nv) v = stored(float(rbf(v)), fp8);
+    }
   };
   cache_reference.operator()<double>(nk, nv);
   std::vector<double> ideal_k, ideal_v;
@@ -251,11 +280,23 @@ bool run(Rng& rng, const Case& cs) {
       ok_v.push_back(&cache.v[size_t(r) * C]);
       dist.push_back(int(p - kp));
     }
+    // For Q4_0: owner's new keys/values are staged in ActT (s_nkv), and native M > 1 runs Q.K^T in ActT MMA
+    // (K rounded to ActT, V rounded to FP16), whereas M = 1 (and low-SMEM sequential M=1 fallback) attends in FP32.
+    const bool m_tc = M > 1 && ingine::current_max_smem_optin() >= (M <= 2 ? 49152 : 65536);
     std::vector<float> nkf(size_t(M) * C), nvf(size_t(M) * C);
-    for (size_t i = 0; i < nkf.size(); ++i) nkf[i] = float(nk[i]), nvf[i] = float(nv[i]);
+    std::vector<float> nkf_raw(size_t(M) * C), nvf_raw(size_t(M) * C);
+    for (size_t i = 0; i < nkf.size(); ++i) {
+      nkf_raw[i] = float(nk[i]);
+      nvf_raw[i] = float(nv[i]);
+      nkf[i] = q4 ? float(rbf(nk[i])) : float(nk[i]);
+      nvf[i] = q4 ? (m_tc ? __half2float(__float2half_rn(float(rbf(nv[i])))) : float(rbf(nv[i]))) : float(nv[i]);
+    }
+    const size_t n_old = ok_k.size();
     for (int i = 0; i <= m; ++i) {
-      ok_k.push_back(&nkf[size_t(i) * C]);
-      ok_v.push_back(&nvf[size_t(i) * C]);
+      // Sequential M=1 fallback reads prior tokens i < m back from the Q4_0 cache in FP32; token m uses s_nkv (ActT).
+      const bool from_q4_cache = q4 && !m_tc && i < m;
+      ok_k.push_back(&(from_q4_cache ? nkf_raw : nkf)[size_t(i) * C]);
+      ok_v.push_back(&(from_q4_cache ? nvf_raw : nvf)[size_t(i) * C]);
       dist.push_back(m - i);
     }
     for (int h = 0; h < HQ; ++h) {
@@ -265,7 +306,8 @@ bool run(Rng& rng, const Case& cs) {
       double mx = proj[size_t(m) * R + OFF_SINK + h];
       for (size_t j = 0; j < ok_k.size(); ++j) {
         double d = 0;
-        for (int e = 0; e < D; ++e) d += qh[e] * ok_k[j][g * D + e];
+        const bool k_bf16 = q4 && m_tc && j < n_old;
+        for (int e = 0; e < D; ++e) d += qh[e] * (k_bf16 ? rbf(ok_k[j][g * D + e]) : double(ok_k[j][g * D + e]));
         s[j] = d / std::sqrt(128.0) + (dist[j] < EXT ? rl[(size_t(m) * HQ + h) * EXT + dist[j]] : 0.0);
         mx = std::max(mx, s[j]);
       }
@@ -274,7 +316,9 @@ bool run(Rng& rng, const Case& cs) {
       for (size_t j = 0; j < ok_k.size(); ++j) {
         const double e = std::exp(s[j] - mx);
         den += e;
-        for (int d = 0; d < D; ++d) o[d] += e * ok_v[j][g * D + d];
+        const bool v_f16 = q4 && m_tc && j < n_old;
+        for (int d = 0; d < D; ++d)
+          o[d] += e * (v_f16 ? double(__half2float(__float2half_rn(ok_v[j][g * D + d]))) : double(ok_v[j][g * D + d]));
       }
       for (int d = 0; d < D; ++d) {
         const size_t i = (size_t(m) * HQ + h) * D + d;
@@ -287,7 +331,7 @@ bool run(Rng& rng, const Case& cs) {
   const std::string n = cs.name;
   bool ok = Check{(n + " out").c_str(), 1.0 / 128, 2e-3, 0.02}(bf16_download(out), exact, &spec);
   // new cache rows (rare one-ulp flips of the BF16 rounding allowed)
-  const auto gk = cache_values(*cache.dk, fp8), gv = cache_values(*cache.dv, fp8);
+  const auto gk = cache_values(*cache.dk, fp8, q4), gv = cache_values(*cache.dv, fp8, q4);
   std::vector<float> rk, rv;
   std::vector<double> wk, wv;
   for (int m = 0; m < M; ++m) {
@@ -297,13 +341,19 @@ bool run(Rng& rng, const Case& cs) {
       rv.push_back(gv[size_t(row) * C + c]), wv.push_back(nv[size_t(m) * C + c]);
     }
   }
-  const double ulp = fp8 ? 1.0 / 8 : 1.0 / 128;
-  if constexpr (ingine::kActIsFP16) {
-    ok &= Check{(n + " new keys vs FP64").c_str(), ulp, 1e-6, 0}(rk, ideal_k);
-    ok &= Check{(n + " new values vs FP64").c_str(), ulp, 1e-6, 0}(rv, ideal_v);
+  if (q4) {
+    // Q4_0: allow rare 1-nibble boundary flip (<= 1 block step) on < 1% of elements, exact on the rest
+    ok &= Check{(n + " new keys").c_str(), 1.0 / 6, 0.45, 0.01}(rk, wk, &wk);
+    ok &= Check{(n + " new values").c_str(), 1.0 / 6, 0.25, 0.01}(rv, wv, &wv);
+  } else {
+    const double ulp = fp8 ? 1.0 / 8 : 1.0 / 128;
+    if constexpr (ingine::kActIsFP16) {
+      ok &= Check{(n + " new keys vs FP64").c_str(), ulp, 1e-6, 0}(rk, ideal_k);
+      ok &= Check{(n + " new values vs FP64").c_str(), ulp, 1e-6, 0}(rv, ideal_v);
+    }
+    ok &= Check{(n + " new keys").c_str(), ulp, 1e-6, 2e-3}(rk, wk, &wk);
+    ok &= Check{(n + " new values").c_str(), ulp, 1e-6, 2e-3}(rv, wv, &wv);
   }
-  ok &= Check{(n + " new keys").c_str(), ulp, 1e-6, 2e-3}(rk, wk, &wk);
-  ok &= Check{(n + " new values").c_str(), ulp, 1e-6, 2e-3}(rv, wv, &wv);
   std::vector<double> sk(want_ck.begin(), want_ck.end()), sv(want_cv.begin(), want_cv.end());
   ok &= Check{(n + " conv_k state").c_str(), 0, 0, 0}(dck.download(), sk);
   ok &= Check{(n + " conv_v state").c_str(), 0, 0, 0}(dcv.download(), sv);
@@ -318,7 +368,7 @@ bool run(Rng& rng, const Case& cs) {
     // Rows at and after p0 hold whatever earlier (rejected speculative) calls left there; the call writes rows
     // p0 .. p0 + M - 1 itself. Re-run twice with fresh random bytes in all of them (NaN / Inf patterns
     // included) and the conv states reset: the output must be bit-identical.
-    const size_t rb = size_t(C) * (fp8 ? 1 : 2);
+    const size_t rb = q4 ? size_t(kTestKvQ4RowBytes) : size_t(C) * (fp8 ? 1 : 2);
     size_t diff = 0;
     for (int rep = 0; rep < 2; ++rep) {
       std::vector<uint8_t> kb = cache.dk->download(), vb = cache.dv->download();
@@ -388,6 +438,19 @@ int main() {
     Case c;
     c.full = true, c.fp8 = true, c.M = M, c.p0 = 4637;
     c.name = "full fp8 p0=4637 M=" + std::to_string(M);
+    ok &= run(rng, c);
+  }
+  for (int p0 : {0, 3000, 9000})
+    for (int M : {1, 3, 8}) {
+      Case c;
+      c.full = true, c.fp8 = false, c.q4 = true, c.M = M, c.p0 = p0;
+      c.name = "full q4 p0=" + std::to_string(p0) + " M=" + std::to_string(M);
+      ok &= run(rng, c);
+    }
+  for (int M = 2; M <= 8; ++M) {  // every verify width, p0 not a multiple of the 64-key Q4 tile
+    Case c;
+    c.full = true, c.fp8 = false, c.q4 = true, c.M = M, c.p0 = 4637;
+    c.name = "full q4 p0=4637 M=" + std::to_string(M);
     ok &= run(rng, c);
   }
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));

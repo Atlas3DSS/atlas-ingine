@@ -161,7 +161,8 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   };
 
   pk::widen_ids(tokens, T, ids_, IMAGE_PLACEHOLDER_ID, s);
-  dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
+  if (w.embed_q4()) dense::embed_q4(ids_, T, w.embed.data, f32p(w.embed_norm), B0_, false, s);
+  else dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
   // image tokens: the vision tower's rows take the place of the placeholder's embedding (model.forward's
   // masked_scatter into the normed embeddings); every later read of the embedding block sees them
   for (const EmbedRows& r : rows) {
@@ -254,12 +255,14 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
     if (layer.full) {
       const int fi = FULL_INDEX[v];
-      const std::size_t es = st.kv_fp8 ? 1 : 2, off = std::size_t(pos0) * KV_DIM * es;
+      const std::size_t off = std::size_t(pos0) * st.full_row_bytes();
       void* kc = st.k_full_at(fi).data;
       void* vc = st.v_full_at(fi).data;
-      ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off, ap.out_fp8 = st.kv_fp8;
+      ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off;
+      ap.out_fp8 = st.kv_fp8, ap.out_q4 = st.kv_q4;
       pk::attn_prep(ap, s);
-      at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kpos = nullptr, at.bounds = nullptr, at.L = pos0 + T;
+      at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kv_q4 = st.kv_q4, at.kpos = nullptr, at.bounds = nullptr,
+      at.L = pos0 + T;
       at.window = 0;
     } else {
       const int ri = RING_INDEX[v];
@@ -269,11 +272,12 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       // keys = cat(ring, chunk) as model.prefill reads them, before the ring takes the chunk's last rows
       pk::ring_gather(k_ring, v_ring, ring_pos, pos0, T, krows_, vrows_, kpos_, kpos_rows_, s);
       ap.k_out = krows_ + std::size_t(WINDOW) * KV_DIM, ap.v_out = vrows_ + std::size_t(WINDOW) * KV_DIM;
-      ap.out_fp8 = false;
+      ap.out_fp8 = false, ap.out_q4 = false;
       pk::attn_prep(ap, s);
       pk::ring_update(krows_, vrows_, pos0, T, k_ring, v_ring, ring_pos, s);
       pk::key_tile_bounds(kpos_, WINDOW + T, bounds_, s);
-      at.k = krows_, at.v = vrows_, at.kv_fp8 = false, at.kpos = kpos_, at.bounds = bounds_, at.L = WINDOW + T;
+      at.k = krows_, at.v = vrows_, at.kv_fp8 = false, at.kv_q4 = false, at.kpos = kpos_, at.bounds = bounds_,
+      at.L = WINDOW + T;
       at.window = WINDOW;
     }
     pk::conv_state_update(st.conv_k_at(v), proj_ + SEG_BEGIN[SEG_K], R, T, KV_DIM, s);
@@ -310,8 +314,18 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
     pk::moe_route(idx_, T, work, s);
     const Experts& ex = layer.experts;
-    const pk::MoeExperts me{static_cast<int>(ex.fmt), ex.w13.data, ex.w13_scale.data,
-                            f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
+    const bool exl13 = is_exl3(ex.w13_fmt), exl2 = is_exl3(ex.w2_fmt);
+    const pk::MoeExperts me{static_cast<int>(ex.w13_fmt),
+                            ex.w13.data,
+                            exl13 ? ex.w13_rin.data : ex.w13_scale.data,
+                            exl13 ? nullptr : f32p(ex.w13_factor),
+                            ex.w2.data,
+                            exl2 ? ex.w2_rin.data : ex.w2_scale.data,
+                            exl2 ? nullptr : f32p(ex.w2_factor),
+                            static_cast<int>(ex.w2_fmt),
+                            ex.w13_rout.data,
+                            ex.w2_rout.data,
+                            down_};
     pk::moe_gate_up(me, xm_, T, work, act_, s);
     pk::moe_down(me, act_, T, work, down_, s);
     pk::moe_combine(down_, wts_, T, moe_sum_, s);

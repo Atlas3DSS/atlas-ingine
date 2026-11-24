@@ -15,6 +15,9 @@ namespace ingine::kernels::prefill {
 inline constexpr int kHidden = 2304;
 inline constexpr int kHeads = 24, kKvHeads = 8, kHeadDim = 128, kRel = 16, kRelExtent = 1024;
 inline constexpr int kKvDim = kKvHeads * kHeadDim;  // 1024
+inline constexpr int kKvQ4NibbleBytes = kKvDim / 2;              // 512
+inline constexpr int kKvQ4ScaleBytes = kKvHeads * (kHeadDim / 32) * 2;  // 64
+inline constexpr int kKvQ4RowBytes = kKvQ4NibbleBytes + kKvQ4ScaleBytes;  // 576
 inline constexpr int kInter = 1152, kExperts = 128, kTopK = 8;
 inline constexpr int kAttnKeyTile = 64;    // keys per attention tile (tile bounds granularity)
 inline constexpr int kAttnMaxTiles = 64;   // explicit-position key tiles per call (ring + chunk)
@@ -65,11 +68,12 @@ struct AttnPrepParams {
   const float* v_w = nullptr;
   const float* conv_k = nullptr;   // [3, 1024] previous conv inputs (read only; see conv_state_update)
   const float* conv_v = nullptr;
-  ActT* q = nullptr;      // out [T, 24, 128]
-  ActT* rel = nullptr;    // out [T, 24, 16]
-  void* k_out = nullptr;           // out [T, 8, 128] rows: bf16, or fp8 e4m3 (out_fp8: full caches with kv_fp8)
+  ActT* q = nullptr;               // out [T, 24, 128]
+  ActT* rel = nullptr;             // out [T, 24, 16]
+  void* k_out = nullptr;           // out [T, 8, 128] ActT/fp8, or [T, 576] u8 Q4_0 (out_q4: full caches)
   void* v_out = nullptr;
   bool out_fp8 = false;
+  bool out_q4 = false;
 };
 // model._qkv per token: q (scale, clip, tau, BF16), rel (scale, clip, tau, BF16), keys/values through the
 // static (sliding) or dynamic (full) conv, BF16, key clip / value RMS norm, stored at the cache precision.
@@ -81,9 +85,10 @@ void rel_logits(const ActT* rel, const float* rel_proj, int T, ActT* out, cudaSt
 
 struct AttnParams {
   const ActT* q = nullptr;  // [T, 24, 128]
-  const void* k = nullptr;           // key rows [L, 8, 128]: bf16, or fp8 e4m3 (kv_fp8)
+  const void* k = nullptr;  // key rows [L, 8, 128] ActT/fp8, or [L, 576] u8 Q4_0 (kv_q4)
   const void* v = nullptr;
   bool kv_fp8 = false;
+  bool kv_q4 = false;
   const int* kpos = nullptr;         // positions of the L keys (padded to tiles with -1), or null: key j at j
   const int4* bounds = nullptr;      // key_tile_bounds of kpos (with kpos)
   int L = 0;
@@ -147,13 +152,17 @@ void moe_topk(const float* logits, const float* bias, int T, int* idx, float* wt
 void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream);
 
 struct MoeExperts {
-  int fmt = 0;  // 0 NVFP4, 1 MXFP8 (weights.py layouts)
+  int fmt = 0;  // w13 format: 0 NVFP4, 1 MXFP8, 2 ATLAS2, 3 ATLAS3, 4 EXL3_2, 5 EXL3_3
   const void* w13 = nullptr;
-  const void* w13_scale = nullptr;
+  const void* w13_scale = nullptr;  // block scales, or w13_rin (F16 [128, H]) for EXL3
   const float* w13_factor = nullptr;
   const void* w2 = nullptr;
-  const void* w2_scale = nullptr;
+  const void* w2_scale = nullptr;   // block scales, or w2_rin (F16 [128, I]) for EXL3
   const float* w2_factor = nullptr;
+  int w2_fmt = -1;                  // w2 format (-1 -> same as fmt)
+  const void* w13_rout = nullptr;   // F16 [128, 2I] for EXL3
+  const void* w2_rout = nullptr;    // F16 [128, H] for EXL3
+  ActT* exl3_scratch = nullptr;     // ActT [T * 8, 2I] scratch for EXL3 stacked gate/up (e.g. down_)
 };
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
 // exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.

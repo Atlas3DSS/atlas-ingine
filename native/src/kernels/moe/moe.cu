@@ -43,6 +43,7 @@
 // Ported from engine/csrc/moe/moe.cu (kernel bodies unchanged; torch launchers -> raw pointers).
 #include "kernels/moe/moe.h"
 
+#include "kernels/common/exl3.cuh"
 #include "kernels/common/l2.cuh"
 #include "kernels/common/mma_sm70.cuh"
 
@@ -369,6 +370,11 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], uint32_t a0, uint32_t a1
     mma::mma_act(d, a0, a1, a2, a3, b0, b1);
 }
 
+__device__ __forceinline__ void mma_f16(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                        uint32_t b0, uint32_t b1) {
+    mma::mma_f16(d, a0, a1, a2, a3, b0, b1);
+}
+
 // One warp step: chunk c of rows g and g+8 of a 16-row tile, plus the lane's B column (token g) for the
 // same 32 columns (zero if the token does not use this expert).
 template <int FMT>
@@ -630,6 +636,428 @@ moe_down_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const
     }
 }
 
+// ----------------------------------------------------------------------------- EXL3 / Escha W2 decode
+
+// EXL3 moe_up: W13 is stacked [gate(0..1151); up(1152..2303)], codes u8 [128, 144, 144, 32*BITS],
+// rin f16 [128, 2304], rout f16 [128, 2304]. Grid: (9, M * TOPK), 18 warps (576 threads).
+// Block (blk, slot) owns 128-row gate block `blk` + 128-row up block `9 + blk` for deduplicated expert `e`.
+// M1=true specializes M==1: 18 KiB smem (2x occupancy) and a SINGLE __syncthreads() for all 16 output tiles.
+template <int BITS, bool M1>
+__global__ void __launch_bounds__(UP_WARPS * 32)
+moe_up_exl3_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
+                   const __half* __restrict__ rin, const __half* __restrict__ rout, int M,
+                   ActT* __restrict__ out) {
+    constexpr int K = H;
+    constexpr int NT = (2 * I) / 16;   // 144
+    constexpr int KT = K / 16;         // 144
+    constexpr int TILE_BYTES = 32 * BITS;
+    constexpr int SM_M = M1 ? 1 : MAXM;
+    __shared__ union {
+        __half x_rot[UP_WARPS][SM_M][128];   // M1: 4,608 B | M>1: 36,864 B
+        float red_m1[UP_WARPS][2][128];      // M1: 18,432 B (single barrier for all 256 gate+up outputs!)
+        struct {
+            float red[UP_WARPS][2][32][4];   // M>1: 18,432 B (2 tiles in parallel per barrier)
+            float y[2][SM_M][128];           // M>1:  8,192 B
+        } r;
+    } smem;
+
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, ti = lane & 3;
+    const int blk = blockIdx.x, slot = blockIdx.y;
+    const int nslots = M * TOPK;
+    pdl_wait();
+    pdl_trigger();
+    const int lo = lane < nslots ? ld_dep(idx + lane) : -1;
+    const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
+    const int e = ld_dep(idx + slot);
+    const uint64_t mask = slot_mask(e, lo, hi);
+    if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;
+
+    // Phase 1: Input rin * x -> 128-pt Hadamard per warp (each warp owns k = warp*128 .. +127)
+    const __half* rin_e = rin + size_t(e) * K + warp * 128;
+    float r_in[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r_in[i] = __half2float(__ldg(rin_e + lane * 4 + i));
+    const int m_lim = M1 ? 1 : M;
+    for (int m = 0; m < m_lim; ++m) {
+        if (M1 || ((mask >> (8 * m)) & 0xffu)) {
+            const ActT* xm = x + size_t(m) * K + warp * 128 + lane * 4;
+            float v[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                uint16_t raw;
+                asm volatile("ld.global.u16 %0, [%1];" : "=h"(raw) : "l"(xm + i) : "memory");
+                v[i] = act::bits_to_float(raw) * r_in[i];
+            }
+            exl3::fwht_128_warp(v, lane);
+            *reinterpret_cast<__half2*>(&smem.x_rot[warp][m][lane * 4]) = __floats2half2_rn(v[0], v[1]);
+            *reinterpret_cast<__half2*>(&smem.x_rot[warp][m][lane * 4 + 2]) = __floats2half2_rn(v[2], v[3]);
+        }
+    }
+    __syncwarp();
+
+    // Phase 2: 16 output tiles (8 gate + 8 up) x 8 contiguous k-tiles via mma_f16 (nt_l outer, kt_l inner!)
+    const bool g_on = M1 ? (g == 0) : (g < M && ((mask >> (8 * g)) & 0xffu));
+    const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+    uint32_t xb0[8], xb1[8];
+#pragma unroll
+    for (int kt_l = 0; kt_l < 8; ++kt_l) {
+        if (g_on) {
+            xb0[kt_l] = *reinterpret_cast<const uint32_t*>(&smem.x_rot[warp][M1 ? 0 : g][kt_l * 16 + 2 * ti]);
+            xb1[kt_l] = *reinterpret_cast<const uint32_t*>(&smem.x_rot[warp][M1 ? 0 : g][kt_l * 16 + 2 * ti + 8]);
+        } else {
+            xb0[kt_l] = 0u;
+            xb1[kt_l] = 0u;
+        }
+    }
+    if constexpr (M1) __syncthreads();  // x_rot is now in registers! Reuse smem immediately for red_m1.
+
+    float acc_g[8][4], acc_u[8][4];
+    const uint8_t* w_e = w + size_t(e) * NT * KT * TILE_BYTES;
+    auto run_side = [&](int side, int nt0, float (&acc)[8][4]) {
+#pragma unroll
+        for (int nt_l = 0; nt_l < 8; ++nt_l) {
+            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            const uint8_t* w_row = w_e + (size_t(nt0 + nt_l) * KT + warp * 8) * TILE_BYTES;
+#pragma unroll
+            for (int kt_l = 0; kt_l < 8; ++kt_l) {
+                const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_row + kt_l * TILE_BYTES);
+                uint32_t h01, h23, h45, h67;
+                exl3::dq8_mcg<BITS>([&](int wi) { return ld_stream_u1(tw + wi, wpol); }, lane, h01, h23, h45, h67);
+                mma_f16(d, h01, h45, h23, h67, xb0[kt_l], xb1[kt_l]);
+            }
+            if constexpr (M1) {
+                if (ti == 0) {
+                    smem.red_m1[warp][side][nt_l * 16 + g] = d[0];
+                    smem.red_m1[warp][side][nt_l * 16 + g + 8] = d[2];
+                }
+            } else {
+#pragma unroll
+                for (int v = 0; v < 4; ++v) acc[nt_l][v] = d[v];
+            }
+        }
+    };
+    run_side(0, blk * 8, acc_g);
+    run_side(1, 72 + blk * 8, acc_u);
+    __syncthreads();
+
+    if constexpr (M1) {
+        // Single barrier total! Warp 0 sums all 18 warps in fixed order -> FWHT -> rout -> SwiGLU -> out!
+        if (warp == 0) {
+            float vg[4] = {0.f, 0.f, 0.f, 0.f}, vu[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int ww = 0; ww < UP_WARPS; ++ww) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    vg[i] += smem.red_m1[ww][0][lane * 4 + i];
+                    vu[i] += smem.red_m1[ww][1][lane * 4 + i];
+                }
+            }
+            exl3::fwht_128_warp(vg, lane);
+            exl3::fwht_128_warp(vu, lane);
+            const __half* rg = rout + size_t(e) * (2 * I) + blk * 128 + lane * 4;
+            const __half* ru = rout + size_t(e) * (2 * I) + I + blk * 128 + lane * 4;
+            ActT ab[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float gate = bf16_round(vg[i] * __half2float(__ldg(rg + i)));
+                const float up = bf16_round(vu[i] * __half2float(__ldg(ru + i)));
+                const float a = tanhf(gate / 4.f) * 4.f * (1.f / (1.f + expf(-gate))) * (tanhf(up / 25.f) * 25.f);
+                ab[i] = act::from_float(a);
+            }
+            uint32_t kmask = uint32_t(mask) & 0xffu;
+            while (kmask) {
+                const int k = __ffs(kmask) - 1;
+                kmask &= kmask - 1;
+                ActT* dst = out + size_t(k) * I + blk * 128 + lane * 4;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) dst[i] = ab[i];
+            }
+        }
+    } else {
+        // M > 1: reduce 2 tiles per barrier using 2 warps in parallel (8 barriers total instead of 32)
+        for (int s = 0; s < 2; ++s) {
+            for (int nt_pair = 0; nt_pair < 8; nt_pair += 2) {
+#pragma unroll
+                for (int p = 0; p < 2; ++p) {
+                    const float (&a)[4] = (s == 0 ? acc_g[nt_pair + p] : acc_u[nt_pair + p]);
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) smem.r.red[warp][p][lane][v] = a[v];
+                }
+                __syncthreads();
+                if (warp < 2) {
+                    const int nt_l = nt_pair + warp;
+                    float sum[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                    for (int ww = 0; ww < UP_WARPS; ++ww)
+#pragma unroll
+                        for (int v = 0; v < 4; ++v) sum[v] += smem.r.red[ww][warp][lane][v];
+                    const int m0 = 2 * ti, m1 = 2 * ti + 1;
+                    if (m0 < M) {
+                        smem.r.y[s][m0][nt_l * 16 + g] = sum[0];
+                        smem.r.y[s][m0][nt_l * 16 + g + 8] = sum[2];
+                    }
+                    if (m1 < M) {
+                        smem.r.y[s][m1][nt_l * 16 + g] = sum[1];
+                        smem.r.y[s][m1][nt_l * 16 + g + 8] = sum[3];
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+        if (warp < M) {
+            uint32_t kmask = uint32_t(mask >> (8 * warp)) & 0xffu;
+            if (kmask) {
+                float vg[4], vu[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    vg[i] = smem.r.y[0][warp][lane * 4 + i];
+                    vu[i] = smem.r.y[1][warp][lane * 4 + i];
+                }
+                exl3::fwht_128_warp(vg, lane);
+                exl3::fwht_128_warp(vu, lane);
+                const __half* rg = rout + size_t(e) * (2 * I) + blk * 128 + lane * 4;
+                const __half* ru = rout + size_t(e) * (2 * I) + I + blk * 128 + lane * 4;
+                ActT ab[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float gate = bf16_round(vg[i] * __half2float(__ldg(rg + i)));
+                    const float up = bf16_round(vu[i] * __half2float(__ldg(ru + i)));
+                    const float a = tanhf(gate / 4.f) * 4.f * (1.f / (1.f + expf(-gate))) * (tanhf(up / 25.f) * 25.f);
+                    ab[i] = act::from_float(a);
+                }
+                while (kmask) {
+                    const int k = __ffs(kmask) - 1;
+                    kmask &= kmask - 1;
+                    ActT* dst = out + (size_t(warp) * TOPK + k) * I + blk * 128 + lane * 4;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) dst[i] = ab[i];
+                }
+            }
+        }
+    }
+}
+
+// EXL3 moe_down Stage 1: W2 codes u8 [128, 144, 72, 32*BITS], rin f16 [128, 1152], rout f16 [128, 2304].
+// Grid: (18, M * TOPK) -> 144 active blocks at M=1! 9 warps (288 threads) cover K = 1152.
+// M1=true specializes M==1: 4.6 KiB smem (max occupancy) and a SINGLE __syncthreads() across all 8 tiles!
+template <int BITS, bool M1>
+__global__ void __launch_bounds__(DOWN_GROUPS * 32)
+moe_down_exl3_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const uint8_t* __restrict__ w,
+                     const __half* __restrict__ rin, const __half* __restrict__ rout, int M,
+                     ActT* __restrict__ ws) {
+    constexpr int K = I;
+    constexpr int NT = H / 16;    // 144
+    constexpr int KT = K / 16;    // 72
+    constexpr int TILE_BYTES = 32 * BITS;
+    constexpr int SM_M = M1 ? 1 : MAXM;
+    __shared__ union {
+        __half x_rot[DOWN_GROUPS][SM_M][128];  // M1: 2,304 B | M>1: 18,432 B
+        float red_m1[DOWN_GROUPS][128];        // M1: 4,608 B
+        struct {
+            float red[DOWN_GROUPS][2][32][4];  // M>1: 9,216 B
+            float y[SM_M][128];                // M>1: 4,096 B
+        } r;
+    } smem;
+
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, ti = lane & 3;
+    const int blk = blockIdx.x, slot = blockIdx.y;
+    const int nslots = M * TOPK;
+    const int lo = lane < nslots ? ld_dep(idx + lane) : -1;
+    const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
+    const int e = ld_dep(idx + slot);
+    const uint64_t mask = slot_mask(e, lo, hi);
+    if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;
+
+    const __half* rin_e = rin + size_t(e) * K + warp * 128;
+    float r_in[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r_in[i] = __half2float(__ldg(rin_e + lane * 4 + i));
+
+    pdl_wait();
+
+    const int m_lim = M1 ? 1 : M;
+    for (int m = 0; m < m_lim; ++m) {
+        const uint32_t km = uint32_t(mask >> (8 * m)) & 0xffu;
+        if (M1 || km) {
+            const int k0 = M1 ? slot : (__ffs(km) - 1);
+            const ActT* am = act + (size_t(m) * TOPK + k0) * K + warp * 128 + lane * 4;
+            float v[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                uint16_t raw;
+                asm volatile("ld.global.u16 %0, [%1];" : "=h"(raw) : "l"(am + i) : "memory");
+                v[i] = act::bits_to_float(raw) * r_in[i];
+            }
+            exl3::fwht_128_warp(v, lane);
+            *reinterpret_cast<__half2*>(&smem.x_rot[warp][m][lane * 4]) = __floats2half2_rn(v[0], v[1]);
+            *reinterpret_cast<__half2*>(&smem.x_rot[warp][m][lane * 4 + 2]) = __floats2half2_rn(v[2], v[3]);
+        }
+    }
+    __syncwarp();
+
+    const bool g_on = M1 ? (g == 0) : (g < M && ((mask >> (8 * g)) & 0xffu));
+    const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+    uint32_t xb0[8], xb1[8];
+#pragma unroll
+    for (int kt_l = 0; kt_l < 8; ++kt_l) {
+        if (g_on) {
+            xb0[kt_l] = *reinterpret_cast<const uint32_t*>(&smem.x_rot[warp][M1 ? 0 : g][kt_l * 16 + 2 * ti]);
+            xb1[kt_l] = *reinterpret_cast<const uint32_t*>(&smem.x_rot[warp][M1 ? 0 : g][kt_l * 16 + 2 * ti + 8]);
+        } else {
+            xb0[kt_l] = 0u;
+            xb1[kt_l] = 0u;
+        }
+    }
+    if constexpr (M1) __syncthreads();  // x_rot is now in registers!
+
+    float acc[8][4];
+    const uint8_t* w_e = w + size_t(e) * NT * KT * TILE_BYTES;
+    const int nt0 = blk * 8;
+#pragma unroll
+    for (int nt_l = 0; nt_l < 8; ++nt_l) {
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        const uint8_t* w_row = w_e + (size_t(nt0 + nt_l) * KT + warp * 8) * TILE_BYTES;
+#pragma unroll
+        for (int kt_l = 0; kt_l < 8; ++kt_l) {
+            const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_row + kt_l * TILE_BYTES);
+            uint32_t h01, h23, h45, h67;
+            exl3::dq8_mcg<BITS>([&](int wi) { return ld_stream_u1(tw + wi, wpol); }, lane, h01, h23, h45, h67);
+            mma_f16(d, h01, h45, h23, h67, xb0[kt_l], xb1[kt_l]);
+        }
+        if constexpr (M1) {
+            if (ti == 0) {
+                smem.red_m1[warp][nt_l * 16 + g] = d[0];
+                smem.red_m1[warp][nt_l * 16 + g + 8] = d[2];
+            }
+        } else {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) acc[nt_l][v] = d[v];
+        }
+    }
+    __syncthreads();
+    pdl_trigger();  // Stage 2 combine+conv may start its prologue
+
+    if constexpr (M1) {
+        if (warp == 0) {
+            float v[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int ww = 0; ww < DOWN_GROUPS; ++ww)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) v[i] += smem.red_m1[ww][lane * 4 + i];
+            exl3::fwht_128_warp(v, lane);
+            const __half* ro = rout + size_t(e) * H + blk * 128 + lane * 4;
+            ActT yb[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) yb[i] = act::from_float(v[i] * __half2float(__ldg(ro + i)));
+            uint32_t kmask = uint32_t(mask) & 0xffu;
+            while (kmask) {
+                const int k = __ffs(kmask) - 1;
+                kmask &= kmask - 1;
+                ActT* dst = ws + size_t(k) * H + blk * 128 + lane * 4;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) dst[i] = yb[i];
+            }
+        }
+    } else {
+        for (int nt_pair = 0; nt_pair < 8; nt_pair += 2) {
+#pragma unroll
+            for (int p = 0; p < 2; ++p)
+#pragma unroll
+                for (int v = 0; v < 4; ++v) smem.r.red[warp][p][lane][v] = acc[nt_pair + p][v];
+            __syncthreads();
+            if (warp < 2) {
+                const int nt_l = nt_pair + warp;
+                float sum[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                for (int ww = 0; ww < DOWN_GROUPS; ++ww)
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) sum[v] += smem.r.red[ww][warp][lane][v];
+                const int m0 = 2 * ti, m1 = 2 * ti + 1;
+                if (m0 < M) {
+                    smem.r.y[m0][nt_l * 16 + g] = sum[0];
+                    smem.r.y[m0][nt_l * 16 + g + 8] = sum[2];
+                }
+                if (m1 < M) {
+                    smem.r.y[m1][nt_l * 16 + g] = sum[1];
+                    smem.r.y[m1][nt_l * 16 + g + 8] = sum[3];
+                }
+            }
+            __syncthreads();
+        }
+
+        if (warp < M) {
+            uint32_t kmask = uint32_t(mask >> (8 * warp)) & 0xffu;
+            if (kmask) {
+                float v[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) v[i] = smem.r.y[warp][lane * 4 + i];
+                exl3::fwht_128_warp(v, lane);
+                const __half* ro = rout + size_t(e) * H + blk * 128 + lane * 4;
+                ActT yb[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) yb[i] = act::from_float(v[i] * __half2float(__ldg(ro + i)));
+                while (kmask) {
+                    const int k = __ffs(kmask) - 1;
+                    kmask &= kmask - 1;
+                    ActT* dst = ws + (size_t(warp) * TOPK + k) * H + blk * 128 + lane * 4;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) dst[i] = yb[i];
+                }
+            }
+        }
+    }
+}
+
+// EXL3 moe_down Stage 2: slot-ordered weighted sum + post-MLP conv + state update (PDL-overlapped).
+__global__ void __launch_bounds__(128)
+moe_down_combine_conv_kernel(const ActT* __restrict__ ws, const float* __restrict__ wts, int M,
+                             const float* __restrict__ conv_w, float* __restrict__ conv_state, float* __restrict__ out,
+                             float* __restrict__ conv_hist) {
+    const int ch = blockIdx.x * 128 + threadIdx.x;
+    const float4 cw = *reinterpret_cast<const float4*>(conv_w + 4 * ch);
+    pdl_wait();
+    float ext[MAXM + 3];
+    ext[0] = ld_dep(conv_state + ch);
+    ext[1] = ld_dep(conv_state + H + ch);
+    ext[2] = ld_dep(conv_state + 2 * H + ch);
+    for (int m = 0; m < MAXM; ++m) {
+        if (m < M) {
+            float s = 0.f;
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) {
+                const int sl = m * TOPK + k;
+                uint16_t raw;
+                asm volatile("ld.global.u16 %0, [%1];" : "=h"(raw) : "l"(ws + size_t(sl) * H + ch) : "memory");
+                s = __fadd_rn(s, __fmul_rn(ld_dep(wts + sl), act::bits_to_float(raw)));
+            }
+            ext[m + 3] = bf16_round(s);
+        } else {
+            ext[m + 3] = 0.f;
+        }
+    }
+    pdl_trigger();
+    constexpr float inv_sqrt5 = 1.f / 2.2360679774997896f;
+#pragma unroll
+    for (int m = 0; m < MAXM; ++m) {
+        if (m < M) {
+            float acc = __fmul_rn(cw.x, ext[m]);
+            acc = __fadd_rn(acc, __fmul_rn(cw.y, ext[m + 1]));
+            acc = __fadd_rn(acc, __fmul_rn(cw.z, ext[m + 2]));
+            acc = __fadd_rn(acc, __fmul_rn(cw.w, ext[m + 3]));
+            out[size_t(m) * H + ch] = __fmul_rn(__fadd_rn(acc, ext[m + 3]), inv_sqrt5);
+            if (conv_hist) conv_hist[size_t(m) * H + ch] = ext[m + 3];
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 3; ++j)
+#pragma unroll
+        for (int m = 1; m <= MAXM; ++m)
+            if (m == M) conv_state[j * H + ch] = ext[m + j];
+}
+
 void require(bool ok, const char* what) {
     if (!ok) throw std::invalid_argument(std::string("moe: ") + what);
 }
@@ -653,9 +1081,25 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
 }  // namespace
 
 void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w13_scale,
-            const float* w13_factor, Format fmt, ActT* out, bool pdl, cudaStream_t stream) {
+            const float* w13_factor, Format fmt, ActT* out, bool pdl, cudaStream_t stream,
+            const void* w13_rout) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(x && idx && w13 && w13_scale && out, "moe_up: null argument");
+    if (fmt == Format::EXL3_2 || fmt == Format::EXL3_3) {
+        require(w13_rout != nullptr, "moe_up(EXL3): w13_rout required");
+        const dim3 grid(I / 128, M * TOPK);  // 9 x (M*8)
+        const auto* w = static_cast<const uint8_t*>(w13);
+        const auto* rin = static_cast<const __half*>(w13_scale);
+        const auto* rout = static_cast<const __half*>(w13_rout);
+        if (fmt == Format::EXL3_2) {
+            if (M == 1) launch(moe_up_exl3_kernel<2, true>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out);
+            else launch(moe_up_exl3_kernel<2, false>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out);
+        } else {
+            if (M == 1) launch(moe_up_exl3_kernel<3, true>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out);
+            else launch(moe_up_exl3_kernel<3, false>, grid, UP_WARPS * 32, pdl, stream, x, idx, w, rin, rout, M, out);
+        }
+        return;
+    }
     require(fmt == Format::MXFP8 || w13_factor, "scaled-block experts need a factor tensor");
     const dim3 grid(2 * I / TILE, M * TOPK);
     const auto* w = static_cast<const uint8_t*>(w13);
@@ -669,9 +1113,27 @@ void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w
 
 void moe_down(const ActT* act, int M, const int* idx, const float* wts, const void* w2,
               const void* w2_scale, const float* w2_factor, Format fmt, const float* conv_w, float* conv_state,
-              float* out, float* conv_hist, bool pdl, cudaStream_t stream) {
+              float* out, float* conv_hist, bool pdl, cudaStream_t stream,
+              const void* w2_rout, ActT* workspace) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(act && idx && wts && w2 && w2_scale && conv_w && conv_state && out, "moe_down: null argument");
+    if (fmt == Format::EXL3_2 || fmt == Format::EXL3_3) {
+        require(w2_rout && workspace, "moe_down(EXL3): w2_rout and workspace required");
+        const dim3 grid(H / 128, M * TOPK);  // 18 x (M*8)
+        const auto* w = static_cast<const uint8_t*>(w2);
+        const auto* rin = static_cast<const __half*>(w2_scale);
+        const auto* rout = static_cast<const __half*>(w2_rout);
+        if (fmt == Format::EXL3_2) {
+            if (M == 1) launch(moe_down_exl3_kernel<2, true>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace);
+            else launch(moe_down_exl3_kernel<2, false>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace);
+        } else {
+            if (M == 1) launch(moe_down_exl3_kernel<3, true>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace);
+            else launch(moe_down_exl3_kernel<3, false>, grid, DOWN_GROUPS * 32, pdl, stream, act, idx, w, rin, rout, M, workspace);
+        }
+        launch(moe_down_combine_conv_kernel, dim3(H / 128), 128, pdl, stream, workspace, wts, M, conv_w, conv_state,
+               out, conv_hist);
+        return;
+    }
     require(fmt == Format::MXFP8 || w2_factor, "scaled-block experts need a factor tensor");
     const auto* w = static_cast<const uint8_t*>(w2);
     const auto* ws = static_cast<const uint8_t*>(w2_scale);
