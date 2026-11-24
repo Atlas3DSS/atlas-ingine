@@ -633,6 +633,19 @@ uint64_t lock_router(LockGen& g, int M) {
 }
 
 // [M - 1][mix, message_gates, router]
+#if INGINE_ACT_FP16
+// Qualified Volta sm_70 FP16 (CUDA 12.9) bit locks, verified across independent Quincy V100 runs.
+constexpr uint64_t kLock[8][3] = {
+    {0x90d012dac41ef6f7ull, 0x8d93fe0355778e3eull, 0xc2ffc1208f974015ull},
+    {0x8289e7eb027711a9ull, 0xcefab781310f9d30ull, 0x8accde320be102dcull},
+    {0x93746f19fa15d83full, 0x5e477356139a3217ull, 0x418dc15851a4d7ddull},
+    {0x830cceb1a15b485dull, 0xee8c64aeb7ee1484ull, 0x2ebaa61e79987ef4ull},
+    {0x36a7ab712a90e57full, 0xde1fdf16c2aef83eull, 0x87aa4d54f479f219ull},
+    {0xdda2d5f70baeb482ull, 0x6216af4cfa724b27ull, 0xba469dcd56427d5cull},
+    {0xd7449dff7833ac9bull, 0xf6eadd32964f6ff7ull, 0x4bd7907daf0f3bedull},
+    {0x7825debe56ce0c37ull, 0x1f24a66e6df86468ull, 0xf790722dce0cfa02ull},
+};
+#else
 constexpr uint64_t kLock[8][3] = {
     {0x2b27dd32a1dd100eull, 0x5efdd3c8b07ce184ull, 0x51c35a315b7e90b3ull},
     {0x75334db64229e2e1ull, 0x1940463968d37814ull, 0xea1ef0b8721fb3ffull},
@@ -643,6 +656,7 @@ constexpr uint64_t kLock[8][3] = {
     {0x82fcad4fa28a5d54ull, 0x908da1a2466cd8ebull, 0x76e91bc67374d743ull},
     {0x485152f0b0ead6f4ull, 0xd6dded13cf36fa5cull, 0xffe0d044657686f0ull},
 };
+#endif
 
 bool test_bit_lock() {
   bool ok = true;
