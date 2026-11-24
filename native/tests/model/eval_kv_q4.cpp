@@ -9,6 +9,7 @@
 #include "kernels/attn/attn.h"
 #include "kernels/head/head.h"
 #include "kernels/prefill/prefill.h"
+#include "model/kv_checkpoint.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
 #include "text/chat.h"
@@ -819,6 +820,7 @@ int run_test_1m_kernel() {
   return ok ? 0 : 1;
 }
 
+
 // ---- Phase 1B + 1C: Resident 1M-token VRAM, prefill/decode speed, and honest Needle-in-a-Haystack ----
 
 void log_nvidia_smi_mem(const char* tag) {
@@ -845,7 +847,8 @@ void log_nvidia_smi_mem(const char* tag) {
 
 int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_chunk, int decode_tokens,
                         const std::vector<int>& ctxs, bool kv_paged, int kv_vram_mb, int kv_ram_mb, bool atlas_6g,
-                        int offload_vram_mb) {
+                        int offload_vram_mb, const std::string& kv_ckpt_path, int kv_ckpt_every,
+                        const std::string& kv_ckpt_resume) {
   cudaFree(nullptr);
   size_t free0 = 0, free_rt = 0, free_pre = 0, total = 0;
   cudaMemGetInfo(&free0, &total);
@@ -942,33 +945,53 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
     paras[i] = tok.encode(buf, false);
   }
 
-  auto prefill_span = [&](const std::vector<int32_t>& ids, int pos0, bool log_progress) -> double {
+  auto prefill_span = [&](const std::vector<int32_t>& ids, int pos0, bool log_progress, int start_off = 0,
+                          const std::string& ckpt_out = "", int ckpt_every = 0) -> double {
     const auto t0 = std::chrono::steady_clock::now();
     auto t_seg = t0;
     int seg_toks = 0;
-    int next_mark = 131072;
-    bool logged_524k = false;
-    for (int off = 0; off < int(ids.size()); off += prefill_chunk) {
+    int next_mark = ((start_off / 131072) + 1) * 131072;
+    int next_ckpt = ckpt_every > 0 ? ((start_off / ckpt_every) + 1) * ckpt_every : 0;
+    bool logged_524k = start_off >= 524288;
+    for (int off = start_off; off < int(ids.size()); off += prefill_chunk) {
       const int T = std::min(prefill_chunk, int(ids.size()) - off);
       CUDA_CHECK(cudaMemcpyAsync(d_chunk.p, ids.data() + off, size_t(T) * 4, cudaMemcpyHostToDevice, rt.stream()));
       pre.run(rt.state(), static_cast<const int32_t*>(d_chunk.p), T, pos0 + off, static_cast<float*>(d_logits.p), nullptr);
       seg_toks += T;
-      if (log_progress && (off + T >= next_mark || off + T == int(ids.size()))) {
+      const int done = off + T;
+      if (log_progress && (done >= next_mark || done == int(ids.size()))) {
         CUDA_CHECK(cudaStreamSynchronize(rt.stream()));
         const auto now = std::chrono::steady_clock::now();
         const double seg_s = std::chrono::duration<double>(now - t_seg).count();
         const double tot_s = std::chrono::duration<double>(now - t0).count();
         std::printf("  [prefill progress] %d / %zu tokens | seg=%.0f tok/s | avg=%.0f tok/s | elapsed=%.1fs\n",
-                    off + T, ids.size(), double(seg_toks) / std::max(seg_s, 1e-9),
-                    double(off + T) / std::max(tot_s, 1e-9), tot_s);
-        if (!logged_524k && off + T >= 524288) {
+                    done, ids.size(), double(seg_toks) / std::max(seg_s, 1e-9),
+                    double(done - start_off) / std::max(tot_s, 1e-9), tot_s);
+        if (!logged_524k && done >= 524288) {
           log_nvidia_smi_mem("524k");
           logged_524k = true;
         }
         std::fflush(stdout);
         t_seg = now;
         seg_toks = 0;
-        while (next_mark <= off + T) next_mark += 131072;
+        while (next_mark <= done) next_mark += 131072;
+      }
+      if (!ckpt_out.empty() && pos0 == 0) {
+        const bool sigterm = kv_checkpoint_sigterm_requested();
+        const bool periodic = (ckpt_every > 0 && done >= next_ckpt && done < int(ids.size()));
+        if (periodic || sigterm) {
+          const auto tc0 = std::chrono::steady_clock::now();
+          save_kv_checkpoint(rt.state(), model_dir, std::span<const int32_t>(ids.data(), size_t(done)),
+                             static_cast<const float*>(d_logits.p), ckpt_out, rt.stream());
+          const double cs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tc0).count();
+          std::printf("  [kv-ckpt] %s saved atomic checkpoint pos=%d / %zu -> %s (%.2fs)\n",
+                      sigterm ? "SIGTERM" : "periodic", done, ids.size(), ckpt_out.c_str(), cs);
+          std::fflush(stdout);
+          if (ckpt_every > 0) while (next_ckpt <= done) next_ckpt += ckpt_every;
+          if (sigterm) {
+            throw std::runtime_error("prefill interrupted by SIGTERM after saving atomic KV checkpoint");
+          }
+        }
       }
     }
     CUDA_CHECK(cudaStreamSynchronize(rt.stream()));
@@ -1050,13 +1073,38 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
     }
     const int L_doc = int(doc_ids.size());
 
-    // Prefill document prefix ONCE and checkpoint state at L_doc
+    // Prefill document prefix ONCE (with optional atomic disk checkpointing & resume) and checkpoint state at L_doc
     reset_state(rt.state(), rt.stream());
-    const double prefill_s = prefill_span(doc_ids, 0, true);
+    int resume_pos = 0;
+    if (!kv_ckpt_path.empty()) install_kv_checkpoint_sigterm_handler();
+    if (!kv_ckpt_resume.empty()) {
+      const auto tr0 = std::chrono::steady_clock::now();
+      resume_pos = load_kv_checkpoint(rt.state(), model_dir, doc_ids, static_cast<float*>(d_logits.p), kv_ckpt_resume,
+                                      rt.stream());
+      const double rs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
+      std::printf("  [kv-ckpt] resumed %d / %d tokens from %s in %.2fs\n", resume_pos, L_doc, kv_ckpt_resume.c_str(), rs);
+      std::fflush(stdout);
+    } else if (!kv_ckpt_path.empty() && std::filesystem::exists(kv_ckpt_path)) {
+      const KvCheckpointInfo info = inspect_kv_checkpoint(kv_ckpt_path);
+      if (info.pos > 0 && info.pos <= L_doc &&
+          sha256_bytes(doc_ids.data(), size_t(info.pos) * sizeof(int32_t)) == info.prompt_sha256) {
+        const auto tr0 = std::chrono::steady_clock::now();
+        resume_pos = load_kv_checkpoint(rt.state(), model_dir, doc_ids, static_cast<float*>(d_logits.p), kv_ckpt_path,
+                                        rt.stream());
+        const double rs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
+        std::printf("  [kv-ckpt] auto-resumed %d / %d tokens from %s in %.2fs\n", resume_pos, L_doc, kv_ckpt_path.c_str(), rs);
+        std::fflush(stdout);
+      }
+    }
+    const double prefill_s = prefill_span(doc_ids, 0, true, resume_pos, kv_ckpt_path, kv_ckpt_every);
+    if (!kv_ckpt_path.empty() && resume_pos < L_doc) {
+      save_kv_checkpoint(rt.state(), model_dir, doc_ids, static_cast<const float*>(d_logits.p), kv_ckpt_path, rt.stream());
+      std::printf("  [kv-ckpt] saved final atomic checkpoint pos=%d -> %s\n", L_doc, kv_ckpt_path.c_str());
+    }
     rt.save_checkpoint(ckpt.p);
     CUDA_CHECK(cudaStreamSynchronize(rt.stream()));
-    std::printf("PREFILL ctx=%d (doc=%d toks): %.2fs -> %.1f tok/s\n",
-                target_ctx, L_doc, prefill_s, double(L_doc) / std::max(prefill_s, 1e-9));
+    std::printf("PREFILL ctx=%d (doc=%d toks, resumed=%d): %.2fs -> %.1f tok/s\n", target_ctx, L_doc, resume_pos,
+                prefill_s, double(L_doc - resume_pos) / std::max(prefill_s, 1e-9));
     std::fflush(stdout);
 
     // 3 depth probes reusing full KV [0..L_doc) via checkpoint restore (<1ms!)
@@ -1250,6 +1298,174 @@ int run_test_paged_kv(const std::string& model_dir, const std::string& golden_js
   return ok ? 0 : 1;
 }
 
+// ---- Atomic Disk KV Checkpoint & Resume Verification (Resident Q4_0, 3-Tier Paged, Cross-Mode, Mismatch Rejection) ----
+int run_test_kv_ckpt(const std::string& model_dir, const std::string& golden_json, bool atlas_6g, int offload_vram_mb) {
+  std::ifstream gf(golden_json);
+  if (!gf) {
+    std::fprintf(stderr, "cannot open %s\n", golden_json.c_str());
+    return 1;
+  }
+  std::vector<int32_t> base_ids = nlohmann::json::parse(gf)["prompt_ids"].get<std::vector<int32_t>>();
+  const int prefix_len = 12288;  // 3 pages (24 pages across 8 visits > 16 VRAM slots -> forces active RAM spill!)
+  const int split_pos = 6144;    // mid-page boundary (1.5 pages)
+  const int eval_tokens = 16;
+  const int chunk = 512;
+  std::vector<int32_t> ids;
+  ids.reserve(prefix_len + eval_tokens);
+  while (int(ids.size()) < prefix_len + eval_tokens) ids.insert(ids.end(), base_ids.begin(), base_ids.end());
+  ids.resize(prefix_len + eval_tokens);
+
+  cudaStream_t stream = nullptr;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  OffloadConfig offload;
+  if (atlas_6g || offload_vram_mb > 0) {
+    offload.vram_mb = offload_vram_mb > 0 ? offload_vram_mb : 5500;
+    offload.ram_mb = 12288;
+    offload.max_ctx = prefix_len + eval_tokens + 64;
+    offload.prefill_chunk = chunk;
+    offload.kv_q4 = true;
+    offload.kv_vram_mb = 256;
+  }
+  std::printf("=== Atomic Disk KV Checkpoint & Resume Verification (L=%d, split=%d, +%d decode) ===\n", prefix_len,
+              split_pos, eval_tokens);
+  Weights w = load_weights(model_dir, true, stream, offload);
+  Ablation abl = load_ablation({});
+  Prefiller pre(w, abl, chunk, stream);
+  DeviceBuffer d_ids(size_t(prefix_len + eval_tokens) * 4);
+  d_ids.copy_from_host(ids.data(), size_t(prefix_len + eval_tokens) * 4);
+  DeviceBuffer d_logits(size_t(UNPADDED_VOCAB) * 4);
+  DeviceBuffer d_pos(8);
+  Buffers buf1 = make_buffers(1);
+
+  auto run_range_and_decode = [&](State& st, int start_off) -> std::vector<std::vector<float>> {
+    Decoder dec(w, abl, st, true);
+    for (int off = start_off; off < prefix_len; off += chunk) {
+      const int T = std::min(chunk, prefix_len - off);
+      pre.run(st, static_cast<const int32_t*>(d_ids.p) + off, T, off, static_cast<float*>(d_logits.p), nullptr);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::vector<float>> out;
+    out.reserve(eval_tokens + 1);
+    out.push_back(download_f32(static_cast<const float*>(d_logits.p), UNPADDED_VOCAB));
+    for (int i = 0; i < eval_tokens; ++i) {
+      const int pos = prefix_len + i;
+      if (st.paged_kv) st.paged_kv->ensure_decode_pages(pos, 1, stream);
+      const int64_t tok64 = ids[pos], pos64 = pos;
+      CUDA_CHECK(cudaMemcpyAsync(buf1.token.data, &tok64, 8, cudaMemcpyHostToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(d_pos.p, &pos64, 8, cudaMemcpyHostToDevice, stream));
+      dec.decode(buf1, static_cast<const int64_t*>(d_pos.p), false, stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      out.push_back(download_f32(static_cast<const float*>(buf1.logits.data), UNPADDED_VOCAB));
+    }
+    return out;
+  };
+
+  auto check_exact = [&](const char* label, const std::vector<std::vector<float>>& ref,
+                         const std::vector<std::vector<float>>& test) -> bool {
+    double sum_kl = 0.0, max_kl = 0.0, max_diff = 0.0;
+    int top1 = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      const double kl = kl_div(ref[i], test[i]);
+      sum_kl += kl;
+      max_kl = std::max(max_kl, kl);
+      if (argmax(ref[i]) == argmax(test[i])) ++top1;
+      for (size_t j = 0; j < ref[i].size(); ++j)
+        max_diff = std::max(max_diff, double(std::fabs(ref[i][j] - test[i][j])));
+    }
+    const double mean_kl = sum_kl / double(ref.size());
+    const bool pass = mean_kl == 0.0 && max_kl == 0.0 && max_diff == 0.0 && top1 == int(ref.size());
+    std::printf("%s %s: mean_kl=%.6f max_kl=%.6f max_logit_diff=%.6f top1=%d/%zu\n", pass ? "PASS" : "FAIL", label,
+                mean_kl, max_kl, max_diff, top1, ref.size());
+    return pass;
+  };
+
+  const std::filesystem::path ckpt_res = "/tmp/ingine_test_kv_ckpt_res_" + std::to_string(int(getpid())) + ".bin";
+  const std::filesystem::path ckpt_pg = "/tmp/ingine_test_kv_ckpt_pg_" + std::to_string(int(getpid())) + ".bin";
+  bool ok = true;
+
+  // Reference uninterrupted resident Q4_0 run
+  std::vector<std::vector<float>> ref;
+  {
+    State st = make_state(prefix_len + eval_tokens + 64, false, true, PagedKvConfig{});
+    reset_state(st, stream);
+    ref = run_range_and_decode(st, 0);
+  }
+
+  // Arm 1: Resident Q4_0 -> save at split_pos -> fresh State -> resume -> bit-identical 0.000000 KL!
+  {
+    State st1 = make_state(prefix_len + eval_tokens + 64, false, true, PagedKvConfig{});
+    reset_state(st1, stream);
+    for (int off = 0; off < split_pos; off += chunk) {
+      pre.run(st1, static_cast<const int32_t*>(d_ids.p) + off, chunk, off, static_cast<float*>(d_logits.p), nullptr);
+    }
+    save_kv_checkpoint(st1, model_dir, std::span<const int32_t>(ids.data(), size_t(split_pos)),
+                       static_cast<const float*>(d_logits.p), ckpt_res, stream);
+  }
+  {
+    State st2 = make_state(prefix_len + eval_tokens + 64, false, true, PagedKvConfig{});
+    reset_state(st2, stream);
+    // Verify loud mismatch rejection on altered prompt prefix!
+    std::vector<int32_t> bad_ids = ids;
+    bad_ids[1234] ^= 1;
+    bool rejected = false;
+    try {
+      (void)load_kv_checkpoint(st2, model_dir, bad_ids, static_cast<float*>(d_logits.p), ckpt_res, stream);
+    } catch (const std::exception& e) {
+      rejected = true;
+      std::printf("PASS mismatch-rejection: %s\n", e.what());
+    }
+    if (!rejected) std::printf("FAIL mismatch-rejection: altered prompt was not rejected!\n");
+    ok &= rejected;
+
+    const int resumed = load_kv_checkpoint(st2, model_dir, ids, static_cast<float*>(d_logits.p), ckpt_res, stream);
+    ok &= (resumed == split_pos);
+    const auto got = run_range_and_decode(st2, resumed);
+    ok &= check_exact("resident-q4-resume", ref, got);
+  }
+
+  // Arm 2: 3-tier Paged Q4_0 (active RAM spill!) -> save at split_pos -> fresh paged State -> resume -> bit-identical!
+  PagedKvConfig pcfg;
+  pcfg.max_ctx = prefix_len + eval_tokens + 64;
+  pcfg.vram_mb = 96;  // 16 VRAM slots < 24 active pages -> forces Tier-1 RAM spill
+  pcfg.ram_mb = 512;
+  pcfg.prefill_chunk = chunk;
+  {
+    State st1 = make_state(prefix_len + eval_tokens + 64, false, true, pcfg);
+    reset_state(st1, stream);
+    for (int off = 0; off < split_pos; off += chunk) {
+      pre.run(st1, static_cast<const int32_t*>(d_ids.p) + off, chunk, off, static_cast<float*>(d_logits.p), nullptr);
+    }
+    save_kv_checkpoint(st1, model_dir, std::span<const int32_t>(ids.data(), size_t(split_pos)),
+                       static_cast<const float*>(d_logits.p), ckpt_pg, stream);
+  }
+  {
+    State st2 = make_state(prefix_len + eval_tokens + 64, false, true, pcfg);
+    reset_state(st2, stream);
+    const int resumed = load_kv_checkpoint(st2, model_dir, ids, static_cast<float*>(d_logits.p), ckpt_pg, stream);
+    ok &= (resumed == split_pos);
+    const auto got = run_range_and_decode(st2, resumed);
+    std::printf("  [paged-resume] %s\n", st2.paged_kv->summary().c_str());
+    ok &= check_exact("paged-q4-resume", ref, got);
+  }
+
+  // Arm 3: Cross-mode resume (saved from resident Q4_0 -> loaded into 3-tier Paged Q4_0 -> bit-identical!)
+  {
+    State st3 = make_state(prefix_len + eval_tokens + 64, false, true, pcfg);
+    reset_state(st3, stream);
+    const int resumed = load_kv_checkpoint(st3, model_dir, ids, static_cast<float*>(d_logits.p), ckpt_res, stream);
+    ok &= (resumed == split_pos);
+    const auto got = run_range_and_decode(st3, resumed);
+    ok &= check_exact("cross-mode-res-to-paged", ref, got);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(ckpt_res, ec);
+  std::filesystem::remove(ckpt_pg, ec);
+  CUDA_CHECK(cudaStreamDestroy(stream));
+  std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
+  return ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1265,6 +1481,8 @@ int main(int argc, char** argv) {
   int kv_vram_mb = 0;
   int kv_ram_mb = 12288;
   int offload_vram_mb = 0;
+  std::string kv_ckpt_path, kv_ckpt_resume;
+  int kv_ckpt_every = 0;
   std::vector<int> ctxs = {262144, 524288, 1000000};
   bool test_kv_q4 = false;
   bool dense_fp8 = true;
@@ -1284,6 +1502,9 @@ int main(int argc, char** argv) {
     else if (a == "--kv-vram-mb" && i + 1 < argc) kv_vram_mb = std::atoi(argv[++i]);
     else if (a == "--kv-ram-mb" && i + 1 < argc) kv_ram_mb = std::atoi(argv[++i]);
     else if (a == "--offload-vram-mb" && i + 1 < argc) offload_vram_mb = std::atoi(argv[++i]);
+    else if (a == "--kv-ckpt-path" && i + 1 < argc) kv_ckpt_path = argv[++i];
+    else if (a == "--kv-ckpt-every" && i + 1 < argc) kv_ckpt_every = std::atoi(argv[++i]);
+    else if (a == "--kv-ckpt-resume" && i + 1 < argc) kv_ckpt_resume = argv[++i];
     else if (a == "--ctxs" && i + 1 < argc) {
       ctxs.clear();
       std::stringstream ss(argv[++i]);
@@ -1302,9 +1523,10 @@ int main(int argc, char** argv) {
     if (mode == "needle") return run_needle(model_dir, max_ctx);
     if (mode == "test-1m-kernel") return run_test_1m_kernel();
     if (mode == "test-paged-kv") return run_test_paged_kv(model_dir, golden, atlas_6g, offload_vram_mb);
+    if (mode == "test-kv-ckpt") return run_test_kv_ckpt(model_dir, golden, atlas_6g, offload_vram_mb);
     if (mode == "bench-needle-1m")
       return run_bench_needle_1m(model_dir, max_ctx, prefill_chunk, decode_tokens, ctxs, kv_paged, kv_vram_mb,
-                                 kv_ram_mb, atlas_6g, offload_vram_mb);
+                                 kv_ram_mb, atlas_6g, offload_vram_mb, kv_ckpt_path, kv_ckpt_every, kv_ckpt_resume);
     std::fprintf(stderr, "unknown mode: %s\n", mode.c_str());
     return 2;
   } catch (const std::exception& e) {

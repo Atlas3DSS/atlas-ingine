@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "kernels/head/head.h"
 #include "model/drafter.h"
+#include "model/kv_checkpoint.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
 #include "model/spec.h"
@@ -314,8 +315,39 @@ class EngineGenerator final : public Generator {
       tokens_in_state_.clear();
       checkpoint_ids_.clear();
       stats.reuse = Reuse::None;
+      // Optional disk KV checkpoint resume (explicit --kv-ckpt-resume fails loudly; --kv-ckpt-path auto-resumes on exact prefix match).
+      if (!options_.kv_ckpt_resume.empty()) {
+        const int resumed = load_kv_checkpoint(st, options_.model_dir, ids, static_cast<float*>(logits_.p),
+                                               options_.kv_ckpt_resume, stream);
+        start = std::size_t(resumed);
+        stats.reuse = Reuse::Checkpoint;
+        std::fprintf(stderr, "[kv-ckpt] resumed %d / %zu tokens from %s\n", resumed, n,
+                     options_.kv_ckpt_resume.c_str());
+      } else if (!options_.kv_ckpt_path.empty() && std::filesystem::exists(options_.kv_ckpt_path)) {
+        try {
+          const KvCheckpointInfo info = inspect_kv_checkpoint(options_.kv_ckpt_path);
+          if (info.pos > 0 && std::size_t(info.pos) <= n) {
+            const auto psha = sha256_bytes(ids.data(), std::size_t(info.pos) * sizeof(std::int32_t));
+            if (psha == info.prompt_sha256) {
+              const int resumed = load_kv_checkpoint(st, options_.model_dir, ids, static_cast<float*>(logits_.p),
+                                                     options_.kv_ckpt_path, stream);
+              start = std::size_t(resumed);
+              stats.reuse = Reuse::Checkpoint;
+              std::fprintf(stderr, "[kv-ckpt] auto-resumed %d / %zu tokens from %s\n", resumed, n,
+                           options_.kv_ckpt_path.c_str());
+            }
+          }
+        } catch (const std::exception& e) {
+          std::fprintf(stderr, "[kv-ckpt] ignoring incompatible existing checkpoint %s: %s\n",
+                       options_.kv_ckpt_path.c_str(), e.what());
+        }
+      }
     }
     st.length = int(start);  // decode steps advance the state without its host-side length
+    std::size_t next_ckpt =
+        options_.kv_ckpt_every > 0
+            ? ((start / std::size_t(options_.kv_ckpt_every)) + 1u) * std::size_t(options_.kv_ckpt_every)
+            : 0u;
     const std::size_t chunk = std::size_t(options_.prefill_chunk);
     struct Encoded {
       const PromptImage* image;
@@ -360,6 +392,23 @@ class EngineGenerator final : public Generator {
       if (drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
+      }
+      if (!options_.kv_ckpt_path.empty()) {
+        const std::size_t done = s + std::size_t(T);
+        const bool sigterm = kv_checkpoint_sigterm_requested();
+        const bool periodic = (options_.kv_ckpt_every > 0 && done >= next_ckpt && done < n);
+        if (periodic || sigterm) {
+          save_kv_checkpoint(st, options_.model_dir, ids.subspan(0, done), static_cast<const float*>(logits_.p),
+                             options_.kv_ckpt_path, stream);
+          std::fprintf(stderr, "[kv-ckpt] %s saved atomic checkpoint at pos=%zu / %zu -> %s\n",
+                       sigterm ? "SIGTERM" : "periodic", done, n, options_.kv_ckpt_path.c_str());
+          if (options_.kv_ckpt_every > 0) {
+            while (next_ckpt <= done) next_ckpt += std::size_t(options_.kv_ckpt_every);
+          }
+          if (sigterm) {
+            throw std::runtime_error("prefill interrupted by SIGTERM after saving atomic KV checkpoint");
+          }
+        }
       }
     }
     if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream));  // queued chunks read the rows freed here

@@ -99,6 +99,13 @@ class PagedKvCache {
   // Resets all logical pages (preserves allocated VRAM/RAM pools for reuse).
   void reset();
 
+  // Streaming disk checkpoint helpers (O(1) host RAM):
+  int vram_slot_count() const noexcept { return vram_slab_.capacity(); }
+  void export_page_to_host(int fi, int page, std::uint8_t* dst_k, std::uint8_t* dst_v, cudaStream_t compute_stream);
+  void import_page_from_host(int fi, int page, const std::uint8_t* src_k, const std::uint8_t* src_v, bool prefer_ram,
+                             cudaStream_t compute_stream);
+  void flush_all_tables(cudaStream_t stream);
+
   PagedKvStats stats() const noexcept;
   std::string summary() const;
 

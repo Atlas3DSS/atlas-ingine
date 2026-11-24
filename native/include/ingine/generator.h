@@ -119,6 +119,10 @@ struct RuntimeOptions {
   int kv_vram_mb = 0;               // 0 = auto when kv_paged (256 MiB with offload, 1536 MiB otherwise)
   int kv_ram_mb = 12288;            // pinned UVA host RAM cap in MiB before spilling to NVMe SwapFile
   std::filesystem::path kv_swap_dir;  // optional directory for Tier-2 NVMe KV swap file
+  // Atomic streaming disk checkpoint & resume for long-context (1M+) prefill runs:
+  std::filesystem::path kv_ckpt_path;    // path for periodic & SIGTERM atomic KV checkpoints (auto-resumes if prefix matches)
+  int kv_ckpt_every = 0;                 // save atomic checkpoint every N tokens during prefill (e.g. 131072; 0 = SIGTERM/manual only)
+  std::filesystem::path kv_ckpt_resume;  // explicit checkpoint path to resume from (fails loudly if missing or mismatched)
 };
 
 class Generator {

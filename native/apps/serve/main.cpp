@@ -66,10 +66,10 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir;
+  std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
-  int kv_vram_mb = 0, kv_ram_mb = 12288;
+  int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
        no_vision = false, atlas_6g = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
@@ -101,6 +101,12 @@ int main(int argc, char** argv) {
   ap.option("--kv-ram-mb", "", "pinned UVA host RAM cap in MiB for paged Q4_0 KV before NVMe SwapFile spill (default 12288)",
             &kv_ram_mb);
   ap.option("--kv-swap-dir", "", "optional directory for Tier-2 NVMe KV swap file", &kv_swap_dir);
+  ap.option("--kv-ckpt-path", "", "atomic disk KV checkpoint file path (periodic & auto-resume on prefix match)",
+            &kv_ckpt_path);
+  ap.option("--kv-ckpt-every", "", "save atomic disk KV checkpoint every N tokens during long prefill (0 = off)",
+            &kv_ckpt_every);
+  ap.option("--kv-ckpt-resume", "", "explicit disk KV checkpoint file to resume from (fails loudly on mismatch)",
+            &kv_ckpt_resume);
   ap.exclusive({"--kv-fp8", "--kv-q4"}, false);
   ap.flag("--atlas-6g", "6 GB VRAM tiered offload preset (offload-vram-mb=5888, dense-fp8, kv-fp8 unless kv-q4, prefill-chunk=512, no-vision)",
           &atlas_6g);
@@ -184,6 +190,9 @@ int main(int argc, char** argv) {
       options.kv_vram_mb = kv_vram_mb;
       options.kv_ram_mb = kv_ram_mb;
       options.kv_swap_dir = kv_swap_dir;
+      options.kv_ckpt_path = kv_ckpt_path;
+      options.kv_ckpt_every = kv_ckpt_every;
+      options.kv_ckpt_resume = kv_ckpt_resume;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;

@@ -1,5 +1,6 @@
 add_library(ingine_model STATIC
   expert_cache.cpp
+  kv_checkpoint.cpp
   paged_kv.cpp
   weights.cpp
   state.cpp
