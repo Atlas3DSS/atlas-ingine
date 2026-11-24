@@ -39,6 +39,10 @@ Unless noted, 64K rows use `ingine-bench --max-ctx 65536 --dense-fp8 --kv-fp8 --
 | RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-10g` (64K) | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` (64K) |
 
 External baseline reference points (different hardware, quants, or settings — reported individually):
+
+![Inkling-2-Mini Inference Engine Comparison: atlas-ingine vs Kern, SGLang, vLLM, Project Maya, and llama.cpp](docs/media/engine_comparison_blackwell_and_3090.png)
+
+- **Kern, SGLang, and vLLM** (`@SuJinYan123`, Nov 22, 2026, single RTX PRO 5000 72 GB `SM120`, ~`1,344 GB/s` vs PRO 6000 `1,792 GB/s` [`1.33×` BW], DSpark `k=7`, `max_seqs=8`): `c=1` HumanEval `256` / `~220` / `~152 tok/s`; `c=8` 512-OSL `693` / `~550` / `~478 tok/s` (`742` SpecBench `c=8`); cold prefill `15.3k` (4K) / `15.0k` (32K) / `10.5k` (128K).
 - **Upstream `satellitedown/ingine`** (RTX 5090 32 GB, native `NVFP4+MXFP8`, 262K ctx, `--spec`, default temp 1): `487 tok/s` chat, `554 tok/s` code, `9,600 tok/s` 64K prefill (`24.4 GiB` VRAM; full table below).
 - **Kintsugi (`ExLlamaV3` / 12 GB community serving)** (reported reference on Blackwell): `4,895 tok/s` 64K prefill.
 - **StrataEngine** (Tesla P100 16 GB, thinking off, prompt length unstated): `35.0 tok/s` (not directly comparable to `--effort medium` thinking-on rows).
