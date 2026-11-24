@@ -314,21 +314,21 @@ int VramLruSlab::find(std::uint64_t key) const noexcept {
   return it == index_.end() ? -1 : it->second;
 }
 
-int VramLruSlab::touch_and_pin(std::uint64_t key, std::uint64_t pin_gen) noexcept {
+int VramLruSlab::touch_and_pin(std::uint64_t key, std::uint64_t pin_gen, bool priority) noexcept {
   auto it = index_.find(key);
   if (it == index_.end()) return -1;
   Slot& s = slots_[it->second];
-  s.last_use = ++tick_;
+  s.last_use = ++tick_ + (priority ? std::uint64_t(slots_.size()) : 0ull);
   s.pin_gen = pin_gen;
   return it->second;
 }
 
-VramLruSlab::AcquireResult VramLruSlab::acquire(std::uint64_t key, std::uint64_t pin_gen) {
+VramLruSlab::AcquireResult VramLruSlab::acquire(std::uint64_t key, std::uint64_t pin_gen, bool priority) {
   AcquireResult r{};
   if (slots_.empty()) throw std::runtime_error("VramLruSlab::acquire on empty slab");
   if (auto it = index_.find(key); it != index_.end()) {
     Slot& s = slots_[it->second];
-    s.last_use = ++tick_;
+    s.last_use = ++tick_ + (priority ? std::uint64_t(slots_.size()) : 0ull);
     s.pin_gen = pin_gen;
     r.slot = it->second;
     r.vram_ptr = s.vram_ptr;
@@ -360,7 +360,7 @@ VramLruSlab::AcquireResult VramLruSlab::acquire(std::uint64_t key, std::uint64_t
     index_.erase(s.key);
   }
   s.key = key;
-  s.last_use = ++tick_;
+  s.last_use = ++tick_ + (priority ? std::uint64_t(slots_.size()) : 0ull);
   s.pin_gen = pin_gen;
   index_[key] = victim;
   r.slot = victim;

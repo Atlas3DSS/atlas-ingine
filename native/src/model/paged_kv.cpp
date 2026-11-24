@@ -37,11 +37,12 @@ PagedKvCache::PagedKvCache(const PagedKvConfig& cfg)
   partial_m_ = DeviceBuffer(std::size_t(max_t) * HEADS * sizeof(float));
   partial_l_ = DeviceBuffer(std::size_t(max_t) * HEADS * sizeof(float));
 
-  // Small scratch for Tier-2 NVMe decode fallback (M <= 8).
+  // Small scratch for streamed Q4 decode (M <= 8) + 16-way split-K workspace (~1.52 MiB).
   dec_proj16_ = DeviceBuffer(std::size_t(8) * PROJ_ROWS_FULL * sizeof(ActT));
   dec_q_ = DeviceBuffer(std::size_t(8) * HEADS * HEAD_DIM * sizeof(ActT));
   dec_rel16_ = DeviceBuffer(std::size_t(8) * HEADS * D_REL * sizeof(ActT));
   dec_rel_ = DeviceBuffer(std::size_t(8) * HEADS * REL_EXTENT * sizeof(ActT));
+  decode_ws_ = DeviceBuffer(std::size_t(kDecodeSplits) * 8 * HEADS * (HEAD_DIM + 2) * sizeof(float));
   dec_pos_host_ = MappedHostBuffer(sizeof(std::int64_t));
 
   // Per-visit fixed device page tables.
@@ -58,7 +59,8 @@ PagedKvCache::PagedKvCache(const PagedKvConfig& cfg)
 
   const std::size_t overhead_bytes =
       2 * (stage_half_k + stage_half_v) + partial_o_.bytes + partial_m_.bytes + partial_l_.bytes +
-      dec_proj16_.bytes + dec_q_.bytes + dec_rel16_.bytes + dec_rel_.bytes + 2 * NUM_FULL_VISITS * table_bytes;
+      dec_proj16_.bytes + dec_q_.bytes + dec_rel16_.bytes + dec_rel_.bytes + decode_ws_.bytes +
+      2 * NUM_FULL_VISITS * table_bytes;
   const std::size_t budget_bytes = std::size_t(cfg.vram_mb) << 20;
   // Minimum 16 VRAM slots (72 MiB) so all 8 full visits can pin 2 active write pages simultaneously.
   const std::size_t avail_for_slab = budget_bytes > overhead_bytes ? (budget_bytes - overhead_bytes) : 0;
@@ -472,6 +474,8 @@ void PagedKvCache::decode_attention_with_swap(int fi, const Layer& layer, int /*
   at.proj = static_cast<const ActT*>(dec_proj16_.p);
   at.ld = R;
   at.out = out;
+  at.decode_ws = static_cast<float*>(decode_ws_.p);
+  at.decode_splits = kDecodeSplits;
   prefill_attention(fi, at, stream);
 }
 

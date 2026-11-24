@@ -59,35 +59,120 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   auto f32 = [&](std::size_t n) { return static_cast<float*>(alloc(n * 4)); };
   auto bf16 = [&](std::size_t n) { return static_cast<ActT*>(alloc(n * 2)); };
   auto i32 = [&](std::size_t n) { return static_cast<int*>(alloc(n * 4)); };
+  auto align256 = [](std::size_t n) { return (n + 255) / 256 * 256; };
+
+  // Persistent across a visit (block states, residual accumulators, message buffer, tiny helpers).
   B0_ = f32(C * H), B1_ = f32(C * H);
   for (int p = 0; p < PASSES; ++p) B2_[p] = f32(C * H), E_[p] = f32(C * H);
   hid_ = f32(C * H), part_ = f32(C * H), y_ = f32(C * H), y2_ = f32(C * H);
-  xin_ = bf16(3 * C * H), xm_ = bf16(C * H), xf_ = bf16(C * H);
-  mixf_ = f32(3 * C * H), msgs_ = f32(4 * C * H), mixm_ = f32(C * H);
-  proj_ = bf16(C * PROJ_ROWS_FULL);
-  q_ = bf16(C * HEADS * HEAD_DIM), rel16_ = bf16(C * HEADS * D_REL), rel_ = bf16(C * HEADS * REL_EXTENT);
-  krows_ = bf16(std::size_t(kpos_rows_) * KV_DIM), vrows_ = bf16(std::size_t(kpos_rows_) * KV_DIM);
+  msgs_ = f32(4 * C * H);
   kpos_ = i32(kpos_rows_);
   bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
-  attn_out_ = bf16(C * HEADS * HEAD_DIM), wo_out_ = bf16(C * H);
   g16_ = bf16(C * GATE_RANK);
-  // message-gate scratch lives in buffers dead while the gates run: gin_ in rel_ (written by rel_logits after
-  // the attention-side gates, dead before the MLP-side gate), fpre_/gpre_ in down_ (written by the experts after
-  // both gates)
-  static_assert(3 * 2 * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 && 2 * HIDDEN * 4 <= TOP_K * HIDDEN * 2);
-  router_logits_ = f32(C * EXPERTS), wts_ = f32(C * TOP_K);
-  idx_ = i32(C * TOP_K);
-  counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(C * TOP_K), pair_dst_ = i32(C * TOP_K);
-  tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4)));
-  act_ = bf16(C * TOP_K * INTER), down_ = bf16(C * TOP_K * H), moe_sum_ = bf16(C * H);
-  bool any_exl3_w13 = false;
-  for (int l = 0; l < LAYERS; ++l) any_exl3_w13 |= is_exl3(w.expert_formats[l]);
-  // Dedicated EXL3 gate/up scratch only when tiered offloading may sub-batch prefill (so sub-batch k+1 never clobbers down_).
-  exl3_scratch_ = (w.expert_cache && any_exl3_w13) ? bf16(C * TOP_K * H) : down_;
-  gin_ = rel_;
-  fpre_ = reinterpret_cast<float*>(down_), gpre_ = fpre_ + C * H;
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
+
+  // Disjoint-lifetime phase arena: Attention phase (mixf/xin -> proj/q/rel/krows/vrows/attn_out/wo_out)
+  // and MLP phase (mixm/xm/router/routing/act/down/exl3_scratch/moe_sum) never overlap in a visit,
+  // and final read (xf_) runs after the visit loop. Message-gate scratch (gin_, fpre_, gpre_) starts
+  // past both phases' live gate-call prefixes (mixf_+xin_ and mixm_+xm_+routing), saving ~113 KB/tok
+  // (~30% of Prefiller scratch, allowing prefill_chunk=1024 inside 6 GB VRAM caps).
+  bool any_exl3_w13 = false;
+  for (int l = 0; l < LAYERS; ++l) any_exl3_w13 |= is_exl3(w.expert_formats[l]);
+  const bool need_exl3_scratch = (w.expert_cache && any_exl3_w13);
+
+  std::size_t off_a = 0;
+  auto take_a = [&](std::size_t bytes) {
+    const std::size_t r = off_a;
+    off_a = align256(off_a + bytes);
+    return r;
+  };
+  const std::size_t off_mixf = take_a(3 * C * H * 4);
+  const std::size_t off_xin = take_a(3 * C * H * 2);
+  const std::size_t a_prefix_end = off_a;
+
+  std::size_t off_b = 0;
+  auto take_b = [&](std::size_t bytes) {
+    const std::size_t r = off_b;
+    off_b = align256(off_b + bytes);
+    return r;
+  };
+  const std::size_t off_mixm = take_b(C * H * 4);
+  const std::size_t off_xm = take_b(C * H * 2);
+  const std::size_t off_xf = take_b(C * H * 2);
+  const std::size_t off_router = take_b(C * EXPERTS * 4);
+  const std::size_t off_wts = take_b(C * TOP_K * 4);
+  const std::size_t off_idx = take_b(C * TOP_K * 4);
+  const std::size_t off_counts = take_b(EXPERTS * 4);
+  const std::size_t off_tiles_n = take_b(4);
+  const std::size_t off_pair_tok = take_b(C * TOP_K * 4);
+  const std::size_t off_pair_dst = take_b(C * TOP_K * 4);
+  const std::size_t off_tiles = take_b(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4));
+  const std::size_t b_prefix_end = off_b;
+
+  // Phase A tail (dead during attention gates() and during entire Phase B)
+  const std::size_t off_rel = take_a(C * HEADS * REL_EXTENT * 2);
+  const std::size_t off_proj = take_a(C * PROJ_ROWS_FULL * 2);
+  const std::size_t off_q = take_a(C * HEADS * HEAD_DIM * 2);
+  const std::size_t off_rel16 = take_a(C * HEADS * D_REL * 2);
+  const std::size_t off_attn_out = take_a(C * HEADS * HEAD_DIM * 2);
+  const std::size_t off_wo_out = take_a(C * H * 2);
+  const std::size_t off_krows = take_a(std::size_t(kpos_rows_) * KV_DIM * 2);
+  const std::size_t off_vrows = take_a(std::size_t(kpos_rows_) * KV_DIM * 2);
+
+  // Phase B tail (dead during MLP gates() and during entire Phase A)
+  const std::size_t off_act = take_b(C * TOP_K * INTER * 2);
+  const std::size_t off_down = take_b(C * TOP_K * H * 2);
+  const std::size_t off_exl3 = need_exl3_scratch ? take_b(C * TOP_K * H * 2) : off_down;
+  const std::size_t off_moe_sum = take_b(C * H * 2);
+
+  // Message-gate scratch lives past BOTH live prefixes so neither attention gates() nor MLP gates() aliases live data.
+  std::size_t off_g = std::max(a_prefix_end, b_prefix_end);
+  auto take_g = [&](std::size_t bytes) {
+    const std::size_t r = off_g;
+    off_g = align256(off_g + bytes);
+    return r;
+  };
+  const std::size_t off_gin = take_g(3 * C * 2 * H * 2);
+  const std::size_t off_fpre = take_g(C * H * 4);
+  const std::size_t off_gpre = take_g(C * H * 4);
+
+  auto* arena = static_cast<char*>(alloc(std::max({off_a, off_b, off_g})));
+  auto at_f32 = [&](std::size_t off) { return reinterpret_cast<float*>(arena + off); };
+  auto at_bf16 = [&](std::size_t off) { return reinterpret_cast<ActT*>(arena + off); };
+  auto at_i32 = [&](std::size_t off) { return reinterpret_cast<int*>(arena + off); };
+
+  mixf_ = at_f32(off_mixf);
+  xin_ = at_bf16(off_xin);
+  rel_ = at_bf16(off_rel);
+  proj_ = at_bf16(off_proj);
+  q_ = at_bf16(off_q);
+  rel16_ = at_bf16(off_rel16);
+  attn_out_ = at_bf16(off_attn_out);
+  wo_out_ = at_bf16(off_wo_out);
+  krows_ = at_bf16(off_krows);
+  vrows_ = at_bf16(off_vrows);
+
+  mixm_ = at_f32(off_mixm);
+  xm_ = at_bf16(off_xm);
+  xf_ = at_bf16(off_xf);
+  router_logits_ = at_f32(off_router);
+  wts_ = at_f32(off_wts);
+  idx_ = at_i32(off_idx);
+  counts_ = at_i32(off_counts);
+  tiles_n_ = at_i32(off_tiles_n);
+  pair_token_ = at_i32(off_pair_tok);
+  pair_dst_ = at_i32(off_pair_dst);
+  tiles_ = reinterpret_cast<int4*>(arena + off_tiles);
+  act_ = at_bf16(off_act);
+  down_ = at_bf16(off_down);
+  exl3_scratch_ = at_bf16(off_exl3);
+  moe_sum_ = at_bf16(off_moe_sum);
+
+  gin_ = at_bf16(off_gin);
+  fpre_ = at_f32(off_fpre);
+  gpre_ = at_f32(off_gpre);
+
   for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
 }
 

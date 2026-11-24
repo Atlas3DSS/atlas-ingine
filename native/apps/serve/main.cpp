@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
             &kv_ram_mb);
   ap.option("--kv-swap-dir", "", "optional directory for Tier-2 NVMe KV swap file", &kv_swap_dir);
   ap.exclusive({"--kv-fp8", "--kv-q4"}, false);
-  ap.flag("--atlas-6g", "6 GB VRAM tiered offload preset (offload-vram-mb=5888, dense-fp8, kv-fp8 unless kv-q4, prefill-chunk=512, no-vision)",
+  ap.flag("--atlas-6g", "6 GB VRAM tiered offload preset (offload-vram-mb=5888, dense-fp8, kv-fp8 unless kv-q4, prefill-chunk=1024, no-vision)",
           &atlas_6g);
   ap.option("--offload-vram-mb", "", "tiered MoE offloading VRAM cap in MiB (0 = off, e.g. 5888 for 6 GB GPU)",
             &offload_vram_mb);
@@ -169,7 +169,7 @@ int main(int argc, char** argv) {
         if (kv_paged || kv_vram_mb > 0) kv_q4 = true;
         if (!kv_q4) kv_fp8 = true;
         no_vision = true;
-        if (prefill_chunk > 512) prefill_chunk = 512;
+        if (prefill_chunk > 1024) prefill_chunk = 1024;
         if (park_mb < 0) park_mb = 0;
         if (!kv_paged && kv_vram_mb <= 0 && max_ctx > 32768) max_ctx = 32768;
       }

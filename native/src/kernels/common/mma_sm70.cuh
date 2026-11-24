@@ -229,6 +229,16 @@ __device__ __forceinline__ void mma_f16(float (&d)[4], unsigned a0, unsigned a1,
                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#elif __CUDA_ARCH__ >= 750
+  // Native Turing sm_75 HMMA.1688: two m16n8k8 instructions match m16n8k16 fragment layout with zero shuffles.
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+               "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+               : "r"(a0), "r"(a1), "r"(b0));
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+               "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+               : "r"(a2), "r"(a3), "r"(b1));
 #else
   const int lane = threadIdx.x & 31;
   const int g = lane >> 2;

@@ -71,8 +71,8 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
       options_.kv_vram_mb = options_.offload_vram_mb > 0 ? 256 : 1536;
     }
   }
-  if (options_.offload_vram_mb > 0 && options_.prefill_chunk > 512) {
-    options_.prefill_chunk = 512;  // keep prefill scratch compact (~190 MB) inside low-VRAM caps
+  if (options_.offload_vram_mb > 0 && options_.prefill_chunk > 1024) {
+    options_.prefill_chunk = 1024;  // aliased Prefiller phase arena fits 1024-token chunks (~315 MB) inside 6 GB caps
   }
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   OffloadConfig offload;
@@ -85,6 +85,7 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   offload.prefill_chunk = options_.prefill_chunk;
   offload.kv_fp8 = options_.kv_fp8;
   offload.kv_q4 = options_.kv_q4;
+  offload.spec = options_.spec;
   offload.kv_vram_mb = options_.kv_paged ? options_.kv_vram_mb : 0;
   weights_ = load_weights(options_.model_dir, options_.dense_fp8, stream_, offload);
   ablation_ = load_ablation(options_.ablation);
@@ -168,6 +169,15 @@ Runtime::~Runtime() {
 bool Runtime::has_width(int m) const { return buffers_.count(m) != 0; }
 
 std::span<const int> Runtime::verify_widths() const { return verify_widths_; }
+
+bool Runtime::needs_eager_step() const noexcept {
+  return (weights_.expert_cache && weights_.expert_cache->needs_host_dispatch()) ||
+         (state_.paged_kv && state_.paged_kv->needs_streamed_decode());
+}
+
+bool Runtime::has_verify_graph() const noexcept {
+  return !(weights_.expert_cache && weights_.expert_cache->needs_host_dispatch());
+}
 
 Buffers& Runtime::buffers(int m) {
   auto it = buffers_.find(m);

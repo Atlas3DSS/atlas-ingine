@@ -37,8 +37,8 @@ Widths verify_widths(const Runtime& rt) {
 }  // namespace
 
 SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
-    : rt_(rt), drafter_(drafter), width_(sizeof(std::int32_t)), record_(sizeof(VerifyRecord)),
-      forced_window_(kd::BLOCK * sizeof(std::int32_t)) {
+    : rt_(rt), drafter_(drafter), width_(sizeof(std::int32_t)), width_host_(sizeof(std::int32_t)),
+      record_(sizeof(VerifyRecord)), forced_window_(kd::BLOCK * sizeof(std::int32_t)) {
   if (drafter.stream() != rt.stream()) throw std::invalid_argument("SpecLoop: drafter and runtime streams differ");
   const Widths widths = verify_widths(rt);
   // the draft outputs live at fixed addresses: one draft names them (its scratch rows are reset)
@@ -46,15 +46,17 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
   drafter.reset();
   width_.fill(0);
   const float threshold = rt.options().spec_threshold;
-  verify_ = rt.capture_switch(
-      [&](cudaStream_t s, cudaGraphConditionalHandle h) {
-        verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(), static_cast<std::int32_t*>(width_.p),
-                      h, s);
-      },
-      [&](cudaStream_t s, int m) {
-        rt_.record_save_verify(m, s);
-        rt_.record_step(m, s);
-      });
+  if (rt.has_verify_graph()) {
+    verify_ = rt.capture_switch(
+        [&](cudaStream_t s, cudaGraphConditionalHandle h) {
+          verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(),
+                        static_cast<std::int32_t*>(width_.p), h, s);
+        },
+        [&](cudaStream_t s, int m) {
+          rt_.record_save_verify(m, s);
+          rt_.record_step(m, s);
+        });
+  }
   // where a round's outcome lives on the device: after the acceptance the drafter commits the accepted
   // rows and drafts for the next anchor from these (one graph, no host round trip in between)
   {
@@ -72,11 +74,13 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
     drafter.bind_round(round);
   }
   CUDA_CHECK(cudaEventCreateWithFlags(&done_, cudaEventDisableTiming));
+  CUDA_CHECK(cudaEventCreateWithFlags(&width_ready_, cudaEventDisableTiming));
   CUDA_CHECK(cudaStreamSynchronize(rt.stream()));
 }
 
 SpecLoop::~SpecLoop() {
   if (done_) cudaEventDestroy(done_);
+  if (width_ready_) cudaEventDestroy(width_ready_);
 }
 
 void SpecLoop::prepare_accept(const Sampling& sampling) {
@@ -189,6 +193,10 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     // commit the accepted rows and draft for the next anchor, all from device values
     const std::int32_t inputs[1] = {anchor};
     rt_.set_inputs(inputs, P);
+    if (rt_.state().paged_kv) {
+      // A verify call writes up to BLOCK (=8) consecutive positions; ensure pages across page boundaries exist.
+      rt_.state().paged_kv->ensure_decode_pages(P, kd::BLOCK, stream);
+    }
     if (forced) {  // the forced tokens after the anchor (forced[emitted - 1]); the accept graph reads them
       auto* w = static_cast<std::int32_t*>(forced_window_.data());
       for (int i = 0; i < kd::BLOCK; ++i)
@@ -197,7 +205,18 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       record_event(0);
     }
     if (!greedy) kh::uniform(kd::GAMMA, rng, scratch.uniforms, stream);
-    verify_.launch(stream);
+    if (rt_.needs_eager_step()) {
+      verify_select_eager(draft_.conf, draft_.tokens, rt_.options().spec_threshold, verify_widths(rt_), rt_.tokens(),
+                          static_cast<std::int32_t*>(width_.p), static_cast<std::int32_t*>(width_host_.device_ptr()),
+                          stream);
+      CUDA_CHECK(cudaEventRecord(width_ready_, stream));
+      CUDA_CHECK(cudaEventSynchronize(width_ready_));
+      const int m = *static_cast<const volatile std::int32_t*>(width_host_.data());
+      rt_.record_save_verify(m, stream);
+      rt_.run_step_eager(m);
+    } else {
+      verify_.launch(stream);
+    }
     accept_.launch(stream);
     if (!greedy) kh::sample_from_probs(scratch.resid, 1, V, V, rng, &record_dev->next, stream);
     CUDA_CHECK(cudaEventRecord(done_, stream));

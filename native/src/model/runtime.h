@@ -117,6 +117,8 @@ class Runtime {
   // Call widths available: {1}, or {1, 2, 4, 8} with options.spec.
   bool has_width(int m) const;
   std::span<const int> verify_widths() const;  // {2, 4, 8} with spec, else empty
+  bool needs_eager_step() const noexcept;      // true when host dispatch or streamed paged KV is active
+  bool has_verify_graph() const noexcept;      // false only when expert offload requires host dispatch
   Buffers& buffers(int m);
   std::int64_t* pos() { return static_cast<std::int64_t*>(pos_.p); }
 

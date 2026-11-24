@@ -40,6 +40,7 @@ struct OffloadConfig {
   int prefill_chunk = 512;
   bool kv_fp8 = true;
   bool kv_q4 = false;
+  bool spec = false;
   int kv_vram_mb = 0;  // when > 0, full KV cache is paged and capped to kv_vram_mb MiB of VRAM
 };
 
@@ -179,10 +180,11 @@ class ExpertCache {
   // Exchange & synchronization primitives
   TieredDmaStream dma_;
   cudaEvent_t idx_ready_ = nullptr;
-  MappedHostBuffer host_idx_;     // int32 [8 * TOP_K]
-  MappedHostBuffer host_counts_;  // int32 [EXPERTS]
-  MappedHostBuffer host_mask_;    // uint8 [EXPERTS]
-  DeviceBuffer dev_mask_;         // uint8 [EXPERTS]
+  cudaEvent_t pass0_done_ = nullptr;
+  MappedHostBuffer host_idx_;                  // int32 [8 * TOP_K]
+  MappedHostBuffer host_counts_;               // int32 [EXPERTS]
+  std::array<MappedHostBuffer, 2> host_mask_;  // uint8 [EXPERTS] x 2 for overlapped HOT/LRU vs WARM passes
+  std::array<DeviceBuffer, 2> dev_mask_;       // uint8 [EXPERTS] x 2
 
   std::uint64_t pin_gen_ = 0;
   OffloadStats stats_{};
