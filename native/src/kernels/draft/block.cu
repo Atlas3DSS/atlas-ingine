@@ -8,6 +8,8 @@
 #include "kernels/draft/draft.h"
 #include "kernels/draft/draft_device.cuh"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -153,12 +155,13 @@ __global__ void __launch_bounds__(HEAD_DIM) ctx_kv_store_kernel(const ActT* kv, 
 // ROUND: n, the taps and the anchor come from the round inputs, and one thread publishes them in *p (no CTA
 // reads the fields it writes); otherwise they are read from *p.
 struct RowWeights {
-  const ActT* alpha;       // bf16 [4, 4]
-  const ActT* f_norm;      // bf16 [H]
-  const ActT* embed;       // bf16 [V, H]
-  const float* embed_norm;          // fp32 [H]
-  const ActT* mask_embed;  // bf16 [H]
-  const ActT* in_norm;     // bf16 [H]
+  const ActT* alpha;       // [4, 4]
+  const ActT* f_norm;      // [H]
+  const ActT* embed;       // [V, H] or q4_0 u8 [V, 1296] when embed_q4
+  const float* embed_norm; // fp32 [H]
+  const ActT* mask_embed;  // [H]
+  const ActT* in_norm;     // [H]
+  bool embed_q4;
 };
 struct RowOutputs {
   ActT *xin, *f_rnn, *res, *xn;
@@ -214,7 +217,16 @@ __global__ void __launch_bounds__(ROW_THREADS) round_rows_kernel(DraftParams* p,
     float x[8];
     if (r == 0) {
       float v[8];
-      unpack8(*reinterpret_cast<const uint4*>(W.embed + size_t(anchor) * H + c), v);
+      if (W.embed_q4) {
+        const uint8_t* row = reinterpret_cast<const uint8_t*>(W.embed) + size_t(anchor) * 1296;
+        const uint32_t nib4 = *reinterpret_cast<const uint32_t*>(row + (c >> 1));
+        const float d = __half2float(reinterpret_cast<const __half*>(row + 1152)[c >> 5]);
+        const float m8d = -8.f * d;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = fmaf(float((nib4 >> (4 * j)) & 0xfu), d, m8d);
+      } else {
+        unpack8(*reinterpret_cast<const uint4*>(W.embed + size_t(anchor) * H + c), v);
+      }
       const float rs = rms_scale(v, scratch);
       const float en[8] = {__uint_as_float(aux[0].x), __uint_as_float(aux[0].y), __uint_as_float(aux[0].z),
                            __uint_as_float(aux[0].w), __uint_as_float(aux[1].x), __uint_as_float(aux[1].y),
@@ -372,7 +384,7 @@ void ctx_kv_store(const ActT* kv, int n, const DraftParams* p, int row0, int kee
 
 void commit_mix(const DraftParams* p, const ActT* alpha, const CtxLayers& L, const ActT* f_norm,
                 ActT* xin, ActT* f_rnn, cudaStream_t stream) {
-  const RowWeights W{alpha, f_norm, nullptr, nullptr, nullptr, nullptr};
+  const RowWeights W{alpha, f_norm, nullptr, nullptr, nullptr, nullptr, false};
   const RowOutputs O{xin, f_rnn, nullptr, nullptr, nullptr};
   launch_pdl(round_rows_kernel<false>, dim3(BLOCK, 4), dim3(ROW_THREADS), stream, const_cast<DraftParams*>(p),
              RoundInputs{}, W, L, O, 0);
@@ -386,9 +398,9 @@ void commit_store(const float* kv, const DraftParams* p, const CtxLayers& L, cud
 
 void embed_block(const ActT* embed, const float* embed_norm, const ActT* mask_embed,
                  const ActT* in_norm, const DraftParams* p, ActT* res, ActT* xn,
-                 unsigned long long* picks, cudaStream_t stream) {
+                 unsigned long long* picks, cudaStream_t stream, bool embed_q4) {
   require_aligned(embed, "embed_block: embed must be 16-byte aligned");
-  const RowWeights W{nullptr, nullptr, embed, embed_norm, mask_embed, in_norm};
+  const RowWeights W{nullptr, nullptr, embed, embed_norm, mask_embed, in_norm, embed_q4};
   const RowOutputs O{nullptr, nullptr, res, xn, picks};
   launch_pdl(round_rows_kernel<false>, dim3(BLOCK, 1), dim3(ROW_THREADS), stream, const_cast<DraftParams*>(p),
              RoundInputs{}, W, CtxLayers{}, O, 4);
@@ -398,12 +410,12 @@ void round_begin(DraftParams* p, const RoundInputs& in, const ActT* alpha, const
                  const ActT* f_norm, const ActT* embed, const float* embed_norm,
                  const ActT* mask_embed, const ActT* in_norm, ActT* xin,
                  ActT* f_rnn, ActT* res, ActT* xn, unsigned long long* picks,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, bool embed_q4) {
   if (in.nwidths < 1 || in.nwidths > 3 || !in.m || !in.accepted || !in.next_greedy || !in.next_sampled)
     throw std::invalid_argument("round_begin: incomplete round inputs");
   for (int i = 0; i < in.nwidths; ++i) require_aligned(in.taps[i], "round_begin: taps must be 16-byte aligned");
   require_aligned(embed, "round_begin: embed must be 16-byte aligned");
-  const RowWeights W{alpha, f_norm, embed, embed_norm, mask_embed, in_norm};
+  const RowWeights W{alpha, f_norm, embed, embed_norm, mask_embed, in_norm, embed_q4};
   const RowOutputs O{xin, f_rnn, res, xn, picks};
   launch_pdl(round_rows_kernel<true>, dim3(BLOCK, 5), dim3(ROW_THREADS), stream, p, in, W, L, O, 0);
 }

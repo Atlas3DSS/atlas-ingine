@@ -123,33 +123,52 @@ class Loader {
   std::vector<UploadRequest> pending_;
 };
 
-std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
+struct LayerExpertFormats {
+  ExpertFormat w13 = ExpertFormat::NVFP4;
+  ExpertFormat w2 = ExpertFormat::NVFP4;
+};
+
+ExpertFormat parse_expert_dtype(const std::string& dt) {
+  if (dt == "nvfp4") return ExpertFormat::NVFP4;
+  if (dt == "mxfp8") return ExpertFormat::MXFP8;
+  if (dt == "atlas2") return ExpertFormat::ATLAS2;
+  if (dt == "atlas3") return ExpertFormat::ATLAS3;
+  if (dt == "exl3_2") return ExpertFormat::EXL3_2;
+  if (dt == "exl3_3") return ExpertFormat::EXL3_3;
+  throw std::runtime_error("weights: unsupported expert format " + dt);
+}
+
+std::array<LayerExpertFormats, LAYERS> expert_formats(const fs::path& model_dir) {
   std::ifstream in(model_dir / "hf_quant_config.json");
   if (!in) throw std::runtime_error("weights: cannot open " + (model_dir / "hf_quant_config.json").string());
   const nlohmann::json q = nlohmann::json::parse(in);
-  std::array<ExpertFormat, LAYERS> fmt{};
-  std::array<bool, LAYERS> seen{};
-  const std::string suffix = "mlp.experts.w13_weight";
+  std::array<LayerExpertFormats, LAYERS> fmt{};
+  std::array<bool, LAYERS> seen13{}, seen2{};
+  const std::string s13 = "mlp.experts.w13_weight";
+  const std::string s2 = "mlp.experts.w2_weight";
+  const std::string pfx = "model.llm.layers.";
   for (const auto& group : q.at("model").at("parameter_groups")) {
     const std::string dt = group.at("compute_dtype").get<std::string>();
     for (const auto& t : group.at("tensors")) {
       const std::string name = t.get<std::string>();
-      if (name.size() < suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
-        continue;
-      // model.llm.layers.<l>.mlp.experts.w13_weight
-      const std::size_t a = std::string("model.llm.layers.").size();
-      const int l = std::stoi(name.substr(a, name.find('.', a) - a));
+      const bool is13 = name.size() >= s13.size() && name.compare(name.size() - s13.size(), s13.size(), s13) == 0;
+      const bool is2 = !is13 && name.size() >= s2.size() && name.compare(name.size() - s2.size(), s2.size(), s2) == 0;
+      if (!is13 && !is2) continue;
+      const int l = std::stoi(name.substr(pfx.size(), name.find('.', pfx.size()) - pfx.size()));
       if (l < 0 || l >= LAYERS) continue;
-      if (dt == "nvfp4") fmt[l] = ExpertFormat::NVFP4;
-      else if (dt == "mxfp8") fmt[l] = ExpertFormat::MXFP8;
-      else if (dt == "atlas2") fmt[l] = ExpertFormat::ATLAS2;
-      else if (dt == "atlas3") fmt[l] = ExpertFormat::ATLAS3;
-      else throw std::runtime_error("weights: unsupported expert format " + dt);
-      seen[l] = true;
+      if (is13) {
+        fmt[l].w13 = parse_expert_dtype(dt);
+        seen13[l] = true;
+      } else {
+        fmt[l].w2 = parse_expert_dtype(dt);
+        seen2[l] = true;
+      }
     }
   }
-  for (int l = 0; l < LAYERS; ++l)
-    if (!seen[l]) throw std::runtime_error("weights: no expert format for layer " + std::to_string(l));
+  for (int l = 0; l < LAYERS; ++l) {
+    if (!seen13[l]) throw std::runtime_error("weights: no w13 expert format for layer " + std::to_string(l));
+    if (!seen2[l]) fmt[l].w2 = fmt[l].w13;
+  }
   return fmt;
 }
 
@@ -170,7 +189,8 @@ Dense row_view(const Dense& d, int begin, int end) {
   return v;
 }
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
+Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, bool load_experts,
+                      std::vector<float>* router_bias_out = nullptr) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -188,12 +208,15 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   }
   layer.mlp_norm = ld.f32(p + "mlp_norm.weight", {H});
 
-  // projections: one [R, H] BF16 matrix in SEG order (fast._concat_projections)
+  // projections: one [R, H] matrix in SEG order (fast._concat_projections).
+  // Supports pre-packed on-disk FP8 E4M3 (+ F32 *_scale) directly without BF16 staging, or BF16 on disk.
   static const char* seg_names[NUM_SEGS] = {"attn.wq_du.weight",        "attn.gate_attn.weight",
                                             "attn.wr_du.weight",        "attn.attn_sink_proj.weight",
                                             "attn.wk_dv.weight",        "attn.wv_dv.weight",
                                             "attn.k_sconv.weight_proj", "attn.v_sconv.weight_proj"};
   const int R = proj_rows(layer.full);
+  const bool proj_fp8_disk = m.at(p + seg_names[0])->dtype == "F8_E4M3";
+  const bool wo_fp8_disk = m.at(p + "attn.wo_ud.weight")->dtype == "F8_E4M3";
   DeviceBuffer proj_tmp, wo_tmp;
   Tensor wproj_bf16, wo_bf16;
   auto queue_bf16_rows = [&](const std::string& name, void* dst, int rows, int cols) {
@@ -203,11 +226,37 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
                                std::to_string(cols) + "]");
     ld.queue(name, dst);
   };
-  {
+  auto queue_fp8_rows = [&](const std::string& name, void* q_dst, float* s_dst, int rows, int cols) {
+    const SafetensorsRef ref = m.at(name);
+    const SafetensorsRef sref = m.at(name + "_scale");
+    if (ref->dtype != "F8_E4M3" || ref->numel() != std::int64_t(rows) * cols)
+      throw std::runtime_error("weights: " + name + " must be F8_E4M3 [" + std::to_string(rows) + ", " +
+                               std::to_string(cols) + "]");
+    if (sref->dtype != "F32" || sref->numel() != std::int64_t(rows))
+      throw std::runtime_error("weights: " + name + "_scale must be F32 [" + std::to_string(rows) + "]");
+    ld.queue(name, q_dst);
+    ld.queue(name + "_scale", s_dst);
+  };
+  if (proj_fp8_disk) {
+    void* q = ld.alloc(std::size_t(R) * H);
+    float* sc = static_cast<float*>(ld.alloc(std::size_t(R) * 4));
+    for (int s = 0; s < num_segs(layer.full); ++s) {
+      queue_fp8_rows(p + seg_names[s], static_cast<char*>(q) + std::size_t(SEG_BEGIN[s]) * H, sc + SEG_BEGIN[s],
+                     SEG_ROWS[s], H);
+    }
+    layer.wproj = Dense{rm(q, DType::FP8_E4M3FN, {R, H}), rm(sc, DType::FP32, {R})};
+  } else {
     void* d = dense_fp8 ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p : ld.alloc(std::size_t(R) * H * 2);
     for (int s = 0; s < num_segs(layer.full); ++s)
       queue_bf16_rows(p + seg_names[s], static_cast<char*>(d) + std::size_t(SEG_BEGIN[s]) * H * 2, SEG_ROWS[s], H);
     wproj_bf16 = rm(d, kActDType, {R, H});
+  }
+  if (wo_fp8_disk) {
+    void* oq = ld.alloc(std::size_t(H) * HEADS * HEAD_DIM);
+    float* osc = static_cast<float*>(ld.alloc(std::size_t(H) * 4));
+    queue_fp8_rows(p + "attn.wo_ud.weight", oq, osc, H, HEADS * HEAD_DIM);
+    layer.wo = Dense{rm(oq, DType::FP8_E4M3FN, {H, HEADS * HEAD_DIM}), rm(osc, DType::FP32, {H})};
+  } else {
     void* o = dense_fp8 ? (wo_tmp = DeviceBuffer(std::size_t(H) * 3072 * 2)).p : ld.alloc(std::size_t(H) * 3072 * 2);
     queue_bf16_rows(p + "attn.wo_ud.weight", o, H, HEADS * HEAD_DIM);
     wo_bf16 = rm(o, kActDType, {H, HEADS * HEAD_DIM});
@@ -226,7 +275,11 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   layer.attn_conv = ld.f32(p + "attn_sconv.weight", {H, CONV_K});
   layer.mlp_conv = ld.f32(p + "mlp_sconv.weight", {H, CONV_K});
   layer.router = ld.f32(p + "mlp.gate.weight", {EXPERTS, H});
-  layer.router_bias = ld.f32(p + "mlp.gate.bias", {EXPERTS});
+  {
+    const std::vector<float> rb = host_f32(m, p + "mlp.gate.bias");
+    if (router_bias_out) *router_bias_out = rb;
+    layer.router_bias = ld.upload_f32(rb, {EXPERTS});
+  }
   layer.router_bf16 = ld.upload_bf16(host_f32(m, p + "mlp.gate.weight"), {EXPERTS, H});  // exact
   if (l > 0) {
     const std::string qn = "model.llm.attn_res.attn_queries." + std::to_string(l - 1);
@@ -296,39 +349,55 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     layer.mlp_gate_gain = at(layer.mlp1_gate_gain, 0, DType::FP32, H, GATE_RANK);
   }
 
-  // routed experts in checkpoint encoding
+  // routed experts in checkpoint encoding (skipped here when ExpertCache manages tiered offloading)
   const std::string e = p + "mlp.experts.";
   Experts& ex = layer.experts;
-  ex.fmt = fmt;
-  ex.w13 = ld.raw(e + "w13_weight");
-  ex.w13_scale = ld.raw(e + "w13_weight_scale");
-  ex.w2 = ld.raw(e + "w2_weight");
-  ex.w2_scale = ld.raw(e + "w2_weight_scale");
-  const bool mxfp8 = fmt == ExpertFormat::MXFP8;
-  const std::string want_codes = mxfp8 ? "F8_E4M3" : "U8", want_scales = mxfp8 ? "U8" : "F8_E4M3";
-  if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
-      m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales)
-    throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
-  if (!mxfp8) {
-    for (const char* w : {"w13", "w2"}) {
-      const std::vector<float> amax = host_f32(m, e + w + "_weight_amax");
-      const std::vector<float> den = host_f32(m, e + w + "_weight_outer_scale_denominator");
+  ex.fmt = ef.w13;
+  ex.w13_fmt = ef.w13;
+  ex.w2_fmt = ef.w2;
+  auto load_expert_proj = [&](const char* proj, ExpertFormat pfmt, Tensor& wt, Tensor& sc, Tensor& fac, Tensor& rin,
+                              Tensor& rout) {
+    if (is_exl3(pfmt)) {
+      if (m.at(e + proj + "_weight")->dtype != "U8" || m.at(e + proj + "_rin")->dtype != "F16" ||
+          m.at(e + proj + "_rout")->dtype != "F16")
+        throw std::runtime_error("weights: layer " + std::to_string(l) + " EXL3 " + proj + " dtype mismatch");
+      if (load_experts) {
+        wt = ld.raw(e + proj + "_weight");
+        rin = ld.raw(e + proj + "_rin");
+        rout = ld.raw(e + proj + "_rout");
+      }
+      return;
+    }
+    const bool mxfp8 = pfmt == ExpertFormat::MXFP8;
+    const std::string want_codes = mxfp8 ? "F8_E4M3" : "U8", want_scales = mxfp8 ? "U8" : "F8_E4M3";
+    if (m.at(e + proj + "_weight")->dtype != want_codes || m.at(e + proj + "_weight_scale")->dtype != want_scales)
+      throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
+    if (load_experts) {
+      wt = ld.raw(e + proj + "_weight");
+      sc = ld.raw(e + proj + "_weight_scale");
+    }
+    if (!mxfp8) {
+      const std::vector<float> amax = host_f32(m, e + proj + "_weight_amax");
+      const std::vector<float> den = host_f32(m, e + proj + "_weight_outer_scale_denominator");
       std::vector<float> f(EXPERTS);
       for (int i = 0; i < EXPERTS; ++i) f[i] = amax[i] / den[den.size() == 1 ? 0 : i];  // FP32 division
-      (std::string(w) == "w13" ? ex.w13_factor : ex.w2_factor) = ld.upload_f32(f, {EXPERTS});
+      fac = ld.upload_f32(f, {EXPERTS});
     }
-  }
+  };
+  load_expert_proj("w13", ef.w13, ex.w13, ex.w13_scale, ex.w13_factor, ex.w13_rin, ex.w13_rout);
+  load_expert_proj("w2", ef.w2, ex.w2, ex.w2_scale, ex.w2_factor, ex.w2_rin, ex.w2_rout);
 
-  ld.flush();
-  bf16_to_act_inplace(wproj_bf16.data, std::size_t(R) * H, ld.stream());
-  bf16_to_act_inplace(wo_bf16.data, std::size_t(H) * HEADS * HEAD_DIM, ld.stream());
-  if (dense_fp8) {
-    layer.wproj = to_fp8(ld, wproj_bf16, R, H);
-    layer.wo = to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM);
-    CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // before the BF16 temporaries are freed
-  } else {
-    layer.wproj = Dense{wproj_bf16, {}};
-    layer.wo = Dense{wo_bf16, {}};
+  if (!proj_fp8_disk || !wo_fp8_disk) {
+    ld.flush();
+    if (!proj_fp8_disk) {
+      bf16_to_act_inplace(wproj_bf16.data, std::size_t(R) * H, ld.stream());
+      layer.wproj = dense_fp8 ? to_fp8(ld, wproj_bf16, R, H) : Dense{wproj_bf16, {}};
+    }
+    if (!wo_fp8_disk) {
+      bf16_to_act_inplace(wo_bf16.data, std::size_t(H) * HEADS * HEAD_DIM, ld.stream());
+      layer.wo = dense_fp8 ? to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM) : Dense{wo_bf16, {}};
+    }
+    if (dense_fp8) CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // before the BF16 temporaries are freed
   }
   Dense* views[NUM_SEGS] = {&layer.wq, &layer.wgate, &layer.wr, &layer.wsink,
                             &layer.wk, &layer.wv,    &layer.wk_dyn, &layer.wv_dyn};
@@ -338,16 +407,26 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
 
 }  // namespace
 
-Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream) {
+Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream,
+                     const OffloadConfig& offload) {
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
   w.dense_fp8 = dense_fp8;
-  w.expert_formats = expert_formats(model_dir);
+  const auto efs = expert_formats(model_dir);
+  for (int l = 0; l < LAYERS; ++l) {
+    w.expert_formats[l] = efs[l].w13;
+    w.w2_expert_formats[l] = efs[l].w2;
+  }
   w.storage.reserve(4096);
   Loader ld(m, up, stream, w.storage);
   const int H = HIDDEN;
-  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
+  const bool tiered = offload.vram_mb > 0;
+  std::array<std::vector<float>, LAYERS> router_biases;
+  for (int l = 0; l < LAYERS; ++l) {
+    w.layers.push_back(load_layer_into(ld, l, efs[l], dense_fp8, !tiered, &router_biases[l]));
+    w.dense_fp8 = w.dense_fp8 || w.layers.back().wproj.fp8() || w.layers.back().wo.fp8();
+  }
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
@@ -364,30 +443,86 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     w.message_queries = ld.upload_f32(mq, {n, 4, H});
   }
   w.embed = ld.raw("model.llm.embed.weight");
-  if (w.embed.dtype != DType::BF16) throw std::runtime_error("weights: embed must be BF16");
+  const bool embed_bf16 = w.embed.dtype == DType::BF16;
+  const bool embed_q4 = w.embed.dtype == DType::U8 && w.embed.ne[0] == EMBED_Q4_ROW_BYTES && w.embed.ne[1] == VOCAB;
+  if (!embed_bf16 && !embed_q4)
+    throw std::runtime_error("weights: embed must be BF16 [VOCAB, H] or Q4_0 U8 [VOCAB, 1296]");
   w.embed_norm = ld.f32("model.llm.embed_norm.weight", {H});
   w.final_query = ld.f32("model.llm.attn_res.output_query", {1, H});
   w.final_norm = ld.f32("model.llm.norm.weight", {H});
   DeviceBuffer unembed_tmp;
   {
     const std::string name = "model.llm.unembed.weight";
-    if (m.at(name)->dtype != "BF16") throw std::runtime_error("weights: unembed must be BF16");
-    const std::size_t bytes = std::size_t(UNPADDED_VOCAB) * H * 2;
-    void* d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.alloc(bytes);
-    ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]
-    ld.flush();
-    bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream);
-    w.embed.dtype = kActDType;
-    bf16_to_act_inplace(d, std::size_t(UNPADDED_VOCAB) * H, stream);
-    const Tensor bf = rm(d, kActDType, {UNPADDED_VOCAB, H});
-    if (dense_fp8) {
-      w.unembed = to_fp8(ld, bf, UNPADDED_VOCAB, H);
-      CUDA_CHECK(cudaStreamSynchronize(stream));
+    const SafetensorsRef uref = m.at(name);
+    if (uref->dtype == "F8_E4M3") {
+      const SafetensorsRef sref = m.at(name + "_scale");
+      if (uref->shape.size() != 2 || uref->shape[0] < UNPADDED_VOCAB || uref->shape[1] != H)
+        throw std::runtime_error("weights: unembed F8_E4M3 shape mismatch");
+      if (sref->dtype != "F32" || sref->numel() < UNPADDED_VOCAB)
+        throw std::runtime_error("weights: unembed_scale must be F32 [>=UNPADDED_VOCAB]");
+      void* q = ld.alloc(std::size_t(UNPADDED_VOCAB) * H);
+      float* sc = static_cast<float*>(ld.alloc(std::size_t(UNPADDED_VOCAB) * 4));
+      ld.queue(name, q, UNPADDED_VOCAB);
+      ld.queue(name + "_scale", sc, UNPADDED_VOCAB);
+      ld.flush();
+      if (embed_bf16) {
+        bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream);
+        w.embed.dtype = kActDType;
+      }
+      w.unembed = Dense{rm(q, DType::FP8_E4M3FN, {UNPADDED_VOCAB, H}), rm(sc, DType::FP32, {UNPADDED_VOCAB})};
+      w.dense_fp8 = true;
+    } else if (uref->dtype == "BF16") {
+      const std::size_t bytes = std::size_t(UNPADDED_VOCAB) * H * 2;
+      void* d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.alloc(bytes);
+      ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]
+      ld.flush();
+      if (embed_bf16) {
+        bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream);
+        w.embed.dtype = kActDType;
+      }
+      bf16_to_act_inplace(d, std::size_t(UNPADDED_VOCAB) * H, stream);
+      const Tensor bf = rm(d, kActDType, {UNPADDED_VOCAB, H});
+      if (dense_fp8) {
+        w.unembed = to_fp8(ld, bf, UNPADDED_VOCAB, H);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+      } else {
+        w.unembed = Dense{bf, {}};
+      }
     } else {
-      w.unembed = Dense{bf, {}};
+      throw std::runtime_error("weights: unembed must be BF16 or F8_E4M3");
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
+  if (tiered) {
+    std::size_t non_expert_bytes = 0;
+    for (const auto& b : w.storage) non_expert_bytes += b.bytes;
+    // Estimate post-load fixed VRAM (KV cache + prefiller scratch + checkpoint + runtime/cuBLAS headroom)
+    // so total model GPU memory stays strictly within offload.vram_mb MiB.
+    const std::size_t kv_ring_bytes =
+        std::size_t(NUM_SLIDING_VISITS) * WINDOW * KV_DIM * 4 + std::size_t(NUM_SLIDING_VISITS) * WINDOW * 8;
+    const std::size_t kv_full_bytes =
+        offload.kv_vram_mb > 0
+            ? (std::size_t(offload.kv_vram_mb) << 20)
+            : (std::size_t(NUM_FULL_VISITS) * std::size_t(offload.max_ctx) *
+               (offload.kv_q4 ? (2 * std::size_t(KV_Q4_ROW_BYTES)) : (std::size_t(KV_DIM) * (offload.kv_fp8 ? 2 : 4))));
+    const std::size_t checkpoint_bytes = kv_ring_bytes + (std::size_t(16) << 20);
+    bool any_exl3_w13 = false;
+    for (int l = 0; l < LAYERS; ++l) any_exl3_w13 |= is_exl3(w.expert_formats[l]);
+    const std::size_t exl3_prefill_extra =
+        any_exl3_w13 ? (std::size_t(offload.prefill_chunk) * TOP_K * HIDDEN * 2) : 0;
+    const std::size_t prefill_bytes =
+        std::size_t(offload.prefill_chunk) * std::size_t(390) * 1024 + (std::size_t(56) << 20) + exl3_prefill_extra;
+    const std::size_t runtime_headroom = std::size_t(384) << 20;
+    const std::size_t fixed_bytes =
+        non_expert_bytes + kv_ring_bytes + kv_full_bytes + checkpoint_bytes + prefill_bytes + runtime_headroom;
+    const std::size_t total_budget = std::size_t(offload.vram_mb) << 20;
+    const std::size_t expert_vram_budget =
+        total_budget > fixed_bytes ? (total_budget - fixed_bytes) : (std::size_t(256) << 20);
+    const std::size_t warm_ram_budget =
+        offload.ram_mb > 512 ? (std::size_t(offload.ram_mb - 256) << 20) : std::size_t(0);
+    w.expert_cache = ExpertCache::create(model_dir, w.expert_formats, w.w2_expert_formats, router_biases,
+                                         expert_vram_budget, warm_ram_budget, offload, stream);
+  }
   return w;
 }
 
@@ -397,7 +532,8 @@ Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t 
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Loader ld(m, up, stream, storage);
-  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8);
+  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8, true);
+  ld.flush();
   CUDA_CHECK(cudaStreamSynchronize(stream));
   return layer;
 }

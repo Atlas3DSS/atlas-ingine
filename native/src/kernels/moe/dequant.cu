@@ -8,9 +8,11 @@
 // One thread decodes one scale block (16 or 32 values) and writes it with 16-byte stores.
 #include "kernels/moe/moe.h"
 
+#include "kernels/common/exl3.cuh"
 #include "core/device.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 #include <stdexcept>
@@ -113,12 +115,126 @@ __global__ void dequant_atlas3(const uint8_t* __restrict__ codes, const __nv_fp8
     dst[1] = reinterpret_cast<uint4*>(v)[1];
 }
 
+// EXL3 / Escha W2 full-matrix decode for unit tests / validation:
+// Grid: (rows / 128, cols / 128, n), 128 threads (4 warps) per block.
+// Each block decodes one 128_row x 128_col super-tile: W = diag(rout) * H_128 * W_hat^T * H_128 * diag(rin).
+// Input codes layout: [128, rows/16, cols/16, 32*BITS] u8; rin f16 [128, cols]; rout f16 [128, rows].
+template <int BITS, typename BufT>
+__global__ void dequant_exl3_kernel(const uint8_t* __restrict__ codes, const __half* __restrict__ rin,
+                                    const __half* __restrict__ rout, const int32_t* __restrict__ experts,
+                                    ActT* __restrict__ out, int rows, int cols) {
+    constexpr int TILE_BYTES = 32 * BITS;
+    extern __shared__ __align__(16) unsigned char tile_raw[];
+    BufT* tile_buf = reinterpret_cast<BufT*>(tile_raw);
+    auto load_tile = [&](int r, int c) -> float {
+        if constexpr (sizeof(BufT) == 4) return tile_buf[r * 128 + c];
+        else return __half2float(tile_buf[r * 128 + c]);
+    };
+    auto store_tile = [&](int r, int c, float x) {
+        if constexpr (sizeof(BufT) == 4) tile_buf[r * 128 + c] = x;
+        else tile_buf[r * 128 + c] = __float2half_rn(x);
+    };
+    const int r_blk = blockIdx.x, c_blk = blockIdx.y, slot = blockIdx.z;
+    const int e = experts[slot];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, ti = lane & 3;
+    const int NT = rows / 16, KT = cols / 16;
+
+    // Step 1: Decode 8 x 8 = 64 tiles of 16x16 into tile[row][col] = W_hat^T[row, col]
+    for (int idx = warp; idx < 64; idx += 4) {
+        const int nr = idx >> 3, nc = idx & 7;
+        const int nt = r_blk * 8 + nr, kt = c_blk * 8 + nc;
+        const uint32_t* tw = reinterpret_cast<const uint32_t*>(
+            codes + ((int64_t(e) * NT + nt) * KT + kt) * TILE_BYTES);
+        uint32_t h01, h23, h45, h67;
+        exl3::dq8_mcg<BITS>([&](int wi) { return tw[wi]; }, lane, h01, h23, h45, h67);
+        const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&h01));
+        const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&h23));
+        const float2 f45 = __half22float2(*reinterpret_cast<const __half2*>(&h45));
+        const float2 f67 = __half22float2(*reinterpret_cast<const __half2*>(&h67));
+        const int r0 = nr * 16 + g, r1 = nr * 16 + g + 8;
+        const int c0 = nc * 16 + 2 * ti, c1 = nc * 16 + 2 * ti + 8;
+        store_tile(r0, c0, f01.x);
+        store_tile(r0, c0 + 1, f01.y);
+        store_tile(r0, c1, f23.x);
+        store_tile(r0, c1 + 1, f23.y);
+        store_tile(r1, c0, f45.x);
+        store_tile(r1, c0 + 1, f45.y);
+        store_tile(r1, c1, f67.x);
+        store_tile(r1, c1 + 1, f67.y);
+    }
+    __syncthreads();
+
+    // Step 2: Apply H_128 along cols (K dim) and multiply by rin[e, c_blk*128 + col]
+    const __half* rin_e = rin + int64_t(e) * cols + c_blk * 128;
+    float r_in[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r_in[i] = __half2float(rin_e[lane * 4 + i]);
+    for (int r = warp; r < 128; r += 4) {
+        float v[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = load_tile(r, lane * 4 + i);
+        exl3::fwht_128_warp(v, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) store_tile(r, lane * 4 + i, v[i] * r_in[i]);
+    }
+    __syncthreads();
+
+    // Step 3: Apply H_128 along rows (N dim), multiply by rout[e, r_blk*128 + row], write ActT out
+    const __half* rout_e = rout + int64_t(e) * rows + r_blk * 128;
+    float r_out[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r_out[i] = __half2float(rout_e[lane * 4 + i]);
+    ActT* out_e = out + int64_t(slot) * rows * cols;
+    for (int c = warp; c < 128; c += 4) {
+        float v[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = load_tile(lane * 4 + i, c);
+        exl3::fwht_128_warp(v, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int rr = r_blk * 128 + lane * 4 + i;
+            const int cc = c_blk * 128 + c;
+            out_e[int64_t(rr) * cols + cc] = act::from_float(v[i] * r_out[i]);
+        }
+    }
+}
+
 }  // namespace
 
-// codes [128, R, C/2] (NVFP4), [128, R, C] (MXFP8), [128, R, C/4] (ATLAS2), or [128, R, 3C/8] (ATLAS3);
-// experts int32 [n]; out ActT [n, R, C].
+// codes [128, R, C/2] (NVFP4), [128, R, C] (MXFP8), [128, R, C/4] (ATLAS2), [128, R, 3C/8] (ATLAS3),
+// or [128, R/16, C/16, 32*bits] (EXL3_2 / EXL3_3); experts int32 [n]; out ActT [n, R, C].
 void dequant_experts(const void* codes, const void* scales, const float* factor, const std::int32_t* experts, int n,
-                     int rows, int cols, Format fmt, ActT* out, cudaStream_t stream) {
+                     int rows, int cols, Format fmt, ActT* out, cudaStream_t stream, const void* rout) {
+    if (fmt == Format::EXL3_2 || fmt == Format::EXL3_3) {
+        if (n < 0 || rows <= 0 || cols <= 0 || rows % 128 != 0 || cols % 128 != 0 || !codes || !scales || !rout ||
+            !experts || !out)
+            throw std::invalid_argument("moe: dequant_experts(EXL3): bad arguments");
+        if (n == 0) return;
+        const dim3 grid(rows / 128, cols / 128, n);
+        const auto launch_exl3 = [&](auto bits_tag) {
+            constexpr int B = decltype(bits_tag)::value;
+            constexpr int SMEM_F32 = 128 * 128 * sizeof(float);
+            constexpr int SMEM_F16 = 128 * 128 * sizeof(__half);
+            if (current_max_smem_optin() >= SMEM_F32) {
+                static const cudaError_t a = cudaFuncSetAttribute(
+                    dequant_exl3_kernel<B, float>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_F32);
+                CUDA_CHECK(a);
+                dequant_exl3_kernel<B, float><<<grid, 128, SMEM_F32, stream>>>(
+                    static_cast<const uint8_t*>(codes), static_cast<const __half*>(scales),
+                    static_cast<const __half*>(rout), experts, out, rows, cols);
+            } else {
+                // Pascal <=48 KiB SMEM: 32 KiB FP16 tile buffer (no opt-in attribute needed).
+                dequant_exl3_kernel<B, __half><<<grid, 128, SMEM_F16, stream>>>(
+                    static_cast<const uint8_t*>(codes), static_cast<const __half*>(scales),
+                    static_cast<const __half*>(rout), experts, out, rows, cols);
+            }
+        };
+        if (fmt == Format::EXL3_2) launch_exl3(std::integral_constant<int, 2>{});
+        else launch_exl3(std::integral_constant<int, 3>{});
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const bool mxfp8 = fmt == Format::MXFP8;
     const int col_align = (fmt == Format::NVFP4 || fmt == Format::ATLAS2) ? 16 : 32;
     if (n < 0 || rows <= 0 || cols % col_align != 0 || (!mxfp8 && !factor))

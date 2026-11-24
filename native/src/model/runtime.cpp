@@ -63,9 +63,31 @@ void GraphExec::launch(cudaStream_t stream) const {
 
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  if (options_.kv_paged || options_.kv_vram_mb > 0) {
+    options_.kv_paged = true;
+    options_.kv_q4 = true;
+    options_.kv_fp8 = false;
+    if (options_.kv_vram_mb <= 0) {
+      options_.kv_vram_mb = options_.offload_vram_mb > 0 ? 256 : 1536;
+    }
+  }
+  if (options_.offload_vram_mb > 0 && options_.prefill_chunk > 512) {
+    options_.prefill_chunk = 512;  // keep prefill scratch compact (~190 MB) inside low-VRAM caps
+  }
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
-  ablation_ = load_ablation(options.ablation);
+  OffloadConfig offload;
+  offload.vram_mb = options_.offload_vram_mb;
+  offload.ram_mb = options_.offload_ram_mb;
+  offload.mode = options_.offload_mode;
+  offload.ranking = options_.expert_ranking;
+  offload.dump_router_stats = options_.dump_router_stats;
+  offload.max_ctx = options_.max_ctx;
+  offload.prefill_chunk = options_.prefill_chunk;
+  offload.kv_fp8 = options_.kv_fp8;
+  offload.kv_q4 = options_.kv_q4;
+  offload.kv_vram_mb = options_.kv_paged ? options_.kv_vram_mb : 0;
+  weights_ = load_weights(options_.model_dir, options_.dense_fp8, stream_, offload);
+  ablation_ = load_ablation(options_.ablation);
   init();
 }
 
@@ -78,7 +100,18 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
-  state_ = make_state(options.max_ctx, options.kv_fp8);
+  PagedKvConfig pkv;
+  if (options.kv_paged || options.kv_vram_mb > 0) {
+    pkv.max_ctx = options.max_ctx;
+    pkv.vram_mb = options.kv_vram_mb > 0 ? options.kv_vram_mb : (options.offload_vram_mb > 0 ? 256 : 1536);
+    pkv.ram_mb = options.kv_ram_mb;
+    pkv.prefill_chunk = options.prefill_chunk;
+    pkv.swap_dir = options.kv_swap_dir;
+  }
+  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_q4, pkv);
+  if (state_.paged_kv) {
+    state_.paged_kv->ensure_decode_pages(0, kMaxWidth, stream_);
+  }
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
@@ -114,7 +147,10 @@ void Runtime::init() {
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
-  for (const auto& [m, history] : history_) capture(m, history);
+  const bool eager_offload = weights_.expert_cache && weights_.expert_cache->needs_host_dispatch();
+  if (!eager_offload) {
+    for (const auto& [m, history] : history_) capture(m, history);
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
@@ -181,10 +217,15 @@ void Runtime::capture(int m, bool history) {
 void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
   const int m = int(tokens.size());
   buffers(m);  // the width must exist
+  if (state_.paged_kv) state_.paged_kv->ensure_decode_pages(position, m, stream_);
   set_step_inputs(tokens.data(), m, position, this->tokens(), pos(), stream_);
 }
 
 const float* Runtime::run_step(int m) {
+  if ((weights_.expert_cache && weights_.expert_cache->needs_host_dispatch()) ||
+      (state_.paged_kv && state_.paged_kv->needs_streamed_decode())) {
+    return run_step_eager(m);
+  }
   auto it = graphs_.find(m);
   if (it == graphs_.end()) throw std::invalid_argument("no decode graph for width " + std::to_string(m));
   CUDA_CHECK(cudaGraphLaunch(it->second, stream_));
@@ -205,6 +246,7 @@ const float* Runtime::decode_logits(std::int32_t token, int position) {
 
 void Runtime::chain_advance(const std::int32_t* sampled, int position) {
   const int k = position & 1;
+  if (state_.paged_kv) state_.paged_kv->ensure_decode_pages(position, 1, stream_);
   model::chain_advance(sampled, tokens(), pos(), position, static_cast<std::int32_t*>(chain_host_.device_ptr()) + k,
                        state_ptrs(), undo_[k], stream_);
   CUDA_CHECK(cudaEventRecord(chain_done_[k], stream_));
@@ -268,15 +310,19 @@ std::size_t Runtime::full_rows_bytes(int n) const {
   return 2 * std::size_t(NUM_FULL_VISITS) * row * std::size_t(n);
 }
 
-// one 2D copy per cache: NUM_FULL_VISITS rows of n positions, pitch max_ctx positions in the cache, packed in
-// the parked copy (k visits, then v visits)
+// Copy NUM_FULL_VISITS visits of n positions packed contiguously (k visits, then v visits).
+// Per-visit 1D copies avoid CUDA's 2 GiB cudaMemcpy2DAsync pitch ceiling at >=1M context lengths.
 void Runtime::save_full_rows(void* dst, int n) {
   const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
   if (n == 0) return;
   const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
   char* p = static_cast<char*>(dst);
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
-    CUDA_CHECK(cudaMemcpy2DAsync(p, width, t->data, pitch, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
+    const char* src = static_cast<const char*>(t->data);
+    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+      CUDA_CHECK(cudaMemcpyAsync(p + std::size_t(f) * width, src + std::size_t(f) * pitch, width, cudaMemcpyDefault,
+                                 stream_));
+    }
     p += bytes;
   }
 }
@@ -287,7 +333,11 @@ void Runtime::restore_full_rows(const void* src, int n) {
   const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
   const char* p = static_cast<const char*>(src);
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
-    CUDA_CHECK(cudaMemcpy2DAsync(t->data, pitch, p, width, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
+    char* dst = static_cast<char*>(t->data);
+    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+      CUDA_CHECK(cudaMemcpyAsync(dst + std::size_t(f) * pitch, p + std::size_t(f) * width, width, cudaMemcpyDefault,
+                                 stream_));
+    }
     p += bytes;
   }
 }

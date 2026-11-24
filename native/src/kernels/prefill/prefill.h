@@ -15,6 +15,9 @@ namespace ingine::kernels::prefill {
 inline constexpr int kHidden = 2304;
 inline constexpr int kHeads = 24, kKvHeads = 8, kHeadDim = 128, kRel = 16, kRelExtent = 1024;
 inline constexpr int kKvDim = kKvHeads * kHeadDim;  // 1024
+inline constexpr int kKvQ4NibbleBytes = kKvDim / 2;              // 512
+inline constexpr int kKvQ4ScaleBytes = kKvHeads * (kHeadDim / 32) * 2;  // 64
+inline constexpr int kKvQ4RowBytes = kKvQ4NibbleBytes + kKvQ4ScaleBytes;  // 576
 inline constexpr int kInter = 1152, kExperts = 128, kTopK = 8;
 inline constexpr int kAttnKeyTile = 64;    // keys per attention tile (tile bounds granularity)
 inline constexpr int kAttnMaxTiles = 64;   // explicit-position key tiles per call (ring + chunk)
@@ -65,11 +68,15 @@ struct AttnPrepParams {
   const float* v_w = nullptr;
   const float* conv_k = nullptr;   // [3, 1024] previous conv inputs (read only; see conv_state_update)
   const float* conv_v = nullptr;
-  ActT* q = nullptr;      // out [T, 24, 128]
-  ActT* rel = nullptr;    // out [T, 24, 16]
-  void* k_out = nullptr;           // out [T, 8, 128] rows: bf16, or fp8 e4m3 (out_fp8: full caches with kv_fp8)
+  ActT* q = nullptr;               // out [T, 24, 128]
+  ActT* rel = nullptr;             // out [T, 24, 16]
+  void* k_out = nullptr;           // out [T, 8, 128] ActT/fp8, or [T, 576] u8 Q4_0 (out_q4: full caches)
   void* v_out = nullptr;
+  void* const* k_pages = nullptr;  // optional [num_pages] Q4_0 page pointers (indexed by (pos0+t) >> page_shift)
+  void* const* v_pages = nullptr;
+  int page_shift = 0;
   bool out_fp8 = false;
+  bool out_q4 = false;
 };
 // model._qkv per token: q (scale, clip, tau, BF16), rel (scale, clip, tau, BF16), keys/values through the
 // static (sliding) or dynamic (full) conv, BF16, key clip / value RMS norm, stored at the cache precision.
@@ -81,10 +88,15 @@ void rel_logits(const ActT* rel, const float* rel_proj, int T, ActT* out, cudaSt
 
 struct AttnParams {
   const ActT* q = nullptr;  // [T, 24, 128]
-  const void* k = nullptr;           // key rows [L, 8, 128]: bf16, or fp8 e4m3 (kv_fp8)
+  const void* k = nullptr;  // key rows [L, 8, 128] ActT/fp8, or [L, 576] u8 Q4_0 (kv_q4)
   const void* v = nullptr;
+  void* const* k_pages = nullptr;  // optional [num_pages] Q4_0 K/V page pointers (indexed by j >> page_shift)
+  void* const* v_pages = nullptr;
+  int page_shift = 0;
+  int k_pos_base = 0;              // absolute token position of key row 0 in k/v (0 for full prefix)
   bool kv_fp8 = false;
-  const int* kpos = nullptr;         // positions of the L keys (padded to tiles with -1), or null: key j at j
+  bool kv_q4 = false;
+  const int* kpos = nullptr;         // positions of the L keys (padded to tiles with -1), or null: key j at k_pos_base + j
   const int4* bounds = nullptr;      // key_tile_bounds of kpos (with kpos)
   int L = 0;
   int T = 0, pos0 = 0;
@@ -93,6 +105,12 @@ struct AttnParams {
   const ActT* proj = nullptr; // [T, ld]: gate (sigmoid input) and sink logits in SEG order
   int ld = 0;
   ActT* out = nullptr;        // [T, 3072] = bf16(bf16(attention * sigmoid(lse - sink)) * sigmoid(gate))
+  // Optional chunked online-softmax merge across staged KV batches (non-null only during paged KV streaming):
+  float* partial_o = nullptr;        // [T, 24, 128] FP32 running unscaled numerator O (2^15 scaled)
+  float* partial_m = nullptr;        // [T, 24] FP32 running log2 row max
+  float* partial_l = nullptr;        // [T, 24] FP32 running row sum
+  bool partial_init = true;          // true on first batch; false resumes from partial_*
+  bool partial_final = true;         // true on final batch (writes out); false saves partial_*
 };
 // flex.attend + the output gate of model._visit: scores (q.k)/sqrt(128) + rel bias (distance < 1024), masked,
 // softmax with the per-head sink folded in through the log-sum-exp. Q.K in BF16 MMA with FP32 accumulation
@@ -136,24 +154,40 @@ struct MoeWork {
 // (token, expert) pairs per grouped-GEMM tile: 32 for small chunks (few pairs per expert: deeper weight
 // prefetch), 128 otherwise. INGINE_MOE_TILE_ROWS (32 or 128) overrides it (benchmarks).
 int moe_tile_rows(int T);
-inline int moe_max_tiles(int T) { return (T * kTopK + moe_tile_rows(T) - 1) / moe_tile_rows(T) + kExperts; }
+inline int moe_max_tiles(int T, int tile_rows = 0) {
+  const int tr = tile_rows > 0 ? tile_rows : moe_tile_rows(T);
+  return (T * kTopK + tr - 1) / tr + kExperts;
+}
 // tile-list capacity for every chunk size up to max_T
 int moe_tiles_capacity(int max_T);
 
 // Router selection on FP32 logits [T, 128] (x . router^T): s = sigmoid, top-8 of s + bias (descending),
 // wts = 8 s / (sum s + 1e-20); counts[e] += hits.
 void moe_topk(const float* logits, const float* bias, int T, int* idx, float* wts, int* counts, cudaStream_t stream);
-// Expert-sorted pair lists and moe_tile_rows(T)-pair tiles from idx and counts.
-void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream);
+// Expert-sorted pair lists and tile_rows (default moe_tile_rows(T)) tiles from idx and counts.
+void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream, int tile_rows = 0);
 
 struct MoeExperts {
-  int fmt = 0;  // 0 NVFP4, 1 MXFP8 (weights.py layouts)
+  int fmt = 0;  // w13 format: 0 NVFP4, 1 MXFP8, 2 ATLAS2, 3 ATLAS3, 4 EXL3_2, 5 EXL3_3
   const void* w13 = nullptr;
-  const void* w13_scale = nullptr;
+  const void* w13_scale = nullptr;  // block scales, or w13_rin (F16 [128, H]) for EXL3
   const float* w13_factor = nullptr;
   const void* w2 = nullptr;
-  const void* w2_scale = nullptr;
+  const void* w2_scale = nullptr;   // block scales, or w2_rin (F16 [128, I]) for EXL3
   const float* w2_factor = nullptr;
+  int w2_fmt = -1;                  // w2 format (-1 -> same as fmt)
+  const void* w13_rout = nullptr;   // F16 [128, 2I] for EXL3
+  const void* w2_rout = nullptr;    // F16 [128, H] for EXL3
+  ActT* exl3_scratch = nullptr;     // ActT [T * 8, 2I] scratch for EXL3 stacked gate/up (e.g. down_)
+  // Optional per-expert pointer tables ([128]) and active-expert mask ([128] u8) for tiered offloading.
+  const std::uint8_t* const* w13_ptrs = nullptr;
+  const std::uint8_t* const* w13_scale_ptrs = nullptr;
+  const std::uint8_t* const* w13_rout_ptrs = nullptr;
+  const std::uint8_t* const* w2_ptrs = nullptr;
+  const std::uint8_t* const* w2_scale_ptrs = nullptr;
+  const std::uint8_t* const* w2_rout_ptrs = nullptr;
+  const std::uint8_t* active_mask = nullptr;
+  int tile_rows = 0;  // 0 = moe_tile_rows(T); EXL3 uses 32 (3-CTA/SM, zero register spills)
 };
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
 // exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.
@@ -178,5 +212,7 @@ void store_tap(const float* x, int T, ActT* out, int64_t out_stride, cudaStream_
 // model.logits for one row: out[v] = 30 tanh(bf16(w_v . x) / 30), w bf16 [V, H] or FP8 rows dequantized
 // as weights.dequant (bf16(fp8 * scale[v])); x bf16 [H].
 void head_logits(const ActT* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream);
+// Round FP32 buffer to ActT (BF16/FP16) elementwise (used by paged KV Tier-2 NVMe decode fallback).
+void f32_to_act(const float* src, ActT* dst, std::size_t n, cudaStream_t stream);
 
 }  // namespace ingine::kernels::prefill

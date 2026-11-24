@@ -137,8 +137,12 @@ std::string default_model_dir() {
 
 int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
-  int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
-  bool dense_fp8 = false, kv_fp8 = false, spec = false;
+  std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
+  int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
+      forced_free = -1;
+  int offload_vram_mb = 0, offload_ram_mb = 12288;
+  int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
+  bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -147,12 +151,37 @@ int main(int argc, char** argv) {
   ap.option("--backend", "{fast}", "", &backend, {"fast"});
   ap.option("--ablation", "", "", &ablation);
   ap.option("--max-ctx", "", "", &max_ctx);
+  ap.option("--prefill-chunk", "", "tokens per prefill chunk (default 3072; 512 in offload mode / 12 GB GPUs)",
+            &prefill_chunk);
   ap.option("--tokens", "", "", &tokens);
   ap.option("--runs", "", "", &runs);
   ap.option("--effort", "", "", &effort);
   ap.flag("--dense-fp8", "", &dense_fp8);
+  ap.flag("--vision", "also load the vision tower", &vision);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
+  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok; SWA stays BF16)", &kv_q4);
+  ap.flag("--kv-paged", "3-tier paged Q4_0 full-attention KV cache (VRAM LRU + pinned UVA RAM + NVMe SwapFile)", &kv_paged);
+  ap.option("--kv-vram-mb", "", "VRAM cap in MiB for paged Q4_0 KV cache (implies --kv-paged --kv-q4)", &kv_vram_mb);
+  ap.option("--kv-ram-mb", "", "pinned UVA host RAM cap in MiB for paged Q4_0 KV before NVMe SwapFile spill (default 12288)",
+            &kv_ram_mb);
+  ap.option("--kv-swap-dir", "", "optional directory for Tier-2 NVMe KV swap file", &kv_swap_dir);
+  ap.option("--kv-ckpt-path", "", "atomic disk KV checkpoint file path (periodic & auto-resume on prefix match)",
+            &kv_ckpt_path);
+  ap.option("--kv-ckpt-every", "", "save atomic disk KV checkpoint every N tokens during long prefill (0 = off)",
+            &kv_ckpt_every);
+  ap.option("--kv-ckpt-resume", "", "explicit disk KV checkpoint file to resume from (fails loudly on mismatch)",
+            &kv_ckpt_resume);
+  ap.exclusive({"--kv-fp8", "--kv-q4"}, false);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
+  ap.flag("--atlas-6g", "6 GB VRAM preset (offload-vram-mb=5888, offload-ram-mb=12288, dense-fp8, kv-fp8, prefill-chunk=512)",
+          &atlas_6g);
+  ap.option("--offload-vram-mb", "", "tiered MoE offloading VRAM cap in MiB (0 = off, e.g. 5888 for 6 GB GPU)",
+            &offload_vram_mb);
+  ap.option("--offload-ram-mb", "", "pinned host RAM cap in MiB for WARM experts (default 12288)", &offload_ram_mb);
+  ap.option("--offload-mode", "{auto,dma-lru,uva}", "tiered offload transport mode", &offload_mode,
+            {"auto", "dma-lru", "uva"});
+  ap.option("--expert-ranking", "", "optional JSON with per-layer [24][128] homology/frequency scores", &expert_ranking);
+  ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--temperature", "", "", &temperature);
@@ -172,13 +201,35 @@ int main(int argc, char** argv) {
     cudaMemGetInfo(&free0, &total);
     const auto t0 = Clock::now();
     ingine::model::RuntimeOptions options;
+    if (atlas_6g) {
+      if (offload_vram_mb == 0) offload_vram_mb = 5888;
+      dense_fp8 = true;
+      if (kv_paged || kv_vram_mb > 0) kv_q4 = true;
+      if (!kv_q4) kv_fp8 = true;
+      if (prefill_chunk > 512) prefill_chunk = 512;
+    }
     options.model_dir = model_dir;
     options.ablation = ablation;
     options.max_ctx = max_ctx;
+    options.prefill_chunk = prefill_chunk;
     options.dense_fp8 = dense_fp8;
     options.kv_fp8 = kv_fp8;
+    options.kv_q4 = kv_q4;
+    options.kv_paged = kv_paged || kv_vram_mb > 0;
+    options.kv_vram_mb = kv_vram_mb;
+    options.kv_ram_mb = kv_ram_mb;
+    options.kv_swap_dir = kv_swap_dir;
+    options.kv_ckpt_path = kv_ckpt_path;
+    options.kv_ckpt_every = kv_ckpt_every;
+    options.kv_ckpt_resume = kv_ckpt_resume;
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
+    options.vision = vision;
+    options.offload_vram_mb = offload_vram_mb;
+    options.offload_ram_mb = offload_ram_mb;
+    options.offload_mode = offload_mode;
+    options.expert_ranking = expert_ranking;
+    options.dump_router_stats = dump_router_stats;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;
@@ -251,7 +302,8 @@ int main(int argc, char** argv) {
       source << in.rdbuf();
       const std::vector<int32_t> once = tok.encode(source.str(), /*special=*/true);
       std::vector<int32_t> ids;
-      for (int i = 0; i < 1000 && int(ids.size()) < long_prompt; ++i) ids.insert(ids.end(), once.begin(), once.end());
+      ids.reserve(size_t(long_prompt) + once.size());
+      while (!once.empty() && int(ids.size()) < long_prompt) ids.insert(ids.end(), once.begin(), once.end());
       ids.resize(std::min<size_t>(ids.size(), size_t(long_prompt)));
       ingine::model::Sampling greedy;
       greedy.temperature = 0.0f;
@@ -261,6 +313,9 @@ int main(int argc, char** argv) {
       json += ", \"prefill\": {\"tokens\": " + std::to_string(ids.size()) + ", \"tok_s\": " + py_float(tok_s) + "}";
       std::printf("prefill %zu tokens: %.0f tok/s\n", ids.size(), tok_s);
       std::fflush(stdout);
+    }
+    if (const std::string osum = gen->offload_summary(); !osum.empty()) {
+      std::printf("%s\n", osum.c_str());
     }
     std::printf("%s}\n", json.c_str());
     return 0;

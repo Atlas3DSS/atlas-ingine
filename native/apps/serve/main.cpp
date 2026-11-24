@@ -66,8 +66,12 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
-  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
+  std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
+  int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1;
+  int offload_vram_mb = 0, offload_ram_mb = 12288;
+  int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
+  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
+       no_vision = false, atlas_6g = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -83,11 +87,36 @@ int main(int argc, char** argv) {
   ap.exclusive({"--engine", "--fake"}, true);
   ap.option("--ablation", "", "ablation file (safetensors) applied at every visit", &ablation);
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
+  ap.option("--prefill-chunk", "", "tokens per prefill chunk (default 3072; use 512 on 12 GB GPUs for 262K ctx)",
+            &prefill_chunk);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
+  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok, ~2.25 GiB at 262144 positions; SWA stays BF16)",
+          &kv_q4);
+  ap.flag("--kv-paged", "3-tier paged Q4_0 full-attention KV cache (VRAM LRU + pinned UVA RAM + NVMe SwapFile)", &kv_paged);
+  ap.option("--kv-vram-mb", "", "VRAM cap in MiB for paged Q4_0 KV cache (implies --kv-paged --kv-q4)", &kv_vram_mb);
+  ap.option("--kv-ram-mb", "", "pinned UVA host RAM cap in MiB for paged Q4_0 KV before NVMe SwapFile spill (default 12288)",
+            &kv_ram_mb);
+  ap.option("--kv-swap-dir", "", "optional directory for Tier-2 NVMe KV swap file", &kv_swap_dir);
+  ap.option("--kv-ckpt-path", "", "atomic disk KV checkpoint file path (periodic & auto-resume on prefix match)",
+            &kv_ckpt_path);
+  ap.option("--kv-ckpt-every", "", "save atomic disk KV checkpoint every N tokens during long prefill (0 = off)",
+            &kv_ckpt_every);
+  ap.option("--kv-ckpt-resume", "", "explicit disk KV checkpoint file to resume from (fails loudly on mismatch)",
+            &kv_ckpt_resume);
+  ap.exclusive({"--kv-fp8", "--kv-q4"}, false);
+  ap.flag("--atlas-6g", "6 GB VRAM tiered offload preset (offload-vram-mb=5888, dense-fp8, kv-fp8 unless kv-q4, prefill-chunk=512, no-vision)",
+          &atlas_6g);
+  ap.option("--offload-vram-mb", "", "tiered MoE offloading VRAM cap in MiB (0 = off, e.g. 5888 for 6 GB GPU)",
+            &offload_vram_mb);
+  ap.option("--offload-ram-mb", "", "pinned host RAM cap in MiB for WARM experts (default 12288)", &offload_ram_mb);
+  ap.option("--offload-mode", "{auto,dma-lru,uva}", "tiered offload transport mode", &offload_mode,
+            {"auto", "dma-lru", "uva"});
+  ap.option("--expert-ranking", "", "optional JSON with per-layer [24][128] homology/frequency scores", &expert_ranking);
+  ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--park-mb", "",
@@ -140,15 +169,39 @@ int main(int argc, char** argv) {
     } else {
 #ifdef INGINE_WITH_MODEL
       ingine::model::RuntimeOptions options;
+      if (atlas_6g) {
+        if (offload_vram_mb == 0) offload_vram_mb = 5888;
+        dense_fp8 = true;
+        if (kv_paged || kv_vram_mb > 0) kv_q4 = true;
+        if (!kv_q4) kv_fp8 = true;
+        no_vision = true;
+        if (prefill_chunk > 512) prefill_chunk = 512;
+        if (park_mb < 0) park_mb = 0;
+        if (!kv_paged && kv_vram_mb <= 0 && max_ctx > 32768) max_ctx = 32768;
+      }
       options.model_dir = model_dir;
       options.ablation = ablation;
       options.max_ctx = max_ctx;
+      options.prefill_chunk = prefill_chunk;
       options.dense_fp8 = dense_fp8;
       options.kv_fp8 = kv_fp8;
+      options.kv_q4 = kv_q4;
+      options.kv_paged = kv_paged || kv_vram_mb > 0;
+      options.kv_vram_mb = kv_vram_mb;
+      options.kv_ram_mb = kv_ram_mb;
+      options.kv_swap_dir = kv_swap_dir;
+      options.kv_ckpt_path = kv_ckpt_path;
+      options.kv_ckpt_every = kv_ckpt_every;
+      options.kv_ckpt_resume = kv_ckpt_resume;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
       options.vision = !no_vision;
+      options.offload_vram_mb = offload_vram_mb;
+      options.offload_ram_mb = offload_ram_mb;
+      options.offload_mode = offload_mode;
+      options.expert_ranking = expert_ranking;
+      options.dump_router_stats = dump_router_stats;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

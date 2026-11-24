@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "kernels/head/head.h"
 #include "model/drafter.h"
+#include "model/kv_checkpoint.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
 #include "model/spec.h"
@@ -55,21 +56,31 @@ class EngineGenerator final : public Generator {
 
   bool supports_images() const override { return vision_ != nullptr; }
 
+  std::string offload_summary() const override {
+    std::string out;
+    if (rt_.weights().expert_cache) out = rt_.weights().expert_cache->summary();
+    if (rt_.state().paged_kv) {
+      if (!out.empty()) out += "\n";
+      out += rt_.state().paged_kv->summary();
+    }
+    return out;
+  }
+
  private:
   EngineGenerator(const RuntimeOptions& options, std::unique_ptr<Runtime> runtime)
-      : options_(options),
+      : options_(runtime->options()),
         runtime_(std::move(runtime)),
         rt_(*runtime_),
-        prefiller_(rt_.weights(), rt_.ablation(), options.prefill_chunk, rt_.stream()),
-        chunk_tokens_(std::size_t(options.prefill_chunk) * sizeof(std::int32_t)),
+        prefiller_(rt_.weights(), rt_.ablation(), rt_.options().prefill_chunk, rt_.stream()),
+        chunk_tokens_(std::size_t(rt_.options().prefill_chunk) * sizeof(std::int32_t)),
         logits_(std::size_t(UNPADDED_VOCAB) * sizeof(float)),
         token_(sizeof(std::int32_t)),
         host_token_(sizeof(std::int32_t)) {
-    if (options.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
-    if (options.spec) {
-      drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream());
+    if (options_.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
+    if (options_.spec) {
+      drafter_ = std::make_unique<Drafter>(options_.model_dir, rt_.weights(), options_.max_ctx, rt_.stream());
       drafter_->capture();
-      taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
+      taps_ = DeviceBuffer(std::size_t(options_.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
       spec_ = std::make_unique<SpecLoop>(rt_, *drafter_);
     }
     // checkpoint layout: target state | drafter context | last prompt logits
@@ -77,14 +88,16 @@ class EngineGenerator final : public Generator {
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
     checkpoint_ = DeviceBuffer(checkpoint_logits_ + logits_.bytes);
     // the vision tower's weights are resident: loaded before the park budget below is measured
-    if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
+    if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
-    if (options.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
+    if ((options_.offload_vram_mb > 0 || options_.kv_paged || options_.kv_vram_mb > 0) && options_.park_mb < 0) {
+      park_budget_ = 0;  // keep strict VRAM cap in offload/paged-KV mode unless user explicitly requests parking
+    } else if (options_.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
       std::size_t free = 0, total = 0;
       CUDA_CHECK(cudaMemGetInfo(&free, &total));
       park_budget_ = std::min<std::size_t>(3072, std::max<std::size_t>(free >> 20, 4096) - 4096) << 20;
     } else {
-      park_budget_ = std::size_t(options.park_mb) << 20;
+      park_budget_ = std::size_t(options_.park_mb) << 20;
     }
     // parked conversations are best-effort: a device allocation that fails releases them and retries
     release_hook_ = add_release_hook([this] { return release_parked(); });
@@ -302,8 +315,39 @@ class EngineGenerator final : public Generator {
       tokens_in_state_.clear();
       checkpoint_ids_.clear();
       stats.reuse = Reuse::None;
+      // Optional disk KV checkpoint resume (explicit --kv-ckpt-resume fails loudly; --kv-ckpt-path auto-resumes on exact prefix match).
+      if (!options_.kv_ckpt_resume.empty()) {
+        const int resumed = load_kv_checkpoint(st, options_.model_dir, ids, static_cast<float*>(logits_.p),
+                                               options_.kv_ckpt_resume, stream);
+        start = std::size_t(resumed);
+        stats.reuse = Reuse::Checkpoint;
+        std::fprintf(stderr, "[kv-ckpt] resumed %d / %zu tokens from %s\n", resumed, n,
+                     options_.kv_ckpt_resume.c_str());
+      } else if (!options_.kv_ckpt_path.empty() && std::filesystem::exists(options_.kv_ckpt_path)) {
+        try {
+          const KvCheckpointInfo info = inspect_kv_checkpoint(options_.kv_ckpt_path);
+          if (info.pos > 0 && std::size_t(info.pos) <= n) {
+            const auto psha = sha256_bytes(ids.data(), std::size_t(info.pos) * sizeof(std::int32_t));
+            if (psha == info.prompt_sha256) {
+              const int resumed = load_kv_checkpoint(st, options_.model_dir, ids, static_cast<float*>(logits_.p),
+                                                     options_.kv_ckpt_path, stream);
+              start = std::size_t(resumed);
+              stats.reuse = Reuse::Checkpoint;
+              std::fprintf(stderr, "[kv-ckpt] auto-resumed %d / %zu tokens from %s\n", resumed, n,
+                           options_.kv_ckpt_path.c_str());
+            }
+          }
+        } catch (const std::exception& e) {
+          std::fprintf(stderr, "[kv-ckpt] ignoring incompatible existing checkpoint %s: %s\n",
+                       options_.kv_ckpt_path.c_str(), e.what());
+        }
+      }
     }
     st.length = int(start);  // decode steps advance the state without its host-side length
+    std::size_t next_ckpt =
+        options_.kv_ckpt_every > 0
+            ? ((start / std::size_t(options_.kv_ckpt_every)) + 1u) * std::size_t(options_.kv_ckpt_every)
+            : 0u;
     const std::size_t chunk = std::size_t(options_.prefill_chunk);
     struct Encoded {
       const PromptImage* image;
@@ -348,6 +392,23 @@ class EngineGenerator final : public Generator {
       if (drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
+      }
+      if (!options_.kv_ckpt_path.empty()) {
+        const std::size_t done = s + std::size_t(T);
+        const bool sigterm = kv_checkpoint_sigterm_requested();
+        const bool periodic = (options_.kv_ckpt_every > 0 && done >= next_ckpt && done < n);
+        if (periodic || sigterm) {
+          save_kv_checkpoint(st, options_.model_dir, ids.subspan(0, done), static_cast<const float*>(logits_.p),
+                             options_.kv_ckpt_path, stream);
+          std::fprintf(stderr, "[kv-ckpt] %s saved atomic checkpoint at pos=%zu / %zu -> %s\n",
+                       sigterm ? "SIGTERM" : "periodic", done, n, options_.kv_ckpt_path.c_str());
+          if (options_.kv_ckpt_every > 0) {
+            while (next_ckpt <= done) next_ckpt += std::size_t(options_.kv_ckpt_every);
+          }
+          if (sigterm) {
+            throw std::runtime_error("prefill interrupted by SIGTERM after saving atomic KV checkpoint");
+          }
+        }
       }
     }
     if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream));  // queued chunks read the rows freed here

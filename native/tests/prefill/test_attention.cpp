@@ -101,13 +101,13 @@ std::vector<double> oracle(const Inputs& in, const std::vector<float>& K, const 
   return out;
 }
 
-bool run_attention(const char* name, const Inputs& in, const void* k_dev, const void* v_dev, bool fp8,
+bool run_attention(const char* name, const Inputs& in, const void* k_dev, const void* v_dev, bool fp8, bool q4,
                    const int* kpos_dev, const int4* bounds_dev, int L, int window, const std::vector<float>& K,
                    const std::vector<float>& V, const std::vector<int>& kpos, int stride) {
   DeviceArray<uint16_t> q(in.q), rel(in.rel), proj(in.proj), out(size_t(in.T) * HQ * D);
   pk::AttnParams p;
   p.q = reinterpret_cast<const ingine::ActT*>(q.get());
-  p.k = k_dev, p.v = v_dev, p.kv_fp8 = fp8;
+  p.k = k_dev, p.v = v_dev, p.kv_fp8 = fp8, p.kv_q4 = q4;
   p.kpos = kpos_dev, p.bounds = bounds_dev, p.L = L;
   p.T = in.T, p.pos0 = in.pos0, p.window = window;
   p.rel = reinterpret_cast<const ingine::ActT*>(rel.get());
@@ -124,12 +124,25 @@ bool run_attention(const char* name, const Inputs& in, const void* k_dev, const 
   return check_close(name, got, ref, 1.2e-2, 2e-4);
 }
 
-bool full_case(Rng& rng, bool fp8, int pos0, int T) {
+bool full_case(Rng& rng, bool fp8, bool q4, int pos0, int T) {
   const int L = pos0 + T, rows = L + 37;  // extra rows past L: never read
   std::vector<float> K(size_t(rows) * HK * D), V(K.size());
   for (int j = 0; j < rows; ++j) make_kv_row(rng, &K[size_t(j) * HK * D], &V[size_t(j) * HK * D]);
-  DeviceArray<uint8_t> kd(K.size() * (fp8 ? 1 : 2)), vd(K.size() * (fp8 ? 1 : 2));
-  if (fp8) {
+  const size_t row_bytes = q4 ? size_t(kTestKvQ4RowBytes) : size_t(HK * D) * (fp8 ? 1 : 2);
+  DeviceArray<uint8_t> kd(size_t(rows) * row_bytes), vd(size_t(rows) * row_bytes);
+  if (q4) {
+    std::vector<uint8_t> kb(size_t(rows) * kTestKvQ4RowBytes), vb(size_t(rows) * kTestKvQ4RowBytes);
+    for (int j = 0; j < rows; ++j) {
+      q4_0_pack_row(&K[size_t(j) * HK * D], &kb[size_t(j) * kTestKvQ4RowBytes], &K[size_t(j) * HK * D]);
+      q4_0_pack_row(&V[size_t(j) * HK * D], &vb[size_t(j) * kTestKvQ4RowBytes], &V[size_t(j) * HK * D]);
+      // Prefill Q.K^T runs on BF16 MMA (store_tile rounds dequantized Q4_0 K to BF16 and V to FP16).
+      for (int c = 0; c < HK * D; ++c) {
+        K[size_t(j) * HK * D + c] = rbf(K[size_t(j) * HK * D + c]);
+        V[size_t(j) * HK * D + c] = __half2float(__float2half_rn(V[size_t(j) * HK * D + c]));
+      }
+    }
+    kd.upload(kb), vd.upload(vb);
+  } else if (fp8) {
     std::vector<uint8_t> kb(K.size()), vb(K.size());
     for (size_t i = 0; i < K.size(); ++i) {
       kb[i] = e4m3_bits(K[i]), vb[i] = e4m3_bits(V[i]);
@@ -148,8 +161,8 @@ bool full_case(Rng& rng, bool fp8, int pos0, int T) {
   for (int j = 0; j < L; ++j) kpos[j] = j;
   const Inputs in = make_inputs(rng, T, pos0);
   char name[96];
-  std::snprintf(name, sizeof name, "full %s pos0=%d T=%d", fp8 ? "fp8" : "bf16", pos0, T);
-  return run_attention(name, in, kd.get(), vd.get(), fp8, nullptr, nullptr, L, 0, K, V, kpos, 1);
+  std::snprintf(name, sizeof name, "full %s pos0=%d T=%d", q4 ? "q4" : (fp8 ? "fp8" : "bf16"), pos0, T);
+  return run_attention(name, in, kd.get(), vd.get(), fp8, q4, nullptr, nullptr, L, 0, K, V, kpos, 1);
 }
 
 // Sliding visit: ring state before the chunk (ring_pos per slot), chunk keys, gathered rows.
@@ -203,7 +216,7 @@ bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
   const Inputs in = make_inputs(rng, T, pos0);
   char name[96];
   std::snprintf(name, sizeof name, "sliding pos0=%d T=%d%s", pos0, T, stale ? " stale" : "");
-  ok &= run_attention(name, in, kr.get(), vr.get(), false, kp.get(), bounds.get(), L, W, K, V, kpos, stride);
+  ok &= run_attention(name, in, kr.get(), vr.get(), false, false, kp.get(), bounds.get(), L, W, K, V, kpos, stride);
 
   pk::ring_update(reinterpret_cast<const ingine::ActT*>(kr.get()), reinterpret_cast<const ingine::ActT*>(vr.get()),
                   pos0, T, reinterpret_cast<ingine::ActT*>(ring_k.get()),
@@ -235,10 +248,13 @@ int main() {
   if (skip_without_gpu()) return kSkip;
   Rng rng(1234);
   bool ok = true;
-  ok &= full_case(rng, false, 0, 45);
-  ok &= full_case(rng, false, 1200, 77);
-  ok &= full_case(rng, true, 1200, 77);
-  ok &= full_case(rng, true, 3, 130);
+  ok &= full_case(rng, false, false, 0, 45);
+  ok &= full_case(rng, false, false, 1200, 77);
+  ok &= full_case(rng, true, false, 1200, 77);
+  ok &= full_case(rng, true, false, 3, 130);
+  ok &= full_case(rng, false, true, 0, 45);
+  ok &= full_case(rng, false, true, 1200, 77);
+  ok &= full_case(rng, false, true, 3, 130);
   ok &= sliding_case(rng, 0, 50, false, 1);
   ok &= sliding_case(rng, 700, 300, false, 3);
   ok &= sliding_case(rng, 5000, 1100, true, 7);

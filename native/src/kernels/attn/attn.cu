@@ -119,10 +119,16 @@ constexpr size_t ws_nst_off(int M) { return ws_nkv_off(M) + size_t(HKV) * 2 * M 
 constexpr size_t ws_bytes(int M) { return ws_nst_off(M) + size_t(HKV) * 3 * 2 * D * 4; }
 
 constexpr int NT = 256;  // threads per block (8 warps) for every M
+// Q4_0 per-row layout for full layers: [8 heads x 64B nibbles | 8 heads x 4 FP16 scales] = 576B/row
+constexpr int Q4_NIB_B = HKV * (D / 2);          // 512
+constexpr int Q4_SC_B = HKV * (D / 32) * 2;      // 64
+constexpr int Q4_ROW_B = Q4_NIB_B + Q4_SC_B;     // 576
+constexpr int Q4_HEAD_B = D / 2 + (D / 32) * 2;  // 72 (64B nibbles + 8B scales)
 
 // dynamic shared memory layout (floats), per M
-template <int M, bool F8 = false>
+template <int M, bool F8 = false, bool Q4 = false>
 struct Smem {
+    static constexpr bool RAW_TILE = F8 || Q4;
     static constexpr int ROWS = GQA * M;
     // staged inputs (dead once the main loop starts)
     static constexpr int Q = 0;                          // proj q rows [M][3][D]
@@ -143,18 +149,21 @@ struct Smem {
     // M > 1: K/V tiles loaded by the whole block (own region, so the first tiles are in flight while q /
     // rel and the owner's convolutions are computed); 16-byte chunks are XOR-swizzled by key.
     // BF16 caches: double-buffered 16-bit stages [2][KT][2][D], K rows bf16, V rows converted to fp16
-    // in place. E4M3 caches (full layers): two raw tiles [2][K: KT][D] + [V: KT][D] bytes (K chunks
-    // swizzled; K is read straight from them), V widened to fp16 in the staging region.
-    static constexpr int KT = F8 ? 64 : 32;              // keys per tile
-    static constexpr int KVS = (UNION_END + 3) & ~3;     // 32 KB either way
-    static constexpr int KPS = KVS + (M > 1 ? 2 * KT * 2 * D * (F8 ? 1 : 2) / 4 : 0);  // kpos (int) [2][KT]
-    static constexpr int SRP = KPS + (M > 1 && !F8 ? 2 * KT : 0);      // rel_proj window [2][DREL][KT + MAXM]
-    static constexpr int TILE_END = SRP + (M > 1 && !F8 ? 2 * DREL * (KT + MAXM) : 0);
+    // in place. E4M3 / Q4_0 caches (full layers): two raw tiles in flight, K read straight from them,
+    // V widened to fp16 in the staging region.
+    static constexpr int KT = RAW_TILE ? 64 : 32;        // keys per tile
+    static constexpr int KVS = (UNION_END + 3) & ~3;
+    static constexpr int KVS_FLOATS =
+        M > 1 ? (Q4 ? (2 * KT * 2 * Q4_HEAD_B / 4) : (2 * KT * 2 * D * (F8 ? 1 : 2) / 4)) : 0;
+    static constexpr int KPS = KVS + KVS_FLOATS;         // kpos (int) [2][KT]
+    static constexpr int SRP = KPS + (M > 1 && !RAW_TILE ? 2 * KT : 0);      // rel_proj window [2][DREL][KT + MAXM]
+    static constexpr int TILE_END = SRP + (M > 1 && !RAW_TILE ? 2 * DREL * (KT + MAXM) : 0);
     // dedicated regions
     static constexpr int GATE = (TILE_END + 3) & ~3;     // this block's output gates [ROWS][OD]
     static constexpr int SINK = GATE + ROWS * OD;        // [ROWS]
     static constexpr int NKV = (SINK + ROWS + 3) & ~3;   // new k/v bf16 [2][M][D] (as floats: M * D)
-    static constexpr int RELP0 = NKV + M * D;            // rel_proj[:, 0..7] [16][8]
+    static constexpr int NKV_Q4 = NKV + M * D;           // Q4: packed new k/v [2][M][72B]
+    static constexpr int RELP0 = (NKV_Q4 + (Q4 ? 2 * M * (Q4_HEAD_B / 4) : 0) + 3) & ~3;  // rel_proj[:, 0..7] [16][8]
     static constexpr int NST = RELP0 + DREL * 8;         // advanced conv state [3][2][D]
     // M > 1 tensor-core path: query rows r = 3 token + head, padded to NRP (multiple of 8)
     static constexpr int NRP = M > 1 ? (ROWS + 7) / 8 * 8 : 0;
@@ -204,6 +213,9 @@ struct Params {
     float* conv_v;
     void* k_cache;  // ActT, or E4M3 bytes (F8)
     void* v_cache;
+    void* const* k_pages;  // optional [num_pages] Q4_0 page pointers (Q4 full layers only)
+    void* const* v_pages;
+    int page_shift;
     long long* kpos;
     const long long* pos;
     int* counter;
@@ -258,6 +270,27 @@ __device__ __forceinline__ void unpack8(const uint2 u, float f[8]) {
     f[4] = a.x, f[5] = a.y, f[6] = b.x, f[7] = b.y;
 }
 
+// 8 Q4_0 values (dims 8c..8c+7, low nibble first) + FP16 scale of their 32-element block
+struct Q4Chunk {
+    uint32_t nib;
+    uint16_t scale;
+};
+
+__device__ __forceinline__ void unpack8(const Q4Chunk u, float f[8]) {
+    const float d_raw = __half2float(__ushort_as_half(u.scale));
+    const float d = isfinite(d_raw) ? d_raw : 0.f;
+    const float neg8d = -8.f * d;
+    const uint32_t w = u.nib;
+    f[0] = fmaf(float(w & 0xfu), d, neg8d);
+    f[1] = fmaf(float((w >> 4) & 0xfu), d, neg8d);
+    f[2] = fmaf(float((w >> 8) & 0xfu), d, neg8d);
+    f[3] = fmaf(float((w >> 12) & 0xfu), d, neg8d);
+    f[4] = fmaf(float((w >> 16) & 0xfu), d, neg8d);
+    f[5] = fmaf(float((w >> 20) & 0xfu), d, neg8d);
+    f[6] = fmaf(float((w >> 24) & 0xfu), d, neg8d);
+    f[7] = fmaf(float((w >> 28) & 0xfu), d, neg8d);
+}
+
 // x rounded to E4M3: nearest even, saturated to +-448 (torch: x.clamp(-448, 448).to(float8_e4m3fn))
 __device__ __forceinline__ float e4m3r(float x) {
     return __half2float(__half(__nv_cvt_fp8_to_halfraw(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3), __NV_E4M3)));
@@ -298,6 +331,30 @@ __device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
                      : "memory");
     else
         asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ uint32_t ld_kv4(const void* ptr, std::uint64_t pol) {
+    uint32_t v;
+    if constexpr (l2::hinted<KV_L2>)
+        asm volatile("ld.global.L1::no_allocate.L2::cache_hint.u32 %0, [%1], %2;"
+                     : "=r"(v)
+                     : "l"(ptr), "l"(pol)
+                     : "memory");
+    else
+        asm volatile("ld.global.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ uint16_t ld_kv2(const void* ptr, std::uint64_t pol) {
+    uint16_t v;
+    if constexpr (l2::hinted<KV_L2>)
+        asm volatile("ld.global.L1::no_allocate.L2::cache_hint.u16 %0, [%1], %2;"
+                     : "=h"(v)
+                     : "l"(ptr), "l"(pol)
+                     : "memory");
+    else
+        asm volatile("ld.global.L1::no_allocate.u16 %0, [%1];" : "=h"(v) : "l"(ptr) : "memory");
     return v;
 }
 
@@ -353,6 +410,16 @@ __device__ __forceinline__ void cp4z(float* dst, const float* src, bool ok) {
 #endif
 }
 
+__device__ __forceinline__ void cp8z(void* dst, const void* src, bool ok) {
+#if __CUDA_ARCH__ < 800
+    *static_cast<uint2*>(dst) = ok ? *static_cast<const uint2*>(src) : make_uint2(0u, 0u);
+#else
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(unsigned(__cvta_generic_to_shared(dst))), "l"(src),
+                 "r"(ok ? 8 : 0)
+                 : "memory");
+#endif
+}
+
 __device__ __forceinline__ uint32_t pack2(float a, float b) {
     return act::pack2(a, b);
 }
@@ -372,13 +439,15 @@ struct Buf {
     float rp[U];  // rel_proj[c][dp] (0 if dp >= 1024)
 };
 
-template <int M, bool FULL, bool F8, bool SPLIT = false>
+template <int M, bool FULL, bool F8, bool SPLIT = false, bool Q4 = false>
 __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
-    static_assert(FULL || !F8, "FP8 caches are full-layer only");
-    using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;  // cache element
-    using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
+    static_assert(FULL || (!F8 && !Q4), "FP8/Q4 caches are full-layer only");
+    static_assert(!(F8 && Q4), "F8 and Q4 are mutually exclusive");
+    constexpr bool RAW_TILE = F8 || Q4;
+    using CT = std::conditional_t<Q4, uint8_t, std::conditional_t<F8, __nv_fp8_storage_t, ActT>>;
+    using KV = std::conditional_t<Q4, Q4Chunk, std::conditional_t<F8, uint2, uint4>>;
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
-    using L = Smem<M, F8>;
+    using L = Smem<M, F8, Q4>;
     extern __shared__ __align__(16) float sm[];
     ActT(*s_nkv)[M][D] = reinterpret_cast<ActT(*)[M][D]>(sm + L::NKV);
 
@@ -423,13 +492,28 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             b.k[u] = b.v[u] = KV{};
             b.kp[u] = -1;
             if (j < old_end) {
-                const size_t off = (size_t(j) * HKV + g) * D + c * 8;
-                if constexpr (F8) {
-                    b.k[u] = ld_kv8(kc + off, kvpol);
-                    b.v[u] = ld_kv8(vc + off, kvpol);
+                if constexpr (Q4) {
+                    const uint8_t* krow = p.k_pages
+                        ? (static_cast<const uint8_t*>(p.k_pages[j >> p.page_shift]) +
+                           size_t(j & ((1 << p.page_shift) - 1)) * Q4_ROW_B)
+                        : (reinterpret_cast<const uint8_t*>(p.k_cache) + size_t(j) * Q4_ROW_B);
+                    const uint8_t* vrow = p.v_pages
+                        ? (static_cast<const uint8_t*>(p.v_pages[j >> p.page_shift]) +
+                           size_t(j & ((1 << p.page_shift) - 1)) * Q4_ROW_B)
+                        : (reinterpret_cast<const uint8_t*>(p.v_cache) + size_t(j) * Q4_ROW_B);
+                    b.k[u] = Q4Chunk{ld_kv4(krow + g * 64 + c * 4, kvpol),
+                                     ld_kv2(krow + Q4_NIB_B + g * 8 + (c >> 2) * 2, kvpol)};
+                    b.v[u] = Q4Chunk{ld_kv4(vrow + g * 64 + c * 4, kvpol),
+                                     ld_kv2(vrow + Q4_NIB_B + g * 8 + (c >> 2) * 2, kvpol)};
                 } else {
-                    b.k[u] = ld_kv(kc + off, kvpol);
-                    b.v[u] = ld_kv(vc + off, kvpol);
+                    const size_t off = (size_t(j) * HKV + g) * D + c * 8;
+                    if constexpr (F8) {
+                        b.k[u] = ld_kv8(kc + off, kvpol);
+                        b.v[u] = ld_kv8(vc + off, kvpol);
+                    } else {
+                        b.k[u] = ld_kv(kc + off, kvpol);
+                        b.v[u] = ld_kv(vc + off, kvpol);
+                    }
                 }
                 b.kp[u] = FULL ? j : int(ld_s64(p.kpos + j));
             }
@@ -491,21 +575,50 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // straight into mma fragments), then V rows (widened to fp16 in the staging region, which is dead once
     // q / rel and the owner's convs are done). Every call commits a group (empty past the end), so the
     // group count per tile is fixed.
-    constexpr int NRAW = 2, RAWB = KT * 2 * D;  // E4M3 tiles in flight, bytes per tile
-    static_assert(!F8 || M == 1 || (NRAW * RAWB <= 2 * KT * 2 * D && KT * D * 2 <= L::UNION_END * 4),
-                  "E4M3 tiles and the widened V tile must fit the stage and staging regions");
+    constexpr int NRAW = 2;
+    constexpr int RAWB = Q4 ? (KT * 2 * Q4_HEAD_B) : (KT * 2 * D);  // bytes per raw tile
+    static_assert(!RAW_TILE || M == 1 || (NRAW * RAWB <= L::KVS_FLOATS * 4 && KT * D * 2 <= L::UNION_END * 4),
+                  "compressed tiles and the widened V tile must fit the stage and staging regions");
     char* const raw = reinterpret_cast<char*>(sm + L::KVS);
-    __half* const wv = reinterpret_cast<__half*>(sm);  // E4M3: the widened V tile [KT][D], chunks swizzled
+    __half* const wv = reinterpret_cast<__half*>(sm);  // F8/Q4: the widened V tile [KT][D], chunks swizzled
     auto issue_raw = [&](const int t) {
         const int base = rank * KT + t * CS * KT;
         if (base < L_old) {
-            for (int i = tid; i < KT * 2 * (D / 16); i += NT) {
-                const int key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16), j = base + key;
-                const bool ok = j < L_old;
-                char* dst = raw + (t % NRAW) * RAWB + kv * KT * D + key * D + (kv ? ch : ch ^ (key & 7)) * 16;
-                cp16z(reinterpret_cast<float*>(dst),
-                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok,
-                      kvpol);
+            if constexpr (Q4) {
+                const int pmask = p.k_pages ? ((1 << p.page_shift) - 1) : 0;
+                for (int i = tid; i < KT * 2 * 4; i += NT) {
+                    const int key = i / 8, kv = (i / 4) & 1, ch = i & 3, j = base + key;
+                    const bool ok = j < L_old;
+                    const int jj = ok ? j : 0;
+                    char* dst = raw + (t % NRAW) * RAWB + kv * (KT * 64) + key * 64 + (kv ? ch : (ch ^ (key & 3))) * 16;
+                    const uint8_t* row_ptr = p.k_pages
+                        ? (static_cast<const uint8_t*>((kv ? p.v_pages : p.k_pages)[jj >> p.page_shift]) +
+                           size_t(jj & pmask) * Q4_ROW_B)
+                        : (static_cast<const uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(jj) * Q4_ROW_B);
+                    cp16z(reinterpret_cast<float*>(dst),
+                          reinterpret_cast<const float*>(row_ptr + g * 64 + ch * 16), ok,
+                          kvpol);
+                }
+                for (int i = tid; i < KT * 2; i += NT) {
+                    const int key = i >> 1, kv = i & 1, j = base + key;
+                    const bool ok = j < L_old;
+                    const int jj = ok ? j : 0;
+                    char* dst = raw + (t % NRAW) * RAWB + 2 * KT * 64 + kv * (KT * 8) + key * 8;
+                    const uint8_t* row_ptr = p.k_pages
+                        ? (static_cast<const uint8_t*>((kv ? p.v_pages : p.k_pages)[jj >> p.page_shift]) +
+                           size_t(jj & pmask) * Q4_ROW_B)
+                        : (static_cast<const uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(jj) * Q4_ROW_B);
+                    cp8z(dst, row_ptr + Q4_NIB_B + g * 8, ok);
+                }
+            } else {
+                for (int i = tid; i < KT * 2 * (D / 16); i += NT) {
+                    const int key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16), j = base + key;
+                    const bool ok = j < L_old;
+                    char* dst = raw + (t % NRAW) * RAWB + kv * KT * D + key * D + (kv ? ch : ch ^ (key & 7)) * 16;
+                    cp16z(reinterpret_cast<float*>(dst),
+                          reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok,
+                          kvpol);
+                }
             }
         }
         copy::commit();
@@ -552,7 +665,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
     }
 
-    if constexpr (M > 1 && F8) {  // staged inputs as the oldest group, then the first NRAW tiles behind them
+    if constexpr (M > 1 && RAW_TILE) {  // staged inputs as the oldest group, then the first NRAW tiles behind them
         copy::commit();
 #pragma unroll 1
         for (int t = 0; t < NRAW; ++t) issue_raw(t);
@@ -686,7 +799,35 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             const float ss = wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
             const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
             float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
-            if constexpr (F8) {  // the values the cache will hold: BF16, then E4M3 (exact in BF16)
+            if constexpr (Q4) {
+                // BF16 first (matching attn_prep), then Q4_0 per 32-element block (8 lanes x 4 elems)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) y[e] = bf16r(y[e]);
+                auto pick_max = [](float a, float b) {
+                    const float aa = fabsf(a), ab = fabsf(b);
+                    return (ab > aa || (ab == aa && b < a)) ? b : a;
+                };
+                float mx = pick_max(pick_max(y[0], y[1]), pick_max(y[2], y[3]));
+#pragma unroll
+                for (int o = 1; o < 8; o <<= 1) mx = pick_max(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                const __half d_h = __float2half_rn(mx * (-0.125f));
+                const float d = __half2float(d_h);
+                const float id = d != 0.f ? (1.f / d) : 0.f;
+                const float neg8d = -8.f * d;
+                uint32_t q[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    int qi = __float2int_rn(y[e] * id);
+                    qi = max(-8, min(7, qi));
+                    q[e] = uint32_t(qi + 8);
+                    y[e] = fmaf(float(q[e]), d, neg8d);
+                }
+                uint8_t* qdst = reinterpret_cast<uint8_t*>(sm + L::NKV_Q4) + (kv * M + m) * Q4_HEAD_B;
+                *reinterpret_cast<uint16_t*>(qdst + lane * 2) =
+                    uint16_t(q[0] | (q[1] << 4) | (q[2] << 8) | (q[3] << 12));
+                if ((lane & 7) == 0)
+                    *reinterpret_cast<uint16_t*>(qdst + 64 + (lane >> 3) * 2) = __half_as_ushort(d_h);
+            } else if constexpr (F8) {  // the values the cache will hold: BF16, then E4M3 (exact in BF16)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
             }
@@ -872,24 +1013,46 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         };
         // 16-bit offset of 16-byte chunk ch8 of row `key` in a [rows][D] tile, chunks XOR-swizzled by key
         auto roff = [](int key, int ch8) { return key * D + ((ch8 ^ (key & 7)) * 8); };
-        // F8: the V rows of raw slot `slot` to fp16 in wv (exact for E4M3 values)
+        // F8/Q4: the V rows of raw slot `slot` to fp16 in wv
         auto expand_v = [&](const int slot) {
-            constexpr int NCH = KT * (D / 16) / NT;  // 16-byte E4M3 chunks per thread
-            static_assert(NCH * NT == KT * (D / 16), "chunks must divide over the block");
+            if constexpr (Q4) {
+                // 64 keys x 4 blocks/head = 256 threads: one Q4_0 block (32 elems) per thread
+                const int key = tid >> 2, blk = tid & 3;
+                const uint4 vn = *reinterpret_cast<const uint4*>(raw + slot * RAWB + KT * 64 + key * 64 + blk * 16);
+                const uint16_t vsc =
+                    *reinterpret_cast<const uint16_t*>(raw + slot * RAWB + 2 * KT * 64 + KT * 8 + key * 8 + blk * 2);
+                const float vd_raw = __half2float(__ushort_as_half(vsc));
+                const float vd = isfinite(vd_raw) ? vd_raw : 0.f;
+                const float neg8d = -8.f * vd;
+                const uint32_t w[4] = {vn.x, vn.y, vn.z, vn.w};
 #pragma unroll
-            for (int n = 0; n < NCH; ++n) {
-                const int i = tid + n * NT, key = i / (D / 16), ch = i % (D / 16);
-                const uint4 r = *reinterpret_cast<const uint4*>(raw + slot * RAWB + KT * D + key * D + ch * 16);
-                const uint32_t w[4] = {r.x, r.y, r.z, r.w};
-#pragma unroll
-                for (int h = 0; h < 2; ++h) {  // dims 16 ch + 8 h .. + 7
+                for (int sub = 0; sub < 4; ++sub) {
+                    const uint32_t u = w[sub];
                     uint32_t o[4];
+                    o[0] = half2_of(fmaf(float(u & 0xfu), vd, neg8d), fmaf(float((u >> 4) & 0xfu), vd, neg8d));
+                    o[1] = half2_of(fmaf(float((u >> 8) & 0xfu), vd, neg8d), fmaf(float((u >> 12) & 0xfu), vd, neg8d));
+                    o[2] = half2_of(fmaf(float((u >> 16) & 0xfu), vd, neg8d), fmaf(float((u >> 20) & 0xfu), vd, neg8d));
+                    o[3] = half2_of(fmaf(float((u >> 24) & 0xfu), vd, neg8d), fmaf(float((u >> 28) & 0xfu), vd, neg8d));
+                    *reinterpret_cast<uint4*>(wv + roff(key, 4 * blk + sub)) = make_uint4(o[0], o[1], o[2], o[3]);
+                }
+            } else {
+                constexpr int NCH = KT * (D / 16) / NT;  // 16-byte E4M3 chunks per thread
+                static_assert(NCH * NT == KT * (D / 16), "chunks must divide over the block");
 #pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        const float2 f = e4m3x2_f2((w[2 * h + e / 2] >> (16 * (e % 2))) & 0xffffu);
-                        o[e] = half2_of(f.x, f.y);
+                for (int n = 0; n < NCH; ++n) {
+                    const int i = tid + n * NT, key = i / (D / 16), ch = i % (D / 16);
+                    const uint4 r = *reinterpret_cast<const uint4*>(raw + slot * RAWB + KT * D + key * D + ch * 16);
+                    const uint32_t w[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {  // dims 16 ch + 8 h .. + 7
+                        uint32_t o[4];
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const float2 f = e4m3x2_f2((w[2 * h + e / 2] >> (16 * (e % 2))) & 0xffffu);
+                            o[e] = half2_of(f.x, f.y);
+                        }
+                        *reinterpret_cast<uint4*>(wv + roff(key, 2 * ch + h)) = make_uint4(o[0], o[1], o[2], o[3]);
                     }
-                    *reinterpret_cast<uint4*>(wv + roff(key, 2 * ch + h)) = make_uint4(o[0], o[1], o[2], o[3]);
                 }
             }
         };
@@ -927,13 +1090,29 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                     uint32_t af[4];
                     if constexpr (KRAW) {  // a0/a2: dims 4 t4 .. + 3 of key gid; a1/a3: key gid + 8
                         const int key = km * 16 + gid;
-                        const char* kr = kraw + key * D + ((ks ^ (key & 7)) * 16) + 4 * t4;
-                        const uint32_t u0 = *reinterpret_cast<const uint32_t*>(kr);
-                        const uint32_t u1 = *reinterpret_cast<const uint32_t*>(kr + 8 * D);
-                        const float2 f0 = e4m3x2_f2(u0 & 0xffffu), f1 = e4m3x2_f2(u1 & 0xffffu);
-                        const float2 f2 = e4m3x2_f2(u0 >> 16), f3 = e4m3x2_f2(u1 >> 16);
-                        af[0] = pack2(f0.x, f0.y), af[1] = pack2(f1.x, f1.y);
-                        af[2] = pack2(f2.x, f2.y), af[3] = pack2(f3.x, f3.y);
+                        if constexpr (Q4) {
+                            const int blk = ks >> 1, sub = ks & 1, swz_ch = blk ^ (key & 3);
+                            const char* kr = kraw + key * 64 + swz_ch * 16 + sub * 8 + t4 * 2;
+                            const uint16_t u0 = *reinterpret_cast<const uint16_t*>(kr);
+                            const uint16_t u1 = *reinterpret_cast<const uint16_t*>(kr + 8 * 64);
+                            const char* ksc = kraw + 2 * KT * 64 + key * 8 + blk * 2;
+                            const float d0_r = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(ksc)));
+                            const float d1_r = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(ksc + 8 * 8)));
+                            const float d0 = isfinite(d0_r) ? d0_r : 0.f, neg0 = -8.f * d0;
+                            const float d1 = isfinite(d1_r) ? d1_r : 0.f, neg1 = -8.f * d1;
+                            af[0] = pack2(fmaf(float(u0 & 0xfu), d0, neg0), fmaf(float((u0 >> 4) & 0xfu), d0, neg0));
+                            af[1] = pack2(fmaf(float(u1 & 0xfu), d1, neg1), fmaf(float((u1 >> 4) & 0xfu), d1, neg1));
+                            af[2] = pack2(fmaf(float((u0 >> 8) & 0xfu), d0, neg0), fmaf(float((u0 >> 12) & 0xfu), d0, neg0));
+                            af[3] = pack2(fmaf(float((u1 >> 8) & 0xfu), d1, neg1), fmaf(float((u1 >> 12) & 0xfu), d1, neg1));
+                        } else {
+                            const char* kr = kraw + key * D + ((ks ^ (key & 7)) * 16) + 4 * t4;
+                            const uint32_t u0 = *reinterpret_cast<const uint32_t*>(kr);
+                            const uint32_t u1 = *reinterpret_cast<const uint32_t*>(kr + 8 * D);
+                            const float2 f0 = e4m3x2_f2(u0 & 0xffffu), f1 = e4m3x2_f2(u1 & 0xffffu);
+                            const float2 f2 = e4m3x2_f2(u0 >> 16), f3 = e4m3x2_f2(u1 >> 16);
+                            af[0] = pack2(f0.x, f0.y), af[1] = pack2(f1.x, f1.y);
+                            af[2] = pack2(f2.x, f2.y), af[3] = pack2(f3.x, f3.y);
+                        }
                     } else {
                         const int q = lane >> 3, key = km * 16 + (q & 1) * 8 + (lane & 7);
                         ldsm_x4(smem_u32(kaddr(key, ks * 2 + (q >> 1))), af);
@@ -962,7 +1141,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 const int nn = nn0 + jt * nstep, r0 = nn * 8 + 2 * t4;
                 if (nn >= NTN) break;
                 const int dbase = dbase_of(base);
-                const bool staged = !F8 && !is_new && dbase < EXT;  // E4M3 tiles stage no rel_proj window
+                const bool staged = !RAW_TILE && !is_new && dbase < EXT;  // F8/Q4 tiles stage no rel_proj window
                 float sv[4];
 #pragma unroll
                 for (int v = 0; v < 4; ++v) {  // (key gid | gid + 8, row 2 t4 | 2 t4 + 1)
@@ -1073,19 +1252,19 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 uint4 u = make_uint4(0u, 0u, 0u, 0u);
                 if (key < M) u = reinterpret_cast<const uint4*>(&s_nkv[kv][key][0])[ch];
                 if (kv) u = make_uint4(to_half(u.x), to_half(u.y), to_half(u.z), to_half(u.w));
-                uint4* dst = F8 ? reinterpret_cast<uint4*>(wv + (kv ? 0 : 32 * D) + roff(key, ch))
-                                : reinterpret_cast<uint4*>(kvs + kv_off(1, key, kv, ch));
+                uint4* dst = RAW_TILE ? reinterpret_cast<uint4*>(wv + (kv ? 0 : 32 * D) + roff(key, ch))
+                                      : reinterpret_cast<uint4*>(kvs + kv_off(1, key, kv, ch));
                 *dst = u;
             }
             __syncthreads();
-            if constexpr (F8)
+            if constexpr (RAW_TILE)
                 consume([&](int key, int ch) { return reinterpret_cast<const ActT*>(wv + 32 * D + roff(key, ch)); },
                         [&](int key, int ch) { return wv + roff(key, ch); }, SmemK{}, nullptr, 0, 0, true, nothing);
             else
                 consume([&](int key, int ch) { return kvs + kv_off(1, key, 0, ch); },
                         [&](int key, int ch) { return kvs + kv_off(1, key, 1, ch); }, SmemK{}, nullptr, 1, 0, true, nothing);
         }
-        if constexpr (F8) {
+        if constexpr (RAW_TILE) {
             int t = 0;
             for (int base = rank * KT; base < L_old; base += CS * KT, ++t) {
                 copy::wait<NRAW - 1>();  // this thread's part of tile t
@@ -1129,11 +1308,18 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
     if constexpr (SPLIT) {
         if (owner) {
-            ActT* dst_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
-            for (int idx = tid; idx < 2 * M * 16; idx += NT) {
-                const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
-                reinterpret_cast<uint4*>(dst_nkv + (kv * M + m) * D)[c8] =
-                    reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+            if constexpr (Q4) {
+                uint32_t* dst_q4 = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(p.saved_nkv) +
+                                                               size_t(g) * 2 * M * Q4_HEAD_B);
+                const uint32_t* src_q4 = reinterpret_cast<const uint32_t*>(sm + L::NKV_Q4);
+                for (int idx = tid; idx < 2 * M * (Q4_HEAD_B / 4); idx += NT) dst_q4[idx] = src_q4[idx];
+            } else {
+                ActT* dst_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
+                for (int idx = tid; idx < 2 * M * 16; idx += NT) {
+                    const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+                    reinterpret_cast<uint4*>(dst_nkv + (kv * M + m) * D)[c8] =
+                        reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+                }
             }
             float* dst_nst = p.saved_nst + size_t(g) * 3 * 2 * D;
             for (int idx = tid; idx < 3 * 2 * D; idx += NT) dst_nst[idx] = sm[L::NST + idx];
@@ -1182,18 +1368,35 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // owner: the global writes, at the end so they delay nothing (and, for M > 1 on a ring, because the
     // overwritten slots were still being read)
     if (owner) {
-        for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
-            const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
-            const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
-            const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
-            CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
-            if constexpr (F8) {  // exact: the values are E4M3 already
-                float f[8];
-                unpack8(u, f);
-                reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
-                                                               pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
-            } else {
-                reinterpret_cast<uint4*>(dst)[c8] = u;
+        if constexpr (Q4) {
+            const uint8_t* src_q4 = reinterpret_cast<const uint8_t*>(sm + L::NKV_Q4);
+            for (int idx = tid; idx < 2 * M * 18; idx += NT) {
+                const int kv = idx / (M * 18), m = (idx / 18) % M, w = idx % 18;
+                const int row = p0 + m;
+                uint8_t* row_dst = p.k_pages
+                    ? (static_cast<uint8_t*>((kv ? p.v_pages : p.k_pages)[row >> p.page_shift]) +
+                       size_t(row & ((1 << p.page_shift) - 1)) * Q4_ROW_B)
+                    : (static_cast<uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(row) * Q4_ROW_B);
+                const uint32_t val = reinterpret_cast<const uint32_t*>(src_q4 + (kv * M + m) * Q4_HEAD_B)[w];
+                if (w < 16)
+                    reinterpret_cast<uint32_t*>(row_dst + g * 64)[w] = val;
+                else
+                    reinterpret_cast<uint32_t*>(row_dst + Q4_NIB_B + g * 8)[w - 16] = val;
+            }
+        } else {
+            for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
+                const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+                const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
+                const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+                CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
+                if constexpr (F8) {  // exact: the values are E4M3 already
+                    float f[8];
+                    unpack8(u, f);
+                    reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
+                                                                   pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
+                } else {
+                    reinterpret_cast<uint4*>(dst)[c8] = u;
+                }
             }
         }
         for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels
@@ -1204,9 +1407,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
 }
 
-template <int M, bool FULL, bool F8>
+template <int M, bool FULL, bool F8, bool Q4 = false>
 __global__ void __launch_bounds__(NT) attn_decode_stage2_kernel(const Params p) {
-    using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
+    using CT = std::conditional_t<Q4, uint8_t, std::conditional_t<F8, __nv_fp8_storage_t, ActT>>;
     constexpr int ROWS = GQA * M;
     const int g = blockIdx.y, rank = blockIdx.x, tid = threadIdx.x;
     const bool owner = rank == 0;
@@ -1243,21 +1446,38 @@ __global__ void __launch_bounds__(NT) attn_decode_stage2_kernel(const Params p) 
     }
 
     if (owner) {
-        CT* const kc = static_cast<CT*>(p.k_cache);
-        CT* const vc = static_cast<CT*>(p.v_cache);
-        const ActT* src_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
-        for (int idx = tid; idx < 2 * M * 16; idx += NT) {
-            const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
-            const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
-            const uint4 u = reinterpret_cast<const uint4*>(src_nkv + (kv * M + m) * D)[c8];
-            CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
-            if constexpr (F8) {
-                float f[8];
-                unpack8(u, f);
-                reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
-                                                               pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
-            } else {
-                reinterpret_cast<uint4*>(dst)[c8] = u;
+        if constexpr (Q4) {
+            const uint8_t* src_q4 = reinterpret_cast<const uint8_t*>(p.saved_nkv) + size_t(g) * 2 * M * Q4_HEAD_B;
+            for (int idx = tid; idx < 2 * M * 18; idx += NT) {
+                const int kv = idx / (M * 18), m = (idx / 18) % M, w = idx % 18;
+                const int row = p0 + m;
+                uint8_t* row_dst = p.k_pages
+                    ? (static_cast<uint8_t*>((kv ? p.v_pages : p.k_pages)[row >> p.page_shift]) +
+                       size_t(row & ((1 << p.page_shift) - 1)) * Q4_ROW_B)
+                    : (static_cast<uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(row) * Q4_ROW_B);
+                const uint32_t val = reinterpret_cast<const uint32_t*>(src_q4 + (kv * M + m) * Q4_HEAD_B)[w];
+                if (w < 16)
+                    reinterpret_cast<uint32_t*>(row_dst + g * 64)[w] = val;
+                else
+                    reinterpret_cast<uint32_t*>(row_dst + Q4_NIB_B + g * 8)[w - 16] = val;
+            }
+        } else {
+            CT* const kc = static_cast<CT*>(p.k_cache);
+            CT* const vc = static_cast<CT*>(p.v_cache);
+            const ActT* src_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
+            for (int idx = tid; idx < 2 * M * 16; idx += NT) {
+                const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+                const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
+                const uint4 u = reinterpret_cast<const uint4*>(src_nkv + (kv * M + m) * D)[c8];
+                CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
+                if constexpr (F8) {
+                    float f[8];
+                    unpack8(u, f);
+                    reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
+                                                                   pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
+                } else {
+                    reinterpret_cast<uint4*>(dst)[c8] = u;
+                }
             }
         }
         const float* src_nst = p.saved_nst + size_t(g) * 3 * 2 * D;
@@ -1284,51 +1504,51 @@ struct Kernel {
     size_t smem;
 };
 
-template <int M, bool FULL, bool F8>
+template <int M, bool FULL, bool F8, bool Q4 = false>
 Kernel kernel_of() {
     static const Kernel k = [] {
         if (current_sm_major() >= 9) {
-            const KernelFn f = attn_decode_kernel<M, FULL, F8, false>;
+            const KernelFn f = attn_decode_kernel<M, FULL, F8, false, Q4>;
             CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-            CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
-            return Kernel{f, nullptr, M, Smem<M, F8>::BYTES};
+            CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, Q4>::BYTES)));
+            return Kernel{f, nullptr, M, Smem<M, F8, Q4>::BYTES};
         } else {
-            const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true>;
-            const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8>;
-            if constexpr (Smem<M, F8>::BYTES > 49152) {
-                CUDA_CHECK(cudaFuncSetAttribute(f1, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
+            const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true, Q4>;
+            const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8, Q4>;
+            if constexpr (Smem<M, F8, Q4>::BYTES > 49152) {
+                CUDA_CHECK(cudaFuncSetAttribute(f1, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, Q4>::BYTES)));
             }
-            return Kernel{f1, f2, M, Smem<M, F8>::BYTES};
+            return Kernel{f1, f2, M, Smem<M, F8, Q4>::BYTES};
         }
     }();
     return k;
 }
 
-template <bool F8>
+template <bool F8, bool Q4>
 constexpr size_t smem_bytes(int M) {
     switch (M) {
-        case 1: return Smem<1, F8>::BYTES;
-        case 2: return Smem<2, F8>::BYTES;
-        case 3: return Smem<3, F8>::BYTES;
-        case 4: return Smem<4, F8>::BYTES;
-        case 5: return Smem<5, F8>::BYTES;
-        case 6: return Smem<6, F8>::BYTES;
-        case 7: return Smem<7, F8>::BYTES;
-        default: return Smem<8, F8>::BYTES;
+        case 1: return Smem<1, F8, Q4>::BYTES;
+        case 2: return Smem<2, F8, Q4>::BYTES;
+        case 3: return Smem<3, F8, Q4>::BYTES;
+        case 4: return Smem<4, F8, Q4>::BYTES;
+        case 5: return Smem<5, F8, Q4>::BYTES;
+        case 6: return Smem<6, F8, Q4>::BYTES;
+        case 7: return Smem<7, F8, Q4>::BYTES;
+        default: return Smem<8, F8, Q4>::BYTES;
     }
 }
 
-template <bool FULL, bool F8 = false>
+template <bool FULL, bool F8 = false, bool Q4 = false>
 Kernel select(int M) {
     switch (M) {
-        case 1: return kernel_of<1, FULL, F8>();
-        case 2: return kernel_of<2, FULL, F8>();
-        case 3: return kernel_of<3, FULL, F8>();
-        case 4: return kernel_of<4, FULL, F8>();
-        case 5: return kernel_of<5, FULL, F8>();
-        case 6: return kernel_of<6, FULL, F8>();
-        case 7: return kernel_of<7, FULL, F8>();
-        default: return kernel_of<8, FULL, F8>();
+        case 1: return kernel_of<1, FULL, F8, Q4>();
+        case 2: return kernel_of<2, FULL, F8, Q4>();
+        case 3: return kernel_of<3, FULL, F8, Q4>();
+        case 4: return kernel_of<4, FULL, F8, Q4>();
+        case 5: return kernel_of<5, FULL, F8, Q4>();
+        case 6: return kernel_of<6, FULL, F8, Q4>();
+        case 7: return kernel_of<7, FULL, F8, Q4>();
+        default: return kernel_of<8, FULL, F8, Q4>();
     }
 }
 
@@ -1375,10 +1595,12 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     const bool full = a.window == 0;
     const int M = a.M;
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
+    const bool have_kv = (a.k_cache && a.v_cache) || (a.cache_q4 && a.k_pages && a.v_pages && a.page_shift > 0);
     require(a.proj && a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv && a.conv_k_state &&
-                a.conv_v_state && a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
+                a.conv_v_state && have_kv && a.pos && a.workspace && a.out,
             "null argument");
-    require(full || !a.cache_fp8, "float8_e4m3fn caches are supported on full layers (window = 0) only");
+    require(full || (!a.cache_fp8 && !a.cache_q4), "compressed caches are supported on full layers (window = 0) only");
+    require(!(a.cache_fp8 && a.cache_q4), "cache_fp8 and cache_q4 are mutually exclusive");
     // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides
     require(a.cache_rows >= 1 && a.cache_rows <= (int64_t(1) << 30), "caches hold 1..2^30 positions");
     if (!full) {
@@ -1401,6 +1623,9 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.conv_v = a.conv_v_state;
     p.k_cache = a.k_cache;
     p.v_cache = a.v_cache;
+    p.k_pages = a.k_pages;
+    p.v_pages = a.v_pages;
+    p.page_shift = a.page_shift;
     p.kpos = full ? nullptr : reinterpret_cast<long long*>(a.kpos);
     p.pos = reinterpret_cast<const long long*>(a.pos);
     p.counter = static_cast<int*>(a.workspace);
@@ -1409,12 +1634,18 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.saved_nst = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + ws_nst_off(M));
     p.out = a.out;
     // Turing (64 KiB opt-in SMEM) fits M=1,2 natively; Pascal (48 KiB) fits M=1 natively.
-    // For larger M on those devices, run M sequential M=1 decode steps (16,912 B SMEM, CUDA-graph capturable).
-    const size_t need_smem = (full && a.cache_fp8) ? smem_bytes<true>(M) : smem_bytes<false>(M);
+    // For larger M on those devices, run M sequential M=1 decode steps (<=18 KiB SMEM, CUDA-graph capturable).
+    const size_t need_smem = full ? (a.cache_q4 ? smem_bytes<false, true>(M)
+                                                : (a.cache_fp8 ? smem_bytes<true, false>(M) : smem_bytes<false, false>(M)))
+                                  : smem_bytes<false, false>(M);
     if (M > 1 && current_max_smem_optin() < int(need_smem)) {
-        const Kernel k1 = full ? (a.cache_fp8 ? select<true, true>(1) : select<true>(1)) : select<false>(1);
+        const Kernel k1 = full ? (a.cache_q4 ? select<true, false, true>(1)
+                                             : (a.cache_fp8 ? select<true, true, false>(1) : select<true, false, false>(1)))
+                               : select<false, false, false>(1);
         cudaLaunchAttribute attrs[2];
-        const cudaLaunchConfig_t cfg1 = launch_config(k1, stream, attrs);
+        cudaLaunchConfig_t cfg1 = launch_config(k1, stream, attrs);
+        // Disable PDL between sequential M=1 steps: step m+1 reads k_cache/v_cache/conv_state written at the end of step m.
+        if (cfg1.numAttrs > 1) cfg1.numAttrs = 1;
         cudaLaunchConfig_t cfg2{};
         cfg2.gridDim = dim3(CS, HKV);
         cfg2.blockDim = dim3(NT);
@@ -1430,7 +1661,9 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
         }
         return;
     }
-    const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
+    const Kernel k = full ? (a.cache_q4 ? select<true, false, true>(M)
+                                        : (a.cache_fp8 ? select<true, true, false>(M) : select<true, false, false>(M)))
+                          : select<false, false, false>(M);
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));

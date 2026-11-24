@@ -13,9 +13,12 @@
 #include <array>
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
 #include <vector>
 
 namespace ingine::model {
+
+class ExpertCache;
 
 // ------------------------------------------------------------------------------------ weights.py constants
 
@@ -35,6 +38,17 @@ inline constexpr float GATE_SOFTCAP = 4.0f, UP_SOFTCAP = 25.0f, LOGIT_SOFTCAP = 
 inline constexpr float ROUTE_SCALE = 8.0f;
 inline constexpr float FP8_MAX = 448.0f;  // largest finite float8_e4m3fn (model.FP8_MAX)
 inline constexpr int KV_DIM = KV_HEADS * HEAD_DIM;  // 1024
+// Q4_0 per-row layout for full-attention caches: [8 heads x 64B nibbles | 8 heads x 4 FP16 scales] = 576B/row
+// (18B per 32-element block, 64-byte aligned row stride, 9 KiB/tok across 8 full visits x K/V).
+inline constexpr int KV_Q4_GROUP = 32;
+inline constexpr int KV_Q4_BLOCKS_PER_HEAD = HEAD_DIM / KV_Q4_GROUP;  // 4
+inline constexpr int KV_Q4_NIBBLE_BYTES = KV_DIM / 2;                 // 512
+inline constexpr int KV_Q4_SCALE_BYTES = KV_HEADS * KV_Q4_BLOCKS_PER_HEAD * 2;  // 64
+inline constexpr int KV_Q4_ROW_BYTES = KV_Q4_NIBBLE_BYTES + KV_Q4_SCALE_BYTES;  // 576
+// Q4_0 per-row layout for token embeddings: [1152B nibbles | 72 FP16 scales = 144B] = 1296B/row (16-byte aligned).
+inline constexpr int EMBED_Q4_NIBBLE_BYTES = HIDDEN / 2;            // 1152
+inline constexpr int EMBED_Q4_SCALE_BYTES = (HIDDEN / 32) * 2;      // 144
+inline constexpr int EMBED_Q4_ROW_BYTES = EMBED_Q4_NIBBLE_BYTES + EMBED_Q4_SCALE_BYTES;  // 1296
 
 inline constexpr bool is_full_layer(int l) { return l == 5 || l == 11 || l == 17 || l == 23; }
 inline constexpr bool is_loop_layer(int l) { return LOOP_START <= l && l < LOOP_END; }
@@ -130,11 +144,15 @@ struct Dense {
   int cols() const { return w.ne[0]; }
 };
 
-enum class ExpertFormat : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3 };  // the moe kernels' `fmt`
+enum class ExpertFormat : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5 };
+
+inline constexpr bool is_exl3(ExpertFormat f) { return f == ExpertFormat::EXL3_2 || f == ExpertFormat::EXL3_3; }
 
 // weights.Experts (checkpoint encoding; see weights.py docstring)
 struct Experts {
-  ExpertFormat fmt = ExpertFormat::NVFP4;
+  ExpertFormat fmt = ExpertFormat::NVFP4;       // w13 format (legacy alias)
+  ExpertFormat w13_fmt = ExpertFormat::NVFP4;   // w13 format (may differ from w2_fmt, e.g. EXL3 Map M2)
+  ExpertFormat w2_fmt = ExpertFormat::NVFP4;    // w2 format
   // NVFP4:  w13 u8 [128, 2304, 1152], w13_scale e4m3 [128, 2304, 144], w2 u8 [128, 2304, 576],
   //         w2_scale e4m3 [128, 2304, 72], factors fp32 [128] (amax / outer_scale_denominator)
   // MXFP8:  w13 e4m3 [128, 2304, 2304], w13_scale u8 (E8M0) [128, 2304, 72], w2 e4m3 [128, 2304, 1152],
@@ -143,8 +161,12 @@ struct Experts {
   //         e4m3 scales & fp32 factors same as NVFP4
   // ATLAS3: 3-bit symmetric Lloyd-Max (group 16, 3.50 b/w): w13 u8 [128, 2304, 864], w2 u8 [128, 2304, 432],
   //         e4m3 scales & fp32 factors same as NVFP4
+  // EXL3_2 / EXL3_3: EXL3 MCG trellis + 128-pt Hadamard (2 or 3 b/w):
+  //         w13 u8 [128, 144, 144, 32*bits] (stacked [gate; up]), w13_rin f16 [128, 2304], w13_rout f16 [128, 2304];
+  //         w2  u8 [128, 144,  72, 32*bits],                      w2_rin  f16 [128, 1152], w2_rout  f16 [128, 2304]
   Tensor w13, w13_scale, w2, w2_scale;
   Tensor w13_factor, w2_factor;
+  Tensor w13_rin, w13_rout, w2_rin, w2_rout;
 };
 
 // weights.Layer plus the per-layer derived tensors of fast.FastDecoder (_concat_projections,
@@ -198,14 +220,17 @@ struct Layer {
 // weights.Weights (+ fast.FastDecoder.final_norm1 / head_w). Owns its device memory.
 struct Weights {
   std::vector<Layer> layers;  // LAYERS
-  Tensor embed;               // bf16 [VOCAB, H] (padded rows kept, as weights.load)
+  Tensor embed;               // bf16 [VOCAB, H] or q4_0 u8 [VOCAB, EMBED_Q4_ROW_BYTES]
   Tensor embed_norm;          // fp32 [H]
   Tensor final_query;         // fp32 [1, H]
   Tensor final_norm;          // fp32 [H] (also final_norm1 = [1, H] view of the same memory)
   Dense unembed;              // [UNPADDED_VOCAB, H] bf16, or FP8 rows + scales (dense_fp8)
   Tensor message_queries;     // fp32 [12, 4, H]: q, k, v, mlp per loop layer
   std::array<ExpertFormat, LAYERS> expert_formats{};
+  std::array<ExpertFormat, LAYERS> w2_expert_formats{};
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
+  bool embed_q4() const { return embed.dtype == DType::U8; }
+  std::shared_ptr<ExpertCache> expert_cache;  // non-null when tiered MoE offloading is enabled
 
   std::vector<DeviceBuffer> storage;  // device allocations behind the views
 };
@@ -228,17 +253,23 @@ struct Ablation {
 // ------------------------------------------------------------------------------------------------- state
 
 // model.State: per-request caches.
+class PagedKvCache;
+
 struct State {
   int max_ctx = 0;
   bool kv_fp8 = false;
+  bool kv_q4 = false;
+  std::shared_ptr<PagedKvCache> paged_kv;  // non-null when 3-tier paged Q4_0 full-attention KV is enabled
   Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
-  Tensor k_full, v_full;      // bf16 or fp8 e4m3 [8, max_ctx, 8, 128] (full visits, FULL_INDEX)
+  Tensor k_full, v_full;      // bf16/fp8 [8, max_ctx, 8, 128] or q4_0 u8 [8, max_ctx, 576] (full visits)
   Tensor conv_k, conv_v;      // fp32 [48, 3, 1024] previous 3 key/value conv inputs (oldest first)
   Tensor conv_attn, conv_mlp; // fp32 [48, 3, H]
   int length = 0;             // tokens in the context (host copy; decode steps do not advance it)
 
   std::vector<DeviceBuffer> storage;
+
+  std::size_t full_row_bytes() const { return kv_q4 ? KV_Q4_ROW_BYTES : std::size_t(KV_DIM) * (kv_fp8 ? 1 : 2); }
 
   // per-visit views
   Tensor k_ring_at(int ring) const;

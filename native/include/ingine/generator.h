@@ -91,7 +91,7 @@ struct RuntimeOptions {
   // Tokens per prefill chunk. 3072 (the largest the sliding attention takes) reads a long prompt 6-10% faster
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
-  bool dense_fp8 = true, kv_fp8 = false, spec = false;
+  bool dense_fp8 = true, kv_fp8 = false, kv_q4 = false, spec = false;
   float spec_threshold = 0.8f;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
@@ -99,6 +99,30 @@ struct RuntimeOptions {
   int park_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
+  // Dynamic 3-tier MoE expert offloading (atlas-6g-homology):
+  //   offload_vram_mb == 0: disabled (all experts resident in VRAM).
+  //   offload_vram_mb > 0:  target VRAM cap in MiB (e.g. 6144 for 6 GB GPUs); non-expert weights, KV cache,
+  //                         and static homology-pinned HOT experts + dynamic LRU pool stay inside this cap.
+  //   offload_ram_mb:       pinned host RAM cap in MiB for WARM experts (default 12288 inside 16 GB RAM);
+  //                         any remaining COLD experts stream on demand from read-only NVMe mmap.
+  //   offload_mode:         "auto" (dma-lru), "dma-lru" (3-tier async PCIe DMA + dynamic VRAM LRU), or
+  //                         "uva" (2-tier HOT VRAM + zero-copy UVA pinned RAM, CUDA-graph capturable).
+  int offload_vram_mb = 0;
+  int offload_ram_mb = 12288;
+  std::string offload_mode = "auto";
+  std::filesystem::path expert_ranking;     // optional JSON per-layer [24][128] homology/frequency scores
+  std::filesystem::path dump_router_stats;  // optional JSON output path for observed [24][128] router hits
+  // 3-tier paged Q4_0 full-attention KV cache (for 1M context on <= 12 GB and <= 6 GB GPUs):
+  //   kv_paged / kv_vram_mb > 0: keeps hot 4096-token KV pages in VRAM, overflows warm pages to lazy
+  //   pinned UVA HostRegion slabs (<= kv_ram_mb), and spills cold pages to a crash-safe NVMe SwapFile.
+  bool kv_paged = false;
+  int kv_vram_mb = 0;               // 0 = auto when kv_paged (256 MiB with offload, 1536 MiB otherwise)
+  int kv_ram_mb = 12288;            // pinned UVA host RAM cap in MiB before spilling to NVMe SwapFile
+  std::filesystem::path kv_swap_dir;  // optional directory for Tier-2 NVMe KV swap file
+  // Atomic streaming disk checkpoint & resume for long-context (1M+) prefill runs:
+  std::filesystem::path kv_ckpt_path;    // path for periodic & SIGTERM atomic KV checkpoints (auto-resumes if prefix matches)
+  int kv_ckpt_every = 0;                 // save atomic checkpoint every N tokens during prefill (e.g. 131072; 0 = SIGTERM/manual only)
+  std::filesystem::path kv_ckpt_resume;  // explicit checkpoint path to resume from (fails loudly if missing or mismatched)
 };
 
 class Generator {
@@ -120,6 +144,7 @@ class Generator {
     return generate(prompt.ids, max_new_tokens, sampling, stop_ids, on_tokens);
   }
   virtual bool supports_images() const { return false; }
+  virtual std::string offload_summary() const { return {}; }
 };
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options);  // the model (ingine_model)

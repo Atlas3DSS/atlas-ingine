@@ -484,7 +484,7 @@ void Drafter::run_small_commit() {
 
 void Drafter::run_draft(int bucket) {
   kd::embed_block(static_cast<const ActT*>(w_.embed.data), static_cast<const float*>(w_.embed_norm.data),
-                  mask_embed_, layers_[0].in_norm, params_, res_, xn_, picks_, stream_);
+                  mask_embed_, layers_[0].in_norm, params_, res_, xn_, picks_, stream_, w_.embed_q4());
   run_layers(bucket);
 }
 
@@ -541,7 +541,7 @@ Drafter::Draft Drafter::draft(int anchor, int P, float temperature) {
 void Drafter::run_advance(int bucket) {
   kd::round_begin(params_, round_, alpha_, ctx_layers_, f_norm_, static_cast<const ActT*>(w_.embed.data),
                   static_cast<const float*>(w_.embed_norm.data), mask_embed_, layers_[0].in_norm, commit_xin_, f_rnn_,
-                  res_, xn_, picks_, stream_);
+                  res_, xn_, picks_, stream_, w_.embed_q4());
   kdense::proj(commit_xin_, BLOCK, wkv_all_, seg_kv_, 3, commit_kv_, true, stream_);
   kd::commit_store(commit_kv_, params_, ctx_layers_, stream_);
   run_layers(bucket);

@@ -5,9 +5,12 @@
 #include "kernels/prefill/prefill.h"
 #include "prefill/prefill_test.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <vector>
 
@@ -23,13 +26,110 @@ constexpr float kE2M1[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f
 constexpr float kAtlas2[4] = {-1.5f, -0.453125f, 0.453125f, 1.5f};
 constexpr float kAtlas3[8] = {-2.0f, -1.25f, -0.703125f, -0.2265625f, 0.2265625f, 0.703125f, 1.25f, 2.0f};
 
+float fp16_bits_to_f32(uint16_t h) {
+  const uint32_t s = uint32_t(h >> 15) << 31;
+  const uint32_t e = (h >> 10) & 31u;
+  const uint32_t m = h & 1023u;
+  uint32_t f;
+  if (e == 0) {
+    if (m == 0) f = s;
+    else {
+      int sh = 0;
+      uint32_t mm = m;
+      while ((mm & 1024u) == 0) { mm <<= 1; ++sh; }
+      f = s | (uint32_t(127 - 14 - sh) << 23) | ((mm & 1023u) << 13);
+    }
+  } else if (e == 31) {
+    f = s | 0x7f800000u | (m << 13);
+  } else {
+    f = s | ((e + 112u) << 23) | (m << 13);
+  }
+  float out;
+  std::memcpy(&out, &f, 4);
+  return out;
+}
+
+uint16_t f32_to_fp16_bits(float v) { return __half_as_ushort(__float2half_rn(v)); }
+
+float mcg_host(uint32_t st16) {
+  const uint32_t p = st16 * 0xCBAC1FEDu;
+  const uint32_t u = (p & 0x8fff8fffu) ^ 0x3b603b60u;
+  const float lo = fp16_bits_to_f32(uint16_t(u & 0xffffu));
+  const float hi = fp16_bits_to_f32(uint16_t(u >> 16));
+  return fp16_bits_to_f32(f32_to_fp16_bits(lo + hi));
+}
+
+void fwht128_host(double* x) {
+  for (int h = 1; h < 128; h <<= 1) {
+    for (int i = 0; i < 128; i += 2 * h) {
+      for (int j = i; j < i + h; ++j) {
+        const double a = x[j], b = x[j + h];
+        x[j] = a + b;
+        x[j + h] = a - b;
+      }
+    }
+  }
+  const double inv = 1.0 / std::sqrt(128.0);
+  for (int i = 0; i < 128; ++i) x[i] *= inv;
+}
+
 struct Mat {  // one expert-stacked matrix [kAlloc, rows, cols] in checkpoint encoding
   int fmt, rows, cols;
   std::vector<uint8_t> codes, scales;
+  std::vector<uint16_t> rin, rout;
   std::vector<float> factor;
   std::vector<float> dec;  // decoded BF16 values [kAlloc, rows, cols]
   float value(int e, int r, int k) const { return dec[(size_t(e) * rows + r) * cols + k]; }
   void decode() {
+    if (fmt == 4 || fmt == 5) {
+      const int bits = fmt == 4 ? 2 : 3;
+      const int nt = rows / 16, kt = cols / 16, tb = 32 * bits, nw = 8 * bits;
+      dec.resize(size_t(kAlloc) * rows * cols);
+      for (int e = 0; e < kAlloc; ++e) {
+        std::vector<double> mat(size_t(rows) * cols, 0.0);
+        for (int n_t = 0; n_t < nt; ++n_t) {
+          for (int k_t = 0; k_t < kt; ++k_t) {
+            const uint8_t* tp = codes.data() + ((size_t(e) * nt + n_t) * kt + k_t) * tb;
+            uint32_t words[24];
+            std::memcpy(words, tp, tb);
+            for (int lane = 0; lane < 32; ++lane) {
+              for (int half = 0; half < 2; ++half) {
+                const int t_off = lane * 8 + half * 4;
+                const int b0 = (t_off + 257) * bits - 16;
+                const int w0 = (b0 >> 5) % nw, w1 = (w0 + 1) % nw, sh = b0 & 31;
+                const uint64_t pair = (uint64_t(words[w0]) << 32) | uint64_t(words[w1]);
+                const uint32_t win = uint32_t((pair << sh) >> 32);
+                for (int m = 0; m < 4; ++m) {
+                  const uint32_t st = (win >> (16 - m * bits)) & 0xffffu;
+                  const int j = half * 4 + m;
+                  const int kr = (lane & 3) * 2 + (j & 1) + ((j & 2) ? 8 : 0);
+                  const int nc = (lane >> 2) + ((j & 4) ? 8 : 0);
+                  mat[size_t(n_t * 16 + nc) * cols + (k_t * 16 + kr)] = double(mcg_host(st));
+                }
+              }
+            }
+          }
+        }
+        for (int r = 0; r < rows; ++r) {
+          for (int cb = 0; cb < cols; cb += 128) {
+            fwht128_host(&mat[size_t(r) * cols + cb]);
+            for (int i = 0; i < 128; ++i)
+              mat[size_t(r) * cols + cb + i] *= double(fp16_bits_to_f32(rin[size_t(e) * cols + cb + i]));
+          }
+        }
+        for (int c = 0; c < cols; ++c) {
+          for (int rb = 0; rb < rows; rb += 128) {
+            double col[128];
+            for (int i = 0; i < 128; ++i) col[i] = mat[size_t(rb + i) * cols + c];
+            fwht128_host(col);
+            for (int i = 0; i < 128; ++i)
+              dec[(size_t(e) * rows + rb + i) * cols + c] =
+                  float(col[i] * double(fp16_bits_to_f32(rout[size_t(e) * rows + rb + i])));
+          }
+        }
+      }
+      return;
+    }
     float e4[256];
     for (int c = 0; c < 256; ++c) e4[c] = e4m3_to_float(uint8_t(c));
     dec.resize(size_t(kAlloc) * rows * cols);
@@ -65,7 +165,7 @@ struct Mat {  // one expert-stacked matrix [kAlloc, rows, cols] in checkpoint en
 };
 
 Mat make_mat(Rng& rng, int fmt, int rows, int cols) {
-  Mat m{fmt, rows, cols, {}, {}, {}, {}};
+  Mat m{fmt, rows, cols, {}, {}, {}, {}, {}, {}};
   if (fmt == 0) {
     m.codes.resize(size_t(kAlloc) * rows * cols / 2);
     for (auto& b : m.codes) b = uint8_t(rng.next());
@@ -85,6 +185,14 @@ Mat make_mat(Rng& rng, int fmt, int rows, int cols) {
     for (auto& s : m.scales) s = uint8_t(((5 + rng.next() % 4) << 3) | (rng.next() & 7));
     m.factor.resize(E, 0.f);
     for (int e = 0; e < kAlloc; ++e) m.factor[e] = float(rng.uniform(0.01, 0.03));
+  } else if (fmt == 4 || fmt == 5) {
+    const int bits = fmt == 4 ? 2 : 3;
+    m.codes.resize(size_t(kAlloc) * (rows / 16) * (cols / 16) * (32 * bits));
+    for (auto& b : m.codes) b = uint8_t(rng.next());
+    m.rin.resize(size_t(kAlloc) * cols);
+    for (auto& r : m.rin) r = f32_to_fp16_bits(float(rng.uniform(-0.12, 0.12)));
+    m.rout.resize(size_t(kAlloc) * rows);
+    for (auto& r : m.rout) r = f32_to_fp16_bits(float(rng.uniform(-0.12, 0.12)));
   } else {
     m.codes.resize(size_t(kAlloc) * rows * (cols / 32) * 12);
     for (auto& b : m.codes) b = uint8_t(rng.next());
@@ -103,8 +211,9 @@ double act_ref(double g, double u) {
 }
 
 bool run(Rng& rng, int fmt, int T) {
-  static constexpr const char* kFmtName[4] = {"NVFP4", "MXFP8", "ATLAS2", "ATLAS3"};
-  const bool has_factor = fmt != 1;
+  static constexpr const char* kFmtName[6] = {"NVFP4", "MXFP8", "ATLAS2", "ATLAS3", "EXL3_2", "EXL3_3"};
+  const bool is_exl3 = fmt == 4 || fmt == 5;
+  const bool has_factor = fmt != 1 && !is_exl3;
   std::printf("-- %s, T=%d\n", kFmtName[fmt], T);
   const Mat w13 = make_mat(rng, fmt, 2 * I, H), w2 = make_mat(rng, fmt, H, I);
   std::vector<float> logits(size_t(T) * E), bias(E);
@@ -117,13 +226,26 @@ bool run(Rng& rng, int fmt, int T) {
   DeviceArray<int> d_idx(size_t(T) * TOPK), counts(E), tiles_n(1), pair_token(size_t(T) * TOPK),
       pair_dst(size_t(T) * TOPK);
   DeviceArray<int4> tiles(pk::moe_tiles_capacity(T));
-  DeviceArray<uint8_t> c13(w13.codes), s13(w13.scales), c2(w2.codes), s2(w2.scales);
+  DeviceArray<uint8_t> c13(w13.codes), s13(is_exl3 ? std::vector<uint8_t>(1) : w13.scales), c2(w2.codes),
+      s2(is_exl3 ? std::vector<uint8_t>(1) : w2.scales);
+  DeviceArray<uint16_t> rin13(is_exl3 ? w13.rin : std::vector<uint16_t>(1)),
+      rout13(is_exl3 ? w13.rout : std::vector<uint16_t>(1)), rin2(is_exl3 ? w2.rin : std::vector<uint16_t>(1)),
+      rout2(is_exl3 ? w2.rout : std::vector<uint16_t>(1));
   DeviceArray<float> f13(has_factor ? w13.factor : std::vector<float>(1)),
       f2(has_factor ? w2.factor : std::vector<float>(1));
   DeviceArray<uint16_t> d_x(x), act(size_t(T) * TOPK * I), down(size_t(T) * TOPK * H), out(size_t(T) * H);
   pk::MoeWork wk{counts.get(), tiles_n.get(), tiles.get(), pair_token.get(), pair_dst.get()};
-  pk::MoeExperts ex{fmt, c13.get(), s13.get(), has_factor ? f13.get() : nullptr, c2.get(), s2.get(),
-                    has_factor ? f2.get() : nullptr};
+  pk::MoeExperts ex{fmt,
+                    c13.get(),
+                    is_exl3 ? static_cast<const void*>(rin13.get()) : static_cast<const void*>(s13.get()),
+                    has_factor ? f13.get() : nullptr,
+                    c2.get(),
+                    is_exl3 ? static_cast<const void*>(rin2.get()) : static_cast<const void*>(s2.get()),
+                    has_factor ? f2.get() : nullptr,
+                    fmt,
+                    is_exl3 ? static_cast<const void*>(rout13.get()) : nullptr,
+                    is_exl3 ? static_cast<const void*>(rout2.get()) : nullptr,
+                    is_exl3 ? reinterpret_cast<ingine::ActT*>(down.get()) : nullptr};
 
   pk::moe_topk(d_logits.get(), d_bias.get(), T, d_idx.get(), d_wts.get(), counts.get(), nullptr);
   pk::moe_route(d_idx.get(), T, wk, nullptr);
@@ -197,6 +319,12 @@ bool run(Rng& rng, int fmt, int T) {
     auto act_raw = [](double g, double u) {
       return std::tanh(g / 4) * 4 * (1 / (1 + std::exp(-g))) * std::tanh(u / 25) * 25;
     };
+    // Output quantization floor: 0.5 ULP of the smallest subnormal (FP16: 2^-25; BF16: ~1e-30).
+#if INGINE_ACT_FP16
+    constexpr double kSubnormalHalfStep = 2.98023223876953125e-8;  // 2^-25
+#else
+    constexpr double kSubnormalHalfStep = 1e-30;
+#endif
     for (int t = 0; t < T; t += 7) {
       for (int k = 0; k < TOPK; ++k) {
         const int dst = t * TOPK + k, e = idx[dst], pp = pos_of[dst];
@@ -204,18 +332,15 @@ bool run(Rng& rng, int fmt, int T) {
           double g = 0, u = 0, sg = 0, su = 0;
           for (int c = 0; c < H; ++c) {
             const double xv = bf16_val(x[size_t(t) * H + c]);
-            const double tg = w13.value(e, 2 * i, c) * xv, tu = w13.value(e, 2 * i + 1, c) * xv;
+            const int gr_row = is_exl3 ? i : 2 * i;
+            const int ur_row = is_exl3 ? (I + i) : (2 * i + 1);
+            const double tg = w13.value(e, gr_row, c) * xv, tu = w13.value(e, ur_row, c) * xv;
             g += tg, u += tu, sg += std::fabs(tg), su += std::fabs(tu);
           }
           const double a = act_ref(g, u);
           const double gr = rbf(g), ur = rbf(u);
-          const double dg = 1e-6 * sg + std::ldexp(std::fabs(gr), -7), du = 1e-6 * su + std::ldexp(std::fabs(ur), -7);
-          // Output quantization floor: 0.5 ULP of the smallest subnormal (FP16: 2^-25; BF16: ~1e-30).
-#if INGINE_ACT_FP16
-          constexpr double kSubnormalHalfStep = 2.98023223876953125e-8;  // 2^-25
-#else
-          constexpr double kSubnormalHalfStep = 1e-30;
-#endif
+          const double acc_tol = is_exl3 ? 4e-4 : 1e-6;
+          const double dg = acc_tol * sg + std::ldexp(std::fabs(gr), -7), du = acc_tol * su + std::ldexp(std::fabs(ur), -7);
           abs_a.push_back(std::max(std::fabs(act_raw(gr + dg, ur) - a), std::fabs(act_raw(gr - dg, ur) - a)) +
                           std::max(std::fabs(act_raw(gr, ur + du) - a), std::fabs(act_raw(gr, ur - du) - a)) +
                           kSubnormalHalfStep);
@@ -229,13 +354,13 @@ bool run(Rng& rng, int fmt, int T) {
             acc += term, s += std::fabs(term);
           }
           ref_d.push_back(acc);
-          abs_d.push_back(1e-6 * s);
+          abs_d.push_back((is_exl3 ? 4e-4 : 1e-6) * s + kSubnormalHalfStep);
           got_d.push_back(bf16_val(down_g[size_t(dst) * H + n]));
         }
       }
     }
-    ok &= check_close("gate_up", got_a, ref_a, 4e-3, abs_a);
-    ok &= check_close("down", got_d, ref_d, 4e-3, abs_d);
+    ok &= check_close("gate_up", got_a, ref_a, is_exl3 ? 1.5e-2 : 4e-3, abs_a);
+    ok &= check_close("down", got_d, ref_d, is_exl3 ? 1.5e-2 : 4e-3, abs_d);
   }
   {
     const auto out_g = out.download();
@@ -273,6 +398,12 @@ int main() {
   ok &= run(rng, 1, 700);
   ok &= run(rng, 2, 700);
   ok &= run(rng, 3, 700);
+  ok &= run(rng, 4, 9);
+  ok &= run(rng, 5, 9);
+  ok &= run(rng, 4, 200);
+  ok &= run(rng, 5, 200);
+  ok &= run(rng, 4, 700);
+  ok &= run(rng, 5, 700);
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

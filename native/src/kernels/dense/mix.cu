@@ -23,6 +23,8 @@
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
 
+#include <cuda_fp16.h>
+
 namespace ingine::kernels::dense {
 namespace {
 
@@ -429,6 +431,75 @@ __global__ void __launch_bounds__(BW) embed_kernel(const int64_t* __restrict__ t
   }
 }
 
+// Q4_0 SoA embedding lookup + identical RMS norm: row layout [1152B nibbles | 72 FP16 scales = 144B] = 1296B/row.
+template <int BW>
+__global__ void __launch_bounds__(BW) embed_q4_kernel(const int64_t* __restrict__ token,
+                                                      const uint8_t* __restrict__ table,
+                                                      const float* __restrict__ norm_w, float* __restrict__ out) {
+  constexpr int NV = H / 4;                  // 576 four-element vectors
+  constexpr int PER = (NV + BW - 1) / BW;
+  constexpr size_t NIB_BYTES = H / 2;        // 1152
+  constexpr size_t ROW_BYTES = NIB_BYTES + (H / 32) * 2;  // 1296
+  __shared__ float part[BW];
+  __shared__ float rinv_s;
+  const int m = blockIdx.x, t = threadIdx.x;
+  float4 g[PER];
+#pragma unroll
+  for (int k = 0; k < PER; ++k)
+    if (t + k * BW < NV) g[k] = *reinterpret_cast<const float4*>(norm_w + 4 * (t + k * BW));
+  pdl_wait();
+  pdl_trigger();
+  const uint8_t* row = table + size_t(token[m]) * ROW_BYTES;
+  const __half* scales = reinterpret_cast<const __half*>(row + NIB_BYTES);
+  float4 v[PER];
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int k = 0; k < PER; ++k) {
+    const int idx = t + k * BW;
+    if (idx < NV) {
+      const uint16_t b2 = *reinterpret_cast<const uint16_t*>(row + 2 * idx);
+      const float d = __half2float(scales[idx >> 3]);
+      const float m8d = -8.f * d;
+      v[k] = make_float4(fmaf(float(b2 & 0xfu), d, m8d), fmaf(float((b2 >> 4) & 0xfu), d, m8d),
+                         fmaf(float((b2 >> 8) & 0xfu), d, m8d), fmaf(float((b2 >> 12) & 0xfu), d, m8d));
+      acc[0] = __fadd_rn(acc[0], __fmul_rn(v[k].x, v[k].x));
+      acc[1] = __fadd_rn(acc[1], __fmul_rn(v[k].y, v[k].y));
+      acc[2] = __fadd_rn(acc[2], __fmul_rn(v[k].z, v[k].z));
+      acc[3] = __fadd_rn(acc[3], __fmul_rn(v[k].w, v[k].w));
+    }
+  }
+  float s = __fadd_rn(__fadd_rn(__fadd_rn(acc[0], acc[1]), acc[2]), acc[3]);
+  if constexpr (BW > 32) {
+    part[t] = s;
+#pragma unroll
+    for (int o = BW / 2; o >= 32; o >>= 1) {
+      __syncthreads();
+      if (t < o) {
+        s = __fadd_rn(s, part[t + o]);
+        part[t] = s;
+      }
+    }
+    __syncthreads();
+  }
+  if (t < 32) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, o));
+    if (t == 0) rinv_s = rsqrtf(__fadd_rn(__fmul_rn(s, 1.f / H), EPS));
+  }
+  __syncthreads();
+  const float rinv = rinv_s;
+  float* o = out + size_t(m) * H;
+#pragma unroll
+  for (int k = 0; k < PER; ++k) {
+    if (t + k * BW < NV) {
+      const float4 x = v[k], w = g[k];
+      *reinterpret_cast<float4*>(o + 4 * (t + k * BW)) =
+          make_float4(round_bf16(__fmul_rn(__fmul_rn(x.x, rinv), w.x)), round_bf16(__fmul_rn(__fmul_rn(x.y, rinv), w.y)),
+                      round_bf16(__fmul_rn(__fmul_rn(x.z, rinv), w.z)), round_bf16(__fmul_rn(__fmul_rn(x.w, rinv), w.w)));
+    }
+  }
+}
+
 }  // namespace
 
 namespace {
@@ -523,6 +594,17 @@ void embed(const std::int64_t* token, int M, const ActT* table, const float* nor
   else if (M < 4) launch_ex(embed_kernel<256>, dim3(M), 256, 0, 1, pdl, stream, token, table, norm_w, out);
   else if (M < 8) launch_ex(embed_kernel<128>, dim3(M), 128, 0, 1, pdl, stream, token, table, norm_w, out);
   else launch_ex(embed_kernel<64>, dim3(M), 64, 0, 1, pdl, stream, token, table, norm_w, out);
+}
+
+void embed_q4(const std::int64_t* token, int M, const void* table_q4, const float* norm_w, float* out,
+              bool pdl, cudaStream_t stream) {
+  require(M >= 1, "embed_q4: M must be >= 1");
+  require(token && table_q4 && norm_w && out, "embed_q4: null argument");
+  const auto* tbl = static_cast<const uint8_t*>(table_q4);
+  if (M == 1) launch_ex(embed_q4_kernel<512>, dim3(M), 512, 0, 1, pdl, stream, token, tbl, norm_w, out);
+  else if (M < 4) launch_ex(embed_q4_kernel<256>, dim3(M), 256, 0, 1, pdl, stream, token, tbl, norm_w, out);
+  else if (M < 8) launch_ex(embed_q4_kernel<128>, dim3(M), 128, 0, 1, pdl, stream, token, tbl, norm_w, out);
+  else launch_ex(embed_q4_kernel<64>, dim3(M), 64, 0, 1, pdl, stream, token, tbl, norm_w, out);
 }
 
 }  // namespace ingine::kernels::dense

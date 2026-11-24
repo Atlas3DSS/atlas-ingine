@@ -5,8 +5,11 @@
 // and tolerance comparison against FP64 oracles.
 #include "core/act.h"
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -92,6 +95,61 @@ inline float e4m3_to_float(uint8_t code) {
   if (exp == 0) v = std::ldexp(float(man) / 8.0f, -6);
   else v = std::ldexp(1.0f + float(man) / 8.0f, exp - 7);
   return sign ? -v : v;
+}
+
+// Q4_0 per-row KV cache layout: [8 heads x 64B nibbles | 8 heads x 4 FP16 scales] = 576B/row.
+inline constexpr int kTestKvQ4NibBytes = 512;
+inline constexpr int kTestKvQ4RowBytes = 576;
+
+inline float q4_pick_max(float a, float b) {
+  const float aa = std::fabs(a), ab = std::fabs(b);
+  return (ab > aa || (ab == aa && b < a)) ? b : a;
+}
+
+// Quantize one row [8, 128] of BF16-valued floats into 576 Q4_0 bytes; optionally also write dequantized floats.
+inline void q4_0_pack_row(const float* in, uint8_t* row_out, float* deq_out = nullptr) {
+  std::memset(row_out, 0, kTestKvQ4RowBytes);
+  for (int g = 0; g < 8; ++g) {
+    for (int blk = 0; blk < 4; ++blk) {
+      const float* x = in + g * 128 + blk * 32;
+      float mx = x[0];
+      for (int j = 1; j < 32; ++j) mx = q4_pick_max(mx, x[j]);
+      const __half dh = __float2half_rn(mx * (-0.125f));
+      const float d = __half2float(dh);
+      const float id = d != 0.f ? (1.f / d) : 0.f;
+      uint16_t dh_bits = 0;
+      std::memcpy(&dh_bits, &dh, 2);
+      std::memcpy(row_out + kTestKvQ4NibBytes + g * 8 + blk * 2, &dh_bits, 2);
+      for (int j = 0; j < 32; ++j) {
+        int qi = int(std::nearbyint(x[j] * id));
+        qi = std::max(-8, std::min(7, qi));
+        const uint8_t q = uint8_t(qi + 8);
+        uint8_t& byte = row_out[g * 64 + blk * 16 + (j >> 1)];
+        if ((j & 1) == 0) byte = q;
+        else byte |= uint8_t(q << 4);
+        if (deq_out) deq_out[g * 128 + blk * 32 + j] = float(qi) * d;
+      }
+    }
+  }
+}
+
+// Unpack one 576-byte Q4_0 row into 1024 floats [8, 128].
+inline void q4_0_unpack_row(const uint8_t* row_in, float* out) {
+  for (int g = 0; g < 8; ++g) {
+    for (int blk = 0; blk < 4; ++blk) {
+      uint16_t dh_bits = 0;
+      std::memcpy(&dh_bits, row_in + kTestKvQ4NibBytes + g * 8 + blk * 2, 2);
+      __half dh;
+      std::memcpy(&dh, &dh_bits, 2);
+      const float d_raw = __half2float(dh);
+      const float d = std::isfinite(d_raw) ? d_raw : 0.f;
+      for (int j = 0; j < 32; ++j) {
+        const uint8_t byte = row_in[g * 64 + blk * 16 + (j >> 1)];
+        const uint8_t q = (j & 1) ? (byte >> 4) : (byte & 0x0f);
+        out[g * 128 + blk * 32 + j] = float(int(q) - 8) * d;
+      }
+    }
+  }
 }
 
 struct ErrorStats {

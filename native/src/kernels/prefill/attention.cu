@@ -53,17 +53,42 @@ static_assert(sizeof(Smem<1>) <= 49152, "single-stage prefill attention must fit
 static_assert(offsetof(Smem<1>, v) == sizeof(Smem<1>::k), "Q staging spans k and v contiguously");
 static_assert(sizeof(Smem<1>::k) + sizeof(Smem<1>::v) >= BR * D * sizeof(uint16_t), "Q staging must fit k+v");
 
-template <bool FP8>
+// KV_FMT: 0 = BF16, 1 = FP8 E4M3, 2 = Q4_0 (per-32-element block, 576B/row)
+template <int KV_FMT>
 struct KvRegs {
-  static constexpr int N = FP8 ? 2 : 4;  // 16-byte loads per thread per matrix
+  static constexpr int N = KV_FMT == 1 ? 2 : (KV_FMT == 2 ? 1 : 4);  // 16-byte loads per thread per matrix
   uint4 k[N], v[N];
+  uint16_t ks, vs;  // Q4_0 FP16 block scales (unused for BF16/FP8)
   int kp;
 };
 
-template <bool FP8, bool EXPLICIT>
-__device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, KvRegs<FP8>& r) {
+template <int KV_FMT, bool EXPLICIT>
+__device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, KvRegs<KV_FMT>& r) {
   const int tid = threadIdx.x;
-  if constexpr (FP8) {
+  if constexpr (KV_FMT == 2) {
+    // 64 keys x 4 blocks/head = 256 threads: exactly one Q4_0 block (32 elems) per thread
+    const int row = tid >> 2, blk = tid & 3;
+    const int j = j0 + row;
+    if (j < p.L) {
+      const uint8_t* Krow;
+      const uint8_t* Vrow;
+      if (p.k_pages) {
+        const int mask = (1 << p.page_shift) - 1;
+        Krow = static_cast<const uint8_t*>(p.k_pages[j >> p.page_shift]) + size_t(j & mask) * kKvQ4RowBytes;
+        Vrow = static_cast<const uint8_t*>(p.v_pages[j >> p.page_shift]) + size_t(j & mask) * kKvQ4RowBytes;
+      } else {
+        Krow = static_cast<const uint8_t*>(p.k) + size_t(j) * kKvQ4RowBytes;
+        Vrow = static_cast<const uint8_t*>(p.v) + size_t(j) * kKvQ4RowBytes;
+      }
+      r.k[0] = __ldg(reinterpret_cast<const uint4*>(Krow + g * 64 + blk * 16));
+      r.v[0] = __ldg(reinterpret_cast<const uint4*>(Vrow + g * 64 + blk * 16));
+      r.ks = __ldg(reinterpret_cast<const uint16_t*>(Krow + kKvQ4NibbleBytes + g * 8 + blk * 2));
+      r.vs = __ldg(reinterpret_cast<const uint16_t*>(Vrow + kKvQ4NibbleBytes + g * 8 + blk * 2));
+    } else {
+      r.k[0] = r.v[0] = make_uint4(0, 0, 0, 0);
+      r.ks = r.vs = 0;
+    }
+  } else if constexpr (KV_FMT == 1) {
     const uint8_t* K = static_cast<const uint8_t*>(p.k);
     const uint8_t* V = static_cast<const uint8_t*>(p.v);
 #pragma unroll
@@ -116,10 +141,37 @@ __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint16_t u) {
 #endif
 }
 
-template <bool FP8, bool EXPLICIT, int STAGES>
-__device__ __forceinline__ void store_tile(Smem<STAGES>& s, int buf, const KvRegs<FP8>& r) {
+template <int KV_FMT, bool EXPLICIT, int STAGES>
+__device__ __forceinline__ void store_tile(Smem<STAGES>& s, int buf, const KvRegs<KV_FMT>& r) {
   const int tid = threadIdx.x;
-  if constexpr (FP8) {
+  if constexpr (KV_FMT == 2) {
+    const int row = tid >> 2, blk = tid & 3;
+    const float kd_raw = __half2float(__ushort_as_half(r.ks));
+    const float vd_raw = __half2float(__ushort_as_half(r.vs));
+    const float kd = isfinite(kd_raw) ? kd_raw : 0.f;
+    const float vd = isfinite(vd_raw) ? vd_raw : 0.f;
+    const float k_neg8d = -8.f * kd, v_neg8d = -8.f * vd;
+    const uint32_t kw[4] = {r.k[0].x, r.k[0].y, r.k[0].z, r.k[0].w};
+    const uint32_t vw[4] = {r.v[0].x, r.v[0].y, r.v[0].z, r.v[0].w};
+    auto safe_h2 = [](float a, float b) {
+      return pack_half2(fabsf(a) <= 65504.f ? a : 0.f, fabsf(b) <= 65504.f ? b : 0.f);
+    };
+#pragma unroll
+    for (int sub = 0; sub < 4; ++sub) {
+      const uint32_t ku = kw[sub], vu = vw[sub];
+      uint4 kout, vout;
+      kout.x = pack_bf16x2(fmaf(float(ku & 0xfu), kd, k_neg8d), fmaf(float((ku >> 4) & 0xfu), kd, k_neg8d));
+      kout.y = pack_bf16x2(fmaf(float((ku >> 8) & 0xfu), kd, k_neg8d), fmaf(float((ku >> 12) & 0xfu), kd, k_neg8d));
+      kout.z = pack_bf16x2(fmaf(float((ku >> 16) & 0xfu), kd, k_neg8d), fmaf(float((ku >> 20) & 0xfu), kd, k_neg8d));
+      kout.w = pack_bf16x2(fmaf(float((ku >> 24) & 0xfu), kd, k_neg8d), fmaf(float((ku >> 28) & 0xfu), kd, k_neg8d));
+      vout.x = safe_h2(fmaf(float(vu & 0xfu), vd, v_neg8d), fmaf(float((vu >> 4) & 0xfu), vd, v_neg8d));
+      vout.y = safe_h2(fmaf(float((vu >> 8) & 0xfu), vd, v_neg8d), fmaf(float((vu >> 12) & 0xfu), vd, v_neg8d));
+      vout.z = safe_h2(fmaf(float((vu >> 16) & 0xfu), vd, v_neg8d), fmaf(float((vu >> 20) & 0xfu), vd, v_neg8d));
+      vout.w = safe_h2(fmaf(float((vu >> 24) & 0xfu), vd, v_neg8d), fmaf(float((vu >> 28) & 0xfu), vd, v_neg8d));
+      *reinterpret_cast<uint4*>(&s.k[buf][swz<DCH>(row, 4 * blk + sub)]) = kout;
+      *reinterpret_cast<uint4*>(&s.v[buf][swz<DCH>(row, 4 * blk + sub)]) = vout;
+    }
+  } else if constexpr (KV_FMT == 1) {
 #pragma unroll
     for (int i = 0; i < r.N; ++i) {
       const int id = tid + i * NT, row = id >> 3, c = id & 7;
@@ -157,7 +209,7 @@ __device__ __forceinline__ void store_tile(Smem<STAGES>& s, int buf, const KvReg
   }
 }
 
-template <bool FP8, bool EXPLICIT, int STAGES>
+template <int KV_FMT, bool EXPLICIT, int STAGES>
 __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
   Smem<STAGES>& s = *reinterpret_cast<Smem<STAGES>*>(smem_raw);
@@ -207,8 +259,10 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
       s.nlist = n;
     }
   } else {
-    const int lo = p.window ? max(0, qmin - p.window + 1) : 0;
-    const int hi = min(qmax, p.L - 1);
+    const int lo_abs = p.window ? max(0, qmin - p.window + 1) : 0;
+    const int hi_abs = min(qmax, p.k_pos_base + p.L - 1);
+    const int lo = max(0, lo_abs - p.k_pos_base);
+    const int hi = hi_abs - p.k_pos_base;
     first = lo / BK;
     ntiles = hi >= lo ? hi / BK - first + 1 : 0;
   }
@@ -229,18 +283,36 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 #pragma unroll
   for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
   float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+  if (p.partial_o && !p.partial_init) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int R = R0 + warp * 16 + (lane >> 2) + r * 8;
+      if (R >= rows) continue;
+      const int t = R / GQA, h = g * GQA + R % GQA;
+      const size_t rh = size_t(t) * kHeads + h;
+      m[r] = p.partial_m[rh];
+      // Total row sum lives in partial_l[rh]; seed lane&3 == 0 so the 4-lane xor reduction stays exact.
+      l[r] = (lane & 3) == 0 ? p.partial_l[rh] : 0.f;
+#pragma unroll
+      for (int dt = 0; dt < D / 8; ++dt) {
+        const int col = dt * 8 + (lane & 3) * 2;
+        o[dt][2 * r] = p.partial_o[rh * D + col];
+        o[dt][2 * r + 1] = p.partial_o[rh * D + col + 1];
+      }
+    }
+  }
 
-  KvRegs<FP8> regs;
+  KvRegs<KV_FMT> regs;
   if (ntiles > 0) {
-    load_tile<FP8, EXPLICIT>(p, g, tile_at(0) * BK, regs);
-    store_tile<FP8, EXPLICIT>(s, 0, regs);
+    load_tile<KV_FMT, EXPLICIT>(p, g, tile_at(0) * BK, regs);
+    store_tile<KV_FMT, EXPLICIT>(s, 0, regs);
   }
   __syncthreads();
 
 #pragma unroll 1
   for (int i = 0; i < ntiles; ++i) {
     const int kt = tile_at(i), buf = STAGES == 2 ? (i & 1) : 0;
-    if (i + 1 < ntiles) load_tile<FP8, EXPLICIT>(p, g, tile_at(i + 1) * BK, regs);
+    if (i + 1 < ntiles) load_tile<KV_FMT, EXPLICIT>(p, g, tile_at(i + 1) * BK, regs);
 
     // tile class (uniform over the CTA)
     int kmin, kmax;
@@ -249,8 +321,8 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
       const int4 b = s.bounds[kt];
       kmin = b.x, kmax = b.y, allv = b.z != 0;
     } else {
-      kmin = kt * BK;
-      kmax = min(kt * BK + BK - 1, p.L - 1);
+      kmin = p.k_pos_base + kt * BK;
+      kmax = p.k_pos_base + min(kt * BK + BK - 1, p.L - 1);
       allv = kt * BK + BK <= p.L;
     }
     const int dmin = qmin - kmax, dmax = qmax - kmin;
@@ -280,7 +352,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     // stage the next tile now (its buffer was last read before the previous barrier): the conversion and the
     // shared stores overlap the Q.K^T MMAs in flight instead of trailing the P.V MMAs
     if constexpr (STAGES == 2) {
-      if (i + 1 < ntiles) store_tile<FP8, EXPLICIT>(s, buf ^ 1, regs);
+      if (i + 1 < ntiles) store_tile<KV_FMT, EXPLICIT>(s, buf ^ 1, regs);
     }
 
     // ---- scores (log2 units), bias, mask
@@ -292,9 +364,10 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
         const int r = e >> 1, jl = nt * 8 + (lane & 3) * 2 + (e & 1);
         float x = sc[nt][e] * kScale;
         if (need_mask || need_bias) {
-          const int kp = EXPLICIT ? s.kpos[buf][jl] : kt * BK + jl;
+          const int j_local = kt * BK + jl;
+          const int kp = EXPLICIT ? s.kpos[buf][jl] : (p.k_pos_base + j_local);
           const int d = qpos[r] - kp;
-          const bool ok = kp >= 0 && d >= 0 && (p.window == 0 || d < p.window) && (EXPLICIT || kp < p.L);
+          const bool ok = kp >= 0 && d >= 0 && (p.window == 0 || d < p.window) && (EXPLICIT || j_local < p.L);
           if (need_bias && ok && d < kRelExtent) x += bf2f(__ldg(relp[r] + d));
           x = ok ? x * kLog2e : -INFINITY;
         } else {
@@ -355,13 +428,36 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     __syncthreads();
     if constexpr (STAGES == 1) {
       if (i + 1 < ntiles) {
-        store_tile<FP8, EXPLICIT>(s, 0, regs);
+        store_tile<KV_FMT, EXPLICIT>(s, 0, regs);
         __syncthreads();
       }
     }
   }
 
-  // ---- epilogue
+  // ---- epilogue (or save online-softmax partials for next paged KV batch)
+  if (p.partial_o && !p.partial_final) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      float lr = l[r];
+      lr += __shfl_xor_sync(0xffffffffu, lr, 1);
+      lr += __shfl_xor_sync(0xffffffffu, lr, 2);
+      const int R = R0 + warp * 16 + (lane >> 2) + r * 8;
+      if (R >= rows) continue;
+      const int t = R / GQA, h = g * GQA + R % GQA;
+      const size_t rh = size_t(t) * kHeads + h;
+      if ((lane & 3) == 0) {
+        p.partial_m[rh] = m[r];
+        p.partial_l[rh] = lr;
+      }
+#pragma unroll
+      for (int dt = 0; dt < D / 8; ++dt) {
+        const int col = dt * 8 + (lane & 3) * 2;
+        p.partial_o[rh * D + col] = o[dt][2 * r];
+        p.partial_o[rh * D + col + 1] = o[dt][2 * r + 1];
+      }
+    }
+    return;
+  }
   const uint16_t* proj = reinterpret_cast<const uint16_t*>(p.proj);
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
@@ -388,17 +484,17 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   }
 }
 
-template <bool FP8, bool EXPLICIT>
+template <int KV_FMT, bool EXPLICIT>
 void launch(const AttnParams& p, cudaStream_t stream) {
   const dim3 grid((GQA * p.T + BR - 1) / BR, kKvHeads);
   if (current_max_smem_optin() >= int(sizeof(Smem<2>))) {
     static const cudaError_t attr = cudaFuncSetAttribute(
-        attn_kernel<FP8, EXPLICIT, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem<2>)));
+        attn_kernel<KV_FMT, EXPLICIT, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem<2>)));
     if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
-    attn_kernel<FP8, EXPLICIT, 2><<<grid, NT, sizeof(Smem<2>), stream>>>(p);
+    attn_kernel<KV_FMT, EXPLICIT, 2><<<grid, NT, sizeof(Smem<2>), stream>>>(p);
   } else {
     // Turing (64 KiB opt-in) and Pascal (48 KiB) use single-stage K/V SMEM (34,308 B <= 48 KiB).
-    attn_kernel<FP8, EXPLICIT, 1><<<grid, NT, sizeof(Smem<1>), stream>>>(p);
+    attn_kernel<KV_FMT, EXPLICIT, 1><<<grid, NT, sizeof(Smem<1>), stream>>>(p);
   }
 }
 
@@ -452,17 +548,24 @@ __global__ void bounds_kernel(const int* __restrict__ kpos, int L, int4* __restr
 }  // namespace
 
 void attention(const AttnParams& p, cudaStream_t stream) {
-  if (p.T <= 0 || p.L <= 0 || !p.q || !p.k || !p.v || !p.rel || !p.proj || !p.out)
+  const bool have_kv = (p.k && p.v) || (p.kv_q4 && p.k_pages && p.v_pages && p.page_shift > 0);
+  const bool have_out = p.partial_final ? (p.out != nullptr && p.proj != nullptr) : (p.partial_o && p.partial_m && p.partial_l);
+  if (p.T <= 0 || p.L <= 0 || !p.q || !have_kv || !p.rel || !have_out)
     throw std::invalid_argument("prefill attention: missing argument");
   const bool expl = p.kpos != nullptr;
   if (expl && (!p.bounds || (p.L + BK - 1) / BK > kAttnMaxTiles))
     throw std::invalid_argument("prefill attention: explicit keys need bounds and at most 64 tiles");
-  if (p.kv_fp8) {
-    if (expl) launch<true, true>(p, stream);
-    else launch<true, false>(p, stream);
+  if (p.kv_fp8 && p.kv_q4)
+    throw std::invalid_argument("prefill attention: kv_fp8 and kv_q4 are mutually exclusive");
+  if (p.kv_q4) {
+    if (expl) throw std::invalid_argument("prefill attention: kv_q4 is supported on full layers only");
+    launch<2, false>(p, stream);
+  } else if (p.kv_fp8) {
+    if (expl) launch<1, true>(p, stream);
+    else launch<1, false>(p, stream);
   } else {
-    if (expl) launch<false, true>(p, stream);
-    else launch<false, false>(p, stream);
+    if (expl) launch<0, true>(p, stream);
+    else launch<0, false>(p, stream);
   }
 }
 

@@ -32,7 +32,7 @@ std::vector<float> rand_f32(Rng& rng, size_t n, double scale, double offset = 0)
 
 double clipf(double sumsq, double thr) { return std::min(thr / (std::sqrt(sumsq) + 1e-6), 1.0); }
 
-bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
+bool test_attn_prep(Rng& rng, bool full, bool fp8, bool q4, int T, int pos0) {
   const int ld = full ? 8664 : 8600;
   const auto proj = rand_bf16(rng, size_t(T) * ld, 1.0);
   const auto q_scale = rand_f32(rng, HQ * D, 0.3, 1.0), r_scale = rand_f32(rng, HQ * 16, 0.3, 1.0);
@@ -46,7 +46,7 @@ bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
   p.q_scale = d_qs.get(), p.r_scale = d_rs.get(), p.k_w = d_kw.get(), p.v_w = d_vw.get();
   p.conv_k = d_ck.get(), p.conv_v = d_cv.get();
   p.q = reinterpret_cast<ingine::ActT*>(q.get()), p.rel = reinterpret_cast<ingine::ActT*>(rel.get());
-  p.k_out = kout.get(), p.v_out = vout.get(), p.out_fp8 = fp8;
+  p.k_out = kout.get(), p.v_out = vout.get(), p.out_fp8 = fp8, p.out_q4 = q4;
   pk::attn_prep(p, nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto gq = q.download(), grel = rel.download();
@@ -55,6 +55,7 @@ bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
 
   std::vector<float> got_q, got_r, got_k, got_v;
   std::vector<double> ref_q, ref_r, ref_k, ref_v;
+  std::vector<double> abs_k, abs_v;
   for (int t = 0; t < T; ++t) {
     const int pos = pos0 + t;
     const double tau = 1 + 0.1 * std::log(std::max((pos + 1) / 8192.0, 1.0));
@@ -81,6 +82,7 @@ bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
       const auto& st = kv ? conv_v : conv_k;
       const auto& w = kv ? vw : kw;
       auto in = [&](int s, int c) { return s >= 0 ? P(s, off + c) : double(st[(3 + s) * KV + c]); };
+      float bf16_row[KV];
       for (int g = 0; g < HK; ++g) {
         double y[D], ss = 0;
         for (int d = 0; d < D; ++d) {
@@ -97,10 +99,30 @@ bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
           ss += y[d] * y[d];
         }
         const double f = kv ? 1.0 / std::sqrt(ss / D + 1e-6) : clipf(ss, 22.627416997969522);
-        for (int d = 0; d < D; ++d) {
-          const size_t i = size_t(t) * KV + g * D + d;
-          const double r = rbf(y[d] * f);
-          const auto& gout = kv ? gv : gk;
+        for (int d = 0; d < D; ++d) bf16_row[g * D + d] = float(rbf(y[d] * f));
+      }
+      const auto& gout = kv ? gv : gk;
+      if (q4) {
+        uint8_t ref_bytes[kTestKvQ4RowBytes];
+        float ref_deq[KV], got_deq[KV];
+        q4_0_pack_row(bf16_row, ref_bytes, ref_deq);
+        q4_0_unpack_row(&gout[size_t(t) * kTestKvQ4RowBytes], got_deq);
+        for (int c = 0; c < KV; ++c) {
+          const int g = c / D, blk = (c % D) / 32;
+          uint16_t dh_bits = 0;
+          std::memcpy(&dh_bits, ref_bytes + kTestKvQ4NibBytes + g * 8 + blk * 2, 2);
+          __half dh;
+          std::memcpy(&dh, &dh_bits, 2);
+          const double step = std::fabs(double(__half2float(dh)));
+          (kv ? got_v : got_k).push_back(got_deq[c]);
+          (kv ? ref_v : ref_k).push_back(ref_deq[c]);
+          // allow rare 1-nibble boundary flip from 1-ULP rsqrtf/conv rounding
+          (kv ? abs_v : abs_k).push_back(step * 1.01 + 1e-4);
+        }
+      } else {
+        for (int c = 0; c < KV; ++c) {
+          const size_t i = size_t(t) * KV + c;
+          const double r = bf16_row[c];
           float got;
           double ref = r;
           if (fp8) {
@@ -115,14 +137,26 @@ bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
     }
   }
   char name[64];
-  std::snprintf(name, sizeof name, "attn_prep %s%s T=%d", full ? "full" : "sliding", fp8 ? " fp8" : "", T);
+  std::snprintf(name, sizeof name, "attn_prep %s%s T=%d", full ? "full" : "sliding", q4 ? " q4" : (fp8 ? " fp8" : ""), T);
   bool ok = true;
-  const double tol = fp8 ? 0.07 : 8e-3;  // one ulp of the output format (a rounding flip)
   std::string n = name;
   ok &= check_close((n + " q").c_str(), got_q, ref_q, 8e-3, 1e-6);
   ok &= check_close((n + " rel").c_str(), got_r, ref_r, 8e-3, 1e-6);
-  ok &= check_close((n + " k").c_str(), got_k, ref_k, tol, 1e-3);
-  ok &= check_close((n + " v").c_str(), got_v, ref_v, tol, 1e-3);
+  if (q4) {
+    ok &= check_close((n + " k").c_str(), got_k, ref_k, 1e-2, abs_k);
+    ok &= check_close((n + " v").c_str(), got_v, ref_v, 1e-2, abs_v);
+    size_t diff_k = 0, diff_v = 0;
+    for (size_t i = 0; i < got_k.size(); ++i) diff_k += std::fabs(double(got_k[i]) - ref_k[i]) > 1e-5;
+    for (size_t i = 0; i < got_v.size(); ++i) diff_v += std::fabs(double(got_v[i]) - ref_v[i]) > 1e-5;
+    const double fk = double(diff_k) / got_k.size(), fv = double(diff_v) / got_v.size();
+    const bool qok = fk <= 0.01 && fv <= 0.01;
+    std::printf("%s %s exact-match: k_diff=%.4f v_diff=%.4f\n", qok ? "PASS" : "FAIL", name, fk, fv);
+    ok &= qok;
+  } else {
+    const double tol = fp8 ? 0.07 : 8e-3;  // one ulp of the output format (a rounding flip)
+    ok &= check_close((n + " k").c_str(), got_k, ref_k, tol, 1e-3);
+    ok &= check_close((n + " v").c_str(), got_v, ref_v, tol, 1e-3);
+  }
   return ok;
 }
 
@@ -339,10 +373,11 @@ int main() {
   if (skip_without_gpu()) return kSkip;
   Rng rng(99);
   bool ok = true;
-  ok &= test_attn_prep(rng, false, false, 9, 0);
-  ok &= test_attn_prep(rng, false, false, 2, 37);
-  ok &= test_attn_prep(rng, true, false, 7, 9000);
-  ok &= test_attn_prep(rng, true, true, 7, 20000);
+  ok &= test_attn_prep(rng, false, false, false, 9, 0);
+  ok &= test_attn_prep(rng, false, false, false, 2, 37);
+  ok &= test_attn_prep(rng, true, false, false, 7, 9000);
+  ok &= test_attn_prep(rng, true, true, false, 7, 20000);
+  ok &= test_attn_prep(rng, true, false, true, 13, 20000);
   ok &= test_rel_logits(rng, 21);
   ok &= test_rel_logits(rng, 300);
   ok &= test_conv(rng, 2);
