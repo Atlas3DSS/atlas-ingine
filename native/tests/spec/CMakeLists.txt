@@ -11,6 +11,7 @@ ingine_add_test(NAME spec_sampling_fidelity SOURCES test_sampling_fidelity.cpp
 if(TARGET ingine_kernels_dense)
   ingine_add_test(NAME spec_drafter
                   SOURCES test_drafter.cpp ${PROJECT_SOURCE_DIR}/src/model/drafter.cpp
+                          ${PROJECT_SOURCE_DIR}/src/model/model_kernels.cu
                   LIBS ingine_kernels_draft ingine_kernels_dense ingine_core CUDA::cudart
                   GPU MODEL TIMEOUT 600)
 endif()
