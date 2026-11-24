@@ -71,8 +71,10 @@ All 100 Stanford KernelBench Level-2 tasks (`423217d9`, fixed deterministic perm
 | Stage & Memory Layout | Tasks | `iter1` Pass | `best5` Pass | `fast_1` (vs eager) | `fast_2` (>2× eager) | `fast_1` (vs compile) | Geomean Speedup (eager / compile) | Flagged |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | **Stage 1: `100×1` Bare** (no cross-task memory) | 100 | `10%` (`0.10`) | `38%` (`0.38`) | `36%` (`0.36`) | `11%` (`0.11`) | `31%` (`0.31`) | `1.77×` / `1.45×` | 1 |
-| **Stage 2a: `10×10` Live Continual** (verified winners) | 100 | `29%` (`0.29`) | **`74%`** (`0.74`) | **`68%`** (`0.68`) | **`39%`** (`0.39`) | **`59%`** (`0.59`) | `2.74×` / `1.92×` | 1 |
-| **Stage 2b: `10×10` Verified Ledger** (+ verified repairs) | 100 | **`38%`** (`0.38`, **3.8× bare**) | `62%` (`0.62`) | `58%` (`0.58`) | `29%` (`0.29`) | `50%` (`0.50`) | **`2.76×` / `1.93×`** | 2 |
+| **Stage 2a: `10×10` Live Continual** (verified winners) | 100 | `29%` (`0.29`) | `74%` (`0.74`) | `68%` (`0.68`) | `39%` (`0.39`) | `59%` (`0.59`) | `2.74×` / `1.92×` | 1 |
+| **Stage 2b: `10×10` Verified Ledger** (+ verified repairs) | 100 | `38%` (`0.38`, 3.8× bare) | `62%` (`0.62`) | `58%` (`0.58`) | `29%` (`0.29`) | `50%` (`0.50`) | `2.76×` / `1.93×` | 2 |
+| **Stage 3a: `1×100` Live Continual** (full 100-task chain) | 100 | **`49%`** (`0.49`, **4.9× bare**) | `80%` (`0.80`) | `76%` (`0.76`) | `40%` (`0.40`) | **`72%`** (`0.72`) | **`3.09×` / `2.12×`** | 3 |
+| **Stage 3b: `1×100` Verified Ledger** (full 100-task chain) | 100 | `44%` (`0.44`, 4.4× bare) | **`86%`** (`0.86`, **+48 pp**) | **`80%`** (`0.80`) | **`50%`** (`0.50`, **4.5× bare**) | **`72%`** (`0.72`) | `3.04×` / `2.06×` | 2 |
 
 - **Exploratory A100 DEV Paired Repair-Transfer (`#805`, NVIDIA A100-SXM4-40GB, `TORCH_CUDA_ARCH_LIST=8.0`, 0 infra errors):** Across 89 disjoint Level-2 targets (`58` Attempt-1 passes, `31` eligible failures forked symmetrically under `grade1` + independent `regrade`), Treatment recovered **`21 / 31`** (`67.74%`, Wilson 95% CI `[50.14%, 81.43%]`) vs Control **`19 / 31`** (`61.29%`, `[43.82%, 76.27%]`), with `4` Treatment-only wins vs `2` Control-only wins (exact two-sided McNemar `p = 0.6875`, exploratory; `14/17` vs `12/17` on retrieval hits; all `14` no-hit pairs produced identical code including `4` empty pairs).
 
