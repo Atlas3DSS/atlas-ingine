@@ -13,27 +13,29 @@ OUT_DIR="${OUT_DIR:-$REPO/results}"
 PORT="${PORT:-18491}"
 GIT_REV="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-# Resolve the ACTUAL CUDA device selected by CUDA_VISIBLE_DEVICES (index or UUID) — never blindly pick GPU 0.
+# Resolve the ACTUAL physical GPU that CUDA opens as logical device 0 via libcuda (no CUDA context created),
+# honoring CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER identically to the CUDA runtime.
 read -r GPU_UUID GPU_NAME < <(python3 - << 'EOF'
-import os, subprocess
-cvd = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
-sel = cvd.split(",")[0].strip() if cvd else "0"
-lines = subprocess.check_output(
-    ["nvidia-smi", "--query-gpu=index,uuid,name", "--format=csv,noheader"],
-    text=True,
-).splitlines()
-for line in lines:
-    parts = [p.strip() for p in line.split(",", 2)]
-    if len(parts) != 3:
-        continue
-    idx, uuid, name = parts
-    if sel == idx or sel == uuid or (sel.startswith("GPU-") and uuid.startswith(sel)):
-        print(uuid, name)
-        raise SystemExit(0)
-raise SystemExit(f"Could not resolve CUDA_VISIBLE_DEVICES={cvd!r} in nvidia-smi output")
+import ctypes
+
+lib = ctypes.CDLL("libcuda.so.1")
+if lib.cuInit(0) != 0:
+    raise SystemExit("cuInit(0) failed")
+dev = ctypes.c_int(0)
+if lib.cuDeviceGet(ctypes.byref(dev), 0) != 0:
+    raise SystemExit("cuDeviceGet(0) failed")
+uuid_bytes = (ctypes.c_ubyte * 16)()
+if lib.cuDeviceGetUuid(uuid_bytes, dev) != 0:
+    raise SystemExit("cuDeviceGetUuid failed")
+h = bytes(uuid_bytes).hex()
+uuid = f"GPU-{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+name_buf = ctypes.create_string_buffer(256)
+if lib.cuDeviceGetName(name_buf, 256, dev) != 0:
+    raise SystemExit("cuDeviceGetName failed")
+print(uuid, name_buf.value.decode("utf-8").strip())
 EOF
 )
-echo "Resolved CUDA device: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>} -> uuid=$GPU_UUID name=$GPU_NAME"
+echo "Resolved CUDA logical device 0: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>} -> uuid=$GPU_UUID name=$GPU_NAME"
 
 run_arm() {
   local mode="$1"

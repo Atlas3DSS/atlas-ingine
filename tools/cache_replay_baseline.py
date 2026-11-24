@@ -173,11 +173,19 @@ def validate_usage(res: dict[str, Any], label: str) -> tuple[str, int, int, int]
         raise RuntimeError(f"[{label}] response missing required 'usage' object (id={req_id})")
     prompt_tok = usage.get("prompt_tokens")
     comp_tok = usage.get("completion_tokens")
+    total_tok = usage.get("total_tokens")
     details = usage.get("prompt_tokens_details")
+    finish = res.get("finish_reason")
     if not isinstance(prompt_tok, int) or isinstance(prompt_tok, bool) or prompt_tok <= 0:
         raise RuntimeError(f"[{label}] invalid prompt_tokens={prompt_tok!r} (id={req_id})")
     if not isinstance(comp_tok, int) or isinstance(comp_tok, bool) or comp_tok < 0:
         raise RuntimeError(f"[{label}] invalid completion_tokens={comp_tok!r} (id={req_id})")
+    if not isinstance(total_tok, int) or isinstance(total_tok, bool) or total_tok != prompt_tok + comp_tok:
+        raise RuntimeError(
+            f"[{label}] invalid total_tokens={total_tok!r} != {prompt_tok}+{comp_tok} (id={req_id})"
+        )
+    if finish not in ("stop", "length", "tool_calls"):
+        raise RuntimeError(f"[{label}] invalid finish_reason={finish!r} (id={req_id})")
     if not isinstance(details, dict):
         raise RuntimeError(f"[{label}] missing usage.prompt_tokens_details (id={req_id})")
     cached_tok = details.get("cached_tokens")
@@ -191,6 +199,56 @@ def validate_usage(res: dict[str, Any], label: str) -> tuple[str, int, int, int]
             f"[{label}] invalid cached_tokens={cached_tok!r} for prompt_tokens={prompt_tok} (id={req_id})"
         )
     return req_id, prompt_tok, cached_tok, comp_tok
+
+
+def validate_joined_turn(
+    row: dict[str, Any], lrec: dict[str, Any] | None, trace_name: str, mode: str
+) -> None:
+    cid = row["request_id"]
+    if not lrec or not lrec.get("prefill_seen") or not lrec.get("done_seen"):
+        raise RuntimeError(f"[{trace_name}:{row['label']}] incomplete server log record for {cid}: {lrec!r}")
+    if lrec["log_prompt_tokens"] != row["prompt_tokens"]:
+        raise RuntimeError(
+            f"[{cid}] prompt_tokens mismatch: api={row['prompt_tokens']} log={lrec['log_prompt_tokens']}"
+        )
+    if lrec["log_cached_tokens"] != row["cached_tokens"] or lrec["prefill_reused_tokens"] != row["cached_tokens"]:
+        raise RuntimeError(
+            f"[{cid}] cached_tokens mismatch: api={row['cached_tokens']} "
+            f"log_done={lrec['log_cached_tokens']} log_prefill={lrec['prefill_reused_tokens']}"
+        )
+    expected_recomp = row["prompt_tokens"] - row["cached_tokens"]
+    if (
+        row["recomputed_tokens"] != expected_recomp
+        or lrec["prefill_recomputed_tokens"] != expected_recomp
+        or lrec["log_recomputed_tokens"] != expected_recomp
+    ):
+        raise RuntimeError(
+            f"[{cid}] recomputed_tokens mismatch: expected={expected_recomp} "
+            f"row={row['recomputed_tokens']} prefill={lrec['prefill_recomputed_tokens']} "
+            f"done={lrec['log_recomputed_tokens']}"
+        )
+    if lrec["log_completion_tokens"] != row["completion_tokens"]:
+        raise RuntimeError(
+            f"[{cid}] completion_tokens mismatch: api={row['completion_tokens']} log={lrec['log_completion_tokens']}"
+        )
+    if lrec["log_finish_reason"] != row["finish_reason"]:
+        raise RuntimeError(
+            f"[{cid}] finish_reason mismatch: api={row['finish_reason']!r} log={lrec['log_finish_reason']!r}"
+        )
+    if lrec["reuse"] != lrec["prefill_reuse"]:
+        raise RuntimeError(
+            f"[{cid}] reuse path mismatch: prefill={lrec['prefill_reuse']} done={lrec['reuse']}"
+        )
+    if lrec["prefill_restored_bytes"] != lrec["restored_bytes"]:
+        raise RuntimeError(
+            f"[{cid}] restored_bytes mismatch: prefill={lrec['prefill_restored_bytes']!r} "
+            f"done={lrec['restored_bytes']!r}"
+        )
+    if mode in ("b1-cold", "batch-cold") and (row["cached_tokens"] != 0 or lrec["reuse"] != "none"):
+        raise RuntimeError(
+            f"Cold control violation in {mode} at {trace_name}:{row['label']} ({cid}): "
+            f"cached_tokens={row['cached_tokens']}, reuse={lrec['reuse']}"
+        )
 
 
 def parse_server_log(log_path: Path) -> dict[str, dict[str, Any]]:
@@ -319,7 +377,6 @@ def main() -> int:
     # Allow spdlog flush, then enforce complete, unique, per-turn consistent server-log join.
     time.sleep(0.35)
     log_by_id = parse_server_log(args.server_log)
-    is_cold_control = args.mode in ("b1-cold", "batch-cold")
 
     for tr in trace_results:
         tot_prompt = tot_cached = tot_recomp = tot_comp = 0
@@ -330,28 +387,7 @@ def main() -> int:
         for row in tr["per_turn"]:
             cid = row["request_id"]
             lrec = log_by_id.get(cid)
-            if not lrec or not lrec.get("prefill_seen") or not lrec.get("done_seen"):
-                raise RuntimeError(
-                    f"[{tr['name']}:{row['label']}] incomplete server log record for {cid}: {lrec!r}"
-                )
-            if lrec["log_prompt_tokens"] != row["prompt_tokens"]:
-                raise RuntimeError(
-                    f"[{cid}] prompt_tokens mismatch: api={row['prompt_tokens']} log={lrec['log_prompt_tokens']}"
-                )
-            if lrec["log_cached_tokens"] != row["cached_tokens"] or lrec["prefill_reused_tokens"] != row["cached_tokens"]:
-                raise RuntimeError(
-                    f"[{cid}] cached_tokens mismatch: api={row['cached_tokens']} "
-                    f"log_done={lrec['log_cached_tokens']} log_prefill={lrec['prefill_reused_tokens']}"
-                )
-            if lrec["reuse"] != lrec["prefill_reuse"]:
-                raise RuntimeError(
-                    f"[{cid}] reuse path mismatch: prefill={lrec['prefill_reuse']} done={lrec['reuse']}"
-                )
-            if is_cold_control and (row["cached_tokens"] != 0 or lrec["reuse"] != "none"):
-                raise RuntimeError(
-                    f"Cold control violation in {args.mode} at {tr['name']}:{row['label']} ({cid}): "
-                    f"cached_tokens={row['cached_tokens']}, reuse={lrec['reuse']}"
-                )
+            validate_joined_turn(row, lrec, tr["name"], args.mode)
 
             row["reuse"] = lrec["reuse"]
             row["model_prefill_ms"] = lrec["model_prefill_ms"]
