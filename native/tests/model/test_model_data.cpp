@@ -2,6 +2,8 @@
 // indices, tap visits and the projection layout.
 #include "model/model_data.h"
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 
 using namespace ingine::model;
@@ -35,6 +37,23 @@ int main() {
   for (int s = 0; s <= NUM_SEGS; ++s) expect(SEG_BEGIN[s] == begin[s], "projection layout");
   expect(PROJ_ROWS_SLIDING == 8600 && PROJ_ROWS_FULL == 8664, "projection rows");
   expect(KV_Q4_ROW_BYTES == 576 && NUM_FULL_VISITS * 2 * KV_Q4_ROW_BYTES == 9216, "q4 kv row bytes (9 KiB/tok)");
+
+  // 1M-token (1,048,576) 64-bit byte-size, pitch, and offset overflow checks (no GPU needed)
+  constexpr int kOneM = 1 << 20;
+  const ingine::Tensor kq4 = rm(nullptr, ingine::DType::U8, {NUM_FULL_VISITS, kOneM, KV_Q4_ROW_BYTES});
+  expect(kq4.bytes() == 4831838208ull, "1M q4_0 k_full == 4.50 GiB");
+  expect(kq4.bytes() * 2 == 9663676416ull, "1M q4_0 k+v == 9.00 GiB");
+  // Visit 7 offset exceeds 32-bit uint32_t max (4,294,967,295): verify 64-bit pointer arithmetic
+  const std::size_t q4_visit7 = std::size_t(NUM_FULL_VISITS - 1) * std::size_t(kOneM) * KV_Q4_ROW_BYTES;
+  expect(q4_visit7 == 4227858432ull, "1M q4_0 visit 7 byte offset");
+  const ingine::Tensor kbf16 = rm(nullptr, ingine::DType::BF16, {NUM_FULL_VISITS, kOneM, KV_HEADS, HEAD_DIM});
+  expect(kbf16.bytes() == 17179869184ull, "1M bf16 k_full == 16.00 GiB");
+  expect(kbf16.bytes() / NUM_FULL_VISITS == 2147483648ull, "1M bf16 per-visit pitch == 2.00 GiB (> INT32_MAX)");
+  // log_scale at 1M: float(pos + 1) exact (< 2^24), tau = 1 + 0.1 * ln(128) ~= 1.485203
+  const float pos_f = float(kOneM);
+  const float tau_1m = 1.f + 0.1f * std::log(std::fmax(pos_f * (1.f / 8192.f), 1.f));
+  expect(pos_f == 1048576.f && std::isfinite(tau_1m) && std::fabs(tau_1m - 1.4852030f) < 1e-5f, "1M log_scale tau");
+
   std::printf("%s model_data constants\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }

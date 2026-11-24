@@ -260,7 +260,8 @@ int main(int argc, char** argv) {
       source << in.rdbuf();
       const std::vector<int32_t> once = tok.encode(source.str(), /*special=*/true);
       std::vector<int32_t> ids;
-      for (int i = 0; i < 1000 && int(ids.size()) < long_prompt; ++i) ids.insert(ids.end(), once.begin(), once.end());
+      ids.reserve(size_t(long_prompt) + once.size());
+      while (!once.empty() && int(ids.size()) < long_prompt) ids.insert(ids.end(), once.begin(), once.end());
       ids.resize(std::min<size_t>(ids.size(), size_t(long_prompt)));
       ingine::model::Sampling greedy;
       greedy.temperature = 0.0f;
