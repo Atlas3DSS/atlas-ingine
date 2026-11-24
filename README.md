@@ -41,7 +41,7 @@ Additional verified architecture, branch, and live-serving details:
 - **RTX 4090 (`sm_89`, 24 GB):** `atlas-12g` at 128K ctx with `--no-vision` uses **`17,776 MiB`**; live long-output serving with vision enabled at 64K ctx runs at **~257 tok/s**.
 - **Upstream RTX 5090 (`sm_120a`, 32 GB):** native `NVFP4+MXFP8` serves up to **262,144 tokens** of context in `24.4 GiB` (`490–560 tok/s` decode, `6,200–10,900 tok/s` prefill; see [Upstream RTX 5090 results](#upstream-rtx-5090-and-abliteration-results)).
 - **Verified feature branches on GitHub (built on `901d86e`):**
-  - `feat/kvq4-elastic-9g`: native EXL3/Escha sub-3-bit MoE (`10.71 GB` safetensors on disk; `11.38 GB` folder with vision + MTP drafter) + `--kv-q4` global Q4_0 KV cache + Q4_0 embed ported across `sm_60..sm_120a` (`48/48` `kernels_bitlock` PASS; `262,144` ctx in `11.64 GiB` VRAM at `112 tok/s` no-spec on RTX 3090; `368.5` chat / `394.7` code tok/s at `262K` ctx on RTX PRO 6000 Blackwell).
+  - `feat/kvq4-elastic-9g`: native EXL3/Escha sub-3-bit MoE (`10.08 GB` text LLM + `0.64 GB` vision shard + `0.64 GB` MTP drafter; `11.38 GB` full folder) + `--kv-q4` global Q4_0 KV cache + Q4_0 embed ported across `sm_60..sm_120a` (`48/48` `kernels_bitlock` PASS; `262,144` ctx in `11.64 GiB` VRAM at `112 tok/s` no-spec on RTX 3090; `368.5` chat / `394.7` code tok/s at `262K` ctx on RTX PRO 6000 Blackwell).
   - `feat/atlas-6g-homology`: decoupled 3-tier paging core (`native/src/core/paged_tier.{h,cpp}`) and homology-guided `--atlas-6g` MoE offloading running `atlas-10g` in **`5.90 GB` VRAM** (`6.89 GB` host RSS, `87.4%` VRAM hit rate, **`34.7` chat / `31.5` code tok/s** on RTX 3090, `100%` token-exact vs `uva`; live `ingine-serve --engine --atlas-6g` at `5,870 MiB` VRAM passes `verify_atlas_6g.py` `3/3`).
 
 ## What this fork adds over upstream `satellitedown/ingine`
@@ -157,10 +157,10 @@ and `mtp.safetensors` files):
 python3 tools/quantize_elastic_ingine.py \
   --src /path/to/Inkling-2-Mini \
   --dst /path/to/Inkling-2-Mini-atlas-12g \
-  --profile atlas-12g   # or atlas-10g
+  --profile atlas-12g   # or atlas-10g; add --no-vision (-0.64 GB), --no-mtp (-0.64 GB), or --text-only (-1.27 GB)
 ```
 
-Then pass `--model-dir /path/to/Inkling-2-Mini-atlas-12g` to `ingine-serve` (or set `INGINE_MODEL_DIR` in `~/.config/ingine/env`).
+Then pass `--model-dir /path/to/Inkling-2-Mini-atlas-12g` to `ingine-serve` (add `--no-vision` if exported with `--no-vision`/`--text-only`, or set `INGINE_MODEL_DIR` in `~/.config/ingine/env`).
 
 ## Service management (`ingine` CLI)
 
