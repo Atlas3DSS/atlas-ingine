@@ -32,11 +32,110 @@ __device__ __forceinline__ std::uint32_t ld_smem_u32(unsigned saddr) {
   return v;
 }
 
+__device__ __forceinline__ uint2 ld_smem_u64(unsigned saddr) {
+  uint2 v;
+  asm volatile("ld.shared.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "r"(saddr));
+  return v;
+}
+
 __device__ __forceinline__ std::uint16_t ld_smem_u16(unsigned saddr) {
   std::uint16_t v;
   asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(saddr));
   return v;
 }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+// Native Volta sm_70 HMMA.884 primitives: keep acc[8] across entire K-loops and eliminate
+// per-step accumulator reductions (and per-step input shuffles when A/B are loaded directly).
+__device__ __forceinline__ void sm70_mma_f16_direct(float (&acc)[8], unsigned ma0, unsigned ma1, unsigned na0,
+                                                    unsigned na1, unsigned mb0, unsigned mb1, unsigned nb0,
+                                                    unsigned nb1) {
+  asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+               "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+               : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3]),
+                 "+f"(acc[4]), "+f"(acc[5]), "+f"(acc[6]), "+f"(acc[7])
+               : "r"(ma0), "r"(ma1), "r"(mb0), "r"(mb1));
+  asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+               "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+               : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3]),
+                 "+f"(acc[4]), "+f"(acc[5]), "+f"(acc[6]), "+f"(acc[7])
+               : "r"(na0), "r"(na1), "r"(nb0), "r"(nb1));
+}
+
+__device__ __forceinline__ void sm70_permute_a(unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                               unsigned& ma0, unsigned& ma1, unsigned& na0, unsigned& na1) {
+  const int lane = threadIdx.x & 31;
+  const int qp = (lane >> 2) & 3;
+  const int idx = (lane & 3) | ((lane & 16) >> 2);
+  const int src0 = (idx << 2) | ((qp & 1) << 1);
+  const int src1 = src0 | 1;
+  const unsigned a0_s0 = __shfl_sync(0xffffffffu, a0, src0);
+  const unsigned a0_s1 = __shfl_sync(0xffffffffu, a0, src1);
+  const unsigned a1_s0 = __shfl_sync(0xffffffffu, a1, src0);
+  const unsigned a1_s1 = __shfl_sync(0xffffffffu, a1, src1);
+  ma0 = qp < 2 ? a0_s0 : a1_s0;
+  ma1 = qp < 2 ? a0_s1 : a1_s1;
+  const unsigned a2_s0 = __shfl_sync(0xffffffffu, a2, src0);
+  const unsigned a2_s1 = __shfl_sync(0xffffffffu, a2, src1);
+  const unsigned a3_s0 = __shfl_sync(0xffffffffu, a3, src0);
+  const unsigned a3_s1 = __shfl_sync(0xffffffffu, a3, src1);
+  na0 = qp < 2 ? a2_s0 : a3_s0;
+  na1 = qp < 2 ? a2_s1 : a3_s1;
+}
+
+__device__ __forceinline__ void sm70_mma_f16_acc(float (&acc)[8], unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                                 unsigned b0, unsigned b1) {
+  const int lane = threadIdx.x & 31;
+  const int qp = (lane >> 2) & 3;
+  const int idx = (lane & 3) | ((lane & 16) >> 2);
+  const int src0 = (idx << 2) | ((qp & 1) << 1);
+  const int src1 = src0 | 1;
+  unsigned ma0, ma1, na0, na1;
+  sm70_permute_a(a0, a1, a2, a3, ma0, ma1, na0, na1);
+  const unsigned mb0 = __shfl_sync(0xffffffffu, b0, src0);
+  const unsigned mb1 = __shfl_sync(0xffffffffu, b0, src1);
+  const unsigned nb0 = __shfl_sync(0xffffffffu, b1, src0);
+  const unsigned nb1 = __shfl_sync(0xffffffffu, b1, src1);
+  sm70_mma_f16_direct(acc, ma0, ma1, na0, na1, mb0, mb1, nb0, nb1);
+}
+
+__device__ __forceinline__ void sm70_reduce_acc8_to_d4(const float (&acc)[8], float (&d)[4]) {
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int qp = g & 3;
+  const float p0 = acc[0] + __shfl_xor_sync(0xffffffffu, acc[0], 4);
+  const float p1 = acc[1] + __shfl_xor_sync(0xffffffffu, acc[1], 4);
+  const float p2 = acc[2] + __shfl_xor_sync(0xffffffffu, acc[2], 4);
+  const float p3 = acc[3] + __shfl_xor_sync(0xffffffffu, acc[3], 4);
+  const float p4 = acc[4] + __shfl_xor_sync(0xffffffffu, acc[4], 4);
+  const float p5 = acc[5] + __shfl_xor_sync(0xffffffffu, acc[5], 4);
+  const float p6 = acc[6] + __shfl_xor_sync(0xffffffffu, acc[6], 4);
+  const float p7 = acc[7] + __shfl_xor_sync(0xffffffffu, acc[7], 4);
+  const bool odd_qp = (qp & 1) != 0;
+  const float s0 = odd_qp ? p4 : p0;
+  const float s1 = odd_qp ? p5 : p1;
+  const float s2 = odd_qp ? p6 : p2;
+  const float s3 = odd_qp ? p7 : p3;
+  const int owner_top = ((g & 4) << 2) | (t << 1) | (g & 1);
+  const int owner_bot = owner_top | 8;
+  const bool hi_row = (g & 2) != 0;
+
+  const float t0 = __shfl_sync(0xffffffffu, s0, owner_top);
+  const float t1 = __shfl_sync(0xffffffffu, s1, owner_top);
+  const float t2 = __shfl_sync(0xffffffffu, s2, owner_top);
+  const float t3 = __shfl_sync(0xffffffffu, s3, owner_top);
+  d[0] += hi_row ? t2 : t0;
+  d[1] += hi_row ? t3 : t1;
+
+  const float b0_f = __shfl_sync(0xffffffffu, s0, owner_bot);
+  const float b1_f = __shfl_sync(0xffffffffu, s1, owner_bot);
+  const float b2_f = __shfl_sync(0xffffffffu, s2, owner_bot);
+  const float b3_f = __shfl_sync(0xffffffffu, s3, owner_bot);
+  d[2] += hi_row ? b2_f : b0_f;
+  d[3] += hi_row ? b3_f : b1_f;
+}
+#endif
 
 // Drop-in replacement for ldmatrix.sync.aligned.m8n8.x4.shared.b16
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned saddr) {

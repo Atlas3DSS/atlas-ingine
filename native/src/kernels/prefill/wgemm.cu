@@ -88,6 +88,62 @@ __device__ __forceinline__ float softcap(float x, float cap) { return tanhf(x * 
 template <int MT, int TM, class After>
 __device__ __forceinline__ void mma_step(float (&acc)[TM / 16][2][4], const uint16_t* A,
                                          const unsigned (&b)[BK / 16][2][2], int lane, After&& after) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600 && INGINE_ACT_FP16 && !defined(INGINE_FORCE_SIMT_MMA)
+  // GP100 (sm_60) fast path: direct SMEM reads for A (0 shuffles) + hoisted B shuffles across MT
+  // + native full-rate packed __half2 (__hfma2, 2x FP32 throughput).
+  const int g = lane >> 2, c = lane & 3;
+#pragma unroll
+  for (int kk = 0; kk < BK / 16; ++kk) {
+    uint4 a_lo[MT][2], a_hi[MT][2];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      a_lo[mt][0] = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g, kk * 2));
+      a_lo[mt][1] = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g, kk * 2 + 1));
+      a_hi[mt][0] = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g + 8, kk * 2));
+      a_hi[mt][1] = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g + 8, kk * 2 + 1));
+    }
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+      const int bl0 = 4 * (2 * c), bl1 = 4 * (2 * c + 1);
+      __half2 b0[8], b1[8];
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const uint32_t l0 = __shfl_sync(0xffffffffu, b[kk][nt][0], bl0 + p);
+        const uint32_t l1 = __shfl_sync(0xffffffffu, b[kk][nt][1], bl0 + p);
+        const uint32_t r0 = __shfl_sync(0xffffffffu, b[kk][nt][0], bl1 + p);
+        const uint32_t r1 = __shfl_sync(0xffffffffu, b[kk][nt][1], bl1 + p);
+        b0[p] = *reinterpret_cast<const __half2*>(&l0);
+        b0[4 + p] = *reinterpret_cast<const __half2*>(&l1);
+        b1[p] = *reinterpret_cast<const __half2*>(&r0);
+        b1[4 + p] = *reinterpret_cast<const __half2*>(&r1);
+      }
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        const uint32_t al[8] = {a_lo[mt][0].x, a_lo[mt][0].y, a_lo[mt][0].z, a_lo[mt][0].w,
+                                a_lo[mt][1].x, a_lo[mt][1].y, a_lo[mt][1].z, a_lo[mt][1].w};
+        const uint32_t ah[8] = {a_hi[mt][0].x, a_hi[mt][0].y, a_hi[mt][0].z, a_hi[mt][0].w,
+                                a_hi[mt][1].x, a_hi[mt][1].y, a_hi[mt][1].z, a_hi[mt][1].w};
+        __half2 d0 = __float2half2_rn(0.f), d1 = d0, d2 = d0, d3 = d0;
+#pragma unroll
+        for (int p = 0; p < 8; ++p) {
+          const __half2 hal = *reinterpret_cast<const __half2*>(&al[p]);
+          const __half2 hah = *reinterpret_cast<const __half2*>(&ah[p]);
+          d0 = __hfma2(hal, b0[p], d0);
+          d1 = __hfma2(hal, b1[p], d1);
+          d2 = __hfma2(hah, b0[p], d2);
+          d3 = __hfma2(hah, b1[p], d3);
+        }
+        const float2 f0 = __half22float2(d0), f1 = __half22float2(d1);
+        const float2 f2 = __half22float2(d2), f3 = __half22float2(d3);
+        acc[mt][nt][0] += f0.x + f0.y;
+        acc[mt][nt][1] += f1.x + f1.y;
+        acc[mt][nt][2] += f2.x + f2.y;
+        acc[mt][nt][3] += f3.x + f3.y;
+      }
+    }
+    after(kk);
+  }
+#else
 #pragma unroll
   for (int kk = 0; kk < BK / 16; ++kk) {
     unsigned a[MT][4];
@@ -102,7 +158,32 @@ __device__ __forceinline__ void mma_step(float (&acc)[TM / 16][2][4], const uint
     }
     after(kk);
   }
+#endif
 }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+// Native Volta sm_70 HMMA.884 step: direct SMEM A-loads + direct Volta B-frags -> ZERO warp shuffles in K-loop!
+template <int MT, int TM, class DecodeB>
+__device__ __forceinline__ void mma_step_sm70(float (&acc_v)[TM / 16][2][8], const uint16_t* A, int lane,
+                                              DecodeB&& decode_b) {
+  const int qp = (lane >> 2) & 3;
+  const int idx = (lane & 3) | ((lane & 16) >> 2);
+  const int row_a = (qp >= 2 ? 8 : 0) + idx;
+  const int k_half = (qp & 1) * 4;
+#pragma unroll
+  for (int kk = 0; kk < BK / 16; ++kk) {
+    unsigned b[2][4];
+    decode_b(kk, b);
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      const uint2 a01 = mma::ld_smem_u64(smem_addr(A + swz<KCH>(mt * 16 + row_a, kk * 2) + k_half));
+      const uint2 a23 = mma::ld_smem_u64(smem_addr(A + swz<KCH>(mt * 16 + row_a, kk * 2 + 1) + k_half));
+      mma::sm70_mma_f16_direct(acc_v[mt][0], a01.x, a01.y, a23.x, a23.y, b[0][0], b[0][1], b[0][2], b[0][3]);
+      mma::sm70_mma_f16_direct(acc_v[mt][1], a01.x, a01.y, a23.x, a23.y, b[1][0], b[1][1], b[1][2], b[1][3]);
+    }
+  }
+}
+#endif
 
 // Up: A = x rows of the pairs' tokens (K = H), W = w13 (N = 2I), out act [pairs, I].
 // Down: A = act rows (K = I), W = w2 (N = H), out down [T * 8, H] at pair_dst.
@@ -247,6 +328,115 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
 
   // Software pipeline: step ks's MMAs run on fragments decoded during step ks - 1; the decoding of step ks + 1
   // is interleaved with them (its chunk has landed: R (WS - 1) >= AS, and the barrier published it).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+  // Native Volta sm_70 path: keep acc_v[TM/16][2][8] across entire K-loop, decode B directly into
+  // Volta HMMA.884 layout, load A directly from SMEM -> ZERO shuffles inside K-loop, 1 reduction at end!
+  float acc_v[TM / 16][2][8];
+#pragma unroll
+  for (int a = 0; a < TM / 16; ++a)
+#pragma unroll
+    for (int b = 0; b < 2; ++b)
+#pragma unroll
+      for (int v = 0; v < 8; ++v) acc_v[a][b][v] = 0.f;
+  const int v_idx = (lane & 3) | ((lane & 16) >> 2);
+  const int v_kh = ((lane >> 2) & 1) * 4;
+  auto scales_v = [&](int ks, float (&sc)[2][4]) {
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+      const int row = warp * 16 + nt * 8 + v_idx;
+      if constexpr (FMT != FMT_MXFP8) {
+        const uint32_t s4 = *reinterpret_cast<const uint32_t*>(sc_smem + row * C::SCALE_ROW + ks * 4);
+        const float2 lo = e4m3x2_to_float2(uint16_t(s4 & 0xffff)), hi = e4m3x2_to_float2(uint16_t(s4 >> 16));
+        sc[nt][0] = lo.x, sc[nt][1] = lo.y, sc[nt][2] = hi.x, sc[nt][3] = hi.y;
+      } else {
+        const uint8_t* ms = sc_smem + row * C::SCALE_ROW + ks * 2;
+        sc[nt][0] = sc[nt][1] = exp2f(float(ms[0]) - 127.f);
+        sc[nt][2] = sc[nt][3] = exp2f(float(ms[1]) - 127.f);
+      }
+    }
+  };
+#pragma unroll 1
+  for (int ks = 0; ks < KS; ++ks) {
+    cp_wait<C::AS_STG - 2>();
+    __syncthreads();
+    const int chunk = ks / C::R;
+    if (ks % C::R == 0 && chunk + C::WS - 1 < C::KC) load_w(chunk + C::WS - 1);
+    issue(ks + C::AS_STG - 1);
+    const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
+    const unsigned char* ws = w_smem + ((ks / C::R) % C::WS) * C::W_BYTES;
+    float sc[2][4];
+    scales_v(ks, sc);
+    auto decode_v = [&](int kk, unsigned (&b)[2][4]) {
+      const int kc = (ks % C::R) * BK + kk * 16;
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+        const int row = warp * 16 + nt * 8 + v_idx;
+        const float s = sc[nt][kk];
+        if constexpr (FMT == FMT_NVFP4) {
+          const uint2 wd = *reinterpret_cast<const uint2*>(ws + row * C::WSTRIDE + kc / 2);
+          const uint32_t m16 = wd.x >> (v_kh * 4);
+          const uint32_t n16 = wd.y >> (v_kh * 4);
+          const uint32_t b0 = m16 & 0xffu, b1 = (m16 >> 8) & 0xffu;
+          const uint32_t b2 = n16 & 0xffu, b3 = (n16 >> 8) & 0xffu;
+          b[nt][0] = pack_bf16x2((lut[b0 & 0xf] * s) * factor, (lut[b0 >> 4] * s) * factor);
+          b[nt][1] = pack_bf16x2((lut[b1 & 0xf] * s) * factor, (lut[b1 >> 4] * s) * factor);
+          b[nt][2] = pack_bf16x2((lut[b2 & 0xf] * s) * factor, (lut[b2 >> 4] * s) * factor);
+          b[nt][3] = pack_bf16x2((lut[b3 & 0xf] * s) * factor, (lut[b3 >> 4] * s) * factor);
+        } else if constexpr (FMT == FMT_MXFP8) {
+          const uint4 q = *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc);
+          const uint32_t wm = v_kh ? q.y : q.x;
+          const uint32_t wn = v_kh ? q.w : q.z;
+          const float2 f0 = e4m3x2_to_float2(uint16_t(wm & 0xffff)), f1 = e4m3x2_to_float2(uint16_t(wm >> 16));
+          const float2 f2 = e4m3x2_to_float2(uint16_t(wn & 0xffff)), f3 = e4m3x2_to_float2(uint16_t(wn >> 16));
+          b[nt][0] = pack_bf16x2(f0.x * s, f0.y * s);
+          b[nt][1] = pack_bf16x2(f1.x * s, f1.y * s);
+          b[nt][2] = pack_bf16x2(f2.x * s, f2.y * s);
+          b[nt][3] = pack_bf16x2(f3.x * s, f3.y * s);
+        } else if constexpr (FMT == FMT_ATLAS2) {
+          const uint32_t wd = *reinterpret_cast<const uint32_t*>(ws + row * C::WSTRIDE + kc / 4);
+          const uint32_t m8 = (wd >> (v_kh * 2)) & 0xffu;
+          const uint32_t n8 = (wd >> (16 + v_kh * 2)) & 0xffu;
+          b[nt][0] = pack_bf16x2((lut[m8 & 3u] * s) * factor, (lut[(m8 >> 2) & 3u] * s) * factor);
+          b[nt][1] = pack_bf16x2((lut[(m8 >> 4) & 3u] * s) * factor, (lut[(m8 >> 6) & 3u] * s) * factor);
+          b[nt][2] = pack_bf16x2((lut[n8 & 3u] * s) * factor, (lut[(n8 >> 2) & 3u] * s) * factor);
+          b[nt][3] = pack_bf16x2((lut[(n8 >> 4) & 3u] * s) * factor, (lut[(n8 >> 6) & 3u] * s) * factor);
+        } else {
+          const unsigned char* blk = ws + row * C::WSTRIDE + (kc / 32) * 12;
+          const int half = (kc >> 4) & 1;
+          const uint32_t lo = *reinterpret_cast<const uint32_t*>(blk + half * 4);
+          const uint16_t hi16 = *reinterpret_cast<const uint16_t*>(blk + 8 + half * 2);
+          const uint32_t mlo = (lo >> (v_kh * 2)) & 0xffu, mhi = (hi16 >> v_kh) & 0xfu;
+          const uint32_t nlo = (lo >> (16 + v_kh * 2)) & 0xffu, nhi = (hi16 >> (8 + v_kh)) & 0xfu;
+          b[nt][0] = pack_bf16x2((lut[(mlo & 3u) | ((mhi & 1u) << 2)] * s) * factor,
+                                 (lut[((mlo >> 2) & 3u) | (((mhi >> 1) & 1u) << 2)] * s) * factor);
+          b[nt][1] = pack_bf16x2((lut[((mlo >> 4) & 3u) | (((mhi >> 2) & 1u) << 2)] * s) * factor,
+                                 (lut[((mlo >> 6) & 3u) | (((mhi >> 3) & 1u) << 2)] * s) * factor);
+          b[nt][2] = pack_bf16x2((lut[(nlo & 3u) | ((nhi & 1u) << 2)] * s) * factor,
+                                 (lut[((nlo >> 2) & 3u) | (((nhi >> 1) & 1u) << 2)] * s) * factor);
+          b[nt][3] = pack_bf16x2((lut[((nlo >> 4) & 3u) | (((nhi >> 2) & 1u) << 2)] * s) * factor,
+                                 (lut[((nlo >> 6) & 3u) | (((nhi >> 3) & 1u) << 2)] * s) * factor);
+        }
+      }
+    };
+    switch (mact) {
+      case 1: if constexpr (1 <= TM / 16) mma_step_sm70<1, TM>(acc_v, A, lane, decode_v); break;
+      case 2: if constexpr (2 <= TM / 16) mma_step_sm70<2, TM>(acc_v, A, lane, decode_v); break;
+      case 3: if constexpr (3 <= TM / 16) mma_step_sm70<3, TM>(acc_v, A, lane, decode_v); break;
+      case 4: if constexpr (4 <= TM / 16) mma_step_sm70<4, TM>(acc_v, A, lane, decode_v); break;
+      case 5: if constexpr (5 <= TM / 16) mma_step_sm70<5, TM>(acc_v, A, lane, decode_v); break;
+      case 6: if constexpr (6 <= TM / 16) mma_step_sm70<6, TM>(acc_v, A, lane, decode_v); break;
+      case 7: if constexpr (7 <= TM / 16) mma_step_sm70<7, TM>(acc_v, A, lane, decode_v); break;
+      default: mma_step_sm70<TM / 16, TM>(acc_v, A, lane, decode_v); break;
+    }
+  }
+  cp_wait<0>();
+#pragma unroll
+  for (int mt = 0; mt < TM / 16; ++mt) {
+    if (mt >= mact) continue;
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) mma::sm70_reduce_acc8_to_d4(acc_v[mt][nt], acc[mt][nt]);
+  }
+#else
   unsigned bcur[BK / 16][2][2], bnext[BK / 16][2][2];
 #pragma unroll 1
   for (int ks = 0; ks < KS; ++ks) {
@@ -287,6 +477,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
       for (int nt = 0; nt < 2; ++nt) bcur[kk][nt][0] = bnext[kk][nt][0], bcur[kk][nt][1] = bnext[kk][nt][1];
   }
   cp_wait<0>();
+#endif
 
 #pragma unroll
   for (int mt = 0; mt < TM / 16; ++mt) {

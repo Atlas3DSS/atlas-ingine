@@ -921,6 +921,50 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             float a4[NPW][4];
 #pragma unroll
             for (int j = 0; j < NPW; ++j) a4[j][0] = a4[j][1] = a4[j][2] = a4[j][3] = 0.f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+            const int v_qp = (lane >> 2) & 3;
+            const int v_idx = (lane & 3) | ((lane & 16) >> 2);
+            const int v_row_a = (v_qp >= 2 ? 8 : 0) + v_idx;
+            const int v_kh = (v_qp & 1) * 4;
+            if (nn0 < NTN) {
+                float a4_v[NPW][8];
+#pragma unroll
+                for (int j = 0; j < NPW; ++j)
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) a4_v[j][v] = 0.f;
+#pragma unroll
+                for (int ks = 0; ks < D / 16; ++ks) {
+                    uint32_t af[4];
+                    const int key = km * 16 + v_row_a;
+                    if constexpr (KRAW) {
+                        const char* kr = kraw + key * D + ((ks ^ (key & 7)) * 16);
+                        const uint32_t u0 = *reinterpret_cast<const uint32_t*>(kr + v_kh);
+                        const uint32_t u1 = *reinterpret_cast<const uint32_t*>(kr + 8 + v_kh);
+                        af[0] = act::e4m3x2_to_half2_bits(u0);
+                        af[1] = act::e4m3x2_to_half2_bits(u0 >> 16);
+                        af[2] = act::e4m3x2_to_half2_bits(u1);
+                        af[3] = act::e4m3x2_to_half2_bits(u1 >> 16);
+                    } else {
+                        const uint2 k0 = mma::ld_smem_u64(smem_u32(kaddr(key, 2 * ks) + v_kh));
+                        const uint2 k1 = mma::ld_smem_u64(smem_u32(kaddr(key, 2 * ks + 1) + v_kh));
+                        af[0] = k0.x, af[1] = k0.y, af[2] = k1.x, af[3] = k1.y;
+                    }
+#pragma unroll
+                    for (int j = 0; j < NPW; ++j) {
+                        const int nn = nn0 + j * nstep;
+                        if (nn < NTN) {
+                            const int row = nn * 8 + v_idx;
+                            const uint2 q0 = mma::ld_smem_u64(smem_u32(qb + row * D + (((2 * ks) ^ (row & 7)) * 8) + v_kh));
+                            const uint2 q1 = mma::ld_smem_u64(smem_u32(qb + row * D + (((2 * ks + 1) ^ (row & 7)) * 8) + v_kh));
+                            mma::sm70_mma_f16_direct(a4_v[j], af[0], af[1], af[2], af[3], q0.x, q0.y, q1.x, q1.y);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NPW; ++j)
+                    if (nn0 + j * nstep < NTN) mma::sm70_reduce_acc8_to_d4(a4_v[j], a4[j]);
+            }
+#else
             if (nn0 < NTN) {
 #pragma unroll
                 for (int ks = 0; ks < D / 16; ++ks) {
@@ -957,6 +1001,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                     }
                 }
             }
+#endif
 #pragma unroll
             for (int jt = 0; jt < NPW; ++jt) {
                 const int nn = nn0 + jt * nstep, r0 = nn * 8 + 2 * t4;
@@ -1042,6 +1087,35 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 #pragma unroll
             for (int ks = 0; ks < KM; ++ks) {
                 if (ks >= nk) break;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+                const int d_ch = warp * 2 + (v_row_a >> 3), d_in = v_row_a & 7;
+                const int k0 = ks * 16 + v_kh;
+                const unsigned v0 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 0, d_ch) + d_in));
+                const unsigned v1 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 1, d_ch) + d_in));
+                const unsigned v2 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 2, d_ch) + d_in));
+                const unsigned v3 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 3, d_ch) + d_in));
+                const unsigned v8 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 8, d_ch) + d_in));
+                const unsigned v9 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 9, d_ch) + d_in));
+                const unsigned v10 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 10, d_ch) + d_in));
+                const unsigned v11 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 11, d_ch) + d_in));
+                const unsigned va0 = v0 | (v1 << 16), va1 = v2 | (v3 << 16);
+                const unsigned va2 = v8 | (v9 << 16), va3 = v10 | (v11 << 16);
+#pragma unroll
+                for (int n = 0; n < NTN; ++n) {
+                    float t8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    const __half* pr = ps + (n * 8 + v_idx) * PSTRIDE + ks * 16 + v_kh;
+                    const uint2 p0 = mma::ld_smem_u64(smem_u32(pr));
+                    const uint2 p1 = mma::ld_smem_u64(smem_u32(pr + 8));
+                    mma::sm70_mma_f16_direct(t8, va0, va1, va2, va3, p0.x, p0.y, p1.x, p1.y);
+                    const uint2 q0 = mma::ld_smem_u64(smem_u32(pr + NRP * PSTRIDE));
+                    const uint2 q1 = mma::ld_smem_u64(smem_u32(pr + NRP * PSTRIDE + 8));
+                    mma::sm70_mma_f16_direct(t8, va0, va1, va2, va3, q0.x, q0.y, q1.x, q1.y);
+                    float t[4] = {0.f, 0.f, 0.f, 0.f};
+                    mma::sm70_reduce_acc8_to_d4(t8, t);
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) oacc[n][v] = fmaf(f[ks][n][v & 1], t[v], oacc[n][v]);
+                }
+#else
                 uint32_t af[4];
                 {
                     const int q = lane >> 3, key = ks * 16 + (q >> 1) * 8 + (lane & 7);
@@ -1059,6 +1133,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 #pragma unroll
                     for (int v = 0; v < 4; ++v) oacc[n][v] = fmaf(f[ks][n][v & 1], t[v], oacc[n][v]);
                 }
+#endif
             }
         };
         auto nothing = [] {};

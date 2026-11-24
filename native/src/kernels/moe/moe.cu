@@ -388,6 +388,56 @@ __device__ __forceinline__ void load_w(Frag<FMT>& f, const uint8_t* codes, const
     f.factor = factor;
 }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+// Volta sm_70 direct HMMA.884 layout: lane (qp, idx) owns ONE row and TWO contiguous chunks c0, c0+1.
+template <int FMT>
+struct FragSm70 {
+    Chunk<FMT> r0, r1;
+    float factor;
+};
+
+template <int FMT>
+__device__ __forceinline__ void load_w_sm70(FragSm70<FMT>& f, const uint8_t* codes, const uint8_t* scales, int c0,
+                                            float factor, std::uint64_t pol) {
+    f.r0 = load_chunk<FMT>(codes, scales, c0, pol);
+    f.r1 = load_chunk<FMT>(codes, scales, c0 + 1, pol);
+    f.factor = factor;
+}
+
+__device__ __forceinline__ void load_x_chunk(const ActT* xrow, int c, uint32_t (&xv)[16]) {
+    if (xrow) {
+        const uint8_t* xp = reinterpret_cast<const uint8_t*>(xrow + 32 * c);
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            const uint4 q = ld_dep(xp + 16 * v);
+            xv[4 * v] = q.x, xv[4 * v + 1] = q.y, xv[4 * v + 2] = q.z, xv[4 * v + 3] = q.w;
+        }
+    } else {
+#pragma unroll
+        for (int v = 0; v < 16; ++v) xv[v] = 0;
+    }
+}
+
+template <int FMT>
+__device__ __forceinline__ void mma_frag_sm70(const FragSm70<FMT>& f, const ActT* xrow, int c0, float (&d)[4]) {
+    float acc8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    uint32_t a[16], xv[16];
+    decode(f.r0, f.factor, a);
+    load_x_chunk(xrow, c0, xv);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        mma::sm70_mma_f16_direct(acc8, a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3],
+                                 xv[4 * i], xv[4 * i + 1], xv[4 * i + 2], xv[4 * i + 3]);
+    decode(f.r1, f.factor, a);
+    load_x_chunk(xrow, c0 + 1, xv);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        mma::sm70_mma_f16_direct(acc8, a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3],
+                                 xv[4 * i], xv[4 * i + 1], xv[4 * i + 2], xv[4 * i + 3]);
+    mma::sm70_reduce_acc8_to_d4(acc8, d);
+}
+#endif
+
 // Activations: `xrow` is the lane's token activation row (K bf16) or nullptr (zero column).
 template <int FMT>
 __device__ __forceinline__ void load_x(Frag<FMT>& f, const ActT* xrow, int c) {
@@ -417,12 +467,72 @@ __device__ __forceinline__ void pdl_trigger() {
 }
 
 template <int FMT>
-__device__ __forceinline__ void mma_frag(const Frag<FMT>& f, float (&d)[4]) {
+__device__ __forceinline__ void mma_frag(const Frag<FMT>& f, float (&d)[4], uint64_t mask, int M) {
     uint32_t a[16], b[16];
     decode(f.r0, f.factor, a);
     decode(f.r1, f.factor, b);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+    // Hoist Volta HMMA.884 accumulator across all 8 steps -> 1 reduction instead of 8 (112 fewer shuffles/warp).
+    float acc8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        mma::sm70_mma_f16_acc(acc8, a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1], f.x[2 * i], f.x[2 * i + 1]);
+    mma::sm70_reduce_acc8_to_d4(acc8, d);
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+    // Pascal sm_60/sm_61 fast path: iterate ONLY over tokens that actually routed to this expert (1..2 vs 8),
+    // eliminating 32-shuffle SIMT MMA emulation and using native full-rate GP100 __hfma2 on sm_60.
+    const int t = threadIdx.x & 3;
+    for (int m = 0; m < M; ++m) {
+        if (((mask >> (8 * m)) & 0xffu) == 0u) continue;
+        const int src_lane = 4 * m + t;
+        float pa = 0.f, pb = 0.f;
+#if __CUDA_ARCH__ == 600 && INGINE_ACT_FP16 && !defined(INGINE_FORCE_SIMT_MMA)
+        __half2 ha0 = __float2half2_rn(0.f), ha1 = __float2half2_rn(0.f);
+        __half2 hb0 = __float2half2_rn(0.f), hb1 = __float2half2_rn(0.f);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t x0 = __shfl_sync(0xffffffffu, f.x[2 * i], src_lane);
+            const uint32_t x1 = __shfl_sync(0xffffffffu, f.x[2 * i + 1], src_lane);
+            const __half2 hx0 = *reinterpret_cast<const __half2*>(&x0);
+            const __half2 hx1 = *reinterpret_cast<const __half2*>(&x1);
+            ha0 = __hfma2(*reinterpret_cast<const __half2*>(&a[2 * i]), hx0, ha0);
+            ha1 = __hfma2(*reinterpret_cast<const __half2*>(&a[2 * i + 1]), hx1, ha1);
+            hb0 = __hfma2(*reinterpret_cast<const __half2*>(&b[2 * i]), hx0, hb0);
+            hb1 = __hfma2(*reinterpret_cast<const __half2*>(&b[2 * i + 1]), hx1, hb1);
+        }
+        const float2 fa0 = __half22float2(ha0), fa1 = __half22float2(ha1);
+        const float2 fb0 = __half22float2(hb0), fb1 = __half22float2(hb1);
+        pa = (fa0.x + fa0.y) + (fa1.x + fa1.y);
+        pb = (fb0.x + fb0.y) + (fb1.x + fb1.y);
+#else
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const uint32_t xv = __shfl_sync(0xffffffffu, f.x[i], src_lane);
+            const float2 fx = __half22float2(*reinterpret_cast<const __half2*>(&xv));
+            const float2 fa = __half22float2(*reinterpret_cast<const __half2*>(&a[i]));
+            const float2 fb = __half22float2(*reinterpret_cast<const __half2*>(&b[i]));
+            pa = fmaf(fa.x, fx.x, fmaf(fa.y, fx.y, pa));
+            pb = fmaf(fb.x, fx.x, fmaf(fb.y, fx.y, pb));
+        }
+#endif
+        pa += __shfl_xor_sync(0xffffffffu, pa, 1);
+        pa += __shfl_xor_sync(0xffffffffu, pa, 2);
+        pb += __shfl_xor_sync(0xffffffffu, pb, 1);
+        pb += __shfl_xor_sync(0xffffffffu, pb, 2);
+        if (m == 2 * t) {
+            d[0] += pa;
+            d[2] += pb;
+        } else if (m == 2 * t + 1) {
+            d[1] += pa;
+            d[3] += pb;
+        }
+    }
+#else
+    (void)mask;
+    (void)M;
 #pragma unroll
     for (int i = 0; i < 8; ++i) mma_bf16(d, a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1], f.x[2 * i], f.x[2 * i + 1]);
+#endif
 }
 
 // Slots 0..63 (token * 8 + k) whose expert equals e, from a warp-wide view of idx (lo = idx[lane],
@@ -459,14 +569,25 @@ moe_up_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, const uin
     const uint64_t mask = slot_mask(e, lo, hi);
     if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
 
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+    const int qp = (lane >> 2) & 3, idx_v = (lane & 3) | ((lane & 16) >> 2);
+    const int row_off = (qp >= 2 ? 8 : 0) + idx_v;
+    const int c0_v = 4 * warp + (qp & 1) * 2;
+    const size_t row = static_cast<size_t>(e) * R + tile * TILE + row_off;
+    const bool on = idx_v < M && ((mask >> (8 * idx_v)) & 0xffu);
+    FragSm70<FMT> f;
+    load_w_sm70<FMT>(f, w + row * CB, ws + row * SB, c0_v, FMT != 1 ? wfactor[e] : 1.f, l2::policy<WEIGHT_L2>());
+    mma_frag_sm70(f, on ? x + static_cast<size_t>(idx_v) * K : nullptr, c0_v, d);
+#else
     const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
     const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
     Frag<FMT> f;
     load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT != 1 ? wfactor[e] : 1.f,
                    l2::policy<WEIGHT_L2>());
     load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
-    float d[4] = {0.f, 0.f, 0.f, 0.f};
-    mma_frag(f, d);
+    mma_frag(f, d, mask, M);
+#endif
 
 #pragma unroll
     for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
@@ -545,11 +666,35 @@ moe_down_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const
 
     const int U = nuniq;
     const int p = warp / DOWN_GROUPS, c = 4 * (warp % DOWN_GROUPS) + t;
+    const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+    const int qp = (lane >> 2) & 3, idx_v = (lane & 3) | ((lane & 16) >> 2);
+    const int row_off = (qp >= 2 ? 8 : 0) + idx_v;
+    const int c0_v = 4 * (warp % DOWN_GROUPS) + (qp & 1) * 2;
+    auto xrow_v = [&](int u) -> const ActT* {
+        const uint32_t kmask = idx_v < M ? uint32_t(umask[u] >> (8 * idx_v)) & 0xffu : 0u;
+        return kmask ? act + (static_cast<size_t>(idx_v) * TOPK + (__ffs(kmask) - 1)) * K : nullptr;
+    };
+    auto load_v = [&](int u, FragSm70<FMT>& f) {
+        const int e = uexp[u];
+        const size_t row = static_cast<size_t>(e) * R + tile * TILE + row_off;
+        load_w_sm70<FMT>(f, w + row * CB, ws + row * SB, c0_v, FMT != 1 ? wfactor[e] : 1.f, wpol);
+    };
+    FragSm70<FMT> nxt;
+    if (p < U) load_v(p, nxt);
+    pdl_wait();
+#pragma unroll 1
+    for (int base = 0; base < U; base += DOWN_PAR) {
+        const FragSm70<FMT> cur = nxt;
+        const int u = base + p;
+        if (u + DOWN_PAR < U) load_v(u + DOWN_PAR, nxt);
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        if (u < U) mma_frag_sm70(cur, xrow_v(u), c0_v, d);
+#else
     auto xrow = [&](int u) -> const ActT* {
         const uint32_t kmask = g < M ? uint32_t(umask[u] >> (8 * g)) & 0xffu : 0u;
         return kmask ? act + (static_cast<size_t>(g) * TOPK + (__ffs(kmask) - 1)) * K : nullptr;
     };
-    const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
     auto load = [&](int u, Frag<FMT>& f) {
         const int e = uexp[u];
         const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
@@ -560,6 +705,16 @@ moe_down_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const
     Frag<FMT> nxt;
     if (p < U) load(p, nxt);
     pdl_wait();
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+    // On Pascal (96-reg launch bound), avoid holding both cur.x[16] and nxt.x[16] live across mma_frag.
+#pragma unroll 1
+    for (int base = 0; base < U; base += DOWN_PAR) {
+        const int u = base + p;
+        if (u < U) load_x(nxt, xrow(u), c);
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        if (u < U) mma_frag(nxt, d, umask[u], M);
+        if (u + DOWN_PAR < U) load(u + DOWN_PAR, nxt);
+#else
     if (p < U) load_x(nxt, xrow(p), c);
 #pragma unroll 1
     for (int base = 0; base < U; base += DOWN_PAR) {
@@ -567,7 +722,9 @@ moe_down_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const
         const int u = base + p;
         if (u + DOWN_PAR < U) load(u + DOWN_PAR, nxt), load_x(nxt, xrow(u + DOWN_PAR), c);  // next round
         float d[4] = {0.f, 0.f, 0.f, 0.f};
-        if (u < U) mma_frag(cur, d);
+        if (u < U) mma_frag(cur, d, umask[u], M);
+#endif
+#endif
 #pragma unroll
         for (int v = 0; v < 4; ++v) part[warp][lane][v] = d[v];
         __syncthreads();
