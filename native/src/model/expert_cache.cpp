@@ -685,6 +685,127 @@ void ExpertCache::prepare_decode(int l, const int* d_idx, int m, cudaStream_t co
   }
 }
 
+void ExpertCache::run_decode_layer(
+    int l, const int* d_idx, int m, cudaStream_t compute_stream,
+    const std::function<void(int tok_offset, int tok_count)>& launch_moe_slice) {
+  if (mode_ == OffloadMode::Uva && dump_router_stats_.empty()) {
+    launch_moe_slice(0, m);
+    return;
+  }
+
+  const int nslots = m * TOP_K;
+  CUDA_CHECK(cudaMemcpyAsync(host_idx_.data(), d_idx, std::size_t(nslots) * sizeof(int), cudaMemcpyDeviceToHost,
+                             compute_stream));
+  CUDA_CHECK(cudaEventRecord(idx_ready_, compute_stream));
+  CUDA_CHECK(cudaEventSynchronize(idx_ready_));
+
+  const auto* idx = static_cast<const int*>(host_idx_.data());
+  for (int i = 0; i < nslots; ++i) {
+    const int e = idx[i];
+    if (e >= 0 && e < EXPERTS) ++router_hits_[l][e];
+  }
+
+  if (mode_ == OffloadMode::Uva) {
+    std::uint64_t seen_lo = 0, seen_hi = 0;
+    for (int i = 0; i < nslots; ++i) {
+      const int e = idx[i];
+      if (e < 0 || e >= EXPERTS) continue;
+      const std::uint64_t bit = 1ull << (e & 63);
+      std::uint64_t& word = (e < 64) ? seen_lo : seen_hi;
+      if (word & bit) continue;
+      word |= bit;
+      if (meta_[l][e].tier == Tier::HotVram) ++stats_.hot_hits;
+      else ++stats_.warm_fetches;
+    }
+    launch_moe_slice(0, m);
+    return;
+  }
+
+  const int b = layer_slab_[l];
+  const int cap = slabs_[b].capacity();
+  const bool prio = is_loop_layer(l);
+  if (cap == 0) {
+    // All experts in this record-size bucket are HOT VRAM resident.
+    std::uint64_t seen_lo = 0, seen_hi = 0;
+    for (int i = 0; i < nslots; ++i) {
+      const int e = idx[i];
+      if (e < 0 || e >= EXPERTS) continue;
+      const std::uint64_t bit = 1ull << (e & 63);
+      std::uint64_t& word = (e < 64) ? seen_lo : seen_hi;
+      if (word & bit) continue;
+      word |= bit;
+      ++stats_.hot_hits;
+    }
+    if (tables_[l].dirty) {
+      flush_layer_table(l);
+      dma_.record_and_wait_on(compute_stream);
+    }
+    launch_moe_slice(0, m);
+    return;
+  }
+
+  int t0 = 0;
+  while (t0 < m) {
+    if (t0 > 0) CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+    std::uint64_t seen_lo = 0, seen_hi = 0;
+    std::array<int, 8 * TOP_K> slice_non_hot{};
+    int n_non_hot = 0;
+    int n_hot = 0;
+    int t1 = t0;
+    while (t1 < m) {
+      std::uint64_t cand_lo = seen_lo, cand_hi = seen_hi;
+      std::array<int, TOP_K> add_non_hot{};
+      int n_add_non_hot = 0;
+      int n_add_hot = 0;
+      for (int k = 0; k < TOP_K; ++k) {
+        const int e = idx[t1 * TOP_K + k];
+        if (e < 0 || e >= EXPERTS) continue;
+        const std::uint64_t bit = 1ull << (e & 63);
+        std::uint64_t& word = (e < 64) ? cand_lo : cand_hi;
+        if (word & bit) continue;
+        word |= bit;
+        if (meta_[l][e].tier == Tier::HotVram) {
+          ++n_add_hot;
+        } else {
+          add_non_hot[n_add_non_hot++] = e;
+        }
+      }
+      if (t1 > t0 && n_non_hot + n_add_non_hot > cap) break;
+      seen_lo = cand_lo;
+      seen_hi = cand_hi;
+      n_hot += n_add_hot;
+      for (int i = 0; i < n_add_non_hot; ++i) slice_non_hot[n_non_hot++] = add_non_hot[i];
+      ++t1;
+    }
+
+    stats_.hot_hits += std::uint64_t(n_hot);
+    const std::uint64_t gen = ++pin_gen_;
+    std::array<int, 8 * TOP_K> misses{};
+    int nmiss = 0;
+    for (int i = 0; i < n_non_hot; ++i) {
+      const int e = slice_non_hot[i];
+      if (slabs_[b].touch_and_pin(make_key(l, e), gen, prio) >= 0) {
+        ++stats_.lru_hits;
+      } else {
+        misses[nmiss++] = e;
+      }
+    }
+    bool need_wait = false;
+    for (int i = 0; i < nmiss; ++i) {
+      need_wait |= stage_expert(l, misses[i], gen);
+    }
+    if (tables_[l].dirty) {
+      flush_layer_table(l);
+      need_wait = true;
+    }
+    if (need_wait) {
+      dma_.record_and_wait_on(compute_stream);
+    }
+    launch_moe_slice(t0, t1 - t0);
+    t0 = t1;
+  }
+}
+
 void ExpertCache::run_prefill_layer(
     int l, const int* d_counts, cudaStream_t compute_stream,
     const std::function<void(const std::uint8_t* d_active_mask)>& launch_moe_pair) {

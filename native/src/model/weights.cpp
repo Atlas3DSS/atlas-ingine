@@ -509,9 +509,13 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     // Prefiller aliases Attention vs MLP scratch (including EXL3 scratch) in one phase arena (~269 KB/tok + 42 MiB).
     const std::size_t prefill_bytes =
         std::size_t(offload.prefill_chunk) * std::size_t(280) * 1024 + (std::size_t(48) << 20);
-    // DSpark drafter weights + shortlist + KV + prefill taps + verify buffers when --spec is active.
+    // DSpark drafter weights + shortlist + FP8 global KV ring (min(max_ctx, 65536) * 2 KiB) +
+    // verify buffers (widths 2/4/8) + prefill taps when --spec is active (measured ~1.09 GB at 64K/1024).
     const std::size_t spec_bytes =
-        offload.spec ? ((std::size_t(680) << 20) + std::size_t(offload.prefill_chunk) * std::size_t(18) * 1024) : 0;
+        offload.spec ? ((std::size_t(928) << 20) +
+                        std::size_t(std::min(offload.max_ctx, 65536)) * std::size_t(2048) +
+                        std::size_t(offload.prefill_chunk) * std::size_t(18) * 1024)
+                     : 0;
     const std::size_t runtime_headroom = std::size_t(384) << 20;
     const std::size_t fixed_bytes =
         non_expert_bytes + kv_ring_bytes + kv_full_bytes + checkpoint_bytes + prefill_bytes + spec_bytes + runtime_headroom;

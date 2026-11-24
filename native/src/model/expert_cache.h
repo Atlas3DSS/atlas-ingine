@@ -84,6 +84,13 @@ class ExpertCache {
 
   void prepare_decode(int l, const int* d_idx, int m, cudaStream_t compute_stream);
 
+  // Run MoE decode (up + down) for m tokens (1..8). Executes in a single batched launch [0, m) when all
+  // unique non-HOT experts fit in the layer's LRU slab; otherwise splits [0, m) into maximal contiguous token
+  // slices [tok_offset, tok_offset + tok_count) that fit so DSpark verify (M=2..8) stays bit-exact and
+  // deadlock-free under tight --atlas-6g VRAM budgets.
+  void run_decode_layer(int l, const int* d_idx, int m, cudaStream_t compute_stream,
+                        const std::function<void(int tok_offset, int tok_count)>& launch_moe_slice);
+
   void run_prefill_layer(int l, const int* d_counts, cudaStream_t compute_stream,
                          const std::function<void(const std::uint8_t* d_active_mask)>& launch_moe_pair);
 
