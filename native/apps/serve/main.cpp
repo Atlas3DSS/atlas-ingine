@@ -67,6 +67,7 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
+  int max_batch = 1, max_kv_tokens = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
@@ -104,6 +105,8 @@ int main(int argc, char** argv) {
   ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
   ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
+  ap.option("--max-batch", "", "max concurrent sequences for continuous batching (1 = single-request mode)", &max_batch);
+  ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity for --max-batch > 1 (0 = auto)", &max_kv_tokens);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
   ap.option("--log-level", "", "", &log_level);
@@ -149,6 +152,8 @@ int main(int argc, char** argv) {
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
       options.vision = !no_vision;
+      options.max_batch = max_batch;
+      options.max_kv_tokens = max_kv_tokens;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

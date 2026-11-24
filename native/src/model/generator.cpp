@@ -9,6 +9,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "kernels/head/head.h"
+#include "model/batch_engine.h"
 #include "model/drafter.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
@@ -538,10 +539,12 @@ class EngineGenerator final : public Generator {
 }  // namespace
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
+  if (options.max_batch > 1) return make_batch_generator(options);
   return std::make_unique<EngineGenerator>(options);
 }
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options, Weights weights, Ablation ablation) {
+  if (options.max_batch > 1) return make_batch_generator(options, std::move(weights), std::move(ablation));
   return std::make_unique<EngineGenerator>(options, std::move(weights), std::move(ablation));
 }
 
