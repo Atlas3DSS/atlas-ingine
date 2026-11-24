@@ -1,9 +1,4 @@
-// Volta (sm_70) Tensor Core MMA and ldmatrix compatibility primitives.
-//
-// Provides exact drop-in equivalents for the Ampere/Ada/Blackwell m16n8k16 MMA and Turing+ ldmatrix
-// instructions so all 6 tensor-core kernels (dense/gemv, moe/moe, attn/attn, draft/attention,
-// prefill/wgemm, prefill/attention) execute on native Volta HMMA.884 Tensor Cores (FP16 x FP16 -> FP32)
-// when compiled for __CUDA_ARCH__ < 800, while remaining 100% bit-identical on __CUDA_ARCH__ >= 800.
+// FP16 tensor-core and FP32 SIMT implementations of the shared MMA fragment layout.
 //
 // Fragment conventions match PTX mma.sync.aligned.m16n8k16.row.col.f32.{bf16,f16}.{bf16,f16}.f32:
 //   lane = 4 * g + t   (g = lane >> 2 in 0..7, t = lane & 3 in 0..3)
@@ -19,7 +14,7 @@
 //   QP1: Top 8x8 (rows 0..7),  k in {4..7, 12..15}
 //   QP2: Bot 8x8 (rows 8..15), k in {0..3,  8..11}
 //   QP3: Bot 8x8 (rows 8..15), k in {4..7, 12..15}
-// Two HMMA.884 instructions cover the entire 16x8x16 tile at 100% Tensor Core utilization.
+// Two m8n8k4 instructions cover the 16x8x16 tile.
 #pragma once
 
 #include "core/act.h"
@@ -105,7 +100,32 @@ __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned
 // D += A * B, m16n8k16, FP16 inputs, FP32 accumulation (native m16n8k16 on sm_80+, native HMMA.884 on sm_70).
 __device__ __forceinline__ void mma_f16(float (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                         unsigned b1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)
+  // SIMT seam for targets without tensor cores. Each lane owns two columns
+  // in two rows of the m16n8k16 tile; exchange the packed K pairs within the warp.
+  const int row = (threadIdx.x & 31) / 4;
+  const int col = (threadIdx.x & 3) * 2;
+#pragma unroll
+  for (int pair = 0; pair < 8; ++pair) {
+    const int a_lane = 4 * row + (pair & 3);
+    const int b_lane = 4 * col + (pair & 3);
+    const unsigned top = __shfl_sync(0xffffffffu, pair < 4 ? a0 : a2, a_lane);
+    const unsigned bottom = __shfl_sync(0xffffffffu, pair < 4 ? a1 : a3, a_lane);
+    const unsigned left = __shfl_sync(0xffffffffu, pair < 4 ? b0 : b1, b_lane);
+    const unsigned right = __shfl_sync(0xffffffffu, pair < 4 ? b0 : b1, b_lane + 4);
+#pragma unroll
+    for (int element = 0; element < 2; ++element) {
+      const float x0 = __half2float(__ushort_as_half(top >> (16 * element)));
+      const float x1 = __half2float(__ushort_as_half(bottom >> (16 * element)));
+      const float y0 = __half2float(__ushort_as_half(left >> (16 * element)));
+      const float y1 = __half2float(__ushort_as_half(right >> (16 * element)));
+      d[0] = fmaf(x0, y0, d[0]);
+      d[1] = fmaf(x0, y1, d[1]);
+      d[2] = fmaf(x1, y0, d[2]);
+      d[3] = fmaf(x1, y1, d[3]);
+    }
+  }
+#elif __CUDA_ARCH__ >= 800
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])

@@ -7,7 +7,7 @@
 // order). Invalid arguments throw std::invalid_argument.
 #pragma once
 
-#include <cuda_bf16.h>
+#include "core/act.h"
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -23,31 +23,31 @@ struct Matrix {
 
 // proj: multi-segment GEMV. xin bf16 [3, M, H]; segments int32 device [nseg, 3] = (row_begin, row_end,
 // input index); out fp32 [M, R] = bf16(w[r] . xin[seg(r).input, m]), R = w.rows.
-void proj(const __nv_bfloat16* xin, int M, Matrix w, const int* segments, int nseg, float* out, bool pdl,
+void proj(const ActT* xin, int M, Matrix w, const int* segments, int nseg, float* out, bool pdl,
           cudaStream_t stream);
 
 // proj_conv: attention output projection (w [H, 3072]) + post-attention conv with state update.
 // x bf16 [M, 3072]; conv_w fp32 [H, 4]; conv_state fp32 [3, H]; out fp32 [M, H]; conv_hist fp32 [M, H]
 // (BF16-rounded conv inputs, for speculative rollback) or nullptr.
-void proj_conv(const __nv_bfloat16* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,
+void proj_conv(const ActT* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,
                float* conv_hist, bool pdl, cudaStream_t stream);
 
 // head: out[m, v] = 30 tanh(bf16(w_v . x[m]) / 30), x bf16 [M, H], out fp32 [M, V], V = w.rows.
-void head(const __nv_bfloat16* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream);
+void head(const ActT* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream);
 
 // gemv: plain GEMV (drafter o_proj / down_proj). x bf16 [M, K] (row stride K), out fp32 [M, R] =
 // bf16(w[r] . x[m]), R = w.rows; K = 3072 or 9216; same PDL contract as proj.
-void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream);
+void gemv(const ActT* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream);
 
 // fp8_rows: bf16 [rows, K] -> float8_e4m3fn [rows, K] (q) + fp32 scale [rows] = amax / 448.
-void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream);
+void fp8_rows(const ActT* w, int rows, int K, void* q, float* scale, cudaStream_t stream);
 
 // dequant_rows: weights.dequant: out = bf16(float(q) * scale[row]) for FP8 rows [rows, K].
-void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream);
+void dequant_rows(const void* q, const float* scale, int rows, int K, ActT* out, cudaStream_t stream);
 
 // router: x bf16 [M, H]; w [128, H] fp32 (w_fp32) or bf16 holding BF16 values; bias fp32 [128];
 // idx int32 [M, 8] (descending score), wts fp32 [M, 8] = 8 s / (sum s + 1e-20).
-void router(const __nv_bfloat16* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
+void router(const ActT* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
             bool pdl, cudaStream_t stream);
 
 // mix: ablated residual update + attention residual over block states + RMS norm (KERNELS.md).
@@ -74,11 +74,11 @@ struct MixParams {
   const float* queries = nullptr;        // [Q, H]; null only for the layer-0 path (no blocks, Q = 1)
   int Q = 1;                             // 1..4
   const float* norm_w = nullptr;         // [Q, H], required with out_bf16
-  __nv_bfloat16* out_bf16 = nullptr;     // [Q, M, H] or null
+  ActT* out_bf16 = nullptr;     // [Q, M, H] or null
   float* out_f32 = nullptr;              // [Q, M, H] or null
-  __nv_bfloat16* new_bf16 = nullptr;     // bf16(new), row m at new_bf16 + m * new_bf16_stride, or null
+  ActT* new_bf16 = nullptr;     // bf16(new), row m at new_bf16 + m * new_bf16_stride, or null
   long long new_bf16_stride = 0;
-  __nv_bfloat16* out_copy = nullptr;     // Q == 1: copy of out_bf16, row m at out_copy + m * out_copy_stride
+  ActT* out_copy = nullptr;     // Q == 1: copy of out_bf16, row m at out_copy + m * out_copy_stride
   long long out_copy_stride = 0;
   MixRowCopy copies[2];
   int M = 1;
@@ -91,13 +91,13 @@ void mix_pair(const MixParams& p, const MixParams& msg, bool pdl, cudaStream_t s
 // message_gates (loop passes 1-2): h, msg fp32 [G, M, H] (G <= 3; h_shared: every gate reads h[0], i.e. h is
 // [M, H]); w_down bf16 [G, 64, 2H]; w_forget/w_gain [G, H, 64] fp32 (fg_fp32) or bf16; norm_w fp32 [G, H];
 // out_bf16 [G, M, H]; out_f32 [G, M, H] (gated, before the norm) or null.
-void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const __nv_bfloat16* w_down,
+void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const ActT* w_down,
                    const void* w_forget, const void* w_gain, bool fg_fp32, const float* norm_w,
-                   __nv_bfloat16* out_bf16, float* out_f32, bool pdl, cudaStream_t stream);
+                   ActT* out_bf16, float* out_f32, bool pdl, cudaStream_t stream);
 
 // embed: out[m] = float(bf16(rms_norm(float(table[token[m]])) * norm_w)), bit-exact with model.Model.embed.
 // token int64 [M] (device), table bf16 [V, H], norm_w fp32 [H], out fp32 [M, H].
-void embed(const std::int64_t* token, int M, const __nv_bfloat16* table, const float* norm_w, float* out,
+void embed(const std::int64_t* token, int M, const ActT* table, const float* norm_w, float* out,
            bool pdl, cudaStream_t stream);
 
 }  // namespace ingine::kernels::dense

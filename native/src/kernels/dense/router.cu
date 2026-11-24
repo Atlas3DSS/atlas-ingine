@@ -39,7 +39,7 @@ constexpr int EXPERTS = 128, TOPK = 8;
 constexpr l2::Evict WEIGHT_L2 = l2::Evict::none;
 
 template <int CL, bool WF32, int M>
-__global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bfloat16* __restrict__ x,
+__global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const ActT* __restrict__ x,
                                                                    const void* __restrict__ w,
                                                                    const float* __restrict__ bias,
                                                                    int* __restrict__ idx, float* __restrict__ wts,
@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   constexpr int RPC = EXPERTS / CL, NT = 32 * RPC;
   constexpr int EPC = WF32 ? 4 : 8;  // weights per 16-byte chunk
   constexpr int CH = H / (EPC * 32);
-  __shared__ __align__(16) __nv_bfloat16 xs[M][H];
+  __shared__ __align__(16) ActT xs[M][H];
   __shared__ __align__(16) float logits[EXPERTS];  // token `rank`'s logits (CTAs rank < M)
   __shared__ __align__(8) uint64_t mbar;           // completes when the 128 logits arrived
   __shared__ __align__(16) float part[M][RPC];     // this CTA's logits
@@ -172,7 +172,7 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
 }
 
 template <int CL, bool WF32>
-void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bias, int* idx, float* wts, bool pdl,
+void launch_router(int M, const ActT* x, const void* w, const float* bias, int* idx, float* wts, bool pdl,
                    cudaStream_t stream) {
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
@@ -193,13 +193,13 @@ void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bi
 }
 
 template <int CL, bool WF32, int M>
-__global__ void __launch_bounds__(32 * EXPERTS / CL) router_sm8x_dot_kernel(const __nv_bfloat16* __restrict__ x,
+__global__ void __launch_bounds__(32 * EXPERTS / CL) router_sm8x_dot_kernel(const ActT* __restrict__ x,
                                                                             const void* __restrict__ w,
                                                                             float* __restrict__ logits_out) {
   constexpr int RPC = EXPERTS / CL, NT = 32 * RPC;
   constexpr int EPC = WF32 ? 4 : 8;
   constexpr int CH = H / (EPC * 32);
-  __shared__ __align__(16) __nv_bfloat16 xs[M][H];
+  __shared__ __align__(16) ActT xs[M][H];
   const int rank = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int row = rank * RPC + warp;
@@ -298,7 +298,7 @@ __global__ void __launch_bounds__(NT) router_sm8x_select_kernel(const float* __r
 __device__ float g_router_sm8x_scratch[8 * EXPERTS];
 
 template <bool WF32>
-void launch_router_sm8x(int M, const __nv_bfloat16* x, const void* w, const float* bias, int* idx, float* wts,
+void launch_router_sm8x(int M, const ActT* x, const void* w, const float* bias, int* idx, float* wts,
                         cudaStream_t stream) {
   float* scratch = nullptr;
   CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&scratch), g_router_sm8x_scratch));
@@ -347,7 +347,7 @@ int router_cluster_size() {
 
 }  // namespace
 
-void router(const __nv_bfloat16* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
+void router(const ActT* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
             bool pdl, cudaStream_t stream) {
   require(x && w && bias && idx && wts, "router: null argument");
   if (current_sm_major() < 9) {

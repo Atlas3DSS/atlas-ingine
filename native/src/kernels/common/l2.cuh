@@ -36,6 +36,17 @@
 #endif
 #endif
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#undef INGINE_L2_HINTS
+#define INGINE_L2_HINTS 0
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#define INGINE_L1_NO_ALLOCATE ".L1::no_allocate"
+#else
+#define INGINE_L1_NO_ALLOCATE ""
+#endif
+
 namespace ingine::kernels::l2 {
 
 enum class Evict { none, first, normal, last };
@@ -62,11 +73,11 @@ template <Evict E>
 __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
   uint4 r;
   if constexpr (hinted<E>) {
-    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+    asm volatile("ld.global.nc" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
                  : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
                  : "l"(p), "l"(pol));
   } else {
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+    asm volatile("ld.global.nc" INGINE_L1_NO_ALLOCATE ".v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
                  : "l"(p));
   }

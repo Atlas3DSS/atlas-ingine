@@ -41,9 +41,9 @@ Bf16Gemm::Plan& Bf16Gemm::plan(int n, int N, int K) {
   const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
   lt_check(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)), "transa");
   lt_check(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)), "transb");
-  lt_check(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16BF, K, N, K), "layout w");
-  lt_check(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16BF, K, n, K), "layout a");
-  lt_check(cublasLtMatrixLayoutCreate(&p.c, CUDA_R_16BF, N, n, N), "layout c");
+  lt_check(cublasLtMatrixLayoutCreate(&p.a, kCublasActType, K, N, K), "layout w");
+  lt_check(cublasLtMatrixLayoutCreate(&p.b, kCublasActType, K, n, K), "layout a");
+  lt_check(cublasLtMatrixLayoutCreate(&p.c, kCublasActType, N, n, N), "layout c");
   cublasLtMatmulPreference_t pref = nullptr;
   lt_check(cublasLtMatmulPreferenceCreate(&pref), "preference");
   lt_check(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes_,
@@ -58,14 +58,14 @@ Bf16Gemm::Plan& Bf16Gemm::plan(int n, int N, int K) {
     cublasLtMatrixLayoutDestroy(p.b);
     cublasLtMatrixLayoutDestroy(p.c);
     cublasLtMatmulDescDestroy(p.op);
-    throw std::runtime_error("cuBLASLt: no BF16 algorithm for [" + std::to_string(n) + ", " + std::to_string(K) +
+    throw std::runtime_error("cuBLASLt: no activation-type algorithm for [" + std::to_string(n) + ", " + std::to_string(K) +
                              "] x [" + std::to_string(K) + ", " + std::to_string(N) + "]");
   }
   p.algo = result.algo;
   return plans_.emplace(key, p).first->second;
 }
 
-void Bf16Gemm::run(const __nv_bfloat16* a, int n, const __nv_bfloat16* w, int N, int K, __nv_bfloat16* c,
+void Bf16Gemm::run(const ActT* a, int n, const ActT* w, int N, int K, ActT* c,
                    cudaStream_t stream) {
   if (n <= 0) return;
   Plan& p = plan(n, N, K);

@@ -4,7 +4,7 @@
 // Always launched with programmatic dependent launch (as the Python binding does); graph capturable.
 #pragma once
 
-#include <cuda_bf16.h>
+#include "core/act.h"
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -32,7 +32,7 @@ struct DecodeArgs {
   bool log_scaling = false;         // full layers: q, rel *= tau(p)
   void* workspace = nullptr;        // workspace_bytes(M) bytes, zeroed once at allocation
   std::size_t workspace_size = 0;
-  __nv_bfloat16* out = nullptr;     // bf16 [M, 3072]
+  ActT* out = nullptr;     // bf16 [M, 3072]
 };
 
 // Bytes of workspace attn_decode needs for up to max_m tokens: a counter (zero the workspace once; the

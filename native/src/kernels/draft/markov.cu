@@ -45,7 +45,14 @@ struct TopkRowWs {
   TopkItem ties[TOPK_SLICES][CANDIDATES];
 };
 
-__device__ __forceinline__ uint32_t key16(float v) { return float_key(v) >> 16; }
+__device__ __forceinline__ uint32_t key16(float v) {
+#if INGINE_ACT_FP16
+  const unsigned bits = act::float_to_bits(v);
+  return bits ^ ((bits & 0x8000u) ? 0xffffu : 0x8000u);
+#else
+  return float_key(v) >> 16;
+#endif
+}
 
 __device__ __forceinline__ void slice_range(int V, int s, int& b, int& e) {
   const int per = (V + TOPK_SLICES - 1) / TOPK_SLICES;
@@ -231,12 +238,12 @@ constexpr int PRE_THREADS = 128;
 static_assert(PRE_CHUNKS % 32 == 0);
 
 // warp per output row, 7 vectors; the row's weights are loaded before the PDL wait
-__global__ void __launch_bounds__(PRE_THREADS) markov_pre_kernel(const __nv_bfloat16* __restrict__ rnn_w,
-                                                                 const __nv_bfloat16* h, const __nv_bfloat16* f_rnn,
+__global__ void __launch_bounds__(PRE_THREADS) markov_pre_kernel(const ActT* __restrict__ rnn_w,
+                                                                 const ActT* h, const ActT* f_rnn,
                                                                  float* part) {
   pdl_trigger();
   const int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-  const __nv_bfloat16* wr = rnn_w + size_t(row) * RNN_IN + 2 * RANK;
+  const ActT* wr = rnn_w + size_t(row) * RNN_IN + 2 * RANK;
   uint4 wv[PRE_PER_LANE];
 #pragma unroll
   for (int j = 0; j < PRE_PER_LANE; ++j) wv[j] = ld_weight(wr + 8 * (lane + 32 * j));
@@ -281,18 +288,18 @@ __device__ __forceinline__ int step_prev(int i, const unsigned long long* picks,
 }
 
 // warp per state element j (rows j, 256 + j, 512 + j of the projection); weights loaded before the wait
-__global__ void __launch_bounds__(256) markov_step_kernel(int i, const __nv_bfloat16* __restrict__ rnn_w,
-                                                          const __nv_bfloat16* __restrict__ rnn_b,
-                                                          const __nv_bfloat16* __restrict__ w1, const float* part,
+__global__ void __launch_bounds__(256) markov_step_kernel(int i, const ActT* __restrict__ rnn_w,
+                                                          const ActT* __restrict__ rnn_b,
+                                                          const ActT* __restrict__ w1, const float* part,
                                                           const unsigned long long* picks,
                                                           const std::int32_t* cand_idx, const DraftParams* p,
-                                                          __nv_bfloat16* state, __nv_bfloat16* latent) {
+                                                          ActT* state, ActT* latent) {
   pdl_trigger();
   const int j = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
   uint4 wa[3], wb[3];
 #pragma unroll
   for (int g = 0; g < 3; ++g) {
-    const __nv_bfloat16* wr = rnn_w + size_t(g * RANK + j) * RNN_IN;
+    const ActT* wr = rnn_w + size_t(g * RANK + j) * RNN_IN;
     wa[g] = ld_weight(wr + 8 * lane);
     wb[g] = ld_weight(wr + RANK + 8 * lane);
   }
@@ -322,16 +329,16 @@ __global__ void __launch_bounds__(256) markov_step_kernel(int i, const __nv_bflo
     const float gs = bf_round(__fmul_rn(gate, s));
     const float om = bf_round(__fsub_rn(1.f, gate));
     const float oc = bf_round(__fmul_rn(om, cell));
-    state[size_t(i + 1) * RANK + j] = __float2bfloat16_rn(__fadd_rn(gs, oc));
-    latent[j] = __float2bfloat16_rn(tanhf(raw[2]));
+    state[size_t(i + 1) * RANK + j] = act::from_float(__fadd_rn(gs, oc));
+    latent[j] = act::from_float(tanhf(raw[2]));
   }
 }
 
 // warp per candidate
-__global__ void __launch_bounds__(256) markov_logits_kernel(int i, const __nv_bfloat16* __restrict__ fold_w,
-                                                            const __nv_bfloat16* __restrict__ fold_b,
+__global__ void __launch_bounds__(256) markov_logits_kernel(int i, const ActT* __restrict__ fold_w,
+                                                            const ActT* __restrict__ fold_b,
                                                             const float* cand_val, const std::int32_t* cand_idx,
-                                                            const __nv_bfloat16* latent, const DraftParams* p,
+                                                            const ActT* latent, const DraftParams* p,
                                                             float* cand_logits, unsigned long long* picks) {
   pdl_trigger();
   pdl_wait();
@@ -439,21 +446,21 @@ void topk_candidates(const float* base, int rows, int V, const std::int32_t* map
   launch_pdl(topk_gather_kernel, dim3(rows), dim3(GATHER_THREADS), stream, w, map, cand_val, cand_idx);
 }
 
-void markov_pre(const __nv_bfloat16* rnn_w, const __nv_bfloat16* h, const __nv_bfloat16* f_rnn, float* part,
+void markov_pre(const ActT* rnn_w, const ActT* h, const ActT* f_rnn, float* part,
                 cudaStream_t stream) {
   launch_pdl(markov_pre_kernel, dim3(RNN_OUT * 32 / PRE_THREADS), dim3(PRE_THREADS), stream, rnn_w, h, f_rnn, part);
 }
 
-void markov_step(int i, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b, const __nv_bfloat16* w1,
+void markov_step(int i, const ActT* rnn_w, const ActT* rnn_b, const ActT* w1,
                  const float* part, const unsigned long long* picks, const std::int32_t* cand_idx,
-                 const DraftParams* p, __nv_bfloat16* state, __nv_bfloat16* latent, cudaStream_t stream) {
+                 const DraftParams* p, ActT* state, ActT* latent, cudaStream_t stream) {
   if (i < 0 || i >= GAMMA) throw std::invalid_argument("markov_step: step out of range");
   launch_pdl(markov_step_kernel, dim3(RANK * 32 / 256), dim3(256), stream, i, rnn_w, rnn_b, w1, part, picks,
              cand_idx, p, state, latent);
 }
 
-void markov_logits(int i, const __nv_bfloat16* fold_w, const __nv_bfloat16* fold_b, const float* cand_val,
-                   const std::int32_t* cand_idx, const __nv_bfloat16* latent, const DraftParams* p,
+void markov_logits(int i, const ActT* fold_w, const ActT* fold_b, const float* cand_val,
+                   const std::int32_t* cand_idx, const ActT* latent, const DraftParams* p,
                    float* cand_logits, unsigned long long* picks, cudaStream_t stream) {
   if (i < 0 || i >= GAMMA) throw std::invalid_argument("markov_logits: step out of range");
   launch_pdl(markov_logits_kernel, dim3(CANDIDATES * 32 / 256), dim3(256), stream, i, fold_w, fold_b, cand_val,

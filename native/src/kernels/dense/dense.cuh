@@ -4,7 +4,7 @@
 
 #include "kernels/common/copy.cuh"
 
-#include <cuda_bf16.h>
+#include "core/act.h"
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
@@ -37,8 +37,8 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
 #endif
 }
 
-__device__ __forceinline__ float bf_lo(uint32_t u) { return __uint_as_float(u << 16); }
-__device__ __forceinline__ float bf_hi(uint32_t u) { return __uint_as_float(u & 0xffff0000u); }
+__device__ __forceinline__ float bf_lo(uint32_t u) { return act::lo_f(u); }
+__device__ __forceinline__ float bf_hi(uint32_t u) { return act::hi_f(u); }
 
 // 8 BF16 values (one uint4) -> 8 floats.
 __device__ __forceinline__ void unpack_bf16x8(const uint4& v, float* f) {
@@ -76,7 +76,7 @@ __device__ __forceinline__ void unpack_e4m3x16(const uint4& v, float* f) {
   unpack_e4m3x4(v.x, f); unpack_e4m3x4(v.y, f + 4); unpack_e4m3x4(v.z, f + 8); unpack_e4m3x4(v.w, f + 12);
 }
 
-__device__ __forceinline__ float round_bf16(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+__device__ __forceinline__ float round_bf16(float x) { return act::round_act(x); }
 
 // Sum over groups of LANES consecutive lanes (LANES = 16 or 32); every lane of the group gets the sum. Only
 // the calling group's lanes take part, so the other half warp may have exited.

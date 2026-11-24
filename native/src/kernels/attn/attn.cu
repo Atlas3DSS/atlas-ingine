@@ -76,13 +76,14 @@
 // * Capturable: no allocation, no host sync, current stream; positions come from `pos` on the device.
 // * Positions are int32 on the device (row offsets 64-bit); the host caps full caches at 2^30 rows.
 // Ported from engine/csrc/attn/attn.cu (kernel bodies unchanged; torch launcher -> raw pointers).
+#include "kernels/common/mma_sm70.cuh"
 #include "kernels/attn/attn.h"
 
 #include "kernels/common/l2.cuh"
 
 #include "core/device.h"
 
-#include <cuda_bf16.h>
+#include "core/act.h"
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
@@ -169,34 +170,24 @@ struct Smem {
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return unsigned(__cvta_generic_to_shared(p)); }
 
 __device__ __forceinline__ void ldsm_x4(uint32_t addr, uint32_t (&r)[4]) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
+  mma::ldmatrix_x4(r[0], r[1], r[2], r[3], addr);
 }
 
 __device__ __forceinline__ void ldsm_x4_t(uint32_t addr, uint32_t (&r)[4]) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
+  mma::ldmatrix_x4_trans(r[0], r[1], r[2], r[3], addr);
 }
 
 __device__ __forceinline__ void ldsm_x2(uint32_t addr, uint32_t (&r)[2]) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
+  mma::ldmatrix_x2(r[0], r[1], addr);
 }
 
 // D += A (16x16, row) * B (16x8, col), fp32 accumulators
 __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%0,%1,%2,%3};"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+  mma::mma_act(d, a[0], a[1], a[2], a[3], b[0], b[1]);
 }
 
 __device__ __forceinline__ void mma_f16(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%0,%1,%2,%3};"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+  mma::mma_f16(d, a[0], a[1], a[2], a[3], b[0], b[1]);
 }
 
 struct Params {
@@ -211,19 +202,19 @@ struct Params {
     const float* v_conv;
     float* conv_k;
     float* conv_v;
-    void* k_cache;  // __nv_bfloat16, or E4M3 bytes (F8)
+    void* k_cache;  // ActT, or E4M3 bytes (F8)
     void* v_cache;
     long long* kpos;
     const long long* pos;
     int* counter;
     float* part;
-    __nv_bfloat16* saved_nkv;
+    ActT* saved_nkv;
     float* saved_nst;
-    __nv_bfloat16* out;
+    ActT* out;
     int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
 };
 
-__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+__device__ __forceinline__ float bf16r(float x) { return act::round_act(x); }
 
 __device__ __forceinline__ float hsum16(float x) {
 #pragma unroll
@@ -238,10 +229,7 @@ __device__ __forceinline__ float wsum(float x) {
 }
 
 __device__ __forceinline__ void unpack8(const uint4 u, float f[8]) {
-    f[0] = __uint_as_float(u.x << 16), f[1] = __uint_as_float(u.x & 0xffff0000u);
-    f[2] = __uint_as_float(u.y << 16), f[3] = __uint_as_float(u.y & 0xffff0000u);
-    f[4] = __uint_as_float(u.z << 16), f[5] = __uint_as_float(u.z & 0xffff0000u);
-    f[6] = __uint_as_float(u.w << 16), f[7] = __uint_as_float(u.w & 0xffff0000u);
+    act::unpack8(u, f);
 }
 
 // E4M3 pair (low byte = lower dim) to floats, exact (hw cvt.f16x2.e4m3x2 on SM89+, branchless ALU on SM86)
@@ -287,12 +275,12 @@ constexpr l2::Evict KV_L2 = l2::Evict::first;
 __device__ __forceinline__ uint4 ld_kv(const void* ptr, std::uint64_t pol) {
     uint4 v;
     if constexpr (l2::hinted<KV_L2>)
-        asm volatile("ld.global.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+        asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
                      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                      : "l"(ptr), "l"(pol)
                      : "memory");
     else
-        asm volatile("ld.global.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+        asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".v4.u32 {%0,%1,%2,%3}, [%4];"
                      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                      : "l"(ptr)
                      : "memory");
@@ -302,12 +290,12 @@ __device__ __forceinline__ uint4 ld_kv(const void* ptr, std::uint64_t pol) {
 __device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
     uint2 v;
     if constexpr (l2::hinted<KV_L2>)
-        asm volatile("ld.global.L1::no_allocate.L2::cache_hint.v2.u32 {%0,%1}, [%2], %3;"
+        asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.v2.u32 {%0,%1}, [%2], %3;"
                      : "=r"(v.x), "=r"(v.y)
                      : "l"(ptr), "l"(pol)
                      : "memory");
     else
-        asm volatile("ld.global.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
+        asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
     return v;
 }
 
@@ -364,8 +352,7 @@ __device__ __forceinline__ void cp4z(float* dst, const float* src, bool ok) {
 }
 
 __device__ __forceinline__ uint32_t pack2(float a, float b) {
-    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
-    return *reinterpret_cast<const uint32_t*>(&v);
+    return act::pack2(a, b);
 }
 
 // clip factor min(1, t / (sqrt(ss) + 1e-6)) without the IEEE sqrt / div slow-path branches (which
@@ -386,12 +373,12 @@ struct Buf {
 template <int M, bool FULL, bool F8, bool SPLIT = false>
 __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
     static_assert(FULL || !F8, "FP8 caches are full-layer only");
-    using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
+    using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;  // cache element
     using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
     using L = Smem<M, F8>;
     extern __shared__ __align__(16) float sm[];
-    __nv_bfloat16(*s_nkv)[M][D] = reinterpret_cast<__nv_bfloat16(*)[M][D]>(sm + L::NKV);
+    ActT(*s_nkv)[M][D] = reinterpret_cast<ActT(*)[M][D]>(sm + L::NKV);
 
     const int g = blockIdx.y, rank = blockIdx.x;  // cluster = the 16 blocks of KV head g; rank = blockIdx.x
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, half = lane >> 4, c = lane & 15;
@@ -460,8 +447,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // ---- M > 1 key tiles: constants, layout and the cp.async issue of one tile (used by the M > 1 path)
     constexpr int KT = L::KT, NE = KT + M - 1, NRP = L::NRP, NTN = NRP / 8, KM = KT / 16;
     constexpr int PSTRIDE = L::PSTRIDE;
-    __nv_bfloat16* kvs = reinterpret_cast<__nv_bfloat16*>(sm + L::KVS);
-    const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(sm + L::QB);
+    ActT* kvs = reinterpret_cast<ActT*>(sm + L::KVS);
+    const ActT* qb = reinterpret_cast<const ActT*>(sm + L::QB);
     int* kps = reinterpret_cast<int*>(sm + L::KPS);
     float* srp = sm + L::SRP;
     __half* ps = reinterpret_cast<__half*>(sm + L::PS);
@@ -624,7 +611,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 if (p.log_scaling) x[e] = bf16r(x[e] * tau);
             }
             if (rq < ROWS) {  // exact bf16 q for the tensor cores (scale applied to the scores)
-                __nv_bfloat16* qb = reinterpret_cast<__nv_bfloat16*>(sm + L::QB);
+                ActT* qb = reinterpret_cast<ActT*>(sm + L::QB);
                 reinterpret_cast<uint2*>(qb + row * D + (((lane >> 1) ^ (row & 7)) * 8) + (lane & 1) * 4)[0] =
                     make_uint2(pack2(x[0], x[1]), pack2(x[2], x[3]));
             }
@@ -867,7 +854,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             const __half2 h = __floats2half2_rn(a, b);
             return *reinterpret_cast<const uint32_t*>(&h);
         };
-        auto to_half = [&](uint32_t w) { return half2_of(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u)); };
+        auto to_half = [&](uint32_t w) { return half2_of(act::lo_f(w), act::hi_f(w)); };
         // V rows of stage st to fp16: each thread converts the chunks it copied (its cp.async are done)
         auto convert_v = [&](const int st) {
             for (int i = tid; i < KT * 2 * (D / 8); i += NT) {
@@ -1088,7 +1075,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             }
             __syncthreads();
             if constexpr (F8)
-                consume([&](int key, int ch) { return reinterpret_cast<const __nv_bfloat16*>(wv + 32 * D + roff(key, ch)); },
+                consume([&](int key, int ch) { return reinterpret_cast<const ActT*>(wv + 32 * D + roff(key, ch)); },
                         [&](int key, int ch) { return wv + roff(key, ch); }, SmemK{}, nullptr, 0, 0, true, nothing);
             else
                 consume([&](int key, int ch) { return kvs + kv_off(1, key, 0, ch); },
@@ -1138,7 +1125,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
     if constexpr (SPLIT) {
         if (owner) {
-            __nv_bfloat16* dst_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
+            ActT* dst_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
             for (int idx = tid; idx < 2 * M * 16; idx += NT) {
                 const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
                 reinterpret_cast<uint4*>(dst_nkv + (kv * M + m) * D)[c8] =
@@ -1185,7 +1172,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             a += o[q] * f;
         }
         const float gate = 1.f / (1.f + expf(-sm[L::GATE + tid]));
-        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
+        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = act::from_float(bf16r(a / l) * gate);
     }
 
     // owner: the global writes, at the end so they delay nothing (and, for M > 1 on a ring, because the
@@ -1215,7 +1202,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 
 template <int M, bool FULL, bool F8>
 __global__ void __launch_bounds__(NT) attn_decode_stage2_kernel(const Params p) {
-    using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;
+    using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
     constexpr int ROWS = GQA * M;
     const int g = blockIdx.y, rank = blockIdx.x, tid = threadIdx.x;
     const bool owner = rank == 0;
@@ -1246,13 +1233,13 @@ __global__ void __launch_bounds__(NT) attn_decode_stage2_kernel(const Params p) 
         }
         const float gate_raw = p.proj[size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + dim];
         const float gate = 1.f / (1.f + expf(-gate_raw));
-        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
+        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = act::from_float(bf16r(a / l) * gate);
     }
 
     if (owner) {
         CT* const kc = static_cast<CT*>(p.k_cache);
         CT* const vc = static_cast<CT*>(p.v_cache);
-        const __nv_bfloat16* src_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
+        const ActT* src_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
         for (int idx = tid; idx < 2 * M * 16; idx += NT) {
             const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
             const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
@@ -1396,7 +1383,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.pos = reinterpret_cast<const long long*>(a.pos);
     p.counter = static_cast<int*>(a.workspace);
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
-    p.saved_nkv = reinterpret_cast<__nv_bfloat16*>(static_cast<char*>(a.workspace) + ws_nkv_off(M));
+    p.saved_nkv = reinterpret_cast<ActT*>(static_cast<char*>(a.workspace) + ws_nkv_off(M));
     p.saved_nst = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + ws_nst_off(M));
     p.out = a.out;
     const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);

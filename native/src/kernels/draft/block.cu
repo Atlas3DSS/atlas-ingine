@@ -22,13 +22,7 @@ static_assert(H % 8 == 0 && ROW_THREADS % 32 == 0);
 
 // 8 floats -> 8 BF16 (one uint4), round to nearest.
 __device__ __forceinline__ uint4 pack8(const float* f) {
-  uint32_t w[4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const __nv_bfloat162 b = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
-    w[i] = *reinterpret_cast<const uint32_t*>(&b);
-  }
-  return make_uint4(w[0], w[1], w[2], w[3]);
+  return act::pack8(f);
 }
 
 // rsqrt(mean(x^2) + eps) over the CTA's row (dspark.rms), from this thread's 8 values.
@@ -51,7 +45,7 @@ __device__ __forceinline__ uint4 rms_norm(const float (&x)[8], const uint4& wv, 
 }
 
 // mix_rmsnorm of this thread's 8 columns of one feats row [4, H]: m = sum_j f[j] * a[j], bf16(rms(m) * w).
-__device__ __forceinline__ uint4 mix_row(const __nv_bfloat16* f, int c, const float (&a)[4], const uint4& wv,
+__device__ __forceinline__ uint4 mix_row(const ActT* f, int c, const float (&a)[4], const uint4& wv,
                                          float* scratch) {
   uint4 fv[4];
 #pragma unroll
@@ -68,7 +62,7 @@ __device__ __forceinline__ uint4 mix_row(const __nv_bfloat16* f, int c, const fl
 }
 
 // alpha row `part` of bf16 [4, 4] as floats, loaded before a PDL wait (16-byte load of two rows).
-__device__ __forceinline__ void load_alpha(const __nv_bfloat16* alpha, int part, float (&a)[4]) {
+__device__ __forceinline__ void load_alpha(const ActT* alpha, int part, float (&a)[4]) {
   const uint4 v = ld_weight(alpha + 8 * (part >> 1));
   float f[8];
   unpack8(v, f);
@@ -89,7 +83,7 @@ __global__ void set_seed_kernel(DraftParams* p, std::uint64_t seed) {
   p->seed = seed;
   p->draws = 0;
 }
-__global__ void set_commit_kernel(DraftParams* p, const __nv_bfloat16* feats, int n, int start) {
+__global__ void set_commit_kernel(DraftParams* p, const ActT* feats, int n, int start) {
   p->commit_feats = feats;
   p->ncommit = n;
   p->start = start;
@@ -97,10 +91,10 @@ __global__ void set_commit_kernel(DraftParams* p, const __nv_bfloat16* feats, in
 
 // ---- context -------------------------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(ROW_THREADS) mix_rmsnorm_kernel(const __nv_bfloat16* feats,
-                                                                  const __nv_bfloat16* __restrict__ alpha,
-                                                                  const __nv_bfloat16* __restrict__ w,
-                                                                  __nv_bfloat16* out) {
+__global__ void __launch_bounds__(ROW_THREADS) mix_rmsnorm_kernel(const ActT* feats,
+                                                                  const ActT* __restrict__ alpha,
+                                                                  const ActT* __restrict__ w,
+                                                                  ActT* out) {
   __shared__ float scratch[33];
   pdl_trigger();
   const int r = blockIdx.x, c = 8 * threadIdx.x;
@@ -112,7 +106,7 @@ __global__ void __launch_bounds__(ROW_THREADS) mix_rmsnorm_kernel(const __nv_bfl
 
 // One head row of 128 values, one per thread (blockDim 128): bf16(rms(x) * w), then neox RoPE at `pos`
 // over the full head dim, rounded to BF16. `x` is this thread's value; returns the thread's output.
-__device__ __forceinline__ float norm_rope_head(float x, const __nv_bfloat16* __restrict__ w, int pos,
+__device__ __forceinline__ float norm_rope_head(float x, const ActT* __restrict__ w, int pos,
                                                 float* scratch, float* pair) {
   const int d = threadIdx.x;
   const float ss = block_sum(x * x, scratch);
@@ -132,9 +126,9 @@ __device__ __forceinline__ float norm_rope_head(float x, const __nv_bfloat16* __
   return bf_round(o);
 }
 
-__global__ void __launch_bounds__(HEAD_DIM) ctx_kv_store_kernel(const __nv_bfloat16* kv, const DraftParams* p,
+__global__ void __launch_bounds__(HEAD_DIM) ctx_kv_store_kernel(const ActT* kv, const DraftParams* p,
                                                                int row0, int keep_from,
-                                                               const __nv_bfloat16* __restrict__ k_norm,
+                                                               const ActT* __restrict__ k_norm,
                                                                void* k_cache, void* v_cache, bool fp8, int size,
                                                                std::int32_t* ctx_pos) {
   __shared__ float scratch[33];
@@ -144,7 +138,7 @@ __global__ void __launch_bounds__(HEAD_DIM) ctx_kv_store_kernel(const __nv_bfloa
   const int r = keep_from + blockIdx.x, g = blockIdx.y, d = threadIdx.x;
   const int pos = p->start + row0 + r;
   const int slot = pos % size;
-  const __nv_bfloat16* row = kv + size_t(r) * 2 * KV_DIM;
+  const ActT* row = kv + size_t(r) * 2 * KV_DIM;
   const float k = norm_rope_head(bf(row[g * HEAD_DIM + d]), k_norm, pos, scratch, pair);
   const size_t at = (size_t(slot) * KV_HEADS + g) * HEAD_DIM + d;
   store_cache(k_cache, at, k, fp8);
@@ -159,15 +153,15 @@ __global__ void __launch_bounds__(HEAD_DIM) ctx_kv_store_kernel(const __nv_bfloa
 // ROUND: n, the taps and the anchor come from the round inputs, and one thread publishes them in *p (no CTA
 // reads the fields it writes); otherwise they are read from *p.
 struct RowWeights {
-  const __nv_bfloat16* alpha;       // bf16 [4, 4]
-  const __nv_bfloat16* f_norm;      // bf16 [H]
-  const __nv_bfloat16* embed;       // bf16 [V, H]
+  const ActT* alpha;       // bf16 [4, 4]
+  const ActT* f_norm;      // bf16 [H]
+  const ActT* embed;       // bf16 [V, H]
   const float* embed_norm;          // fp32 [H]
-  const __nv_bfloat16* mask_embed;  // bf16 [H]
-  const __nv_bfloat16* in_norm;     // bf16 [H]
+  const ActT* mask_embed;  // bf16 [H]
+  const ActT* in_norm;     // bf16 [H]
 };
 struct RowOutputs {
-  __nv_bfloat16 *xin, *f_rnn, *res, *xn;
+  ActT *xin, *f_rnn, *res, *xn;
   unsigned long long* picks;
 };
 
@@ -178,7 +172,7 @@ __global__ void __launch_bounds__(ROW_THREADS) round_rows_kernel(DraftParams* p,
   pdl_trigger();
   const int r = blockIdx.x, part = part0 + blockIdx.y, c = 8 * threadIdx.x;
   // weights first: in flight across the wait
-  const __nv_bfloat16* norm = part < 3 ? L.ctx_norm[part] : (part == 3 ? W.f_norm : W.in_norm);
+  const ActT* norm = part < 3 ? L.ctx_norm[part] : (part == 3 ? W.f_norm : W.in_norm);
   const uint4 wv = ld_weight(norm + c);
   uint4 aux[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};  // embed_norm (row 0) or mask_embed
   float a[4] = {0.f, 0.f, 0.f, 0.f};
@@ -194,7 +188,7 @@ __global__ void __launch_bounds__(ROW_THREADS) round_rows_kernel(DraftParams* p,
   }
   pdl_wait();
   int n, anchor;
-  const __nv_bfloat16* feats;
+  const ActT* feats;
   if constexpr (ROUND) {
     const int m = *in.m, start = p->round_start;
     n = *in.accepted + 1;
@@ -235,7 +229,7 @@ __global__ void __launch_bounds__(ROW_THREADS) round_rows_kernel(DraftParams* p,
     if (r == 0 && threadIdx.x < GAMMA) O.picks[threadIdx.x] = 0ull;
     return;
   }
-  const __nv_bfloat16* f = feats + size_t(r) * 4 * H;
+  const ActT* f = feats + size_t(r) * 4 * H;
   if (part == 3) {
     if (r == n - 1) *reinterpret_cast<uint4*>(O.f_rnn + c) = mix_row(f, c, a, wv, scratch);
     return;
@@ -269,9 +263,9 @@ __global__ void __launch_bounds__(HEAD_DIM) commit_store_kernel(const float* kv,
 // ---- draft block ---------------------------------------------------------------------------------------
 
 // grid (8 rows, 24 q + 8 k + 8 v heads), block 128
-__global__ void __launch_bounds__(HEAD_DIM) qkv_rope_kernel(const float* qkv, const __nv_bfloat16* __restrict__ q_norm,
-                                                           const __nv_bfloat16* __restrict__ k_norm,
-                                                           const DraftParams* p, __nv_bfloat16* q_out,
+__global__ void __launch_bounds__(HEAD_DIM) qkv_rope_kernel(const float* qkv, const ActT* __restrict__ q_norm,
+                                                           const ActT* __restrict__ k_norm,
+                                                           const DraftParams* p, ActT* q_out,
                                                            void* k_cache, void* v_cache, bool fp8, bool local,
                                                            int ctx) {
   __shared__ float scratch[33];
@@ -284,7 +278,7 @@ __global__ void __launch_bounds__(HEAD_DIM) qkv_rope_kernel(const float* qkv, co
   const int slot = local ? WINDOW + r : pos % ctx;
   if (h < HEADS) {
     const float q = norm_rope_head(row[h * HEAD_DIM + d], q_norm, pos, scratch, pair);
-    q_out[(size_t(r) * HEADS + h) * HEAD_DIM + d] = __float2bfloat16_rn(q);
+    q_out[(size_t(r) * HEADS + h) * HEAD_DIM + d] = act::from_float(q);
   } else if (h < HEADS + KV_HEADS) {
     const int g = h - HEADS;
     const float k = norm_rope_head(row[Q_DIM + g * HEAD_DIM + d], k_norm, pos, scratch, pair);
@@ -297,9 +291,9 @@ __global__ void __launch_bounds__(HEAD_DIM) qkv_rope_kernel(const float* qkv, co
 
 // ---- residual stream -----------------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(ROW_THREADS) add_rmsnorm_kernel(__nv_bfloat16* res, const float* delta,
-                                                                  const __nv_bfloat16* __restrict__ w,
-                                                                  __nv_bfloat16* xn) {
+__global__ void __launch_bounds__(ROW_THREADS) add_rmsnorm_kernel(ActT* res, const float* delta,
+                                                                  const ActT* __restrict__ w,
+                                                                  ActT* xn) {
   __shared__ float scratch[33];
   pdl_trigger();
   const size_t at = size_t(blockIdx.x) * H + 8 * threadIdx.x;
@@ -315,7 +309,7 @@ __global__ void __launch_bounds__(ROW_THREADS) add_rmsnorm_kernel(__nv_bfloat16*
   *reinterpret_cast<uint4*>(xn + at) = rms_norm(x, wv, scratch);
 }
 
-__global__ void silu_mul_kernel(const float* gu, int rows, int inter, __nv_bfloat16* out) {
+__global__ void silu_mul_kernel(const float* gu, int rows, int inter, ActT* out) {
   pdl_trigger();
   pdl_wait();
   const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -323,7 +317,7 @@ __global__ void silu_mul_kernel(const float* gu, int rows, int inter, __nv_bfloa
   const size_t r = i / inter, j = i % inter;
   const float g = gu[r * 2 * inter + j], u = gu[r * 2 * inter + inter + j];
   const float s = __fdiv_rn(g, __fadd_rn(1.f, expf(-g)));  // torch silu: x / (1 + exp(-x))
-  out[i] = __float2bfloat16_rn(__fmul_rn(s, u));
+  out[i] = act::from_float(__fmul_rn(s, u));
 }
 
 __global__ void fill_kernel(float* x, size_t n, float value) {
@@ -352,23 +346,23 @@ void set_seed(DraftParams* p, std::uint64_t seed, cudaStream_t stream) {
   set_seed_kernel<<<1, 1, 0, stream>>>(p, seed);
   check_launch();
 }
-void set_commit(DraftParams* p, const __nv_bfloat16* feats, int n, int start, cudaStream_t stream) {
+void set_commit(DraftParams* p, const ActT* feats, int n, int start, cudaStream_t stream) {
   if (n < 1 || n > BLOCK) throw std::invalid_argument("set_commit: n must be in 1..8");
   require_aligned(feats, "set_commit: feats must be 16-byte aligned");
   set_commit_kernel<<<1, 1, 0, stream>>>(p, feats, n, start);
   check_launch();
 }
 
-void mix_rmsnorm(const __nv_bfloat16* feats, int n, const __nv_bfloat16* alpha, const __nv_bfloat16* w,
-                 __nv_bfloat16* out, cudaStream_t stream) {
+void mix_rmsnorm(const ActT* feats, int n, const ActT* alpha, const ActT* w,
+                 ActT* out, cudaStream_t stream) {
   if (n <= 0) return;
   require_aligned(feats, "mix_rmsnorm: feats must be 16-byte aligned");
   require_aligned(out, "mix_rmsnorm: out must be 16-byte aligned");
   launch_pdl(mix_rmsnorm_kernel, dim3(n), dim3(ROW_THREADS), stream, feats, alpha, w, out);
 }
 
-void ctx_kv_store(const __nv_bfloat16* kv, int n, const DraftParams* p, int row0, int keep_from,
-                  const __nv_bfloat16* k_norm, void* k_cache, void* v_cache, bool fp8, int size,
+void ctx_kv_store(const ActT* kv, int n, const DraftParams* p, int row0, int keep_from,
+                  const ActT* k_norm, void* k_cache, void* v_cache, bool fp8, int size,
                   std::int32_t* ctx_pos, cudaStream_t stream) {
   if (keep_from < 0 || size <= 0) throw std::invalid_argument("ctx_kv_store: bad keep_from/size");
   if (n - keep_from <= 0) return;
@@ -376,8 +370,8 @@ void ctx_kv_store(const __nv_bfloat16* kv, int n, const DraftParams* p, int row0
              k_norm, k_cache, v_cache, fp8, size, ctx_pos);
 }
 
-void commit_mix(const DraftParams* p, const __nv_bfloat16* alpha, const CtxLayers& L, const __nv_bfloat16* f_norm,
-                __nv_bfloat16* xin, __nv_bfloat16* f_rnn, cudaStream_t stream) {
+void commit_mix(const DraftParams* p, const ActT* alpha, const CtxLayers& L, const ActT* f_norm,
+                ActT* xin, ActT* f_rnn, cudaStream_t stream) {
   const RowWeights W{alpha, f_norm, nullptr, nullptr, nullptr, nullptr};
   const RowOutputs O{xin, f_rnn, nullptr, nullptr, nullptr};
   launch_pdl(round_rows_kernel<false>, dim3(BLOCK, 4), dim3(ROW_THREADS), stream, const_cast<DraftParams*>(p),
@@ -390,8 +384,8 @@ void commit_store(const float* kv, const DraftParams* p, const CtxLayers& L, cud
   launch_pdl(commit_store_kernel, dim3(BLOCK, KV_HEADS, 3), dim3(HEAD_DIM), stream, kv, p, L);
 }
 
-void embed_block(const __nv_bfloat16* embed, const float* embed_norm, const __nv_bfloat16* mask_embed,
-                 const __nv_bfloat16* in_norm, const DraftParams* p, __nv_bfloat16* res, __nv_bfloat16* xn,
+void embed_block(const ActT* embed, const float* embed_norm, const ActT* mask_embed,
+                 const ActT* in_norm, const DraftParams* p, ActT* res, ActT* xn,
                  unsigned long long* picks, cudaStream_t stream) {
   require_aligned(embed, "embed_block: embed must be 16-byte aligned");
   const RowWeights W{nullptr, nullptr, embed, embed_norm, mask_embed, in_norm};
@@ -400,10 +394,10 @@ void embed_block(const __nv_bfloat16* embed, const float* embed_norm, const __nv
              RoundInputs{}, W, CtxLayers{}, O, 4);
 }
 
-void round_begin(DraftParams* p, const RoundInputs& in, const __nv_bfloat16* alpha, const CtxLayers& L,
-                 const __nv_bfloat16* f_norm, const __nv_bfloat16* embed, const float* embed_norm,
-                 const __nv_bfloat16* mask_embed, const __nv_bfloat16* in_norm, __nv_bfloat16* xin,
-                 __nv_bfloat16* f_rnn, __nv_bfloat16* res, __nv_bfloat16* xn, unsigned long long* picks,
+void round_begin(DraftParams* p, const RoundInputs& in, const ActT* alpha, const CtxLayers& L,
+                 const ActT* f_norm, const ActT* embed, const float* embed_norm,
+                 const ActT* mask_embed, const ActT* in_norm, ActT* xin,
+                 ActT* f_rnn, ActT* res, ActT* xn, unsigned long long* picks,
                  cudaStream_t stream) {
   if (in.nwidths < 1 || in.nwidths > 3 || !in.m || !in.accepted || !in.next_greedy || !in.next_sampled)
     throw std::invalid_argument("round_begin: incomplete round inputs");
@@ -414,20 +408,20 @@ void round_begin(DraftParams* p, const RoundInputs& in, const __nv_bfloat16* alp
   launch_pdl(round_rows_kernel<true>, dim3(BLOCK, 5), dim3(ROW_THREADS), stream, p, in, W, L, O, 0);
 }
 
-void qkv_rope(const float* qkv, const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm, const DraftParams* p,
-              __nv_bfloat16* q_out, void* k_cache, void* v_cache, bool fp8, bool local, int ctx,
+void qkv_rope(const float* qkv, const ActT* q_norm, const ActT* k_norm, const DraftParams* p,
+              ActT* q_out, void* k_cache, void* v_cache, bool fp8, bool local, int ctx,
               cudaStream_t stream) {
   launch_pdl(qkv_rope_kernel, dim3(BLOCK, HEADS + 2 * KV_HEADS), dim3(HEAD_DIM), stream, qkv, q_norm, k_norm, p, q_out,
              k_cache, v_cache, fp8, local, ctx);
 }
 
-void add_rmsnorm(__nv_bfloat16* res, const float* delta, const __nv_bfloat16* w, __nv_bfloat16* xn, int rows,
+void add_rmsnorm(ActT* res, const float* delta, const ActT* w, ActT* xn, int rows,
                  cudaStream_t stream) {
   if (rows <= 0) return;
   launch_pdl(add_rmsnorm_kernel, dim3(rows), dim3(ROW_THREADS), stream, res, delta, w, xn);
 }
 
-void silu_mul(const float* gu, int rows, int inter, __nv_bfloat16* out, cudaStream_t stream) {
+void silu_mul(const float* gu, int rows, int inter, ActT* out, cudaStream_t stream) {
   const size_t n = size_t(rows) * inter;
   if (n == 0) return;
   launch_pdl(silu_mul_kernel, dim3(unsigned((n + 255) / 256)), dim3(256), stream, gu, rows, inter, out);

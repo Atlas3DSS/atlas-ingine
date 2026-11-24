@@ -44,6 +44,7 @@
 // L2: the weight rows are read once per step, so their lines are filled evict-first (kernels/common/l2.cuh):
 // they stop evicting the activations, KV rings and the small kernels' evict-last constants.
 // Ported from engine/csrc/dense/gemv.cu (kernel bodies unchanged; torch launchers -> raw pointers).
+#include "kernels/common/mma_sm70.cuh"
 #include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
@@ -66,7 +67,7 @@ template <int M>
 struct ProjEpi {
   static constexpr int kInputs = 3;
   static constexpr bool kScatter = true;
-  const __nv_bfloat16* xin;  // [3, M, H]
+  const ActT* xin;  // [3, M, H]
   const int* segments;       // [S, 3]
   int nseg, R;
   float* out;                // [M, R]
@@ -77,7 +78,7 @@ struct ProjEpi {
     }
     return -1;
   }
-  __device__ const __nv_bfloat16* x_of(int i) const { return xin + size_t(i) * M * H; }
+  __device__ const ActT* x_of(int i) const { return xin + size_t(i) * M * H; }
   __device__ void store1(int row, int m, float v) const { out[size_t(m) * R + row] = round_bf16(v); }
 };
 
@@ -85,11 +86,11 @@ template <int M>
 struct HeadEpi {
   static constexpr int kInputs = 1;
   static constexpr bool kScatter = true;
-  const __nv_bfloat16* x;
+  const ActT* x;
   int V;
   float* out;  // [M, V]
   __device__ int input_of(int) const { return 0; }
-  __device__ const __nv_bfloat16* x_of(int) const { return x; }
+  __device__ const ActT* x_of(int) const { return x; }
   __device__ void store1(int row, int m, float v) const {
     out[size_t(m) * V + row] = tanhf(round_bf16(v) / 30.f) * 30.f;
   }
@@ -100,11 +101,11 @@ template <int M>
 struct GemvEpi {
   static constexpr int kInputs = 1;
   static constexpr bool kScatter = true;
-  const __nv_bfloat16* x;
+  const ActT* x;
   int R;
   float* out;  // [M, R]
   __device__ int input_of(int) const { return 0; }
-  __device__ const __nv_bfloat16* x_of(int) const { return x; }
+  __device__ const ActT* x_of(int) const { return x; }
   __device__ void store1(int row, int m, float v) const { out[size_t(m) * R + row] = round_bf16(v); }
 };
 
@@ -112,13 +113,13 @@ template <int M>
 struct ConvEpi {
   static constexpr int kInputs = 1;
   static constexpr bool kScatter = false;  // the conv of token m needs y of tokens m-3 .. m
-  const __nv_bfloat16* x;  // [M, 3072]
+  const ActT* x;  // [M, 3072]
   const float* conv_w;     // [H, 4], tap 3 = current token
   float* state;            // [3, H], oldest first
   float* out;              // [M, H]
   float* hist;             // [M, H] BF16-rounded conv inputs y, or null
   __device__ int input_of(int) const { return 0; }
-  __device__ const __nv_bfloat16* x_of(int) const { return x; }
+  __device__ const ActT* x_of(int) const { return x; }
   __device__ void load_ext(int c, const float (&acc)[M], float (&ext)[M + 3]) const {
 #pragma unroll
     for (int j = 0; j < 3; ++j) ext[j] = state[j * H + c];
@@ -171,7 +172,7 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
   if (row >= rows) return;
   const int in = epi.input_of(row);
   if (in < 0) return;
-  const __nv_bfloat16* x = epi.x_of(in);  // pointer arithmetic only: the segment table is a constant
+  const ActT* x = epi.x_of(in);  // pointer arithmetic only: the segment table is a constant
 
   const uint8_t* wr = w + size_t(row) * ROW_BYTES;
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
@@ -206,15 +207,14 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
 
 __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                          uint32_t b0, uint32_t b1) {
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-               "{%0,%1,%2,%3};"
-               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+  mma::mma_act(c, a0, a1, a2, a3, b0, b1);
 }
 
 // 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one instruction on SM120a, hw FP16 convert on SM89, portable helper on SM86.
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if INGINE_ACT_FP16
+  return act::e4m3x2_to_half2_bits(u);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   uint32_t r;
   asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
   return r;
@@ -264,7 +264,7 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
     const bool la = ia == cur, lb = ib == cur, lx = g < M;
     const uint8_t* wa = w + size_t(la ? ra : 0) * ROW_BYTES;
     const uint8_t* wb = w + size_t(lb ? rb : 0) * ROW_BYTES;
-    const __nv_bfloat16* xg = epi.x_of(cur) + size_t(lx ? g : 0) * K;
+    const ActT* xg = epi.x_of(cur) + size_t(lx ? g : 0) * K;
 #pragma unroll 1
     for (int jb = 0; jb < NJ; jb += U) {
       uint4 A[U], B[U], X[U][CPL / 8];
@@ -366,7 +366,7 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     constexpr int MM = decltype(mc)::value;
     auto epi = make(std::integral_constant<int, MM>{});
     using E = decltype(epi);
-    if constexpr (MM == 1 && BLOCK > 0) {
+    if constexpr (MM == 1 && (BLOCK > 0 || kActIsFP16)) {
       constexpr int B = BLOCK > 0 ? BLOCK : 32;  // (the branch is discarded for BLOCK = 0)
       if (fp8) launch_ex(gemv_kernel<true, K, 16, B, E>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
       else launch_ex(gemv_kernel<false, K, 32, B, E>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
@@ -409,26 +409,26 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
 #define HEAD_SPLITK 6
 #endif
 
-__global__ void fp8_rows_kernel(const __nv_bfloat16* __restrict__ w, int rows, int K, __nv_fp8_storage_t* q,
+__global__ void fp8_rows_kernel(const ActT* __restrict__ w, int rows, int K, __nv_fp8_storage_t* q,
                                 float* scale) {
   const int lane = threadIdx.x & 31;
   const int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   if (row >= rows) return;
-  const __nv_bfloat16* wr = w + size_t(row) * K;
+  const ActT* wr = w + size_t(row) * K;
   float amax = 0.f;
-  for (int k = lane; k < K; k += 32) amax = fmaxf(amax, fabsf(__bfloat162float(wr[k])));
+  for (int k = lane; k < K; k += 32) amax = fmaxf(amax, fabsf(act::to_float(wr[k])));
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
   const float s = amax / 448.f;
   if (lane == 0) scale[row] = s;
   for (int k = lane; k < K; k += 32)
     q[size_t(row) * K + k] =
-        s > 0.f ? __nv_cvt_float_to_fp8(__bfloat162float(wr[k]) / s, __NV_SATFINITE, __NV_E4M3) : 0;
+        s > 0.f ? __nv_cvt_float_to_fp8(act::to_float(wr[k]) / s, __NV_SATFINITE, __NV_E4M3) : 0;
 }
 
 // weights.dequant: bf16(float(q) * scale[row]); one thread per 16 elements (K % 16 == 0).
 __global__ void dequant_rows_kernel(const __nv_fp8_storage_t* __restrict__ q, const float* __restrict__ scale,
-                                    int K, long long total16, __nv_bfloat16* __restrict__ out) {
+                                    int K, long long total16, ActT* __restrict__ out) {
   const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
   if (i >= total16) return;
   const long long e = i * 16;
@@ -436,9 +436,9 @@ __global__ void dequant_rows_kernel(const __nv_fp8_storage_t* __restrict__ q, co
   const uint4 u = *reinterpret_cast<const uint4*>(q + e);
   float f[16];
   unpack_e4m3x16(u, f);
-  __align__(16) __nv_bfloat16 v[16];
+  __align__(16) ActT v[16];
 #pragma unroll
-  for (int j = 0; j < 16; ++j) v[j] = __float2bfloat16_rn(f[j] * s);
+  for (int j = 0; j < 16; ++j) v[j] = act::from_float(f[j] * s);
   uint4* dst = reinterpret_cast<uint4*>(out + e);
   dst[0] = reinterpret_cast<const uint4*>(v)[0];
   dst[1] = reinterpret_cast<const uint4*>(v)[1];
@@ -446,7 +446,7 @@ __global__ void dequant_rows_kernel(const __nv_fp8_storage_t* __restrict__ q, co
 
 }  // namespace
 
-void proj(const __nv_bfloat16* xin, int M, Matrix w, const int* segments, int nseg, float* out, bool pdl,
+void proj(const ActT* xin, int M, Matrix w, const int* segments, int nseg, float* out, bool pdl,
           cudaStream_t stream) {
   require(xin && segments && out && nseg > 0, "proj: null argument");
   const int R = w.rows;
@@ -456,7 +456,7 @@ void proj(const __nv_bfloat16* xin, int M, Matrix w, const int* segments, int ns
   });
 }
 
-void proj_conv(const __nv_bfloat16* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,
+void proj_conv(const ActT* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,
                float* conv_hist, bool pdl, cudaStream_t stream) {
   require(x && conv_w && conv_state && out, "proj_conv: null argument");
   require(w.rows == H, "proj_conv: w must have 2304 rows");
@@ -468,7 +468,7 @@ void proj_conv(const __nv_bfloat16* x, int M, Matrix w, const float* conv_w, flo
   });
 }
 
-void head(const __nv_bfloat16* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream) {
+void head(const ActT* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream) {
   require(x && out, "head: null argument");
   const int V = w.rows;
   launch_gemv<H, 256, HEAD_SPLITK, MMA_U_FP8, HeadEpi>(w, M, pdl, stream, [&](auto mc) {
@@ -477,7 +477,7 @@ void head(const __nv_bfloat16* x, int M, Matrix w, float* out, bool pdl, cudaStr
   });
 }
 
-void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream) {
+void gemv(const ActT* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream) {
   require(x && out, "gemv: null argument");
   const int R = w.rows;
   auto make = [&](auto mc) {
@@ -486,20 +486,20 @@ void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, 
   };
   // 2304 rows = 144 blocks of 16 rows: 16 warps per block (K slices of 192 / 576 columns) keep enough
   // bytes in flight (measured M = 8, BF16: K = 3072 10.4 -> 8.4 us, K = 9216 28.3 -> 26.0 us vs 8 warps).
-  // K = 3072, M = 1: as proj_conv; K = 9216: 36 chunks per lane would spill, so M = 1 uses tensor cores.
+  // For BF16, K = 3072, M = 1: as proj_conv; K = 9216: 36 chunks per lane would spill, so M = 1 uses tensor cores.
   if (K == 3072) launch_gemv<3072, 32, 16, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
   else if (K == 9216) launch_gemv<9216, 0, 16, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
   else require(false, "gemv: K must be 3072 or 9216");
 }
 
-void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream) {
+void fp8_rows(const ActT* w, int rows, int K, void* q, float* scale, cudaStream_t stream) {
   require(rows >= 0 && K > 0, "fp8_rows: bad shape");
   if (rows > 0)
     fp8_rows_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(w, rows, K, static_cast<__nv_fp8_storage_t*>(q), scale);
   CUDA_CHECK(cudaGetLastError());
 }
 
-void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream) {
+void dequant_rows(const void* q, const float* scale, int rows, int K, ActT* out, cudaStream_t stream) {
   require(rows >= 0 && K > 0 && K % 16 == 0, "dequant_rows: K must be a multiple of 16");
   const long long total16 = (long long)rows * K / 16;
   if (total16 > 0)

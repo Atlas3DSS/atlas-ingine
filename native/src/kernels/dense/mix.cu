@@ -47,11 +47,11 @@ struct MixArgs {
   float* partial;      // [M, H] or null
   const float* queries;  // [Q, H]
   const float* norm_w;   // [Q, H] (needed with out_bf16)
-  __nv_bfloat16* out_bf16;  // [Q, M, H] or null
+  ActT* out_bf16;  // [Q, M, H] or null
   float* out_f32;           // [Q, M, H] or null
-  __nv_bfloat16* new_bf16;  // row m at + m * new_bf16_stride, or null
+  ActT* new_bf16;  // row m at + m * new_bf16_stride, or null
   long long new_bf16_stride;
-  __nv_bfloat16* out_copy;  // Q == 1: row m at + m * out_copy_stride, or null
+  ActT* out_copy;  // Q == 1: row m at + m * out_copy_stride, or null
   long long out_copy_stride;
   MixRowCopy copies[2];     // dst == null: unused
   int M;
@@ -67,12 +67,8 @@ __device__ __forceinline__ float sumsq4(float4 a) {
 }
 __device__ __forceinline__ float4 scale4(float4 a, float s) { return make_float4(a.x * s, a.y * s, a.z * s, a.w * s); }
 
-__device__ __forceinline__ void store_bf16x4(__nv_bfloat16* p, float4 v) {
-  __nv_bfloat162 a = __floats2bfloat162_rn(v.x, v.y), b = __floats2bfloat162_rn(v.z, v.w);
-  uint2 u;
-  u.x = *reinterpret_cast<uint32_t*>(&a);
-  u.y = *reinterpret_cast<uint32_t*>(&b);
-  *reinterpret_cast<uint2*>(p) = u;
+__device__ __forceinline__ void store_bf16x4(ActT* p, float4 v) {
+  *reinterpret_cast<uint2*>(p) = make_uint2(act::pack2(v.x, v.y), act::pack2(v.z, v.w));
 }
 
 // Block sum of N per-quad values in two steps. sum_part: the warp stage for this thread's quad `u`, i.e.
@@ -374,7 +370,7 @@ void launch_mix_q(int Q, int M, const MixArgs& a, bool pdl, cudaStream_t stream)
 // torch.rsqrt, and every product rounded separately (no FMA contraction) as torch's separate kernels.
 template <int BW>
 __global__ void __launch_bounds__(BW) embed_kernel(const int64_t* __restrict__ token,
-                                                  const __nv_bfloat16* __restrict__ table,
+                                                  const ActT* __restrict__ table,
                                                   const float* __restrict__ norm_w, float* __restrict__ out) {
   constexpr int NV = H / 4;                   // 576 four-element vectors
   constexpr int PER = (NV + BW - 1) / BW;     // vectors per thread (some threads one fewer)
@@ -387,7 +383,7 @@ __global__ void __launch_bounds__(BW) embed_kernel(const int64_t* __restrict__ t
     if (t + k * BW < NV) g[k] = *reinterpret_cast<const float4*>(norm_w + 4 * (t + k * BW));
   pdl_wait();  // the token id comes from an earlier kernel
   pdl_trigger();
-  const __nv_bfloat16* row = table + size_t(token[m]) * H;
+  const ActT* row = table + size_t(token[m]) * H;
   float4 v[PER];
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -518,7 +514,7 @@ void mix_pair(const MixParams& p, const MixParams& msg, bool pdl, cudaStream_t s
   }
 }
 
-void embed(const std::int64_t* token, int M, const __nv_bfloat16* table, const float* norm_w, float* out,
+void embed(const std::int64_t* token, int M, const ActT* table, const float* norm_w, float* out,
            bool pdl, cudaStream_t stream) {
   require(M >= 1, "embed: M must be >= 1");  // one CTA per row (prefill calls it with M = chunk length)
   require(token && table && norm_w && out, "embed: null argument");

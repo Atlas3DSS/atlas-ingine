@@ -5,7 +5,7 @@
 #include "kernels/common/pdl.cuh"
 #include "kernels/draft/rng.h"
 
-#include <cuda_bf16.h>
+#include "core/act.h"
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -15,17 +15,19 @@
 
 namespace ingine::kernels::draft {
 
-__device__ __forceinline__ float bf_round(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
-__device__ __forceinline__ float bf(const __nv_bfloat16& x) { return __bfloat162float(x); }
+__device__ __forceinline__ float bf_round(float x) { return act::round_act(x); }
+__device__ __forceinline__ float bf(const ActT& x) { return act::to_float(x); }
 
 // One element of a key/value cache: BF16, or E4M3 without a scale (nearest even, saturating at +-448).
 __device__ __forceinline__ void store_cache(void* cache, size_t at, float x, bool fp8) {
   if (fp8) static_cast<__nv_fp8_storage_t*>(cache)[at] = __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
-  else static_cast<__nv_bfloat16*>(cache)[at] = __float2bfloat16_rn(x);
+  else static_cast<ActT*>(cache)[at] = act::from_float(x);
 }
 // 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one cvt.rn.bf16x2.e4m3x2 on sm_120a, hw f16 on sm_89, portable on sm_86.
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if INGINE_ACT_FP16
+  return act::e4m3x2_to_half2_bits(u);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   uint32_t r;
   asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
   return r;
@@ -45,12 +47,7 @@ __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
 
 // 8 BF16 values (one uint4) -> 8 floats.
 __device__ __forceinline__ void unpack8(const uint4& v, float* f) {
-  const uint32_t w[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    f[2 * i] = __uint_as_float(w[i] << 16);
-    f[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
-  }
+  act::unpack8(v, f);
 }
 
 __device__ __forceinline__ float warp_sum(float v) {

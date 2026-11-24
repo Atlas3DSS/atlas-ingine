@@ -4,7 +4,7 @@
 #pragma once
 
 #include <cublasLt.h>
-#include <cuda_bf16.h>
+#include "core/act.h"
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -20,7 +20,7 @@ class Bf16Gemm {
   Bf16Gemm(const Bf16Gemm&) = delete;
   Bf16Gemm& operator=(const Bf16Gemm&) = delete;
 
-  void run(const __nv_bfloat16* a, int n, const __nv_bfloat16* w, int N, int K, __nv_bfloat16* c,
+  void run(const ActT* a, int n, const ActT* w, int N, int K, ActT* c,
            cudaStream_t stream);
 
  private:

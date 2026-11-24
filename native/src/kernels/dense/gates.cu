@@ -57,11 +57,11 @@ struct GateArgs {
   const float* h;    // [G, M, H], or [M, H] read by every gate (h_shared)
   bool h_shared;
   const float* msg;  // [G, M, H]
-  const __nv_bfloat16* w_down;  // [G, 64, 2H]
+  const ActT* w_down;  // [G, 64, 2H]
   const void* w_forget;         // [G, H, 64] fp32 or bf16
   const void* w_gain;
   const float* norm_w;  // [G, H]
-  __nv_bfloat16* out_bf16;  // [G, M, H]
+  ActT* out_bf16;  // [G, M, H]
   float* out_f32;           // [G, M, H] or null
   uint32_t zero;            // 0 (opaque to the compiler: pdl_wait_fenced)
 };
@@ -93,7 +93,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   __shared__ __align__(16) float gall[M][RANK];  // full down output (BF16 values), received
   // bf16([n(h), n(msg)]) of the tokens of a group (M = 1 with FP16 slices: two, the shared-memory size the
   // plain step was tuned with)
-  __shared__ __align__(16) __nv_bfloat16 xs[M == 1 && C::XMAX > 1 ? 2 : XG][2 * H];
+  __shared__ __align__(16) ActT xs[M == 1 && C::XMAX > 1 ? 2 : XG][2 * H];
   __shared__ __align__(16) float part[M][2][C::RPC];  // per-half partial dots
   __shared__ __align__(16) float ssall[CL][4 * MQ];   // per-CTA sums of squares of the gated output, received
   __shared__ float red[C::NW * 32], red2[C::NW * 32];
@@ -137,7 +137,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   // down projection weights -> registers
   uint4 wv[DCH];
   {
-    const __nv_bfloat16* wr = a.w_down + (size_t(g) * RANK + rank * C::RPC + rl) * 2 * H + half * H;
+    const ActT* wr = a.w_down + (size_t(g) * RANK + rank * C::RPC + rl) * 2 * H + half * H;
 #pragma unroll
     for (int i = 0; i < DCH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (i * 32 + lane) * 8, wpol);
   }
@@ -173,11 +173,11 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     for (int j = 0; j < XG; ++j) {
       if (m0 + j < M) {
         const float rh = rsqrtf(ss[2 * j] / H + EPS), rm = rsqrtf(ss[2 * j + 1] / H + EPS);
-        __nv_bfloat16* xb = xs[j];
+        ActT* xb = xs[j];
 #pragma unroll
         for (int k = 0; k < XPT; ++k) {
-          xb[k * C::NT + t] = __float2bfloat16_rn(xh[j][k] * rh);
-          xb[H + k * C::NT + t] = __float2bfloat16_rn(xm[j][k] * rm);
+          xb[k * C::NT + t] = act::from_float(xh[j][k] * rh);
+          xb[H + k * C::NT + t] = act::from_float(xm[j][k] * rm);
         }
       }
     }
@@ -186,7 +186,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     for (int j = 0; j < XG; ++j) {
       const int m = m0 + j;
       if (m < M) {
-        const __nv_bfloat16* xb = xs[j];
+        const ActT* xb = xs[j];
         float acc = 0.f;
 #pragma unroll
         for (int i = 0; i < DCH; ++i) {
@@ -291,7 +291,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
       float ss = 0.f;
 #pragma unroll
       for (int d = 0; d < CL; ++d) ss += ssall[d][m];
-      a.out_bf16[(size_t(g) * M + m) * H + c] = __float2bfloat16_rn(hv[m] * rsqrtf(ss / H + EPS) * nw);
+      a.out_bf16[(size_t(g) * M + m) * H + c] = act::from_float(hv[m] * rsqrtf(ss / H + EPS) * nw);
     }
   }
 }
@@ -320,7 +320,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
   constexpr int DCH = H / (8 * 32);
   constexpr int XPT = H / C::NT;
   constexpr int XG = M < C::XMAX ? M : C::XMAX;
-  __shared__ __align__(16) __nv_bfloat16 xs[M == 1 && C::XMAX > 1 ? 2 : XG][2 * H];
+  __shared__ __align__(16) ActT xs[M == 1 && C::XMAX > 1 ? 2 : XG][2 * H];
   __shared__ __align__(16) float part[M][2][C::RPC];
   __shared__ float red2[C::NW * 32];
 
@@ -334,7 +334,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
   uint4 wv[DCH];
   {
-    const __nv_bfloat16* wr = a.w_down + (size_t(g) * RANK + rank * C::RPC + rl) * 2 * H + half * H;
+    const ActT* wr = a.w_down + (size_t(g) * RANK + rank * C::RPC + rl) * 2 * H + half * H;
 #pragma unroll
     for (int i = 0; i < DCH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (i * 32 + lane) * 8, wpol);
   }
@@ -364,11 +364,11 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
     for (int j = 0; j < XG; ++j) {
       if (m0 + j < M) {
         const float rh = rsqrtf(ss[2 * j] / H + EPS), rm = rsqrtf(ss[2 * j + 1] / H + EPS);
-        __nv_bfloat16* xb = xs[j];
+        ActT* xb = xs[j];
 #pragma unroll
         for (int k = 0; k < XPT; ++k) {
-          xb[k * C::NT + t] = __float2bfloat16_rn(xh[j][k] * rh);
-          xb[H + k * C::NT + t] = __float2bfloat16_rn(xm[j][k] * rm);
+          xb[k * C::NT + t] = act::from_float(xh[j][k] * rh);
+          xb[H + k * C::NT + t] = act::from_float(xm[j][k] * rm);
         }
       }
     }
@@ -377,7 +377,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
     for (int j = 0; j < XG; ++j) {
       const int m = m0 + j;
       if (m < M) {
-        const __nv_bfloat16* xb = xs[j];
+        const ActT* xb = xs[j];
         float acc = 0.f;
 #pragma unroll
         for (int i = 0; i < DCH; ++i) {
@@ -497,7 +497,7 @@ template <int CL, int M>
 __global__ void __launch_bounds__(256) gates_sm8x_norm_kernel(const float* __restrict__ gated_in,
                                                               const float* __restrict__ ssall_in,
                                                               const float* __restrict__ norm_w,
-                                                              __nv_bfloat16* __restrict__ out_bf16) {
+                                                              ActT* __restrict__ out_bf16) {
   constexpr int CPC = H / CL;
   const int rank = blockIdx.x % CL;
   const int g = blockIdx.x / CL;
@@ -511,7 +511,7 @@ __global__ void __launch_bounds__(256) gates_sm8x_norm_kernel(const float* __res
 #pragma unroll
     for (int d = 0; d < CL; ++d) ss += ssall_in[(size_t(g) * CL + d) * M + m];
     const size_t idx_out = (size_t(g) * M + m) * H + c;
-    out_bf16[idx_out] = __float2bfloat16_rn(gated_in[idx_out] * rsqrtf(ss / H + EPS) * nw);
+    out_bf16[idx_out] = act::from_float(gated_in[idx_out] * rsqrtf(ss / H + EPS) * nw);
   }
 }
 
@@ -569,9 +569,9 @@ void launch_gates(int G, int M, const GateArgs& a, bool pdl, cudaStream_t stream
 
 }  // namespace
 
-void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const __nv_bfloat16* w_down,
+void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const ActT* w_down,
                    const void* w_forget, const void* w_gain, bool fg_fp32, const float* norm_w,
-                   __nv_bfloat16* out_bf16, float* out_f32, bool pdl, cudaStream_t stream) {
+                   ActT* out_bf16, float* out_f32, bool pdl, cudaStream_t stream) {
   require(G >= 1 && G <= 3 && M >= 1 && M <= 8, "message_gates: G in 1..3, M in 1..8");
   require(h && msg && w_down && w_forget && w_gain && norm_w && out_bf16, "message_gates: null argument");
   GateArgs a;

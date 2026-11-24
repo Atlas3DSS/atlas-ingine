@@ -14,6 +14,8 @@
 //           queries (the probabilities, transposed through shared memory), 8 mma.
 // About 350 warp instructions per tile (8 KB of BF16 rows), where the CUDA-core kernel this replaces took
 // 0.5 per byte and was compute bound (64K keys: 305 us for 268 MB; local layers: 10 us for 4 MB).
+#include "kernels/common/l2.cuh"
+#include "kernels/common/mma_sm70.cuh"
 #include "kernels/draft/draft.h"
 #include "kernels/draft/draft_device.cuh"
 
@@ -42,37 +44,25 @@ int att_chunks(int nkeys) {
 }
 
 __device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-               "{%0,%1,%2,%3};"
-               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+  mma::mma_act(c, a[0], a[1], a[2], a[3], b[0], b[1]);
 }
 // ldmatrix: lane l < 8 n gives the address of row l % 8 (8 BF16) of matrix l / 8; every lane (g, t) receives
 // elements (g, 2 t), (g, 2 t + 1) of each matrix, or with `trans` elements (2 t, g), (2 t + 1, g).
 __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* row) {
-  const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(row));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(addr)
-               : "memory");
+  mma::ldmatrix_x4(r[0], r[1], r[2], r[3], static_cast<unsigned>(__cvta_generic_to_shared(row)));
 }
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&r)[4], const void* row) {
-  const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(row));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(addr)
-               : "memory");
+  mma::ldmatrix_x4_trans(r[0], r[1], r[2], r[3], static_cast<unsigned>(__cvta_generic_to_shared(row)));
 }
 __device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[2], const void* row) {
-  const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(row));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(addr) : "memory");
+  mma::ldmatrix_x2(r[0], r[1], static_cast<unsigned>(__cvta_generic_to_shared(row)));
 }
 
 // 16-byte coherent load issued where it is written (queries and cache rows are written by earlier kernels).
 // The caches are read once per draft: no L1 allocation.
 __device__ __forceinline__ uint4 ld_cache(const void* p) {
   uint4 r;
-  asm volatile("ld.global.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+  asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".v4.u32 {%0,%1,%2,%3}, [%4];"
                : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
                : "l"(p)
                : "memory");
@@ -92,16 +82,16 @@ struct TileRegs {
 // plus the block rows; else keys [0, nkeys) valid below P + 8. FP8: E4M3 cache rows (else BF16).
 // ws_o fp32 [chunks, 8, 24 queries, 128 dims], ws_ml fp32 [chunks, 8, 24, 2] (running max, sum).
 template <bool LOCAL, bool FP8>
-__global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bfloat16* q, const uint8_t* k_cache,
+__global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q, const uint8_t* k_cache,
                                                                   const uint8_t* v_cache, int nkeys, int chunk_keys,
                                                                   const std::int32_t* ctx_pos, const DraftParams* p,
                                                                   float* ws_o, float* ws_ml) {
   constexpr int ROW_BYTES = FP8 ? HEAD_DIM : 2 * HEAD_DIM;
   constexpr int NL = TileRegs<FP8>::NL;
-  __shared__ __align__(16) __nv_bfloat16 qs[QH][BLOCK][HEAD_DIM];    // the queries, by head
-  __shared__ __align__(16) __nv_bfloat16 kt[2][ATT_TILE][HEAD_DIM];  // keys of a tile, by tile parity
-  __shared__ __align__(16) __nv_bfloat16 vt[2][ATT_TILE][HEAD_DIM];  // values
-  __shared__ __align__(16) __nv_bfloat16 pt[QH][BLOCK][ATT_TILE];    // a head's probabilities [query][key]
+  __shared__ __align__(16) ActT qs[QH][BLOCK][HEAD_DIM];    // the queries, by head
+  __shared__ __align__(16) ActT kt[2][ATT_TILE][HEAD_DIM];  // keys of a tile, by tile parity
+  __shared__ __align__(16) ActT vt[2][ATT_TILE][HEAD_DIM];  // values
+  __shared__ __align__(16) ActT pt[QH][BLOCK][ATT_TILE];    // a head's probabilities [query][key]
   __shared__ unsigned vmask[2];                                      // valid keys of a tile
   pdl_trigger();
   pdl_wait();
@@ -211,7 +201,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
     const unsigned mask = vmask[buf];
     const bool valid[2] = {((mask >> gl) & 1u) != 0, ((mask >> (gl + 8)) & 1u) != 0};
     float al[2];
-    __nv_bfloat16 pb16[2][2];  // [query e][key gl + 8 kk]
+    ActT pb16[2][2];  // [query e][key gl + 8 kk]
 #pragma unroll
     for (int e = 0; e < 2; ++e) {
       float xs[2], mt = -INFINITY;
@@ -227,8 +217,8 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
       float ps = 0.f;
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk) {
-        pb16[e][kk] = __float2bfloat16_rn(valid[kk] ? __expf(xs[kk] - m_new) : 0.f);  // the value mma takes BF16
-        ps += __bfloat162float(pb16[e][kk]);
+        pb16[e][kk] = act::from_float(valid[kk] ? __expf(xs[kk] - m_new) : 0.f);  // the value mma takes BF16
+        ps += act::to_float(pb16[e][kk]);
       }
 #pragma unroll
       for (int sh = 4; sh < 32; sh <<= 1) ps += __shfl_xor_sync(0xffffffffu, ps, sh);
@@ -283,7 +273,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
 
 // grid KV_HEADS * NQ, block 128: thread c weighs chunk c, then every thread sums its dim over the chunks
 __global__ void __launch_bounds__(HEAD_DIM) attn_combine_kernel(const float* ws_o, const float* ws_ml, int chunks,
-                                                               __nv_bfloat16* out) {
+                                                               ActT* out) {
   __shared__ float scratch[33];
   __shared__ float f[HEAD_DIM];
   pdl_trigger();
@@ -303,7 +293,7 @@ __global__ void __launch_bounds__(HEAD_DIM) attn_combine_kernel(const float* ws_
 #pragma unroll 8
   for (int c = 0; c < chunks; ++c) o += ws_o[((size_t(c) * KV_HEADS + g) * NQ + qi) * HEAD_DIM + d] * f[c];
   const int hh = qi / BLOCK, r = qi % BLOCK, h = g * QH + hh;
-  out[size_t(r) * Q_DIM + h * HEAD_DIM + d] = __float2bfloat16_rn(l > 0.f ? o / l : 0.f);
+  out[size_t(r) * Q_DIM + h * HEAD_DIM + d] = act::from_float(l > 0.f ? o / l : 0.f);
 }
 
 }  // namespace
@@ -312,8 +302,8 @@ std::size_t attention_workspace_floats(int nkeys) {
   return std::size_t(att_chunks(nkeys)) * KV_HEADS * NQ * (HEAD_DIM + 2);
 }
 
-void block_attention(const __nv_bfloat16* q, const void* k_cache, const void* v_cache, int nkeys,
-                     const std::int32_t* ctx_pos, bool fp8, const DraftParams* p, float* ws, __nv_bfloat16* out,
+void block_attention(const ActT* q, const void* k_cache, const void* v_cache, int nkeys,
+                     const std::int32_t* ctx_pos, bool fp8, const DraftParams* p, float* ws, ActT* out,
                      cudaStream_t stream) {
   if (nkeys <= 0) throw std::invalid_argument("block_attention: nkeys must be positive");
   if (ctx_pos != nullptr && (nkeys != WINDOW + BLOCK || fp8))
