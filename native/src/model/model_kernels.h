@@ -89,6 +89,11 @@ struct Widths {
 void verify_select(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
                    std::int64_t* token, std::int32_t* m_out, cudaGraphConditionalHandle handle, cudaStream_t stream);
 
+// Eager counterpart of verify_select for host-dispatched low-VRAM / streamed-KV verify steps: writes *m_out
+// (device) and *m_host (mapped host memory) without setting a CUDA graph conditional handle.
+void verify_select_eager(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
+                         std::int64_t* token, std::int32_t* m_out, std::int32_t* m_host, cudaStream_t stream);
+
 // The switch condition `handle` = index of *m in `widths`. Captured into the graph that owns `handle`.
 void width_select(const std::int32_t* m, const Widths& widths, cudaGraphConditionalHandle handle,
                   cudaStream_t stream);

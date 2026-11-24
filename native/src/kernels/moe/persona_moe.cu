@@ -16,10 +16,10 @@ constexpr int kMaxTapBlocks = 32;
 
 __global__ void decode_neuron_affine_kernel(ActT* __restrict__ act, const int* __restrict__ idx, int M,
                                             const persona::ExpertTapVisit* __restrict__ hook,
-                                            const std::int64_t* __restrict__ pos_dev) {
+                                            const std::int64_t* __restrict__ pos_dev, int pos_offset) {
   if (!hook || hook->n_neuron_entries <= 0 || !hook->neuron_entries) return;
   const int n_entries = hook->n_neuron_entries;
-  const int base_pos = pos_dev ? int(pos_dev[0]) : 0;
+  const int base_pos = (pos_dev ? int(pos_dev[0]) : 0) + pos_offset;
 
   for (int ei = blockIdx.x; ei < n_entries; ei += gridDim.x) {
     if (threadIdx.x == 0) {
@@ -82,12 +82,12 @@ __global__ void decode_neuron_affine_kernel(ActT* __restrict__ act, const int* _
 
 __global__ void decode_expert_tap_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, int M,
                                          const persona::ExpertTapVisit* __restrict__ hook,
-                                         const std::int64_t* __restrict__ pos_dev) {
+                                         const std::int64_t* __restrict__ pos_dev, int pos_offset) {
   if (!hook || hook->n_tap_targets <= 0 || !hook->tap_targets || !hook->tap_hits || !hook->tap_sum || !hook->tap_last) {
     return;
   }
   const int n_targets = hook->n_tap_targets;
-  const int base_pos = pos_dev ? int(pos_dev[0]) : 0;
+  const int base_pos = (pos_dev ? int(pos_dev[0]) : 0) + pos_offset;
   const int tid = threadIdx.x;
   const int bsz = blockDim.x;
 
@@ -162,11 +162,11 @@ __global__ void decode_expert_tap_kernel(const ActT* __restrict__ act, const int
 }  // namespace
 
 void apply_expert_hooks_decode(ActT* act, const int* idx, int M, const persona::ExpertTapVisit* hook,
-                               const std::int64_t* pos_dev, cudaStream_t stream) {
+                               const std::int64_t* pos_dev, cudaStream_t stream, int pos_offset) {
   if (!hook || M <= 0) return;
-  decode_neuron_affine_kernel<<<kMaxNeuronBlocks, 32, 0, stream>>>(act, idx, M, hook, pos_dev);
+  decode_neuron_affine_kernel<<<kMaxNeuronBlocks, 32, 0, stream>>>(act, idx, M, hook, pos_dev, pos_offset);
   CUDA_CHECK(cudaGetLastError());
-  decode_expert_tap_kernel<<<kMaxTapBlocks, 256, 0, stream>>>(act, idx, M, hook, pos_dev);
+  decode_expert_tap_kernel<<<kMaxTapBlocks, 256, 0, stream>>>(act, idx, M, hook, pos_dev, pos_offset);
   CUDA_CHECK(cudaGetLastError());
 }
 

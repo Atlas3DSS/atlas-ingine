@@ -215,6 +215,22 @@ __global__ void verify_select_kernel(const float* __restrict__ conf, const int* 
   }
 }
 
+__global__ void verify_select_eager_kernel(const float* __restrict__ conf, const int* __restrict__ drafts,
+                                           float threshold, Widths widths, long long* __restrict__ token,
+                                           int* __restrict__ m_out, volatile int* m_host) {
+  const int i = threadIdx.x;
+  if (i < 7) token[1 + i] = drafts[i];
+  if (i == 0) {
+    int lead = 0;
+    while (lead < 7 && conf[lead] > threshold) ++lead;
+    int m = widths.w[widths.n - 1];
+    for (int k = widths.n - 1; k >= 0; --k)
+      if (widths.w[k] >= lead + 1) m = widths.w[k];
+    *m_out = m;
+    *m_host = m;
+  }
+}
+
 __global__ void width_select_kernel(const int* __restrict__ m, Widths widths, cudaGraphConditionalHandle handle) {
   cudaGraphSetConditional(handle, width_index(widths, *m));
 }
@@ -315,6 +331,14 @@ void verify_select(const float* conf, const std::int32_t* drafts, float threshol
   if (widths.n < 1 || widths.n > 3) throw std::invalid_argument("verify_select: 1 to 3 widths");
   verify_select_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, reinterpret_cast<long long*>(token),
                                              m_out, handle);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void verify_select_eager(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
+                         std::int64_t* token, std::int32_t* m_out, std::int32_t* m_host, cudaStream_t stream) {
+  if (widths.n < 1 || widths.n > 3) throw std::invalid_argument("verify_select_eager: 1 to 3 widths");
+  verify_select_eager_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, reinterpret_cast<long long*>(token),
+                                                   m_out, m_host);
   CUDA_CHECK(cudaGetLastError());
 }
 

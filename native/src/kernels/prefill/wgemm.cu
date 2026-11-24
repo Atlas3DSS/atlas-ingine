@@ -551,6 +551,49 @@ template <int MT, int TM, int BITS>
 __device__ __forceinline__ void mma_step_exl3(float (&acc)[TM / 16][2][4], const uint16_t* A,
                                               const uint8_t* w_warp, int lane) {
   constexpr int TILE_BYTES = 32 * BITS;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+  // Pascal sm_60/sm_61 fast path: direct SMEM uint4 A reads (0 A shuffles) + hoisted B shuffles across MT
+  // processed in two 8-element K-halves (h=0,1) so live B/A regs stay tiny (zero local-memory spills).
+  const int g = lane >> 2, c = lane & 3;
+  const int bl0 = 4 * (2 * c), bl1 = 4 * (2 * c + 1);
+#pragma unroll
+  for (int kk = 0; kk < 8; ++kk) {
+    const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_warp + kk * TILE_BYTES);
+    uint32_t h01, h23, h45, h67;
+    exl3::dq8_mcg<BITS>([&](int wi) { return tw[wi]; }, lane, h01, h23, h45, h67);
+    const uint32_t bsrc[2][2] = {{h01, h23}, {h45, h67}};
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+      for (int kh = 0; kh < 2; ++kh) {
+        float2 b0[4], b1[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+          const uint32_t v0 = __shfl_sync(0xffffffffu, bsrc[nt][kh], bl0 + p);
+          const uint32_t v1 = __shfl_sync(0xffffffffu, bsrc[nt][kh], bl1 + p);
+          b0[p] = __half22float2(*reinterpret_cast<const __half2*>(&v0));
+          b1[p] = __half22float2(*reinterpret_cast<const __half2*>(&v1));
+        }
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+          const uint4 alo = *reinterpret_cast<const uint4*>(A + swz<16>(mt * 16 + g, kk * 2 + kh));
+          const uint4 ahi = *reinterpret_cast<const uint4*>(A + swz<16>(mt * 16 + g + 8, kk * 2 + kh));
+          const uint32_t al[4] = {alo.x, alo.y, alo.z, alo.w};
+          const uint32_t ah[4] = {ahi.x, ahi.y, ahi.z, ahi.w};
+#pragma unroll
+          for (int p = 0; p < 4; ++p) {
+            const float2 fal = __half22float2(*reinterpret_cast<const __half2*>(&al[p]));
+            const float2 fah = __half22float2(*reinterpret_cast<const __half2*>(&ah[p]));
+            acc[mt][nt][0] = fmaf(fal.y, b0[p].y, fmaf(fal.x, b0[p].x, acc[mt][nt][0]));
+            acc[mt][nt][1] = fmaf(fal.y, b1[p].y, fmaf(fal.x, b1[p].x, acc[mt][nt][1]));
+            acc[mt][nt][2] = fmaf(fah.y, b0[p].y, fmaf(fah.x, b0[p].x, acc[mt][nt][2]));
+            acc[mt][nt][3] = fmaf(fah.y, b1[p].y, fmaf(fah.x, b1[p].x, acc[mt][nt][3]));
+          }
+        }
+      }
+    }
+  }
+#else
   uint32_t h01, h23, h45, h67;
   {
     const uint32_t* tw0 = reinterpret_cast<const uint32_t*>(w_warp);
@@ -588,6 +631,7 @@ __device__ __forceinline__ void mma_step_exl3(float (&acc)[TM / 16][2][4], const
       h67 = nh67;
     }
   }
+#endif
 }
 
 template <int TM>
@@ -596,7 +640,11 @@ inline constexpr int exl3_a_stages() {
 }
 
 template <int BITS, Mode MODE, int K, int TM>
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+__global__ void __launch_bounds__(NT, TM == 32 ? 2 : 1) wgemm_exl3_kernel(const Exl3GemmArgs g) {
+#else
 __global__ void __launch_bounds__(NT, TM == 32 ? 3 : 1) wgemm_exl3_kernel(const Exl3GemmArgs g) {
+#endif
   constexpr int NE = MODE == Mode::Up ? 2 * kInter : kHidden;  // 2304
   constexpr int NTILES_N = NE / TN;                            // 18
   constexpr int BK_EXL = 128;

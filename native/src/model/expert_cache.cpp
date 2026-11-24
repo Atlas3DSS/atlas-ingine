@@ -150,6 +150,7 @@ ExpertCache::ExpertLayout ExpertCache::layout_for(ExpertFormat w13_fmt, ExpertFo
 ExpertCache::~ExpertCache() {
   dump_router_stats_if_configured();
   if (idx_ready_) cudaEventDestroy(idx_ready_);
+  if (pass0_done_) cudaEventDestroy(pass0_done_);
 }
 
 std::shared_ptr<ExpertCache> ExpertCache::create(
@@ -188,10 +189,13 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
   const int num_buckets = int(bucket_rec_bytes.size());
 
   CUDA_CHECK(cudaEventCreateWithFlags(&cache->idx_ready_, cudaEventDisableTiming));
+  CUDA_CHECK(cudaEventCreateWithFlags(&cache->pass0_done_, cudaEventDisableTiming));
   cache->host_idx_ = MappedHostBuffer(8 * TOP_K * sizeof(int));
   cache->host_counts_ = MappedHostBuffer(EXPERTS * sizeof(int));
-  cache->host_mask_ = MappedHostBuffer(EXPERTS);
-  cache->dev_mask_ = DeviceBuffer(EXPERTS);
+  for (int i = 0; i < 2; ++i) {
+    cache->host_mask_[i] = MappedHostBuffer(EXPERTS);
+    cache->dev_mask_[i] = DeviceBuffer(EXPERTS);
+  }
 
   const auto scores = load_or_build_scores(cfg.ranking, router_biases);
 
@@ -592,7 +596,7 @@ bool ExpertCache::stage_expert(int l, int e, std::uint64_t pin_gen) {
   const int b = layer_slab_[l];
   const ExpertLayout& lo = layouts_[l];
   const ExpertMeta& em = meta_[l][e];
-  const auto res = slabs_[b].acquire(make_key(l, e), pin_gen);
+  const auto res = slabs_[b].acquire(make_key(l, e), pin_gen, is_loop_layer(l));
   if (res.hit) {
     ++stats_.lru_hits;
     return false;
@@ -652,6 +656,7 @@ void ExpertCache::prepare_decode(int l, const int* d_idx, int m, cudaStream_t co
   }
 
   const int b = layer_slab_[l];
+  const bool prio = is_loop_layer(l);
   const std::uint64_t gen = ++pin_gen_;
   std::array<int, 8 * TOP_K> misses{};
   int nmiss = 0;
@@ -660,7 +665,7 @@ void ExpertCache::prepare_decode(int l, const int* d_idx, int m, cudaStream_t co
     const int e = uniq[i];
     if (meta_[l][e].tier == Tier::HotVram) {
       ++stats_.hot_hits;
-    } else if (slabs_[b].touch_and_pin(make_key(l, e), gen) >= 0) {
+    } else if (slabs_[b].touch_and_pin(make_key(l, e), gen, prio) >= 0) {
       ++stats_.lru_hits;
     } else {
       misses[nmiss++] = e;
@@ -677,6 +682,127 @@ void ExpertCache::prepare_decode(int l, const int* d_idx, int m, cudaStream_t co
   }
   if (need_wait) {
     dma_.record_and_wait_on(compute_stream);
+  }
+}
+
+void ExpertCache::run_decode_layer(
+    int l, const int* d_idx, int m, cudaStream_t compute_stream,
+    const std::function<void(int tok_offset, int tok_count)>& launch_moe_slice) {
+  if (mode_ == OffloadMode::Uva && dump_router_stats_.empty()) {
+    launch_moe_slice(0, m);
+    return;
+  }
+
+  const int nslots = m * TOP_K;
+  CUDA_CHECK(cudaMemcpyAsync(host_idx_.data(), d_idx, std::size_t(nslots) * sizeof(int), cudaMemcpyDeviceToHost,
+                             compute_stream));
+  CUDA_CHECK(cudaEventRecord(idx_ready_, compute_stream));
+  CUDA_CHECK(cudaEventSynchronize(idx_ready_));
+
+  const auto* idx = static_cast<const int*>(host_idx_.data());
+  for (int i = 0; i < nslots; ++i) {
+    const int e = idx[i];
+    if (e >= 0 && e < EXPERTS) ++router_hits_[l][e];
+  }
+
+  if (mode_ == OffloadMode::Uva) {
+    std::uint64_t seen_lo = 0, seen_hi = 0;
+    for (int i = 0; i < nslots; ++i) {
+      const int e = idx[i];
+      if (e < 0 || e >= EXPERTS) continue;
+      const std::uint64_t bit = 1ull << (e & 63);
+      std::uint64_t& word = (e < 64) ? seen_lo : seen_hi;
+      if (word & bit) continue;
+      word |= bit;
+      if (meta_[l][e].tier == Tier::HotVram) ++stats_.hot_hits;
+      else ++stats_.warm_fetches;
+    }
+    launch_moe_slice(0, m);
+    return;
+  }
+
+  const int b = layer_slab_[l];
+  const int cap = slabs_[b].capacity();
+  const bool prio = is_loop_layer(l);
+  if (cap == 0) {
+    // All experts in this record-size bucket are HOT VRAM resident.
+    std::uint64_t seen_lo = 0, seen_hi = 0;
+    for (int i = 0; i < nslots; ++i) {
+      const int e = idx[i];
+      if (e < 0 || e >= EXPERTS) continue;
+      const std::uint64_t bit = 1ull << (e & 63);
+      std::uint64_t& word = (e < 64) ? seen_lo : seen_hi;
+      if (word & bit) continue;
+      word |= bit;
+      ++stats_.hot_hits;
+    }
+    if (tables_[l].dirty) {
+      flush_layer_table(l);
+      dma_.record_and_wait_on(compute_stream);
+    }
+    launch_moe_slice(0, m);
+    return;
+  }
+
+  int t0 = 0;
+  while (t0 < m) {
+    if (t0 > 0) CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+    std::uint64_t seen_lo = 0, seen_hi = 0;
+    std::array<int, 8 * TOP_K> slice_non_hot{};
+    int n_non_hot = 0;
+    int n_hot = 0;
+    int t1 = t0;
+    while (t1 < m) {
+      std::uint64_t cand_lo = seen_lo, cand_hi = seen_hi;
+      std::array<int, TOP_K> add_non_hot{};
+      int n_add_non_hot = 0;
+      int n_add_hot = 0;
+      for (int k = 0; k < TOP_K; ++k) {
+        const int e = idx[t1 * TOP_K + k];
+        if (e < 0 || e >= EXPERTS) continue;
+        const std::uint64_t bit = 1ull << (e & 63);
+        std::uint64_t& word = (e < 64) ? cand_lo : cand_hi;
+        if (word & bit) continue;
+        word |= bit;
+        if (meta_[l][e].tier == Tier::HotVram) {
+          ++n_add_hot;
+        } else {
+          add_non_hot[n_add_non_hot++] = e;
+        }
+      }
+      if (t1 > t0 && n_non_hot + n_add_non_hot > cap) break;
+      seen_lo = cand_lo;
+      seen_hi = cand_hi;
+      n_hot += n_add_hot;
+      for (int i = 0; i < n_add_non_hot; ++i) slice_non_hot[n_non_hot++] = add_non_hot[i];
+      ++t1;
+    }
+
+    stats_.hot_hits += std::uint64_t(n_hot);
+    const std::uint64_t gen = ++pin_gen_;
+    std::array<int, 8 * TOP_K> misses{};
+    int nmiss = 0;
+    for (int i = 0; i < n_non_hot; ++i) {
+      const int e = slice_non_hot[i];
+      if (slabs_[b].touch_and_pin(make_key(l, e), gen, prio) >= 0) {
+        ++stats_.lru_hits;
+      } else {
+        misses[nmiss++] = e;
+      }
+    }
+    bool need_wait = false;
+    for (int i = 0; i < nmiss; ++i) {
+      need_wait |= stage_expert(l, misses[i], gen);
+    }
+    if (tables_[l].dirty) {
+      flush_layer_table(l);
+      need_wait = true;
+    }
+    if (need_wait) {
+      dma_.record_and_wait_on(compute_stream);
+    }
+    launch_moe_slice(t0, t1 - t0);
+    t0 = t1;
   }
 }
 
@@ -726,6 +852,7 @@ void ExpertCache::run_prefill_layer(
 
   const int b = layer_slab_[l];
   const int cap = slabs_[b].capacity();
+  const bool prio = is_loop_layer(l);
   if (cap <= 0) {
     throw std::runtime_error("expert_cache: zero LRU slab capacity for format " +
                              std::string(format_name(w13_formats_[l])) + "/" +
@@ -734,47 +861,117 @@ void ExpertCache::run_prefill_layer(
 
   if (int(misses.size()) <= cap) {
     const std::uint64_t gen = ++pin_gen_;
+    std::vector<int> lru_hits;
     std::vector<int> to_stage;
+    lru_hits.reserve(misses.size());
     to_stage.reserve(misses.size());
     for (int e : misses) {
-      if (slabs_[b].touch_and_pin(make_key(l, e), gen) >= 0) ++stats_.lru_hits;
-      else to_stage.push_back(e);
+      if (slabs_[b].touch_and_pin(make_key(l, e), gen, prio) >= 0) {
+        ++stats_.lru_hits;
+        lru_hits.push_back(e);
+      } else {
+        to_stage.push_back(e);
+      }
     }
-    bool need_wait = false;
-    for (int e : to_stage) need_wait |= stage_expert(l, e, gen);
-    if (tables_[l].dirty) {
+    if (to_stage.empty()) {
+      if (tables_[l].dirty) {
+        flush_layer_table(l);
+        dma_.record_and_wait_on(compute_stream);
+      }
+      launch_moe_pair(nullptr);
+      return;
+    }
+    if (!active_hot.empty() || !lru_hits.empty()) {
+      // Overlap Pass 0 (already-resident HOT + pinned LRU hits, valid in tables_[l].dev) on compute_stream
+      // with async PCIe H2D staging of `to_stage` into unreferenced LRU slots on dma_.stream().
+      auto* hmask0 = static_cast<std::uint8_t*>(host_mask_[0].data());
+      std::memset(hmask0, 0, EXPERTS);
+      for (int e : active_hot) hmask0[e] = 1;
+      for (int e : lru_hits) hmask0[e] = 1;
+      CUDA_CHECK(cudaMemcpyAsync(dev_mask_[0].p, hmask0, EXPERTS, cudaMemcpyHostToDevice, compute_stream));
+      launch_moe_pair(static_cast<const std::uint8_t*>(dev_mask_[0].p));
+      CUDA_CHECK(cudaEventRecord(pass0_done_, compute_stream));
+
+      auto* hmask1 = static_cast<std::uint8_t*>(host_mask_[1].data());
+      std::memset(hmask1, 0, EXPERTS);
+      for (int e : to_stage) {
+        hmask1[e] = 1;
+        (void)stage_expert(l, e, gen);
+      }
+      // Wait for Pass 0 to finish reading tables_[l].dev before flushing the updated pointer table (6 KB).
+      CUDA_CHECK(cudaStreamWaitEvent(dma_.stream(), pass0_done_, 0));
       flush_layer_table(l);
-      need_wait = true;
+      dma_.copy_h2d_async(dev_mask_[1].p, hmask1, EXPERTS);
+      dma_.record_and_wait_on(compute_stream);
+      launch_moe_pair(static_cast<const std::uint8_t*>(dev_mask_[1].p));
+      return;
     }
-    if (need_wait) dma_.record_and_wait_on(compute_stream);
+    for (int e : to_stage) (void)stage_expert(l, e, gen);
+    flush_layer_table(l);
+    dma_.record_and_wait_on(compute_stream);
     launch_moe_pair(nullptr);
     return;
   }
 
   // Sub-batched prefill when active misses exceed the bucket's LRU slab capacity.
-  auto* hmask = static_cast<std::uint8_t*>(host_mask_.data());
+  // Overlap active_hot compute in Pass 0 with batch 0's PCIe H2D DMA when HOT experts exist.
+  bool hot_done = active_hot.empty();
   for (std::size_t off = 0; off < misses.size(); off += std::size_t(cap)) {
     if (off > 0) CUDA_CHECK(cudaStreamSynchronize(compute_stream));
     const std::uint64_t gen = ++pin_gen_;
-    std::memset(hmask, 0, EXPERTS);
-    if (off == 0) {
-      for (int e : active_hot) hmask[e] = 1;
-    }
     const std::size_t end = std::min(misses.size(), off + std::size_t(cap));
     // Touch resident hits in this batch first so they aren't evicted by misses in the same batch.
+    std::vector<int> batch_hits;
     std::vector<int> batch_stage;
+    batch_hits.reserve(end - off);
     batch_stage.reserve(end - off);
     for (std::size_t j = off; j < end; ++j) {
       const int e = misses[j];
-      hmask[e] = 1;
-      if (slabs_[b].touch_and_pin(make_key(l, e), gen) >= 0) ++stats_.lru_hits;
-      else batch_stage.push_back(e);
+      if (slabs_[b].touch_and_pin(make_key(l, e), gen, prio) >= 0) {
+        ++stats_.lru_hits;
+        batch_hits.push_back(e);
+      } else {
+        batch_stage.push_back(e);
+      }
     }
-    for (int e : batch_stage) (void)stage_expert(l, e, gen);
-    flush_layer_table(l);
-    dma_.copy_h2d_async(dev_mask_.p, hmask, EXPERTS);
-    dma_.record_and_wait_on(compute_stream);
-    launch_moe_pair(static_cast<const std::uint8_t*>(dev_mask_.p));
+    const bool overlap_p0 = (!hot_done || !batch_hits.empty()) && !batch_stage.empty();
+    if (overlap_p0) {
+      auto* hmask0 = static_cast<std::uint8_t*>(host_mask_[0].data());
+      std::memset(hmask0, 0, EXPERTS);
+      if (!hot_done) {
+        for (int e : active_hot) hmask0[e] = 1;
+        hot_done = true;
+      }
+      for (int e : batch_hits) hmask0[e] = 1;
+      CUDA_CHECK(cudaMemcpyAsync(dev_mask_[0].p, hmask0, EXPERTS, cudaMemcpyHostToDevice, compute_stream));
+      launch_moe_pair(static_cast<const std::uint8_t*>(dev_mask_[0].p));
+      CUDA_CHECK(cudaEventRecord(pass0_done_, compute_stream));
+
+      auto* hmask1 = static_cast<std::uint8_t*>(host_mask_[1].data());
+      std::memset(hmask1, 0, EXPERTS);
+      for (int e : batch_stage) {
+        hmask1[e] = 1;
+        (void)stage_expert(l, e, gen);
+      }
+      CUDA_CHECK(cudaStreamWaitEvent(dma_.stream(), pass0_done_, 0));
+      flush_layer_table(l);
+      dma_.copy_h2d_async(dev_mask_[1].p, hmask1, EXPERTS);
+      dma_.record_and_wait_on(compute_stream);
+      launch_moe_pair(static_cast<const std::uint8_t*>(dev_mask_[1].p));
+    } else {
+      auto* hmask = static_cast<std::uint8_t*>(host_mask_[0].data());
+      std::memset(hmask, 0, EXPERTS);
+      if (!hot_done) {
+        for (int e : active_hot) hmask[e] = 1;
+        hot_done = true;
+      }
+      for (std::size_t j = off; j < end; ++j) hmask[misses[j]] = 1;
+      for (int e : batch_stage) (void)stage_expert(l, e, gen);
+      flush_layer_table(l);
+      dma_.copy_h2d_async(dev_mask_[0].p, hmask, EXPERTS);
+      dma_.record_and_wait_on(compute_stream);
+      launch_moe_pair(static_cast<const std::uint8_t*>(dev_mask_[0].p));
+    }
   }
 }
 

@@ -200,7 +200,7 @@ int main(int argc, char** argv) {
             &kv_ckpt_resume);
   ap.exclusive({"--kv-fp8", "--kv-q4"}, false);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
-  ap.flag("--atlas-6g", "6 GB VRAM preset (offload-vram-mb=5888, offload-ram-mb=12288, dense-fp8, kv-fp8, prefill-chunk=512)",
+  ap.flag("--atlas-6g", "6 GB VRAM preset (offload-vram-mb=5888, offload-ram-mb=12288, dense-fp8, kv-fp8, prefill-chunk=1024)",
           &atlas_6g);
   ap.option("--offload-vram-mb", "", "tiered MoE offloading VRAM cap in MiB (0 = off, e.g. 5888 for 6 GB GPU)",
             &offload_vram_mb);
@@ -251,7 +251,7 @@ int main(int argc, char** argv) {
       dense_fp8 = true;
       if (kv_paged || kv_vram_mb > 0) kv_q4 = true;
       if (!kv_q4) kv_fp8 = true;
-      if (prefill_chunk > 512) prefill_chunk = 512;
+      if (prefill_chunk > 1024) prefill_chunk = 1024;
     }
     options.model_dir = model_dir;
     options.ablation = ablation;

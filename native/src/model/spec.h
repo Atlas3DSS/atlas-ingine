@@ -61,6 +61,7 @@ class SpecLoop {
   Drafter& drafter_;
   Drafter::Draft draft_{};             // the drafter's fixed output buffers
   DeviceBuffer width_;                 // int32: the verify width chosen on the device
+  MappedHostBuffer width_host_;        // int32: mapped copy for eager low-VRAM / streamed-KV verify
   MappedHostBuffer record_;            // VerifyRecord of the last round
   MappedHostBuffer forced_window_;     // forced replay: int32 [8], the forced tokens after the round's anchor
   GraphExec verify_, verify_hooked_, accept_;
@@ -74,6 +75,7 @@ class SpecLoop {
   };
   AcceptKey accept_key_{};
   cudaEvent_t done_ = nullptr;
+  cudaEvent_t width_ready_ = nullptr;
 };
 
 }  // namespace ingine::model

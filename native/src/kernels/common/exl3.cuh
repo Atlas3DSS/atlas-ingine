@@ -19,10 +19,71 @@ __device__ __forceinline__ uint32_t decode_mcg_pair(uint32_t s0, uint32_t s1) {
   uint32_t x1 = s1 * 0xCBAC1FEDu;
   asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
   asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 610
+  // Pascal sm_61 (P40/1080Ti) executes FP16 __hadd2 at 1/64 rate; unpack and add in full-rate FP32.
+  const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&x0));
+  const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&x1));
+  const __half2 res = __floats2half2_rn(f0.x + f0.y, f1.x + f1.y);
+  return *reinterpret_cast<const uint32_t*>(&res);
+#else
   const __half2 h0 = *reinterpret_cast<const __half2*>(&x0);
   const __half2 h1 = *reinterpret_cast<const __half2*>(&x1);
   const __half2 res = __hadd2(__lows2half2(h0, h1), __highs2half2(h0, h1));
   return *reinterpret_cast<const uint32_t*>(&res);
+#endif
+}
+
+// Decode two 16-bit MCG codebook states directly into float2 (avoids FP16 round-trip on Pascal sm_60/sm_61).
+__device__ __forceinline__ float2 decode_mcg_pair_f2(uint32_t s0, uint32_t s1) {
+  uint32_t x0 = s0 * 0xCBAC1FEDu;
+  uint32_t x1 = s1 * 0xCBAC1FEDu;
+  asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
+  asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600
+  const __half2 h0 = *reinterpret_cast<const __half2*>(&x0);
+  const __half2 h1 = *reinterpret_cast<const __half2*>(&x1);
+  return __half22float2(__hadd2(__lows2half2(h0, h1), __highs2half2(h0, h1)));
+#else
+  const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&x0));
+  const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&x1));
+  return make_float2(f0.x + f0.y, f1.x + f1.y);
+#endif
+}
+
+template <int BITS, class LoadWord>
+__device__ __forceinline__ void dq8_mcg_f2(LoadWord&& load_word, int lane, float2& f01, float2& f23,
+                                           float2& f45, float2& f67) {
+  static_assert(BITS == 2 || BITS == 3, "exl3::dq8_mcg_f2 supports 2-bit and 3-bit tiles");
+  constexpr int NW = 8 * BITS;
+  const int b0a = (lane * 8 + 257) * BITS - 16;
+  const int w0a = (b0a >> 5) % NW;
+  const int w1a = (w0a + 1) % NW;
+
+  const int b0b = (lane * 8 + 261) * BITS - 16;
+  const int w0b = (b0b >> 5) % NW;
+  const int w1b = (w0b + 1) % NW;
+
+  const uint32_t a0 = load_word(w0a);
+  const uint32_t a1 = load_word(w1a);
+  const uint32_t b0 = (w0b == w0a) ? a0 : ((w0b == w1a) ? a1 : load_word(w0b));
+  const uint32_t b1 = (w1b == w1a) ? a1 : ((w1b == w0a) ? a0 : load_word(w1b));
+
+  const uint32_t wa = __funnelshift_l(a1, a0, b0a & 31);
+  const uint32_t s0 = wa >> 16;
+  const uint32_t s1 = (wa >> (16 - BITS)) & 0xffffu;
+  const uint32_t s2 = (wa >> (16 - 2 * BITS)) & 0xffffu;
+  const uint32_t s3 = (wa >> (16 - 3 * BITS)) & 0xffffu;
+
+  const uint32_t wb = __funnelshift_l(b1, b0, b0b & 31);
+  const uint32_t s4 = wb >> 16;
+  const uint32_t s5 = (wb >> (16 - BITS)) & 0xffffu;
+  const uint32_t s6 = (wb >> (16 - 2 * BITS)) & 0xffffu;
+  const uint32_t s7 = (wb >> (16 - 3 * BITS)) & 0xffffu;
+
+  f01 = decode_mcg_pair_f2(s0, s1);
+  f23 = decode_mcg_pair_f2(s2, s3);
+  f45 = decode_mcg_pair_f2(s4, s5);
+  f67 = decode_mcg_pair_f2(s6, s7);
 }
 
 // Decode this lane's 8 elements of a 16x16 EXL3 tile (BITS in {2, 3}) directly into 4 packed FP16 pairs:

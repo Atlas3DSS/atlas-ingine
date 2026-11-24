@@ -150,12 +150,14 @@ class VramLruSlab {
   [[nodiscard]] std::uint8_t* slot_ptr(int slot) const noexcept { return slots_[slot].vram_ptr; }
 
   // Pin an already-resident key for the current generation `pin_gen` so it cannot be evicted
-  // by other acquires in the same step/visit. Returns slot index on hit, -1 on miss.
-  int touch_and_pin(std::uint64_t key, std::uint64_t pin_gen) noexcept;
+  // by other acquires in the same step/visit. When `priority` is true, boosts LRU recency by
+  // slab capacity so high-reuse (e.g. 3x looped) entries survive single-pass layer sweeps.
+  // Returns slot index on hit, -1 on miss.
+  int touch_and_pin(std::uint64_t key, std::uint64_t pin_gen, bool priority = false) noexcept;
 
   // Acquire a VRAM slot for `key`, pinning it at `pin_gen`. Hits return hit=true without copying;
   // misses evict the least-recently-used slot whose pin_gen != current `pin_gen`.
-  AcquireResult acquire(std::uint64_t key, std::uint64_t pin_gen);
+  AcquireResult acquire(std::uint64_t key, std::uint64_t pin_gen, bool priority = false);
 
   void clear() noexcept;
 

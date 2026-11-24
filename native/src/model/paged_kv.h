@@ -159,8 +159,9 @@ class PagedKvCache {
   std::array<cudaEvent_t, 2> stage_dma_done_{};
   DeviceBuffer partial_o_, partial_m_, partial_l_;
 
-  // Small scratch buffers for Tier-2 NVMe decode fallback (M <= 8, ~1.5 MiB total)
-  DeviceBuffer dec_proj16_, dec_q_, dec_rel16_, dec_rel_;
+  // Small scratch buffers for streamed Q4 decode (M <= 8, ~3 MiB total including 16-way split-K workspace)
+  static constexpr int kDecodeSplits = 16;
+  DeviceBuffer dec_proj16_, dec_q_, dec_rel16_, dec_rel_, decode_ws_;
   MappedHostBuffer dec_pos_host_;
 
   // Per-visit fixed device page tables [max_pages]

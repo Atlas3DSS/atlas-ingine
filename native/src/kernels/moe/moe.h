@@ -61,6 +61,6 @@ void dequant_experts(const void* codes, const void* scales, const float* factor,
 // on decode `act` [M, 8, I] between moe_up and moe_down. Fixed-grid, CUDA-graph capturable, zero-write no-op
 // when gain == 1.0f && offset == 0.0f.
 void apply_expert_hooks_decode(ActT* act, const int* idx, int M, const persona::ExpertTapVisit* hook,
-                               const std::int64_t* pos_dev, cudaStream_t stream);
+                               const std::int64_t* pos_dev, cudaStream_t stream, int pos_offset = 0);
 
 }  // namespace ingine::kernels::moe

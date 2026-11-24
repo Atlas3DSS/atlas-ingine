@@ -88,9 +88,21 @@ void test_mmap_and_bounce_and_lru() {
   mf.advise_dontneed_all();
   require(ingine::process_rss_bytes() > 0, "process_rss_bytes returned 0");
 
+  // Priority LRU eviction shield: a priority (3x loop-layer) key survives single-pass sweeps.
+  {
+    ingine::VramLruSlab pslab(3, kSlot);
+    (void)pslab.acquire(100, 1, /*priority=*/true);   // tick 1 + 3 = 4
+    (void)pslab.acquire(200, 2, /*priority=*/false);  // tick 2
+    (void)pslab.acquire(300, 3, /*priority=*/false);  // tick 3
+    // Acquiring key 400 at gen 4 must evict non-priority key 200 (last_use=2), NOT priority key 100 (last_use=4).
+    const auto ev = pslab.acquire(400, 4, /*priority=*/false);
+    require(ev.evicted && ev.evicted_key == 200, "priority key should survive non-priority sweep");
+    require(pslab.find(100) >= 0, "priority key 100 should remain resident");
+  }
+
   CUDA_CHECK(cudaStreamDestroy(compute));
   fs::remove(tmp);
-  std::printf("test_paged_tier: PASS (MmapFile + PinnedBounceRing + VramLruSlab + TieredDmaStream)\n");
+  std::printf("test_paged_tier: PASS (MmapFile + PinnedBounceRing + VramLruSlab[+priority] + TieredDmaStream)\n");
 }
 
 void test_swap_file() {

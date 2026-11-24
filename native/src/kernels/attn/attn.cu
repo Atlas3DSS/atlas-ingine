@@ -88,6 +88,7 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -125,39 +126,44 @@ constexpr int Q4_SC_B = HKV * (D / 32) * 2;      // 64
 constexpr int Q4_ROW_B = Q4_NIB_B + Q4_SC_B;     // 576
 constexpr int Q4_HEAD_B = D / 2 + (D / 32) * 2;  // 72 (64B nibbles + 8B scales)
 
-// dynamic shared memory layout (floats), per M
-template <int M, bool F8 = false, bool Q4 = false>
+// dynamic shared memory layout (floats), per M.
+// LOW_SMEM=true (M > 1 on <=48 KiB Pascal & <=64 KiB Turing): single-stage half-width KV tile aliased
+// over the dead prologue staging region, direct Q read from proj, and 1-kv-at-a-time owner conv ->
+// <= 45 KiB for all M=2..8 across BF16/FP8/Q4_0 (eliminates up to 8x KV bandwidth amplification from
+// sequential M=1 fallback during DSpark speculative verification).
+template <int M, bool F8 = false, bool Q4 = false, bool LOW_SMEM = false>
 struct Smem {
     static constexpr bool RAW_TILE = F8 || Q4;
     static constexpr int ROWS = GQA * M;
+    static constexpr int NSTAGES = LOW_SMEM ? 1 : 2;
     // staged inputs (dead once the main loop starts)
-    static constexpr int Q = 0;                          // proj q rows [M][3][D]
-    static constexpr int QS = Q + M * GQA * D;           // q_scale [3][D]
+    static constexpr int Q = 0;                          // proj q rows [M][3][D] (omitted in LOW_SMEM)
+    static constexpr int QS = Q + (LOW_SMEM ? 0 : (M * GQA * D));  // q_scale [3][D]
     static constexpr int REL = QS + GQA * D;             // proj rel [M][3][16]
     static constexpr int RS = REL + M * GQA * DREL;      // r_scale [3][16]
     static constexpr int ST = RS + GQA * DREL;           // conv state [3][2][D]
     static constexpr int X = ST + 3 * 2 * D;             // k/v projections [M][2][D]
     static constexpr int W = X + M * 2 * D;              // conv weights [2][D][4] (sliding) | [2][4][D] (full)
     static constexpr int DYN = W + 2 * D * 4;            // dynamic taps [M][2][4]
-    static constexpr int NKF = DYN + M * 2 * 4;          // conv outputs [2][M][D]
-    static constexpr int STAGE_END = NKF + 2 * M * D;
-    // block merge, aliases the staged inputs
+    static constexpr int NKF = DYN + M * 2 * 4;          // conv outputs [2|1][M][D]
+    static constexpr int STAGE_END = NKF + (LOW_SMEM ? 1 : 2) * M * D;
+    // block merge, aliases the staged inputs (M == 1 only)
     static constexpr int RED_O = 0;                      // [warps][3][D]
     static constexpr int RED_ML = RED_O + MAXWARPS * GQA * D;
     static constexpr int MERGE_END = RED_ML + MAXWARPS * GQA * 2;
     static constexpr int UNION_END = STAGE_END > MERGE_END ? STAGE_END : MERGE_END;
-    // M > 1: K/V tiles loaded by the whole block (own region, so the first tiles are in flight while q /
-    // rel and the owner's convolutions are computed); 16-byte chunks are XOR-swizzled by key.
-    // BF16 caches: double-buffered 16-bit stages [2][KT][2][D], K rows bf16, V rows converted to fp16
-    // in place. E4M3 / Q4_0 caches (full layers): two raw tiles in flight, K read straight from them,
-    // V widened to fp16 in the staging region.
-    static constexpr int KT = RAW_TILE ? 64 : 32;        // keys per tile
-    static constexpr int KVS = (UNION_END + 3) & ~3;
+    // M > 1: K/V tiles loaded by the whole block.
+    // Standard: double-buffered after UNION_END for cp.async overlap during prologue.
+    // LOW_SMEM: single-buffered, aliased at offset 0 (after wv for RAW_TILE) once prologue finishes.
+    static constexpr int KT = LOW_SMEM ? (RAW_TILE ? 32 : 16) : (RAW_TILE ? 64 : 32);
+    static constexpr int WV_FLOATS = (LOW_SMEM && M > 1 && RAW_TILE) ? (KT * D / 2) : 0;  // fp16 [KT][D] at offset 0
+    static constexpr int KVS = LOW_SMEM ? ((WV_FLOATS + 3) & ~3) : ((UNION_END + 3) & ~3);
     static constexpr int KVS_FLOATS =
-        M > 1 ? (Q4 ? (2 * KT * 2 * Q4_HEAD_B / 4) : (2 * KT * 2 * D * (F8 ? 1 : 2) / 4)) : 0;
-    static constexpr int KPS = KVS + KVS_FLOATS;         // kpos (int) [2][KT]
-    static constexpr int SRP = KPS + (M > 1 && !RAW_TILE ? 2 * KT : 0);      // rel_proj window [2][DREL][KT + MAXM]
-    static constexpr int TILE_END = SRP + (M > 1 && !RAW_TILE ? 2 * DREL * (KT + MAXM) : 0);
+        M > 1 ? (Q4 ? (NSTAGES * KT * 2 * Q4_HEAD_B / 4) : (NSTAGES * KT * 2 * D * (F8 ? 1 : 2) / 4)) : 0;
+    static constexpr int KPS = KVS + KVS_FLOATS;         // kpos (int) [NSTAGES][KT]
+    static constexpr int SRP = KPS + (M > 1 && !RAW_TILE ? NSTAGES * KT : 0);  // rel_proj window [NSTAGES][DREL][KT+MAXM]
+    static constexpr int LOOP_END = SRP + (M > 1 && !RAW_TILE ? NSTAGES * DREL * (KT + MAXM) : 0);
+    static constexpr int TILE_END = LOW_SMEM ? (STAGE_END > LOOP_END ? STAGE_END : LOOP_END) : LOOP_END;
     // dedicated regions
     static constexpr int GATE = (TILE_END + 3) & ~3;     // this block's output gates [ROWS][OD]
     static constexpr int SINK = GATE + ROWS * OD;        // [ROWS]
@@ -169,12 +175,15 @@ struct Smem {
     static constexpr int NRP = M > 1 ? (ROWS + 7) / 8 * 8 : 0;
     static constexpr int QB = NST + 3 * 2 * D;           // q bf16 [NRP][D] (swizzled; as floats NRP D / 2)
     static constexpr int RELD = QB + NRP * D / 2;        // rel fp32 [NRP][16]
-    static constexpr int PSTRIDE = KT + 8;               // fp16 per P row (80 B: conflict-free ldmatrix)
+    static constexpr int PSTRIDE = KT + 8;               // fp16 per P row (conflict-free ldmatrix)
     static constexpr int PS = RELD + NRP * DREL;         // P as fp16 hi, lo [2][NRP][PSTRIDE]
     static constexpr int ITM = PS + NRP * PSTRIDE;       // per key m-tile row (max, sum) float2 [KT/16][NRP]
     static constexpr int END = ITM + 2 * (KT / 16) * NRP;
     static constexpr size_t BYTES = size_t(END) * 4;
 };
+static_assert(Smem<8, false, false, true>::BYTES <= 49152, "LOW_SMEM M=8 BF16 must fit 48 KiB SMEM");
+static_assert(Smem<8, true, false, true>::BYTES <= 49152, "LOW_SMEM M=8 FP8 must fit 48 KiB SMEM");
+static_assert(Smem<8, false, true, true>::BYTES <= 49152, "LOW_SMEM M=8 Q4 must fit 48 KiB SMEM");
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return unsigned(__cvta_generic_to_shared(p)); }
 
@@ -439,15 +448,16 @@ struct Buf {
     float rp[U];  // rel_proj[c][dp] (0 if dp >= 1024)
 };
 
-template <int M, bool FULL, bool F8, bool SPLIT = false, bool Q4 = false>
-__global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
+template <int M, bool FULL, bool F8, bool SPLIT = false, bool Q4 = false, bool LOW_SMEM = false>
+__global__ void __launch_bounds__(MAXWARPS * 32, LOW_SMEM ? 1 : 2) attn_decode_kernel(const Params p) {
     static_assert(FULL || (!F8 && !Q4), "FP8/Q4 caches are full-layer only");
     static_assert(!(F8 && Q4), "F8 and Q4 are mutually exclusive");
+    static_assert(!LOW_SMEM || M > 1, "LOW_SMEM is only for M > 1");
     constexpr bool RAW_TILE = F8 || Q4;
     using CT = std::conditional_t<Q4, uint8_t, std::conditional_t<F8, __nv_fp8_storage_t, ActT>>;
     using KV = std::conditional_t<Q4, Q4Chunk, std::conditional_t<F8, uint2, uint4>>;
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
-    using L = Smem<M, F8, Q4>;
+    using L = Smem<M, F8, Q4, LOW_SMEM>;
     extern __shared__ __align__(16) float sm[];
     ActT(*s_nkv)[M][D] = reinterpret_cast<ActT(*)[M][D]>(sm + L::NKV);
 
@@ -575,9 +585,11 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // straight into mma fragments), then V rows (widened to fp16 in the staging region, which is dead once
     // q / rel and the owner's convs are done). Every call commits a group (empty past the end), so the
     // group count per tile is fixed.
-    constexpr int NRAW = 2;
+    constexpr int NRAW = L::NSTAGES;
     constexpr int RAWB = Q4 ? (KT * 2 * Q4_HEAD_B) : (KT * 2 * D);  // bytes per raw tile
-    static_assert(!RAW_TILE || M == 1 || (NRAW * RAWB <= L::KVS_FLOATS * 4 && KT * D * 2 <= L::UNION_END * 4),
+    static_assert(!RAW_TILE || M == 1 ||
+                      (NRAW * RAWB <= L::KVS_FLOATS * 4 &&
+                       (LOW_SMEM ? (KT * D * 2 <= L::KVS * 4) : (KT * D * 2 <= L::UNION_END * 4))),
                   "compressed tiles and the widened V tile must fit the stage and staging regions");
     char* const raw = reinterpret_cast<char*>(sm + L::KVS);
     __half* const wv = reinterpret_cast<__half*>(sm);  // F8/Q4: the widened V tile [KT][D], chunks swizzled
@@ -639,8 +651,10 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 #pragma unroll 1
     for (int i = 0; i <= p.zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
-    for (int i = tid; i < M * GQA * D / 4; i += NT)       // q rows of heads 3g..3g+2 are contiguous
-        cp16(sm + L::Q + 4 * i, p.proj + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
+    if constexpr (!LOW_SMEM) {
+        for (int i = tid; i < M * GQA * D / 4; i += NT)       // q rows of heads 3g..3g+2 are contiguous
+            cp16(sm + L::Q + 4 * i, p.proj + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
+    }
     for (int i = tid; i < M * GQA * DREL / 4; i += NT)
         cp16(sm + L::REL + 4 * i,
              p.proj + size_t(i / (GQA * DREL / 4)) * R + OFF_REL + g * GQA * DREL + 4 * (i % (GQA * DREL / 4)));
@@ -665,7 +679,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
     }
 
-    if constexpr (M > 1 && RAW_TILE) {  // staged inputs as the oldest group, then the first NRAW tiles behind them
+    if constexpr (M > 1 && RAW_TILE && !LOW_SMEM) {  // staged inputs as the oldest group, then the first NRAW tiles behind them
         copy::commit();
 #pragma unroll 1
         for (int t = 0; t < NRAW; ++t) issue_raw(t);
@@ -674,7 +688,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     } else {
         copy::wait_all();
         __syncthreads();
-        if constexpr (M > 1) {
+        if constexpr (M > 1 && !LOW_SMEM) {
             if (rank * KT < L_old) issue(0, rank * KT);  // in flight during q / rel and the owner's work
         }
     }
@@ -718,7 +732,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         for (int k = 0; k < (ROWS + 7) / 8; ++k) {
             const int rq = warp + 8 * k, row = min(rq, ROWS - 1), i = row % GQA;
             const float tau = tau_of(row / GQA);
-            const float4 a = reinterpret_cast<const float4*>(sm + L::Q + row * D)[lane];
+            const float4 a = LOW_SMEM
+                ? reinterpret_cast<const float4*>(p.proj + size_t(row / GQA) * R + (g * GQA + i) * D)[lane]
+                : reinterpret_cast<const float4*>(sm + L::Q + row * D)[lane];
             const float4 s = reinterpret_cast<const float4*>(sm + L::QS + i * D)[lane];
             float x[4] = {a.x * s.x, a.y * s.y, a.z * s.z, a.w * s.w};
             const float f = clip_factor(wsum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]), CLIP_QK);
@@ -761,80 +777,91 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 
     // ---- owner: new keys / values of this KV head
     if (owner) {
-        float* nkf = sm + L::NKF;  // [2][M][D]
-        for (int idx = tid; idx < 2 * D; idx += NT) {
-            const int kv = idx / D, ch = idx % D;
-            float e[3 + M];  // [state, x_0..x_{M-1}]
+        float* nkf = sm + L::NKF;  // [2|1][M][D]
+        constexpr int KV_PASSES = LOW_SMEM ? 2 : 1;
 #pragma unroll
-            for (int j = 0; j < 3; ++j) e[j] = sm[L::ST + (j * 2 + kv) * D + ch];
+        for (int kv_pass = 0; kv_pass < KV_PASSES; ++kv_pass) {
+            const int n_ch = LOW_SMEM ? D : (2 * D);
+            for (int idx = tid; idx < n_ch; idx += NT) {
+                const int kv = LOW_SMEM ? kv_pass : (idx / D);
+                const int ch = LOW_SMEM ? idx : (idx % D);
+                float e[3 + M];  // [state, x_0..x_{M-1}]
 #pragma unroll
-            for (int m = 0; m < M; ++m) e[3 + m] = sm[L::X + (m * 2 + kv) * D + ch];
+                for (int j = 0; j < 3; ++j) e[j] = sm[L::ST + (j * 2 + kv) * D + ch];
 #pragma unroll
-            for (int m = 0; m < M; ++m) {
-                float y;
-                if constexpr (FULL) {  // dynamic conv, weights by lag (0 = current), / sqrt(9)
-                    float o = 0.f;
+                for (int m = 0; m < M; ++m) e[3 + m] = sm[L::X + (m * 2 + kv) * D + ch];
 #pragma unroll
-                    for (int lag = 0; lag < 4; ++lag) {
-                        const float w = __fadd_rn(sm[L::W + (kv * 4 + lag) * D + ch], sm[L::DYN + (m * 2 + kv) * 4 + lag]);
-                        o = __fadd_rn(o, __fmul_rn(w, e[m + 3 - lag]));
+                for (int m = 0; m < M; ++m) {
+                    float y;
+                    if constexpr (FULL) {  // dynamic conv, weights by lag (0 = current), / sqrt(9)
+                        float o = 0.f;
+#pragma unroll
+                        for (int lag = 0; lag < 4; ++lag) {
+                            const float w = __fadd_rn(sm[L::W + (kv * 4 + lag) * D + ch], sm[L::DYN + (m * 2 + kv) * 4 + lag]);
+                            o = __fadd_rn(o, __fmul_rn(w, e[m + 3 - lag]));
+                        }
+                        y = __fmul_rn(__fadd_rn(o, e[m + 3]), INV_3);
+                    } else {  // static conv, conv1d order (tap 3 = current), / sqrt(5)
+                        const float* w = sm + L::W + (kv * D + ch) * 4;
+                        float o = __fmul_rn(w[0], e[m]);
+#pragma unroll
+                        for (int j = 1; j < 4; ++j) o = __fadd_rn(o, __fmul_rn(w[j], e[m + j]));
+                        y = __fmul_rn(__fadd_rn(o, e[m + 3]), INV_SQRT5);
                     }
-                    y = __fmul_rn(__fadd_rn(o, e[m + 3]), INV_3);
-                } else {  // static conv, conv1d order (tap 3 = current), / sqrt(5)
-                    const float* w = sm + L::W + (kv * D + ch) * 4;
-                    float o = __fmul_rn(w[0], e[m]);
-#pragma unroll
-                    for (int j = 1; j < 4; ++j) o = __fadd_rn(o, __fmul_rn(w[j], e[m + j]));
-                    y = __fmul_rn(__fadd_rn(o, e[m + 3]), INV_SQRT5);
+                    nkf[((LOW_SMEM ? 0 : kv) * M + m) * D + ch] = bf16r(y);
                 }
-                nkf[(kv * M + m) * D + ch] = bf16r(y);
+#pragma unroll
+                for (int i = 0; i < 3; ++i) sm[L::NST + (i * 2 + kv) * D + ch] = e[M + i];
             }
+            __syncthreads();
+            const int n_pr = LOW_SMEM ? M : (2 * M);
+            for (int pr = warp; pr < n_pr; pr += NT / 32) {
+                const int kv = LOW_SMEM ? kv_pass : (pr / M);
+                const int m = LOW_SMEM ? pr : (pr % M);
+                const float4 x = reinterpret_cast<const float4*>(nkf + pr * D)[lane];
+                const float ss = wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
+                const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
+                float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
+                if constexpr (Q4) {
+                    // BF16 first (matching attn_prep), then Q4_0 per 32-element block (8 lanes x 4 elems)
 #pragma unroll
-            for (int i = 0; i < 3; ++i) sm[L::NST + (i * 2 + kv) * D + ch] = e[M + i];
-        }
-        __syncthreads();
-        for (int pr = warp; pr < 2 * M; pr += NT / 32) {
-            const int kv = pr / M, m = pr % M;
-            const float4 x = reinterpret_cast<const float4*>(nkf + pr * D)[lane];
-            const float ss = wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
-            const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
-            float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
-            if constexpr (Q4) {
-                // BF16 first (matching attn_prep), then Q4_0 per 32-element block (8 lanes x 4 elems)
+                    for (int e = 0; e < 4; ++e) y[e] = bf16r(y[e]);
+                    auto pick_max = [](float a, float b) {
+                        const float aa = fabsf(a), ab = fabsf(b);
+                        return (ab > aa || (ab == aa && b < a)) ? b : a;
+                    };
+                    float mx = pick_max(pick_max(y[0], y[1]), pick_max(y[2], y[3]));
 #pragma unroll
-                for (int e = 0; e < 4; ++e) y[e] = bf16r(y[e]);
-                auto pick_max = [](float a, float b) {
-                    const float aa = fabsf(a), ab = fabsf(b);
-                    return (ab > aa || (ab == aa && b < a)) ? b : a;
-                };
-                float mx = pick_max(pick_max(y[0], y[1]), pick_max(y[2], y[3]));
+                    for (int o = 1; o < 8; o <<= 1) mx = pick_max(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                    const __half d_h = __float2half_rn(mx * (-0.125f));
+                    const float d = __half2float(d_h);
+                    const float id = d != 0.f ? (1.f / d) : 0.f;
+                    const float neg8d = -8.f * d;
+                    uint32_t q[4];
 #pragma unroll
-                for (int o = 1; o < 8; o <<= 1) mx = pick_max(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-                const __half d_h = __float2half_rn(mx * (-0.125f));
-                const float d = __half2float(d_h);
-                const float id = d != 0.f ? (1.f / d) : 0.f;
-                const float neg8d = -8.f * d;
-                uint32_t q[4];
+                    for (int e = 0; e < 4; ++e) {
+                        int qi = __float2int_rn(y[e] * id);
+                        qi = max(-8, min(7, qi));
+                        q[e] = uint32_t(qi + 8);
+                        y[e] = fmaf(float(q[e]), d, neg8d);
+                    }
+                    uint8_t* qdst = reinterpret_cast<uint8_t*>(sm + L::NKV_Q4) + (kv * M + m) * Q4_HEAD_B;
+                    *reinterpret_cast<uint16_t*>(qdst + lane * 2) =
+                        uint16_t(q[0] | (q[1] << 4) | (q[2] << 8) | (q[3] << 12));
+                    if ((lane & 7) == 0)
+                        *reinterpret_cast<uint16_t*>(qdst + 64 + (lane >> 3) * 2) = __half_as_ushort(d_h);
+                } else if constexpr (F8) {  // the values the cache will hold: BF16, then E4M3 (exact in BF16)
 #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    int qi = __float2int_rn(y[e] * id);
-                    qi = max(-8, min(7, qi));
-                    q[e] = uint32_t(qi + 8);
-                    y[e] = fmaf(float(q[e]), d, neg8d);
+                    for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
                 }
-                uint8_t* qdst = reinterpret_cast<uint8_t*>(sm + L::NKV_Q4) + (kv * M + m) * Q4_HEAD_B;
-                *reinterpret_cast<uint16_t*>(qdst + lane * 2) =
-                    uint16_t(q[0] | (q[1] << 4) | (q[2] << 8) | (q[3] << 12));
-                if ((lane & 7) == 0)
-                    *reinterpret_cast<uint16_t*>(qdst + 64 + (lane >> 3) * 2) = __half_as_ushort(d_h);
-            } else if constexpr (F8) {  // the values the cache will hold: BF16, then E4M3 (exact in BF16)
-#pragma unroll
-                for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
+                const uint2 v = make_uint2(pack2(y[0], y[1]), pack2(y[2], y[3]));
+                reinterpret_cast<uint2*>(&s_nkv[kv][m][0])[lane] = v;
             }
-            const uint2 v = make_uint2(pack2(y[0], y[1]), pack2(y[2], y[3]));
-            reinterpret_cast<uint2*>(&s_nkv[kv][m][0])[lane] = v;
+            __syncthreads();
         }
-        __syncthreads();
+    }
+    if constexpr (LOW_SMEM) {
+        __syncthreads();  // prologue staging (0..STAGE_END) is dead before main-loop tile staging overwrites it
     }
 
     // ---- attention over this block's keys
@@ -1016,26 +1043,28 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         // F8/Q4: the V rows of raw slot `slot` to fp16 in wv
         auto expand_v = [&](const int slot) {
             if constexpr (Q4) {
-                // 64 keys x 4 blocks/head = 256 threads: one Q4_0 block (32 elems) per thread
+                // KT keys x 4 blocks/head: 256 threads for KT=64, 128 active threads for KT=32 (LOW_SMEM)
                 const int key = tid >> 2, blk = tid & 3;
-                const uint4 vn = *reinterpret_cast<const uint4*>(raw + slot * RAWB + KT * 64 + key * 64 + blk * 16);
-                const uint16_t vsc =
-                    *reinterpret_cast<const uint16_t*>(raw + slot * RAWB + 2 * KT * 64 + KT * 8 + key * 8 + blk * 2);
-                const float vd_raw = __half2float(__ushort_as_half(vsc));
-                const float vd = isfinite(vd_raw) ? vd_raw : 0.f;
-                const float neg8d = -8.f * vd;
-                const uint32_t w[4] = {vn.x, vn.y, vn.z, vn.w};
+                if (key < KT) {
+                    const uint4 vn = *reinterpret_cast<const uint4*>(raw + slot * RAWB + KT * 64 + key * 64 + blk * 16);
+                    const uint16_t vsc =
+                        *reinterpret_cast<const uint16_t*>(raw + slot * RAWB + 2 * KT * 64 + KT * 8 + key * 8 + blk * 2);
+                    const float vd_raw = __half2float(__ushort_as_half(vsc));
+                    const float vd = isfinite(vd_raw) ? vd_raw : 0.f;
+                    const float neg8d = -8.f * vd;
+                    const uint32_t w[4] = {vn.x, vn.y, vn.z, vn.w};
 #pragma unroll
-                for (int sub = 0; sub < 4; ++sub) {
-                    const uint32_t u = w[sub];
-                    uint32_t o[4];
-                    o[0] = half2_of(fmaf(float(u & 0xfu), vd, neg8d), fmaf(float((u >> 4) & 0xfu), vd, neg8d));
-                    o[1] = half2_of(fmaf(float((u >> 8) & 0xfu), vd, neg8d), fmaf(float((u >> 12) & 0xfu), vd, neg8d));
-                    o[2] = half2_of(fmaf(float((u >> 16) & 0xfu), vd, neg8d), fmaf(float((u >> 20) & 0xfu), vd, neg8d));
-                    o[3] = half2_of(fmaf(float((u >> 24) & 0xfu), vd, neg8d), fmaf(float((u >> 28) & 0xfu), vd, neg8d));
-                    *reinterpret_cast<uint4*>(wv + roff(key, 4 * blk + sub)) = make_uint4(o[0], o[1], o[2], o[3]);
+                    for (int sub = 0; sub < 4; ++sub) {
+                        const uint32_t u = w[sub];
+                        uint32_t o[4];
+                        o[0] = half2_of(fmaf(float(u & 0xfu), vd, neg8d), fmaf(float((u >> 4) & 0xfu), vd, neg8d));
+                        o[1] = half2_of(fmaf(float((u >> 8) & 0xfu), vd, neg8d), fmaf(float((u >> 12) & 0xfu), vd, neg8d));
+                        o[2] = half2_of(fmaf(float((u >> 16) & 0xfu), vd, neg8d), fmaf(float((u >> 20) & 0xfu), vd, neg8d));
+                        o[3] = half2_of(fmaf(float((u >> 24) & 0xfu), vd, neg8d), fmaf(float((u >> 28) & 0xfu), vd, neg8d));
+                        *reinterpret_cast<uint4*>(wv + roff(key, 4 * blk + sub)) = make_uint4(o[0], o[1], o[2], o[3]);
+                    }
                 }
-            } else {
+            } else if constexpr (F8) {
                 constexpr int NCH = KT * (D / 16) / NT;  // 16-byte E4M3 chunks per thread
                 static_assert(NCH * NT == KT * (D / 16), "chunks must divide over the block");
 #pragma unroll
@@ -1333,47 +1362,73 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         using RawK = std::true_type;
         using SmemK = std::false_type;
 
-        // the call's own keys first (stage 1 of kvs; for E4M3 caches V rows 0..15 and K rows 32..47 of wv),
-        // while the first tiles are in flight
+        // the call's own keys first (stage 1 of kvs, or stage 0 in LOW_SMEM; for RAW_TILE V rows 0..15
+        // and K rows (KT/2)..(KT/2+15) of wv), while the first tiles are in flight (or before old loop in LOW_SMEM)
+        constexpr int NEW_K_OFF = (KT / 2) * D;
+        constexpr int NEW_BF_ST = LOW_SMEM ? 0 : 1;
         if (owner) {
             for (int i = tid; i < 16 * 2 * (D / 8); i += NT) {
                 const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8);
                 uint4 u = make_uint4(0u, 0u, 0u, 0u);
                 if (key < M) u = reinterpret_cast<const uint4*>(&s_nkv[kv][key][0])[ch];
                 if (kv) u = make_uint4(to_half(u.x), to_half(u.y), to_half(u.z), to_half(u.w));
-                uint4* dst = RAW_TILE ? reinterpret_cast<uint4*>(wv + (kv ? 0 : 32 * D) + roff(key, ch))
-                                      : reinterpret_cast<uint4*>(kvs + kv_off(1, key, kv, ch));
+                uint4* dst = RAW_TILE ? reinterpret_cast<uint4*>(wv + (kv ? 0 : NEW_K_OFF) + roff(key, ch))
+                                      : reinterpret_cast<uint4*>(kvs + kv_off(NEW_BF_ST, key, kv, ch));
                 *dst = u;
             }
             __syncthreads();
             if constexpr (RAW_TILE)
-                consume([&](int key, int ch) { return reinterpret_cast<const ActT*>(wv + 32 * D + roff(key, ch)); },
+                consume([&](int key, int ch) { return reinterpret_cast<const ActT*>(wv + NEW_K_OFF + roff(key, ch)); },
                         [&](int key, int ch) { return wv + roff(key, ch); }, SmemK{}, nullptr, 0, 0, true, nothing);
             else
-                consume([&](int key, int ch) { return kvs + kv_off(1, key, 0, ch); },
-                        [&](int key, int ch) { return kvs + kv_off(1, key, 1, ch); }, SmemK{}, nullptr, 1, 0, true, nothing);
+                consume([&](int key, int ch) { return kvs + kv_off(NEW_BF_ST, key, 0, ch); },
+                        [&](int key, int ch) { return kvs + kv_off(NEW_BF_ST, key, 1, ch); }, SmemK{}, nullptr, NEW_BF_ST,
+                        0, true, nothing);
+            if constexpr (LOW_SMEM) __syncthreads();
         }
         if constexpr (RAW_TILE) {
             int t = 0;
             for (int base = rank * KT; base < L_old; base += CS * KT, ++t) {
-                copy::wait<NRAW - 1>();  // this thread's part of tile t
-                __syncthreads();  // tile t landed for everyone; the previous tile's P V is done with wv
-                expand_v(t % NRAW);
-                __syncthreads();
-                consume([&](int key, int ch) { return kvs + kv_off(0, key, 0, ch); },  // (unused: K is raw)
-                        [&](int key, int ch) { return wv + roff(key, ch); }, RawK{}, raw + (t % NRAW) * RAWB, 0, base,
-                        false, [&] { issue_raw(t + NRAW); });  // after the S items, this tile's slot is free
+                if constexpr (LOW_SMEM) {
+                    issue_raw(t);
+                    copy::wait<0>();
+                    __syncthreads();
+                    expand_v(0);
+                    __syncthreads();
+                    consume([&](int key, int ch) { return kvs + kv_off(0, key, 0, ch); },
+                            [&](int key, int ch) { return wv + roff(key, ch); }, RawK{}, raw, 0, base, false, nothing);
+                    __syncthreads();
+                } else {
+                    copy::wait<NRAW - 1>();  // this thread's part of tile t
+                    __syncthreads();  // tile t landed for everyone; the previous tile's P V is done with wv
+                    expand_v(t % NRAW);
+                    __syncthreads();
+                    consume([&](int key, int ch) { return kvs + kv_off(0, key, 0, ch); },  // (unused: K is raw)
+                            [&](int key, int ch) { return wv + roff(key, ch); }, RawK{}, raw + (t % NRAW) * RAWB, 0, base,
+                            false, [&] { issue_raw(t + NRAW); });  // after the S items, this tile's slot is free
+                }
             }
         } else {
             int st = 0;
-            for (int base = rank * KT; base < L_old; base += CS * KT, st ^= 1) {
-                copy::wait<0>();  // tile `base` (the only one in flight)
-                convert_v(st);
-                __syncthreads();  // tile landed for everyone; the previous tile's P V is done
-                if (base + CS * KT < L_old) issue(st ^ 1, base + CS * KT);
-                consume([&](int key, int ch) { return kvs + kv_off(st, key, 0, ch); },
-                        [&](int key, int ch) { return kvs + kv_off(st, key, 1, ch); }, SmemK{}, nullptr, st, base, false,
-                        nothing);
+            for (int base = rank * KT; base < L_old; base += CS * KT, st ^= (LOW_SMEM ? 0 : 1)) {
+                if constexpr (LOW_SMEM) {
+                    issue(0, base);
+                    copy::wait<0>();
+                    convert_v(0);
+                    __syncthreads();
+                    consume([&](int key, int ch) { return kvs + kv_off(0, key, 0, ch); },
+                            [&](int key, int ch) { return kvs + kv_off(0, key, 1, ch); }, SmemK{}, nullptr, 0, base,
+                            false, nothing);
+                    __syncthreads();
+                } else {
+                    copy::wait<0>();  // tile `base` (the only one in flight)
+                    convert_v(st);
+                    __syncthreads();  // tile landed for everyone; the previous tile's P V is done
+                    if (base + CS * KT < L_old) issue(st ^ 1, base + CS * KT);
+                    consume([&](int key, int ch) { return kvs + kv_off(st, key, 0, ch); },
+                            [&](int key, int ch) { return kvs + kv_off(st, key, 1, ch); }, SmemK{}, nullptr, st, base,
+                            false, nothing);
+                }
             }
         }
 
@@ -1613,6 +1668,29 @@ Kernel kernel_of() {
     return k;
 }
 
+template <int M, bool FULL, bool F8, bool Q4 = false>
+Kernel kernel_of_low_smem() {
+    static const Kernel k = [] {
+        const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true, Q4, true>;
+        const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8, Q4>;
+        return Kernel{f1, f2, M, Smem<M, F8, Q4, true>::BYTES};
+    }();
+    return k;
+}
+
+template <bool FULL, bool F8 = false, bool Q4 = false>
+Kernel select_low_smem(int M) {
+    switch (M) {
+        case 2: return kernel_of_low_smem<2, FULL, F8, Q4>();
+        case 3: return kernel_of_low_smem<3, FULL, F8, Q4>();
+        case 4: return kernel_of_low_smem<4, FULL, F8, Q4>();
+        case 5: return kernel_of_low_smem<5, FULL, F8, Q4>();
+        case 6: return kernel_of_low_smem<6, FULL, F8, Q4>();
+        case 7: return kernel_of_low_smem<7, FULL, F8, Q4>();
+        default: return kernel_of_low_smem<8, FULL, F8, Q4>();
+    }
+}
+
 template <bool F8, bool Q4>
 constexpr size_t smem_bytes(int M) {
     switch (M) {
@@ -1722,32 +1800,31 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.saved_nkv = reinterpret_cast<ActT*>(static_cast<char*>(a.workspace) + ws_nkv_off(M));
     p.saved_nst = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + ws_nst_off(M));
     p.out = a.out;
-    // Turing (64 KiB opt-in SMEM) fits M=1,2 natively; Pascal (48 KiB) fits M=1 natively.
-    // For larger M on those devices, run M sequential M=1 decode steps (<=18 KiB SMEM, CUDA-graph capturable).
+    // On <=48 KiB Pascal and <=64 KiB Turing GPUs, dispatch the native single-stage LOW_SMEM M=2..8 kernel
+    // (<= 45 KiB SMEM) instead of M sequential M=1 launches (eliminates up to 8x KV bandwidth amplification).
+    static const bool force_low_smem = [] {
+        const char* v = std::getenv("INGINE_FORCE_LOW_SMEM_ATTN");
+        return v && v[0] == '1';
+    }();
     const size_t need_smem = full ? (a.cache_q4 ? smem_bytes<false, true>(M)
                                                 : (a.cache_fp8 ? smem_bytes<true, false>(M) : smem_bytes<false, false>(M)))
                                   : smem_bytes<false, false>(M);
-    if (M > 1 && current_max_smem_optin() < int(need_smem)) {
-        const Kernel k1 = full ? (a.cache_q4 ? select<true, false, true>(1)
-                                             : (a.cache_fp8 ? select<true, true, false>(1) : select<true, false, false>(1)))
-                               : select<false, false, false>(1);
-        cudaLaunchAttribute attrs[2];
-        cudaLaunchConfig_t cfg1 = launch_config(k1, stream, attrs);
-        // Disable PDL between sequential M=1 steps: step m+1 reads k_cache/v_cache/conv_state written at the end of step m.
-        if (cfg1.numAttrs > 1) cfg1.numAttrs = 1;
+    if (M > 1 && (force_low_smem || current_max_smem_optin() < int(need_smem))) {
+        const Kernel k = full ? (a.cache_q4 ? select_low_smem<true, false, true>(M)
+                                            : (a.cache_fp8 ? select_low_smem<true, true, false>(M)
+                                                           : select_low_smem<true, false, false>(M)))
+                              : select_low_smem<false, false, false>(M);
+        cudaLaunchConfig_t cfg1{};
+        cfg1.gridDim = dim3(CS, HKV);
+        cfg1.blockDim = dim3(NT);
+        cfg1.dynamicSmemBytes = k.smem;
+        cfg1.stream = stream;
+        CUDA_CHECK(cudaLaunchKernelEx(&cfg1, k.fn, p));
         cudaLaunchConfig_t cfg2{};
         cfg2.gridDim = dim3(CS, HKV);
         cfg2.blockDim = dim3(NT);
         cfg2.stream = stream;
-        for (int m = 0; m < M; ++m) {
-            Params pm = p;
-            pm.proj = a.proj + size_t(m) * p.R;
-            pm.out = a.out + size_t(m) * HQ * D;
-            pm.pos_off = m;
-            pm.cap_guard = M;
-            CUDA_CHECK(cudaLaunchKernelEx(&cfg1, k1.fn, pm));
-            if (k1.fn_stage2) CUDA_CHECK(cudaLaunchKernelEx(&cfg2, k1.fn_stage2, pm));
-        }
+        CUDA_CHECK(cudaLaunchKernelEx(&cfg2, k.fn_stage2, p));
         return;
     }
     const Kernel k = full ? (a.cache_q4 ? select<true, false, true>(M)

@@ -506,15 +506,19 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
             : (std::size_t(NUM_FULL_VISITS) * std::size_t(offload.max_ctx) *
                (offload.kv_q4 ? (2 * std::size_t(KV_Q4_ROW_BYTES)) : (std::size_t(KV_DIM) * (offload.kv_fp8 ? 2 : 4))));
     const std::size_t checkpoint_bytes = kv_ring_bytes + (std::size_t(16) << 20);
-    bool any_exl3_w13 = false;
-    for (int l = 0; l < LAYERS; ++l) any_exl3_w13 |= is_exl3(w.expert_formats[l]);
-    const std::size_t exl3_prefill_extra =
-        any_exl3_w13 ? (std::size_t(offload.prefill_chunk) * TOP_K * HIDDEN * 2) : 0;
+    // Prefiller aliases Attention vs MLP scratch (including EXL3 scratch) in one phase arena (~269 KB/tok + 42 MiB).
     const std::size_t prefill_bytes =
-        std::size_t(offload.prefill_chunk) * std::size_t(390) * 1024 + (std::size_t(56) << 20) + exl3_prefill_extra;
+        std::size_t(offload.prefill_chunk) * std::size_t(280) * 1024 + (std::size_t(48) << 20);
+    // DSpark drafter weights + shortlist + FP8 global KV ring (min(max_ctx, 65536) * 2 KiB) +
+    // verify buffers (widths 2/4/8) + prefill taps when --spec is active (measured ~1.09 GB at 64K/1024).
+    const std::size_t spec_bytes =
+        offload.spec ? ((std::size_t(928) << 20) +
+                        std::size_t(std::min(offload.max_ctx, 65536)) * std::size_t(2048) +
+                        std::size_t(offload.prefill_chunk) * std::size_t(18) * 1024)
+                     : 0;
     const std::size_t runtime_headroom = std::size_t(384) << 20;
     const std::size_t fixed_bytes =
-        non_expert_bytes + kv_ring_bytes + kv_full_bytes + checkpoint_bytes + prefill_bytes + runtime_headroom;
+        non_expert_bytes + kv_ring_bytes + kv_full_bytes + checkpoint_bytes + prefill_bytes + spec_bytes + runtime_headroom;
     const std::size_t total_budget = std::size_t(offload.vram_mb) << 20;
     const std::size_t expert_vram_budget =
         total_budget > fixed_bytes ? (total_budget - fixed_bytes) : (std::size_t(256) << 20);

@@ -40,6 +40,7 @@ struct OffloadConfig {
   int prefill_chunk = 512;
   bool kv_fp8 = true;
   bool kv_q4 = false;
+  bool spec = false;
   int kv_vram_mb = 0;  // when > 0, full KV cache is paged and capped to kv_vram_mb MiB of VRAM
 };
 
@@ -82,6 +83,13 @@ class ExpertCache {
   kernels::moe::ExpertPtrs layer_ptrs(int l) const noexcept;
 
   void prepare_decode(int l, const int* d_idx, int m, cudaStream_t compute_stream);
+
+  // Run MoE decode (up + down) for m tokens (1..8). Executes in a single batched launch [0, m) when all
+  // unique non-HOT experts fit in the layer's LRU slab; otherwise splits [0, m) into maximal contiguous token
+  // slices [tok_offset, tok_offset + tok_count) that fit so DSpark verify (M=2..8) stays bit-exact and
+  // deadlock-free under tight --atlas-6g VRAM budgets.
+  void run_decode_layer(int l, const int* d_idx, int m, cudaStream_t compute_stream,
+                        const std::function<void(int tok_offset, int tok_count)>& launch_moe_slice);
 
   void run_prefill_layer(int l, const int* d_counts, cudaStream_t compute_stream,
                          const std::function<void(const std::uint8_t* d_active_mask)>& launch_moe_pair);
@@ -179,10 +187,11 @@ class ExpertCache {
   // Exchange & synchronization primitives
   TieredDmaStream dma_;
   cudaEvent_t idx_ready_ = nullptr;
-  MappedHostBuffer host_idx_;     // int32 [8 * TOP_K]
-  MappedHostBuffer host_counts_;  // int32 [EXPERTS]
-  MappedHostBuffer host_mask_;    // uint8 [EXPERTS]
-  DeviceBuffer dev_mask_;         // uint8 [EXPERTS]
+  cudaEvent_t pass0_done_ = nullptr;
+  MappedHostBuffer host_idx_;                  // int32 [8 * TOP_K]
+  MappedHostBuffer host_counts_;               // int32 [EXPERTS]
+  std::array<MappedHostBuffer, 2> host_mask_;  // uint8 [EXPERTS] x 2 for overlapped HOT/LRU vs WARM passes
+  std::array<DeviceBuffer, 2> dev_mask_;       // uint8 [EXPERTS] x 2
 
   std::uint64_t pin_gen_ = 0;
   OffloadStats stats_{};

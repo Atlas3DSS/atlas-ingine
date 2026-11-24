@@ -107,11 +107,14 @@ struct AttnParams {
   int ld = 0;
   ActT* out = nullptr;        // [T, 3072] = bf16(bf16(attention * sigmoid(lse - sink)) * sigmoid(gate))
   // Optional chunked online-softmax merge across staged KV batches (non-null only during paged KV streaming):
-  float* partial_o = nullptr;        // [T, 24, 128] FP32 running unscaled numerator O (2^15 scaled)
+  float* partial_o = nullptr;        // [T, 24, 128] FP32 running unscaled numerator O (2^15 scaled in prefill, 1x in split-K decode)
   float* partial_m = nullptr;        // [T, 24] FP32 running log2 row max
   float* partial_l = nullptr;        // [T, 24] FP32 running row sum
   bool partial_init = true;          // true on first batch; false resumes from partial_*
   bool partial_final = true;         // true on final batch (writes out); false saves partial_*
+  // Optional split-K workspace for low-M (T <= 8) Q4_0 streamed decode: [decode_splits, T, 24, 130] FP32.
+  float* decode_ws = nullptr;
+  int decode_splits = 0;
 };
 // flex.attend + the output gate of model._visit: scores (q.k)/sqrt(128) + rel bias (distance < 1024), masked,
 // softmax with the per-head sink folded in through the log-sum-exp. Q.K in BF16 MMA with FP32 accumulation

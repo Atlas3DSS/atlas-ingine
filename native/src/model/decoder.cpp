@@ -282,32 +282,36 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     const bool exl13 = is_exl3(ex.w13_fmt), exl2 = is_exl3(ex.w2_fmt);
     moe::ExpertPtrs eptrs{};
     const moe::ExpertPtrs* eptrs_p = nullptr;
+    const bool moe_pdl = pdl && !(w.expert_cache && w.expert_cache->needs_host_dispatch());
+    auto launch_moe = [&](int tok_off, int tok_m) {
+      const int* idx_p = static_cast<const int*>(b.idx.data) + std::size_t(tok_off) * TOP_K;
+      const ActT* xm_p = bf16m(b.xm) + std::size_t(tok_off) * H;
+      ActT* act_p = bf16m(b.act) + std::size_t(tok_off) * TOP_K * INTER;
+      const float* wts_p = f32p(b.wts) + std::size_t(tok_off) * TOP_K;
+      float* y2_p = f32m(b.y2) + std::size_t(tok_off) * H;
+      float* hist_p = history ? f32m(b.hist_mlp) + (std::size_t(v) * m + std::size_t(tok_off)) * H : nullptr;
+      moe::moe_up(xm_p, tok_m, idx_p, ex.w13.data, exl13 ? ex.w13_rin.data : ex.w13_scale.data,
+                  exl13 ? nullptr : f32p(ex.w13_factor), fmt13, act_p, moe_pdl, stream, ex.w13_rout.data, eptrs_p);
+      if (hooks) {
+        moe::apply_expert_hooks_decode(act_p, idx_p, tok_m, &hooks->expert[v], pos, stream, tok_off);
+        moe::moe_down(act_p, tok_m, idx_p, wts_p, ex.w2.data, exl2 ? ex.w2_rin.data : ex.w2_scale.data,
+                      exl2 ? nullptr : f32p(ex.w2_factor), fmt2, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_p, hist_p,
+                      false, stream, ex.w2_rout.data, static_cast<ActT*>(moe_down_ws_.p), eptrs_p);
+      } else {
+        // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
+        moe::moe_down(act_p, tok_m, idx_p, wts_p, ex.w2.data, exl2 ? ex.w2_rin.data : ex.w2_scale.data,
+                      exl2 ? nullptr : f32p(ex.w2_factor), fmt2, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_p, hist_p,
+                      moe_pdl, stream, ex.w2_rout.data, static_cast<ActT*>(moe_down_ws_.p), eptrs_p);
+      }
+    };
     if (w.expert_cache) {
-      w.expert_cache->prepare_decode(l, static_cast<const int*>(b.idx.data), m, stream);
       eptrs = w.expert_cache->layer_ptrs(l);
       eptrs_p = &eptrs;
-    }
-    const bool moe_pdl = pdl && !(w.expert_cache && w.expert_cache->needs_host_dispatch());
-    moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data,
-                exl13 ? ex.w13_rin.data : ex.w13_scale.data, exl13 ? nullptr : f32p(ex.w13_factor), fmt13, bf16m(b.act),
-                moe_pdl, stream, ex.w13_rout.data, eptrs_p);
-    if (hooks) {
-      moe::apply_expert_hooks_decode(bf16m(b.act), static_cast<const int*>(b.idx.data), m, &hooks->expert[v], pos,
-                                     stream);
-      moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data,
-                    exl2 ? ex.w2_rin.data : ex.w2_scale.data, exl2 ? nullptr : f32p(ex.w2_factor), fmt2,
-                    f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
-                    history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, false, stream, ex.w2_rout.data,
-                    static_cast<ActT*>(moe_down_ws_.p), eptrs_p);
-      dense::residual_steer(f32m(b.y2), m, &hooks->steer_mlp[v], stream);
+      w.expert_cache->run_decode_layer(l, static_cast<const int*>(b.idx.data), m, stream, launch_moe);
     } else {
-      // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
-      moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data,
-                    exl2 ? ex.w2_rin.data : ex.w2_scale.data, exl2 ? nullptr : f32p(ex.w2_factor), fmt2,
-                    f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
-                    history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, moe_pdl, stream, ex.w2_rout.data,
-                    static_cast<ActT*>(moe_down_ws_.p), eptrs_p);
+      launch_moe(0, m);
     }
+    if (hooks) dense::residual_steer(f32m(b.y2), m, &hooks->steer_mlp[v], stream);
     prev_v = v;
   }
   // ---- final read; the same launch writes b.taps[:, 3] = b.xf

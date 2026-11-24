@@ -642,6 +642,212 @@ void launch(const AttnParams& p, cudaStream_t stream) {
   }
 }
 
+// ---- 128-CTA split-K Q4_0 decode chunk kernel for streamed paged KV (T <= 8)
+// Replaces the 8-CTA 128-row prefill kernel during M=1..8 streamed decode so every SM stays saturated
+// with coalesced 64-byte Q4_0 reads and 16 KiB SMEM (works on Pascal..Blackwell, zero FP16 ALU traps).
+
+constexpr int kDecodeWsStride = D + 2;  // [0..127]=O, [128]=m, [129]=l
+
+template <int M_CAP>
+__global__ void __launch_bounds__(NT, 1) decode_q4_split_kernel(const AttnParams p, int nsplits) {
+  const int split = blockIdx.x;
+  const int g = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int M = p.T;
+  const int R = M * GQA;
+  const int blk = lane >> 3;
+  const int d0 = lane * 4;
+
+  __shared__ float sq[M_CAP * GQA][D];
+  __shared__ float sm_row_o[NWARPS][D];
+  __shared__ float sm_row_m[NWARPS];
+  __shared__ float sm_row_l[NWARPS];
+
+  const int total_q = R * D;
+  for (int idx = tid; idx < total_q; idx += NT) {
+    const int r = idx / D, d = idx % D;
+    const int t = r / GQA, h = g * GQA + (r % GQA);
+    sq[r][d] = bf2f(reinterpret_cast<const uint16_t*>(p.q)[(size_t(t) * kHeads + h) * D + d]);
+  }
+  __syncthreads();
+
+  int qpos[M_CAP];
+  const uint16_t* relp[M_CAP * GQA];
+#pragma unroll
+  for (int t = 0; t < M_CAP; ++t) qpos[t] = p.pos0 + min(t, M - 1);
+#pragma unroll
+  for (int r = 0; r < M_CAP * GQA; ++r) {
+    const int t = min(r / GQA, M - 1), h = g * GQA + (r % GQA);
+    relp[r] = reinterpret_cast<const uint16_t*>(p.rel) + (size_t(t) * kHeads + h) * kRelExtent;
+  }
+
+  float ow[M_CAP * GQA][4];
+  float mw[M_CAP * GQA], lw[M_CAP * GQA];
+#pragma unroll
+  for (int r = 0; r < M_CAP * GQA; ++r) {
+    ow[r][0] = ow[r][1] = ow[r][2] = ow[r][3] = 0.f;
+    mw[r] = -INFINITY;
+    lw[r] = 0.f;
+  }
+
+  const int chunk = (p.L + nsplits - 1) / nsplits;
+  const int j_begin = split * chunk;
+  const int j_end = min(p.L, j_begin + chunk);
+  const int max_qpos = p.pos0 + M - 1;
+  const int page_mask = p.k_pages ? ((1 << p.page_shift) - 1) : 0;
+
+  for (int j = j_begin + warp; j < j_end; j += NWARPS) {
+    const int kp = p.k_pos_base + j;
+    if (kp > max_qpos) break;
+    const uint8_t* Krow;
+    const uint8_t* Vrow;
+    if (p.k_pages) {
+      Krow = static_cast<const uint8_t*>(p.k_pages[j >> p.page_shift]) + size_t(j & page_mask) * kKvQ4RowBytes;
+      Vrow = static_cast<const uint8_t*>(p.v_pages[j >> p.page_shift]) + size_t(j & page_mask) * kKvQ4RowBytes;
+    } else {
+      Krow = static_cast<const uint8_t*>(p.k) + size_t(j) * kKvQ4RowBytes;
+      Vrow = static_cast<const uint8_t*>(p.v) + size_t(j) * kKvQ4RowBytes;
+    }
+    const uint16_t knib = __ldg(reinterpret_cast<const uint16_t*>(Krow + g * 64 + lane * 2));
+    const uint16_t ks_u = __ldg(reinterpret_cast<const uint16_t*>(Krow + kKvQ4NibbleBytes + g * 8 + blk * 2));
+    const uint16_t vnib = __ldg(reinterpret_cast<const uint16_t*>(Vrow + g * 64 + lane * 2));
+    const uint16_t vs_u = __ldg(reinterpret_cast<const uint16_t*>(Vrow + kKvQ4NibbleBytes + g * 8 + blk * 2));
+    const float kd_raw = __half2float(__ushort_as_half(ks_u));
+    const float vd_raw = __half2float(__ushort_as_half(vs_u));
+    const float kd = isfinite(kd_raw) ? kd_raw : 0.f;
+    const float vd = isfinite(vd_raw) ? vd_raw : 0.f;
+    const float k_neg8 = -8.f * kd, v_neg8 = -8.f * vd;
+    const float k0 = fmaf(float(knib & 0xfu), kd, k_neg8);
+    const float k1 = fmaf(float((knib >> 4) & 0xfu), kd, k_neg8);
+    const float k2 = fmaf(float((knib >> 8) & 0xfu), kd, k_neg8);
+    const float k3 = fmaf(float((knib >> 12) & 0xfu), kd, k_neg8);
+    const float v0 = fmaf(float(vnib & 0xfu), vd, v_neg8);
+    const float v1 = fmaf(float((vnib >> 4) & 0xfu), vd, v_neg8);
+    const float v2 = fmaf(float((vnib >> 8) & 0xfu), vd, v_neg8);
+    const float v3 = fmaf(float((vnib >> 12) & 0xfu), vd, v_neg8);
+
+#pragma unroll
+    for (int r = 0; r < M_CAP * GQA; ++r) {
+      if (r >= R) break;
+      const int t = r / GQA;
+      const int dist = qpos[t] - kp;
+      if (dist < 0) continue;
+      const float4 qv = *reinterpret_cast<const float4*>(&sq[r][d0]);
+      float dot = fmaf(qv.x, k0, fmaf(qv.y, k1, fmaf(qv.z, k2, qv.w * k3)));
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+      float score = dot * kScale;
+      if (dist < kRelExtent) score += bf2f(__ldg(relp[r] + dist));
+      score *= kLog2e;
+      const float m_new = fmaxf(mw[r], score);
+      const float alpha = (mw[r] == -INFINITY) ? 0.f : exp2f(mw[r] - m_new);
+      const float pv = exp2f(score - m_new);
+      mw[r] = m_new;
+      lw[r] = fmaf(lw[r], alpha, pv);
+      ow[r][0] = fmaf(ow[r][0], alpha, pv * v0);
+      ow[r][1] = fmaf(ow[r][1], alpha, pv * v1);
+      ow[r][2] = fmaf(ow[r][2], alpha, pv * v2);
+      ow[r][3] = fmaf(ow[r][3], alpha, pv * v3);
+    }
+  }
+
+  for (int r = 0; r < R; ++r) {
+    if (lane == 0) {
+      sm_row_m[warp] = mw[r];
+      sm_row_l[warp] = lw[r];
+    }
+    *reinterpret_cast<float4*>(&sm_row_o[warp][d0]) = make_float4(ow[r][0], ow[r][1], ow[r][2], ow[r][3]);
+    __syncthreads();
+    if (tid < D) {
+      float mmax = -INFINITY;
+#pragma unroll
+      for (int w = 0; w < NWARPS; ++w) mmax = fmaxf(mmax, sm_row_m[w]);
+      float lsum = 0.f, osum = 0.f;
+      if (mmax > -INFINITY) {
+#pragma unroll
+        for (int w = 0; w < NWARPS; ++w) {
+          if (sm_row_l[w] > 0.f) {
+            const float fac = exp2f(sm_row_m[w] - mmax);
+            lsum += sm_row_l[w] * fac;
+            osum = fmaf(sm_row_o[w][tid], fac, osum);
+          }
+        }
+      }
+      const int t = r / GQA, h = g * GQA + (r % GQA);
+      float* dst = p.decode_ws + (((size_t(split) * M + t) * kHeads + h) * kDecodeWsStride);
+      dst[tid] = osum;
+      if (tid == 0) {
+        dst[D] = mmax;
+        dst[D + 1] = lsum;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void reduce_q4_splits_kernel(const AttnParams p, int nsplits) {
+  const int rh = blockIdx.x;
+  const int d = threadIdx.x;
+  const int M = p.T;
+  const int t = rh / kHeads, h = rh % kHeads;
+  const bool resume = (p.partial_o != nullptr && !p.partial_init);
+
+  float mmax = resume ? p.partial_m[rh] : -INFINITY;
+  for (int s = 0; s < nsplits; ++s) {
+    const float* src = p.decode_ws + (((size_t(s) * M + t) * kHeads + h) * kDecodeWsStride);
+    mmax = fmaxf(mmax, src[D]);
+  }
+  float lsum = 0.f, osum = 0.f;
+  if (mmax > -INFINITY) {
+    if (resume) {
+      const float lp = p.partial_l[rh];
+      if (lp > 0.f) {
+        const float fac = exp2f(p.partial_m[rh] - mmax);
+        lsum = lp * fac;
+        osum = p.partial_o[size_t(rh) * D + d] * fac;
+      }
+    }
+    for (int s = 0; s < nsplits; ++s) {
+      const float* src = p.decode_ws + (((size_t(s) * M + t) * kHeads + h) * kDecodeWsStride);
+      const float ls = src[D + 1];
+      if (ls > 0.f) {
+        const float fac = exp2f(src[D] - mmax);
+        lsum += ls * fac;
+        osum = fmaf(src[d], fac, osum);
+      }
+    }
+  }
+
+  if (p.partial_o && !p.partial_final) {
+    p.partial_o[size_t(rh) * D + d] = osum;
+    if (d == 0) {
+      p.partial_m[rh] = mmax;
+      p.partial_l[rh] = lsum;
+    }
+    return;
+  }
+
+  const uint16_t* prow = reinterpret_cast<const uint16_t*>(p.proj) + size_t(t) * p.ld;
+  const float lse = (mmax + log2f(lsum)) * kLn2;
+  const float factor = 1.f / (1.f + expf(-(lse - bf2f(prow[SINK_COL + h]))));
+  const float a = round_bf16((osum / lsum) * factor);
+  const float gate = bf2f(prow[GATE_COL + h * D + d]);
+  const float sg = 1.f / (1.f + expf(-gate));
+  reinterpret_cast<uint16_t*>(p.out)[size_t(rh) * D + d] = f2bf_bits(a * sg);
+}
+
+void launch_decode_q4_split(const AttnParams& p, cudaStream_t stream) {
+  const int nsplits = std::max(1, std::min(p.decode_splits, (p.L + 127) / 128));
+  const dim3 grid(nsplits, kKvHeads);
+  if (p.T <= 1) decode_q4_split_kernel<1><<<grid, NT, 0, stream>>>(p, nsplits);
+  else if (p.T <= 2) decode_q4_split_kernel<2><<<grid, NT, 0, stream>>>(p, nsplits);
+  else if (p.T <= 4) decode_q4_split_kernel<4><<<grid, NT, 0, stream>>>(p, nsplits);
+  else decode_q4_split_kernel<8><<<grid, NT, 0, stream>>>(p, nsplits);
+  reduce_q4_splits_kernel<<<p.T * kHeads, D, 0, stream>>>(p, nsplits);
+}
+
 // ---- sliding-visit key rows
 
 constexpr int kRowVecs = kKvDim * 2 / 16;  // 16-byte vectors per key row (128)
@@ -703,7 +909,11 @@ void attention(const AttnParams& p, cudaStream_t stream) {
     throw std::invalid_argument("prefill attention: kv_fp8 and kv_q4 are mutually exclusive");
   if (p.kv_q4) {
     if (expl) throw std::invalid_argument("prefill attention: kv_q4 is supported on full layers only");
-    launch<2, false>(p, stream);
+    if (p.T <= 8 && p.decode_ws && p.decode_splits > 0) {
+      launch_decode_q4_split(p, stream);
+    } else {
+      launch<2, false>(p, stream);
+    }
   } else if (p.kv_fp8) {
     if (expl) launch<1, true>(p, stream);
     else launch<1, false>(p, stream);

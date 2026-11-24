@@ -242,6 +242,66 @@ bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
   return ok;
 }
 
+// 128-CTA split-K Q4_0 decode chunk kernel (single-batch and multi-batch partial_o/m/l merge) vs FP64 oracle.
+bool decode_q4_split_case(Rng& rng, int pos0, int T, int batches) {
+  const int L = pos0 + T;
+  std::vector<float> K(size_t(L) * HK * D), V(K.size());
+  std::vector<uint8_t> kb(size_t(L) * kTestKvQ4RowBytes), vb(size_t(L) * kTestKvQ4RowBytes);
+  for (int j = 0; j < L; ++j) {
+    make_kv_row(rng, &K[size_t(j) * HK * D], &V[size_t(j) * HK * D]);
+    q4_0_pack_row(&K[size_t(j) * HK * D], &kb[size_t(j) * kTestKvQ4RowBytes], &K[size_t(j) * HK * D]);
+    q4_0_pack_row(&V[size_t(j) * HK * D], &vb[size_t(j) * kTestKvQ4RowBytes], &V[size_t(j) * HK * D]);
+  }
+  DeviceArray<uint8_t> kd(kb), vd(vb);
+  const Inputs in = make_inputs(rng, T, pos0);
+  DeviceArray<uint16_t> q(in.q), rel(in.rel), proj(in.proj), out(size_t(T) * HQ * D);
+  constexpr int kSplits = 16;
+  DeviceArray<float> ws(size_t(kSplits) * T * HQ * (D + 2));
+  DeviceArray<float> po(size_t(T) * HQ * D), pm(size_t(T) * HQ), pl(size_t(T) * HQ);
+
+  const int chunk = (L + batches - 1) / batches;
+  for (int b = 0; b < batches; ++b) {
+    const int k0 = b * chunk;
+    const int bl = std::min(chunk, L - k0);
+    if (bl <= 0) break;
+    pk::AttnParams p;
+    p.q = reinterpret_cast<const ingine::ActT*>(q.get());
+    p.k = kd.get() + size_t(k0) * kTestKvQ4RowBytes;
+    p.v = vd.get() + size_t(k0) * kTestKvQ4RowBytes;
+    p.kv_q4 = true;
+    p.k_pos_base = k0;
+    p.L = bl;
+    p.T = T;
+    p.pos0 = pos0;
+    p.window = 0;
+    p.rel = reinterpret_cast<const ingine::ActT*>(rel.get());
+    p.proj = reinterpret_cast<const ingine::ActT*>(proj.get());
+    p.ld = PROJ_LD;
+    p.out = reinterpret_cast<ingine::ActT*>(out.get());
+    p.decode_ws = ws.get();
+    p.decode_splits = kSplits;
+    if (batches > 1) {
+      p.partial_o = po.get();
+      p.partial_m = pm.get();
+      p.partial_l = pl.get();
+      p.partial_init = (b == 0);
+      p.partial_final = (k0 + bl >= L);
+    }
+    pk::attention(p, nullptr);
+  }
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+  const auto got_bits = out.download();
+  std::vector<int> kpos(L);
+  for (int j = 0; j < L; ++j) kpos[j] = j;
+  std::vector<size_t> index;
+  const auto ref = oracle(in, K, V, kpos, 0, 1, index);
+  std::vector<float> got(index.size());
+  for (size_t i = 0; i < index.size(); ++i) got[i] = bf16_val(got_bits[index[i]]);
+  char name[96];
+  std::snprintf(name, sizeof name, "decode_q4_split pos0=%d T=%d batches=%d", pos0, T, batches);
+  return check_close(name, got, ref, 1.2e-2, 2e-4);
+}
+
 }  // namespace
 
 int main() {
@@ -255,6 +315,10 @@ int main() {
   ok &= full_case(rng, false, true, 0, 45);
   ok &= full_case(rng, false, true, 1200, 77);
   ok &= full_case(rng, false, true, 3, 130);
+  ok &= decode_q4_split_case(rng, 2500, 1, 1);
+  ok &= decode_q4_split_case(rng, 2500, 2, 1);
+  ok &= decode_q4_split_case(rng, 2500, 4, 3);
+  ok &= decode_q4_split_case(rng, 2500, 8, 3);
   ok &= sliding_case(rng, 0, 50, false, 1);
   ok &= sliding_case(rng, 700, 300, false, 3);
   ok &= sliding_case(rng, 5000, 1100, true, 7);
