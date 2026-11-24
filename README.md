@@ -192,6 +192,20 @@ The model reads images through its built-in vision tower (part of the checkpoint
 Images above 4,096 tokens are resized preserving aspect ratio (`--image-max-tokens N`, up to 10,609 for 4096×4096).
 Pass `--no-vision` to serve text only and save ~0.6 GiB VRAM.
 
+## Building your own Verified Ledger
+
+[`ledger/`](ledger/README.md) provides a zero-dependency SQLite **Verified Ledger** ([`ledger/verified_ledger.py`](ledger/verified_ledger.py))
+for pairing `atlas-ingine` with any host-verified workflow (SQL, `pytest`, CUDA/PyTorch kernels, Three.js, Blender, or
+compilers). The host verifier is the sole write gate across four banks (`facts`, `winners`, `repairs`, and `drift`
+invalidation on `env_version` changes), with deterministic character-budgeted retrieval and a CLI for inspecting and
+updating ledgers. See [`ledger/README.md`](ledger/README.md) and [`ledger/examples/code_hillclimb_example.py`](ledger/examples/code_hillclimb_example.py).
+
+## Related: `Atlas3DSS/atlas-engine`
+
+`atlas-ingine` is our primary Inkling-2-Mini engine on Ampere/Ada/Blackwell (`sm_86`, `sm_89`, `sm_120a`). For GGUF
+serving or older SM75+ (Turing) GPUs, see our MIT `llama.cpp` fork:
+[Atlas3DSS/atlas-engine](https://github.com/Atlas3DSS/atlas-engine).
+
 ## Upstream RTX 5090 and abliteration results
 
 The measurements below are from upstream `satellitedown/ingine` on a single RTX 5090 (32 GB, `sm_120a`, default 262K
