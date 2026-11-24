@@ -164,7 +164,12 @@ def main():
     ap.add_argument("--kintsugi-gguf", type=Path, default=Path("/mnt/storage/models/Kintsugi-Inkling-2-Mini/Kintsugi-Inkling-2-Mini-12G.gguf"))
     ap.add_argument("--out-dir", type=Path, default=Path("/mnt/storage/models/Inkling-2-Mini-atlas-exl3-9g"))
     ap.add_argument("--embed-bf16", action="store_true", help="Keep embed.weight in BF16 (default: Q4_0 saves 665 MB)")
+    ap.add_argument("--no-vision", action="store_true", help="Omit vision encoder tensors (model.visual.*, saves ~0.64 GB on disk; run with --no-vision)")
+    ap.add_argument("--no-mtp", action="store_true", help="Omit DSpark MTP speculative drafter (mtp.safetensors, saves ~0.64 GB on disk)")
+    ap.add_argument("--text-only", action="store_true", help="Shorthand for --no-vision --no-mtp (10.08 GB text-only checkpoint, saves ~1.28 GB on disk)")
     args = ap.parse_args()
+    omit_vision = bool(args.no_vision or args.text_only)
+    omit_mtp = bool(args.no_mtp or args.text_only)
 
     t0 = time.time()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -201,8 +206,9 @@ def main():
             text_specs.append((name, "U8", [rows, cols // 2 + (cols // 32) * 2], qbytes))
             sources[name] = ("embed_q4", (fpath, foff, nbytes, rows, cols))
         elif name.startswith("model.visual."):
-            vision_specs.append((name, dtype, shape, nbytes))
-            sources[name] = ("native", (fpath, foff, nbytes))
+            if not omit_vision:
+                vision_specs.append((name, dtype, shape, nbytes))
+                sources[name] = ("native", (fpath, foff, nbytes))
         else:
             text_specs.append((name, dtype, shape, nbytes))
             sources[name] = ("native", (fpath, foff, nbytes))
@@ -278,12 +284,13 @@ def main():
             assert len(raw) == nbytes
             fh.write(raw)
 
-    text_shard = "model-00001-of-00002.safetensors"
+    text_shard = "model-00001-of-00001.safetensors" if omit_vision else "model-00001-of-00002.safetensors"
     vision_shard = "model-00002-of-00002.safetensors"
     print(f"Writing text shard ({len(text_specs)} tensors) -> {args.out_dir / text_shard}")
     write_safetensors(args.out_dir / text_shard, text_specs, emit_tensor)
-    print(f"Writing vision shard ({len(vision_specs)} tensors) -> {args.out_dir / vision_shard}")
-    write_safetensors(args.out_dir / vision_shard, vision_specs, emit_tensor)
+    if not omit_vision:
+        print(f"Writing vision shard ({len(vision_specs)} tensors) -> {args.out_dir / vision_shard}")
+        write_safetensors(args.out_dir / vision_shard, vision_specs, emit_tensor)
     gf.close()
 
     # Write model.safetensors.index.json
@@ -292,9 +299,10 @@ def main():
     for name, _, _, nb in text_specs:
         weight_map[name] = text_shard
         total_bytes += nb
-    for name, _, _, nb in vision_specs:
-        weight_map[name] = vision_shard
-        total_bytes += nb
+    if not omit_vision:
+        for name, _, _, nb in vision_specs:
+            weight_map[name] = vision_shard
+            total_bytes += nb
     (args.out_dir / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {"total_size": total_bytes}, "weight_map": weight_map}, indent=2) + "\n"
     )
@@ -307,8 +315,12 @@ def main():
         if dt in ("nvfp4", "mxfp8", "atlas2", "atlas3", "exl3_2", "exl3_3"):
             continue
         ts = [t for t in grp["tensors"] if not any(t.endswith(s) for s in skip_suffixes)]
+        if omit_vision:
+            ts = [t for t in ts if not t.startswith("model.visual.")]
         if not args.embed_bf16:
             ts = [t for t in ts if t != "model.llm.embed.weight"]
+        if not ts:
+            continue
         grp2 = dict(grp)
         grp2["tensors"] = ts
         new_groups.append(grp2)
@@ -333,28 +345,38 @@ def main():
                 "weight_transform": "exl3_mcg_had128",
             })
     qcfg["model"]["parameter_groups"] = new_groups
+    qcfg["atlas_exl3"] = {
+        "embed_q4": not args.embed_bf16,
+        "no_vision": omit_vision,
+        "no_mtp": omit_mtp,
+    }
     (args.out_dir / "hf_quant_config.json").write_text(json.dumps(qcfg, indent=2) + "\n")
 
-    # Copy metadata & symlink mtp.safetensors (DSpark) + tiktoken
+    # Copy metadata & symlink tiktoken (+ optional mtp.safetensors DSpark drafter)
     for item in [
         "chat_template.jinja", "config.json", "generation_config.json",
         "processor_config.json", "special_tokens_map.json", "tokenizer_config.json",
-        "tokenizer.json", "LICENSE", "NOTICE", "inkling-2-mini-abliterated.safetensors",
+        "tokenizer.json", "LICENSE", "NOTICE",
     ]:
         src = args.native_dir / item
         if src.exists():
             shutil.copy2(src, args.out_dir / item)
-    for link_item in ["mtp.safetensors", "tiktoken"]:
+    link_items = ["tiktoken"] if omit_mtp else ["mtp.safetensors", "tiktoken"]
+    for link_item in link_items:
         src = args.native_dir / link_item
         dst = args.out_dir / link_item
         if src.exists() and not dst.exists():
             dst.symlink_to(src)
 
     text_sz = (args.out_dir / text_shard).stat().st_size
-    vis_sz = (args.out_dir / vision_shard).stat().st_size
+    vis_sz = 0 if omit_vision else (args.out_dir / vision_shard).stat().st_size
     print(f"Done in {time.time() - t0:.1f}s!")
     print(f"  Text shard:   {text_sz / 1e9:.3f} GB ({text_sz / (1024**3):.3f} GiB) [BF16 dense on disk -> ~{(text_sz - 1.146e9)/1e9:.3f} GB / {(text_sz - 1.146e9)/(1024**3):.3f} GiB in VRAM with --dense-fp8!]")
-    print(f"  Vision shard: {vis_sz / 1e9:.3f} GB ({vis_sz / (1024**3):.3f} GiB)")
+    if not omit_vision:
+        print(f"  Vision shard: {vis_sz / 1e9:.3f} GB ({vis_sz / (1024**3):.3f} GiB)")
+    else:
+        print("  Vision shard: omitted (--no-vision / --text-only)")
+    print(f"  DSpark MTP:   {'omitted (--no-mtp / --text-only)' if omit_mtp else 'included (mtp.safetensors)'}")
 
 
 if __name__ == "__main__":
