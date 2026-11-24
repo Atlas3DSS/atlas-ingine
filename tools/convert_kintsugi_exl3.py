@@ -105,6 +105,66 @@ def parse_safetensors_dir(src_dir: Path):
     return entries
 
 
+UNPADDED_VOCAB = 200058
+
+DENSE_FP8_SUFFIXES = (
+    ".attn.wq_du.weight",
+    ".attn.gate_attn.weight",
+    ".attn.wr_du.weight",
+    ".attn.attn_sink_proj.weight",
+    ".attn.wk_dv.weight",
+    ".attn.wv_dv.weight",
+    ".attn.k_sconv.weight_proj",
+    ".attn.v_sconv.weight_proj",
+    ".attn.wo_ud.weight",
+)
+
+
+def float32_to_fp8_e4m3fn(x: np.ndarray) -> np.ndarray:
+    """Bit-exact OCP FP8 E4M3FN conversion matching CUDA __nv_cvt_float_to_fp8(..., __NV_SATFINITE, __NV_E4M3)."""
+    u32 = np.asarray(x, dtype=np.float32).view(np.uint32)
+    sgn = ((u32 >> np.uint32(24)) & np.uint32(0x80)).astype(np.uint8)
+    au = u32 & np.uint32(0x7FFFFFFF)
+
+    # Normal range: |x| >= 2^-6 (0x3C800000); saturate |x| >= 448.0 (0x43E00000) -> 0x7E
+    e32 = (au >> np.uint32(23)) & np.uint32(0xFF)
+    m32 = au & np.uint32(0x7FFFFF)
+    lsb = (m32 >> np.uint32(20)) & np.uint32(1)
+    m_rnd = m32 + np.uint32(0x7FFFF) + lsb
+    e_norm = (e32.astype(np.int32) - 120) + (m_rnd >> np.uint32(23)).astype(np.int32)
+    m_norm = ((m_rnd >> np.uint32(20)) & np.uint32(7)).astype(np.int32)
+    code_norm = np.minimum((e_norm << 3) | m_norm, 0x7E).astype(np.uint8)
+
+    # Subnormal range: |x| < 2^-6 -> exact multiply by 512.0, IEEE round-to-nearest-even -> 0..8
+    abs_f = au.view(np.float32)
+    code_sub = np.rint(np.minimum(abs_f, np.float32(0.015625)) * np.float32(512.0)).astype(np.uint8)
+
+    code = np.where(au >= np.uint32(0x43E00000), np.uint8(0x7E),
+           np.where(au >= np.uint32(0x3C800000), code_norm, code_sub))
+    code = np.where(au > np.uint32(0x7F800000), np.uint8(0x7F), code)
+    return sgn | code
+
+
+def quantize_dense_fp8_e4m3(bf16_bytes: bytes, rows: int, cols: int) -> tuple[bytes, bytes]:
+    """Quantize BF16 [rows, cols] to per-row FP8 E4M3FN + FP32 scale = amax / 448.0.
+    Matches native/src/kernels/dense/gemv.cu:fp8_rows_kernel bit-for-bit."""
+    u16 = np.frombuffer(bf16_bytes, dtype=np.uint16).reshape(rows, cols)
+    q_out = np.empty((rows, cols), dtype=np.uint8)
+    s_out = np.empty((rows,), dtype=np.float32)
+    chunk = 4096
+    for r0 in range(0, rows, chunk):
+        r1 = min(r0 + chunk, rows)
+        x = (u16[r0:r1].astype(np.uint32) << np.uint32(16)).view(np.float32)
+        amax = np.max(np.abs(x), axis=1).astype(np.float32)
+        s = (amax / np.float32(448.0)).astype(np.float32)
+        s_out[r0:r1] = s
+        nz = s > np.float32(0.0)
+        safe_s = np.where(nz, s, np.float32(1.0))[:, None]
+        y = np.where(nz[:, None], x / safe_s, np.float32(0.0))
+        q_out[r0:r1] = np.where(nz[:, None], float32_to_fp8_e4m3fn(y), np.uint8(0))
+    return q_out.tobytes(), s_out.tobytes()
+
+
 def quantize_embed_q4_0(bf16_bytes: bytes, rows: int, cols: int) -> bytes:
     """Quantize BF16 [rows, cols] to SoA Q4_0 U8 [rows, cols/2 + (cols/32)*2] = [rows, 1296].
     Deterministic signed max matching native Q4_0 KV cache."""
@@ -164,12 +224,14 @@ def main():
     ap.add_argument("--kintsugi-gguf", type=Path, default=Path("/mnt/storage/models/Kintsugi-Inkling-2-Mini/Kintsugi-Inkling-2-Mini-12G.gguf"))
     ap.add_argument("--out-dir", type=Path, default=Path("/mnt/storage/models/Inkling-2-Mini-atlas-exl3-9g"))
     ap.add_argument("--embed-bf16", action="store_true", help="Keep embed.weight in BF16 (default: Q4_0 saves 665 MB)")
+    ap.add_argument("--dense-bf16", action="store_true", help="Keep dense attn projections & unembed in BF16 on disk (default: pre-pack FP8 E4M3 + F32 scales on disk, saves ~1.18 GB, bit-identical to --dense-fp8)")
     ap.add_argument("--no-vision", action="store_true", help="Omit vision encoder tensors (model.visual.*, saves ~0.64 GB on disk; run with --no-vision)")
     ap.add_argument("--no-mtp", action="store_true", help="Omit DSpark MTP speculative drafter (mtp.safetensors, saves ~0.64 GB on disk)")
-    ap.add_argument("--text-only", action="store_true", help="Shorthand for --no-vision --no-mtp (10.08 GB text-only checkpoint, saves ~1.28 GB on disk)")
+    ap.add_argument("--text-only", action="store_true", help="Shorthand for --no-vision --no-mtp (~8.90 GB text-only checkpoint, saves ~1.28 GB on disk)")
     args = ap.parse_args()
     omit_vision = bool(args.no_vision or args.text_only)
     omit_mtp = bool(args.no_mtp or args.text_only)
+    pack_dense_fp8 = not bool(args.dense_bf16)
 
     t0 = time.time()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -179,7 +241,7 @@ def main():
     gf, g_base, gtensors, escha_map = parse_gguf(args.kintsugi_gguf)
     print(f"Escha map: {len(escha_map)} layers")
 
-    # Separate text vs vision tensors (keep vision in its own shard so text shard is pure ~9.5 GB on disk!)
+    # Separate text vs vision tensors (keep vision in its own shard so text shard is pure ~8.90 GB on disk!)
     skip_suffixes = (
         ".mlp.experts.w13_weight",
         ".mlp.experts.w13_weight_scale",
@@ -193,18 +255,32 @@ def main():
 
     text_specs = []
     vision_specs = []
-    # Map name -> ("native" | "embed_q4" | "exl3_code" | "exl3_r", info)
+    dense_fp8_names = []
+    # Map name -> ("native" | "embed_q4" | "dense_fp8" | "dense_fp8_scale" | "exl3_code" | "exl3_r", info)
     sources = {}
 
     for name in sorted(native.keys()):
         if any(name.endswith(s) for s in skip_suffixes):
             continue
         fpath, foff, nbytes, dtype, shape = native[name]
+        is_dense_fp8_target = pack_dense_fp8 and dtype == "BF16" and (
+            name == "model.llm.unembed.weight"
+            or (name.startswith("model.llm.layers.") and any(name.endswith(s) for s in DENSE_FP8_SUFFIXES))
+        )
         if name == "model.llm.embed.weight" and not args.embed_bf16:
             rows, cols = shape
             qbytes = rows * (cols // 2 + (cols // 32) * 2)
             text_specs.append((name, "U8", [rows, cols // 2 + (cols // 32) * 2], qbytes))
             sources[name] = ("embed_q4", (fpath, foff, nbytes, rows, cols))
+        elif is_dense_fp8_target:
+            rows, cols = shape
+            out_rows = UNPADDED_VOCAB if name == "model.llm.unembed.weight" else rows
+            in_bytes = out_rows * cols * 2
+            text_specs.append((name, "F8_E4M3", [out_rows, cols], out_rows * cols))
+            text_specs.append((name + "_scale", "F32", [out_rows], out_rows * 4))
+            sources[name] = ("dense_fp8", (fpath, foff, in_bytes, out_rows, cols))
+            sources[name + "_scale"] = ("dense_fp8_scale", name)
+            dense_fp8_names.append(name)
         elif name.startswith("model.visual."):
             if not omit_vision:
                 vision_specs.append((name, dtype, shape, nbytes))
@@ -244,6 +320,8 @@ def main():
             sources[rin_name] = ("exl3_r", (gname + ".escha_rin", 128 * K * 2))
             sources[rout_name] = ("exl3_r", (gname + ".escha_rout", 128 * N * 2))
 
+    pending_scales = {}
+
     def emit_tensor(name, fh):
         kind, info = sources[name]
         if kind == "native":
@@ -263,6 +341,19 @@ def main():
                 sf.seek(foff)
                 raw = sf.read(nbytes)
             fh.write(quantize_embed_q4_0(raw, rows, cols))
+        elif kind == "dense_fp8":
+            fpath, foff, in_bytes, rows, cols = info
+            if name == "model.llm.unembed.weight":
+                print(f"  Quantizing {name} [{rows}, {cols}] BF16 -> FP8 E4M3FN + F32 scale...")
+            with open(fpath, "rb") as sf:
+                sf.seek(foff)
+                raw = sf.read(in_bytes)
+            q_bytes, s_bytes = quantize_dense_fp8_e4m3(raw, rows, cols)
+            pending_scales[name] = s_bytes
+            fh.write(q_bytes)
+        elif kind == "dense_fp8_scale":
+            base_name = info
+            fh.write(pending_scales.pop(base_name))
         elif kind == "exl3_code":
             gname, kt, nt_, bits = info
             dims, tt, off = gtensors[gname]
@@ -310,6 +401,7 @@ def main():
     # Update hf_quant_config.json with per-tensor exl3_2 / exl3_3 groups
     qcfg = json.loads((args.native_dir / "hf_quant_config.json").read_text())
     new_groups = []
+    dense_fp8_set = set(dense_fp8_names)
     for grp in qcfg["model"]["parameter_groups"]:
         dt = grp.get("compute_dtype", "")
         if dt in ("nvfp4", "mxfp8", "atlas2", "atlas3", "exl3_2", "exl3_3"):
@@ -319,11 +411,22 @@ def main():
             ts = [t for t in ts if not t.startswith("model.visual.")]
         if not args.embed_bf16:
             ts = [t for t in ts if t != "model.llm.embed.weight"]
+        if dense_fp8_set:
+            ts = [t for t in ts if t not in dense_fp8_set]
         if not ts:
             continue
         grp2 = dict(grp)
         grp2["tensors"] = ts
         new_groups.append(grp2)
+    if dense_fp8_names:
+        new_groups.append({
+            "compute_dtype": "fp8_e4m3",
+            "output_dtype": "bfloat16",
+            "required_activation_quantization": None,
+            "tensors": sorted(dense_fp8_names),
+            "weight_block_shape": [1, -1],
+            "weight_transform": "per_row_amax_448",
+        })
     if not args.embed_bf16:
         new_groups.append({
             "compute_dtype": "q4_0",
@@ -347,6 +450,7 @@ def main():
     qcfg["model"]["parameter_groups"] = new_groups
     qcfg["atlas_exl3"] = {
         "embed_q4": not args.embed_bf16,
+        "dense_fp8": pack_dense_fp8,
         "no_vision": omit_vision,
         "no_mtp": omit_mtp,
     }
@@ -371,7 +475,10 @@ def main():
     text_sz = (args.out_dir / text_shard).stat().st_size
     vis_sz = 0 if omit_vision else (args.out_dir / vision_shard).stat().st_size
     print(f"Done in {time.time() - t0:.1f}s!")
-    print(f"  Text shard:   {text_sz / 1e9:.3f} GB ({text_sz / (1024**3):.3f} GiB) [BF16 dense on disk -> ~{(text_sz - 1.146e9)/1e9:.3f} GB / {(text_sz - 1.146e9)/(1024**3):.3f} GiB in VRAM with --dense-fp8!]")
+    if pack_dense_fp8:
+        print(f"  Text shard:   {text_sz / 1e9:.3f} GB ({text_sz / (1024**3):.3f} GiB) [pre-packed FP8 dense + Q4_0 embed + EXL3 experts]")
+    else:
+        print(f"  Text shard:   {text_sz / 1e9:.3f} GB ({text_sz / (1024**3):.3f} GiB) [BF16 dense on disk -> ~{(text_sz - 1.181e9)/1e9:.3f} GB / {(text_sz - 1.181e9)/(1024**3):.3f} GiB in VRAM with --dense-fp8!]")
     if not omit_vision:
         print(f"  Vision shard: {vis_sz / 1e9:.3f} GB ({vis_sz / (1024**3):.3f} GiB)")
     else:

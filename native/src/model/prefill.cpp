@@ -14,6 +14,7 @@
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
 #include "model/expert_cache.h"
+#include "model/paged_kv.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -260,15 +261,28 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
     if (layer.full) {
       const int fi = FULL_INDEX[v];
-      const std::size_t off = std::size_t(pos0) * st.full_row_bytes();
-      void* kc = st.k_full_at(fi).data;
-      void* vc = st.v_full_at(fi).data;
-      ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off;
-      ap.out_fp8 = st.kv_fp8, ap.out_q4 = st.kv_q4;
-      pk::attn_prep(ap, s);
-      at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kv_q4 = st.kv_q4, at.kpos = nullptr, at.bounds = nullptr,
-      at.L = pos0 + T;
-      at.window = 0;
+      if (st.paged_kv) {
+        st.paged_kv->ensure_write_pages(fi, pos0, T, s);
+        ap.k_out = nullptr, ap.v_out = nullptr;
+        ap.k_pages = st.paged_kv->k_table(fi);
+        ap.v_pages = st.paged_kv->v_table(fi);
+        ap.page_shift = PagedKvCache::kPageShift;
+        ap.out_fp8 = false, ap.out_q4 = true;
+        pk::attn_prep(ap, s);
+        at.k = nullptr, at.v = nullptr, at.kv_fp8 = false, at.kv_q4 = true, at.kpos = nullptr, at.bounds = nullptr,
+        at.L = pos0 + T;
+        at.window = 0;
+      } else {
+        const std::size_t off = std::size_t(pos0) * st.full_row_bytes();
+        void* kc = st.k_full_at(fi).data;
+        void* vc = st.v_full_at(fi).data;
+        ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off;
+        ap.out_fp8 = st.kv_fp8, ap.out_q4 = st.kv_q4;
+        pk::attn_prep(ap, s);
+        at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kv_q4 = st.kv_q4, at.kpos = nullptr, at.bounds = nullptr,
+        at.L = pos0 + T;
+        at.window = 0;
+      }
     } else {
       const int ri = RING_INDEX[v];
       auto* k_ring = static_cast<ActT*>(st.k_ring_at(ri).data);
@@ -288,7 +302,11 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::conv_state_update(st.conv_k_at(v), proj_ + SEG_BEGIN[SEG_K], R, T, KV_DIM, s);
     pk::conv_state_update(st.conv_v_at(v), proj_ + SEG_BEGIN[SEG_V], R, T, KV_DIM, s);
     pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
-    pk::attention(at, s);
+    if (layer.full && st.paged_kv) {
+      st.paged_kv->prefill_attention(FULL_INDEX[v], at, s);
+    } else {
+      pk::attention(at, s);
+    }
 
     // ---- output projection + post-attention conv
     const ActT* wo = bf16_rows(layer.wo);
@@ -316,10 +334,12 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, T, EXPERTS, H, s);
     CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), s));
     pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
-    const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
-    pk::moe_route(idx_, T, work, s);
     const Experts& ex = layer.experts;
     const bool exl13 = is_exl3(ex.w13_fmt), exl2 = is_exl3(ex.w2_fmt);
+    // EXL3 TM=32 (3 CTAs/SM, zero register spills) beats TM=128 by ~89% on 64K prefill.
+    const int moe_tr = (exl13 || exl2) ? 32 : pk::moe_tile_rows(T);
+    const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
+    pk::moe_route(idx_, T, work, s, moe_tr);
     pk::MoeExperts me{static_cast<int>(ex.w13_fmt),
                       ex.w13.data,
                       exl13 ? ex.w13_rin.data : ex.w13_scale.data,
@@ -331,6 +351,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
                       ex.w13_rout.data,
                       ex.w2_rout.data,
                       exl3_scratch_};
+    me.tile_rows = moe_tr;
     if (w.expert_cache) {
       const auto eptrs = w.expert_cache->layer_ptrs(l);
       me.w13_ptrs = eptrs.w13;

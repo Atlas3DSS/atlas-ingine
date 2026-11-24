@@ -152,7 +152,14 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
         qi = max(-8, min(7, qi));
         q[j] = uint32_t(qi + 8);
       }
-      uint8_t* row_dst = static_cast<uint8_t*>(dst) + size_t(t) * kKvQ4RowBytes;
+      uint8_t* row_dst;
+      if (p.k_pages) {
+        void* const* pages = kv == 0 ? p.k_pages : p.v_pages;
+        const int mask = (1 << p.page_shift) - 1;
+        row_dst = static_cast<uint8_t*>(pages[pos >> p.page_shift]) + size_t(pos & mask) * kKvQ4RowBytes;
+      } else {
+        row_dst = static_cast<uint8_t*>(dst) + size_t(t) * kKvQ4RowBytes;
+      }
       *reinterpret_cast<uint16_t*>(row_dst + warp * 64 + lane * 2) =
           uint16_t(q[0] | (q[1] << 4) | (q[2] << 8) | (q[3] << 12));
       if ((lane & 7) == 0)
@@ -348,10 +355,16 @@ __global__ void __launch_bounds__(256) head_kernel(const uint16_t* __restrict__ 
   if (lane == 0) out[v] = tanhf(round_bf16(acc) * (1.f / 30.f)) * 30.f;
 }
 
+__global__ void f32_to_act_kernel(const float* __restrict__ src, uint16_t* __restrict__ dst, size_t n) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = f2bf_bits(src[i]);
+}
+
 }  // namespace
 
 void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
-  if (p.T <= 0 || !p.proj || !p.q || !p.rel || !p.k_out || !p.v_out || !p.conv_k || !p.conv_v)
+  const bool have_kv = (p.k_out && p.v_out) || (p.out_q4 && p.k_pages && p.v_pages && p.page_shift > 0);
+  if (p.T <= 0 || !p.proj || !p.q || !p.rel || !have_kv || !p.conv_k || !p.conv_v)
     throw std::invalid_argument("attn_prep: missing argument");
   if (p.out_fp8 && p.out_q4) throw std::invalid_argument("attn_prep: out_fp8 and out_q4 are mutually exclusive");
   attn_prep_kernel<<<p.T, 256, 0, stream>>>(p);
@@ -398,6 +411,12 @@ void head_logits(const ActT* x, const void* w, const float* scale, int V, float*
   const auto* xs = reinterpret_cast<const uint16_t*>(x);
   if (scale) head_kernel<true><<<(V + 7) / 8, 256, 0, stream>>>(xs, w, scale, V, out);
   else head_kernel<false><<<(V + 7) / 8, 256, 0, stream>>>(xs, w, scale, V, out);
+}
+
+void f32_to_act(const float* src, ActT* dst, std::size_t n, cudaStream_t stream) {
+  if (n == 0) return;
+  f32_to_act_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
+      src, reinterpret_cast<uint16_t*>(dst), n);
 }
 
 }  // namespace ingine::kernels::prefill

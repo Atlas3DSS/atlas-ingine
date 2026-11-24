@@ -56,7 +56,13 @@ class EngineGenerator final : public Generator {
   bool supports_images() const override { return vision_ != nullptr; }
 
   std::string offload_summary() const override {
-    return rt_.weights().expert_cache ? rt_.weights().expert_cache->summary() : std::string{};
+    std::string out;
+    if (rt_.weights().expert_cache) out = rt_.weights().expert_cache->summary();
+    if (rt_.state().paged_kv) {
+      if (!out.empty()) out += "\n";
+      out += rt_.state().paged_kv->summary();
+    }
+    return out;
   }
 
  private:
@@ -83,8 +89,8 @@ class EngineGenerator final : public Generator {
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
-    if (options_.offload_vram_mb > 0 && options_.park_mb < 0) {
-      park_budget_ = 0;  // keep strict VRAM cap in offload mode unless user explicitly requests parking
+    if ((options_.offload_vram_mb > 0 || options_.kv_paged || options_.kv_vram_mb > 0) && options_.park_mb < 0) {
+      park_budget_ = 0;  // keep strict VRAM cap in offload/paged-KV mode unless user explicitly requests parking
     } else if (options_.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
       std::size_t free = 0, total = 0;
       CUDA_CHECK(cudaMemGetInfo(&free, &total));

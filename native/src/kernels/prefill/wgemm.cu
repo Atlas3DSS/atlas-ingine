@@ -377,26 +377,52 @@ template <int MT, int TM, int BITS>
 __device__ __forceinline__ void mma_step_exl3(float (&acc)[TM / 16][2][4], const uint16_t* A,
                                               const uint8_t* w_warp, int lane) {
   constexpr int TILE_BYTES = 32 * BITS;
+  uint32_t h01, h23, h45, h67;
+  {
+    const uint32_t* tw0 = reinterpret_cast<const uint32_t*>(w_warp);
+    exl3::dq8_mcg<BITS>([&](int wi) { return tw0[wi]; }, lane, h01, h23, h45, h67);
+  }
 #pragma unroll
   for (int kk = 0; kk < 8; ++kk) {
-    const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_warp + kk * TILE_BYTES);
-    uint32_t h01, h23, h45, h67;
-    exl3::dq8_mcg<BITS>([&](int wi) { return tw[wi]; }, lane, h01, h23, h45, h67);
-    unsigned a[MT][4];
+    uint32_t nh01, nh23, nh45, nh67;
+    // Stream ldmatrix_x4 per 16-row tile (4 regs instead of 4*MT regs) to eliminate register spills at TM=128.
+    constexpr int HALF_MT = (MT + 1) / 2;
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt)
-      ldmatrix_x4(a[mt][0], a[mt][1], a[mt][2], a[mt][3],
+    for (int mt = 0; mt < HALF_MT; ++mt) {
+      unsigned a[4];
+      ldmatrix_x4(a[0], a[1], a[2], a[3],
                   smem_addr(A + swz<16>(mt * 16 + (lane & 15), kk * 2 + (lane >> 4))));
+      mma_f16(acc[mt][0], a, h01, h23);
+      mma_f16(acc[mt][1], a, h45, h67);
+    }
+    if (kk + 1 < 8) {
+      const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_warp + (kk + 1) * TILE_BYTES);
+      exl3::dq8_mcg<BITS>([&](int wi) { return tw[wi]; }, lane, nh01, nh23, nh45, nh67);
+    }
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-      mma_f16(acc[mt][0], a[mt], h01, h23);
-      mma_f16(acc[mt][1], a[mt], h45, h67);
+    for (int mt = HALF_MT; mt < MT; ++mt) {
+      unsigned a[4];
+      ldmatrix_x4(a[0], a[1], a[2], a[3],
+                  smem_addr(A + swz<16>(mt * 16 + (lane & 15), kk * 2 + (lane >> 4))));
+      mma_f16(acc[mt][0], a, h01, h23);
+      mma_f16(acc[mt][1], a, h45, h67);
+    }
+    if (kk + 1 < 8) {
+      h01 = nh01;
+      h23 = nh23;
+      h45 = nh45;
+      h67 = nh67;
     }
   }
 }
 
+template <int TM>
+inline constexpr int exl3_a_stages() {
+  return (TM == 32 || !INGINE_ACT_FP16) ? 2 : 1;
+}
+
 template <int BITS, Mode MODE, int K, int TM>
-__global__ void __launch_bounds__(NT, 1) wgemm_exl3_kernel(const Exl3GemmArgs g) {
+__global__ void __launch_bounds__(NT, TM == 32 ? 3 : 1) wgemm_exl3_kernel(const Exl3GemmArgs g) {
   constexpr int NE = MODE == Mode::Up ? 2 * kInter : kHidden;  // 2304
   constexpr int NTILES_N = NE / TN;                            // 18
   constexpr int BK_EXL = 128;
@@ -405,12 +431,13 @@ __global__ void __launch_bounds__(NT, 1) wgemm_exl3_kernel(const Exl3GemmArgs g)
   constexpr int KT = K / 16;                                   // 144 or 72
   constexpr int W_CHUNK_ROW = 8 * TILE_BYTES;                  // 512B (2-bit) or 768B (3-bit)
   constexpr int W_STAGE_BYTES = 8 * W_CHUNK_ROW;               // 4096B (2-bit) or 6144B (3-bit)
+  constexpr int AS_EXL = exl3_a_stages<TM>();
   constexpr int A_BYTES = TM * BK_EXL * 2;                     // 8192B (TM=32) or 32768B (TM=128)
-  static_assert(A_BYTES >= 16 * 128 * 4);
+  static_assert(AS_EXL * A_BYTES >= 16 * 128 * 4);
 
   extern __shared__ __align__(128) unsigned char smem[];
-  uint16_t* A_smem = reinterpret_cast<uint16_t*>(smem);
-  unsigned char* W_smem = smem + A_BYTES;
+  unsigned char* A_base = smem;
+  unsigned char* W_smem = smem + AS_EXL * A_BYTES;
 
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int tile_idx = blockIdx.x / NTILES_N;
@@ -447,21 +474,25 @@ __global__ void __launch_bounds__(NT, 1) wgemm_exl3_kernel(const Exl3GemmArgs g)
 #pragma unroll
     for (int b = 0; b < 2; ++b) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0.f;
 
+  const __half* rin_base = g.rin_ptrs ? reinterpret_cast<const __half*>(g.rin_ptrs[e]) : (g.rin + size_t(e) * K);
+
 #pragma unroll 1
   for (int ks = 0; ks < KS; ++ks) {
-    // Rotate TM activation rows for this 128-element K-block into swizzled FP16 A_smem
-    const __half* rin_p =
-        (g.rin_ptrs ? reinterpret_cast<const __half*>(g.rin_ptrs[e]) : (g.rin + size_t(e) * K)) + ks * BK_EXL + lane * 4;
-    float r_in[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) r_in[i] = __half2float(__ldg(rin_p + i));
+    // Rotate TM activation rows for this 128-element K-block into swizzled FP16 A_smem stage.
+    uint16_t* A_smem = reinterpret_cast<uint16_t*>(A_base + (AS_EXL > 1 ? (ks & 1) * A_BYTES : 0));
+    const uint2 rin_raw = __ldg(reinterpret_cast<const uint2*>(rin_base + ks * BK_EXL + lane * 4));
+    const __half2 rin01 = *reinterpret_cast<const __half2*>(&rin_raw.x);
+    const __half2 rin23 = *reinterpret_cast<const __half2*>(&rin_raw.y);
+    const float r_in0 = __low2float(rin01), r_in1 = __high2float(rin01);
+    const float r_in2 = __low2float(rin23), r_in3 = __high2float(rin23);
 
-    for (int r = warp; r < TM; r += 8) {
+    const int r_lim = mact * 16;
+    for (int r = warp; r < r_lim; r += 8) {
       uint2 h4 = {0u, 0u};
       if (r < n) {
         const size_t src_row = (MODE == Mode::Up) ? size_t(g.w.pair_token[pb + r]) : size_t(pb + r);
         const uint2 raw = *reinterpret_cast<const uint2*>(g.a + src_row * K + ks * BK_EXL + lane * 4);
-        float v[4] = {bf_lo(raw.x) * r_in[0], bf_hi(raw.x) * r_in[1], bf_lo(raw.y) * r_in[2], bf_hi(raw.y) * r_in[3]};
+        float v[4] = {bf_lo(raw.x) * r_in0, bf_hi(raw.x) * r_in1, bf_lo(raw.y) * r_in2, bf_hi(raw.y) * r_in3};
         exl3::fwht_128_warp(v, lane);
         h4.x = pack_half2(v[0], v[1]);
         h4.y = pack_half2(v[2], v[3]);
@@ -484,16 +515,19 @@ __global__ void __launch_bounds__(NT, 1) wgemm_exl3_kernel(const Exl3GemmArgs g)
       case 7: if constexpr (7 <= TM / 16) mma_step_exl3<7, TM, BITS>(acc, A_smem, w_warp, lane); break;
       default: mma_step_exl3<TM / 16, TM, BITS>(acc, A_smem, w_warp, lane); break;
     }
-    __syncthreads();
+    if constexpr (AS_EXL == 1) __syncthreads();
   }
+  if constexpr (AS_EXL > 1) __syncthreads();
 
   // Epilogue: 16 rows at a time through shared ep[16][128] (reuses A_smem), output H_128 + rout -> BF16
   float* ep = reinterpret_cast<float*>(smem);
   const __half* rout_p =
       (g.rout_ptrs ? reinterpret_cast<const __half*>(g.rout_ptrs[e]) : (g.rout + size_t(e) * NE)) + n0 + lane * 4;
-  float r_out[4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) r_out[i] = __half2float(__ldg(rout_p + i));
+  const uint2 rout_raw = __ldg(reinterpret_cast<const uint2*>(rout_p));
+  const __half2 rout01 = *reinterpret_cast<const __half2*>(&rout_raw.x);
+  const __half2 rout23 = *reinterpret_cast<const __half2*>(&rout_raw.y);
+  const float r_out0 = __low2float(rout01), r_out1 = __high2float(rout01);
+  const float r_out2 = __low2float(rout23), r_out3 = __high2float(rout23);
 
   const int g_row = lane >> 2, c_pair = lane & 3;
   for (int mt = 0; mt < mact; ++mt) {
@@ -516,8 +550,8 @@ __global__ void __launch_bounds__(NT, 1) wgemm_exl3_kernel(const Exl3GemmArgs g)
         for (int i = 0; i < 4; ++i) v[i] = ep[r * 128 + lane * 4 + i];
         exl3::fwht_128_warp(v, lane);
         uint2 out4;
-        out4.x = pack_bf16x2(v[0] * r_out[0], v[1] * r_out[1]);
-        out4.y = pack_bf16x2(v[2] * r_out[2], v[3] * r_out[3]);
+        out4.x = pack_bf16x2(v[0] * r_out0, v[1] * r_out1);
+        out4.y = pack_bf16x2(v[2] * r_out2, v[3] * r_out3);
         const size_t dst_row = (MODE == Mode::Up) ? size_t(pb + row) : size_t(g.w.pair_dst[pb + row]);
         *reinterpret_cast<uint2*>(g.out + dst_row * NE + n0 + lane * 4) = out4;
       }
@@ -526,19 +560,26 @@ __global__ void __launch_bounds__(NT, 1) wgemm_exl3_kernel(const Exl3GemmArgs g)
   }
 }
 
+__device__ __forceinline__ uint2 swiglu4(uint2 g4, uint2 u4) {
+  auto elem = [](float g, float u) {
+    const float sig = 1.f / (1.f + expf(-g));
+    return __fmul_rn(__fmul_rn(softcap(g, 4.f), sig), softcap(u, 25.f));
+  };
+  uint2 out;
+  out.x = pack_bf16x2(elem(bf_lo(g4.x), bf_lo(u4.x)), elem(bf_hi(g4.x), bf_hi(u4.x)));
+  out.y = pack_bf16x2(elem(bf_lo(g4.y), bf_lo(u4.y)), elem(bf_hi(g4.y), bf_hi(u4.y)));
+  return out;
+}
+
 // Stacked [gate(0..1151); up(1152..2303)] -> softcapped SwiGLU act [pairs, 1152].
 __global__ void moe_exl3_swiglu_kernel(const uint16_t* __restrict__ gu, uint16_t* __restrict__ act, int pairs) {
   const int p = blockIdx.x;
   if (p >= pairs) return;
-  const uint16_t* row = gu + size_t(p) * (2 * kInter);
-  uint16_t* dst = act + size_t(p) * kInter;
-  for (int i = threadIdx.x; i < kInter; i += blockDim.x) {
-    const float g = bf2f(row[i]);
-    const float u = bf2f(row[kInter + i]);
-    const float sig = 1.f / (1.f + expf(-g));
-    const float v = __fmul_rn(__fmul_rn(softcap(g, 4.f), sig), softcap(u, 25.f));
-    dst[i] = f2bf_bits(v);
-  }
+  const uint2* g_row = reinterpret_cast<const uint2*>(gu + size_t(p) * (2 * kInter));
+  const uint2* u_row = reinterpret_cast<const uint2*>(gu + size_t(p) * (2 * kInter) + kInter);
+  uint2* dst = reinterpret_cast<uint2*>(act + size_t(p) * kInter);
+  constexpr int N4 = kInter / 4;  // 288
+  for (int i = threadIdx.x; i < N4; i += blockDim.x) dst[i] = swiglu4(g_row[i], u_row[i]);
 }
 
 // Tile-masked variant for sub-batched tiered prefill: only writes `act` rows belonging to active experts.
@@ -549,23 +590,19 @@ __global__ void moe_exl3_swiglu_masked_kernel(const uint16_t* __restrict__ gu, u
   const int4 tile = w.tiles[tile_idx];
   if (!active_mask[tile.x]) return;
   const int pb = tile.y, n = tile.z;
+  constexpr int N4 = kInter / 4;  // 288
   for (int r = 0; r < n; ++r) {
     const int p = pb + r;
-    const uint16_t* row = gu + size_t(p) * (2 * kInter);
-    uint16_t* dst = act + size_t(p) * kInter;
-    for (int i = threadIdx.x; i < kInter; i += blockDim.x) {
-      const float g = bf2f(row[i]);
-      const float u = bf2f(row[kInter + i]);
-      const float sig = 1.f / (1.f + expf(-g));
-      const float v = __fmul_rn(__fmul_rn(softcap(g, 4.f), sig), softcap(u, 25.f));
-      dst[i] = f2bf_bits(v);
-    }
+    const uint2* g_row = reinterpret_cast<const uint2*>(gu + size_t(p) * (2 * kInter));
+    const uint2* u_row = reinterpret_cast<const uint2*>(gu + size_t(p) * (2 * kInter) + kInter);
+    uint2* dst = reinterpret_cast<uint2*>(act + size_t(p) * kInter);
+    for (int i = threadIdx.x; i < N4; i += blockDim.x) dst[i] = swiglu4(g_row[i], u_row[i]);
   }
 }
 
 template <int BITS, Mode MODE, int K, int TM>
 void launch_exl3(const Exl3GemmArgs& g, int grid, cudaStream_t stream) {
-  constexpr int SMEM = TM * 128 * 2 + 2 * 8 * 8 * 32 * BITS;
+  constexpr int SMEM = exl3_a_stages<TM>() * TM * 128 * 2 + 2 * 8 * 8 * 32 * BITS;
   if constexpr (SMEM > 49152) {
     static const cudaError_t attr =
         cudaFuncSetAttribute(wgemm_exl3_kernel<BITS, MODE, K, TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
@@ -598,12 +635,14 @@ void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, Ac
     g.a = reinterpret_cast<const uint16_t*>(x);
     g.w = w;
     g.out = reinterpret_cast<uint16_t*>(e.exl3_scratch);
+    const int tr = e.tile_rows > 0 ? e.tile_rows : moe_tile_rows(T);
+    const int mt = moe_max_tiles(T, tr);
     if (e.fmt == FMT_EXL3_2)
-      launch_exl3_rows<2, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+      launch_exl3_rows<2, Mode::Up, kHidden>(g, tr, 2 * kInter / TN, mt, stream);
     else
-      launch_exl3_rows<3, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+      launch_exl3_rows<3, Mode::Up, kHidden>(g, tr, 2 * kInter / TN, mt, stream);
     if (e.active_mask) {
-      moe_exl3_swiglu_masked_kernel<<<moe_max_tiles(T), 256, 0, stream>>>(
+      moe_exl3_swiglu_masked_kernel<<<mt, 256, 0, stream>>>(
           reinterpret_cast<const uint16_t*>(e.exl3_scratch), reinterpret_cast<uint16_t*>(act), w, e.active_mask);
     } else {
       const int pairs = T * kTopK;
@@ -636,10 +675,12 @@ void moe_down(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, Act
     g.a = reinterpret_cast<const uint16_t*>(act);
     g.w = w;
     g.out = reinterpret_cast<uint16_t*>(down);
+    const int tr = e.tile_rows > 0 ? e.tile_rows : moe_tile_rows(T);
+    const int mt = moe_max_tiles(T, tr);
     if (w2_fmt == FMT_EXL3_2)
-      launch_exl3_rows<2, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+      launch_exl3_rows<2, Mode::Down, kInter>(g, tr, kHidden / TN, mt, stream);
     else
-      launch_exl3_rows<3, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+      launch_exl3_rows<3, Mode::Down, kInter>(g, tr, kHidden / TN, mt, stream);
     return;
   }
   const GemmArgs g = expert_args(e.w2, e.w2_scale, e.w2_factor, e.w2_ptrs, e.w2_scale_ptrs,

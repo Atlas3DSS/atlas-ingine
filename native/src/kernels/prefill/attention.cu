@@ -70,8 +70,16 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
     const int row = tid >> 2, blk = tid & 3;
     const int j = j0 + row;
     if (j < p.L) {
-      const uint8_t* Krow = static_cast<const uint8_t*>(p.k) + size_t(j) * kKvQ4RowBytes;
-      const uint8_t* Vrow = static_cast<const uint8_t*>(p.v) + size_t(j) * kKvQ4RowBytes;
+      const uint8_t* Krow;
+      const uint8_t* Vrow;
+      if (p.k_pages) {
+        const int mask = (1 << p.page_shift) - 1;
+        Krow = static_cast<const uint8_t*>(p.k_pages[j >> p.page_shift]) + size_t(j & mask) * kKvQ4RowBytes;
+        Vrow = static_cast<const uint8_t*>(p.v_pages[j >> p.page_shift]) + size_t(j & mask) * kKvQ4RowBytes;
+      } else {
+        Krow = static_cast<const uint8_t*>(p.k) + size_t(j) * kKvQ4RowBytes;
+        Vrow = static_cast<const uint8_t*>(p.v) + size_t(j) * kKvQ4RowBytes;
+      }
       r.k[0] = __ldg(reinterpret_cast<const uint4*>(Krow + g * 64 + blk * 16));
       r.v[0] = __ldg(reinterpret_cast<const uint4*>(Vrow + g * 64 + blk * 16));
       r.ks = __ldg(reinterpret_cast<const uint16_t*>(Krow + kKvQ4NibbleBytes + g * 8 + blk * 2));
@@ -251,8 +259,10 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
       s.nlist = n;
     }
   } else {
-    const int lo = p.window ? max(0, qmin - p.window + 1) : 0;
-    const int hi = min(qmax, p.L - 1);
+    const int lo_abs = p.window ? max(0, qmin - p.window + 1) : 0;
+    const int hi_abs = min(qmax, p.k_pos_base + p.L - 1);
+    const int lo = max(0, lo_abs - p.k_pos_base);
+    const int hi = hi_abs - p.k_pos_base;
     first = lo / BK;
     ntiles = hi >= lo ? hi / BK - first + 1 : 0;
   }
@@ -273,6 +283,24 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 #pragma unroll
   for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
   float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+  if (p.partial_o && !p.partial_init) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int R = R0 + warp * 16 + (lane >> 2) + r * 8;
+      if (R >= rows) continue;
+      const int t = R / GQA, h = g * GQA + R % GQA;
+      const size_t rh = size_t(t) * kHeads + h;
+      m[r] = p.partial_m[rh];
+      // Total row sum lives in partial_l[rh]; seed lane&3 == 0 so the 4-lane xor reduction stays exact.
+      l[r] = (lane & 3) == 0 ? p.partial_l[rh] : 0.f;
+#pragma unroll
+      for (int dt = 0; dt < D / 8; ++dt) {
+        const int col = dt * 8 + (lane & 3) * 2;
+        o[dt][2 * r] = p.partial_o[rh * D + col];
+        o[dt][2 * r + 1] = p.partial_o[rh * D + col + 1];
+      }
+    }
+  }
 
   KvRegs<KV_FMT> regs;
   if (ntiles > 0) {
@@ -293,8 +321,8 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
       const int4 b = s.bounds[kt];
       kmin = b.x, kmax = b.y, allv = b.z != 0;
     } else {
-      kmin = kt * BK;
-      kmax = min(kt * BK + BK - 1, p.L - 1);
+      kmin = p.k_pos_base + kt * BK;
+      kmax = p.k_pos_base + min(kt * BK + BK - 1, p.L - 1);
       allv = kt * BK + BK <= p.L;
     }
     const int dmin = qmin - kmax, dmax = qmax - kmin;
@@ -336,9 +364,10 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
         const int r = e >> 1, jl = nt * 8 + (lane & 3) * 2 + (e & 1);
         float x = sc[nt][e] * kScale;
         if (need_mask || need_bias) {
-          const int kp = EXPLICIT ? s.kpos[buf][jl] : kt * BK + jl;
+          const int j_local = kt * BK + jl;
+          const int kp = EXPLICIT ? s.kpos[buf][jl] : (p.k_pos_base + j_local);
           const int d = qpos[r] - kp;
-          const bool ok = kp >= 0 && d >= 0 && (p.window == 0 || d < p.window) && (EXPLICIT || kp < p.L);
+          const bool ok = kp >= 0 && d >= 0 && (p.window == 0 || d < p.window) && (EXPLICIT || j_local < p.L);
           if (need_bias && ok && d < kRelExtent) x += bf2f(__ldg(relp[r] + d));
           x = ok ? x * kLog2e : -INFINITY;
         } else {
@@ -405,7 +434,30 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     }
   }
 
-  // ---- epilogue
+  // ---- epilogue (or save online-softmax partials for next paged KV batch)
+  if (p.partial_o && !p.partial_final) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      float lr = l[r];
+      lr += __shfl_xor_sync(0xffffffffu, lr, 1);
+      lr += __shfl_xor_sync(0xffffffffu, lr, 2);
+      const int R = R0 + warp * 16 + (lane >> 2) + r * 8;
+      if (R >= rows) continue;
+      const int t = R / GQA, h = g * GQA + R % GQA;
+      const size_t rh = size_t(t) * kHeads + h;
+      if ((lane & 3) == 0) {
+        p.partial_m[rh] = m[r];
+        p.partial_l[rh] = lr;
+      }
+#pragma unroll
+      for (int dt = 0; dt < D / 8; ++dt) {
+        const int col = dt * 8 + (lane & 3) * 2;
+        p.partial_o[rh * D + col] = o[dt][2 * r];
+        p.partial_o[rh * D + col + 1] = o[dt][2 * r + 1];
+      }
+    }
+    return;
+  }
   const uint16_t* proj = reinterpret_cast<const uint16_t*>(p.proj);
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
@@ -496,7 +548,9 @@ __global__ void bounds_kernel(const int* __restrict__ kpos, int L, int4* __restr
 }  // namespace
 
 void attention(const AttnParams& p, cudaStream_t stream) {
-  if (p.T <= 0 || p.L <= 0 || !p.q || !p.k || !p.v || !p.rel || !p.proj || !p.out)
+  const bool have_kv = (p.k && p.v) || (p.kv_q4 && p.k_pages && p.v_pages && p.page_shift > 0);
+  const bool have_out = p.partial_final ? (p.out != nullptr && p.proj != nullptr) : (p.partial_o && p.partial_m && p.partial_l);
+  if (p.T <= 0 || p.L <= 0 || !p.q || !have_kv || !p.rel || !have_out)
     throw std::invalid_argument("prefill attention: missing argument");
   const bool expl = p.kpos != nullptr;
   if (expl && (!p.bounds || (p.L + BK - 1) / BK > kAttnMaxTiles))

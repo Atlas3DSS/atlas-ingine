@@ -121,14 +121,15 @@ int moe_tile_rows(int T) {
   return forced ? forced : T <= 512 ? 32 : 128;
 }
 
-int moe_tiles_capacity(int max_T) { return std::max(moe_max_tiles(std::min(max_T, 512)), moe_max_tiles(max_T)); }
+int moe_tiles_capacity(int max_T) { return (max_T * kTopK + 31) / 32 + kExperts; }
 
 void moe_topk(const float* logits, const float* bias, int T, int* idx, float* wts, int* counts, cudaStream_t stream) {
   topk_kernel<<<(T + 7) / 8, 256, 0, stream>>>(logits, bias, T, idx, wts, counts);
 }
 
-void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream) {
-  route_kernel<<<1, 1024, 0, stream>>>(idx, T, moe_tile_rows(T), w);
+void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream, int tile_rows) {
+  const int tr = tile_rows > 0 ? tile_rows : moe_tile_rows(T);
+  route_kernel<<<1, 1024, 0, stream>>>(idx, T, tr, w);
 }
 
 void moe_combine(const ActT* down, const float* wts, int T, ActT* out, cudaStream_t stream) {

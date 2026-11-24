@@ -137,11 +137,12 @@ std::string default_model_dir() {
 
 int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
-  std::string offload_mode = "auto", expert_ranking, dump_router_stats;
+  std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir;
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
-  bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, spec = false, vision = false, atlas_6g = false;
+  int kv_vram_mb = 0, kv_ram_mb = 12288;
+  bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -159,6 +160,11 @@ int main(int argc, char** argv) {
   ap.flag("--vision", "also load the vision tower", &vision);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
   ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok; SWA stays BF16)", &kv_q4);
+  ap.flag("--kv-paged", "3-tier paged Q4_0 full-attention KV cache (VRAM LRU + pinned UVA RAM + NVMe SwapFile)", &kv_paged);
+  ap.option("--kv-vram-mb", "", "VRAM cap in MiB for paged Q4_0 KV cache (implies --kv-paged --kv-q4)", &kv_vram_mb);
+  ap.option("--kv-ram-mb", "", "pinned UVA host RAM cap in MiB for paged Q4_0 KV before NVMe SwapFile spill (default 12288)",
+            &kv_ram_mb);
+  ap.option("--kv-swap-dir", "", "optional directory for Tier-2 NVMe KV swap file", &kv_swap_dir);
   ap.exclusive({"--kv-fp8", "--kv-q4"}, false);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
   ap.flag("--atlas-6g", "6 GB VRAM preset (offload-vram-mb=5888, offload-ram-mb=12288, dense-fp8, kv-fp8, prefill-chunk=512)",
@@ -192,6 +198,7 @@ int main(int argc, char** argv) {
     if (atlas_6g) {
       if (offload_vram_mb == 0) offload_vram_mb = 5888;
       dense_fp8 = true;
+      if (kv_paged || kv_vram_mb > 0) kv_q4 = true;
       if (!kv_q4) kv_fp8 = true;
       if (prefill_chunk > 512) prefill_chunk = 512;
     }
@@ -202,6 +209,10 @@ int main(int argc, char** argv) {
     options.dense_fp8 = dense_fp8;
     options.kv_fp8 = kv_fp8;
     options.kv_q4 = kv_q4;
+    options.kv_paged = kv_paged || kv_vram_mb > 0;
+    options.kv_vram_mb = kv_vram_mb;
+    options.kv_ram_mb = kv_ram_mb;
+    options.kv_swap_dir = kv_swap_dir;
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
     options.vision = vision;

@@ -821,7 +821,7 @@ int run_test_1m_kernel() {
 // ---- Phase 1B + 1C: Resident 1M-token VRAM, prefill/decode speed, and honest Needle-in-a-Haystack ----
 
 int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_chunk, int decode_tokens,
-                        const std::vector<int>& ctxs) {
+                        const std::vector<int>& ctxs, bool kv_paged, int kv_vram_mb, int kv_ram_mb, bool atlas_6g) {
   cudaFree(nullptr);
   size_t free0 = 0, free_rt = 0, free_pre = 0, total = 0;
   cudaMemGetInfo(&free0, &total);
@@ -829,38 +829,54 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
   RuntimeOptions opt;
   opt.model_dir = model_dir;
   opt.max_ctx = max_ctx;
-  opt.prefill_chunk = prefill_chunk;
+  opt.prefill_chunk = atlas_6g ? std::min(prefill_chunk, 512) : prefill_chunk;
+  prefill_chunk = opt.prefill_chunk;
   opt.dense_fp8 = true;
   opt.kv_q4 = true;
+  opt.kv_paged = kv_paged || kv_vram_mb > 0;
+  opt.kv_vram_mb = kv_vram_mb;
+  opt.kv_ram_mb = kv_ram_mb;
+  if (atlas_6g) {
+    opt.offload_vram_mb = 5888;
+    opt.offload_ram_mb = 12288;
+  }
   opt.spec = false;
   opt.park_mb = 0;
   opt.vision = false;
 
-  std::printf("=== Phase 1B/1C: Resident 1M Context Bench & Honest Needle Test ===\n");
-  std::printf("model=%s max_ctx=%d prefill_chunk=%d kv_q4=true dense_fp8=true\n",
-              model_dir.c_str(), max_ctx, prefill_chunk);
+  std::printf("=== %s Context Bench & Honest Needle Test ===\n",
+              opt.kv_paged ? (atlas_6g ? "Phase 2 (6 GB Paged 1M)" : "Phase 2 (<=12 GB Paged 1M)")
+                           : "Phase 1B/1C (Resident 1M)");
+  std::printf("model=%s max_ctx=%d prefill_chunk=%d kv_q4=true kv_paged=%s kv_vram_mb=%d kv_ram_mb=%d atlas_6g=%s\n",
+              model_dir.c_str(), max_ctx, opt.prefill_chunk, opt.kv_paged ? "true" : "false", opt.kv_vram_mb,
+              opt.kv_ram_mb, atlas_6g ? "true" : "false");
   std::fflush(stdout);
 
   const auto t_load0 = std::chrono::steady_clock::now();
   Runtime rt(opt);
   const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
   cudaMemGetInfo(&free_rt, &total);
-  Prefiller pre(rt.weights(), rt.ablation(), prefill_chunk, rt.stream());
+  Prefiller pre(rt.weights(), rt.ablation(), opt.prefill_chunk, rt.stream());
   DeviceBuffer ckpt(rt.checkpoint_bytes());
-  DeviceBuffer d_chunk(size_t(prefill_chunk) * sizeof(int32_t));
+  DeviceBuffer d_chunk(size_t(opt.prefill_chunk) * sizeof(int32_t));
   DeviceBuffer d_logits(size_t(UNPADDED_VOCAB) * sizeof(float));
   CUDA_CHECK(cudaStreamSynchronize(rt.stream()));
   cudaMemGetInfo(&free_pre, &total);
 
   const double rt_gib = double(free0 > free_rt ? free0 - free_rt : 0) / 1073741824.0;
   const double tot_gib = double(free0 > free_pre ? free0 - free_pre : 0) / 1073741824.0;
-  const double full_kv_gib = double(rt.state().k_full.bytes() + rt.state().v_full.bytes()) / 1073741824.0;
+  const double full_kv_gib = rt.state().paged_kv
+                                 ? (double(rt.state().paged_kv->vram_bytes()) / 1073741824.0)
+                                 : (double(rt.state().k_full.bytes() + rt.state().v_full.bytes()) / 1073741824.0);
   const double swa_mib = double(rt.state().k_ring.bytes() + rt.state().v_ring.bytes()) / 1048576.0;
   std::printf("Load+capture: %.1fs | Runtime VRAM: %.3f GiB (%.2f GB) | Total w/ Prefiller(chunk=%d): %.3f GiB (%.2f GB) | "
-              "Full Q4_0 KV: %.3f GiB | SWA BF16: %.1f MiB | Free: %.3f GiB\n",
-              load_s, rt_gib, rt_gib * 1.073741824, prefill_chunk, tot_gib, tot_gib * 1.073741824, full_kv_gib, swa_mib,
-              double(free_pre) / 1073741824.0);
+              "Full Q4_0 KV VRAM: %.3f GiB | SWA BF16: %.1f MiB | Free: %.3f GiB\n",
+              load_s, rt_gib, rt_gib * 1.073741824, opt.prefill_chunk, tot_gib, tot_gib * 1.073741824, full_kv_gib,
+              swa_mib, double(free_pre) / 1073741824.0);
+  if (rt.weights().expert_cache) std::printf("%s\n", rt.weights().expert_cache->summary().c_str());
+  if (rt.state().paged_kv) std::printf("%s\n", rt.state().paged_kv->summary().c_str());
   std::fflush(stdout);
+  prefill_chunk = opt.prefill_chunk;
 
   const auto fmt = ingine::text::ChatFormat::load(model_dir);
   const auto& tok = fmt.tokenizer();
@@ -1053,9 +1069,114 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
       std::fflush(stdout);
     }
   }
+  if (rt.state().paged_kv) std::printf("%s\n", rt.state().paged_kv->summary().c_str());
+  if (rt.weights().expert_cache) std::printf("%s\n", rt.weights().expert_cache->summary().c_str());
   std::printf("\n=== 1M Bench & Needle Summary: %d / %d needles recalled (%.1f%%) ===\n",
               total_passed, total_trials, total_trials ? 100.0 * double(total_passed) / double(total_trials) : 0.0);
   return 0;
+}
+
+// ---- Phase 2 Oracle: Resident Q4_0 vs 2-Tier Paged (VRAM+RAM) vs 3-Tier Paged (VRAM+RAM+NVMe SwapFile) ----
+int run_test_paged_kv(const std::string& model_dir, const std::string& golden_json) {
+  std::ifstream gf(golden_json);
+  if (!gf) {
+    std::fprintf(stderr, "cannot open %s\n", golden_json.c_str());
+    return 1;
+  }
+  std::vector<int32_t> base_ids = nlohmann::json::parse(gf)["prompt_ids"].get<std::vector<int32_t>>();
+  // Build a 12,288-token prefix (3 full 4096-token pages) + 16 decode tokens = 12,304 tokens!
+  const int prefix_len = 12288;
+  const int eval_tokens = 16;
+  const int chunk = 512;
+  std::vector<int32_t> ids;
+  ids.reserve(prefix_len + eval_tokens);
+  while (int(ids.size()) < prefix_len + eval_tokens) {
+    ids.insert(ids.end(), base_ids.begin(), base_ids.end());
+  }
+  ids.resize(prefix_len + eval_tokens);
+
+  cudaStream_t stream = nullptr;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  std::printf("=== Phase 2 PagedKvCache 3-Tier Equivalence Oracle (L=%d = 3 pages, +%d decode) ===\n", prefix_len,
+              eval_tokens);
+  std::printf("Loading weights (%s)...\n", model_dir.c_str());
+  std::fflush(stdout);
+  Weights w = load_weights(model_dir, true, stream);
+  Ablation abl = load_ablation({});
+  Prefiller pre(w, abl, chunk, stream);
+  DeviceBuffer d_ids(size_t(prefix_len + eval_tokens) * 4);
+  d_ids.copy_from_host(ids.data(), size_t(prefix_len + eval_tokens) * 4);
+  DeviceBuffer d_logits(size_t(UNPADDED_VOCAB) * 4);
+  DeviceBuffer d_pos(8);
+  Buffers buf1 = make_buffers(1);
+
+  auto eval_arm = [&](const char* label, PagedKvConfig pcfg) -> std::vector<std::vector<float>> {
+    State st = make_state(prefix_len + eval_tokens + 64, false, true, pcfg);
+    Decoder dec(w, abl, st, true);
+    reset_state(st, stream);
+    for (int off = 0; off < prefix_len; off += chunk) {
+      const int T = std::min(chunk, prefix_len - off);
+      pre.run(st, static_cast<const int32_t*>(d_ids.p) + off, T, off, static_cast<float*>(d_logits.p), nullptr);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::vector<float>> out;
+    out.reserve(eval_tokens + 1);
+    out.push_back(download_f32(static_cast<const float*>(d_logits.p), UNPADDED_VOCAB));
+    for (int i = 0; i < eval_tokens; ++i) {
+      const int pos = prefix_len + i;
+      if (st.paged_kv) st.paged_kv->ensure_decode_pages(pos, 1, stream);
+      const int64_t tok64 = ids[pos];
+      const int64_t pos64 = pos;
+      CUDA_CHECK(cudaMemcpyAsync(buf1.token.data, &tok64, 8, cudaMemcpyHostToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(d_pos.p, &pos64, 8, cudaMemcpyHostToDevice, stream));
+      dec.decode(buf1, static_cast<const int64_t*>(d_pos.p), false, stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      out.push_back(download_f32(static_cast<const float*>(buf1.logits.data), UNPADDED_VOCAB));
+    }
+    if (st.paged_kv) std::printf("  [%s] %s\n", label, st.paged_kv->summary().c_str());
+    std::fflush(stdout);
+    return out;
+  };
+
+  const auto ref = eval_arm("resident-q4", PagedKvConfig{});
+  PagedKvConfig c_ram;
+  c_ram.max_ctx = prefix_len + eval_tokens + 64;
+  c_ram.vram_mb = 96;   // 16 VRAM slots (72 MiB) < 24 active pages -> forces Tier-1 UVA RAM eviction!
+  c_ram.ram_mb = 512;   // fits all evicted pages in pinned UVA RAM (0 swap)
+  c_ram.prefill_chunk = chunk;
+  const auto paged_ram = eval_arm("paged-2tier-ram", c_ram);
+
+  PagedKvConfig c_swap;
+  c_swap.max_ctx = prefix_len + eval_tokens + 64;
+  c_swap.vram_mb = 96;  // 16 VRAM slots
+  c_swap.ram_mb = 18;   // 4 RAM slots -> forces Tier-2 NVMe SwapFile spill on both prefill AND decode!
+  c_swap.prefill_chunk = chunk;
+  const auto paged_swap = eval_arm("paged-3tier-nvme", c_swap);
+
+  auto check_arm = [&](const char* name, const std::vector<std::vector<float>>& test) -> bool {
+    double sum_kl = 0.0, max_kl = 0.0, max_diff = 0.0;
+    int top1 = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      const double kl = kl_div(ref[i], test[i]);
+      sum_kl += kl;
+      max_kl = std::max(max_kl, kl);
+      if (argmax(ref[i]) == argmax(test[i])) ++top1;
+      for (size_t j = 0; j < ref[i].size(); ++j)
+        max_diff = std::max(max_diff, double(std::fabs(ref[i][j] - test[i][j])));
+    }
+    const double mean_kl = sum_kl / double(ref.size());
+    const bool pass = mean_kl < 1e-4 && max_kl < 1e-3 && top1 == int(ref.size());
+    std::printf("%s %s vs resident-q4: mean_kl=%.3e max_kl=%.3e max_logit_diff=%.3e top1=%d/%zu\n",
+                pass ? "PASS" : "FAIL", name, mean_kl, max_kl, max_diff, top1, ref.size());
+    return pass;
+  };
+
+  bool ok = true;
+  ok &= check_arm("paged-2tier-ram", paged_ram);
+  ok &= check_arm("paged-3tier-nvme", paged_swap);
+  CUDA_CHECK(cudaStreamDestroy(stream));
+  std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
+  return ok ? 0 : 1;
 }
 
 }  // namespace
@@ -1070,9 +1191,13 @@ int main(int argc, char** argv) {
   int eval_tokens = 256;
   int prefill_chunk = 2048;
   int decode_tokens = 64;
+  int kv_vram_mb = 0;
+  int kv_ram_mb = 12288;
   std::vector<int> ctxs = {262144, 524288, 1000000};
   bool test_kv_q4 = false;
   bool dense_fp8 = true;
+  bool kv_paged = false;
+  bool atlas_6g = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--mode" && i + 1 < argc) mode = argv[++i];
@@ -1084,6 +1209,8 @@ int main(int argc, char** argv) {
     else if (a == "--eval-tokens" && i + 1 < argc) eval_tokens = std::atoi(argv[++i]);
     else if (a == "--prefill-chunk" && i + 1 < argc) prefill_chunk = std::atoi(argv[++i]);
     else if (a == "--decode-tokens" && i + 1 < argc) decode_tokens = std::atoi(argv[++i]);
+    else if (a == "--kv-vram-mb" && i + 1 < argc) kv_vram_mb = std::atoi(argv[++i]);
+    else if (a == "--kv-ram-mb" && i + 1 < argc) kv_ram_mb = std::atoi(argv[++i]);
     else if (a == "--ctxs" && i + 1 < argc) {
       ctxs.clear();
       std::stringstream ss(argv[++i]);
@@ -1092,6 +1219,8 @@ int main(int argc, char** argv) {
     }
     else if (a == "--test-kv-q4") test_kv_q4 = true;
     else if (a == "--dense-bf16") dense_fp8 = false;
+    else if (a == "--kv-paged") kv_paged = true;
+    else if (a == "--atlas-6g") atlas_6g = true;
   }
   try {
     if (mode == "vram") return run_vram();
@@ -1099,7 +1228,10 @@ int main(int argc, char** argv) {
     if (mode == "kl-models") return run_kl_models(model_dir, test_model_dir, golden, prefix_len, eval_tokens, test_kv_q4, dense_fp8);
     if (mode == "needle") return run_needle(model_dir, max_ctx);
     if (mode == "test-1m-kernel") return run_test_1m_kernel();
-    if (mode == "bench-needle-1m") return run_bench_needle_1m(model_dir, max_ctx, prefill_chunk, decode_tokens, ctxs);
+    if (mode == "test-paged-kv") return run_test_paged_kv(model_dir, golden);
+    if (mode == "bench-needle-1m")
+      return run_bench_needle_1m(model_dir, max_ctx, prefill_chunk, decode_tokens, ctxs, kv_paged, kv_vram_mb,
+                                 kv_ram_mb, atlas_6g);
     std::fprintf(stderr, "unknown mode: %s\n", mode.c_str());
     return 2;
   } catch (const std::exception& e) {

@@ -112,6 +112,13 @@ struct RuntimeOptions {
   std::string offload_mode = "auto";
   std::filesystem::path expert_ranking;     // optional JSON per-layer [24][128] homology/frequency scores
   std::filesystem::path dump_router_stats;  // optional JSON output path for observed [24][128] router hits
+  // 3-tier paged Q4_0 full-attention KV cache (for 1M context on <= 12 GB and <= 6 GB GPUs):
+  //   kv_paged / kv_vram_mb > 0: keeps hot 4096-token KV pages in VRAM, overflows warm pages to lazy
+  //   pinned UVA HostRegion slabs (<= kv_ram_mb), and spills cold pages to a crash-safe NVMe SwapFile.
+  bool kv_paged = false;
+  int kv_vram_mb = 0;               // 0 = auto when kv_paged (256 MiB with offload, 1536 MiB otherwise)
+  int kv_ram_mb = 12288;            // pinned UVA host RAM cap in MiB before spilling to NVMe SwapFile
+  std::filesystem::path kv_swap_dir;  // optional directory for Tier-2 NVMe KV swap file
 };
 
 class Generator {

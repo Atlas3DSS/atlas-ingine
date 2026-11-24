@@ -19,6 +19,7 @@
 #include "model/expert_cache.h"
 #include "model/model_data.h"
 #include "model/model_kernels.h"
+#include "model/paged_kv.h"
 
 #include "core/host_memory.h"
 
@@ -44,7 +45,7 @@ Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cud
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage);
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
-State make_state(int max_ctx, bool kv_fp8, bool kv_q4 = false);
+State make_state(int max_ctx, bool kv_fp8, bool kv_q4 = false, const PagedKvConfig& paged_kv = {});
 Buffers make_buffers(int m);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).

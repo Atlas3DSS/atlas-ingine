@@ -213,6 +213,9 @@ struct Params {
     float* conv_v;
     void* k_cache;  // ActT, or E4M3 bytes (F8)
     void* v_cache;
+    void* const* k_pages;  // optional [num_pages] Q4_0 page pointers (Q4 full layers only)
+    void* const* v_pages;
+    int page_shift;
     long long* kpos;
     const long long* pos;
     int* counter;
@@ -490,8 +493,14 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             b.kp[u] = -1;
             if (j < old_end) {
                 if constexpr (Q4) {
-                    const uint8_t* krow = reinterpret_cast<const uint8_t*>(p.k_cache) + size_t(j) * Q4_ROW_B;
-                    const uint8_t* vrow = reinterpret_cast<const uint8_t*>(p.v_cache) + size_t(j) * Q4_ROW_B;
+                    const uint8_t* krow = p.k_pages
+                        ? (static_cast<const uint8_t*>(p.k_pages[j >> p.page_shift]) +
+                           size_t(j & ((1 << p.page_shift) - 1)) * Q4_ROW_B)
+                        : (reinterpret_cast<const uint8_t*>(p.k_cache) + size_t(j) * Q4_ROW_B);
+                    const uint8_t* vrow = p.v_pages
+                        ? (static_cast<const uint8_t*>(p.v_pages[j >> p.page_shift]) +
+                           size_t(j & ((1 << p.page_shift) - 1)) * Q4_ROW_B)
+                        : (reinterpret_cast<const uint8_t*>(p.v_cache) + size_t(j) * Q4_ROW_B);
                     b.k[u] = Q4Chunk{ld_kv4(krow + g * 64 + c * 4, kvpol),
                                      ld_kv2(krow + Q4_NIB_B + g * 8 + (c >> 2) * 2, kvpol)};
                     b.v[u] = Q4Chunk{ld_kv4(vrow + g * 64 + c * 4, kvpol),
@@ -576,21 +585,30 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         const int base = rank * KT + t * CS * KT;
         if (base < L_old) {
             if constexpr (Q4) {
+                const int pmask = p.k_pages ? ((1 << p.page_shift) - 1) : 0;
                 for (int i = tid; i < KT * 2 * 4; i += NT) {
                     const int key = i / 8, kv = (i / 4) & 1, ch = i & 3, j = base + key;
                     const bool ok = j < L_old;
+                    const int jj = ok ? j : 0;
                     char* dst = raw + (t % NRAW) * RAWB + kv * (KT * 64) + key * 64 + (kv ? ch : (ch ^ (key & 3))) * 16;
-                    const uint8_t* src_base = static_cast<const uint8_t*>(kv ? p.v_cache : p.k_cache);
+                    const uint8_t* row_ptr = p.k_pages
+                        ? (static_cast<const uint8_t*>((kv ? p.v_pages : p.k_pages)[jj >> p.page_shift]) +
+                           size_t(jj & pmask) * Q4_ROW_B)
+                        : (static_cast<const uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(jj) * Q4_ROW_B);
                     cp16z(reinterpret_cast<float*>(dst),
-                          reinterpret_cast<const float*>(src_base + size_t(ok ? j : 0) * Q4_ROW_B + g * 64 + ch * 16), ok,
+                          reinterpret_cast<const float*>(row_ptr + g * 64 + ch * 16), ok,
                           kvpol);
                 }
                 for (int i = tid; i < KT * 2; i += NT) {
                     const int key = i >> 1, kv = i & 1, j = base + key;
                     const bool ok = j < L_old;
+                    const int jj = ok ? j : 0;
                     char* dst = raw + (t % NRAW) * RAWB + 2 * KT * 64 + kv * (KT * 8) + key * 8;
-                    const uint8_t* src_base = static_cast<const uint8_t*>(kv ? p.v_cache : p.k_cache);
-                    cp8z(dst, src_base + size_t(ok ? j : 0) * Q4_ROW_B + Q4_NIB_B + g * 8, ok);
+                    const uint8_t* row_ptr = p.k_pages
+                        ? (static_cast<const uint8_t*>((kv ? p.v_pages : p.k_pages)[jj >> p.page_shift]) +
+                           size_t(jj & pmask) * Q4_ROW_B)
+                        : (static_cast<const uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(jj) * Q4_ROW_B);
+                    cp8z(dst, row_ptr + Q4_NIB_B + g * 8, ok);
                 }
             } else {
                 for (int i = tid; i < KT * 2 * (D / 16); i += NT) {
@@ -1355,7 +1373,10 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             for (int idx = tid; idx < 2 * M * 18; idx += NT) {
                 const int kv = idx / (M * 18), m = (idx / 18) % M, w = idx % 18;
                 const int row = p0 + m;
-                uint8_t* row_dst = static_cast<uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(row) * Q4_ROW_B;
+                uint8_t* row_dst = p.k_pages
+                    ? (static_cast<uint8_t*>((kv ? p.v_pages : p.k_pages)[row >> p.page_shift]) +
+                       size_t(row & ((1 << p.page_shift) - 1)) * Q4_ROW_B)
+                    : (static_cast<uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(row) * Q4_ROW_B);
                 const uint32_t val = reinterpret_cast<const uint32_t*>(src_q4 + (kv * M + m) * Q4_HEAD_B)[w];
                 if (w < 16)
                     reinterpret_cast<uint32_t*>(row_dst + g * 64)[w] = val;
@@ -1430,7 +1451,10 @@ __global__ void __launch_bounds__(NT) attn_decode_stage2_kernel(const Params p) 
             for (int idx = tid; idx < 2 * M * 18; idx += NT) {
                 const int kv = idx / (M * 18), m = (idx / 18) % M, w = idx % 18;
                 const int row = p0 + m;
-                uint8_t* row_dst = static_cast<uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(row) * Q4_ROW_B;
+                uint8_t* row_dst = p.k_pages
+                    ? (static_cast<uint8_t*>((kv ? p.v_pages : p.k_pages)[row >> p.page_shift]) +
+                       size_t(row & ((1 << p.page_shift) - 1)) * Q4_ROW_B)
+                    : (static_cast<uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(row) * Q4_ROW_B);
                 const uint32_t val = reinterpret_cast<const uint32_t*>(src_q4 + (kv * M + m) * Q4_HEAD_B)[w];
                 if (w < 16)
                     reinterpret_cast<uint32_t*>(row_dst + g * 64)[w] = val;
@@ -1571,8 +1595,9 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     const bool full = a.window == 0;
     const int M = a.M;
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
+    const bool have_kv = (a.k_cache && a.v_cache) || (a.cache_q4 && a.k_pages && a.v_pages && a.page_shift > 0);
     require(a.proj && a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv && a.conv_k_state &&
-                a.conv_v_state && a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
+                a.conv_v_state && have_kv && a.pos && a.workspace && a.out,
             "null argument");
     require(full || (!a.cache_fp8 && !a.cache_q4), "compressed caches are supported on full layers (window = 0) only");
     require(!(a.cache_fp8 && a.cache_q4), "cache_fp8 and cache_q4 are mutually exclusive");
@@ -1598,6 +1623,9 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.conv_v = a.conv_v_state;
     p.k_cache = a.k_cache;
     p.v_cache = a.v_cache;
+    p.k_pages = a.k_pages;
+    p.v_pages = a.v_pages;
+    p.page_shift = a.page_shift;
     p.kpos = full ? nullptr : reinterpret_cast<long long*>(a.kpos);
     p.pos = reinterpret_cast<const long long*>(a.pos);
     p.counter = static_cast<int*>(a.workspace);

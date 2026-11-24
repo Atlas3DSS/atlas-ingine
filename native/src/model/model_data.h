@@ -253,10 +253,13 @@ struct Ablation {
 // ------------------------------------------------------------------------------------------------- state
 
 // model.State: per-request caches.
+class PagedKvCache;
+
 struct State {
   int max_ctx = 0;
   bool kv_fp8 = false;
   bool kv_q4 = false;
+  std::shared_ptr<PagedKvCache> paged_kv;  // non-null when 3-tier paged Q4_0 full-attention KV is enabled
   Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
   Tensor k_full, v_full;      // bf16/fp8 [8, max_ctx, 8, 128] or q4_0 u8 [8, max_ctx, 576] (full visits)

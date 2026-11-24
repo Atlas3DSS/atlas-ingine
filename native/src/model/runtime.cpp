@@ -63,6 +63,14 @@ void GraphExec::launch(cudaStream_t stream) const {
 
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  if (options_.kv_paged || options_.kv_vram_mb > 0) {
+    options_.kv_paged = true;
+    options_.kv_q4 = true;
+    options_.kv_fp8 = false;
+    if (options_.kv_vram_mb <= 0) {
+      options_.kv_vram_mb = options_.offload_vram_mb > 0 ? 256 : 1536;
+    }
+  }
   if (options_.offload_vram_mb > 0 && options_.prefill_chunk > 512) {
     options_.prefill_chunk = 512;  // keep prefill scratch compact (~190 MB) inside low-VRAM caps
   }
@@ -77,6 +85,7 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   offload.prefill_chunk = options_.prefill_chunk;
   offload.kv_fp8 = options_.kv_fp8;
   offload.kv_q4 = options_.kv_q4;
+  offload.kv_vram_mb = options_.kv_paged ? options_.kv_vram_mb : 0;
   weights_ = load_weights(options_.model_dir, options_.dense_fp8, stream_, offload);
   ablation_ = load_ablation(options_.ablation);
   init();
@@ -91,7 +100,18 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
-  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_q4);
+  PagedKvConfig pkv;
+  if (options.kv_paged || options.kv_vram_mb > 0) {
+    pkv.max_ctx = options.max_ctx;
+    pkv.vram_mb = options.kv_vram_mb > 0 ? options.kv_vram_mb : (options.offload_vram_mb > 0 ? 256 : 1536);
+    pkv.ram_mb = options.kv_ram_mb;
+    pkv.prefill_chunk = options.prefill_chunk;
+    pkv.swap_dir = options.kv_swap_dir;
+  }
+  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_q4, pkv);
+  if (state_.paged_kv) {
+    state_.paged_kv->ensure_decode_pages(0, kMaxWidth, stream_);
+  }
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
@@ -197,11 +217,13 @@ void Runtime::capture(int m, bool history) {
 void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
   const int m = int(tokens.size());
   buffers(m);  // the width must exist
+  if (state_.paged_kv) state_.paged_kv->ensure_decode_pages(position, m, stream_);
   set_step_inputs(tokens.data(), m, position, this->tokens(), pos(), stream_);
 }
 
 const float* Runtime::run_step(int m) {
-  if (weights_.expert_cache && weights_.expert_cache->needs_host_dispatch()) {
+  if ((weights_.expert_cache && weights_.expert_cache->needs_host_dispatch()) ||
+      (state_.paged_kv && state_.paged_kv->has_nvme_spill())) {
     return run_step_eager(m);
   }
   auto it = graphs_.find(m);
@@ -224,6 +246,7 @@ const float* Runtime::decode_logits(std::int32_t token, int position) {
 
 void Runtime::chain_advance(const std::int32_t* sampled, int position) {
   const int k = position & 1;
+  if (state_.paged_kv) state_.paged_kv->ensure_decode_pages(position, 1, stream_);
   model::chain_advance(sampled, tokens(), pos(), position, static_cast<std::int32_t*>(chain_host_.device_ptr()) + k,
                        state_ptrs(), undo_[k], stream_);
   CUDA_CHECK(cudaEventRecord(chain_done_[k], stream_));

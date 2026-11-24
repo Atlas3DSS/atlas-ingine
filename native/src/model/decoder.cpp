@@ -192,16 +192,33 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     a.out = bf16m(b.attn_out);
     if (layer.full) {
       const int fi = FULL_INDEX[v];
-      a.k_conv = f32p(layer.k_static);
-      a.v_conv = f32p(layer.v_static);
-      a.k_cache = st.k_full_at(fi).data;
-      a.v_cache = st.v_full_at(fi).data;
-      a.cache_fp8 = st.kv_fp8;
-      a.cache_q4 = st.kv_q4;
-      a.cache_rows = st.max_ctx;
-      a.kpos = nullptr;
-      a.window = 0;
-      a.log_scaling = true;
+      if (st.paged_kv && st.paged_kv->has_nvme_spill()) {
+        std::int64_t h_pos = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&h_pos, pos, sizeof(std::int64_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        st.paged_kv->decode_attention_with_swap(fi, layer, v, f32p(proj_out), m, int(h_pos), st.conv_k_at(v),
+                                                st.conv_v_at(v), bf16m(b.attn_out), stream);
+      } else {
+        a.k_conv = f32p(layer.k_static);
+        a.v_conv = f32p(layer.v_static);
+        if (st.paged_kv) {
+          a.k_cache = nullptr;
+          a.v_cache = nullptr;
+          a.k_pages = st.paged_kv->k_table(fi);
+          a.v_pages = st.paged_kv->v_table(fi);
+          a.page_shift = PagedKvCache::kPageShift;
+        } else {
+          a.k_cache = st.k_full_at(fi).data;
+          a.v_cache = st.v_full_at(fi).data;
+        }
+        a.cache_fp8 = st.kv_fp8;
+        a.cache_q4 = st.kv_q4;
+        a.cache_rows = st.max_ctx;
+        a.kpos = nullptr;
+        a.window = 0;
+        a.log_scaling = true;
+        attn::attn_decode(a, stream);
+      }
     } else {
       const int ri = RING_INDEX[v];
       a.k_conv = f32p(layer.k_conv);
@@ -214,8 +231,8 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.kpos = st.ring_pos_at(ri);
       a.window = WINDOW;
       a.log_scaling = false;
+      attn::attn_decode(a, stream);
     }
-    attn::attn_decode(a, stream);
     dense::proj_conv(bf16m(b.attn_out), m, matrix(layer.wo), f32p(layer.attn_conv), st.conv_attn_at(v), f32m(b.y),
                      history ? f32m(b.hist_attn) + std::size_t(v) * m * H : nullptr, pdl, stream);
     // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)

@@ -39,10 +39,12 @@ Tensor State::v_full_at(int full) const {
   return rm(ptr<char>(v_full) + std::size_t(full) * max_ctx * KV_DIM * es, v_full.dtype, {max_ctx, KV_HEADS, HEAD_DIM});
 }
 
-State make_state(int max_ctx, bool kv_fp8, bool kv_q4) {
+State make_state(int max_ctx, bool kv_fp8, bool kv_q4, const PagedKvConfig& paged_kv) {
   // the attention kernel keeps positions in int32 and caps full caches at 2^30 rows
   if (max_ctx < 1 || max_ctx > (1 << 30)) throw std::invalid_argument("max_ctx must be in 1..2^30");
   if (kv_fp8 && kv_q4) throw std::invalid_argument("kv_fp8 and kv_q4 are mutually exclusive");
+  const bool use_paged = paged_kv.vram_mb > 0;
+  if (use_paged && !kv_q4) throw std::invalid_argument("paged KV cache requires --kv-q4");
   State st;
   st.max_ctx = max_ctx;
   st.kv_fp8 = kv_fp8;
@@ -51,7 +53,11 @@ State make_state(int max_ctx, bool kv_fp8, bool kv_q4) {
   st.v_ring = zeros(st.storage, kActDType, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
-  if (kv_q4) {
+  if (use_paged) {
+    PagedKvConfig cfg = paged_kv;
+    cfg.max_ctx = max_ctx;
+    st.paged_kv = std::make_shared<PagedKvCache>(cfg);
+  } else if (kv_q4) {
     st.k_full = zeros(st.storage, DType::U8, {NUM_FULL_VISITS, max_ctx, KV_Q4_ROW_BYTES});
     st.v_full = zeros(st.storage, DType::U8, {NUM_FULL_VISITS, max_ctx, KV_Q4_ROW_BYTES});
   } else {
@@ -71,6 +77,7 @@ void reset_state(State& st, cudaStream_t stream) {
   CUDA_CHECK(cudaMemsetAsync(st.ring_pos.data, 0xff, st.ring_pos.bytes(), stream));
   for (Tensor* t : {&st.conv_k, &st.conv_v, &st.conv_attn, &st.conv_mlp})
     CUDA_CHECK(cudaMemsetAsync(t->data, 0, t->bytes(), stream));
+  if (st.paged_kv) st.paged_kv->reset();
   st.length = 0;
 }
 
