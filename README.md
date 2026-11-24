@@ -235,7 +235,10 @@ Pass `--no-vision` to serve text only and save ~0.6 GiB VRAM.
 for pairing `atlas-ingine` with any host-verified workflow (SQL, `pytest`, CUDA/PyTorch kernels, Three.js, Blender, or
 compilers). The host verifier is the sole write gate across four banks (`facts`, `winners`, `repairs`, and `drift`
 invalidation on `env_version` changes), with deterministic character-budgeted retrieval and a CLI for inspecting and
-updating ledgers. See [`ledger/README.md`](ledger/README.md) and [`ledger/examples/code_hillclimb_example.py`](ledger/examples/code_hillclimb_example.py).
+updating ledgers. See [`ledger/README.md`](ledger/README.md), [`ledger/examples/code_hillclimb_example.py`](ledger/examples/code_hillclimb_example.py),
+and our end-to-end multimodal GPU-vision example in [`ledger/examples/blender_celebration_hillclimb/`](ledger/examples/blender_celebration_hillclimb/README.md)
+(16-iteration Blender 4.5 LTS hillclimb on RTX PRO 6000 Blackwell with audited add/subtract Verified Ledger, 3-tier rolling
+context compression, and rendered 1080p MP4 showcase).
 
 ## Related: `Atlas3DSS/atlas-engine`
 

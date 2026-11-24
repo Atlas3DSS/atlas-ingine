@@ -1,0 +1,838 @@
+{
+  "out_dir": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z",
+  "ledger_sqlite": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/celebration_video_ledger.sqlite",
+  "model": "inkling-2-mini",
+  "iters_completed": 16,
+  "best_iter": 2,
+  "best_composite_score": 71.0,
+  "best_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02.blend",
+  "best_renders": [
+    "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0013.png",
+    "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0061.png",
+    "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0121.png",
+    "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0180.png",
+    "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0228.png"
+  ],
+  "progression_sheet_png": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/hillclimb_progression.png",
+  "final_1080p_mp4": {
+    "out_mp4": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/celebration_10yr_nvidia_inkling_1080p.mp4",
+    "n_scene_frames": 240,
+    "n_final_frames": 348,
+    "first_scene_frame": 1,
+    "bytes": 4611953,
+    "render_and_encode_seconds": 1725.54
+  },
+  "ledger_stats": {
+    "entries_by_status": {
+      "active": 7,
+      "retracted": 5
+    },
+    "active_by_category": {
+      "api_fact": 7
+    },
+    "events_by_action": {
+      "ADD": 12,
+      "REJECT_UNVERIFIED": 31,
+      "RETRACT": 5
+    }
+  },
+  "total_wall_seconds": 2117.15,
+  "iterations": [
+    {
+      "iter": 1,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 43.0,
+      "vision_score": 21.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 5.0,
+        "architectural_storytelling": 3.0,
+        "material_craft": 5.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 64.0,
+      "is_new_best": true,
+      "verdict": "The glowing core, particle field and blue-steel pillars read as a coherent celebration, but the camera path collapses into pillar-closeups: coverage falls from ~37-54% to ~13% and the hero is increasingly occluded, leaving the 2016->2026 narrative unreadable.",
+      "next_focus": "Re-author the camera track so the CoreRing/CoreCrystal hero stays centered and in-view across frames 1-240 (wider radius, higher elevation, pillars pushed to the edges), then re-check framing_coverage and in_view.",
+      "ledger_added": [
+        "#12:fix_keyerror"
+      ],
+      "ledger_subtracted": [
+        "#11",
+        "#8"
+      ],
+      "context_metrics": {
+        "tier1_chars": 9110,
+        "tier2_chars": 213,
+        "tier3_text_chars": 17279,
+        "tier3_vision_images": 0
+      },
+      "author_usage": {
+        "prompt_tokens": 10518,
+        "completion_tokens": 6458,
+        "llm_seconds": 9.473,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 2123,
+        "completion_tokens": 1442,
+        "llm_seconds": 3.724
+      },
+      "blender_seconds": 9.86,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_01/iter_01_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_01/iter_01_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_01/iter_01_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_01/iter_01_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_01/iter_01_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_01/iter_01.blend",
+      "failed_reasons": [
+        "no_deep_overlap: deep_overlaps=6 [['CoreRing_0', 'CoreRing_1'], ['CoreRing_0', 'CoreRing_2'], ['CoreRing_1', 'CoreRing_2'], ['CoreRing_1', 'CoreCrystal'], ['CoreRing_2', 'CoreCrystal'], ['CoreCrystal', 'CoreInner']]",
+        "framing_coverage: cov=[36.98, 53.65, 25.8, 12.78, 13.04], in_view=[0.6819, 0.436, 0.1697, 0.1301, 0.0752]"
+      ]
+    },
+    {
+      "iter": 2,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 25.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 5.0,
+        "material_craft": 6.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 71.0,
+      "is_new_best": true,
+      "verdict": "The glowing ring stack, particle halo and pillars read clearly and the AgX/glare look is decent, but the camera drifts too far (17m) so coverage collapses from ~29% to ~9% and the hero shrinks out of frame by the end. Framing/coverage is the #1 remaining flaw.",
+      "next_focus": "Rework the camera path to a tight arc (reduce cam_motion from ~17m to ~4-6m) and re-aim the look-at at the ring stack so 5-timestamp coverage stays above ~25%.",
+      "ledger_added": [],
+      "ledger_subtracted": [
+        "#12"
+      ],
+      "context_metrics": {
+        "tier1_chars": 8621,
+        "tier2_chars": 907,
+        "tier3_text_chars": 17092,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 11027,
+        "completion_tokens": 8273,
+        "llm_seconds": 14.683,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1873,
+        "completion_tokens": 890,
+        "llm_seconds": 2.464
+      },
+      "blender_seconds": 8.07,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_02/iter_02.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[28.88, 24.5, 12.81, 9.21, 9.24], in_view=[0.3923, 0.311, 0.1585, 0.1707, 0.1585]"
+      ]
+    },
+    {
+      "iter": 3,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 20.0,
+      "axis_scores": {
+        "composition_framing": 3.0,
+        "lighting_atmosphere": 5.0,
+        "architectural_storytelling": 2.0,
+        "material_craft": 6.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 66.0,
+      "is_new_best": false,
+      "verdict": "The glowing ring, crystal and particle field have a nice celebratory mood, but the camera orbit drifts away from the hero until coverage collapses to ~1.5% and the podiums/bars are cropped or lost. The scene reads as abstract trophy/orb, not a legible 2016->2026 NVIDIA/Inkling-2-Mini progression.",
+      "next_focus": "Re-author the camera path and look-at so the hero crystal/ring stays in the central frame with coverage >=15% at all five timestamps, then re-check framing_coverage before lighting polish.",
+      "ledger_added": [],
+      "ledger_subtracted": [
+        "#10"
+      ],
+      "context_metrics": {
+        "tier1_chars": 8515,
+        "tier2_chars": 1584,
+        "tier3_text_chars": 17391,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 11068,
+        "completion_tokens": 6403,
+        "llm_seconds": 9.76,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1808,
+        "completion_tokens": 1526,
+        "llm_seconds": 4.289
+      },
+      "blender_seconds": 7.04,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_03/iter_03_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_03/iter_03_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_03/iter_03_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_03/iter_03_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_03/iter_03_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_03/iter_03.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[23.42, 12.48, 4.49, 1.72, 1.56], in_view=[0.1504, 0.1118, 0.063, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 4,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 23.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 4.0,
+        "material_craft": 6.0,
+        "animation_progression": 3.0
+      },
+      "composite_score": 69.0,
+      "is_new_best": false,
+      "verdict": "The ring/gem/pedestal motif reads cleanly with a nice glow, but the camera drifts far too much (7.36m) and heroes are effectively out of frame at 4 of 5 timestamps (cov 0.0/0.64/5.48/0.0/0.0), so the '10-year architecture' narrative never lands. The scene is a pretty still-life, not a celebration.",
+      "next_focus": "Re-author the camera path to keep the hero stack (pedestal + ring + gem) inside frame for the full 10s (reduce cam_motion to ~1-2m, add a slow orbit/dolly around the hero, and verify cov_pct >= 0.5 at all 5 timestamps).",
+      "ledger_added": [],
+      "ledger_subtracted": [
+        "#9"
+      ],
+      "context_metrics": {
+        "tier1_chars": 8143,
+        "tier2_chars": 2218,
+        "tier3_text_chars": 34316,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18344,
+        "completion_tokens": 6645,
+        "llm_seconds": 10.928,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1736,
+        "completion_tokens": 874,
+        "llm_seconds": 2.445
+      },
+      "blender_seconds": 7.07,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_04/iter_04_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_04/iter_04_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_04/iter_04_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_04/iter_04_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_04/iter_04_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_04/iter_04.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.64, 5.48, 0.0, 0.0], in_view=[0.0, 0.0122, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 5,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 22.0,
+      "axis_scores": {
+        "composition_framing": 3.0,
+        "lighting_atmosphere": 5.0,
+        "architectural_storytelling": 4.0,
+        "material_craft": 6.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 68.0,
+      "is_new_best": false,
+      "verdict": "The glowing ring stack and faceted core read as a clean hero object, but the subject is too small in a large empty dark void: framing coverage is near zero and the 10s arc barely changes. The main flaw is camera/scale discipline, not the emissive materials.",
+      "next_focus": "Reframe the hero to fill ~60-75% of frame height (tighter camera/FOV or larger stack) and add a deliberate 5%->95% camera/hero move so coverage and in-view metrics rise.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 2918,
+        "tier3_text_chars": 35552,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18636,
+        "completion_tokens": 6850,
+        "llm_seconds": 10.767,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1671,
+        "completion_tokens": 1152,
+        "llm_seconds": 3.122
+      },
+      "blender_seconds": 7.28,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_05/iter_05_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_05/iter_05_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_05/iter_05_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_05/iter_05_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_05/iter_05_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_05/iter_05.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.24, 1.57], in_view=[0.0, 0.0, 0.0, 0.0122, 0.0132]"
+      ]
+    },
+    {
+      "iter": 6,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 22.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 3.0,
+        "material_craft": 6.0,
+        "animation_progression": 3.0
+      },
+      "composite_score": 68.0,
+      "is_new_best": false,
+      "verdict": "The emissive ring stack and faceted crystal read as a clean hero object, but the frames are too centered-and-static with large empty dark margins and telemetry coverage near zero, so the 10-year Pascal-to-Blackwell arc is not legible. The biggest flaw is framing/motion: the camera drifts while the hero barely moves, le",
+      "next_focus": "Reframe the camera path and hero rig so the stack fills ~70-80% of frame at 5/25/50/75/95%, with a slow dolly/arc and explicit ring-by-ring scale/emissive stagger across the 10 seconds.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 3519,
+        "tier3_text_chars": 36271,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18902,
+        "completion_tokens": 7035,
+        "llm_seconds": 11.629,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1667,
+        "completion_tokens": 1207,
+        "llm_seconds": 3.289
+      },
+      "blender_seconds": 7.02,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_06/iter_06_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_06/iter_06_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_06/iter_06_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_06/iter_06_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_06/iter_06_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_06/iter_06.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.0, 0.7], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 7,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 24.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 4.0,
+        "material_craft": 6.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 70.0,
+      "is_new_best": false,
+      "verdict": "The emissive ring stack and faceted gem read clearly, but the hero is cropped at top/bottom, the cube confetti fills the frame, and the failed framing coverage makes the celebration feel like a floating gadget rather than a 10-year architecture story. The main flaw is framing/clutter, not the core materials.",
+      "next_focus": "Reframe the camera/hero so the full ring stack, gem, and base sit inside frame with margin and the top light is no longer clipped.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4162,
+        "tier3_text_chars": 36375,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18869,
+        "completion_tokens": 7088,
+        "llm_seconds": 12.874,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1667,
+        "completion_tokens": 1464,
+        "llm_seconds": 4.036
+      },
+      "blender_seconds": 7.85,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_07/iter_07_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_07/iter_07_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_07/iter_07_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_07/iter_07_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_07/iter_07_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_07/iter_07.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.0, 0.0], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 8,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 24.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 3.0,
+        "material_craft": 6.0,
+        "animation_progression": 5.0
+      },
+      "composite_score": 70.0,
+      "is_new_best": false,
+      "verdict": "The glowing ring, faceted gem and floating cubes read as a clean product-trophy moment, but the hero is too small/centered in a dark void and the gem is clipped at the top in later frames. The biggest flaw is framing/coverage: the 10-year arc is not legible and the camera path does not keep the subject composed.",
+      "next_focus": "Reframe the camera path and lens so the pedestal/ring/gem stay inside the safe frame across all 240 frames, with the gem never clipped and the hero occupying roughly 55-70% of frame height.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4713,
+        "tier3_text_chars": 36044,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18713,
+        "completion_tokens": 6532,
+        "llm_seconds": 11.272,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1667,
+        "completion_tokens": 1089,
+        "llm_seconds": 3.0
+      },
+      "blender_seconds": 7.82,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_08/iter_08_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_08/iter_08_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_08/iter_08_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_08/iter_08_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_08/iter_08_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_08/iter_08.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.16, 0.0], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 9,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 24.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 4.0,
+        "material_craft": 6.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 70.0,
+      "is_new_best": false,
+      "verdict": "The glowing ring stack and particle field read as a celebratory hero, but the subject is too small and isolated in a dark void with weak coverage and little visible narrative progression. The main flaw is framing/scale: the hero barely fills the frame while blocks drift in at the edges.",
+      "next_focus": "Move the camera closer/lower and scale the ring-pedestal hero up so it occupies roughly 20-30% of frame coverage with a clear 2016->2026 progression cue.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4465,
+        "tier3_text_chars": 36265,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18837,
+        "completion_tokens": 6580,
+        "llm_seconds": 11.264,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1676,
+        "completion_tokens": 1053,
+        "llm_seconds": 3.096
+      },
+      "blender_seconds": 7.9,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_09/iter_09_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_09/iter_09_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_09/iter_09_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_09/iter_09_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_09/iter_09_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_09/iter_09.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[3.73, 5.3, 6.17, 5.26, 5.27], in_view=[0.0396, 0.1138, 0.1504, 0.1504, 0.1392]"
+      ]
+    },
+    {
+      "iter": 10,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 23.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 3.0,
+        "material_craft": 6.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 69.0,
+      "is_new_best": false,
+      "verdict": "The crystal-and-rings motif is clean and luminous, but the hero is repeatedly clipped at the top and the celebration/timeline story is almost invisible; framing coverage is 0.0 across all five timestamps, which is the #1 blocker.",
+      "next_focus": "Reframe the camera/hero so the full halo-crystal-ring-pedestal stack stays inside the safe frame at every timestamp and add legible 2016->2026/Inkling-2-Mini text or timeline markers.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4395,
+        "tier3_text_chars": 36583,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18918,
+        "completion_tokens": 6301,
+        "llm_seconds": 10.338,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1667,
+        "completion_tokens": 914,
+        "llm_seconds": 2.519
+      },
+      "blender_seconds": 7.82,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_10/iter_10_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_10/iter_10_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_10/iter_10_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_10/iter_10_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_10/iter_10_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_10/iter_10.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.0, 0.0], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 11,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 22.0,
+      "axis_scores": {
+        "composition_framing": 3.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 3.0,
+        "material_craft": 6.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 68.0,
+      "is_new_best": false,
+      "verdict": "The glowing rings, faceted gem and reflective chrome read as a clean emblem, but the top ring is clipped, the subject sits in an empty dark void, and the 10-year Pascal-to-Blackwell story is not legible. The biggest flaw is framing/storytelling: the camera orbits too wide while the hero stack remains small and cropped.",
+      "next_focus": "Reframe the camera path and hero scale so the full stacked emblem stays inside frame at all 5 timestamps, then add one readable architectural/timeline cue (e.g., stepped Pascal-to-Blackwell silhouette or labeled milestone markers).",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4354,
+        "tier3_text_chars": 36492,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18890,
+        "completion_tokens": 6300,
+        "llm_seconds": 10.371,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1667,
+        "completion_tokens": 1093,
+        "llm_seconds": 3.051
+      },
+      "blender_seconds": 7.92,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_11/iter_11_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_11/iter_11_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_11/iter_11_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_11/iter_11_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_11/iter_11_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_11/iter_11.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.0, 0.7], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 12,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 23.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 3.0,
+        "material_craft": 6.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 69.0,
+      "is_new_best": false,
+      "verdict": "The glowing ring/gem stack reads as a clean emblem, but it is cropped at the base, floats in a dark void, and barely communicates the 2016-2026 NVIDIA/Inkling arc. The biggest flaw is framing/storytelling: the hero is too small and centered-empty, with near-zero coverage and almost no visible progression across the 5 t",
+      "next_focus": "Reframe the camera and scale the hero stack so the full emblem sits inside the frame with margins, then add a legible 10-year architectural progression behind/around it.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4281,
+        "tier3_text_chars": 36460,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18844,
+        "completion_tokens": 6052,
+        "llm_seconds": 10.127,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1665,
+        "completion_tokens": 1251,
+        "llm_seconds": 3.615
+      },
+      "blender_seconds": 7.49,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_12/iter_12_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_12/iter_12_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_12/iter_12_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_12/iter_12_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_12/iter_12_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_12/iter_12.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.0, 0.0], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 13,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 23.0,
+      "axis_scores": {
+        "composition_framing": 3.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 4.0,
+        "material_craft": 6.0,
+        "animation_progression": 4.0
+      },
+      "composite_score": 69.0,
+      "is_new_best": false,
+      "verdict": "The emissive ring stack, chrome torus, faceted crystal and particle field read as a clean celebratory emblem, but the hero is too small and centered in a large empty dark void, so the 2016->2026 narrative and motion are not legible. #1 flaw: framing coverage is effectively zero across timestamps.",
+      "next_focus": "Tighten the camera/hero scale so the stacked-ring emblem fills roughly 60-75% of the frame at all 5 timestamps, then re-check framing_coverage and in_view.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4280,
+        "tier3_text_chars": 35843,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18596,
+        "completion_tokens": 6677,
+        "llm_seconds": 11.926,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1667,
+        "completion_tokens": 1162,
+        "llm_seconds": 3.169
+      },
+      "blender_seconds": 7.6,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_13/iter_13_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_13/iter_13_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_13/iter_13_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_13/iter_13_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_13/iter_13_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_13/iter_13.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.0, 1.15], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 14,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 23.0,
+      "axis_scores": {
+        "composition_framing": 4.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 4.0,
+        "material_craft": 6.0,
+        "animation_progression": 3.0
+      },
+      "composite_score": 69.0,
+      "is_new_best": false,
+      "verdict": "The glowing torus, faceted gem and pedestal read clearly and the AgX/glare look is pleasant, but the heroes are clipped at the top edge, the 5-timestamp coverage/in-view checks are 0%, and hero motion is nearly static (0.0123m), so the celebration reads as a still life rather than a 10-year arc.",
+      "next_focus": "Reframe the camera/pedestal so the gem, torus and pedestal sit fully inside frame at all 5 timestamps (raise coverage/in_view) and add a visible hero/camera drift with a timed gem-torus separation.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4444,
+        "tier3_text_chars": 36111,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18708,
+        "completion_tokens": 6266,
+        "llm_seconds": 10.313,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1667,
+        "completion_tokens": 755,
+        "llm_seconds": 2.1
+      },
+      "blender_seconds": 7.59,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_14/iter_14_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_14/iter_14_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_14/iter_14_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_14/iter_14_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_14/iter_14_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_14/iter_14.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.0, 0.0], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 15,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 25.0,
+      "axis_scores": {
+        "composition_framing": 5.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 3.0,
+        "material_craft": 6.0,
+        "animation_progression": 5.0
+      },
+      "composite_score": 71.0,
+      "is_new_best": false,
+      "verdict": "The glowing ring, faceted gem and emissive pedestal read as a clean celebratory motif, but the subject is drifting/clipped at the edges, the backdrop is empty, and there is no legible 2016-to-2026 architecture story; framing coverage is 0%, which is the #1 blocker.",
+      "next_focus": "Re-aim/re-frame the camera path so the ring, gem and pedestal remain fully inside frame with verified coverage >0 at all five timestamps, then add a legible progression label/stage cue.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4563,
+        "tier3_text_chars": 36720,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18970,
+        "completion_tokens": 6420,
+        "llm_seconds": 10.883,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1666,
+        "completion_tokens": 1196,
+        "llm_seconds": 3.371
+      },
+      "blender_seconds": 8.65,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_15/iter_15_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_15/iter_15_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_15/iter_15_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_15/iter_15_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_15/iter_15_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_15/iter_15.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.0, 0.0], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    },
+    {
+      "iter": 16,
+      "ok_execution": true,
+      "host_passed": false,
+      "host_score": 46.0,
+      "vision_score": 23.0,
+      "axis_scores": {
+        "composition_framing": 5.0,
+        "lighting_atmosphere": 6.0,
+        "architectural_storytelling": 3.0,
+        "material_craft": 6.0,
+        "animation_progression": 3.0
+      },
+      "composite_score": 69.0,
+      "is_new_best": false,
+      "verdict": "The glowing ring-and-gem hero reads clearly and the pedestal/particles give some celebration energy, but the framing is static and centered with 0% coverage/in-view telemetry, the hero barely moves (0.0123m), and the 2016->2026/Inkling-2-Mini narrative is absent \u2014 it looks like a generic jewel trophy, not a 10-year arc",
+      "next_focus": "Re-frame the camera to a lower, off-axis 3/4 angle with the hero filling ~60-70% of frame and add a visible timeline/evolution cue (e.g., stacked era glyphs or a rising arc of 5 GPU-chip silhouettes behind the ring) so the 10-year story is legible in-frame.",
+      "ledger_added": [],
+      "ledger_subtracted": [],
+      "context_metrics": {
+        "tier1_chars": 7784,
+        "tier2_chars": 4573,
+        "tier3_text_chars": 36648,
+        "tier3_vision_images": 5
+      },
+      "author_usage": {
+        "prompt_tokens": 18878,
+        "completion_tokens": 6675,
+        "llm_seconds": 11.71,
+        "finish_reason": "stop"
+      },
+      "critique_usage": {
+        "prompt_tokens": 1667,
+        "completion_tokens": 766,
+        "llm_seconds": 2.141
+      },
+      "blender_seconds": 8.13,
+      "saved_renders": [
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_16/iter_16_f0013.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_16/iter_16_f0061.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_16/iter_16_f0121.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_16/iter_16_f0180.png",
+        "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_16/iter_16_f0228.png"
+      ],
+      "saved_blend": "/home/orwel/dev_genius/experiments/kernals/celebration_video/runs/celebration_20261124T055141Z/iterations/iter_16/iter_16.blend",
+      "failed_reasons": [
+        "framing_coverage: cov=[0.0, 0.0, 0.0, 0.0, 0.0], in_view=[0.0, 0.0, 0.0, 0.0, 0.0]"
+      ]
+    }
+  ]
+}
