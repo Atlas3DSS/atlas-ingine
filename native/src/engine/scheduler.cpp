@@ -37,10 +37,11 @@ std::string type_name(const std::exception& e) {
 }  // namespace
 
 Job::Job(std::vector<int32_t> prompt_ids_, int max_new_tokens_, model::Sampling sampling_,
-         std::vector<model::PromptImage> images_)
+         std::vector<model::PromptImage> images_, int root_prefix_tokens_)
     : id("chatcmpl-" + random_hex32()),
       prompt_ids(std::move(prompt_ids_)),
       images(std::move(images_)),
+      root_prefix_tokens(root_prefix_tokens_),
       max_new_tokens(max_new_tokens_),
       sampling(sampling_),
       t_submit(Clock::now()) {}
@@ -265,7 +266,8 @@ void Scheduler::loop_batched() {
         int32_t first_tok = 0;
         model::GenerateStats st;
         const int slot =
-            generator_.start_slot(model::Prompt{job->prompt_ids, job->images}, eff_max, job->sampling, first_tok, st);
+            generator_.start_slot(model::Prompt{job->prompt_ids, job->images, job->root_prefix_tokens}, eff_max,
+                                  job->sampling, first_tok, st);
         if (slot < 0) {
           // Put back at front of queue; retry after next step frees resources.
           std::lock_guard lock(mutex_);
@@ -404,8 +406,9 @@ void Scheduler::run(Job& job) {
   };
   try {
     const auto on_prefill = [&](const model::GenerateStats& pst) { job.set_prefill_stats(pst); };
-    const model::GenerateStats st = generator_.generate(model::Prompt{job.prompt_ids, job.images}, job.max_new_tokens,
-                                                        job.sampling, stop_list_, on_tokens, on_prefill);
+    const model::GenerateStats st = generator_.generate(
+        model::Prompt{job.prompt_ids, job.images, job.root_prefix_tokens}, job.max_new_tokens, job.sampling, stop_list_,
+        on_tokens, on_prefill);
     job.set_prefill_stats(st);
     // prefix reuse of the prompt: the path, the tokens reused and recomputed, restored bytes, prefill time
     const int recomputed = std::max(0, st.prompt_tokens - std::clamp(st.reused_tokens, 0, st.prompt_tokens));

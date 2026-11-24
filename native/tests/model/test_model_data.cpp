@@ -1,10 +1,13 @@
 // model_data.h constants against weights.py / model.py / fast.py (CPU only): the visit plan, ring/full cache
 // indices, tap visits and the projection layout.
+#include "ingine/generator.h"
 #include "model/model_data.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 using namespace ingine::model;
 
@@ -53,6 +56,55 @@ int main() {
   const float pos_f = float(kOneM);
   const float tau_1m = 1.f + 0.1f * std::log(std::fmax(pos_f * (1.f / 8192.f), 1.f));
   expect(pos_f == 1048576.f && std::isfinite(tau_1m) && std::fabs(tau_1m - 1.4852030f) < 1e-5f, "1M log_scale tau");
+
+  // Shared prefix-cache contract checks (#825/#826): StateIdentity, hashes, root validation, Reuse strings.
+  {
+    StateIdentity a;
+    a.model_sha256[0] = 0xAB;
+    a.act_dtype = 0;
+    a.dense_fp8 = true;
+    a.kv_format = 1;
+    a.max_ctx = 65536;
+    a.prefill_chunk = 3072;
+    a.spec_enabled = false;
+    a.persona_key = 0;
+    a.cache_namespace = "";
+    StateIdentity b = a;
+    expect(a == b && hash_state_identity(a) == hash_state_identity(b), "StateIdentity equal & hash match");
+    b.cache_namespace = "tenant-b";
+    expect(!(a == b), "StateIdentity cache_namespace isolation");
+    b = a;
+    b.persona_key = 42;
+    b.persona_fingerprint = "deadbeef";
+    expect(!(a == b), "StateIdentity persona isolation");
+    b = a;
+    b.kv_format = 2;
+    expect(!(a == b), "StateIdentity kv_format isolation");
+    b = a;
+    b.prefill_chunk = 512;
+    expect(!(a == b), "StateIdentity prefill_chunk isolation");
+    b = a;
+    b.spec_enabled = true;
+    expect(!(a == b), "StateIdentity spec_enabled isolation");
+
+    const std::vector<std::int32_t> ids = {1, 2, 3, -1, -2, -3, -4, 8, 9};
+    PromptImage img;
+    img.pos = 3;
+    img.height = 80;
+    img.width = 80;  // 2x2 = 4 tokens covering [3, 7)
+    const PromptImage imgs[1] = {img};
+    expect(validate_root_prefix_tokens(ids, imgs, 3) == 3, "root boundary before image is valid");
+    expect(validate_root_prefix_tokens(ids, imgs, 7) == 7, "root boundary after image is valid");
+    expect(validate_root_prefix_tokens(ids, imgs, 5) == 0, "root boundary straddling image rejected");
+    expect(validate_root_prefix_tokens(ids, imgs, -1) == 0, "negative root boundary rejected");
+    expect(validate_root_prefix_tokens(ids, imgs, 10) == 0, "out-of-range root boundary rejected");
+    expect(std::strcmp(to_string(Reuse::RootCheckpoint), "root_checkpoint") == 0 &&
+               std::strcmp(to_string(Reuse::HostParked), "host_parked") == 0 &&
+               std::strcmp(to_string(Reuse::PagedPrefix), "paged_prefix") == 0,
+           "Reuse enum to_string contract");
+    expect(hash_token_prefix(std::span(ids).subspan(0, 3)) != hash_token_prefix(std::span(ids).subspan(0, 4)),
+           "hash_token_prefix distinguishes prefix lengths");
+  }
 
   std::printf("%s model_data constants\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;

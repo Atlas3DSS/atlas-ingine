@@ -2,12 +2,21 @@
 // the Prefiller; plain decoding replays the width-1 graph per token, pipelined (each step's input token
 // stays on the device, the host launches the next step before it reads the current token); with
 // options.spec the speculative loop (SpecLoop) drafts with DSpark and verifies with the width-2/4/8 graphs.
-// A prompt that extends the tokens already in the state only prefills the new suffix; any other prompt
-// starts from an empty state.
+//
+// Prefix reuse hierarchy (all fail-closed on exact StateIdentity + exact token-ID match; disabled wholly
+// when RuntimeOptions::prefix_cache == false):
+//   1. Extend: live state is a strict prefix of the incoming prompt.
+//   2. Checkpoint: last prefill's in-place device checkpoint is a prefix of the incoming prompt.
+//   3. Parked (2-tier bounded LRU: Tier 0 VRAM `park_mb` + Tier 1 pinned host RAM `park_host_mb`):
+//      longest exact prefix match across parked conversations and verified root-prefix checkpoints.
+//      Root checkpoints (`is_root = true`) are captured at a verified token boundary `root_prefix_tokens`
+//      during cold prefill and are never erased as "superseded" by longer child extensions.
+//   4. Optional disk KV checkpoint resume (`kv_ckpt_resume` / `kv_ckpt_path`).
 #include "ingine/generator.h"
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/host_memory.h"
 #include "kernels/head/head.h"
 #include "model/batch_engine.h"
 #include "model/drafter.h"
@@ -21,6 +30,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <random>
@@ -41,6 +51,16 @@ const RuntimeOptions& without_spec(const RuntimeOptions& options) {
   return options;
 }
 
+std::array<std::uint8_t, 32> compute_model_identity_sha(const RuntimeOptions& opt) {
+  std::array<std::uint8_t, 64> buf{};
+  const auto cfg_sha =
+      opt.model_dir.empty() ? std::array<std::uint8_t, 32>{} : sha256_file_or_zero(opt.model_dir / "config.json");
+  const auto abl_sha = opt.ablation.empty() ? std::array<std::uint8_t, 32>{} : sha256_file_or_zero(opt.ablation);
+  std::memcpy(buf.data(), cfg_sha.data(), 32);
+  std::memcpy(buf.data() + 32, abl_sha.data(), 32);
+  return sha256_bytes(buf.data(), buf.size());
+}
+
 class EngineGenerator final : public Generator {
  public:
   explicit EngineGenerator(const RuntimeOptions& options)
@@ -57,12 +77,37 @@ class EngineGenerator final : public Generator {
 
   bool supports_images() const override { return vision_ != nullptr; }
 
+  PrefixCacheStats cache_stats() const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cache_stats_locked();
+  }
+
   std::string offload_summary() const override {
     std::string out;
     if (rt_.weights().expert_cache) out = rt_.weights().expert_cache->summary();
     if (rt_.state().paged_kv) {
       if (!out.empty()) out += "\n";
       out += rt_.state().paged_kv->summary();
+    }
+    const PrefixCacheStats cs = cache_stats();
+    if (cs.vram_budget_bytes > 0 || cs.host_budget_bytes > 0) {
+      char buf[512];
+      std::snprintf(
+          buf, sizeof(buf),
+          "[prefix-cache] staging=%.1f MiB | vram=%.1f/%.1f MiB (peak=%.1f MiB, entries=%llu, evict=%llu) | "
+          "host_pinned=%.1f/%.1f MiB (peak=%.1f MiB, entries=%llu, evict=%llu, demote=%llu, oom_fallback=%llu) | "
+          "roots=%llu | xfer(h2d=%.2f MB d2h=%.2f MB d2d_r=%.2f MB d2d_p=%.2f MB)",
+          double(cs.device_staging_bytes) / (1024.0 * 1024.0), double(cs.vram_used_bytes) / (1024.0 * 1024.0),
+          double(cs.vram_budget_bytes) / (1024.0 * 1024.0), double(cs.vram_peak_bytes) / (1024.0 * 1024.0),
+          static_cast<unsigned long long>(cs.vram_entries), static_cast<unsigned long long>(cs.vram_evictions),
+          double(cs.host_used_bytes) / (1024.0 * 1024.0), double(cs.host_budget_bytes) / (1024.0 * 1024.0),
+          double(cs.host_peak_bytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(cs.host_entries),
+          static_cast<unsigned long long>(cs.host_evictions), static_cast<unsigned long long>(cs.host_demotions),
+          static_cast<unsigned long long>(cs.host_alloc_failures), static_cast<unsigned long long>(cs.root_entries),
+          double(cs.h2d_restore_bytes) / 1e6, double(cs.d2h_park_bytes) / 1e6, double(cs.d2d_restore_bytes) / 1e6,
+          double(cs.d2d_park_bytes) / 1e6);
+      if (!out.empty()) out += "\n";
+      out += buf;
     }
     return out;
   }
@@ -90,19 +135,50 @@ class EngineGenerator final : public Generator {
     checkpoint_drafter_ = carved(rt_.checkpoint_bytes());
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
     checkpoint_ = DeviceBuffer(checkpoint_logits_ + logits_.bytes);
+    cache_stats_.device_staging_bytes = checkpoint_.bytes;
+
+    CUDA_CHECK(cudaEventCreate(&restore_start_));
+    CUDA_CHECK(cudaEventCreate(&restore_end_));
+
+    // Build fail-closed runtime/model identity pinned for all prefix-cache lookups.
+    base_identity_.model_sha256 = compute_model_identity_sha(options_);
+    base_identity_.act_dtype = (kActDType == DType::FP16) ? 1u : 0u;
+    base_identity_.dense_fp8 = options_.dense_fp8;
+    base_identity_.kv_format = options_.kv_q4 ? 2u : (options_.kv_fp8 ? 1u : 0u);
+    base_identity_.max_ctx = options_.max_ctx;
+    base_identity_.prefill_chunk = options_.prefill_chunk;
+    base_identity_.spec_enabled = (drafter_ != nullptr);
+
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
-    if ((options_.offload_vram_mb > 0 || options_.kv_paged || options_.kv_vram_mb > 0) && options_.park_mb < 0) {
-      park_budget_ = 0;  // keep strict VRAM cap in offload/paged-KV mode unless user explicitly requests parking
-    } else if (options_.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
-      std::size_t free = 0, total = 0;
-      CUDA_CHECK(cudaMemGetInfo(&free, &total));
-      park_budget_ = std::min<std::size_t>(3072, std::max<std::size_t>(free >> 20, 4096) - 4096) << 20;
+
+    if (!options_.prefix_cache) {
+      park_budget_ = 0;
+      host_park_budget_ = 0;
+    } else if (rt_.state().paged_kv) {
+      // Full-row parking requires contiguous full-attention buffers; fail closed under 3-tier paged KV.
+      if (options_.park_mb > 0 || options_.park_host_mb > 0) {
+        std::fprintf(stderr, "prefix-cache: parking disabled with --kv-paged (contiguous full-KV required)\n");
+      }
+      park_budget_ = 0;
+      host_park_budget_ = 0;
     } else {
-      park_budget_ = std::size_t(options_.park_mb) << 20;
+      if (options_.offload_vram_mb > 0 && options_.park_mb < 0) {
+        park_budget_ = 0;  // keep strict VRAM cap in offload mode unless user explicitly requests VRAM parking
+      } else if (options_.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        park_budget_ = std::min<std::size_t>(3072, std::max<std::size_t>(free >> 20, 4096) - 4096) << 20;
+      } else {
+        park_budget_ = std::size_t(options_.park_mb) << 20;
+      }
+      host_park_budget_ = options_.park_host_mb > 0 ? (std::size_t(options_.park_host_mb) << 20) : 0;
     }
-    // parked conversations are best-effort: a device allocation that fails releases them and retries
+    cache_stats_.vram_budget_bytes = park_budget_;
+    cache_stats_.host_budget_bytes = host_park_budget_;
+
+    // parked VRAM conversations are best-effort: a device allocation that fails releases them and retries
     release_hook_ = add_release_hook([this] { return release_parked(); });
   }
 
@@ -140,20 +216,37 @@ class EngineGenerator final : public Generator {
     head::SamplerRng rng;
     rng.seed = sampling.seed ? *sampling.seed : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
     if (sampling.persona) persona::validate_profile_safety(*sampling.persona, refusal_map_);
-    const std::uint64_t req_persona_key =
-        (sampling.persona && !sampling.persona->is_unhooked()) ? sampling.persona->cache_key : 0ull;
-    const bool bypass_reuse = (sampling.persona && sampling.persona->bypasses_prefix_reuse());
+    const bool active_persona = (sampling.persona && !sampling.persona->is_unhooked());
+    StateIdentity req_identity = base_identity_;
+    if (active_persona) {
+      req_identity.persona_key = sampling.persona->cache_key;
+      req_identity.persona_fingerprint = sampling.persona->fingerprint_sha256;
+    }
+    req_identity.cache_namespace = full_prompt.cache_namespace;
+    const bool bypass_reuse = !options_.prefix_cache || (sampling.persona && sampling.persona->bypasses_prefix_reuse());
+    const int root_prefix_tokens =
+        validate_root_prefix_tokens(prompt, full_prompt.images, full_prompt.root_prefix_tokens);
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto t = std::chrono::steady_clock::now();
+    bool restore_timed = false;
     try {
       rt_.set_persona(sampling.persona.get());
-      prefill(prompt, full_prompt.images, req_persona_key, bypass_reuse, stats);
+      prefill(prompt, full_prompt.images, root_prefix_tokens, req_identity, bypass_reuse, stats, restore_timed);
       stats.prompt_tokens = n;
       stats.image_tokens = image_tokens;
+      auto finalize_restore_timing = [&] {
+        if (restore_timed) {
+          float ms = 0.f;
+          CUDA_CHECK(cudaEventElapsedTime(&ms, restore_start_, restore_end_));
+          stats.restore_seconds = double(ms) * 1e-3;
+          restore_timed = false;
+        }
+      };
       if (spec_) {
         std::int32_t token = sample(static_cast<const float*>(logits_.p), sampling, rng);
         if (!sampling.forced.empty()) token = sampling.forced[0];
+        finalize_restore_timing();
         stats.prefill_seconds = seconds_since(t);
         if (on_prefill) on_prefill(stats);
         t = std::chrono::steady_clock::now();
@@ -162,9 +255,10 @@ class EngineGenerator final : public Generator {
           spec_->generate(token, max_new_tokens, sampling, rng, stop_ids, on_tokens, stats, tokens_in_state_);
         }
       } else {
-        decode(n, max_new_tokens, sampling, rng, stop_ids, on_tokens, on_prefill, stats, t);
+        decode(n, max_new_tokens, sampling, rng, stop_ids, on_tokens, on_prefill, finalize_restore_timing, stats, t);
       }
       CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+      finalize_restore_timing();
     } catch (...) {
       forget_state();
       throw;
@@ -177,6 +271,8 @@ class EngineGenerator final : public Generator {
     remove_release_hook(release_hook_);
     // nothing queued may outlive the graphs and buffers of the members destroyed below
     if (rt_.stream()) cudaStreamSynchronize(rt_.stream());
+    if (restore_start_) cudaEventDestroy(restore_start_);
+    if (restore_end_) cudaEventDestroy(restore_end_);
   }
 
  private:
@@ -215,17 +311,12 @@ class EngineGenerator final : public Generator {
     cudaStreamSynchronize(rt_.stream());
     tokens_in_state_.clear();
     checkpoint_ids_.clear();
-    live_persona_key_ = 0;
-    checkpoint_persona_key_ = 0;
+    live_identity_ = StateIdentity{};
+    checkpoint_identity_ = StateIdentity{};
     live_bypass_reuse_ = false;
     if (drafter_) drafter_->reset();  // stream-ordered; CUDA failures abort (CUDA_CHECK)
   }
 
-  // Plain decoding after the prefill of n tokens (logits in logits_): the token at position p is sampled on
-  // the device, chain_advance makes it the width-1 step's input, and the step at p is launched before the
-  // host reads that token, so the GPU never waits for the host. A step launched for a token that ends the
-  // generation (stop token, cancel) is undone, leaving the state at tokens_in_state_. Sets prefill_seconds
-  // (until the first token is known) and restarts `t` for the decode time.
   head::SamplingParams to_head_params(const Sampling& sampling) const {
     head::SamplingParams p;
     p.temperature = sampling.temperature;
@@ -240,9 +331,17 @@ class EngineGenerator final : public Generator {
   void decode(int n, int max_new_tokens, const Sampling& sampling, head::SamplerRng& rng,
               std::span<const std::int32_t> stop_ids,
               const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
-              const PrefillCallback& on_prefill, GenerateStats& stats,
-              std::chrono::steady_clock::time_point& t) {
+              const PrefillCallback& on_prefill, const std::function<void()>& finalize_restore_timing,
+              GenerateStats& stats, std::chrono::steady_clock::time_point& t) {
     const cudaStream_t stream = rt_.stream();
+    if (max_new_tokens <= 0) {
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      finalize_restore_timing();
+      stats.prefill_seconds = seconds_since(t);
+      if (on_prefill) on_prefill(stats);
+      t = std::chrono::steady_clock::now();
+      return;
+    }
     const head::SamplingParams params = to_head_params(sampling);
     auto* sampled = static_cast<std::int32_t*>(token_.p);
     // forced replay: the forced tokens on the device; each sampled token is replaced by its forced one
@@ -267,6 +366,7 @@ class EngineGenerator final : public Generator {
     sample_for(static_cast<const float*>(logits_.p), n);
     if (max_new_tokens > 1) launch(n);
     std::int32_t token = rt_.chain_token(n);
+    finalize_restore_timing();
     stats.prefill_seconds = seconds_since(t);
     if (on_prefill) on_prefill(stats);
     t = std::chrono::steady_clock::now();
@@ -286,82 +386,75 @@ class EngineGenerator final : public Generator {
     }
   }
 
-  // engine._prefill with prompt checkpoints: brings the state to `ids` (last logits in logits_) and sets
-  // stats.reused_tokens and stats.reuse.
-  // * Extend: `ids` extends tokens_in_state_ (the previous prompt and the generated tokens processed since):
-  //   prefill the new suffix.
-  // * Checkpoint: the prompt of the request that saved the checkpoint (the state right after its prefill) is a
-  //   prefix of `ids`: restore it and prefill the rest. This is the agent-loop case: the next prompt
-  //   re-renders the previous answer differently from the tokens the model generated.
-  // * Parked: a parked conversation's prompt is a longer prefix of `ids` than the live state offers: park the
-  //   live conversation, restore the parked one's checkpoint and prefill the rest.
-  // * None: park the live conversation, reset and prefill everything.
-  // After a prefill the checkpoint moves to the end of `ids`.
-  //
-  // Images: an image token's id is a function of the image's content, so the comparisons above tell images
-  // apart. The vision tower encodes an image when the first chunk that holds some of its tokens is reached
-  // (images inside the reused prefix are not encoded again), and the Prefiller writes its rows over the
-  // embeddings of its tokens; an image may span chunks.
-  void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, std::uint64_t req_persona_key,
-               bool bypass_reuse, GenerateStats& stats) {
+  void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, int root_prefix_tokens,
+               const StateIdentity& req_identity, bool bypass_reuse, GenerateStats& stats, bool& restore_timed) {
     const std::vector<std::int32_t>& prev = tokens_in_state_;
     const std::size_t n = ids.size();
     const bool drafter_in_step = !drafter_ || drafter_->length() == int(prev.size());  // else a row is missing
     State& st = rt_.state();
     const cudaStream_t stream = rt_.stream();
-    const bool extend = !bypass_reuse && !live_bypass_reuse_ && live_persona_key_ == req_persona_key &&
-                        drafter_in_step && !prev.empty() && prev.size() < n &&
-                        std::equal(prev.begin(), prev.end(), ids.begin());
-    const bool checkpoint = !bypass_reuse && !extend && checkpoint_persona_key_ == req_persona_key &&
+    const bool extend = !bypass_reuse && !live_bypass_reuse_ && live_identity_ == req_identity && drafter_in_step &&
+                        !prev.empty() && prev.size() < n && std::equal(prev.begin(), prev.end(), ids.begin());
+    const bool checkpoint = !bypass_reuse && !extend && checkpoint_identity_ == req_identity &&
                             !checkpoint_ids_.empty() && checkpoint_ids_.size() <= n &&
                             std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), ids.begin());
-    Parked* parked =
-        bypass_reuse ? nullptr : find_parked(ids, extend ? prev.size() : checkpoint ? checkpoint_ids_.size() : 0,
-                                             req_persona_key);
+    const std::size_t live_match = extend ? prev.size() : (checkpoint ? checkpoint_ids_.size() : 0u);
+    Parked* parked = bypass_reuse ? nullptr : find_parked(ids, live_match, req_identity);
     std::size_t start = 0;
     request_evictions_ = 0;
     if (parked) {
-      // parking the live conversation may move the parked list (never evicting the one to restore)
+      // parking the live conversation may modify parked_ (never evicting the entry we are restoring)
       const std::vector<std::int32_t> keep = parked->ids;
-      const std::uint64_t keep_key = parked->persona_key;
-      park_live(&keep, keep_key);
-      auto& target = *std::find_if(parked_.begin(), parked_.end(),
-                                   [&](const Parked& p) { return p.ids == keep && p.persona_key == keep_key; });
-      const std::size_t unpark_bytes = unpark(target);
+      const StateIdentity keep_id = parked->identity;
+      park_live(&keep, &keep_id, request_evictions_);
+      auto it = std::find_if(parked_.begin(), parked_.end(),
+                             [&](const Parked& p) { return p.ids == keep && p.identity == keep_id; });
+      const ParkTier restored_tier = it->tier;
+      const bool restored_root = it->is_root;
+      CUDA_CHECK(cudaEventRecord(restore_start_, stream));
+      const std::size_t unpark_bytes = unpark(*it);
       const std::size_t ckpt_bytes = restore_checkpoint();
+      CUDA_CHECK(cudaEventRecord(restore_end_, stream));
+      restore_timed = true;
       start = checkpoint_ids_.size();
-      stats.reuse = Reuse::Parked;
       stats.restored_bytes = std::uint64_t(unpark_bytes + ckpt_bytes);
-      // Async stream-ordered D2D restore: wall time is not separately isolated from prefill without a sync.
-      stats.restore_seconds = std::nullopt;
+      stats.reuse = restored_tier == ParkTier::Host
+                        ? Reuse::HostParked
+                        : (restored_root ? Reuse::RootCheckpoint : Reuse::Parked);
     } else if (extend) {
       start = prev.size();
       stats.reuse = Reuse::Extend;
-      stats.restored_bytes = 0;
+      stats.restored_bytes = 0u;
       stats.restore_seconds = 0.0;
     } else if (checkpoint) {
+      CUDA_CHECK(cudaEventRecord(restore_start_, stream));
       const std::size_t ckpt_bytes = restore_checkpoint();
+      CUDA_CHECK(cudaEventRecord(restore_end_, stream));
+      restore_timed = true;
       start = checkpoint_ids_.size();
       stats.reuse = Reuse::Checkpoint;
       stats.restored_bytes = std::uint64_t(ckpt_bytes);
-      stats.restore_seconds = std::nullopt;
     } else {
-      park_live();
+      if (!bypass_reuse) park_live(nullptr, nullptr, request_evictions_);
       reset_state(st, stream);
       if (drafter_) drafter_->reset();
       tokens_in_state_.clear();
       checkpoint_ids_.clear();
-      live_persona_key_ = req_persona_key;
-      checkpoint_persona_key_ = 0;
+      live_identity_ = req_identity;
+      checkpoint_identity_ = StateIdentity{};
       live_bypass_reuse_ = bypass_reuse;
+      stats.restored_bytes = 0u;
+      stats.restore_seconds = 0.0;
       stats.reuse = Reuse::None;
       stats.restored_bytes = 0;
       stats.restore_seconds = 0.0;
       // Optional disk KV checkpoint resume (explicit --kv-ckpt-resume fails loudly; --kv-ckpt-path auto-resumes on exact prefix match).
-      // Disk KV checkpoints belong to the unhooked baseline (persona_key == 0); never cross-contaminate hooked personas.
+      // Disk KV checkpoints belong to the unhooked baseline (persona_key == 0, empty namespace); never cross-contaminate.
+      const bool baseline_disk_ok =
+          req_identity.persona_key == 0 && req_identity.cache_namespace.empty() && !bypass_reuse;
       if (!options_.kv_ckpt_resume.empty()) {
-        if (req_persona_key != 0 || bypass_reuse) {
-          throw std::invalid_argument("--kv-ckpt-resume cannot be combined with a hooked persona profile");
+        if (req_identity.persona_key != 0 || !req_identity.cache_namespace.empty() || bypass_reuse) {
+          throw std::invalid_argument("--kv-ckpt-resume cannot be combined with a hooked persona, namespace, or --no-prefix-cache");
         }
         const auto tr = std::chrono::steady_clock::now();
         const int resumed = load_kv_checkpoint(st, options_.model_dir, ids, static_cast<float*>(logits_.p),
@@ -372,7 +465,7 @@ class EngineGenerator final : public Generator {
         stats.restore_seconds = seconds_since(tr);
         std::fprintf(stderr, "[kv-ckpt] resumed %d / %zu tokens from %s\n", resumed, n,
                      options_.kv_ckpt_resume.c_str());
-      } else if (req_persona_key == 0 && !bypass_reuse && !options_.kv_ckpt_path.empty() &&
+      } else if (baseline_disk_ok && !options_.kv_ckpt_path.empty() &&
                  std::filesystem::exists(options_.kv_ckpt_path)) {
         try {
           const KvCheckpointInfo info = inspect_kv_checkpoint(options_.kv_ckpt_path);
@@ -396,6 +489,21 @@ class EngineGenerator final : public Generator {
         }
       }
     }
+
+    // Verified root-prefix snapshot boundary: only capture if we have parking budget, a valid verified root
+    // boundary >= kMinRootTokens, and no exact parked copy already exists for (ids[0..root_len), req_identity).
+    const std::size_t root_len =
+        (!bypass_reuse && can_park_any() && root_prefix_tokens >= int(kMinRootTokens))
+            ? std::size_t(root_prefix_tokens)
+            : 0u;
+    bool need_root_capture =
+        root_len > 0 && !has_exact_parked(ids.subspan(0, root_len), req_identity, /*mark_root=*/true);
+    // If we restored an exact checkpoint at `root_len` (logits_ is exact for root_len - 1), promote it to root now.
+    if (need_root_capture && start == root_len && stats.reuse == Reuse::Checkpoint) {
+      capture_root_checkpoint(ids.subspan(0, root_len), req_identity, request_evictions_);
+      need_root_capture = false;
+    }
+
     st.length = int(start);  // decode steps advance the state without its host-side length
     std::size_t next_ckpt =
         options_.kv_ckpt_every > 0
@@ -413,9 +521,15 @@ class EngineGenerator final : public Generator {
       ++next_image;  // inside the reused prefix
     }
     std::vector<EmbedRows> rows;
-    for (std::size_t s = start; s < n; s += chunk) {
-      const int T = int(std::min(chunk, n - s));
-      for (; next_image < images.size() && std::size_t(images[next_image].pos) < s + std::size_t(T); ++next_image) {
+    for (std::size_t s = start; s < n;) {
+      std::size_t step = std::min(chunk, n - s);
+      // Split once at the verified root boundary so sliding rings, conv states, drafter context, and exact
+      // logits at root_len - 1 can be snapshotted in one pass with zero recomputation.
+      if (need_root_capture && s < root_len && s + step > root_len) {
+        step = root_len - s;
+      }
+      const int T = int(step);
+      for (; next_image < images.size() && std::size_t(images[next_image].pos) < s + step; ++next_image) {
         const PromptImage& image = images[next_image];
         const auto t = std::chrono::steady_clock::now();
         DeviceBuffer out = vision_->encode(image.rgb->data(), image.height, image.width);
@@ -443,11 +557,16 @@ class EngineGenerator final : public Generator {
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
                      drafter_ ? &taps : nullptr, rows, rt_.active_hooks());
       if (drafter_) {
-        drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
+        drafter_->note_tokens(ids.subspan(s, step));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
       }
-      if (req_persona_key == 0 && !bypass_reuse && !options_.kv_ckpt_path.empty()) {
-        const std::size_t done = s + std::size_t(T);
+      const std::size_t done = s + step;
+      if (need_root_capture && done == root_len) {
+        capture_root_checkpoint(ids.subspan(0, root_len), req_identity, request_evictions_);
+        need_root_capture = false;
+      }
+      if (req_identity.persona_key == 0 && req_identity.cache_namespace.empty() && !bypass_reuse &&
+          !options_.kv_ckpt_path.empty()) {
         const bool sigterm = kv_checkpoint_sigterm_requested();
         const bool periodic = (options_.kv_ckpt_every > 0 && done >= next_ckpt && done < n);
         if (periodic || sigterm) {
@@ -463,14 +582,15 @@ class EngineGenerator final : public Generator {
           }
         }
       }
+      s = done;
     }
     if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream));  // queued chunks read the rows freed here
     tokens_in_state_.assign(ids.begin(), ids.end());
-    live_persona_key_ = req_persona_key;
+    live_identity_ = req_identity;
     live_bypass_reuse_ = bypass_reuse;
     if (bypass_reuse) {
       checkpoint_ids_.clear();
-      checkpoint_persona_key_ = 0;
+      checkpoint_identity_ = StateIdentity{};
     } else if (start < n) {
       save_checkpoint();
     }
@@ -478,17 +598,33 @@ class EngineGenerator final : public Generator {
     stats.cache_evictions = request_evictions_;
   }
 
-  // Conversation parking. A parked conversation is a packed copy of a prompt checkpoint (target state |
-  // drafter checkpoint regions | last logits) plus the target's full-attention rows [0, n) of its n prompt
-  // tokens, in device memory within park_budget_ (least recently used evicted), and the drafter's context
-  // tokens of the checkpoint (its shortlist rows). Keyed by (ids, persona_key) to prevent cross-persona leakage.
+  // Two-tier bounded conversation & root-prefix parking.
+  // Tier 0 (VRAM): up to park_budget_ bytes, fast D2D copies, dropped on VRAM pressure.
+  // Tier 1 (Pinned Host RAM): up to host_park_budget_ bytes, async PCIe D2H/H2D DMA, strict LRU eviction,
+  //   graceful fallback under host memory pressure, survives GPU VRAM pressure (0 bytes of VRAM).
+  // Every entry is keyed by full StateIdentity + exact token IDs (hashes are index accelerators only).
+  enum class ParkTier : std::uint8_t { Vram = 0, Host = 1 };
+
   struct Parked {
     std::vector<std::int32_t> ids, context;
-    std::uint64_t persona_key = 0;
-    DeviceBuffer data;
+    StateIdentity identity;
+    std::uint64_t id_hash = 0;
+    std::uint64_t prefix_hash = 0;
+    bool is_root = false;  // root checkpoints are never erased as superseded by longer child extensions
+    ParkTier tier = ParkTier::Vram;
+    DeviceBuffer vram_data;
+    PinnedHostBuffer host_data;
+    std::size_t bytes = 0;
     std::uint64_t used = 0;
+
+    void* ptr() noexcept { return tier == ParkTier::Vram ? vram_data.p : host_data.data(); }
+    const void* ptr() const noexcept { return tier == ParkTier::Vram ? vram_data.p : host_data.data(); }
   };
-  static constexpr std::size_t kMinParked = 256;  // shorter prompts are cheaper to prefill than to keep
+  static constexpr std::size_t kMinParked = 256;       // shorter non-root prompts are cheaper to prefill than to keep
+  static constexpr std::size_t kMinRootTokens = 64;    // skip bare ~12-tok effort-only prefixes with no system/tools
+  static constexpr std::uint64_t kHostSafetyReserveBytes = std::uint64_t(256) << 20;  // keep >=256 MiB host RAM free
+
+  bool can_park_any() const noexcept { return park_budget_ > 0 || host_park_budget_ > 0; }
 
   // the layout of a parked copy of n tokens: {offset, bytes} of each drafter region, logits, full rows
   struct ParkLayout {
@@ -508,111 +644,361 @@ class EngineGenerator final : public Generator {
     return l;
   }
 
-  // the parked conversation whose prompt is the longest prefix of `ids` for `persona_key`, if longer than `live`
-  Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live, std::uint64_t persona_key) {
+  void refresh_cache_usage_locked() noexcept {
+    std::size_t v_used = 0, h_used = 0;
+    std::uint64_t v_cnt = 0, h_cnt = 0, r_cnt = 0;
+    for (const Parked& p : parked_) {
+      if (p.tier == ParkTier::Vram) {
+        v_used += p.bytes;
+        ++v_cnt;
+      } else {
+        h_used += p.bytes;
+        ++h_cnt;
+      }
+      if (p.is_root) ++r_cnt;
+    }
+    cache_stats_.vram_budget_bytes = park_budget_;
+    cache_stats_.host_budget_bytes = host_park_budget_;
+    cache_stats_.vram_used_bytes = v_used;
+    cache_stats_.host_used_bytes = h_used;
+    cache_stats_.vram_peak_bytes = std::max(cache_stats_.vram_peak_bytes, v_used);
+    cache_stats_.host_peak_bytes = std::max(cache_stats_.host_peak_bytes, h_used);
+    cache_stats_.vram_entries = v_cnt;
+    cache_stats_.host_entries = h_cnt;
+    cache_stats_.root_entries = r_cnt;
+  }
+
+  PrefixCacheStats cache_stats_locked() const noexcept { return cache_stats_; }
+
+  bool has_exact_parked(std::span<const std::int32_t> prefix, const StateIdentity& identity, bool mark_root) {
+    const std::uint64_t ih = hash_state_identity(identity);
+    const std::uint64_t ph = hash_token_prefix(prefix);
+    for (Parked& p : parked_) {
+      if (p.id_hash == ih && p.prefix_hash == ph && p.ids.size() == prefix.size() && p.identity == identity &&
+          std::equal(p.ids.begin(), p.ids.end(), prefix.begin())) {
+        if (mark_root) p.is_root = true;
+        p.used = ++clock_;
+        refresh_cache_usage_locked();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Longest exact parked prefix of `ids` matching `identity` with length > `live`.
+  // Prefers Tier 0 (VRAM) over Tier 1 (Host) on equal length (dedup makes equal lengths distinct only in theory).
+  Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live, const StateIdentity& identity) {
+    const std::uint64_t ih = hash_state_identity(identity);
     Parked* best = nullptr;
-    for (Parked& p : parked_)
-      if (p.persona_key == persona_key && p.ids.size() >= kMinParked && p.ids.size() > live &&
-          p.ids.size() <= ids.size() && (!best || p.ids.size() > best->ids.size()) &&
-          std::equal(p.ids.begin(), p.ids.end(), ids.begin()))
+    for (Parked& p : parked_) {
+      const std::size_t min_len = p.is_root ? kMinRootTokens : kMinParked;
+      if (p.id_hash != ih || p.ids.size() < min_len || p.ids.size() <= live || p.ids.size() > ids.size()) continue;
+      if (best && p.ids.size() < best->ids.size()) continue;
+      if (best && p.ids.size() == best->ids.size() && best->tier == ParkTier::Vram) continue;
+      if (p.identity == identity && std::equal(p.ids.begin(), p.ids.end(), ids.begin())) {
         best = &p;
+      }
+    }
     return best;
   }
 
-  // The release hook (core/arena.h): a device allocation failed; drop every parked conversation so that it can
-  // be retried. Runs on the allocating thread, i.e. inside a request (the Generator allocates nothing else).
+  // The release hook (core/arena.h): a device allocation failed; drop Tier-0 VRAM parked entries so it can
+  // retry. Tier-1 pinned host entries hold 0 bytes of VRAM and stay intact.
   bool release_parked() {
-    if (parking_ || parked_.empty()) return false;
+    if (parking_) return false;
+    bool any_vram = false;
+    for (const Parked& p : parked_) {
+      if (p.tier == ParkTier::Vram) {
+        any_vram = true;
+        break;
+      }
+    }
+    if (!any_vram) return false;
     cudaStreamSynchronize(rt_.stream());  // copies from or into parked buffers may be queued
-    request_evictions_ += int(parked_.size());
-    std::fprintf(stderr, "device memory low: released %zu parked conversation(s)\n", parked_.size());
-    parked_.clear();
+    std::size_t dropped = 0;
+    std::erase_if(parked_, [&](const Parked& p) {
+      if (p.tier == ParkTier::Vram) {
+        ++dropped;
+        return true;
+      }
+      return false;
+    });
+    request_evictions_ += int(dropped);
+    cache_stats_.vram_evictions += dropped;
+    ++cache_stats_.vram_pressure_releases;
+    refresh_cache_usage_locked();
+    std::fprintf(stderr, "device memory low: released %zu VRAM parked conversation(s)\n", dropped);
     return true;
   }
 
-  // Parks the live conversation's checkpoint (the state after its last prompt; the full rows [0, n) are still
-  // in the caches) unless it is short, already parked or larger than the budget; the parked conversation with
-  // (prompt `keep`, `keep_key`) stays. Never fails the request: a failed allocation disables parking.
-  void park_live(const std::vector<std::int32_t>* keep = nullptr, std::uint64_t keep_key = 0) {
-    const std::size_t n = checkpoint_ids_.size();
-    if (park_budget_ == 0 || n < kMinParked) return;
-    for (Parked& p : parked_)
-      if (p.ids == checkpoint_ids_ && p.persona_key == checkpoint_persona_key_) {
-        p.used = ++clock_;
-        return;
-      }
-    auto kept = [&](const Parked& p) { return keep && p.ids == *keep && p.persona_key == keep_key; };
-    // a parked prefix of this conversation (under the same persona key) is superseded by it
-    std::erase_if(parked_, [&](const Parked& p) {
-      return !kept(p) && p.persona_key == checkpoint_persona_key_ && p.ids.size() < n &&
-             std::equal(p.ids.begin(), p.ids.end(), checkpoint_ids_.begin());
-    });
-    const ParkLayout l = park_layout(int(n));
-    std::size_t used = 0, kept_bytes = 0;
-    for (const Parked& p : parked_) used += p.data.bytes, kept_bytes += kept(p) ? p.data.bytes : 0;
-    if (kept_bytes + l.bytes > park_budget_) return;
-    while (used + l.bytes > park_budget_) {  // least recently used first
-      auto lru = parked_.end();
-      for (auto it = parked_.begin(); it != parked_.end(); ++it)
-        if (!kept(*it) && (lru == parked_.end() || it->used < lru->used)) lru = it;
-      used -= lru->data.bytes;
-      parked_.erase(lru);
-      ++request_evictions_;
+  std::size_t tier_used_bytes(ParkTier tier, const std::vector<std::int32_t>* keep, const StateIdentity* keep_id,
+                              std::size_t* kept_out = nullptr) const noexcept {
+    std::size_t total = 0, kept_bytes = 0;
+    for (const Parked& p : parked_) {
+      if (p.tier != tier) continue;
+      total += p.bytes;
+      if (keep && keep_id && p.ids == *keep && p.identity == *keep_id) kept_bytes += p.bytes;
     }
-    Parked p;
-    try {
-      parking_ = true;  // a failure here must not release the parked conversations through the hook
-      p.data = DeviceBuffer(l.bytes);
-      parking_ = false;
-    } catch (const std::exception& e) {
-      parking_ = false;
-      std::fprintf(stderr, "conversation parking disabled: %s\n", e.what());
-      cudaGetLastError();  // the failed allocation is not a sticky error
-      park_budget_ = 0;
-      request_evictions_ += int(std::erase_if(parked_, [&](const Parked& q) { return !kept(q); }));
-      return;
-    }
-    char* d = static_cast<char*>(p.data.p);
-    const char* c = static_cast<const char*>(checkpoint_.p);
-    const cudaStream_t s = rt_.stream();
-    CUDA_CHECK(cudaMemcpyAsync(d, c, checkpoint_drafter_, cudaMemcpyDeviceToDevice, s));
-    for (int i = 0; i < 3 && drafter_; ++i)
-      CUDA_CHECK(cudaMemcpyAsync(d + l.drafter_off[i], c + checkpoint_drafter_ + l.drafter[i].offset,
-                                 l.drafter[i].bytes, cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(d + l.logits, c + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice, s));
-    rt_.save_full_rows(d + l.rows, int(n));
-    p.ids = checkpoint_ids_;
-    p.persona_key = checkpoint_persona_key_;
-    if (drafter_) p.context = drafter_->checkpoint_context();
-    p.used = ++clock_;
-    parked_.push_back(std::move(p));
+    if (kept_out) *kept_out = kept_bytes;
+    return total;
   }
 
-  // Puts a parked conversation back as the prompt checkpoint (restore_checkpoint() then restores it) and its
-  // full rows into the caches. It stays parked. Returns exact bytes copied via cudaMemcpyAsync.
+  // Attempt to allocate a PinnedHostBuffer of `bytes` within `host_park_budget_`, evicting Tier-1 LRU entries
+  // as needed and degrading gracefully under host memory pressure (never throws).
+  bool alloc_host_park_slot(std::size_t bytes, const std::vector<std::int32_t>* keep, const StateIdentity* keep_id,
+                            PinnedHostBuffer& out, int& req_evictions) {
+    if (host_park_budget_ == 0 || bytes == 0) return false;
+    auto kept = [&](const Parked& p) { return keep && keep_id && p.ids == *keep && p.identity == *keep_id; };
+    std::size_t kept_host = 0;
+    std::size_t host_used = tier_used_bytes(ParkTier::Host, keep, keep_id, &kept_host);
+    if (kept_host + bytes > host_park_budget_) return false;
+
+    auto evict_one_host_lru = [&]() -> bool {
+      auto lru = parked_.end();
+      for (auto it = parked_.begin(); it != parked_.end(); ++it) {
+        if (it->tier == ParkTier::Host && !kept(*it) && (lru == parked_.end() || it->used < lru->used)) lru = it;
+      }
+      if (lru == parked_.end()) return false;
+      CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));  // ensure no in-flight H2D/D2H touches the buffer being freed
+      host_used -= lru->bytes;
+      parked_.erase(lru);
+      ++cache_stats_.host_evictions;
+      ++req_evictions;
+      return true;
+    };
+
+    while (host_used + bytes > host_park_budget_) {
+      if (!evict_one_host_lru()) return false;
+    }
+
+    // Respect OS MemAvailable safety margin before pinning new host RAM.
+    const std::uint64_t avail = mem_available_bytes();
+    if (avail > 0 && avail < kHostSafetyReserveBytes + bytes) {
+      std::uint64_t cur_avail = avail;
+      while (cur_avail < kHostSafetyReserveBytes + bytes && evict_one_host_lru()) {
+        cur_avail = mem_available_bytes();
+      }
+      if (cur_avail > 0 && cur_avail < kHostSafetyReserveBytes + bytes) {
+        ++cache_stats_.host_alloc_failures;
+        refresh_cache_usage_locked();
+        std::fprintf(stderr, "prefix-cache: skipped host park of %.1f MiB (MemAvailable %.1f MiB below safety reserve)\n",
+                     double(bytes) / (1024.0 * 1024.0), double(cur_avail) / (1024.0 * 1024.0));
+        return false;
+      }
+    }
+
+    try {
+      out = PinnedHostBuffer(bytes);
+      return true;
+    } catch (const std::exception& e) {
+      cudaGetLastError();  // clear sticky allocation error
+      bool freed_any = false;
+      while (evict_one_host_lru()) freed_any = true;
+      if (freed_any) {
+        try {
+          out = PinnedHostBuffer(bytes);
+          return true;
+        } catch (const std::exception&) {
+          cudaGetLastError();
+        }
+      }
+      ++cache_stats_.host_alloc_failures;
+      refresh_cache_usage_locked();
+      std::fprintf(stderr, "prefix-cache: host pinned allocation failed (%.1f MiB): %s (continuing without parking)\n",
+                   double(bytes) / (1024.0 * 1024.0), e.what());
+      return false;
+    }
+  }
+
+  // Demote a Tier-0 VRAM entry into Tier-1 pinned host RAM instead of dropping it, when budget allows.
+  bool try_demote_to_host(Parked& victim, const std::vector<std::int32_t>* keep, const StateIdentity* keep_id,
+                          int& req_evictions) {
+    if (host_park_budget_ == 0 || victim.tier != ParkTier::Vram) return false;
+    // Never evict `victim` itself while making room in Tier 1 (victim is still Tier 0 anyway).
+    PinnedHostBuffer hbuf;
+    if (!alloc_host_park_slot(victim.bytes, keep, keep_id, hbuf, req_evictions)) return false;
+    const cudaStream_t s = rt_.stream();
+    CUDA_CHECK(cudaMemcpyAsync(hbuf.data(), victim.vram_data.p, victim.bytes, cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));  // D2H must finish before releasing victim.vram_data
+    victim.vram_data = DeviceBuffer();
+    victim.host_data = std::move(hbuf);
+    victim.tier = ParkTier::Host;
+    cache_stats_.d2h_park_bytes += victim.bytes;
+    ++cache_stats_.host_demotions;
+    refresh_cache_usage_locked();
+    return true;
+  }
+
+  // Copies the current packed checkpoint in `checkpoint_` plus full rows [0, n) from `rt_.state()` into a new
+  // Tier-0 VRAM or Tier-1 pinned host RAM entry. Never fails the request.
+  void store_parked_from_checkpoint(std::span<const std::int32_t> ids, const StateIdentity& identity, bool is_root,
+                                    const std::vector<std::int32_t>* keep, const StateIdentity* keep_id,
+                                    int& req_evictions) {
+    const std::size_t n = ids.size();
+    const std::size_t min_len = is_root ? kMinRootTokens : kMinParked;
+    if (!can_park_any() || n < min_len) return;
+    if (has_exact_parked(ids, identity, is_root)) return;
+
+    auto kept = [&](const Parked& p) { return keep && keep_id && p.ids == *keep && p.identity == *keep_id; };
+
+    // A non-root parked prefix of this conversation (same StateIdentity) is superseded by it.
+    // Root checkpoints (`p.is_root == true`) are NEVER erased as superseded so forks immediately after the
+    // root boundary still hit the root checkpoint even after a sibling conversation grows longer.
+    if (!is_root) {
+      bool any_superseded = false;
+      for (const Parked& p : parked_) {
+        if (!kept(p) && !p.is_root && p.identity == identity && p.ids.size() < n &&
+            std::equal(p.ids.begin(), p.ids.end(), ids.begin())) {
+          any_superseded = true;
+          break;
+        }
+      }
+      if (any_superseded) {
+        CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+        std::erase_if(parked_, [&](const Parked& p) {
+          return !kept(p) && !p.is_root && p.identity == identity && p.ids.size() < n &&
+                 std::equal(p.ids.begin(), p.ids.end(), ids.begin());
+        });
+        refresh_cache_usage_locked();
+      }
+    }
+
+    const ParkLayout l = park_layout(int(n));
+    Parked entry;
+    entry.ids.assign(ids.begin(), ids.end());
+    entry.identity = identity;
+    entry.id_hash = hash_state_identity(identity);
+    entry.prefix_hash = hash_token_prefix(ids);
+    entry.is_root = is_root;
+    entry.bytes = l.bytes;
+
+    bool allocated = false;
+    // Try Tier 0 (VRAM) first if budget fits.
+    if (park_budget_ > 0) {
+      std::size_t kept_vram = 0;
+      std::size_t vram_used = tier_used_bytes(ParkTier::Vram, keep, keep_id, &kept_vram);
+      if (kept_vram + l.bytes <= park_budget_) {
+        while (vram_used + l.bytes > park_budget_) {
+          auto lru = parked_.end();
+          for (auto it = parked_.begin(); it != parked_.end(); ++it) {
+            if (it->tier == ParkTier::Vram && !kept(*it) && (lru == parked_.end() || it->used < lru->used)) lru = it;
+          }
+          if (lru == parked_.end()) break;
+          const std::size_t victim_bytes = lru->bytes;
+          if (try_demote_to_host(*lru, keep, keep_id, req_evictions)) {
+            vram_used -= victim_bytes;
+          } else {
+            CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+            vram_used -= victim_bytes;
+            parked_.erase(lru);
+            ++cache_stats_.vram_evictions;
+            ++req_evictions;
+          }
+        }
+        if (vram_used + l.bytes <= park_budget_) {
+          try {
+            parking_ = true;  // a failure here must not trigger release_parked()
+            entry.vram_data = DeviceBuffer(l.bytes);
+            parking_ = false;
+            entry.tier = ParkTier::Vram;
+            allocated = true;
+          } catch (const std::exception& e) {
+            parking_ = false;
+            std::fprintf(stderr, "VRAM conversation parking disabled: %s\n", e.what());
+            cudaGetLastError();  // clear sticky error
+            CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+            park_budget_ = 0;
+            const std::size_t dropped =
+                std::erase_if(parked_, [&](const Parked& q) { return q.tier == ParkTier::Vram && !kept(q); });
+            req_evictions += int(dropped);
+            cache_stats_.vram_evictions += dropped;
+            refresh_cache_usage_locked();
+          }
+        }
+      }
+    }
+
+    // Fall back to Tier 1 (Pinned Host RAM) if Tier 0 was disabled, too small, or failed allocation.
+    if (!allocated && host_park_budget_ > 0) {
+      PinnedHostBuffer hbuf;
+      if (alloc_host_park_slot(l.bytes, keep, keep_id, hbuf, req_evictions)) {
+        entry.host_data = std::move(hbuf);
+        entry.tier = ParkTier::Host;
+        allocated = true;
+      }
+    }
+    if (!allocated) {
+      refresh_cache_usage_locked();
+      return;
+    }
+
+    char* dst = static_cast<char*>(entry.ptr());
+    const char* c = static_cast<const char*>(checkpoint_.p);
+    const cudaStream_t s = rt_.stream();
+    const cudaMemcpyKind kind = (entry.tier == ParkTier::Vram) ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
+    CUDA_CHECK(cudaMemcpyAsync(dst, c, checkpoint_drafter_, kind, s));
+    for (int i = 0; i < 3 && drafter_; ++i) {
+      if (l.drafter[i].bytes > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(dst + l.drafter_off[i], c + checkpoint_drafter_ + l.drafter[i].offset,
+                                   l.drafter[i].bytes, kind, s));
+      }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dst + l.logits, c + checkpoint_logits_, logits_.bytes, kind, s));
+    rt_.save_full_rows(dst + l.rows, int(n));
+    if (drafter_) entry.context = drafter_->checkpoint_context();
+    entry.used = ++clock_;
+    if (entry.tier == ParkTier::Vram) cache_stats_.d2d_park_bytes += l.bytes;
+    else cache_stats_.d2h_park_bytes += l.bytes;
+    parked_.push_back(std::move(entry));
+    refresh_cache_usage_locked();
+  }
+
+  // Parks the live conversation's checkpoint (from checkpoint_ + live full rows [0, n)).
+  void park_live(const std::vector<std::int32_t>* keep, const StateIdentity* keep_id, int& req_evictions) {
+    if (checkpoint_ids_.empty()) return;
+    store_parked_from_checkpoint(checkpoint_ids_, checkpoint_identity_, /*is_root=*/false, keep, keep_id, req_evictions);
+  }
+
+  // Captures the live state at an exact verified root-prefix boundary `root_ids` right after prefilling to it.
+  // Uses the pre-allocated fixed `checkpoint_` device staging buffer (zero dynamic device staging allocation).
+  void capture_root_checkpoint(std::span<const std::int32_t> root_ids, const StateIdentity& identity,
+                               int& req_evictions) {
+    char* p = static_cast<char*>(checkpoint_.p);
+    rt_.save_checkpoint(p);
+    if (drafter_) drafter_->save_checkpoint(p + checkpoint_drafter_);
+    CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
+                               rt_.stream()));
+    store_parked_from_checkpoint(root_ids, identity, /*is_root=*/true, nullptr, nullptr, req_evictions);
+  }
+
+  // Puts a parked conversation (VRAM or pinned host RAM) back into the fixed `checkpoint_` staging buffer and
+  // restores its full rows into the target caches. Entry stays parked. Returns exact bytes copied via cudaMemcpyAsync.
   std::size_t unpark(Parked& p) {
     const int n = int(p.ids.size());
     const ParkLayout l = park_layout(n);
-    const char* d = static_cast<const char*>(p.data.p);
+    const char* src = static_cast<const char*>(p.ptr());
     char* c = static_cast<char*>(checkpoint_.p);
     const cudaStream_t s = rt_.stream();
+    const cudaMemcpyKind kind = (p.tier == ParkTier::Vram) ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
     std::size_t copied = 0;
-    CUDA_CHECK(cudaMemcpyAsync(c, d, checkpoint_drafter_, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(c, src, checkpoint_drafter_, kind, s));
     copied += checkpoint_drafter_;
     for (int i = 0; i < 3 && drafter_; ++i) {
       if (l.drafter[i].bytes > 0) {
-        CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_drafter_ + l.drafter[i].offset, d + l.drafter_off[i],
-                                   l.drafter[i].bytes, cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_drafter_ + l.drafter[i].offset, src + l.drafter_off[i],
+                                   l.drafter[i].bytes, kind, s));
         copied += l.drafter[i].bytes;
       }
     }
-    CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_logits_, d + l.logits, logits_.bytes, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_logits_, src + l.logits, logits_.bytes, kind, s));
     copied += logits_.bytes;
-    copied += rt_.restore_full_rows(d + l.rows, n);
+    copied += rt_.restore_full_rows(src + l.rows, n);
     if (drafter_) drafter_->adopt_checkpoint(c + checkpoint_drafter_, n, p.context);
     checkpoint_ids_ = p.ids;
-    checkpoint_persona_key_ = p.persona_key;
+    checkpoint_identity_ = p.identity;
     p.used = ++clock_;
+    if (p.tier == ParkTier::Vram) cache_stats_.d2d_restore_bytes += copied;
+    else cache_stats_.h2d_restore_bytes += copied;
     return copied;
   }
 
@@ -625,7 +1011,7 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
     checkpoint_ids_ = tokens_in_state_;
-    checkpoint_persona_key_ = live_persona_key_;
+    checkpoint_identity_ = live_identity_;
   }
 
   // Restores the saved checkpoint into live device state and returns exact bytes copied via cudaMemcpyAsync.
@@ -637,7 +1023,7 @@ class EngineGenerator final : public Generator {
                                rt_.stream()));
     copied += logits_.bytes;
     tokens_in_state_ = checkpoint_ids_;
-    live_persona_key_ = checkpoint_persona_key_;
+    live_identity_ = checkpoint_identity_;
     live_bypass_reuse_ = false;
     return copied;
   }
@@ -665,22 +1051,26 @@ class EngineGenerator final : public Generator {
   std::unique_ptr<VisionEncoder> vision_;  // image input (RuntimeOptions::vision)
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;
   PinnedHostBuffer host_token_;
-  // prompt checkpoint (save_checkpoint) and the prompt it holds (empty: none)
+  // prompt checkpoint (save_checkpoint) — also serves as the fixed device staging buffer for parking
   DeviceBuffer checkpoint_;
   std::size_t checkpoint_drafter_ = 0, checkpoint_logits_ = 0;  // byte offsets in checkpoint_
+  cudaEvent_t restore_start_ = nullptr, restore_end_ = nullptr;
+  StateIdentity base_identity_;
+  StateIdentity live_identity_;
+  StateIdentity checkpoint_identity_;
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;
-  std::uint64_t live_persona_key_ = 0;
-  std::uint64_t checkpoint_persona_key_ = 0;
   bool live_bypass_reuse_ = false;
   persona::RefusalMap refusal_map_;
   std::vector<Parked> parked_;
-  std::size_t park_budget_ = 0;  // bytes
-  std::uint64_t clock_ = 0;      // last use of a parked conversation
-  bool parking_ = false;         // park_live is allocating
-  int request_evictions_ = 0;    // parked entries evicted during the active request
+  std::size_t park_budget_ = 0;       // Tier-0 VRAM bytes
+  std::size_t host_park_budget_ = 0;  // Tier-1 pinned host RAM bytes
+  PrefixCacheStats cache_stats_;
+  std::uint64_t clock_ = 0;           // monotonic LRU clock
+  bool parking_ = false;              // park allocation guard against re-entrant release hook
+  int request_evictions_ = 0;         // parked entries evicted/released during the active request
   int release_hook_ = -1;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
 };
 
 }  // namespace

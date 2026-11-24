@@ -420,7 +420,18 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   const Json& effective_tools = tools == body.end() ? kAbsent : *tools;
   text::RenderedPrompt prompt = fmt.render(effective_messages, effective_tools, options);
   ChatRequest req;
-  if (!image_parts.empty()) expand_images(image_parts, image_options, prompt.ids, req.images);
+  int root_prefix_tokens = prompt.root_prefix_tokens;
+  if (!image_parts.empty()) {
+    // Images are only permitted in user/tool turns (strictly at or after the leading system root);
+    // defensively zero root_prefix_tokens if any placeholder somehow preceded it.
+    const std::size_t r = std::min(std::size_t(std::max(0, root_prefix_tokens)), prompt.ids.size());
+    if (std::find(prompt.ids.begin(), prompt.ids.begin() + std::ptrdiff_t(r), model::IMAGE_PLACEHOLDER_ID) !=
+        prompt.ids.begin() + std::ptrdiff_t(r)) {
+      root_prefix_tokens = 0;
+    }
+    expand_images(image_parts, image_options, prompt.ids, req.images);
+  }
+  req.root_prefix_tokens = model::validate_root_prefix_tokens(prompt.ids, req.images, root_prefix_tokens);
 
   const int64_t room = int64_t(max_model_len) - int64_t(prompt.ids.size());
   if (room <= 0) {

@@ -6,6 +6,9 @@ ingine_add_test(NAME model_layer SOURCES test_layer.cpp LIBS ingine_model GPU MO
 ingine_add_test(NAME model_runtime SOURCES test_runtime.cpp LIBS ingine_model GPU TIMEOUT 600)
 # prompt checkpoints with speculative decoding on the full model (~22 GB of GPU memory)
 ingine_add_test(NAME model_reuse SOURCES test_reuse.cpp LIBS ingine_model GPU MODEL TIMEOUT 900)
+# Stage 3 (#826): verified root-prefix checkpoint, forks, exact-root, byte-capped pinned host-RAM parking,
+# LRU eviction, memory-pressure fallback, and restore-vs-recompute latency crossover
+ingine_add_test(NAME model_cache_stage3 SOURCES test_cache_stage3.cpp LIBS ingine_model ingine_text GPU MODEL TIMEOUT 1200)
 # full-model parity against the Python engine's goldens (tools/goldens_model.py); ~20 GB of GPU memory
 if(TARGET ingine-validate)
   set(_validate ingine-validate --model-dir ${INGINE_TEST_MODEL_DIR} --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)

@@ -299,7 +299,7 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
 
 void ChatServer::complete(const httplib::Request& req, httplib::Response& res, ChatRequest request) {
   auto job = std::make_shared<engine::Job>(request.prompt_ids, request.max_new_tokens, request.sampling,
-                                           std::move(request.images));
+                                           std::move(request.images), request.root_prefix_tokens);
   if (!scheduler_.submit(job)) {
     res.set_header("Retry-After", "1");
     send_error(res, 503, "server busy: request queue is full");

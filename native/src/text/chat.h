@@ -75,6 +75,7 @@ struct RenderedPrompt {
   std::string text;
   std::vector<int32_t> prefill_ids;  // tail of ids the model would otherwise have generated
   RenderStats stats;                 // CPU render/tokenization metrics (strictly distinct from GPU KV cache reuse)
+  int root_prefix_tokens = 0;        // verified leading system+tools+effort token boundary in `ids`
 };
 
 struct ToolCallDelta {

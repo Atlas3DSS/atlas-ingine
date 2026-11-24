@@ -39,6 +39,7 @@ struct ChatRequest {
   std::vector<int32_t> prompt_ids;   // full prompt, prefill included; images expanded to their tokens
   std::vector<int32_t> prefill_ids;  // tail of prompt_ids the model would otherwise have generated
   std::vector<model::PromptImage> images;  // by position in prompt_ids
+  int root_prefix_tokens = 0;        // verified leading system+tools+effort boundary in prompt_ids
   int max_new_tokens = 0;
   model::Sampling sampling;
   std::vector<std::string> stop;

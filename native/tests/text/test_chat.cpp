@@ -109,5 +109,57 @@ int main() {
   }
   for (auto& th : threads) th.join();
   c.expect(mismatches.load() == 0, "concurrent renders differ: " + std::to_string(mismatches.load()));
+  // Verified root-prefix token boundary detection on rendered prompts (#826).
+  {
+    const auto sys_id = *fmt.tokenizer().token_id(MESSAGE_SYSTEM);
+    const auto user_id = *fmt.tokenizer().token_id(MESSAGE_USER);
+    const auto model_id = *fmt.tokenizer().token_id(MESSAGE_MODEL);
+    const auto end_id = *fmt.tokenizer().token_id(END_MESSAGE);
+    const Json tools = Json::array({{{"type", "function"},
+                                     {"function",
+                                      {{"name", "read_file"},
+                                       {"description", "Read a file"},
+                                       {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}}}}});
+    const Json fork_a = Json::array(
+        {{{"role", "system"}, {"content", "You are a precise coding assistant."}},
+         {{"role", "user"}, {"content", "Inspect alpha.cpp"}}});
+    const Json fork_b = Json::array(
+        {{{"role", "system"}, {"content", "You are a precise coding assistant."}},
+         {{"role", "user"}, {"content", "Inspect beta.cpp"}}});
+    const RenderedPrompt pa = fmt.render(fork_a, tools, ChatOptions{});
+    const RenderedPrompt pb = fmt.render(fork_b, tools, ChatOptions{});
+    c.expect(pa.root_prefix_tokens > 0 && std::size_t(pa.root_prefix_tokens) < pa.ids.size(),
+             "root_prefix: tools+system+user has strict prefix boundary");
+    c.expect(pa.root_prefix_tokens == pb.root_prefix_tokens,
+             "root_prefix: forks after system+tools share identical boundary");
+    c.expect(pa.ids[0] == sys_id && pa.ids[std::size_t(pa.root_prefix_tokens - 1)] == end_id &&
+                 pa.ids[std::size_t(pa.root_prefix_tokens)] == user_id,
+             "root_prefix: starts at <|message_system|>, ends at <|end_message|> right before <|message_user|>");
+    c.expect(std::equal(pa.ids.begin(), pa.ids.begin() + pa.root_prefix_tokens, pb.ids.begin()),
+             "root_prefix: forks match token-for-token up to boundary");
+    // Exact-root system-only prompt: root_prefix_tokens == ids.size().
+    const Json sys_only = Json::array({{{"role", "system"}, {"content", "You are a precise coding assistant."}}});
+    const RenderedPrompt ps = fmt.render(sys_only, tools, ChatOptions{});
+    c.expect(ps.root_prefix_tokens == int(ps.ids.size()),
+             "root_prefix: exact-root system-only prompt equals full ids length");
+    c.expect(ps.ids.size() == std::size_t(pa.root_prefix_tokens) &&
+                 std::equal(ps.ids.begin(), ps.ids.end(), pa.ids.begin()),
+             "root_prefix: exact-root render matches fork prefix token-for-token");
+    // enable_thinking=false appends <|message_model|><|content_text|> after root; boundary stops before it.
+    ChatOptions nothink;
+    nothink.enable_thinking = false;
+    const RenderedPrompt pnt = fmt.render(sys_only, tools, nothink);
+    c.expect(pnt.root_prefix_tokens == ps.root_prefix_tokens &&
+                 pnt.ids[std::size_t(pnt.root_prefix_tokens)] == model_id,
+             "root_prefix: enable_thinking=false stops before <|message_model|>");
+    // Mid-conversation system message after user turn must NOT extend root_prefix_tokens.
+    const Json mid_sys = Json::array(
+        {{{"role", "system"}, {"content", "You are a precise coding assistant."}},
+         {{"role", "user"}, {"content", "First question"}},
+         {{"role", "system"}, {"content", "Mid-turn delta"}}});
+    const RenderedPrompt pm = fmt.render(mid_sys, tools, ChatOptions{});
+    c.expect(pm.root_prefix_tokens == pa.root_prefix_tokens,
+             "root_prefix: mid-conversation system message does not move root boundary");
+  }
   return c.finish("text_chat");
 }
