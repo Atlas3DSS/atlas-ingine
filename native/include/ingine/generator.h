@@ -4,6 +4,8 @@
 
 #include "ingine/persona.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -203,6 +205,50 @@ class Generator {
   }
   // Releases `slot` and returns its KV pages immediately. Safe to call on any active slot.
   virtual void release_slot(int /*slot*/) {}
+
+  // Shared single-request lifecycle over the continuous-batching slot API (used by BatchGenerator::generate()
+  // and unit tests so slot/KV-page exception cleanup is tested directly through the production path).
+  GenerateStats generate_from_slots(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
+                                    std::span<const int32_t> stop_ids,
+                                    const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                                    const PrefillCallback& on_prefill) {
+    GenerateStats stats;
+    std::int32_t token = 0;
+    const int n = int(full_prompt.ids.size());
+    if (!sampling.forced.empty()) max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
+    const int max_len = max_model_len();
+    if (n + max_new_tokens > max_len) {
+      max_new_tokens = max_len - n;
+      if (max_new_tokens <= 0)
+        throw std::invalid_argument("prompt of " + std::to_string(n) + " tokens does not fit max_ctx " +
+                                    std::to_string(max_len));
+    }
+    const int s = start_slot(full_prompt, max_new_tokens, sampling, token, stats);
+    if (s < 0) throw std::runtime_error("BatchGenerator::generate: no free batch slot");
+    auto is_stop = [&](std::int32_t tok) {
+      return std::find(stop_ids.begin(), stop_ids.end(), tok) != stop_ids.end();
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+      if (on_prefill) on_prefill(stats);
+      for (int i = 0; i < max_new_tokens; ++i) {
+        stats.generated_tokens = i + 1;
+        const std::int32_t out[1] = {token};
+        const bool go_on = on_tokens(out);
+        if (i + 1 == max_new_tokens || is_stop(token) || !go_on) break;
+        const BatchSlotStep step[1] = {{s, token}};
+        std::int32_t next[1] = {0};
+        step_slots(step, next);
+        token = next[0];
+      }
+    } catch (...) {
+      release_slot(s);
+      throw;
+    }
+    stats.decode_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    release_slot(s);
+    return stats;
+  }
 };
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options);  // the model (ingine_model)

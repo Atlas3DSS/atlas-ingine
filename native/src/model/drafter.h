@@ -85,8 +85,8 @@ class Drafter {
   void set_seed(std::uint64_t seed);
 
   // Tokens of the context (prompt and generated): those outside the shortlist join it (up to CONTEXT_ROWS
-  // until reset()), so the drafter can propose them. Stream-ordered; call before the drafts that should see them.
-  void note_tokens(std::span<const std::int32_t> ids);
+  // until reset()), so the drafter can propose them. Stream-ordered; returns exact H2D bytes copied via cudaMemcpyAsync.
+  std::size_t note_tokens(std::span<const std::int32_t> ids);
 
   // A speculative round's transition, entirely from device values (no host synchronisation), for a verify
   // call at the last draft's position `start`: commits the accepted rows (n = *in.accepted + 1 rows of the
@@ -184,7 +184,7 @@ class Drafter {
   std::vector<std::uint8_t> short_in_;    // host: token has a row
   std::vector<std::int32_t> short_extra_; // host: the context tokens, in row order
   std::vector<std::int32_t> checkpoint_extra_;  // the context tokens of the checkpoint
-  void set_context_rows(int rows);        // drops context rows past `rows` (stream-ordered)
+  std::size_t set_context_rows(int rows);        // drops context rows past `rows` (stream-ordered)
   kernels::dense::Matrix wkv_all_{};      // FP8 rows [3 * 2048, H]: the three layers' k/v context projections
   kernels::draft::CtxLayers ctx_layers_{};
 

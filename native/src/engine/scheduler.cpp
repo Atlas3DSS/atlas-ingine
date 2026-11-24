@@ -5,6 +5,7 @@
 #include <cxxabi.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -54,9 +55,9 @@ std::optional<model::GenerateStats> Job::prefill_stats() const {
   return prefill_stats_;
 }
 
-std::optional<model::GenerateStats> Job::wait_prefill_stats(Clock::duration timeout) const {
+std::optional<model::GenerateStats> Job::wait_prefill_stats() const {
   std::unique_lock lock(mutex_);
-  cv_.wait_for(lock, timeout, [&] { return prefill_stats_.has_value() || finished_ || failure_.has_value(); });
+  cv_.wait(lock, [&] { return prefill_stats_.has_value() || finished_ || failure_.has_value(); });
   return prefill_stats_;
 }
 

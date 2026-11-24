@@ -979,41 +979,7 @@ class BatchGenerator final : public Generator {
                          std::span<const std::int32_t> stop_ids,
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
                          const PrefillCallback& on_prefill) override {
-    GenerateStats stats;
-    std::int32_t token = 0;
-    const int n = int(full_prompt.ids.size());
-    if (!sampling.forced.empty()) max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
-    if (n + max_new_tokens > options_.max_ctx) {
-      max_new_tokens = options_.max_ctx - n;
-      if (max_new_tokens <= 0)
-        throw std::invalid_argument("prompt of " + std::to_string(n) + " tokens does not fit max_ctx " +
-                                    std::to_string(options_.max_ctx));
-    }
-    const int s = start_slot(full_prompt, max_new_tokens, sampling, token, stats);
-    if (s < 0) throw std::runtime_error("BatchGenerator::generate: no free batch slot");
-    auto is_stop = [&](std::int32_t tok) {
-      return std::find(stop_ids.begin(), stop_ids.end(), tok) != stop_ids.end();
-    };
-    const auto t0 = std::chrono::steady_clock::now();
-    try {
-      if (on_prefill) on_prefill(stats);
-      for (int i = 0; i < max_new_tokens; ++i) {
-        stats.generated_tokens = i + 1;
-        const std::int32_t out[1] = {token};
-        const bool go_on = on_tokens(out);
-        if (i + 1 == max_new_tokens || is_stop(token) || !go_on) break;
-        const BatchSlotStep step[1] = {{s, token}};
-        std::int32_t next[1] = {0};
-        step_slots(step, next);
-        token = next[0];
-      }
-    } catch (...) {
-      release_slot(s);
-      throw;
-    }
-    stats.decode_seconds = seconds_since(t0);
-    release_slot(s);
-    return stats;
+    return generate_from_slots(full_prompt, max_new_tokens, sampling, stop_ids, on_tokens, on_prefill);
   }
 
  private:

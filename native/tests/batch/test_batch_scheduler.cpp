@@ -109,31 +109,7 @@ class FakeBatchGenerator final : public ingine::model::Generator {
                          std::span<const int32_t> stop_ids,
                          const std::function<bool(std::span<const int32_t>)>& on_tokens,
                          const ingine::model::PrefillCallback& on_prefill) override {
-    GenerateStats stats;
-    int32_t token = 0;
-    const int s = start_slot(full_prompt, max_new_tokens, sampling, token, stats);
-    if (s < 0) throw std::runtime_error("no free batch slot");
-    try {
-      if (on_prefill) on_prefill(stats);
-      for (int i = 0; i < max_new_tokens; ++i) {
-        stats.generated_tokens = i + 1;
-        const int32_t out[1] = {token};
-        const bool go_on = on_tokens(out);
-        if (i + 1 == max_new_tokens ||
-            std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end() || !go_on) {
-          break;
-        }
-        const BatchSlotStep step[1] = {{s, token}};
-        int32_t next[1] = {0};
-        step_slots(step, next);
-        token = next[0];
-      }
-    } catch (...) {
-      release_slot(s);
-      throw;
-    }
-    release_slot(s);
-    return stats;
+    return generate_from_slots(full_prompt, max_new_tokens, sampling, stop_ids, on_tokens, on_prefill);
   }
 
   int peak_active() const {

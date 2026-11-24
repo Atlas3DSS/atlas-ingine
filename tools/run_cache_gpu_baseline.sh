@@ -12,7 +12,28 @@ TRACES_DIR="${TRACES_DIR:-$REPO/results/cache_stage1_traces}"
 OUT_DIR="${OUT_DIR:-$REPO/results}"
 PORT="${PORT:-18491}"
 GIT_REV="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1 | xargs || echo unknown)"
+
+# Resolve the ACTUAL CUDA device selected by CUDA_VISIBLE_DEVICES (index or UUID) — never blindly pick GPU 0.
+read -r GPU_UUID GPU_NAME < <(python3 - << 'EOF'
+import os, subprocess
+cvd = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+sel = cvd.split(",")[0].strip() if cvd else "0"
+lines = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=index,uuid,name", "--format=csv,noheader"],
+    text=True,
+).splitlines()
+for line in lines:
+    parts = [p.strip() for p in line.split(",", 2)]
+    if len(parts) != 3:
+        continue
+    idx, uuid, name = parts
+    if sel == idx or sel == uuid or (sel.startswith("GPU-") and uuid.startswith(sel)):
+        print(uuid, name)
+        raise SystemExit(0)
+raise SystemExit(f"Could not resolve CUDA_VISIBLE_DEVICES={cvd!r} in nvidia-smi output")
+EOF
+)
+echo "Resolved CUDA device: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>} -> uuid=$GPU_UUID name=$GPU_NAME"
 
 run_arm() {
   local mode="$1"
@@ -20,7 +41,7 @@ run_arm() {
   local out_json="$OUT_DIR/cache_stage1_gpu_${mode//-/_}.json"
   local srv_log="$OUT_DIR/cache_stage1_gpu_${mode//-/_}.server.log"
   rm -f "$srv_log"
-  echo "=== Starting $mode ($extra_flags) on $GPU_NAME ($GIT_REV) ==="
+  echo "=== Starting $mode ($extra_flags) on $GPU_NAME ($GPU_UUID, $GIT_REV) ==="
   # shellcheck disable=SC2086
   "$SERVE_BIN" --engine --model-dir "$MODEL_DIR" --model-id inkling-2-mini \
     --host 127.0.0.1 --port "$PORT" --max-ctx 65536 --dense-fp8 --kv-fp8 --no-vision \
@@ -47,12 +68,14 @@ run_arm() {
   fi
   python3 "$REPO/tools/cache_replay_baseline.py" \
     --traces-dir "$TRACES_DIR" \
+    --model-dir "$MODEL_DIR" \
     --base-url "http://127.0.0.1:$PORT" \
     --model inkling-2-mini \
     --mode "$mode" \
     --server-log "$srv_log" \
     --git-rev "$GIT_REV" \
     --gpu-name "$GPU_NAME" \
+    --gpu-uuid "$GPU_UUID" \
     --serve-flags "--max-ctx 65536 --dense-fp8 --kv-fp8 --no-vision $extra_flags" \
     --max-tokens 16 \
     --output "$out_json"

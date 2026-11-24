@@ -316,8 +316,8 @@ void Drafter::reset() {
   set_context_rows(0);
 }
 
-void Drafter::set_context_rows(int rows) {
-  if (rows >= short_E_) return;
+std::size_t Drafter::set_context_rows(int rows) {
+  if (rows >= short_E_) return 0;
   for (std::size_t i = std::size_t(rows); i < short_extra_.size(); ++i) short_in_[short_extra_[i]] = 0;
   short_extra_.resize(std::size_t(rows));
   short_E_ = rows;
@@ -327,20 +327,22 @@ void Drafter::set_context_rows(int rows) {
   for (int i = 0; i < GAMMA; ++i)
     kd::fill(base_ + std::size_t(i) * short_head_.rows + short_K_ + rows, std::size_t(CONTEXT_ROWS - rows), -INFINITY,
              stream_);
+  return sizeof seg;
 }
 
-void Drafter::note_tokens(std::span<const std::int32_t> ids) {
+std::size_t Drafter::note_tokens(std::span<const std::int32_t> ids) {
   std::vector<std::int32_t> add;
   for (std::int32_t t : ids)
     if (t >= 0 && t < V_ && !short_in_[t] && short_E_ + int(add.size()) < CONTEXT_ROWS) {
       short_in_[t] = 1;
       add.push_back(t);
     }
-  if (add.empty()) return;
+  if (add.empty()) return 0;
   const std::size_t row = std::size_t(short_K_ + short_E_);
   const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
   // pageable sources: copied before cudaMemcpyAsync returns; short_ids_ is free once earlier gathers ran
-  CUDA_CHECK(cudaMemcpyAsync(short_ids_, add.data(), add.size() * 4, cudaMemcpyHostToDevice, stream_));
+  const std::size_t ids_bytes = add.size() * 4;
+  CUDA_CHECK(cudaMemcpyAsync(short_ids_, add.data(), ids_bytes, cudaMemcpyHostToDevice, stream_));
   kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, int(add.size()),
                        static_cast<std::uint8_t*>(const_cast<void*>(short_head_.w)) + row * row_bytes,
                        head_.scale ? const_cast<float*>(short_head_.scale) + row : nullptr, short_map_ + row, stream_);
@@ -348,6 +350,7 @@ void Drafter::note_tokens(std::span<const std::int32_t> ids) {
   short_E_ += int(add.size());
   const int seg[3] = {0, short_K_ + short_E_, 0};
   CUDA_CHECK(cudaMemcpyAsync(seg_short_, seg, sizeof seg, cudaMemcpyHostToDevice, stream_));
+  return ids_bytes + sizeof seg;
 }
 
 void Drafter::set_seed(std::uint64_t seed) { kd::set_seed(params_, seed, stream_); }
@@ -439,8 +442,8 @@ std::size_t Drafter::restore_checkpoint(const void* src) {
   // the context tokens of the checkpoint: drop the ones added since (rebuild if they were reset meanwhile)
   const bool prefix = short_extra_.size() >= checkpoint_extra_.size() &&
                       std::equal(checkpoint_extra_.begin(), checkpoint_extra_.end(), short_extra_.begin());
-  set_context_rows(prefix ? int(checkpoint_extra_.size()) : 0);
-  if (!prefix) note_tokens(checkpoint_extra_);
+  copied_bytes += set_context_rows(prefix ? int(checkpoint_extra_.size()) : 0);
+  if (!prefix) copied_bytes += note_tokens(checkpoint_extra_);
   return copied_bytes;
 }
 

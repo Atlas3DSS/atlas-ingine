@@ -95,14 +95,16 @@ void pump(Exchange& x, const std::function<bool()>& gone, const std::function<vo
 Json usage(const Exchange& x) {
   const int prompt = int(x.job->prompt_ids.size());
   const int completion = x.parser.num_tokens();
-  int cached = 0;
+  Json details = Json::object();
   if (x.prefill_stats) {
-    cached = std::clamp(x.prefill_stats->reused_tokens, 0, prompt);
+    details["cached_tokens"] = std::clamp(x.prefill_stats->reused_tokens, 0, prompt);
+  } else {
+    details["cached_tokens"] = nullptr;
   }
   return Json{{"prompt_tokens", prompt},
               {"completion_tokens", completion},
               {"total_tokens", prompt + completion},
-              {"prompt_tokens_details", {{"cached_tokens", cached}}}};
+              {"prompt_tokens_details", std::move(details)}};
 }
 
 void log_done(const Exchange& x) {

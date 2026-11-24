@@ -52,7 +52,7 @@ class Job {
   std::optional<model::GenerateStats> prefill_stats() const;
   // Returns prefill_stats() immediately if already published; otherwise waits until stats are published or the
   // job finishes/fails (synchronized compatibility path for legacy 5-arg generators on early stop-string cancel).
-  std::optional<model::GenerateStats> wait_prefill_stats(Clock::duration timeout = std::chrono::seconds(30)) const;
+  std::optional<model::GenerateStats> wait_prefill_stats() const;
 
   // Waits up to `timeout` for output, then returns everything available (empty on timeout).
   JobBatch take(Clock::duration timeout);
