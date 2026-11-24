@@ -150,8 +150,8 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
     const uint2 q1 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&qs[hw][v_idx][16 * s + 8 + v_kh])));
     qb_v[s][0] = q0.x, qb_v[s][1] = q0.y, qb_v[s][2] = q1.x, qb_v[s][3] = q1.y;
   }
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600 && INGINE_ACT_FP16 && !defined(INGINE_FORCE_SIMT_MMA)
-  // GP100 sm_60: reads qs directly from SMEM via uint4 in tile() with native __hfma2 (0 shuffles).
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+  // Pascal sm_60/sm_61: reads qs directly from SMEM via uint4 in tile() with exact FP32 fmaf (0 shuffles).
 #else
   uint32_t qb[HEAD_DIM / 16][2];  // this head's queries as B fragments (16 dims x 8 queries), per 16 dims
 #pragma unroll
@@ -217,11 +217,9 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
       mma::sm70_mma_f16_direct(sc8, k0.x, k0.y, k1.x, k1.y, qb_v[s][0], qb_v[s][1], qb_v[s][2], qb_v[s][3]);
     }
     mma::sm70_reduce_acc8_to_d4(sc8, sc);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600 && INGINE_ACT_FP16 && !defined(INGINE_FORCE_SIMT_MMA)
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
 #pragma unroll
     for (int s = 0; s < HEAD_DIM / 16; ++s) {
-      __half2 h0 = __float2half2_rn(0.f), h1 = __float2half2_rn(0.f);
-      __half2 h2 = __float2half2_rn(0.f), h3 = __float2half2_rn(0.f);
 #pragma unroll
       for (int c = 0; c < 2; ++c) {
         const uint4 ka = *reinterpret_cast<const uint4*>(&kt[buf][gl][16 * s + 8 * c]);
@@ -232,22 +230,16 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
         const uint32_t qaw[4] = {qa.x, qa.y, qa.z, qa.w}, qbw[4] = {qb4.x, qb4.y, qb4.z, qb4.w};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-          const __half2 hka = *reinterpret_cast<const __half2*>(&kaw[i]);
-          const __half2 hkb = *reinterpret_cast<const __half2*>(&kbw[i]);
-          const __half2 hqa = *reinterpret_cast<const __half2*>(&qaw[i]);
-          const __half2 hqb = *reinterpret_cast<const __half2*>(&qbw[i]);
-          h0 = __hfma2(hka, hqa, h0);
-          h1 = __hfma2(hka, hqb, h1);
-          h2 = __hfma2(hkb, hqa, h2);
-          h3 = __hfma2(hkb, hqb, h3);
+          const float2 fka = act::unpack2(kaw[i]);
+          const float2 fkb = act::unpack2(kbw[i]);
+          const float2 fqa = act::unpack2(qaw[i]);
+          const float2 fqb = act::unpack2(qbw[i]);
+          sc[0] = fmaf(fka.y, fqa.y, fmaf(fka.x, fqa.x, sc[0]));
+          sc[1] = fmaf(fka.y, fqb.y, fmaf(fka.x, fqb.x, sc[1]));
+          sc[2] = fmaf(fkb.y, fqa.y, fmaf(fkb.x, fqa.x, sc[2]));
+          sc[3] = fmaf(fkb.y, fqb.y, fmaf(fkb.x, fqb.x, sc[3]));
         }
       }
-      const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
-      const float2 f2 = __half22float2(h2), f3 = __half22float2(h3);
-      sc[0] += f0.x + f0.y;
-      sc[1] += f1.x + f1.y;
-      sc[2] += f2.x + f2.y;
-      sc[3] += f3.x + f3.y;
     }
 #else
 #pragma unroll
@@ -317,13 +309,19 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
                                p0.x, p0.y, p1.x, p1.y);
       mma::sm70_reduce_acc8_to_d4(ov, oacc[d]);
     }
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600 && INGINE_ACT_FP16 && !defined(INGINE_FORCE_SIMT_MMA)
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
     const uint4 pq0a = *reinterpret_cast<const uint4*>(&pt[w][2 * t][0]);
     const uint4 pq0b = *reinterpret_cast<const uint4*>(&pt[w][2 * t][8]);
     const uint4 pq1a = *reinterpret_cast<const uint4*>(&pt[w][2 * t + 1][0]);
     const uint4 pq1b = *reinterpret_cast<const uint4*>(&pt[w][2 * t + 1][8]);
     const uint32_t pw0[8] = {pq0a.x, pq0a.y, pq0a.z, pq0a.w, pq0b.x, pq0b.y, pq0b.z, pq0b.w};
     const uint32_t pw1[8] = {pq1a.x, pq1a.y, pq1a.z, pq1a.w, pq1b.x, pq1b.y, pq1b.z, pq1b.w};
+    float2 fp0[8], fp1[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      fp0[k] = act::unpack2(pw0[k]);
+      fp1[k] = act::unpack2(pw1[k]);
+    }
 #pragma unroll
     for (int d = 0; d < HEAD_DIM / 16; ++d) {
       if (rescale) {
@@ -332,30 +330,18 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
         oacc[d][2] *= al[0];
         oacc[d][3] *= al[1];
       }
-      __half2 h0 = __float2half2_rn(0.f), h1 = __float2half2_rn(0.f);
-      __half2 h2 = __float2half2_rn(0.f), h3 = __float2half2_rn(0.f);
       const int da = 16 * d + gl, db = da + 8;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
-        const unsigned va = static_cast<unsigned>(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k][da])))) |
-                            (static_cast<unsigned>(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k + 1][da])))) << 16);
-        const unsigned vb = static_cast<unsigned>(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k][db])))) |
-                            (static_cast<unsigned>(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k + 1][db])))) << 16);
-        const __half2 hva = *reinterpret_cast<const __half2*>(&va);
-        const __half2 hvb = *reinterpret_cast<const __half2*>(&vb);
-        const __half2 hp0 = *reinterpret_cast<const __half2*>(&pw0[k]);
-        const __half2 hp1 = *reinterpret_cast<const __half2*>(&pw1[k]);
-        h0 = __hfma2(hva, hp0, h0);
-        h1 = __hfma2(hva, hp1, h1);
-        h2 = __hfma2(hvb, hp0, h2);
-        h3 = __hfma2(hvb, hp1, h3);
+        const float va0 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k][da]))));
+        const float va1 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k + 1][da]))));
+        const float vb0 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k][db]))));
+        const float vb1 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k + 1][db]))));
+        oacc[d][0] = fmaf(va1, fp0[k].y, fmaf(va0, fp0[k].x, oacc[d][0]));
+        oacc[d][1] = fmaf(va1, fp1[k].y, fmaf(va0, fp1[k].x, oacc[d][1]));
+        oacc[d][2] = fmaf(vb1, fp0[k].y, fmaf(vb0, fp0[k].x, oacc[d][2]));
+        oacc[d][3] = fmaf(vb1, fp1[k].y, fmaf(vb0, fp1[k].x, oacc[d][3]));
       }
-      const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
-      const float2 f2 = __half22float2(h2), f3 = __half22float2(h3);
-      oacc[d][0] += f0.x + f0.y;
-      oacc[d][1] += f1.x + f1.y;
-      oacc[d][2] += f2.x + f2.y;
-      oacc[d][3] += f3.x + f3.y;
     }
 #else
     uint32_t pf[2];

@@ -183,36 +183,6 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
   pdl_trigger();
 
   float acc = 0.f;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600 && INGINE_ACT_FP16
-  // GP100 (sm_60) native full-rate packed __half2 (__hfma2, 2x FP32 throughput), flushing every
-  // chunk into FP32 so FP8 unscaled E4M3 codes (<=448) never risk FP16 overflow.
-#pragma unroll
-  for (int i = 0; i < CH; ++i) {
-    const int col = (i * LANES + gl) * EPC;
-    if constexpr (FP8) {
-      const uint4 x0 = ld_act(x + col), x1 = ld_act(x + col + 8);
-      const uint32_t ww[4] = {wv[i].x, wv[i].y, wv[i].z, wv[i].w};
-      const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-#pragma unroll
-      for (int s = 0; s < 4; ++s) {
-        const uint32_t h0 = act::e4m3x2_to_half2_bits(ww[s]);
-        const uint32_t h1 = act::e4m3x2_to_half2_bits(ww[s] >> 16);
-        __half2 p = __hmul2(*reinterpret_cast<const __half2*>(&h0), *reinterpret_cast<const __half2*>(&xx[2 * s]));
-        p = __hfma2(*reinterpret_cast<const __half2*>(&h1), *reinterpret_cast<const __half2*>(&xx[2 * s + 1]), p);
-        const float2 pf = __half22float2(p);
-        acc += pf.x + pf.y;
-      }
-    } else {
-      const uint4 xv = ld_act(x + col);
-      __half2 p = __hmul2(*reinterpret_cast<const __half2*>(&wv[i].x), *reinterpret_cast<const __half2*>(&xv.x));
-      p = __hfma2(*reinterpret_cast<const __half2*>(&wv[i].y), *reinterpret_cast<const __half2*>(&xv.y), p);
-      p = __hfma2(*reinterpret_cast<const __half2*>(&wv[i].z), *reinterpret_cast<const __half2*>(&xv.z), p);
-      p = __hfma2(*reinterpret_cast<const __half2*>(&wv[i].w), *reinterpret_cast<const __half2*>(&xv.w), p);
-      const float2 pf = __half22float2(p);
-      acc += pf.x + pf.y;
-    }
-  }
-#else
 #pragma unroll
   for (int i = 0; i < CH; ++i) {
     const int col = (i * LANES + gl) * EPC;
@@ -224,7 +194,6 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
 #pragma unroll
     for (int j = 0; j < EPC; ++j) acc = fmaf(wf[j], xf[j], acc);
   }
-#endif
 
   float v[1] = {group_sum<LANES>(acc) * (FP8 ? __ldg(w_scale + row) : 1.f)};
   if constexpr (Epi::kScatter) {
@@ -393,82 +362,40 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
 #pragma unroll
       for (int u = 0; u < U; ++u) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
-        // Pascal sm_60/sm_61: compute ONLY active columns 0..M-1 (zero wasted columns, GP100 native __hfma2 on sm_60).
+        // Pascal sm_60/sm_61: compute ONLY active columns 0..M-1 with hoisted weight unpacks and exact FP32 fmaf.
         if constexpr (FP8) {
           const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
-          uint32_t ah[8], bh[8];
-#pragma unroll
-          for (int s = 0; s < 4; ++s) {
-            ah[2 * s] = e4m3x2_to_bf16x2(aw[s]);
-            ah[2 * s + 1] = e4m3x2_to_bf16x2(aw[s] >> 16);
-            bh[2 * s] = e4m3x2_to_bf16x2(bw[s]);
-            bh[2 * s + 1] = e4m3x2_to_bf16x2(bw[s] >> 16);
-          }
           const uint32_t xw[8] = {X[u][0].x ^ dep, X[u][0].y, X[u][0].z, X[u][0].w,
                                   X[u][1].x,       X[u][1].y, X[u][1].z, X[u][1].w};
 #pragma unroll
-          for (int m = 0; m < M; ++m) {
-            const int sl = 4 * m + t;
-#if __CUDA_ARCH__ == 600 && INGINE_ACT_FP16 && !defined(INGINE_FORCE_SIMT_MMA)
+          for (int s = 0; s < 4; ++s) {
+            const float2 fa0 = act::unpack2(e4m3x2_to_bf16x2(aw[s]));
+            const float2 fa1 = act::unpack2(e4m3x2_to_bf16x2(aw[s] >> 16));
+            const float2 fb0 = act::unpack2(e4m3x2_to_bf16x2(bw[s]));
+            const float2 fb1 = act::unpack2(e4m3x2_to_bf16x2(bw[s] >> 16));
 #pragma unroll
-            for (int s = 0; s < 4; ++s) {
-              const uint32_t x0 = __shfl_sync(0xffffffffu, xw[2 * s], sl);
-              const uint32_t x1 = __shfl_sync(0xffffffffu, xw[2 * s + 1], sl);
-              const __half2 hx0 = *reinterpret_cast<const __half2*>(&x0);
-              const __half2 hx1 = *reinterpret_cast<const __half2*>(&x1);
-              __half2 pa = __hmul2(*reinterpret_cast<const __half2*>(&ah[2 * s]), hx0);
-              pa = __hfma2(*reinterpret_cast<const __half2*>(&ah[2 * s + 1]), hx1, pa);
-              __half2 pb = __hmul2(*reinterpret_cast<const __half2*>(&bh[2 * s]), hx0);
-              pb = __hfma2(*reinterpret_cast<const __half2*>(&bh[2 * s + 1]), hx1, pb);
-              const float2 fa = __half22float2(pa), fb = __half22float2(pb);
-              acc_a[m] += fa.x + fa.y;
-              acc_b[m] += fb.x + fb.y;
+            for (int m = 0; m < M; ++m) {
+              const int sl = 4 * m + t;
+              const float2 fx0 = act::unpack2(__shfl_sync(0xffffffffu, xw[2 * s], sl));
+              const float2 fx1 = act::unpack2(__shfl_sync(0xffffffffu, xw[2 * s + 1], sl));
+              acc_a[m] = fmaf(fa1.y, fx1.y, fmaf(fa1.x, fx1.x, fmaf(fa0.y, fx0.y, fmaf(fa0.x, fx0.x, acc_a[m]))));
+              acc_b[m] = fmaf(fb1.y, fx1.y, fmaf(fb1.x, fx1.x, fmaf(fb0.y, fx0.y, fmaf(fb0.x, fx0.x, acc_b[m]))));
             }
-#else
-#pragma unroll
-            for (int s = 0; s < 8; ++s) {
-              const uint32_t xv = __shfl_sync(0xffffffffu, xw[s], sl);
-              const float2 fx = __half22float2(*reinterpret_cast<const __half2*>(&xv));
-              const float2 fa = __half22float2(*reinterpret_cast<const __half2*>(&ah[s]));
-              const float2 fb = __half22float2(*reinterpret_cast<const __half2*>(&bh[s]));
-              acc_a[m] = fmaf(fa.x, fx.x, fmaf(fa.y, fx.y, acc_a[m]));
-              acc_b[m] = fmaf(fb.x, fx.x, fmaf(fb.y, fx.y, acc_b[m]));
-            }
-#endif
           }
         } else {
           const uint32_t ah[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bh[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
           const uint32_t xw[4] = {X[u][0].x ^ dep, X[u][0].y, X[u][0].z, X[u][0].w};
 #pragma unroll
-          for (int m = 0; m < M; ++m) {
-            const int sl = 4 * m + t;
-#if __CUDA_ARCH__ == 600 && INGINE_ACT_FP16 && !defined(INGINE_FORCE_SIMT_MMA)
-            const uint32_t x0 = __shfl_sync(0xffffffffu, xw[0], sl);
-            const uint32_t x1 = __shfl_sync(0xffffffffu, xw[1], sl);
-            const uint32_t x2 = __shfl_sync(0xffffffffu, xw[2], sl);
-            const uint32_t x3 = __shfl_sync(0xffffffffu, xw[3], sl);
-            __half2 pa = __hmul2(*reinterpret_cast<const __half2*>(&ah[0]), *reinterpret_cast<const __half2*>(&x0));
-            pa = __hfma2(*reinterpret_cast<const __half2*>(&ah[1]), *reinterpret_cast<const __half2*>(&x1), pa);
-            pa = __hfma2(*reinterpret_cast<const __half2*>(&ah[2]), *reinterpret_cast<const __half2*>(&x2), pa);
-            pa = __hfma2(*reinterpret_cast<const __half2*>(&ah[3]), *reinterpret_cast<const __half2*>(&x3), pa);
-            __half2 pb = __hmul2(*reinterpret_cast<const __half2*>(&bh[0]), *reinterpret_cast<const __half2*>(&x0));
-            pb = __hfma2(*reinterpret_cast<const __half2*>(&bh[1]), *reinterpret_cast<const __half2*>(&x1), pb);
-            pb = __hfma2(*reinterpret_cast<const __half2*>(&bh[2]), *reinterpret_cast<const __half2*>(&x2), pb);
-            pb = __hfma2(*reinterpret_cast<const __half2*>(&bh[3]), *reinterpret_cast<const __half2*>(&x3), pb);
-            const float2 fa = __half22float2(pa), fb = __half22float2(pb);
-            acc_a[m] += fa.x + fa.y;
-            acc_b[m] += fb.x + fb.y;
-#else
+          for (int s = 0; s < 4; ++s) {
+            const float2 fa = act::unpack2(ah[s]);
+            const float2 fb = act::unpack2(bh[s]);
 #pragma unroll
-            for (int s = 0; s < 4; ++s) {
-              const uint32_t xv = __shfl_sync(0xffffffffu, xw[s], sl);
-              const float2 fx = __half22float2(*reinterpret_cast<const __half2*>(&xv));
-              const float2 fa = __half22float2(*reinterpret_cast<const __half2*>(&ah[s]));
-              const float2 fb = __half22float2(*reinterpret_cast<const __half2*>(&bh[s]));
-              acc_a[m] = fmaf(fa.x, fx.x, fmaf(fa.y, fx.y, acc_a[m]));
-              acc_b[m] = fmaf(fb.x, fx.x, fmaf(fb.y, fx.y, acc_b[m]));
+            for (int m = 0; m < M; ++m) {
+              const int sl = 4 * m + t;
+              const float2 fx = act::unpack2(__shfl_sync(0xffffffffu, xw[s], sl));
+              acc_a[m] = fmaf(fa.y, fx.y, fmaf(fa.x, fx.x, acc_a[m]));
+              acc_b[m] = fmaf(fb.y, fx.y, fmaf(fb.x, fx.x, acc_b[m]));
             }
-#endif
           }
         }
 #else

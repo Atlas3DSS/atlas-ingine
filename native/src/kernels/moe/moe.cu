@@ -480,41 +480,20 @@ __device__ __forceinline__ void mma_frag(const Frag<FMT>& f, float (&d)[4], uint
     mma::sm70_reduce_acc8_to_d4(acc8, d);
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
     // Pascal sm_60/sm_61 fast path: iterate ONLY over tokens that actually routed to this expert (1..2 vs 8),
-    // eliminating 32-shuffle SIMT MMA emulation and using native full-rate GP100 __hfma2 on sm_60.
+    // eliminating 32-shuffle SIMT MMA emulation while keeping exact FP32 fmaf accumulation.
     const int t = threadIdx.x & 3;
     for (int m = 0; m < M; ++m) {
         if (((mask >> (8 * m)) & 0xffu) == 0u) continue;
         const int src_lane = 4 * m + t;
         float pa = 0.f, pb = 0.f;
-#if __CUDA_ARCH__ == 600 && INGINE_ACT_FP16 && !defined(INGINE_FORCE_SIMT_MMA)
-        __half2 ha0 = __float2half2_rn(0.f), ha1 = __float2half2_rn(0.f);
-        __half2 hb0 = __float2half2_rn(0.f), hb1 = __float2half2_rn(0.f);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const uint32_t x0 = __shfl_sync(0xffffffffu, f.x[2 * i], src_lane);
-            const uint32_t x1 = __shfl_sync(0xffffffffu, f.x[2 * i + 1], src_lane);
-            const __half2 hx0 = *reinterpret_cast<const __half2*>(&x0);
-            const __half2 hx1 = *reinterpret_cast<const __half2*>(&x1);
-            ha0 = __hfma2(*reinterpret_cast<const __half2*>(&a[2 * i]), hx0, ha0);
-            ha1 = __hfma2(*reinterpret_cast<const __half2*>(&a[2 * i + 1]), hx1, ha1);
-            hb0 = __hfma2(*reinterpret_cast<const __half2*>(&b[2 * i]), hx0, hb0);
-            hb1 = __hfma2(*reinterpret_cast<const __half2*>(&b[2 * i + 1]), hx1, hb1);
-        }
-        const float2 fa0 = __half22float2(ha0), fa1 = __half22float2(ha1);
-        const float2 fb0 = __half22float2(hb0), fb1 = __half22float2(hb1);
-        pa = (fa0.x + fa0.y) + (fa1.x + fa1.y);
-        pb = (fb0.x + fb0.y) + (fb1.x + fb1.y);
-#else
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            const uint32_t xv = __shfl_sync(0xffffffffu, f.x[i], src_lane);
-            const float2 fx = __half22float2(*reinterpret_cast<const __half2*>(&xv));
-            const float2 fa = __half22float2(*reinterpret_cast<const __half2*>(&a[i]));
-            const float2 fb = __half22float2(*reinterpret_cast<const __half2*>(&b[i]));
+            const float2 fx = act::unpack2(__shfl_sync(0xffffffffu, f.x[i], src_lane));
+            const float2 fa = act::unpack2(a[i]);
+            const float2 fb = act::unpack2(b[i]);
             pa = fmaf(fa.x, fx.x, fmaf(fa.y, fx.y, pa));
             pb = fmaf(fb.x, fx.x, fmaf(fb.y, fx.y, pb));
         }
-#endif
         pa += __shfl_xor_sync(0xffffffffu, pa, 1);
         pa += __shfl_xor_sync(0xffffffffu, pa, 2);
         pb += __shfl_xor_sync(0xffffffffu, pb, 1);

@@ -88,57 +88,40 @@ __device__ __forceinline__ float softcap(float x, float cap) { return tanhf(x * 
 template <int MT, int TM, class After>
 __device__ __forceinline__ void mma_step(float (&acc)[TM / 16][2][4], const uint16_t* A,
                                          const unsigned (&b)[BK / 16][2][2], int lane, After&& after) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600 && INGINE_ACT_FP16 && !defined(INGINE_FORCE_SIMT_MMA)
-  // GP100 (sm_60) fast path: direct SMEM reads for A (0 shuffles) + hoisted B shuffles across MT
-  // + native full-rate packed __half2 (__hfma2, 2x FP32 throughput).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+  // Pascal sm_60/sm_61 fast path: direct SMEM uint4 A reads (0 shuffles) + hoisted B shuffles and FP32
+  // unpacks across MT + exact FP32 fmaf accumulation.
   const int g = lane >> 2, c = lane & 3;
 #pragma unroll
   for (int kk = 0; kk < BK / 16; ++kk) {
-    uint4 a_lo[MT][2], a_hi[MT][2];
-#pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-      a_lo[mt][0] = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g, kk * 2));
-      a_lo[mt][1] = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g, kk * 2 + 1));
-      a_hi[mt][0] = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g + 8, kk * 2));
-      a_hi[mt][1] = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g + 8, kk * 2 + 1));
-    }
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
       const int bl0 = 4 * (2 * c), bl1 = 4 * (2 * c + 1);
-      __half2 b0[8], b1[8];
+      float2 b0[8], b1[8];
 #pragma unroll
       for (int p = 0; p < 4; ++p) {
-        const uint32_t l0 = __shfl_sync(0xffffffffu, b[kk][nt][0], bl0 + p);
-        const uint32_t l1 = __shfl_sync(0xffffffffu, b[kk][nt][1], bl0 + p);
-        const uint32_t r0 = __shfl_sync(0xffffffffu, b[kk][nt][0], bl1 + p);
-        const uint32_t r1 = __shfl_sync(0xffffffffu, b[kk][nt][1], bl1 + p);
-        b0[p] = *reinterpret_cast<const __half2*>(&l0);
-        b0[4 + p] = *reinterpret_cast<const __half2*>(&l1);
-        b1[p] = *reinterpret_cast<const __half2*>(&r0);
-        b1[4 + p] = *reinterpret_cast<const __half2*>(&r1);
+        b0[p] = act::unpack2(__shfl_sync(0xffffffffu, b[kk][nt][0], bl0 + p));
+        b0[4 + p] = act::unpack2(__shfl_sync(0xffffffffu, b[kk][nt][1], bl0 + p));
+        b1[p] = act::unpack2(__shfl_sync(0xffffffffu, b[kk][nt][0], bl1 + p));
+        b1[4 + p] = act::unpack2(__shfl_sync(0xffffffffu, b[kk][nt][1], bl1 + p));
       }
 #pragma unroll
       for (int mt = 0; mt < MT; ++mt) {
-        const uint32_t al[8] = {a_lo[mt][0].x, a_lo[mt][0].y, a_lo[mt][0].z, a_lo[mt][0].w,
-                                a_lo[mt][1].x, a_lo[mt][1].y, a_lo[mt][1].z, a_lo[mt][1].w};
-        const uint32_t ah[8] = {a_hi[mt][0].x, a_hi[mt][0].y, a_hi[mt][0].z, a_hi[mt][0].w,
-                                a_hi[mt][1].x, a_hi[mt][1].y, a_hi[mt][1].z, a_hi[mt][1].w};
-        __half2 d0 = __float2half2_rn(0.f), d1 = d0, d2 = d0, d3 = d0;
+        const uint4 alo0 = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g, kk * 2));
+        const uint4 alo1 = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g, kk * 2 + 1));
+        const uint4 ahi0 = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g + 8, kk * 2));
+        const uint4 ahi1 = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + g + 8, kk * 2 + 1));
+        const uint32_t al[8] = {alo0.x, alo0.y, alo0.z, alo0.w, alo1.x, alo1.y, alo1.z, alo1.w};
+        const uint32_t ah[8] = {ahi0.x, ahi0.y, ahi0.z, ahi0.w, ahi1.x, ahi1.y, ahi1.z, ahi1.w};
 #pragma unroll
         for (int p = 0; p < 8; ++p) {
-          const __half2 hal = *reinterpret_cast<const __half2*>(&al[p]);
-          const __half2 hah = *reinterpret_cast<const __half2*>(&ah[p]);
-          d0 = __hfma2(hal, b0[p], d0);
-          d1 = __hfma2(hal, b1[p], d1);
-          d2 = __hfma2(hah, b0[p], d2);
-          d3 = __hfma2(hah, b1[p], d3);
+          const float2 fal = act::unpack2(al[p]);
+          const float2 fah = act::unpack2(ah[p]);
+          acc[mt][nt][0] = fmaf(fal.y, b0[p].y, fmaf(fal.x, b0[p].x, acc[mt][nt][0]));
+          acc[mt][nt][1] = fmaf(fal.y, b1[p].y, fmaf(fal.x, b1[p].x, acc[mt][nt][1]));
+          acc[mt][nt][2] = fmaf(fah.y, b0[p].y, fmaf(fah.x, b0[p].x, acc[mt][nt][2]));
+          acc[mt][nt][3] = fmaf(fah.y, b1[p].y, fmaf(fah.x, b1[p].x, acc[mt][nt][3]));
         }
-        const float2 f0 = __half22float2(d0), f1 = __half22float2(d1);
-        const float2 f2 = __half22float2(d2), f3 = __half22float2(d3);
-        acc[mt][nt][0] += f0.x + f0.y;
-        acc[mt][nt][1] += f1.x + f1.y;
-        acc[mt][nt][2] += f2.x + f2.y;
-        acc[mt][nt][3] += f3.x + f3.y;
       }
     }
     after(kk);
