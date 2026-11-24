@@ -1111,7 +1111,8 @@ int run_bench_needle_1m(const std::string& model_dir, int max_ctx, int prefill_c
 }
 
 // ---- Phase 2 Oracle: Resident Q4_0 vs 2-Tier UVA vs 2-Tier Bulk-DMA (>=32 RAM pages) vs 3-Tier NVMe SwapFile ----
-int run_test_paged_kv(const std::string& model_dir, const std::string& golden_json) {
+int run_test_paged_kv(const std::string& model_dir, const std::string& golden_json, bool atlas_6g,
+                      int offload_vram_mb) {
   std::ifstream gf(golden_json);
   if (!gf) {
     std::fprintf(stderr, "cannot open %s\n", golden_json.c_str());
@@ -1131,11 +1132,26 @@ int run_test_paged_kv(const std::string& model_dir, const std::string& golden_js
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  OffloadConfig offload;
+  const bool use_offload = atlas_6g || offload_vram_mb > 0;
+  if (use_offload) {
+    offload.vram_mb = offload_vram_mb > 0 ? offload_vram_mb : 5500;
+    offload.ram_mb = 12288;
+    offload.max_ctx = max_prefix + eval_tokens + 64;
+    offload.prefill_chunk = chunk;
+    offload.kv_q4 = true;
+    offload.kv_vram_mb = 256;  // covers both 217 MiB resident Q4_0 KV at L=24,576 and 110 MiB paged KV oracle
+  }
   std::printf("=== Phase 2 PagedKvCache 3-Tier Equivalence Oracle (L=12288 & L=24576 bulk-DMA, +%d decode) ===\n",
               eval_tokens);
+  std::printf("Reference mode: %s (atlas_6g=%s, offload_vram_mb=%d)\n",
+              use_offload ? "6g-resident Q4_0 vs 6g-paged Q4_0" : "full-resident Q4_0 vs full-paged Q4_0",
+              atlas_6g ? "true" : "false", offload.vram_mb);
   std::printf("Loading weights (%s)...\n", model_dir.c_str());
   std::fflush(stdout);
-  Weights w = load_weights(model_dir, true, stream);
+  Weights w = load_weights(model_dir, true, stream, offload);
+  if (w.expert_cache) std::printf("%s\n", w.expert_cache->summary().c_str());
+  log_nvidia_smi_mem("oracle-load");
   Ablation abl = load_ablation({});
   Prefiller pre(w, abl, chunk, stream);
   DeviceBuffer d_ids(size_t(max_prefix + eval_tokens) * 4);
@@ -1285,7 +1301,7 @@ int main(int argc, char** argv) {
     if (mode == "kl-models") return run_kl_models(model_dir, test_model_dir, golden, prefix_len, eval_tokens, test_kv_q4, dense_fp8);
     if (mode == "needle") return run_needle(model_dir, max_ctx);
     if (mode == "test-1m-kernel") return run_test_1m_kernel();
-    if (mode == "test-paged-kv") return run_test_paged_kv(model_dir, golden);
+    if (mode == "test-paged-kv") return run_test_paged_kv(model_dir, golden, atlas_6g, offload_vram_mb);
     if (mode == "bench-needle-1m")
       return run_bench_needle_1m(model_dir, max_ctx, prefill_chunk, decode_tokens, ctxs, kv_paged, kv_vram_mb,
                                  kv_ram_mb, atlas_6g, offload_vram_mb);
