@@ -43,6 +43,7 @@ External baseline reference points (different hardware, quants, or settings — 
 - **Kintsugi (`ExLlamaV3` / 12 GB community serving)** (reported reference on Blackwell): `4,895 tok/s` 64K prefill.
 - **StrataEngine** (Tesla P100 16 GB, thinking off, prompt length unstated): `35.0 tok/s` (not directly comparable to `--effort medium` thinking-on rows).
 - **Project Maya** (AMD ROCm/HIP & multi-GPU Inkling-2-Mini serving) and **`llama.cpp` / `Atlas3DSS/atlas-engine`** (GGUF serving; see [Atlas3DSS/atlas-engine](https://github.com/Atlas3DSS/atlas-engine)).
+- **Like-for-like 6-engine RTX 3090 24 GB bare multi-turn Blender authoring showdown** (identical prompts, 6 sequences / 24 shots, no Verified Ledger, Blender 4.5.14 LTS verifier): `atlas-ingine` Native **`220.15 tok/s`** (`21.23 GiB`, `25.0%` bare pass / `43.93%` compliance — **`1.86×`** Project Maya `118.26 tok/s`, **`2.15×`** `llama.cpp v7+DSpark` `102.21 tok/s`, **`3.48×`** `Kintsugi-12G` `63.22 tok/s`), while `atlas-12g` ran **`163.73 tok/s`** (**`2.59×`** `Kintsugi-12G` with vision included; upstream `satellitedown/ingine` fails startup on `sm_86`). Adding Verified Ledger lifts `atlas-ingine` Native from `25%` bare to `100%` (`28/28` shots).
 
 ## 1,000,000-Token Context (6 GB to 96 GB Silicon)
 
@@ -52,7 +53,8 @@ Using Q4_0 full-attention KV caching (`--kv-q4`), 3-tier paged KV (`VRAM -> pinn
 
 | GPU & Configuration | Branch / Commit | Peak VRAM | 1M Prefill | Decode @ 1M | Needle Recall | Notes |
 |---|---|---:|---:|---:|---:|---|
-| **RTX A2000 6 GB** (Physical 6 GB, `sm_86`) | `feat/kvq4-elastic-9g @ 8b92ef5` | **`5,334 / 6,138 MiB`** (`0.445 GiB` free) | **`240.5 tok/s`** (`69.3 min`) | **`1.71 tok/s`** | **`3/3` (100%)** | 6g oracle `17/17` PASS; `15.46 GB` host RSS, `SWAP=0`, PCIe Gen4 x16 |
+| **RTX 2060 6 GB** (Physical 6 GB, 2019 Turing `sm_75`) | `feat/kvq4-elastic-9g @ 8b92ef5` | **`5,346 / 6,144 MiB`** (`0.402 GiB` free) | `40.5 tok/s` (`6.87 h`) | `0.20 tok/s` | **`3/3` (100%)** | `INGINE_ACT_FP16=ON`, `15.5 GB` host RSS, `SWAP=0`, PCIe Gen3 x8 (works, slow at 1M) |
+| **RTX A2000 6 GB** (Physical 6 GB, 2021 Ampere `sm_86`) | `feat/kvq4-elastic-9g @ 8b92ef5` | **`5,334 / 6,138 MiB`** (`0.445 GiB` free) | **`240.5 tok/s`** (`69.3 min`) | **`1.71 tok/s`** | **`3/3` (100%)** | 6g oracle `17/17` PASS; `15.46 GB` host RSS, `SWAP=0`, PCIe Gen4 x16 |
 | **RTX 3090 (`<=6 GB` mode, `sm_86`)** | `feat/kvq4-elastic-9g @ 8b92ef5` | **`5,492 MiB`** | **`245.1 tok/s`** | `0.60 tok/s` | **`3/3` (100%)** | Devbox PCIe Gen4 x4 slot; `SWAP=0` |
 | **RTX 3090 (`<=12 GB` paged, `sm_86`)** | `feat/kvq4-elastic-9g @ f9c8da5` | **`10.79 GiB`** | **`566.6 tok/s`** | `0.52 tok/s` | **`6/6` (100%)** | `262K` (`1,614.4` / `2.93 tok/s`) + `1M`; PCIe Gen4 x4; `SWAP=0` |
 | **RTX 4090 (`<=12 GB` paged, `sm_89`)** | `feat/kvq4-elastic-9g @ a3513b6` | **`10.63 GiB`** | **`1,338.1 tok/s`** | `1.25 tok/s` | **`9/9` (100%)** | `262K` (`3,174`) + `524K` (`2,092`) + `1M` (`1,338.1 tok/s`) |
@@ -227,7 +229,7 @@ Additional verified architecture, branch, and live-serving details:
 - **RTX 3090 (`sm_86`, 24 GB):** `atlas-10g` at 16K ctx with `--no-vision --dense-fp8 --kv-fp8 --spec --park-mb 0` uses **`12,984 MiB`** (`<12 GiB` without `--spec`).
 - **RTX 4090 (`sm_89`, 24 GB):** `atlas-12g` at 128K ctx with `--no-vision` uses **`17,776 MiB`**; live long-output serving with vision enabled at 64K ctx runs at **~257 tok/s**.
 - **Upstream RTX 5090 (`sm_120a`, 32 GB):** native `NVFP4+MXFP8` serves up to **262,144 tokens** of context in `24.4 GiB` (`490–560 tok/s` decode, `6,200–10,900 tok/s` prefill; see [Upstream RTX 5090 results](#upstream-rtx-5090-and-abliteration-results)).
-- **Verified feature branches on GitHub / local worktrees (built on `901d86e`):**
+- **Verified feature branches live on GitHub (built on `901d86e`):**
   - `feat/kvq4-elastic-9g` (`8b92ef5`): EXL3 sub-3-bit MoE (`Atlas3D/Inkling-2-Mini-atlas-exl3-9g-fp8-ingine`) + `--kv-q4` + 3-tier paged KV + bulk-DMA prefetching (`1,048,576` tokens proven on physical 6 GB `RTX A2000`, `RTX 3090`, and `RTX 4090`; `48/48` `kernels_bitlock` PASS).
   - `feat/kv-checkpoint-resume` (`efefeb3`): `O(1)` streaming atomic disk KV checkpoint/resume (`0.000000` KL bit-identical resume across resident, 3-tier paged, and cross-mode, `0.93s` multi-process resume).
   - `feat/sm60-sm70-victory` (`fe18669`): Volta V100 `81.0` chat / `100.7` code / `2,052` 64K prefill + real 2016 Pascal P100 `7/7` kernel suites PASS (0 register spills).
