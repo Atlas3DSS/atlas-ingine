@@ -51,7 +51,7 @@ run_arm() {
   local pid=$!
   trap "kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true" RETURN
   local ready=0
-  for _ in $(seq 1 240); do
+  for _ in $(seq 1 720); do
     if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null; then
       ready=1
       break
