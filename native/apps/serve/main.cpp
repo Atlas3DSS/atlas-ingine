@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
-       no_vision = false, atlas_6g = false, persona_probe_mode = false;
+       no_vision = false, atlas_6g = false, persona_probe_mode = false, no_prefix_cache = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -146,6 +146,8 @@ int main(int argc, char** argv) {
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
   ap.option("--max-batch", "", "max concurrent sequences for continuous batching (1 = single-request mode)", &max_batch);
   ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity for --max-batch > 1 (0 = auto)", &max_kv_tokens);
+  ap.flag("--no-prefix-cache", "disable prefix checkpoint caching (cache-off parity baseline for B=1 and B>1)",
+          &no_prefix_cache);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
   ap.option("--log-level", "", "", &log_level);
@@ -232,6 +234,7 @@ int main(int argc, char** argv) {
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
+      options.prefix_cache = !no_prefix_cache;
       options.vision = !no_vision;
       options.offload_vram_mb = offload_vram_mb;
       options.offload_ram_mb = offload_ram_mb;

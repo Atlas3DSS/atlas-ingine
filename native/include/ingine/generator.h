@@ -3,6 +3,7 @@
 #pragma once
 
 #include "ingine/persona.h"
+#include "ingine/prefix_cache.h"
 
 #include <algorithm>
 #include <chrono>
@@ -50,11 +51,25 @@ struct PromptImage {
   [[nodiscard]] int tokens() const { return rows() * cols(); }
 };
 
-// A prompt: token ids and its images, in the order of their positions (without overlap).
+// A prompt: token ids, images in position order (without overlap), optional verified root-prefix snapshot
+// boundary hint (0 = none; never a trust key), and optional cache isolation namespace.
 struct Prompt {
   std::span<const std::int32_t> ids;
   std::span<const PromptImage> images;
+  int root_prefix_tokens = 0;
+  std::string cache_namespace;
 };
+
+// Validates that `root_prefix_tokens` lies inside [0, ids.size()] and does not straddle any PromptImage.
+// Returns the validated boundary (or 0 if invalid/out-of-range).
+inline int validate_root_prefix_tokens(std::span<const std::int32_t> ids, std::span<const PromptImage> images,
+                                       int root_prefix_tokens) noexcept {
+  if (root_prefix_tokens <= 0 || std::size_t(root_prefix_tokens) > ids.size()) return 0;
+  for (const PromptImage& img : images) {
+    if (img.pos < root_prefix_tokens && img.pos + img.tokens() > root_prefix_tokens) return 0;
+  }
+  return root_prefix_tokens;
+}
 
 // How the prompt reused the state of earlier requests (reused_tokens were not prefilled again).
 enum class Reuse {
@@ -116,6 +131,11 @@ struct RuntimeOptions {
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
   // min(3072, free memory after start-up - 4096), at least 0.
   int park_mb = -1;
+  // Bounded pinned host-RAM parking tier (MiB) for checkpoints evicted from VRAM or parked when park_mb=0
+  // (LRU eviction, graceful fallback under host memory pressure; default 0 = opt-in).
+  int park_host_mb = 0;
+  // Symmetric prefix-cache toggle for both B=1 and B>1 (false = cache-off parity baseline, zero reuse).
+  bool prefix_cache = true;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
   // Dynamic 3-tier MoE expert offloading (atlas-6g-homology):
@@ -188,6 +208,7 @@ class Generator {
   }
   virtual bool supports_images() const { return false; }
   virtual std::string offload_summary() const { return {}; }
+  virtual PrefixCacheStats cache_stats() const { return {}; }
 
   // ---- Optional continuous-batching interface (used by Scheduler and ingine-bench when max_batch_size() > 1)
   virtual int max_batch_size() const { return 1; }

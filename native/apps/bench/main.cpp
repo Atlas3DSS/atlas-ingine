@@ -169,7 +169,7 @@ int main(int argc, char** argv) {
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
-       ignore_eos = false, staggered = false;
+       ignore_eos = false, staggered = false, no_prefix_cache = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -225,6 +225,7 @@ int main(int argc, char** argv) {
   ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity (0 = auto)", &max_kv_tokens);
   ap.flag("--ignore-eos", "with --concurrency: decode full --tokens per request (steady-state peak throughput)", &ignore_eos);
   ap.flag("--staggered", "with --concurrency: also run a staggered mid-generation continuous-batching arrival pass", &staggered);
+  ap.flag("--no-prefix-cache", "disable prefix checkpoint caching (cache-off parity baseline)", &no_prefix_cache);
   ap.parse(argc, argv);
 
   try {
@@ -277,6 +278,7 @@ int main(int argc, char** argv) {
     options.dump_router_stats = dump_router_stats;
     options.max_batch = resolved_max_batch;
     options.max_kv_tokens = max_kv_tokens;
+    options.prefix_cache = !no_prefix_cache;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;

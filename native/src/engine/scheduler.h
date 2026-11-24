@@ -35,11 +35,13 @@ struct JobBatch {
 class Job {
  public:
   Job(std::vector<int32_t> prompt_ids, int max_new_tokens, model::Sampling sampling,
-      std::vector<model::PromptImage> images = {});
+      std::vector<model::PromptImage> images = {}, int root_prefix_tokens = 0, std::string cache_namespace = {});
 
   const std::string id;  // "chatcmpl-" + 32 hex digits
   const std::vector<int32_t> prompt_ids;
   const std::vector<model::PromptImage> images;  // the prompt's images, by position (see model::Prompt)
+  const int root_prefix_tokens;
+  const std::string cache_namespace;
   const int max_new_tokens;
   const model::Sampling sampling;
   const Clock::time_point t_submit;
