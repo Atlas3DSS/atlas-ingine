@@ -892,6 +892,8 @@ class BatchGenerator final : public Generator {
       stats.prompt_tokens = n;
       stats.reused_tokens = 0;
       stats.reuse = Reuse::None;
+      stats.restored_bytes = 0;
+      stats.restore_seconds = 0.0;
       stats.image_tokens = image_tokens;
       stats.prefill_seconds = seconds_since(t0);
       return s;
@@ -989,12 +991,12 @@ class BatchGenerator final : public Generator {
     }
     const int s = start_slot(full_prompt, max_new_tokens, sampling, token, stats);
     if (s < 0) throw std::runtime_error("BatchGenerator::generate: no free batch slot");
-    if (on_prefill) on_prefill(stats);
     auto is_stop = [&](std::int32_t tok) {
       return std::find(stop_ids.begin(), stop_ids.end(), tok) != stop_ids.end();
     };
     const auto t0 = std::chrono::steady_clock::now();
     try {
+      if (on_prefill) on_prefill(stats);
       for (int i = 0; i < max_new_tokens; ++i) {
         stats.generated_tokens = i + 1;
         const std::int32_t out[1] = {token};

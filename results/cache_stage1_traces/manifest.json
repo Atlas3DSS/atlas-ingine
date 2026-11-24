@@ -1,0 +1,28 @@
+{
+  "schema": "atlas-ingine.frozen_cache_traces_manifest.v1",
+  "tokenizer_sha256": "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6",
+  "chat_template_sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc",
+  "traces": [
+    {
+      "name": "multi_turn_tool_loop",
+      "file": "multi_turn_tool_loop.json",
+      "turns": 12,
+      "trace_sha256": "4fe48b97a4962114eece404daecfed5d5cdcedc3bf4653e1d1f13438ddb92a8c",
+      "token_ids_sha256": "6acde94310a837e7b414181a86c2a91145753be0db68a1989d4423716955453e"
+    },
+    {
+      "name": "forked_subagents_shared_root",
+      "file": "forked_subagents_shared_root.json",
+      "turns": 16,
+      "trace_sha256": "2177131ddc19629b0177fe5476357306016cf789d9f3c46119eccdf0f0792041",
+      "token_ids_sha256": "9d40491549b34e8d1904f8eb3728b5498ebeb578e4c732be3014ec63920827f4"
+    },
+    {
+      "name": "terminal_bench_long_context",
+      "file": "terminal_bench_long_context.json",
+      "turns": 17,
+      "trace_sha256": "31700b40152466d7a431bf97ff51c2e3882e6d577c885cb9f6159f1bfb4b93d3",
+      "token_ids_sha256": "e9e30179911e8a56ffce04339b96682b3dfef8b554e04381d3a3702bd04c256a"
+    }
+  ]
+}

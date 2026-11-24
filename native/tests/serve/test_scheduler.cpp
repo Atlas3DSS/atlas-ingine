@@ -157,7 +157,7 @@ void test_prefill_stats_before_first_token() {
   const auto st = j->prefill_stats();
   CHECK(st.has_value());
   CHECK(st->prompt_tokens == 4 && st->reused_tokens == 3 && st->reuse == ingine::model::Reuse::Checkpoint &&
-        st->restored_bytes == 12345);
+        st->restored_bytes.has_value() && *st->restored_bytes == 12345);
   drain(*j);
 }
 

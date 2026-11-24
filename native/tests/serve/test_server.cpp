@@ -1255,6 +1255,77 @@ void test_cached_tokens_accounting() {
   CHECK(r_hi.status == 200 && r_hi.body["usage"]["prompt_tokens_details"]["cached_tokens"] == p1);
 }
 
+void test_legacy_generator_early_stop_cached_tokens() {
+  // Regression for review item #1: a legacy Generator subclass implementing ONLY the 5-arg generate()
+  // (never overriding the 6-arg on_prefill overload) that reports a warm hit and delays after an early
+  // stop-string cancellation must STILL report exact cached_tokens on both non-streaming JSON and SSE.
+  class LegacyWarmGenerator final : public ingine::model::Generator {
+   public:
+    explicit LegacyWarmGenerator(const ingine::text::Tokenizer& tok) : tok_(tok) {}
+    std::string model_id() const override { return "inkling-test"; }
+    int max_model_len() const override { return 1 << 20; }
+    ingine::model::GenerateStats generate(
+        std::span<const int32_t> prompt, int max_new_tokens, const ingine::model::Sampling&,
+        std::span<const int32_t> stop_ids,
+        const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
+      const std::string reply =
+          "<|message_model|><|content_text|>alpha beta<END> trailing words that should be cancelled"
+          "<|end_message|><|content_model_end_sampling|>";
+      const std::vector<int32_t> out = tok_.encode(reply, /*special=*/true);
+      const std::unordered_set<int32_t> stops(stop_ids.begin(), stop_ids.end());
+      const std::size_t lim = std::min(out.size(), std::size_t(std::max(max_new_tokens, 0)));
+      int yielded = 0;
+      for (std::size_t i = 0; i < lim; ++i) {
+        ++yielded;
+        const bool more = on_tokens(std::span<const int32_t>(&out[i], 1));
+        if (stops.contains(out[i]) || !more) break;
+      }
+      // Deliberately delay AFTER early-stop cancellation returns false from on_tokens(): without
+      // wait_prefill_stats() synchronization, usage() would race and observe cached_tokens == 0.
+      std::this_thread::sleep_for(std::chrono::milliseconds(80));
+      ingine::model::GenerateStats st;
+      st.prompt_tokens = int(prompt.size());
+      st.reused_tokens = std::max(0, int(prompt.size()) - 3);
+      st.reuse = ingine::model::Reuse::Checkpoint;
+      st.generated_tokens = yielded;
+      return st;
+    }
+
+   private:
+    const ingine::text::Tokenizer& tok_;
+  };
+
+  LegacyWarmGenerator gen(g_fmt->tokenizer());
+  ChatServer srv(gen, *g_fmt);
+  CHECK(srv.bind("127.0.0.1", 0));
+  srv.start();
+
+  const Json msgs = Json::array({
+      {{"role", "system"}, {"content", "Legacy generator system prompt."}},
+      {{"role", "user"}, {"content", "Emit alpha beta<END>."}},
+  });
+  const int p_len = int(render(msgs).ids.size());
+  const int expected_cached = std::max(0, p_len - 3);
+
+  Chat r_json = chat(srv.port(), {{"messages", msgs}, {"stop", Json::array({"<END>"})}});
+  CHECK(r_json.status == 200);
+  check_completion(r_json.body);
+  CHECK(r_json.body["choices"][0]["message"]["content"] == "alpha beta");
+  CHECK(r_json.body["choices"][0]["finish_reason"] == "stop");
+  CHECK(r_json.body["usage"]["prompt_tokens_details"]["cached_tokens"] == expected_cached);
+
+  Chat r_sse = chat(srv.port(), {{"messages", msgs},
+                                 {"stop", Json::array({"<END>"})},
+                                 {"stream", true},
+                                 {"stream_options", {{"include_usage", true}}}});
+  CHECK(r_sse.status == 200);
+  Stream st_sse = check_chunks(r_sse.body, true);
+  CHECK(st_sse.content == "alpha beta" && st_sse.finish == "stop");
+  CHECK(st_sse.usage["prompt_tokens_details"]["cached_tokens"] == expected_cached);
+
+  srv.stop();
+}
+
 void test_prompt_stability_and_render_stats() {
   // Verify actual post-template token IDs under Atlas's chat_template.jinja so harness prompt-stability rules
   // are grounded in measured token IDs, not assumptions.
@@ -1358,6 +1429,7 @@ int main() {
       {"response_format_and_tool_ban", test_response_format_and_tool_ban},
       {"persona_control_plane", test_persona_control_plane},
       {"cached_tokens_accounting", test_cached_tokens_accounting},
+      {"legacy_generator_early_stop_cached_tokens", test_legacy_generator_early_stop_cached_tokens},
       {"prompt_stability_and_render_stats", test_prompt_stability_and_render_stats},
   };
   int failed = 0;

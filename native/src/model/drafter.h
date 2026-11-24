@@ -107,7 +107,8 @@ class Drafter {
   // one of them.
   std::size_t checkpoint_bytes() const;
   void save_checkpoint(void* dst);
-  void restore_checkpoint(const void* src);
+  // Restores the saved checkpoint and returns the exact number of bytes copied via cudaMemcpyAsync.
+  std::size_t restore_checkpoint(const void* src);
 
   // Conversation parking: the bytes of a checkpoint of length L that hold data, as {offset, bytes} regions of
   // its checkpoint_bytes() (the rest is unused), and the context tokens of the last save (shortlist rows, in

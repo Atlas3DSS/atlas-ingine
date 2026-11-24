@@ -54,6 +54,12 @@ std::optional<model::GenerateStats> Job::prefill_stats() const {
   return prefill_stats_;
 }
 
+std::optional<model::GenerateStats> Job::wait_prefill_stats(Clock::duration timeout) const {
+  std::unique_lock lock(mutex_);
+  cv_.wait_for(lock, timeout, [&] { return prefill_stats_.has_value() || finished_ || failure_.has_value(); });
+  return prefill_stats_;
+}
+
 JobBatch Job::take(Clock::duration timeout) {
   std::unique_lock lock(mutex_);
   cv_.wait_for(lock, timeout, [&] { return !tokens_.empty() || failure_ || end_; });
@@ -72,8 +78,11 @@ void Job::started() {
 }
 
 void Job::set_prefill_stats(model::GenerateStats stats) {
-  std::lock_guard lock(mutex_);
-  prefill_stats_ = std::move(stats);
+  {
+    std::lock_guard lock(mutex_);
+    prefill_stats_ = std::move(stats);
+  }
+  cv_.notify_all();
 }
 
 void Job::push(const std::vector<int32_t>& tokens) {
@@ -97,6 +106,7 @@ void Job::finish() {
   {
     std::lock_guard lock(mutex_);
     end_ = true;
+    finished_ = true;
   }
   cv_.notify_all();
 }
@@ -267,28 +277,38 @@ void Scheduler::loop_batched() {
           }
           break;
         }
+        struct SlotGuard {
+          model::Generator& gen;
+          int slot;
+          void release() { slot = -1; }
+          ~SlotGuard() {
+            if (slot >= 0) gen.release_slot(slot);
+          }
+        } slot_guard{generator_, slot};
+
         job->set_prefill_stats(st);
         const int recomputed = std::max(0, st.prompt_tokens - std::clamp(st.reused_tokens, 0, st.prompt_tokens));
+        const std::string restored_str =
+            st.restored_bytes ? std::to_string(*st.restored_bytes) : std::string("n/a");
         server_log().info("{}: slot={} reuse={} reused={} recomputed={} restored_bytes={} prefill={:.3f}s", job->id,
-                          slot, model::to_string(st.reuse), st.reused_tokens, recomputed, st.restored_bytes,
+                          slot, model::to_string(st.reuse), st.reused_tokens, recomputed, restored_str,
                           st.prefill_seconds);
         if (!job->images.empty()) {
           server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job->id, job->images.size(),
                             st.image_tokens, st.images_encoded, st.vision_seconds);
         }
         if (job->cancelled()) {
-          generator_.release_slot(slot);
           job->finish();
           remove_active_job(job);
           continue;
         }
         job->push({first_tok});
         if (stop_ids_.contains(first_tok) || eff_max <= 1 || job->cancelled()) {
-          generator_.release_slot(slot);
           job->finish();
           remove_active_job(job);
         } else {
           live.push_back(SlotEntry{std::move(job), slot, first_tok, 1, eff_max});
+          slot_guard.release();
         }
       } catch (const std::exception& e) {
         server_log().error("generator failed: {}: {}", type_name(e), e.what());
@@ -388,8 +408,10 @@ void Scheduler::run(Job& job) {
     job.set_prefill_stats(st);
     // prefix reuse of the prompt: the path, the tokens reused and recomputed, restored bytes, prefill time
     const int recomputed = std::max(0, st.prompt_tokens - std::clamp(st.reused_tokens, 0, st.prompt_tokens));
+    const std::string restored_str =
+        st.restored_bytes ? std::to_string(*st.restored_bytes) : std::string("n/a");
     server_log().info("{}: reuse={} reused={} recomputed={} restored_bytes={} prefill={:.3f}s", job.id,
-                      model::to_string(st.reuse), st.reused_tokens, recomputed, st.restored_bytes,
+                      model::to_string(st.reuse), st.reused_tokens, recomputed, restored_str,
                       st.prefill_seconds);
     if (!job.images.empty()) {  // images: all of the prompt, those the vision tower encoded now, its time
       server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job.id, job.images.size(),

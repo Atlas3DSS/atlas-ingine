@@ -59,6 +59,7 @@ struct Exchange {
   int64_t created;
   std::optional<std::string> failure;
   std::optional<Clock::time_point> t_first;
+  std::optional<model::GenerateStats> prefill_stats;
 };
 
 // Drains the job's output into the parser until it reports a finish reason; `gone()` is polled every
@@ -95,8 +96,8 @@ Json usage(const Exchange& x) {
   const int prompt = int(x.job->prompt_ids.size());
   const int completion = x.parser.num_tokens();
   int cached = 0;
-  if (const auto st = x.job->prefill_stats()) {
-    cached = std::clamp(st->reused_tokens, 0, prompt);
+  if (x.prefill_stats) {
+    cached = std::clamp(x.prefill_stats->reused_tokens, 0, prompt);
   }
   return Json{{"prompt_tokens", prompt},
               {"completion_tokens", completion},
@@ -110,11 +111,12 @@ void log_done(const Exchange& x) {
   const double queued = seconds(job.t_start().value_or(now) - job.t_submit);
   const int prompt = int(job.prompt_ids.size());
   const int n = x.parser.num_tokens();
-  const auto pst = job.prefill_stats();
+  const auto& pst = x.prefill_stats;
   const int cached = pst ? std::clamp(pst->reused_tokens, 0, prompt) : 0;
   const int recomputed = std::max(0, prompt - cached);
   const char* reuse = pst ? model::to_string(pst->reuse) : "none";
-  const std::uint64_t restored_bytes = pst ? pst->restored_bytes : 0;
+  const std::string restored_bytes =
+      (pst && pst->restored_bytes) ? std::to_string(*pst->restored_bytes) : std::string("n/a");
   const std::string rate =
       x.t_first && n > 1 ? fmt::format("{:.1f} tok/s", (n - 1) / std::max(seconds(now - *x.t_first), 1e-9)) : "-";
   const std::string ttft = x.t_first ? fmt::format("{:.3f}s", seconds(*x.t_first - job.t_submit)) : "-";
@@ -314,6 +316,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
       send_error(res, 500, "client disconnected");
       return;
     }
+    x->prefill_stats = x->job->wait_prefill_stats();
     log_done(*x);
     if (x->failure) {
       send_error(res, 500, *x->failure);
@@ -373,6 +376,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
           log_disconnected(x);
           return false;
         }
+        x.prefill_stats = x.job->wait_prefill_stats();
         log_done(x);
         try {
           if (x.failure) {

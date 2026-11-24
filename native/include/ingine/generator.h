@@ -86,9 +86,11 @@ struct SpecRoundRecord {
 struct GenerateStats {
   int prompt_tokens = 0, reused_tokens = 0, generated_tokens = 0;
   Reuse reuse = Reuse::None;
-  std::uint64_t restored_bytes = 0;  // bytes copied (D2D/H2D/disk) to restore reused model state
-  double restore_seconds = 0;        // time spent restoring cached prefix state (subset of prefill_seconds)
-  int cache_evictions = 0;           // cache entries evicted during this request
+  // Actual bytes copied to restore reused model state, restore time, and cache evictions during this request.
+  // std::nullopt means the backend/path did not measure the metric (never reported as a synthetic zero).
+  std::optional<std::uint64_t> restored_bytes;
+  std::optional<double> restore_seconds;
+  std::optional<int> cache_evictions;
   double prefill_seconds = 0, decode_seconds = 0;
   int spec_rounds = 0, spec_accepted = 0;
   std::vector<SpecRoundRecord> spec_trace;  // forced replay only

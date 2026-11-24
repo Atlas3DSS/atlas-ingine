@@ -47,8 +47,12 @@ class Job {
   void cancel() { cancel_.store(true, std::memory_order_release); }
   bool cancelled() const { return cancel_.load(std::memory_order_acquire); }
   std::optional<Clock::time_point> t_start() const;
-  // Completed prefill/cache accounting, published before the first generated token is pushed.
+  // Completed prefill/cache accounting, published before the first generated token is pushed (modern generators)
+  // or upon generate() return (legacy 5-arg Generator subclasses).
   std::optional<model::GenerateStats> prefill_stats() const;
+  // Returns prefill_stats() immediately if already published; otherwise waits until stats are published or the
+  // job finishes/fails (synchronized compatibility path for legacy 5-arg generators on early stop-string cancel).
+  std::optional<model::GenerateStats> wait_prefill_stats(Clock::duration timeout = std::chrono::seconds(30)) const;
 
   // Waits up to `timeout` for output, then returns everything available (empty on timeout).
   JobBatch take(Clock::duration timeout);
@@ -63,10 +67,11 @@ class Job {
 
   std::atomic<bool> cancel_{false};
   mutable std::mutex mutex_;
-  std::condition_variable cv_;
+  mutable std::condition_variable cv_;
   std::deque<int32_t> tokens_;
   std::optional<std::string> failure_;
   bool end_ = false;
+  bool finished_ = false;  // monotonic: remains true even after take() consumes end_
   std::optional<Clock::time_point> t_start_;
   std::optional<model::GenerateStats> prefill_stats_;
 };

@@ -105,6 +105,37 @@ class FakeBatchGenerator final : public ingine::model::Generator {
     throw std::logic_error("unexpected single-request generate()");
   }
 
+  GenerateStats generate(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
+                         std::span<const int32_t> stop_ids,
+                         const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                         const ingine::model::PrefillCallback& on_prefill) override {
+    GenerateStats stats;
+    int32_t token = 0;
+    const int s = start_slot(full_prompt, max_new_tokens, sampling, token, stats);
+    if (s < 0) throw std::runtime_error("no free batch slot");
+    try {
+      if (on_prefill) on_prefill(stats);
+      for (int i = 0; i < max_new_tokens; ++i) {
+        stats.generated_tokens = i + 1;
+        const int32_t out[1] = {token};
+        const bool go_on = on_tokens(out);
+        if (i + 1 == max_new_tokens ||
+            std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end() || !go_on) {
+          break;
+        }
+        const BatchSlotStep step[1] = {{s, token}};
+        int32_t next[1] = {0};
+        step_slots(step, next);
+        token = next[0];
+      }
+    } catch (...) {
+      release_slot(s);
+      throw;
+    }
+    release_slot(s);
+    return stats;
+  }
+
   int peak_active() const {
     std::lock_guard lock(mu_);
     return peak_active_;
@@ -252,12 +283,45 @@ void test_error_isolation_and_backpressure() {
   CHECK(gen.free_pages() == 4);
 }
 
+void test_on_prefill_exception_releases_slot_for_reuse() {
+  // Regression for review item #2: with only 1 slot and 2 pages, a throwing on_prefill callback must
+  // release the slot and its KV pages so the immediately following request can acquire and reuse them.
+  FakeBatchGenerator gen(/*max_batch=*/1, /*max_pages=*/2);
+  const std::vector<int32_t> p1 = {7};
+  bool threw = false;
+  try {
+    (void)gen.generate(Prompt{p1, {}}, 4, Sampling{}, {},
+                       [](std::span<const int32_t>) { return true; },
+                       [](const GenerateStats&) { throw std::runtime_error("injected on_prefill failure"); });
+  } catch (const std::runtime_error& e) {
+    threw = std::string(e.what()).find("injected on_prefill failure") != std::string::npos;
+  }
+  CHECK(threw);
+  CHECK(gen.active_now() == 0);
+  CHECK(gen.free_pages() == 2);
+
+  // A new request must immediately acquire the released slot and complete cleanly.
+  std::vector<int32_t> emitted;
+  const GenerateStats st = gen.generate(
+      Prompt{p1, {}}, 3, Sampling{}, {},
+      [&](std::span<const int32_t> toks) {
+        emitted.insert(emitted.end(), toks.begin(), toks.end());
+        return true;
+      },
+      [](const GenerateStats&) {});
+  CHECK((emitted == std::vector<int32_t>{7000, 7001, 7002}));
+  CHECK(st.generated_tokens == 3);
+  CHECK(gen.active_now() == 0);
+  CHECK(gen.free_pages() == 2);
+}
+
 }  // namespace
 
 int main() {
   test_64_concurrent_heterogeneous();
   test_continuous_join_leave_and_cancel();
   test_error_isolation_and_backpressure();
+  test_on_prefill_exception_releases_slot_for_reuse();
   std::printf(g_failures ? "FAILED (%d checks)\n" : "batch_scheduler ok\n", g_failures);
   return g_failures ? 1 : 0;
 }

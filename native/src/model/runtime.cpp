@@ -373,12 +373,15 @@ void Runtime::save_checkpoint(void* dst) {
   }
 }
 
-void Runtime::restore_checkpoint(const void* src) {
+std::size_t Runtime::restore_checkpoint(const void* src) {
   const char* p = static_cast<const char*>(src);
+  std::size_t copied = 0;
   for (const Tensor* t : checkpoint_tensors(state_)) {
     CUDA_CHECK(cudaMemcpyAsync(t->data, p, t->bytes(), cudaMemcpyDefault, stream_));
+    copied += t->bytes();
     p += carved(t->bytes());
   }
+  return copied;
 }
 
 std::size_t Runtime::full_rows_bytes(int n) const {
@@ -406,19 +409,23 @@ void Runtime::save_full_rows(void* dst, int n) {
   }
 }
 
-void Runtime::restore_full_rows(const void* src, int n) {
-  const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
-  if (n == 0) return;
+std::size_t Runtime::restore_full_rows(const void* src, int n) {
+  const std::size_t total = full_rows_bytes(n);
+  const std::size_t bytes = total / 2, width = bytes / NUM_FULL_VISITS;
+  if (n == 0) return 0;
   const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
   const char* p = static_cast<const char*>(src);
+  std::size_t copied = 0;
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
     char* dst = static_cast<char*>(t->data);
     for (int f = 0; f < NUM_FULL_VISITS; ++f) {
       CUDA_CHECK(cudaMemcpyAsync(dst + std::size_t(f) * pitch, p + std::size_t(f) * width, width, cudaMemcpyDefault,
                                  stream_));
+      copied += width;
     }
     p += bytes;
   }
+  return copied;
 }
 
 void Runtime::save_verify(int P, int m) {

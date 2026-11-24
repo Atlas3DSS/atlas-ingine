@@ -1,0 +1,2346 @@
+{
+  "schema": "atlas-ingine.frozen_cache_trace.v1",
+  "name": "forked_subagents_shared_root",
+  "description": "4 interleaved forked subagents sharing static system+tools+repo root (round-robin schedule)",
+  "tokenizer_sha256": "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6",
+  "chat_template_sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc",
+  "trace_sha256": "2177131ddc19629b0177fe5476357306016cf789d9f3c46119eccdf0f0792041",
+  "turns": [
+    {
+      "turn": 0,
+      "label": "lane0_step0",
+      "lane": "lane_0",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 0: audit subsystem #0 and report failing assertions."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 1,
+      "label": "lane1_step0",
+      "lane": "lane_1",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 1: audit subsystem #1 and report failing assertions."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 2,
+      "label": "lane2_step0",
+      "lane": "lane_2",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 2: audit subsystem #2 and report failing assertions."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 3,
+      "label": "lane3_step0",
+      "lane": "lane_3",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 3: audit subsystem #3 and report failing assertions."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 4,
+      "label": "lane0_step1",
+      "lane": "lane_0",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 0: audit subsystem #0 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 0 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_0_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_0.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_0_0",
+            "content": "[step=0 line=0] /workspace/src/module_0.cpp:100: verified symbol hash=0x100000 status=OK\n[step=0 line=1] /workspace/src/module_1.cpp:107: verified symbol hash=0x100031 status=OK\n[step=0 line=2] /workspace/src/module_2.cpp:114: verified symbol hash=0x100062 status=OK\n[step=0 line=3] /workspace/src/module_3.cpp:121: verified symbol hash=0x100093 status=OK\n[step=0 line=4] /workspace/src/module_4.cpp:128: verified symbol hash=0x100124 status=OK\n[step=0 line=5] /workspace/src/module_5.cpp:135: verified symbol hash=0x100155 status=OK\n[step=0 line=6] /workspace/src/module_6.cpp:142: verified symbol hash=0x100186 status=OK\n[step=0 line=7] /workspace/src/module_7.cpp:149: verified symbol hash=0x100217 status=OK\n[step=0 line=8] /workspace/src/module_8.cpp:156: verified symbol hash=0x100248 status=OK\n[step=0 line=9] /workspace/src/module_9.cpp:163: verified symbol hash=0x100279 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 5,
+      "label": "lane1_step1",
+      "lane": "lane_1",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 1: audit subsystem #1 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 1 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_1_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_1.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_1_0",
+            "content": "[step=100 line=0] /workspace/src/module_15.cpp:100: verified symbol hash=0x199700 status=OK\n[step=100 line=1] /workspace/src/module_16.cpp:107: verified symbol hash=0x199731 status=OK\n[step=100 line=2] /workspace/src/module_0.cpp:114: verified symbol hash=0x199762 status=OK\n[step=100 line=3] /workspace/src/module_1.cpp:121: verified symbol hash=0x199793 status=OK\n[step=100 line=4] /workspace/src/module_2.cpp:128: verified symbol hash=0x199824 status=OK\n[step=100 line=5] /workspace/src/module_3.cpp:135: verified symbol hash=0x199855 status=OK\n[step=100 line=6] /workspace/src/module_4.cpp:142: verified symbol hash=0x199886 status=OK\n[step=100 line=7] /workspace/src/module_5.cpp:149: verified symbol hash=0x199917 status=OK\n[step=100 line=8] /workspace/src/module_6.cpp:156: verified symbol hash=0x199948 status=OK\n[step=100 line=9] /workspace/src/module_7.cpp:163: verified symbol hash=0x199979 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 6,
+      "label": "lane2_step1",
+      "lane": "lane_2",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 2: audit subsystem #2 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 2 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_2_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_2.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_2_0",
+            "content": "[step=200 line=0] /workspace/src/module_13.cpp:100: verified symbol hash=0x299400 status=OK\n[step=200 line=1] /workspace/src/module_14.cpp:107: verified symbol hash=0x299431 status=OK\n[step=200 line=2] /workspace/src/module_15.cpp:114: verified symbol hash=0x299462 status=OK\n[step=200 line=3] /workspace/src/module_16.cpp:121: verified symbol hash=0x299493 status=OK\n[step=200 line=4] /workspace/src/module_0.cpp:128: verified symbol hash=0x299524 status=OK\n[step=200 line=5] /workspace/src/module_1.cpp:135: verified symbol hash=0x299555 status=OK\n[step=200 line=6] /workspace/src/module_2.cpp:142: verified symbol hash=0x299586 status=OK\n[step=200 line=7] /workspace/src/module_3.cpp:149: verified symbol hash=0x299617 status=OK\n[step=200 line=8] /workspace/src/module_4.cpp:156: verified symbol hash=0x299648 status=OK\n[step=200 line=9] /workspace/src/module_5.cpp:163: verified symbol hash=0x299679 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 7,
+      "label": "lane3_step1",
+      "lane": "lane_3",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 3: audit subsystem #3 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 3 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_3_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_3.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_3_0",
+            "content": "[step=300 line=0] /workspace/src/module_11.cpp:100: verified symbol hash=0x399100 status=OK\n[step=300 line=1] /workspace/src/module_12.cpp:107: verified symbol hash=0x399131 status=OK\n[step=300 line=2] /workspace/src/module_13.cpp:114: verified symbol hash=0x399162 status=OK\n[step=300 line=3] /workspace/src/module_14.cpp:121: verified symbol hash=0x399193 status=OK\n[step=300 line=4] /workspace/src/module_15.cpp:128: verified symbol hash=0x399224 status=OK\n[step=300 line=5] /workspace/src/module_16.cpp:135: verified symbol hash=0x399255 status=OK\n[step=300 line=6] /workspace/src/module_0.cpp:142: verified symbol hash=0x399286 status=OK\n[step=300 line=7] /workspace/src/module_1.cpp:149: verified symbol hash=0x399317 status=OK\n[step=300 line=8] /workspace/src/module_2.cpp:156: verified symbol hash=0x399348 status=OK\n[step=300 line=9] /workspace/src/module_3.cpp:163: verified symbol hash=0x399379 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 8,
+      "label": "lane0_step2",
+      "lane": "lane_0",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 0: audit subsystem #0 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 0 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_0_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_0.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_0_0",
+            "content": "[step=0 line=0] /workspace/src/module_0.cpp:100: verified symbol hash=0x100000 status=OK\n[step=0 line=1] /workspace/src/module_1.cpp:107: verified symbol hash=0x100031 status=OK\n[step=0 line=2] /workspace/src/module_2.cpp:114: verified symbol hash=0x100062 status=OK\n[step=0 line=3] /workspace/src/module_3.cpp:121: verified symbol hash=0x100093 status=OK\n[step=0 line=4] /workspace/src/module_4.cpp:128: verified symbol hash=0x100124 status=OK\n[step=0 line=5] /workspace/src/module_5.cpp:135: verified symbol hash=0x100155 status=OK\n[step=0 line=6] /workspace/src/module_6.cpp:142: verified symbol hash=0x100186 status=OK\n[step=0 line=7] /workspace/src/module_7.cpp:149: verified symbol hash=0x100217 status=OK\n[step=0 line=8] /workspace/src/module_8.cpp:156: verified symbol hash=0x100248 status=OK\n[step=0 line=9] /workspace/src/module_9.cpp:163: verified symbol hash=0x100279 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 0 step 1",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_0_1",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_0.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_0_1",
+            "content": "[step=1 line=0] /workspace/src/module_1.cpp:100: verified symbol hash=0x100997 status=OK\n[step=1 line=1] /workspace/src/module_2.cpp:107: verified symbol hash=0x101028 status=OK\n[step=1 line=2] /workspace/src/module_3.cpp:114: verified symbol hash=0x101059 status=OK\n[step=1 line=3] /workspace/src/module_4.cpp:121: verified symbol hash=0x101090 status=OK\n[step=1 line=4] /workspace/src/module_5.cpp:128: verified symbol hash=0x101121 status=OK\n[step=1 line=5] /workspace/src/module_6.cpp:135: verified symbol hash=0x101152 status=OK\n[step=1 line=6] /workspace/src/module_7.cpp:142: verified symbol hash=0x101183 status=OK\n[step=1 line=7] /workspace/src/module_8.cpp:149: verified symbol hash=0x101214 status=OK\n[step=1 line=8] /workspace/src/module_9.cpp:156: verified symbol hash=0x101245 status=OK\n[step=1 line=9] /workspace/src/module_10.cpp:163: verified symbol hash=0x101276 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 9,
+      "label": "lane1_step2",
+      "lane": "lane_1",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 1: audit subsystem #1 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 1 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_1_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_1.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_1_0",
+            "content": "[step=100 line=0] /workspace/src/module_15.cpp:100: verified symbol hash=0x199700 status=OK\n[step=100 line=1] /workspace/src/module_16.cpp:107: verified symbol hash=0x199731 status=OK\n[step=100 line=2] /workspace/src/module_0.cpp:114: verified symbol hash=0x199762 status=OK\n[step=100 line=3] /workspace/src/module_1.cpp:121: verified symbol hash=0x199793 status=OK\n[step=100 line=4] /workspace/src/module_2.cpp:128: verified symbol hash=0x199824 status=OK\n[step=100 line=5] /workspace/src/module_3.cpp:135: verified symbol hash=0x199855 status=OK\n[step=100 line=6] /workspace/src/module_4.cpp:142: verified symbol hash=0x199886 status=OK\n[step=100 line=7] /workspace/src/module_5.cpp:149: verified symbol hash=0x199917 status=OK\n[step=100 line=8] /workspace/src/module_6.cpp:156: verified symbol hash=0x199948 status=OK\n[step=100 line=9] /workspace/src/module_7.cpp:163: verified symbol hash=0x199979 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 1 step 1",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_1_1",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_1.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_1_1",
+            "content": "[step=101 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x200697 status=OK\n[step=101 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x200728 status=OK\n[step=101 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x200759 status=OK\n[step=101 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x200790 status=OK\n[step=101 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x200821 status=OK\n[step=101 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x200852 status=OK\n[step=101 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x200883 status=OK\n[step=101 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x200914 status=OK\n[step=101 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x200945 status=OK\n[step=101 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x200976 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 10,
+      "label": "lane2_step2",
+      "lane": "lane_2",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 2: audit subsystem #2 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 2 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_2_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_2.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_2_0",
+            "content": "[step=200 line=0] /workspace/src/module_13.cpp:100: verified symbol hash=0x299400 status=OK\n[step=200 line=1] /workspace/src/module_14.cpp:107: verified symbol hash=0x299431 status=OK\n[step=200 line=2] /workspace/src/module_15.cpp:114: verified symbol hash=0x299462 status=OK\n[step=200 line=3] /workspace/src/module_16.cpp:121: verified symbol hash=0x299493 status=OK\n[step=200 line=4] /workspace/src/module_0.cpp:128: verified symbol hash=0x299524 status=OK\n[step=200 line=5] /workspace/src/module_1.cpp:135: verified symbol hash=0x299555 status=OK\n[step=200 line=6] /workspace/src/module_2.cpp:142: verified symbol hash=0x299586 status=OK\n[step=200 line=7] /workspace/src/module_3.cpp:149: verified symbol hash=0x299617 status=OK\n[step=200 line=8] /workspace/src/module_4.cpp:156: verified symbol hash=0x299648 status=OK\n[step=200 line=9] /workspace/src/module_5.cpp:163: verified symbol hash=0x299679 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 2 step 1",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_2_1",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_2.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_2_1",
+            "content": "[step=201 line=0] /workspace/src/module_14.cpp:100: verified symbol hash=0x300397 status=OK\n[step=201 line=1] /workspace/src/module_15.cpp:107: verified symbol hash=0x300428 status=OK\n[step=201 line=2] /workspace/src/module_16.cpp:114: verified symbol hash=0x300459 status=OK\n[step=201 line=3] /workspace/src/module_0.cpp:121: verified symbol hash=0x300490 status=OK\n[step=201 line=4] /workspace/src/module_1.cpp:128: verified symbol hash=0x300521 status=OK\n[step=201 line=5] /workspace/src/module_2.cpp:135: verified symbol hash=0x300552 status=OK\n[step=201 line=6] /workspace/src/module_3.cpp:142: verified symbol hash=0x300583 status=OK\n[step=201 line=7] /workspace/src/module_4.cpp:149: verified symbol hash=0x300614 status=OK\n[step=201 line=8] /workspace/src/module_5.cpp:156: verified symbol hash=0x300645 status=OK\n[step=201 line=9] /workspace/src/module_6.cpp:163: verified symbol hash=0x300676 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 11,
+      "label": "lane3_step2",
+      "lane": "lane_3",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 3: audit subsystem #3 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 3 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_3_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_3.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_3_0",
+            "content": "[step=300 line=0] /workspace/src/module_11.cpp:100: verified symbol hash=0x399100 status=OK\n[step=300 line=1] /workspace/src/module_12.cpp:107: verified symbol hash=0x399131 status=OK\n[step=300 line=2] /workspace/src/module_13.cpp:114: verified symbol hash=0x399162 status=OK\n[step=300 line=3] /workspace/src/module_14.cpp:121: verified symbol hash=0x399193 status=OK\n[step=300 line=4] /workspace/src/module_15.cpp:128: verified symbol hash=0x399224 status=OK\n[step=300 line=5] /workspace/src/module_16.cpp:135: verified symbol hash=0x399255 status=OK\n[step=300 line=6] /workspace/src/module_0.cpp:142: verified symbol hash=0x399286 status=OK\n[step=300 line=7] /workspace/src/module_1.cpp:149: verified symbol hash=0x399317 status=OK\n[step=300 line=8] /workspace/src/module_2.cpp:156: verified symbol hash=0x399348 status=OK\n[step=300 line=9] /workspace/src/module_3.cpp:163: verified symbol hash=0x399379 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 3 step 1",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_3_1",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_3.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_3_1",
+            "content": "[step=301 line=0] /workspace/src/module_12.cpp:100: verified symbol hash=0x400097 status=OK\n[step=301 line=1] /workspace/src/module_13.cpp:107: verified symbol hash=0x400128 status=OK\n[step=301 line=2] /workspace/src/module_14.cpp:114: verified symbol hash=0x400159 status=OK\n[step=301 line=3] /workspace/src/module_15.cpp:121: verified symbol hash=0x400190 status=OK\n[step=301 line=4] /workspace/src/module_16.cpp:128: verified symbol hash=0x400221 status=OK\n[step=301 line=5] /workspace/src/module_0.cpp:135: verified symbol hash=0x400252 status=OK\n[step=301 line=6] /workspace/src/module_1.cpp:142: verified symbol hash=0x400283 status=OK\n[step=301 line=7] /workspace/src/module_2.cpp:149: verified symbol hash=0x400314 status=OK\n[step=301 line=8] /workspace/src/module_3.cpp:156: verified symbol hash=0x400345 status=OK\n[step=301 line=9] /workspace/src/module_4.cpp:163: verified symbol hash=0x400376 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 12,
+      "label": "lane0_step3",
+      "lane": "lane_0",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 0: audit subsystem #0 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 0 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_0_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_0.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_0_0",
+            "content": "[step=0 line=0] /workspace/src/module_0.cpp:100: verified symbol hash=0x100000 status=OK\n[step=0 line=1] /workspace/src/module_1.cpp:107: verified symbol hash=0x100031 status=OK\n[step=0 line=2] /workspace/src/module_2.cpp:114: verified symbol hash=0x100062 status=OK\n[step=0 line=3] /workspace/src/module_3.cpp:121: verified symbol hash=0x100093 status=OK\n[step=0 line=4] /workspace/src/module_4.cpp:128: verified symbol hash=0x100124 status=OK\n[step=0 line=5] /workspace/src/module_5.cpp:135: verified symbol hash=0x100155 status=OK\n[step=0 line=6] /workspace/src/module_6.cpp:142: verified symbol hash=0x100186 status=OK\n[step=0 line=7] /workspace/src/module_7.cpp:149: verified symbol hash=0x100217 status=OK\n[step=0 line=8] /workspace/src/module_8.cpp:156: verified symbol hash=0x100248 status=OK\n[step=0 line=9] /workspace/src/module_9.cpp:163: verified symbol hash=0x100279 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 0 step 1",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_0_1",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_0.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_0_1",
+            "content": "[step=1 line=0] /workspace/src/module_1.cpp:100: verified symbol hash=0x100997 status=OK\n[step=1 line=1] /workspace/src/module_2.cpp:107: verified symbol hash=0x101028 status=OK\n[step=1 line=2] /workspace/src/module_3.cpp:114: verified symbol hash=0x101059 status=OK\n[step=1 line=3] /workspace/src/module_4.cpp:121: verified symbol hash=0x101090 status=OK\n[step=1 line=4] /workspace/src/module_5.cpp:128: verified symbol hash=0x101121 status=OK\n[step=1 line=5] /workspace/src/module_6.cpp:135: verified symbol hash=0x101152 status=OK\n[step=1 line=6] /workspace/src/module_7.cpp:142: verified symbol hash=0x101183 status=OK\n[step=1 line=7] /workspace/src/module_8.cpp:149: verified symbol hash=0x101214 status=OK\n[step=1 line=8] /workspace/src/module_9.cpp:156: verified symbol hash=0x101245 status=OK\n[step=1 line=9] /workspace/src/module_10.cpp:163: verified symbol hash=0x101276 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 0 step 2",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_0_2",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_0.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_0_2",
+            "content": "[step=2 line=0] /workspace/src/module_2.cpp:100: verified symbol hash=0x101994 status=OK\n[step=2 line=1] /workspace/src/module_3.cpp:107: verified symbol hash=0x102025 status=OK\n[step=2 line=2] /workspace/src/module_4.cpp:114: verified symbol hash=0x102056 status=OK\n[step=2 line=3] /workspace/src/module_5.cpp:121: verified symbol hash=0x102087 status=OK\n[step=2 line=4] /workspace/src/module_6.cpp:128: verified symbol hash=0x102118 status=OK\n[step=2 line=5] /workspace/src/module_7.cpp:135: verified symbol hash=0x102149 status=OK\n[step=2 line=6] /workspace/src/module_8.cpp:142: verified symbol hash=0x102180 status=OK\n[step=2 line=7] /workspace/src/module_9.cpp:149: verified symbol hash=0x102211 status=OK\n[step=2 line=8] /workspace/src/module_10.cpp:156: verified symbol hash=0x102242 status=OK\n[step=2 line=9] /workspace/src/module_11.cpp:163: verified symbol hash=0x102273 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 13,
+      "label": "lane1_step3",
+      "lane": "lane_1",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 1: audit subsystem #1 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 1 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_1_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_1.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_1_0",
+            "content": "[step=100 line=0] /workspace/src/module_15.cpp:100: verified symbol hash=0x199700 status=OK\n[step=100 line=1] /workspace/src/module_16.cpp:107: verified symbol hash=0x199731 status=OK\n[step=100 line=2] /workspace/src/module_0.cpp:114: verified symbol hash=0x199762 status=OK\n[step=100 line=3] /workspace/src/module_1.cpp:121: verified symbol hash=0x199793 status=OK\n[step=100 line=4] /workspace/src/module_2.cpp:128: verified symbol hash=0x199824 status=OK\n[step=100 line=5] /workspace/src/module_3.cpp:135: verified symbol hash=0x199855 status=OK\n[step=100 line=6] /workspace/src/module_4.cpp:142: verified symbol hash=0x199886 status=OK\n[step=100 line=7] /workspace/src/module_5.cpp:149: verified symbol hash=0x199917 status=OK\n[step=100 line=8] /workspace/src/module_6.cpp:156: verified symbol hash=0x199948 status=OK\n[step=100 line=9] /workspace/src/module_7.cpp:163: verified symbol hash=0x199979 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 1 step 1",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_1_1",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_1.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_1_1",
+            "content": "[step=101 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x200697 status=OK\n[step=101 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x200728 status=OK\n[step=101 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x200759 status=OK\n[step=101 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x200790 status=OK\n[step=101 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x200821 status=OK\n[step=101 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x200852 status=OK\n[step=101 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x200883 status=OK\n[step=101 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x200914 status=OK\n[step=101 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x200945 status=OK\n[step=101 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x200976 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 1 step 2",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_1_2",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_1.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_1_2",
+            "content": "[step=102 line=0] /workspace/src/module_0.cpp:100: verified symbol hash=0x201694 status=OK\n[step=102 line=1] /workspace/src/module_1.cpp:107: verified symbol hash=0x201725 status=OK\n[step=102 line=2] /workspace/src/module_2.cpp:114: verified symbol hash=0x201756 status=OK\n[step=102 line=3] /workspace/src/module_3.cpp:121: verified symbol hash=0x201787 status=OK\n[step=102 line=4] /workspace/src/module_4.cpp:128: verified symbol hash=0x201818 status=OK\n[step=102 line=5] /workspace/src/module_5.cpp:135: verified symbol hash=0x201849 status=OK\n[step=102 line=6] /workspace/src/module_6.cpp:142: verified symbol hash=0x201880 status=OK\n[step=102 line=7] /workspace/src/module_7.cpp:149: verified symbol hash=0x201911 status=OK\n[step=102 line=8] /workspace/src/module_8.cpp:156: verified symbol hash=0x201942 status=OK\n[step=102 line=9] /workspace/src/module_9.cpp:163: verified symbol hash=0x201973 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 14,
+      "label": "lane2_step3",
+      "lane": "lane_2",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 2: audit subsystem #2 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 2 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_2_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_2.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_2_0",
+            "content": "[step=200 line=0] /workspace/src/module_13.cpp:100: verified symbol hash=0x299400 status=OK\n[step=200 line=1] /workspace/src/module_14.cpp:107: verified symbol hash=0x299431 status=OK\n[step=200 line=2] /workspace/src/module_15.cpp:114: verified symbol hash=0x299462 status=OK\n[step=200 line=3] /workspace/src/module_16.cpp:121: verified symbol hash=0x299493 status=OK\n[step=200 line=4] /workspace/src/module_0.cpp:128: verified symbol hash=0x299524 status=OK\n[step=200 line=5] /workspace/src/module_1.cpp:135: verified symbol hash=0x299555 status=OK\n[step=200 line=6] /workspace/src/module_2.cpp:142: verified symbol hash=0x299586 status=OK\n[step=200 line=7] /workspace/src/module_3.cpp:149: verified symbol hash=0x299617 status=OK\n[step=200 line=8] /workspace/src/module_4.cpp:156: verified symbol hash=0x299648 status=OK\n[step=200 line=9] /workspace/src/module_5.cpp:163: verified symbol hash=0x299679 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 2 step 1",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_2_1",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_2.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_2_1",
+            "content": "[step=201 line=0] /workspace/src/module_14.cpp:100: verified symbol hash=0x300397 status=OK\n[step=201 line=1] /workspace/src/module_15.cpp:107: verified symbol hash=0x300428 status=OK\n[step=201 line=2] /workspace/src/module_16.cpp:114: verified symbol hash=0x300459 status=OK\n[step=201 line=3] /workspace/src/module_0.cpp:121: verified symbol hash=0x300490 status=OK\n[step=201 line=4] /workspace/src/module_1.cpp:128: verified symbol hash=0x300521 status=OK\n[step=201 line=5] /workspace/src/module_2.cpp:135: verified symbol hash=0x300552 status=OK\n[step=201 line=6] /workspace/src/module_3.cpp:142: verified symbol hash=0x300583 status=OK\n[step=201 line=7] /workspace/src/module_4.cpp:149: verified symbol hash=0x300614 status=OK\n[step=201 line=8] /workspace/src/module_5.cpp:156: verified symbol hash=0x300645 status=OK\n[step=201 line=9] /workspace/src/module_6.cpp:163: verified symbol hash=0x300676 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 2 step 2",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_2_2",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_2.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_2_2",
+            "content": "[step=202 line=0] /workspace/src/module_15.cpp:100: verified symbol hash=0x301394 status=OK\n[step=202 line=1] /workspace/src/module_16.cpp:107: verified symbol hash=0x301425 status=OK\n[step=202 line=2] /workspace/src/module_0.cpp:114: verified symbol hash=0x301456 status=OK\n[step=202 line=3] /workspace/src/module_1.cpp:121: verified symbol hash=0x301487 status=OK\n[step=202 line=4] /workspace/src/module_2.cpp:128: verified symbol hash=0x301518 status=OK\n[step=202 line=5] /workspace/src/module_3.cpp:135: verified symbol hash=0x301549 status=OK\n[step=202 line=6] /workspace/src/module_4.cpp:142: verified symbol hash=0x301580 status=OK\n[step=202 line=7] /workspace/src/module_5.cpp:149: verified symbol hash=0x301611 status=OK\n[step=202 line=8] /workspace/src/module_6.cpp:156: verified symbol hash=0x301642 status=OK\n[step=202 line=9] /workspace/src/module_7.cpp:163: verified symbol hash=0x301673 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    },
+    {
+      "turn": 15,
+      "label": "lane3_step3",
+      "lane": "lane_3",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are one worker in a verified multi-agent repair swarm. Shared repository inventory:\n[step=900 line=0] /workspace/src/module_16.cpp:100: verified symbol hash=0x997300 status=OK\n[step=900 line=1] /workspace/src/module_0.cpp:107: verified symbol hash=0x997331 status=OK\n[step=900 line=2] /workspace/src/module_1.cpp:114: verified symbol hash=0x997362 status=OK\n[step=900 line=3] /workspace/src/module_2.cpp:121: verified symbol hash=0x997393 status=OK\n[step=900 line=4] /workspace/src/module_3.cpp:128: verified symbol hash=0x997424 status=OK\n[step=900 line=5] /workspace/src/module_4.cpp:135: verified symbol hash=0x997455 status=OK\n[step=900 line=6] /workspace/src/module_5.cpp:142: verified symbol hash=0x997486 status=OK\n[step=900 line=7] /workspace/src/module_6.cpp:149: verified symbol hash=0x997517 status=OK\n[step=900 line=8] /workspace/src/module_7.cpp:156: verified symbol hash=0x997548 status=OK\n[step=900 line=9] /workspace/src/module_8.cpp:163: verified symbol hash=0x997579 status=OK\n[step=900 line=10] /workspace/src/module_9.cpp:170: verified symbol hash=0x997610 status=OK\n[step=900 line=11] /workspace/src/module_10.cpp:177: verified symbol hash=0x997641 status=OK\n[step=900 line=12] /workspace/src/module_11.cpp:184: verified symbol hash=0x997672 status=OK\n[step=900 line=13] /workspace/src/module_12.cpp:191: verified symbol hash=0x997703 status=OK\n[step=900 line=14] /workspace/src/module_13.cpp:198: verified symbol hash=0x997734 status=OK\n[step=900 line=15] /workspace/src/module_14.cpp:205: verified symbol hash=0x997765 status=OK\n[step=900 line=16] /workspace/src/module_15.cpp:212: verified symbol hash=0x997796 status=OK\n[step=900 line=17] /workspace/src/module_16.cpp:219: verified symbol hash=0x997827 status=OK\n[step=900 line=18] /workspace/src/module_0.cpp:226: verified symbol hash=0x997858 status=OK\n[step=900 line=19] /workspace/src/module_1.cpp:233: verified symbol hash=0x997889 status=OK\n[step=900 line=20] /workspace/src/module_2.cpp:240: verified symbol hash=0x997920 status=OK\n[step=900 line=21] /workspace/src/module_3.cpp:247: verified symbol hash=0x997951 status=OK\n[step=900 line=22] /workspace/src/module_4.cpp:254: verified symbol hash=0x997982 status=OK\n[step=900 line=23] /workspace/src/module_5.cpp:261: verified symbol hash=0x998013 status=OK\n[step=900 line=24] /workspace/src/module_6.cpp:268: verified symbol hash=0x998044 status=OK\n[step=900 line=25] /workspace/src/module_7.cpp:275: verified symbol hash=0x998075 status=OK\n[step=900 line=26] /workspace/src/module_8.cpp:282: verified symbol hash=0x998106 status=OK\n[step=900 line=27] /workspace/src/module_9.cpp:289: verified symbol hash=0x998137 status=OK\n"
+          },
+          {
+            "role": "user",
+            "content": "Subagent lane 3: audit subsystem #3 and report failing assertions."
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 3 step 0",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_3_0",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_3.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_3_0",
+            "content": "[step=300 line=0] /workspace/src/module_11.cpp:100: verified symbol hash=0x399100 status=OK\n[step=300 line=1] /workspace/src/module_12.cpp:107: verified symbol hash=0x399131 status=OK\n[step=300 line=2] /workspace/src/module_13.cpp:114: verified symbol hash=0x399162 status=OK\n[step=300 line=3] /workspace/src/module_14.cpp:121: verified symbol hash=0x399193 status=OK\n[step=300 line=4] /workspace/src/module_15.cpp:128: verified symbol hash=0x399224 status=OK\n[step=300 line=5] /workspace/src/module_16.cpp:135: verified symbol hash=0x399255 status=OK\n[step=300 line=6] /workspace/src/module_0.cpp:142: verified symbol hash=0x399286 status=OK\n[step=300 line=7] /workspace/src/module_1.cpp:149: verified symbol hash=0x399317 status=OK\n[step=300 line=8] /workspace/src/module_2.cpp:156: verified symbol hash=0x399348 status=OK\n[step=300 line=9] /workspace/src/module_3.cpp:163: verified symbol hash=0x399379 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 3 step 1",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_3_1",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_3.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_3_1",
+            "content": "[step=301 line=0] /workspace/src/module_12.cpp:100: verified symbol hash=0x400097 status=OK\n[step=301 line=1] /workspace/src/module_13.cpp:107: verified symbol hash=0x400128 status=OK\n[step=301 line=2] /workspace/src/module_14.cpp:114: verified symbol hash=0x400159 status=OK\n[step=301 line=3] /workspace/src/module_15.cpp:121: verified symbol hash=0x400190 status=OK\n[step=301 line=4] /workspace/src/module_16.cpp:128: verified symbol hash=0x400221 status=OK\n[step=301 line=5] /workspace/src/module_0.cpp:135: verified symbol hash=0x400252 status=OK\n[step=301 line=6] /workspace/src/module_1.cpp:142: verified symbol hash=0x400283 status=OK\n[step=301 line=7] /workspace/src/module_2.cpp:149: verified symbol hash=0x400314 status=OK\n[step=301 line=8] /workspace/src/module_3.cpp:156: verified symbol hash=0x400345 status=OK\n[step=301 line=9] /workspace/src/module_4.cpp:163: verified symbol hash=0x400376 status=OK\n"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Lane 3 step 2",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_f_3_2",
+                "type": "function",
+                "function": {
+                  "name": "bash",
+                  "arguments": "{\"cmd\":\"pytest tests/sub_3.py\",\"timeout_s\":30}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_f_3_2",
+            "content": "[step=302 line=0] /workspace/src/module_13.cpp:100: verified symbol hash=0x401094 status=OK\n[step=302 line=1] /workspace/src/module_14.cpp:107: verified symbol hash=0x401125 status=OK\n[step=302 line=2] /workspace/src/module_15.cpp:114: verified symbol hash=0x401156 status=OK\n[step=302 line=3] /workspace/src/module_16.cpp:121: verified symbol hash=0x401187 status=OK\n[step=302 line=4] /workspace/src/module_0.cpp:128: verified symbol hash=0x401218 status=OK\n[step=302 line=5] /workspace/src/module_1.cpp:135: verified symbol hash=0x401249 status=OK\n[step=302 line=6] /workspace/src/module_2.cpp:142: verified symbol hash=0x401280 status=OK\n[step=302 line=7] /workspace/src/module_3.cpp:149: verified symbol hash=0x401311 status=OK\n[step=302 line=8] /workspace/src/module_4.cpp:156: verified symbol hash=0x401342 status=OK\n[step=302 line=9] /workspace/src/module_5.cpp:163: verified symbol hash=0x401373 status=OK\n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "description": "Execute a shell command in the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cmd"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a line range from a file.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "description": "Apply an exact search-and-replace edit.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "target",
+                  "replacement"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "grep_search",
+              "description": "Search workspace files with regex.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "dir": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              }
+            }
+          }
+        ],
+        "reasoning_effort": "medium",
+        "enable_thinking": true,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 42
+      }
+    }
+  ]
+}

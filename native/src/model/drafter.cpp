@@ -408,11 +408,14 @@ void Drafter::save_checkpoint(void* dst) {
   checkpoint_extra_ = short_extra_;
 }
 
-void Drafter::restore_checkpoint(const void* src) {
+std::size_t Drafter::restore_checkpoint(const void* src) {
   if (src != checkpoint_) throw std::invalid_argument("Drafter::restore_checkpoint: not the last checkpoint saved");
   const auto* s = static_cast<const std::byte*>(src);
+  std::size_t copied_bytes = 0;
   auto copy = [&](void* dst, std::size_t off, std::size_t bytes) {
+    if (bytes == 0) return;
     CUDA_CHECK(cudaMemcpyAsync(dst, s + off, bytes, cudaMemcpyDeviceToDevice, stream_));
+    copied_bytes += bytes;
   };
   std::size_t off = 0;
   for (int l : {0, 2}) {
@@ -438,6 +441,7 @@ void Drafter::restore_checkpoint(const void* src) {
                       std::equal(checkpoint_extra_.begin(), checkpoint_extra_.end(), short_extra_.begin());
   set_context_rows(prefix ? int(checkpoint_extra_.size()) : 0);
   if (!prefix) note_tokens(checkpoint_extra_);
+  return copied_bytes;
 }
 
 void Drafter::run_commit(const ActT* feats, int n, int row0, bool last_piece) {
