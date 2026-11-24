@@ -27,7 +27,7 @@ __device__ uint32_t hash(size_t i, uint32_t seed) {
 }
 __global__ void k_bf16(uint16_t* p, size_t n, uint32_t seed, float scale) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
-    p[i] = ingine::act::to_bits(ingine::act::from_float(((hash(i, seed) & 0xffffff) / 16777216.f - 0.5f) * 3.46f * scale));
+    p[i] = ingine::act::float_to_bits(((hash(i, seed) & 0xffffff) / 16777216.f - 0.5f) * 3.46f * scale);
 }
 __global__ void k_f32(float* p, size_t n, uint32_t seed, float scale, float offset) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)

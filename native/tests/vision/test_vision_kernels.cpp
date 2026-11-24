@@ -28,8 +28,8 @@ int failures = 0;
     }                                                                               \
   } while (0)
 
-std::uint16_t bits_of(float f) { return ingine::act::host_float_to_act_bits(f); }
-float value_of(std::uint16_t u) { return ingine::act::host_act_bits_to_float(u); }
+std::uint16_t bits_of(float f) { return ingine::act::host_float_to_bits(f); }
+float value_of(std::uint16_t u) { return ingine::act::host_bits_to_float(u); }
 
 std::vector<float> rand_f32(Rng& rng, std::size_t n, double scale, double offset = 0) {
   std::vector<float> v(n);

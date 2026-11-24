@@ -10,9 +10,9 @@
 
 namespace ingine::test::prefill {
 
-inline uint16_t bf16_bits(float f) { return ingine::act::host_float_to_act_bits(f); }
+inline uint16_t bf16_bits(float f) { return ingine::act::host_float_to_bits(f); }
 
-inline float bf16_val(uint16_t u) { return ingine::act::host_act_bits_to_float(u); }
+inline float bf16_val(uint16_t u) { return ingine::act::host_bits_to_float(u); }
 
 inline float rbf(double x) { return bf16_val(bf16_bits(float(x))); }
 

@@ -30,7 +30,7 @@ __global__ void fill_bf16(uint16_t* p, size_t n, uint32_t seed, float scale) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
     uint32_t h = uint32_t(i) * 2654435761u ^ seed;
     h ^= h >> 15, h *= 2246822519u, h ^= h >> 13;
-    p[i] = ingine::act::to_bits(ingine::act::from_float(((h & 0xffffff) / 16777216.f - 0.5f) * scale));
+    p[i] = ingine::act::float_to_bits(((h & 0xffffff) / 16777216.f - 0.5f) * scale);
   }
 }
 __global__ void fill_e4m3(uint8_t* p, size_t n, uint32_t seed) {
