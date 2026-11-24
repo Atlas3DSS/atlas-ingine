@@ -74,14 +74,21 @@ constexpr int DOWN_WARPS = DOWN_GROUPS * DOWN_PAR;
 // they stop evicting the activations, KV rings and the small kernels' evict-last constants.
 constexpr l2::Evict WEIGHT_L2 = l2::Evict::first;
 
+// A 256-byte L2 prefetch footprint is available from SM80 onward.
+#if __CUDA_ARCH__ >= 800
+#define INGINE_MOE_L2_PREFETCH ".L2::256B"
+#else
+#define INGINE_MOE_L2_PREFETCH ""
+#endif
+
 __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
     uint4 v;
     if constexpr (l2::hinted<WEIGHT_L2>) {
-        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint" INGINE_MOE_L2_PREFETCH ".v4.u32 {%0,%1,%2,%3}, [%4], %5;"
                      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                      : "l"(p), "l"(pol));
     } else {
-        asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+        asm volatile("ld.global.nc.L1::no_allocate" INGINE_MOE_L2_PREFETCH ".v4.u32 {%0,%1,%2,%3}, [%4];"
                      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                      : "l"(p));
     }
@@ -90,11 +97,11 @@ __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
 __device__ __forceinline__ uint2 ld_stream_u2(const void* p, std::uint64_t pol) {
     uint2 v;
     if constexpr (l2::hinted<WEIGHT_L2>) {
-        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v2.u32 {%0,%1}, [%2], %3;"
+        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint" INGINE_MOE_L2_PREFETCH ".v2.u32 {%0,%1}, [%2], %3;"
                      : "=r"(v.x), "=r"(v.y)
                      : "l"(p), "l"(pol));
     } else {
-        asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v2.u32 {%0,%1}, [%2];"
+        asm volatile("ld.global.nc.L1::no_allocate" INGINE_MOE_L2_PREFETCH ".v2.u32 {%0,%1}, [%2];"
                      : "=r"(v.x), "=r"(v.y)
                      : "l"(p));
     }
@@ -103,16 +110,18 @@ __device__ __forceinline__ uint2 ld_stream_u2(const void* p, std::uint64_t pol) 
 __device__ __forceinline__ uint32_t ld_stream_u1(const void* p, std::uint64_t pol) {
     uint32_t v;
     if constexpr (l2::hinted<WEIGHT_L2>) {
-        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.u32 %0, [%1], %2;"
+        asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint" INGINE_MOE_L2_PREFETCH ".u32 %0, [%1], %2;"
                      : "=r"(v)
                      : "l"(p), "l"(pol));
     } else {
-        asm volatile("ld.global.nc.L1::no_allocate.L2::256B.u32 %0, [%1];"
+        asm volatile("ld.global.nc.L1::no_allocate" INGINE_MOE_L2_PREFETCH ".u32 %0, [%1];"
                      : "=r"(v)
                      : "l"(p));
     }
     return v;
 }
+#undef INGINE_MOE_L2_PREFETCH
+
 __device__ __forceinline__ uint16_t ld_scale2(const void* p, std::uint64_t pol) {
     uint16_t v;
     if constexpr (l2::hinted<WEIGHT_L2>) asm volatile("ld.global.nc.L2::cache_hint.u16 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
