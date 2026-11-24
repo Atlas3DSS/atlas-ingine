@@ -85,6 +85,140 @@ All three showcase videos below were authored, rendered, visually critiqued thro
 | ![Celebration Film v2 Preview](docs/media/celebration_preview.gif) | ![Whiteout Circuit 350K Preview](docs/media/whiteout_podracer_preview.gif) | ![Whiteout Circuit 1M Context Preview](docs/media/whiteout_1m_preview.gif) |
 | 16-iteration Blender 4.5 LTS hillclimb (**`84.0/100`**, `+13 pts` over v1, 240 Cycles 64-spp OIDN frames, Verified Ledger: 26 ADD / 13 RETRACT / 6 REJECT).<br>[**Watch full 1080p MP4 (4.0 MB)**](https://github.com/Atlas3DSS/atlas-ingine/releases/download/media-v1/celebration_10yr_nvidia_inkling_1080p.mp4) | Single-file 60 FPS Three.js WebGL2 snow podracer built & visually self-critiqued via Playwright screenshots + Verified Ledger (**`82.5/100`**).<br>[**Watch full 720p MP4 (6.8 MB)**](https://github.com/Atlas3DSS/atlas-ingine/releases/download/media-v1/whiteout_circuit_720p.mp4) | Single continuous multi-turn conversation inside `--max-ctx 1,048,576` (`39.8 GiB` VRAM, `629–719 tok/s`, `1.05M` cum. tokens in 5.5 min, `obj 97.8`).<br>[**Watch full 720p MP4 (3.8 MB)**](https://github.com/Atlas3DSS/atlas-ingine/releases/download/media-v1/whiteout_circuit_1m_720p.mp4) |
 
+## Quick Visual Guides: How to Use All the Extra Goodies
+
+### 1. Pick Your GPU & Turn On 1,000,000-Token Memory
+
+![Quick Visual Guide: Pick Your GPU and Turn On 1M-Token Memory](docs/media/guide_gpu_and_1m_memory.png)
+
+<details>
+<summary><b>Copy-paste commands: 1M context on 6 GB, 12 GB, 24 GB, and 96 GB + 0.93s crash-proof KV checkpoints</b></summary>
+
+First, download the EXL3 9 GB checkpoint for 6 GB–24 GB 1M runs (skip this if using the native 20.2 GB checkpoint on 96 GB cards):
+```bash
+hf download Atlas3D/Inkling-2-Mini-atlas-exl3-9g-fp8-ingine --local-dir ./Inkling-2-Mini-exl3-9g
+```
+
+- **6 GB – 12 GB GPU (`feat/kvq4-elastic-9g` branch) — 1M tokens in ~5.3–10.8 GB VRAM (3-tier paged KV, `SWAP=0`):**
+  ```bash
+  git checkout feat/kvq4-elastic-9g
+  ./native/build-multiarch/apps/serve/ingine-serve --engine \
+    --model-dir ./Inkling-2-Mini-exl3-9g --max-ctx 1048576 \
+    --atlas-6g --kv-q4 --kv-paged --kv-vram-mb 512 --kv-ram-mb 12288 \
+    --prefill-chunk 512 --no-vision --host 127.0.0.1 --port 8003
+  # For 12 GB cards, replace --atlas-6g --kv-vram-mb 512 with --dense-fp8 --kv-vram-mb 2048
+  # Optional Tier-2 NVMe spill for low-RAM machines: add --kv-swap-dir /fast/nvme/kvswap
+  ```
+- **24 GB GPU (`feat/kvq4-elastic-9g` branch) — Full 1M resident on-card (`29–53 tok/s`, ~17.8 GiB VRAM):**
+  ```bash
+  git checkout feat/kvq4-elastic-9g
+  ./native/build-multiarch/apps/serve/ingine-serve --engine \
+    --model-dir ./Inkling-2-Mini-exl3-9g --max-ctx 1048576 \
+    --dense-fp8 --kv-q4 --prefill-chunk 2048 --no-vision --host 127.0.0.1 --port 8003
+  ```
+- **96 GB Workstation (`main`) — Live 1M context with vision + DSpark speculative decoding (`39.8 GiB` VRAM, `629–719 tok/s`):**
+  ```bash
+  ./native/build-multiarch/apps/serve/ingine-serve --engine \
+    --model-dir /path/to/Inkling-2-Mini --max-ctx 1048576 \
+    --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --park-mb 0 --host 127.0.0.1 --port 8003
+  ```
+- **Crash-proof 1M Atomic Disk KV Checkpoints (`feat/kv-checkpoint-resume` branch) — save mid-prefill, resume in `0.93s` (`0.000000` KL):**
+  ```bash
+  git checkout feat/kv-checkpoint-resume
+  # Save an atomic checkpoint every 131,072 prefilled tokens (safe on Ctrl-C / SIGTERM):
+  ./native/build-multiarch/apps/serve/ingine-serve --engine \
+    --model-dir ./Inkling-2-Mini-exl3-9g --max-ctx 1048576 --dense-fp8 --kv-q4 \
+    --kv-ckpt-path /tmp/session.kvckpt --kv-ckpt-every 131072 --no-vision
+
+  # Resume bit-identically later (even switching resident <-> paged; fails loudly on prompt mismatch):
+  ./native/build-multiarch/apps/serve/ingine-serve --engine \
+    --model-dir ./Inkling-2-Mini-exl3-9g --max-ctx 1048576 --dense-fp8 --kv-q4 \
+    --kv-ckpt-resume /tmp/session.kvckpt --no-vision
+  ```
+
+</details>
+
+### 2. Visual Map of All Extra Goodies
+
+![Atlas-Ingine Extra Goodies Visual Toolkit Map](docs/media/guide_extra_goodies.png)
+
+<details>
+<summary><b>Copy-paste recipes: Elastic Shrinker, JSON Schema &amp; GPU Vision, Verified Ledger, Continuous Batching, Legacy GPUs, Mech-Interp</b></summary>
+
+1. **Shrink the Model for 12–16 GB Cards (`main`):**
+   ```bash
+   python3 tools/quantize_elastic_ingine.py \
+     --src /path/to/Inkling-2-Mini --dst /path/to/Inkling-2-Mini-atlas-12g --profile atlas-12g
+   # Use --profile atlas-10g for 12.01 GB on disk; add --no-vision or --text-only to trim further.
+   ```
+
+2. **Guaranteed JSON Schema, Built-In GPU Vision, & Reasoning Dial (`main`):**
+   ```python
+   import base64
+   from openai import OpenAI
+
+   client = OpenAI(base_url="http://127.0.0.1:8003/v1", api_key="none")
+   img_b64 = base64.b64encode(open("screenshot.png", "rb").read()).decode()
+
+   resp = client.chat.completions.create(
+       model="inkling-2-mini",
+       messages=[{
+           "role": "user",
+           "content": [
+               {"type": "text", "text": "Rate this render and list the top 2 visual fixes as JSON."},
+               {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+           ],
+       }],
+       response_format={
+           "type": "json_schema",
+           "json_schema": {
+               "name": "render_audit",
+               "schema": {
+                   "type": "object",
+                   "properties": {
+                       "score": {"type": "number"},
+                       "fixes": {"type": "array", "items": {"type": "string"}},
+                   },
+                   "required": ["score", "fixes"],
+               },
+           },
+       },
+       extra_body={"reasoning_effort": "medium"},  # none | minimal | low | medium | high | max
+   )
+   print(resp.choices[0].message.content)
+   ```
+
+3. **Turn Inkling Into a Self-Improving Agent with Verified Ledger (`main`, [`ledger/`](ledger/README.md)):**
+   ```bash
+   # Try the zero-dependency SQLite Verified Ledger example right away:
+   python3 ledger/examples/code_hillclimb_example.py --base-url http://127.0.0.1:8003/v1 --model inkling-2-mini
+   # Inspect what your host verifier admitted (facts, winners, repairs, drift):
+   python3 ledger/verified_ledger.py --db code_hillclimb.sqlite inspect
+   ```
+   See [`ledger/README.md`](ledger/README.md) for the 15-line Python loop (`VerifiedLedger` + `run_verified_loop`).
+
+4. **Serve Up to 64 Concurrent Users / Agents (`feat/continuous-batching`):**
+   ```bash
+   ./native/build-multiarch/apps/serve/ingine-serve --engine \
+     --model-dir /path/to/Inkling-2-Mini --max-batch 64 --max-ctx 4096 \
+     --max-kv-tokens 131072 --max-queue 256 --kv-fp8 --no-vision --host 127.0.0.1 --port 8003
+   ```
+
+5. **Run on 2016–2018 Pascal / Volta / Turing GPUs (`main` & `feat/sm60-sm70-victory`):**
+   ```bash
+   cmake --preset sm70 -S native && cmake --build native/build-sm70 -j          # Tesla V100 32 GB
+   cmake --preset legacy-fp16 -S native && cmake --build native/build-legacy-fp16 -j  # P100 + V100 + T4/2060
+   ```
+
+6. **Mechanistic Interpretability & Persona Steering Hooks (`feat/mech-interp-persona`):**
+   ```bash
+   ./native/build-multiarch/apps/serve/ingine-serve --engine \
+     --model-dir /path/to/Inkling-2-Mini --persona-spec persona_spec.json \
+     --refusal-map refusal_deny.json --persona-probe-mode --host 127.0.0.1 --port 8003
+   ```
+
+</details>
+
 Additional verified architecture, branch, and live-serving details:
 - **Pascal (`sm_60`/`sm_61`, 2016) & Turing (`sm_75`, 2018):** Runtime opt-in SMEM dispatch in `901d86e` enables both speculative (`--spec`) and non-speculative decoding on `<=48 KiB` Pascal (`Tesla P100-PCIE-16GB`) and `<=64 KiB` Turing (`Tesla T4 16 GB`, `Quadro RTX 6000 24 GB`). On `feat/sm60-sm70-victory @ fe18669`, all **7/7 kernel suites passed on real 2016 Tesla P100 (`sm_60`) silicon** (`kernels_bitlock`, `kernels_dense`, `kernels_moe`, `kernels_attn`, `prefill_moe`, `prefill_attention`, `spec_draft_kernels`); P100 speed rows above remain on the `901d86e` baseline pending a cooled, clock-controlled host comparison (passive cloud P100 rentals thermally throttled from `1328 MHz` to `405 MHz` at `79–80°C`).
 - **Volta (`sm_70`, Tesla V100 32 GB, 2017):** On `feat/sm60-sm70-victory @ 2545a22`, README `--effort medium` decode reached **`81.0 tok/s` chat (+35.0%) / `100.7 tok/s` code (+39.9%)** and **`2,052 tok/s` 64K prefill (2.86×)** in `21.82 GB` VRAM. With `INGINE_ACT_FP16=ON`, 39 distinct CTest cases passed across qualification runs.
