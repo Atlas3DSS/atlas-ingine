@@ -33,3 +33,21 @@ ingine_add_test(
   LIBS ingine_text nlohmann_json::nlohmann_json
   LABELS backend text cpu
 )
+
+ingine_add_test(
+  NAME qwen38_phase1a_cpu_prep
+  SOURCES test_qwen38_phase1a_cpu_prep.cpp
+  LIBS ingine_qwen38_cpu ingine_engine nlohmann_json::nlohmann_json
+  LABELS backend qwen38 cpu
+  ORACLE
+)
+
+ingine_add_test(
+  NAME qwen38_gpu_gate1
+  SOURCES test_qwen38_gpu_gate1.cpp
+  LIBS ingine_qwen38_cuda ingine_qwen38_cpu ingine_core nlohmann_json::nlohmann_json
+  LABELS backend qwen38 phase1a
+  GPU
+  ORACLE
+  TIMEOUT 600
+)
