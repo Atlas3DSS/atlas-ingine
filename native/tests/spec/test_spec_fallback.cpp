@@ -2,6 +2,7 @@
 // bit-exact parity against normal conditional-graph execution across multi-turn greedy decode, teacher-forced
 // replay (widths, accepted/rejected counts, spec_trace), rollback state continuation, and hooked persona verify.
 #include "common/test_util.h"
+#include "core/hal.h"
 #include "ingine/generator.h"
 #include "ingine/persona.h"
 
@@ -46,6 +47,7 @@ struct EnvRestorer {
 };
 
 struct RunCapture {
+  bool conditional_graphs_enabled = false;
   std::vector<std::int32_t> turn1_out;
   model::GenerateStats turn1_stats;
   std::vector<std::int32_t> turn2_out;
@@ -74,6 +76,10 @@ RunCapture run_suite(const std::filesystem::path& dir, bool disable_conditional_
   if (disable_conditional_graphs) setenv("INGINE_DISABLE_CONDITIONAL_GRAPHS", "1", 1);
   else unsetenv("INGINE_DISABLE_CONDITIONAL_GRAPHS");
 
+  int active_dev = 0;
+  INGINE_TEST_CUDA(cudaGetDevice(&active_dev));
+  const bool cond_enabled = ingine::hal::conditional_graphs_enabled(active_dev);
+
   model::RuntimeOptions opt;
   opt.model_dir = dir;
   opt.max_ctx = 8192;
@@ -84,6 +90,7 @@ RunCapture run_suite(const std::filesystem::path& dir, bool disable_conditional_
 
   auto gen = model::make_generator(opt);
   RunCapture cap;
+  cap.conditional_graphs_enabled = cond_enabled;
 
   model::Sampling greedy;
   greedy.temperature = 0.f;
@@ -147,13 +154,13 @@ int main() {
   prof->name = "spec_fallback_router_force";
   prof->fingerprint_sha256 = persona::sha256_hex(prof->name);
   prof->cache_key = persona::cache_key_from_hex(prof->fingerprint_sha256);
-  {
+  for (int visit : {10, 14, 18, 22, 26, 30}) {
     persona::InterventionSpec iv;
     iv.type = persona::InterventionType::RouterForce;
-    iv.visit = 10;
+    iv.visit = visit;
     iv.expert = 5;
-    iv.bias = 25.0f;
-    iv.gain = 2.5f;
+    iv.bias = 100.0f;
+    iv.gain = 12.0f;
     prof->interventions.push_back(iv);
   }
   persona::validate_profile_safety(*prof, persona::RefusalMap::default_map());
@@ -162,6 +169,8 @@ int main() {
   const RunCapture normal = run_suite(dir, /*disable_conditional_graphs=*/false, prof);
   const RunCapture fallback = run_suite(dir, /*disable_conditional_graphs=*/true, prof);
 
+  expect(normal.conditional_graphs_enabled && !fallback.conditional_graphs_enabled,
+         "env toggle disabled conditional SWITCH graphs for fallback run");
   expect(normal.turn1_stats.spec_rounds > 0 && !normal.turn1_out.empty(), "normal run executed speculative rounds");
   expect(normal.turn1_out == fallback.turn1_out &&
              normal.turn1_stats.generated_tokens == fallback.turn1_stats.generated_tokens &&
@@ -200,6 +209,16 @@ int main() {
 
   const std::vector<std::int32_t> t1_prefix(
       normal.turn1_out.begin(), normal.turn1_out.begin() + std::min<std::size_t>(64, normal.turn1_out.size()));
+  std::size_t hooked_diff = 0;
+  const std::size_t cmp_len = std::min(normal.hooked_out.size(), t1_prefix.size());
+  for (std::size_t i = 0; i < cmp_len; ++i) {
+    if (normal.hooked_out[i] != t1_prefix[i]) ++hooked_diff;
+  }
+  if (normal.hooked_out.size() != t1_prefix.size()) {
+    hooked_diff += (normal.hooked_out.size() > t1_prefix.size() ? normal.hooked_out.size() - t1_prefix.size()
+                                                                : t1_prefix.size() - normal.hooked_out.size());
+  }
+  std::printf("INFO hooked vs unhooked differing tokens: %zu / %zu\n", hooked_diff, t1_prefix.size());
   expect(normal.hooked_out != t1_prefix, "hooked persona profile alters output vs unhooked baseline");
   expect(fallback.unhooked_after_out == normal.unhooked_after_out && fallback.unhooked_after_out == t1_prefix,
          "unhooked speculative decode after hooked request matches baseline under fallback");

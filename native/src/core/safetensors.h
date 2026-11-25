@@ -180,4 +180,8 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Test hook: causes the next DeviceUploader worker startup loop to fail with std::system_error when
+// launching worker `worker_index` (0-based; negative disables).
+void fail_next_uploader_worker_start(int worker_index) noexcept;
+
 } // namespace ingine

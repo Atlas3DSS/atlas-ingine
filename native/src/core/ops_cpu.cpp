@@ -25,6 +25,22 @@ OpResolution resolve_embed_q4_rmsnorm(const EmbedQ4RmsNormDesc& desc, bool /*all
   return OpResolution{true, hal::BackendKind::Cpu, DispatchPath::Native, "cpu native Q4_0 embed + RMSNorm"};
 }
 
+void decode_q4_0(const void* table_q4, int rows, int hidden_size, float* out_f32, hal::StreamHandle stream) {
+  if (!table_q4 || !out_f32) throw std::invalid_argument("decode_q4_0: null pointer");
+  if (rows < 1) throw std::invalid_argument("decode_q4_0: rows must be >= 1");
+  if (hidden_size <= 0 || (hidden_size % 32) != 0) {
+    throw std::invalid_argument("decode_q4_0: hidden_size must be a positive multiple of 32");
+  }
+  hal::stream_synchronize(stream);
+  const std::size_t row_bytes =
+      static_cast<std::size_t>(hidden_size / 2) + static_cast<std::size_t>(hidden_size / 32) * 2;
+  const auto* tbl = static_cast<const std::uint8_t*>(table_q4);
+  for (int r = 0; r < rows; ++r) {
+    decode_q4_0_row(tbl + static_cast<std::size_t>(r) * row_bytes, hidden_size,
+                    out_f32 + static_cast<std::size_t>(r) * static_cast<std::size_t>(hidden_size));
+  }
+}
+
 DispatchPath run_embed_q4_rmsnorm(const EmbedQ4RmsNormDesc& desc, const EmbedQ4RmsNormArgs& args,
                                   hal::StreamHandle stream, bool allow_fallback, bool force_fallback) {
   const OpResolution res = resolve_embed_q4_rmsnorm(desc, allow_fallback);
@@ -36,17 +52,24 @@ DispatchPath run_embed_q4_rmsnorm(const EmbedQ4RmsNormDesc& desc, const EmbedQ4R
   if (!args.token_ids || !args.table_q4 || !args.norm_weight || !args.out) {
     throw std::invalid_argument("embed_q4_rmsnorm: null buffer argument");
   }
+  if (desc.token_bounds == TokenBoundsMode::Validate && args.host_token_ids != nullptr) {
+    validate_token_ids(args.host_token_ids, desc.tokens, desc.vocab_size);
+  }
 
   hal::stream_synchronize(stream);
   const int M = desc.tokens;
   const int H = desc.hidden_size;
+  try {
+    validate_token_ids(args.token_ids, M, desc.vocab_size);
+  } catch (const std::out_of_range&) {
+    if (args.invalid_token_flag != nullptr) *args.invalid_token_flag = 1u;
+    throw;
+  }
+
   const auto* tbl = static_cast<const std::uint8_t*>(args.table_q4);
   std::vector<float> decoded(static_cast<std::size_t>(H));
   for (int m = 0; m < M; ++m) {
     const std::int64_t tok = args.token_ids[m];
-    if (tok < 0 || tok >= desc.vocab_size) {
-      throw std::out_of_range("embed_q4_rmsnorm: token id out of vocabulary range");
-    }
     const std::uint8_t* row = tbl + static_cast<std::size_t>(tok) * desc.weight_row_bytes;
     decode_q4_0_row(row, H, decoded.data());
     float ss = 0.f;

@@ -1,3 +1,4 @@
+// Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
 // Pure C++20 scalar oracles, IEEE-754 half/BF16/FP8 bit conversions, Q4_0 packing/unpacking,
 // and FP64 comparison helpers for ingine tests. Zero CUDA headers or runtime dependencies.
 #pragma once
@@ -8,11 +9,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#ifndef INGINE_ACT_FP16
+#define INGINE_ACT_FP16 0
+#endif
+
 namespace ingine::test {
 
+inline constexpr bool kScalarActIsFP16 = (INGINE_ACT_FP16 != 0);
 inline constexpr int kSkip = 77;
 
 #define INGINE_CHECK(cond)                                                                \
@@ -182,7 +189,8 @@ inline std::vector<float> randn(Rng& r, std::size_t n, double scale) {
   return v;
 }
 
-inline std::vector<float> randn_bf16(Rng& r, std::size_t n, double scale, bool fp16_act = false) {
+inline std::vector<float> randn_bf16(Rng& r, std::size_t n, double scale,
+                                     bool fp16_act = kScalarActIsFP16) {
   std::vector<float> v = randn(r, n, scale);
   for (auto& x : v) x = round_act_scalar(x, fp16_act);
   return v;
@@ -241,10 +249,11 @@ inline void scalar_q4_0_unpack_row(const std::uint8_t* row_in, int num_groups, i
       std::memcpy(&dh_bits, row_in + total_nib_bytes + g * blocks_per_group * 2 + blk * 2, 2);
       const float d_raw = fp16_bits_to_float(dh_bits);
       const float d = std::isfinite(d_raw) ? d_raw : 0.f;
+      const float m8d = -8.0f * d;
       for (int j = 0; j < 32; ++j) {
         const std::uint8_t byte = row_in[g * nib_bytes_per_group + blk * 16 + (j >> 1)];
         const std::uint8_t q = (j & 1) ? (byte >> 4) : (byte & 0x0f);
-        out[g * group_size + blk * 32 + j] = float(int(q) - 8) * d;
+        out[g * group_size + blk * 32 + j] = std::fmaf(static_cast<float>(q), d, m8d);
       }
     }
   }
@@ -277,13 +286,12 @@ inline void scalar_embed_q4_rmsnorm_fp64(const std::int64_t* token_ids, int toke
   std::vector<float> decoded(static_cast<std::size_t>(hidden_size));
   for (int m = 0; m < tokens; ++m) {
     const std::int64_t tok = token_ids[m];
-    const bool valid = tok >= 0 && tok < static_cast<std::int64_t>(vocab_size);
-    if (valid) {
-      const std::uint8_t* row = table_bytes + static_cast<std::size_t>(tok) * static_cast<std::size_t>(row_bytes);
-      scalar_q4_0_unpack_row(row, 1, hidden_size, decoded.data());
-    } else {
-      std::fill(decoded.begin(), decoded.end(), 0.f);
+    if (tok < 0 || tok >= static_cast<std::int64_t>(vocab_size)) {
+      throw std::out_of_range("scalar_embed_q4_rmsnorm_fp64: token id " + std::to_string(tok) +
+                              " out of vocabulary range [0, " + std::to_string(vocab_size) + ")");
     }
+    const std::uint8_t* row = table_bytes + static_cast<std::size_t>(tok) * static_cast<std::size_t>(row_bytes);
+    scalar_q4_0_unpack_row(row, 1, hidden_size, decoded.data());
     double ss = 0.0;
     for (int j = 0; j < hidden_size; ++j) {
       const double x = static_cast<double>(decoded[j]);

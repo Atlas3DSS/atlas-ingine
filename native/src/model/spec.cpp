@@ -47,7 +47,7 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
   width_.fill(0);
   const float threshold = rt.options().spec_threshold;
   if (rt.has_verify_graph()) {
-    verify_ = rt.capture_switch(
+    verify_ = rt.try_capture_switch(
         [&](cudaStream_t s, cudaGraphConditionalHandle h) {
           verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(),
                         static_cast<std::int32_t*>(width_.p), h, s);
@@ -89,7 +89,7 @@ void SpecLoop::ensure_verify_hooked() {
   if (!rt_.has_verify_graph()) return;
   const Widths widths = verify_widths(rt_);
   const float threshold = rt_.options().spec_threshold;
-  verify_hooked_ = rt_.capture_switch(
+  verify_hooked_ = rt_.try_capture_switch(
       [&](cudaStream_t s, cudaGraphConditionalHandle h) {
         verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(), static_cast<std::int32_t*>(width_.p),
                       h, s);
@@ -98,6 +98,10 @@ void SpecLoop::ensure_verify_hooked() {
         rt_.record_save_verify(m, s);
         rt_.record_step(m, s, /*hooked=*/true);
       });
+  if (!verify_hooked_) {
+    verify_ = GraphExec();
+    accept_ = GraphExec();
+  }
 }
 
 void SpecLoop::record_accept_for_width(int m, cudaStream_t stream) {
@@ -155,9 +159,13 @@ void SpecLoop::prepare_accept(const Sampling& sampling) {
   accept_prepared_ = true;
   accept_ = GraphExec();
   if (!rt_.supports_conditional_graphs()) return;
-  accept_ = rt_.capture_switch(
+  accept_ = rt_.try_capture_switch(
       [&](cudaStream_t s, cudaGraphConditionalHandle h) { width_select(width, widths, h, s); },
       [&](cudaStream_t s, int m) { record_accept_for_width(m, s); });
+  if (!accept_) {
+    verify_ = GraphExec();
+    verify_hooked_ = GraphExec();
+  }
 }
 
 void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& sampling, kh::SamplerRng& rng,
@@ -241,7 +249,9 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     if (!greedy) kh::uniform(kd::GAMMA, rng, scratch.uniforms, stream);
     if (rt_.hooked_active()) ensure_verify_hooked();
     int selected_m = 0;
-    if (!rt_.has_verify_graph()) {
+    const bool use_verify_graph =
+        rt_.has_verify_graph() && (rt_.hooked_active() ? bool(verify_hooked_) : bool(verify_));
+    if (!use_verify_graph) {
       verify_select_eager(draft_.conf, draft_.tokens, rt_.options().spec_threshold, verify_widths(rt_), rt_.tokens(),
                           static_cast<std::int32_t*>(width_.p), static_cast<std::int32_t*>(width_host_.device_ptr()),
                           stream);
@@ -255,9 +265,13 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     } else {
       verify_.launch(stream);
     }
-    if (rt_.supports_conditional_graphs()) {
+    if (rt_.supports_conditional_graphs() && accept_) {
       accept_.launch(stream);
     } else {
+      if (selected_m == 0) {
+        CUDA_CHECK(cudaMemcpyAsync(&selected_m, width_.p, sizeof(selected_m), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+      }
       record_accept_for_width(selected_m, stream);
     }
     if (!greedy) kh::sample_from_probs(scratch.resid, 1, V, V, rng, &record_dev->next, stream);

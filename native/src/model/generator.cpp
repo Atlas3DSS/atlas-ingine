@@ -8,6 +8,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/ops.h"
 #include "kernels/head/head.h"
 #include "model/batch_engine.h"
 #include "model/drafter.h"
@@ -127,7 +128,16 @@ class EngineGenerator final : public Generator {
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     const int n = int(prompt.size());
     const int image_tokens = check_images(full_prompt);
-    if (!sampling.forced.empty()) max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+      if (prompt[i] >= VOCAB) {
+        throw std::out_of_range("prompt token id " + std::to_string(prompt[i]) +
+                                " out of vocabulary range [0, " + std::to_string(VOCAB) + ")");
+      }
+    }
+    if (!sampling.forced.empty()) {
+      ops::validate_token_ids_i32(sampling.forced.data(), int(sampling.forced.size()), VOCAB);
+      max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
+    }
     // a verify call writes up to max(verify widths) positions
     const int reserve = drafter_ ? *std::max_element(rt_.verify_widths().begin(), rt_.verify_widths().end()) : 0;
     if (n + std::int64_t(max_new_tokens) + reserve > options_.max_ctx) {

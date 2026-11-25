@@ -1,17 +1,24 @@
 #include "core/safetensors.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace ingine {
+namespace {
+
+std::atomic<int> g_fail_worker_index{-1};
+
+} // namespace
 
 struct DeviceUploader::Impl {
     struct Chunk {
@@ -31,9 +38,26 @@ struct DeviceUploader::Impl {
         if (options_.chunk_bytes > std::numeric_limits<std::size_t>::max() / n) {
             throw std::invalid_argument("DeviceUploader: staging size overflows");
         }
+        const int fail_at = g_fail_worker_index.exchange(-1, std::memory_order_acq_rel);
         workers_.reserve(static_cast<std::size_t>(options_.reader_threads));
-        for (int i = 0; i < options_.reader_threads; ++i) {
-            workers_.emplace_back([this] { worker_main(); });
+        try {
+            for (int i = 0; i < options_.reader_threads; ++i) {
+                if (i == fail_at) {
+                    throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                            "injected CPU uploader worker startup failure");
+                }
+                workers_.emplace_back([this] { worker_main(); });
+            }
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex_);
+                stopping_ = true;
+            }
+            work_cv_.notify_all();
+            for (std::thread& w : workers_) {
+                if (w.joinable()) { w.join(); }
+            }
+            throw;
         }
     }
 
@@ -140,6 +164,10 @@ DeviceUploader::~DeviceUploader() = default;
 UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests,
                                    hal::StreamHandle stream) {
     return impl_->upload(requests, stream);
+}
+
+void fail_next_uploader_worker_start(int worker_index) noexcept {
+    g_fail_worker_index.store(worker_index, std::memory_order_release);
 }
 
 } // namespace ingine

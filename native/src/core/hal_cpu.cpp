@@ -1,3 +1,8 @@
+// Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
+// DeviceBuffer, DeviceArena, and PinnedHostBuffer sections adapted from arena.cu:
+// Modified for fngine from cinference:src/core/arena.cu @ 383e5db. See NOTICE.
+// HostRegion and MappedHostBuffer sections adapted from host_memory.cpp (fngine, Apache-2.0).
+
 #include "core/arena.h"
 #include "core/hal.h"
 #include "core/host_memory.h"
@@ -505,11 +510,28 @@ MemoryInfo query_memory_info() {
 
 bool is_stream_capturing(StreamHandle /*stream*/) { return false; }
 
-void require_graph_capture_or_eager(const DeviceCaps& caps, bool allow_eager, const char* caller) {
-  if (!caps.supports_graph_capture && !allow_eager) {
-    throw std::runtime_error(std::string(caller ? caller : "hal") + ": graph capture unsupported on backend " +
+bool graph_requirement_met(const DeviceCaps& caps, GraphRequirement requirement) noexcept {
+  switch (requirement) {
+    case GraphRequirement::Capture: return caps.supports_graph_capture;
+    case GraphRequirement::ConditionalSwitch: return caps.supports_graph_capture && caps.supports_conditional_graph;
+  }
+  return false;
+}
+
+void require_graph_capture_or_eager(const DeviceCaps& caps, bool allow_eager, const char* caller,
+                                    GraphRequirement requirement) {
+  if (allow_eager || graph_requirement_met(caps, requirement)) return;
+  const char* tag = caller ? caller : "hal";
+  if (!caps.supports_graph_capture) {
+    throw std::runtime_error(std::string(tag) + ": graph capture unsupported on backend " +
                              backend_name(caps.backend));
   }
+  throw std::runtime_error(std::string(tag) + ": conditional SWITCH graph unsupported on backend " +
+                           backend_name(caps.backend));
+}
+
+void require_conditional_switch_or_eager(const DeviceCaps& caps, bool allow_eager, const char* caller) {
+  require_graph_capture_or_eager(caps, allow_eager, caller, GraphRequirement::ConditionalSwitch);
 }
 
 void memcpy_h2d_async(void* dst_dev, const void* src_host, std::size_t bytes, StreamHandle /*stream*/) {

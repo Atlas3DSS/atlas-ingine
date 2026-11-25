@@ -105,7 +105,8 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   };
 
   if (w.embed_q4()) {
-    const auto desc = ops::make_inkling_embed_q4_desc(m, VOCAB, pdl);
+    auto desc = ops::make_inkling_embed_q4_desc(m, VOCAB, pdl);
+    desc.token_bounds = ops::TokenBoundsMode::PreValidated;
     const ops::EmbedQ4RmsNormArgs args{static_cast<const std::int64_t*>(b.token.data), w.embed.data,
                                        f32p(w.embed_norm), f32m(b.B0)};
     ops::run_embed_q4_rmsnorm(desc, args, stream);

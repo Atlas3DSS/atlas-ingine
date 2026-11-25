@@ -84,6 +84,34 @@ void validate_dense_gemm_desc(const DenseGemmDesc& desc) {
   }
 }
 
+void validate_token_ids(const std::int64_t* host_token_ids, int tokens, int vocab_size) {
+  if (vocab_size < 1) throw std::invalid_argument("token bounds: vocab_size must be >= 1");
+  if (tokens < 0) throw std::invalid_argument("token bounds: tokens must be >= 0");
+  if (tokens == 0) return;
+  if (!host_token_ids) throw std::invalid_argument("token bounds: null host_token_ids");
+  for (int m = 0; m < tokens; ++m) {
+    const std::int64_t tok = host_token_ids[m];
+    if (tok < 0 || tok >= static_cast<std::int64_t>(vocab_size)) {
+      throw std::out_of_range("embed_q4_rmsnorm: token id " + std::to_string(tok) +
+                              " out of vocabulary range [0, " + std::to_string(vocab_size) + ")");
+    }
+  }
+}
+
+void validate_token_ids_i32(const std::int32_t* host_token_ids, int tokens, int vocab_size) {
+  if (vocab_size < 1) throw std::invalid_argument("token bounds: vocab_size must be >= 1");
+  if (tokens < 0) throw std::invalid_argument("token bounds: tokens must be >= 0");
+  if (tokens == 0) return;
+  if (!host_token_ids) throw std::invalid_argument("token bounds: null host_token_ids");
+  for (int m = 0; m < tokens; ++m) {
+    const std::int32_t tok = host_token_ids[m];
+    if (tok < 0 || tok >= vocab_size) {
+      throw std::out_of_range("token id " + std::to_string(tok) + " out of vocabulary range [0, " +
+                              std::to_string(vocab_size) + ")");
+    }
+  }
+}
+
 void decode_q4_0_row(const std::uint8_t* row_bytes, int hidden_size, float* out_f32) {
   if (!row_bytes || !out_f32) throw std::invalid_argument("decode_q4_0_row: null pointer");
   if (hidden_size <= 0 || (hidden_size % 32) != 0) {
@@ -97,11 +125,12 @@ void decode_q4_0_row(const std::uint8_t* row_bytes, int hidden_size, float* out_
     std::memcpy(&d_bits, scales + std::size_t(b) * 2, 2);
     const float d_raw = act::host_fp16_bits_to_float(d_bits);
     const float d = std::isfinite(d_raw) ? d_raw : 0.f;
+    const float m8d = -8.0f * d;
     const int base = b * 32;
     for (int j = 0; j < 32; ++j) {
       const std::uint8_t byte = row_bytes[(base + j) >> 1];
       const std::uint8_t nib = ((j & 1) != 0) ? (byte >> 4) : (byte & 0x0fu);
-      out_f32[base + j] = float(int(nib) - 8) * d;
+      out_f32[base + j] = std::fmaf(static_cast<float>(nib), d, m8d);
     }
   }
 }
@@ -128,6 +157,9 @@ DispatchPath run_embed_q4_rmsnorm_fallback(const EmbedQ4RmsNormDesc& desc, const
   if (hal::is_stream_capturing(stream)) {
     throw std::runtime_error("embed_q4_rmsnorm portable fallback cannot run inside graph capture");
   }
+  if (desc.token_bounds == TokenBoundsMode::Validate && args.host_token_ids != nullptr) {
+    validate_token_ids(args.host_token_ids, desc.tokens, desc.vocab_size);
+  }
 
   const int M = desc.tokens;
   const int H = desc.hidden_size;
@@ -137,10 +169,15 @@ DispatchPath run_embed_q4_rmsnorm_fallback(const EmbedQ4RmsNormDesc& desc, const
   hal::memcpy_d2h_async(host_norm.data(), args.norm_weight, host_norm.size() * sizeof(float), stream);
   hal::stream_synchronize(stream);
 
-  for (int m = 0; m < M; ++m) {
-    if (host_tokens[m] < 0 || host_tokens[m] >= desc.vocab_size) {
-      throw std::out_of_range("embed_q4_rmsnorm: token id out of vocabulary range");
+  try {
+    validate_token_ids(host_tokens.data(), M, desc.vocab_size);
+  } catch (const std::out_of_range&) {
+    if (args.invalid_token_flag != nullptr) {
+      const std::uint32_t one = 1u;
+      hal::memcpy_h2d_async(args.invalid_token_flag, &one, sizeof(one), stream);
+      hal::stream_synchronize(stream);
     }
+    throw;
   }
 
   std::vector<std::uint8_t> host_rows(static_cast<std::size_t>(M) * desc.weight_row_bytes);

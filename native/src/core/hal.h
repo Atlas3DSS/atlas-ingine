@@ -10,8 +10,8 @@
 //   * Under graph capture or lazy execution, operations enqueued to a StreamHandle are deferred until the
 //     captured graph launches or commits; host-visible readbacks from memcpy_d2h_async or mapped exchange
 //     buffers are guaranteed visible to the host only after stream_synchronize() or Event::synchronize().
-//   * Backends without graph capture or conditional switch support must either execute eagerly via
-//     allow_eager=true or fail explicitly via require_graph_capture_or_eager().
+//   * Backends without ordinary graph capture or conditional SWITCH graph nodes must either execute eagerly via
+//     allow_eager=true or fail explicitly via require_graph_capture_or_eager() / require_conditional_switch_or_eager().
 #pragma once
 
 #ifndef INGINE_BACKEND_CUDA
@@ -65,9 +65,15 @@ struct DeviceCaps {
   bool supports_fp16 = false;
   bool supports_fp8_e4m3 = false;
   bool supports_graph_capture = false;
+  // Conditional SWITCH graph node support (e.g. cudaGraphCondTypeSwitch on CUDA >= 12.8 driver/context).
   bool supports_conditional_graph = false;
   bool supports_pdl = false;
   bool unified_memory = false;
+};
+
+enum class GraphRequirement : std::uint8_t {
+  Capture = 0,            // ordinary linear graph capture
+  ConditionalSwitch = 1,  // graph capture + conditional SWITCH node support
 };
 
 struct MemoryInfo {
@@ -166,7 +172,10 @@ DeviceCaps query_device_caps(int device_id = 0);
 MemoryInfo query_memory_info();
 bool conditional_graphs_enabled(int device_id = 0);
 bool is_stream_capturing(StreamHandle stream);
-void require_graph_capture_or_eager(const DeviceCaps& caps, bool allow_eager, const char* caller);
+bool graph_requirement_met(const DeviceCaps& caps, GraphRequirement requirement) noexcept;
+void require_graph_capture_or_eager(const DeviceCaps& caps, bool allow_eager, const char* caller,
+                                    GraphRequirement requirement = GraphRequirement::Capture);
+void require_conditional_switch_or_eager(const DeviceCaps& caps, bool allow_eager, const char* caller);
 
 void memcpy_h2d_async(void* dst_dev, const void* src_host, std::size_t bytes, StreamHandle stream = {});
 void memcpy_d2h_async(void* dst_host, const void* src_dev, std::size_t bytes, StreamHandle stream = {});

@@ -5,8 +5,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace ingine::hal {
@@ -132,15 +134,112 @@ const char* backend_name(BackendKind kind) noexcept {
   return "unknown";
 }
 
-bool conditional_graphs_enabled(int /*device_id*/) {
+namespace {
+
+bool probe_conditional_switch_device(int device_id) noexcept {
+#if CUDART_VERSION < 12080
+  (void)device_id;
+  return false;
+#else
+  int driver_ver = 0;
+  int runtime_ver = 0;
+  if (cudaDriverGetVersion(&driver_ver) != cudaSuccess || driver_ver < 12080) {
+    (void)cudaGetLastError();
+    return false;
+  }
+  if (cudaRuntimeGetVersion(&runtime_ver) != cudaSuccess || runtime_ver < 12080) {
+    (void)cudaGetLastError();
+    return false;
+  }
+  int major = 0;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id) != cudaSuccess || major < 7) {
+    (void)cudaGetLastError();
+    return false;
+  }
+
+  struct DeviceGuard {
+    int prev = 0;
+    bool restore = false;
+    ~DeviceGuard() {
+      if (restore) (void)cudaSetDevice(prev);
+    }
+  } guard;
+  int prev_dev = 0;
+  const bool had_prev = (cudaGetDevice(&prev_dev) == cudaSuccess);
+  if (!had_prev) (void)cudaGetLastError();
+  if (!had_prev || prev_dev != device_id) {
+    if (cudaSetDevice(device_id) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return false;
+    }
+    guard.prev = prev_dev;
+    guard.restore = had_prev;
+  }
+
+  // Ensure the primary CUDA context is active on `device_id` before graph conditional node creation.
+  if (cudaFree(nullptr) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return false;
+  }
+
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  bool ok = false;
+  if (cudaGraphCreate(&graph, 0) == cudaSuccess) {
+    cudaGraphConditionalHandle handle{};
+    if (cudaGraphConditionalHandleCreate(&handle, graph, 0, 0) == cudaSuccess) {
+      cudaGraphNodeParams p{};
+      p.type = cudaGraphNodeTypeConditional;
+      p.conditional.handle = handle;
+      p.conditional.type = cudaGraphCondTypeSwitch;
+      p.conditional.size = 1;
+      cudaGraphNode_t node = nullptr;
+#if CUDART_VERSION >= 13000
+      const cudaError_t add_err = cudaGraphAddNode(&node, graph, nullptr, nullptr, 0, &p);
+#else
+      const cudaError_t add_err = cudaGraphAddNode(&node, graph, nullptr, 0, &p);
+#endif
+      if (add_err == cudaSuccess && cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess) {
+        ok = true;
+      }
+    }
+  }
+  if (exec != nullptr) (void)cudaGraphExecDestroy(exec);
+  if (graph != nullptr) (void)cudaGraphDestroy(graph);
+  if (!ok) (void)cudaGetLastError();
+  return ok;
+#endif
+}
+
+}  // namespace
+
+bool conditional_graphs_enabled(int device_id) {
   const char* disable = std::getenv("INGINE_DISABLE_CONDITIONAL_GRAPHS");
   if (disable != nullptr && *disable != '\0' && std::strcmp(disable, "0") != 0) {
     return false;
   }
-#if CUDART_VERSION >= 12040
-  return true;
-#else
+#if CUDART_VERSION < 12080
+  (void)device_id;
   return false;
+#else
+  int count = 0;
+  if (cudaGetDeviceCount(&count) != cudaSuccess || device_id < 0 || device_id >= count) {
+    (void)cudaGetLastError();
+    return false;
+  }
+  static std::mutex cache_mutex;
+  static std::unordered_map<int, bool> cache;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto it = cache.find(device_id);
+    if (it != cache.end()) return it->second;
+  }
+  const bool supported = probe_conditional_switch_device(device_id);
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache.emplace(device_id, supported);
+  }
+  return supported;
 #endif
 }
 
@@ -184,11 +283,28 @@ bool is_stream_capturing(StreamHandle stream) {
   return status != cudaStreamCaptureStatusNone;
 }
 
-void require_graph_capture_or_eager(const DeviceCaps& caps, bool allow_eager, const char* caller) {
-  if (!caps.supports_graph_capture && !allow_eager) {
-    throw std::runtime_error(std::string(caller ? caller : "hal") + ": graph capture unsupported on backend " +
+bool graph_requirement_met(const DeviceCaps& caps, GraphRequirement requirement) noexcept {
+  switch (requirement) {
+    case GraphRequirement::Capture: return caps.supports_graph_capture;
+    case GraphRequirement::ConditionalSwitch: return caps.supports_graph_capture && caps.supports_conditional_graph;
+  }
+  return false;
+}
+
+void require_graph_capture_or_eager(const DeviceCaps& caps, bool allow_eager, const char* caller,
+                                    GraphRequirement requirement) {
+  if (allow_eager || graph_requirement_met(caps, requirement)) return;
+  const char* tag = caller ? caller : "hal";
+  if (!caps.supports_graph_capture) {
+    throw std::runtime_error(std::string(tag) + ": graph capture unsupported on backend " +
                              backend_name(caps.backend));
   }
+  throw std::runtime_error(std::string(tag) + ": conditional SWITCH graph unsupported on backend " +
+                           backend_name(caps.backend));
+}
+
+void require_conditional_switch_or_eager(const DeviceCaps& caps, bool allow_eager, const char* caller) {
+  require_graph_capture_or_eager(caps, allow_eager, caller, GraphRequirement::ConditionalSwitch);
 }
 
 void memcpy_h2d_async(void* dst_dev, const void* src_host, std::size_t bytes, StreamHandle stream) {

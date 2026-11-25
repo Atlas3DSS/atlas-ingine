@@ -5,6 +5,7 @@
 
 #include "core/device.h"
 #include "core/hal.h"
+#include "core/ops.h"
 
 #include <algorithm>
 #include <array>
@@ -150,7 +151,9 @@ void Runtime::init() {
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
-  supports_conditional_graphs_ = hal::conditional_graphs_enabled();
+  int active_dev = 0;
+  CUDA_CHECK(cudaGetDevice(&active_dev));
+  supports_conditional_graphs_ = hal::conditional_graphs_enabled(active_dev);
   const bool eager_offload = weights_.expert_cache && weights_.expert_cache->needs_host_dispatch();
   if (!eager_offload) {
     for (const auto& [m, history] : history_) capture(m, history);
@@ -299,6 +302,7 @@ void Runtime::set_persona(const persona::PersonaProfile* profile, const PersonaT
 void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
   const int m = int(tokens.size());
   buffers(m);  // the width must exist
+  ops::validate_token_ids_i32(tokens.data(), m, VOCAB);
   if (state_.paged_kv) state_.paged_kv->ensure_decode_pages(position, m, stream_);
   set_step_inputs(tokens.data(), m, position, this->tokens(), pos(), stream_);
 }
@@ -462,71 +466,140 @@ void Runtime::record_rollback(int m, const std::int32_t* accepted, cudaStream_t 
   verify_rollback(state_ptrs(), backup_, hist, pos(), 0, accepted, 0, m, stream);
 }
 
-GraphExec Runtime::capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
-                                  const std::function<void(cudaStream_t, int)>& branch) {
-  if (!supports_conditional_graphs_) {
-    throw std::logic_error("capture_switch: conditional CUDA graphs are disabled or unsupported");
+namespace {
+
+bool is_conditional_unsupported(cudaError_t err) noexcept {
+  switch (err) {
+    case cudaErrorNotSupported:
+    case cudaErrorNotPermitted:
+    case cudaErrorInsufficientDriver:
+    case cudaErrorOperatingSystem:
+#ifdef cudaErrorCallRequiresNewerDriver
+    case cudaErrorCallRequiresNewerDriver:
+#endif
+#ifdef cudaErrorUnsupportedPtxVersion
+    case cudaErrorUnsupportedPtxVersion:
+#endif
+      return true;
+    default:
+      return false;
   }
+}
+
+struct SwitchCudaError {
+  cudaError_t err = cudaSuccess;
+  const char* what = "";
+  bool from_switch_node = false;
+};
+
+void throw_if_switch_err(cudaError_t err, const char* what, bool from_switch_node = false) {
+  if (err != cudaSuccess) throw SwitchCudaError{err, what, from_switch_node};
+}
+
+}  // namespace
+
+GraphExec Runtime::try_capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
+                                      const std::function<void(cudaStream_t, int)>& branch) {
+  if (!supports_conditional_graphs_) return GraphExec{};
   if (verify_widths_.empty()) throw std::logic_error("capture_switch needs the speculative widths (options.spec)");
+#if CUDART_VERSION < 12080
+  (void)head;
+  (void)branch;
+  supports_conditional_graphs_ = false;
+  return GraphExec{};
+#else
   const cudaStream_t s = capture_stream_;
   cudaGraph_t graph = nullptr;
-  CUDA_CHECK(cudaGraphCreate(&graph, 0));
   struct Owned {
-    cudaGraph_t g;
-    ~Owned() { cudaGraphDestroy(g); }
-  } owned{graph};
-  // run `body` captured into `g` (an exception ends the capture first)
-  auto captured = [&](cudaGraph_t g, const std::function<void()>& body) {
-    CUDA_CHECK(cudaStreamBeginCaptureToGraph(s, g, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
-    try {
-      body();
-    } catch (...) {
-      cudaGraph_t out = nullptr;
-      cudaStreamEndCapture(s, &out);
-      throw;
+    cudaGraph_t& g;
+    ~Owned() {
+      if (g) (void)cudaGraphDestroy(g);
     }
-    cudaGraph_t out = nullptr;
-    CUDA_CHECK(cudaStreamEndCapture(s, &out));
-  };
+  } owned{graph};
 
-  cudaGraphConditionalHandle handle;
-  CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, graph, 0, 0));
-  cudaGraph_t* bodies = nullptr;
-  captured(graph, [&] {
-    head(s, handle);
-    cudaStreamCaptureStatus status;
-    cudaGraph_t g = nullptr;
-    const cudaGraphNode_t* deps = nullptr;
-    std::size_t n = 0;
-#if CUDART_VERSION >= 13000
-    const cudaGraphEdgeData* edges = nullptr;
-    CUDA_CHECK(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &edges, &n));
-#else
-    CUDA_CHECK(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &n));
-#endif
-    cudaGraphNodeParams p{};
-    p.type = cudaGraphNodeTypeConditional;
-    p.conditional.handle = handle;
-    p.conditional.type = cudaGraphCondTypeSwitch;
-    p.conditional.size = unsigned(verify_widths_.size());
-    cudaGraphNode_t node = nullptr;
-#if CUDART_VERSION >= 13000
-    CUDA_CHECK(cudaGraphAddNode(&node, g, deps, edges, n, &p));
-    bodies = p.conditional.phGraph_out;
-    CUDA_CHECK(cudaStreamUpdateCaptureDependencies(s, &node, nullptr, 1, cudaStreamSetCaptureDependencies));
-#else
-    CUDA_CHECK(cudaGraphAddNode(&node, g, deps, n, &p));
-    bodies = p.conditional.phGraph_out;
-    CUDA_CHECK(cudaStreamUpdateCaptureDependencies(s, &node, 1, cudaStreamSetCaptureDependencies));
-#endif
-  });
-  for (std::size_t i = 0; i < verify_widths_.size(); ++i)
-    captured(bodies[i], [&] { branch(s, verify_widths_[i]); });
+  try {
+    throw_if_switch_err(cudaGraphCreate(&graph, 0), "cudaGraphCreate");
+    // run `body` captured into `g` (an exception ends the capture first)
+    auto captured = [&](cudaGraph_t g, const std::function<void()>& body) {
+      throw_if_switch_err(
+          cudaStreamBeginCaptureToGraph(s, g, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal),
+          "cudaStreamBeginCaptureToGraph");
+      try {
+        body();
+      } catch (...) {
+        cudaGraph_t out = nullptr;
+        (void)cudaStreamEndCapture(s, &out);
+        throw;
+      }
+      cudaGraph_t out = nullptr;
+      throw_if_switch_err(cudaStreamEndCapture(s, &out), "cudaStreamEndCapture");
+    };
 
-  cudaGraphExec_t exec = nullptr;
-  CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
-  GraphExec result(exec);
-  CUDA_CHECK(cudaGraphUpload(exec, stream_));
+    cudaGraphConditionalHandle handle{};
+    throw_if_switch_err(cudaGraphConditionalHandleCreate(&handle, graph, 0, 0),
+                        "cudaGraphConditionalHandleCreate", /*from_switch_node=*/true);
+    cudaGraph_t* bodies = nullptr;
+    captured(graph, [&] {
+      head(s, handle);
+      cudaStreamCaptureStatus status;
+      cudaGraph_t g = nullptr;
+      const cudaGraphNode_t* deps = nullptr;
+      std::size_t n = 0;
+#if CUDART_VERSION >= 13000
+      const cudaGraphEdgeData* edges = nullptr;
+      throw_if_switch_err(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &edges, &n),
+                          "cudaStreamGetCaptureInfo");
+#else
+      throw_if_switch_err(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &n),
+                          "cudaStreamGetCaptureInfo");
+#endif
+      cudaGraphNodeParams p{};
+      p.type = cudaGraphNodeTypeConditional;
+      p.conditional.handle = handle;
+      p.conditional.type = cudaGraphCondTypeSwitch;
+      p.conditional.size = unsigned(verify_widths_.size());
+      cudaGraphNode_t node = nullptr;
+#if CUDART_VERSION >= 13000
+      throw_if_switch_err(cudaGraphAddNode(&node, g, deps, edges, n, &p), "cudaGraphAddNode(SWITCH)",
+                          /*from_switch_node=*/true);
+      bodies = p.conditional.phGraph_out;
+      throw_if_switch_err(
+          cudaStreamUpdateCaptureDependencies(s, &node, nullptr, 1, cudaStreamSetCaptureDependencies),
+          "cudaStreamUpdateCaptureDependencies");
+#else
+      throw_if_switch_err(cudaGraphAddNode(&node, g, deps, n, &p), "cudaGraphAddNode(SWITCH)",
+                          /*from_switch_node=*/true);
+      bodies = p.conditional.phGraph_out;
+      throw_if_switch_err(cudaStreamUpdateCaptureDependencies(s, &node, 1, cudaStreamSetCaptureDependencies),
+                          "cudaStreamUpdateCaptureDependencies");
+#endif
+    });
+    for (std::size_t i = 0; i < verify_widths_.size(); ++i)
+      captured(bodies[i], [&] { branch(s, verify_widths_[i]); });
+
+    cudaGraphExec_t exec = nullptr;
+    throw_if_switch_err(cudaGraphInstantiate(&exec, graph, 0), "cudaGraphInstantiate(SWITCH)",
+                        /*from_switch_node=*/true);
+    GraphExec result(exec);
+    throw_if_switch_err(cudaGraphUpload(exec, stream_), "cudaGraphUpload(SWITCH)");
+    return result;
+  } catch (const SwitchCudaError& e) {
+    (void)cudaGetLastError();
+    if (is_conditional_unsupported(e.err) || (e.from_switch_node && e.err == cudaErrorInvalidValue)) {
+      supports_conditional_graphs_ = false;
+      return GraphExec{};
+    }
+    throw std::runtime_error(std::string(e.what) + ": " + cudaGetErrorName(e.err) + ": " + cudaGetErrorString(e.err));
+  }
+#endif
+}
+
+GraphExec Runtime::capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
+                                  const std::function<void(cudaStream_t, int)>& branch) {
+  GraphExec result = try_capture_switch(head, branch);
+  if (!result) {
+    throw std::runtime_error("capture_switch: conditional SWITCH CUDA graphs are disabled or unsupported");
+  }
   return result;
 }
 

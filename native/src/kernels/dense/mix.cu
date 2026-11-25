@@ -431,11 +431,43 @@ __global__ void __launch_bounds__(BW) embed_kernel(const int64_t* __restrict__ t
   }
 }
 
+__device__ __forceinline__ float4 decode_q4_0_x4(uint16_t b2, __half scale) {
+  const float d_raw = __half2float(scale);
+  const float d = isfinite(d_raw) ? d_raw : 0.f;
+  const float m8d = -8.f * d;
+  return make_float4(fmaf(float(b2 & 0xfu), d, m8d), fmaf(float((b2 >> 4) & 0xfu), d, m8d),
+                     fmaf(float((b2 >> 8) & 0xfu), d, m8d), fmaf(float((b2 >> 12) & 0xfu), d, m8d));
+}
+
+__global__ void __launch_bounds__(256) decode_q4_0_kernel(const uint8_t* __restrict__ table, int hidden_size,
+                                                          float* __restrict__ out) {
+  const int row_idx = blockIdx.x;
+  const int t = threadIdx.x;
+  const int nv = hidden_size / 4;
+  const size_t nib_bytes = size_t(hidden_size) / 2;
+  const size_t row_bytes = nib_bytes + size_t(hidden_size / 32) * 2;
+  const uint8_t* row = table + size_t(row_idx) * row_bytes;
+  const uint8_t* scale_bytes = row + nib_bytes;
+  float* out_row = out + size_t(row_idx) * size_t(hidden_size);
+  for (int idx = t; idx < nv; idx += blockDim.x) {
+    const uint16_t b2 = static_cast<uint16_t>(row[2 * idx]) |
+                        (static_cast<uint16_t>(row[2 * idx + 1]) << 8);
+    const unsigned short sb = static_cast<unsigned short>(scale_bytes[2 * (idx >> 3)]) |
+                              (static_cast<unsigned short>(scale_bytes[2 * (idx >> 3) + 1]) << 8);
+    const float4 v = decode_q4_0_x4(b2, __ushort_as_half(sb));
+    out_row[4 * idx + 0] = v.x;
+    out_row[4 * idx + 1] = v.y;
+    out_row[4 * idx + 2] = v.z;
+    out_row[4 * idx + 3] = v.w;
+  }
+}
+
 // Q4_0 SoA embedding lookup + identical RMS norm: row layout [1152B nibbles | 72 FP16 scales = 144B] = 1296B/row.
 template <int BW>
-__global__ void __launch_bounds__(BW) embed_q4_kernel(const int64_t* __restrict__ token,
+__global__ void __launch_bounds__(BW) embed_q4_kernel(const int64_t* __restrict__ token, int vocab_size,
                                                       const uint8_t* __restrict__ table,
-                                                      const float* __restrict__ norm_w, float* __restrict__ out) {
+                                                      const float* __restrict__ norm_w, float* __restrict__ out,
+                                                      std::uint32_t* __restrict__ oob_flag) {
   constexpr int NV = H / 4;                  // 576 four-element vectors
   constexpr int PER = (NV + BW - 1) / BW;
   constexpr size_t NIB_BYTES = H / 2;        // 1152
@@ -449,7 +481,12 @@ __global__ void __launch_bounds__(BW) embed_q4_kernel(const int64_t* __restrict_
     if (t + k * BW < NV) g[k] = *reinterpret_cast<const float4*>(norm_w + 4 * (t + k * BW));
   pdl_wait();
   pdl_trigger();
-  const uint8_t* row = table + size_t(token[m]) * ROW_BYTES;
+  const int64_t tok = token[m];
+  if (tok < 0 || tok >= vocab_size) {
+    if (t == 0 && oob_flag != nullptr) atomicExch(oob_flag, 1u);
+    return;
+  }
+  const uint8_t* row = table + size_t(tok) * ROW_BYTES;
   const __half* scales = reinterpret_cast<const __half*>(row + NIB_BYTES);
   float4 v[PER];
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
@@ -458,10 +495,7 @@ __global__ void __launch_bounds__(BW) embed_q4_kernel(const int64_t* __restrict_
     const int idx = t + k * BW;
     if (idx < NV) {
       const uint16_t b2 = *reinterpret_cast<const uint16_t*>(row + 2 * idx);
-      const float d = __half2float(scales[idx >> 3]);
-      const float m8d = -8.f * d;
-      v[k] = make_float4(fmaf(float(b2 & 0xfu), d, m8d), fmaf(float((b2 >> 4) & 0xfu), d, m8d),
-                         fmaf(float((b2 >> 8) & 0xfu), d, m8d), fmaf(float((b2 >> 12) & 0xfu), d, m8d));
+      v[k] = decode_q4_0_x4(b2, scales[idx >> 3]);
       acc[0] = __fadd_rn(acc[0], __fmul_rn(v[k].x, v[k].x));
       acc[1] = __fadd_rn(acc[1], __fmul_rn(v[k].y, v[k].y));
       acc[2] = __fadd_rn(acc[2], __fmul_rn(v[k].z, v[k].z));
@@ -596,15 +630,24 @@ void embed(const std::int64_t* token, int M, const ActT* table, const float* nor
   else launch_ex(embed_kernel<64>, dim3(M), 64, 0, 1, pdl, stream, token, table, norm_w, out);
 }
 
-void embed_q4(const std::int64_t* token, int M, const void* table_q4, const float* norm_w, float* out,
-              bool pdl, cudaStream_t stream) {
+void embed_q4(const std::int64_t* token, int M, int vocab_size, const void* table_q4, const float* norm_w, float* out,
+              bool pdl, cudaStream_t stream, std::uint32_t* oob_flag) {
   require(M >= 1, "embed_q4: M must be >= 1");
+  require(vocab_size >= 1, "embed_q4: vocab_size must be >= 1");
   require(token && table_q4 && norm_w && out, "embed_q4: null argument");
   const auto* tbl = static_cast<const uint8_t*>(table_q4);
-  if (M == 1) launch_ex(embed_q4_kernel<512>, dim3(M), 512, 0, 1, pdl, stream, token, tbl, norm_w, out);
-  else if (M < 4) launch_ex(embed_q4_kernel<256>, dim3(M), 256, 0, 1, pdl, stream, token, tbl, norm_w, out);
-  else if (M < 8) launch_ex(embed_q4_kernel<128>, dim3(M), 128, 0, 1, pdl, stream, token, tbl, norm_w, out);
-  else launch_ex(embed_q4_kernel<64>, dim3(M), 64, 0, 1, pdl, stream, token, tbl, norm_w, out);
+  if (M == 1) launch_ex(embed_q4_kernel<512>, dim3(M), 512, 0, 1, pdl, stream, token, vocab_size, tbl, norm_w, out, oob_flag);
+  else if (M < 4) launch_ex(embed_q4_kernel<256>, dim3(M), 256, 0, 1, pdl, stream, token, vocab_size, tbl, norm_w, out, oob_flag);
+  else if (M < 8) launch_ex(embed_q4_kernel<128>, dim3(M), 128, 0, 1, pdl, stream, token, vocab_size, tbl, norm_w, out, oob_flag);
+  else launch_ex(embed_q4_kernel<64>, dim3(M), 64, 0, 1, pdl, stream, token, vocab_size, tbl, norm_w, out, oob_flag);
+}
+
+void decode_q4_0(const void* table_q4, int rows, int hidden_size, float* out_f32, cudaStream_t stream) {
+  require(rows >= 1, "decode_q4_0: rows must be >= 1");
+  require(hidden_size > 0 && (hidden_size % 32) == 0, "decode_q4_0: hidden_size must be a positive multiple of 32");
+  require(table_q4 && out_f32, "decode_q4_0: null argument");
+  launch_ex(decode_q4_0_kernel, dim3(rows), 256, 0, 1, false, stream,
+            static_cast<const uint8_t*>(table_q4), hidden_size, out_f32);
 }
 
 namespace {

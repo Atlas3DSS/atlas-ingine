@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -12,12 +13,15 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace ingine {
 namespace {
+
+std::atomic<int> g_fail_worker_index{-1};
 
 std::string cuda_message(const char* what, cudaError_t err) {
     return std::string(what) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
@@ -63,8 +67,13 @@ struct DeviceUploader::Impl {
                            "DeviceUploader: cudaEventCreateWithFlags");
                 free_slots_.push_back(static_cast<int>(i));
             }
+            const int fail_at = g_fail_worker_index.exchange(-1, std::memory_order_acq_rel);
             workers_.reserve(static_cast<std::size_t>(options_.reader_threads));
             for (int i = 0; i < options_.reader_threads; ++i) {
+                if (i == fail_at) {
+                    throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                            "injected CUDA uploader worker startup failure");
+                }
                 workers_.emplace_back([this] { worker_main(); });
             }
         } catch (...) {
@@ -73,7 +82,9 @@ struct DeviceUploader::Impl {
                 stopping_ = true;
             }
             work_cv_.notify_all();
-            for (std::thread& w : workers_) { w.join(); }
+            for (std::thread& w : workers_) {
+                if (w.joinable()) { w.join(); }
+            }
             for (Slot& s : slots_) {
                 if (s.done != nullptr) { (void)cudaEventDestroy(s.done); }
             }
@@ -267,6 +278,10 @@ DeviceUploader::~DeviceUploader() = default;
 UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests,
                                    hal::StreamHandle stream) {
     return impl_->upload(requests, static_cast<cudaStream_t>(stream));
+}
+
+void fail_next_uploader_worker_start(int worker_index) noexcept {
+    g_fail_worker_index.store(worker_index, std::memory_order_release);
 }
 
 } // namespace ingine

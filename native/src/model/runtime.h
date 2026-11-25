@@ -180,6 +180,10 @@ class Runtime {
   // ---- device-selected verify widths (graph building; `stream` is a capturing stream)
   // A graph of `head` (captured; it must set the switch condition to an index into verify_widths()) followed
   // by a switch node whose branch i is `branch(verify_widths()[i])` (captured).
+  // try_capture_switch returns an empty GraphExec and disables conditional graphs on controlled unsupported
+  // driver/runtime/SWITCH failures; capture_switch throws if conditional SWITCH graphs are unavailable.
+  GraphExec try_capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
+                               const std::function<void(cudaStream_t, int)>& branch);
   GraphExec capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
                            const std::function<void(cudaStream_t, int)>& branch);
   // Mech-interp / persona runtime hooks: fixed-address device table + dual unhooked/hooked CUDA graphs.
