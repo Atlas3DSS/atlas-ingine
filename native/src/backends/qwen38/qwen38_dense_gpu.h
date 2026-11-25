@@ -41,6 +41,7 @@ struct Qwen38GemmParityReport {
   float nvfp4_max_abs = 0.0f;
   float fp8_cal_max_abs = 0.0f;
   float bf16_max_abs = 0.0f;
+  float batch_invariance_max_abs = 0.0f;
   bool passed = false;
 };
 

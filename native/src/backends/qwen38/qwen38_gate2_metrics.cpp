@@ -171,13 +171,19 @@ Qwen38KldSummary summarize_kld_metrics(std::span<const Qwen38LogitParityPoint> p
 Qwen38Gate2Verdict evaluate_gate2_verdict(const Qwen38Gate2Input& in) {
   Qwen38Gate2Verdict v;
 
+  auto summary_scalars_valid = [](const Qwen38KldSummary& s) noexcept {
+    return s.all_finite && std::isfinite(s.kld_mean) && std::isfinite(s.kld_p99) && std::isfinite(s.kld_max) &&
+           std::isfinite(s.top1_agreement) && s.kld_mean >= 0.0 && s.kld_p99 >= 0.0 && s.kld_max >= 0.0 &&
+           s.top1_agreement >= 0.0 && s.top1_agreement <= 1.0 && s.top1_matches <= s.positions;
+  };
+
   auto check_short = [&]() {
     if (in.short_prompt_count != 3 || in.short_summary.positions != 141) {
       v.failures.push_back("short_prompts incomplete count/positions");
       return false;
     }
-    if (!in.short_summary.all_finite) {
-      v.failures.push_back("short_prompts nonfinite logits");
+    if (!summary_scalars_valid(in.short_summary)) {
+      v.failures.push_back("short_prompts nonfinite or out-of-range summary");
       return false;
     }
     if (in.prompt0_greedy_total != 16 || in.prompt0_greedy_matches != 16) {
@@ -205,8 +211,8 @@ Qwen38Gate2Verdict evaluate_gate2_verdict(const Qwen38Gate2Input& in) {
       v.failures.push_back("long_code incomplete count/positions");
       return false;
     }
-    if (!in.long_summary.all_finite) {
-      v.failures.push_back("long_code nonfinite logits");
+    if (!summary_scalars_valid(in.long_summary)) {
+      v.failures.push_back("long_code nonfinite or out-of-range summary");
       return false;
     }
     bool ok = true;
@@ -230,8 +236,8 @@ Qwen38Gate2Verdict evaluate_gate2_verdict(const Qwen38Gate2Input& in) {
       v.failures.push_back("chunked_vs_stepwise incomplete count/positions");
       return false;
     }
-    if (!in.chunk_vs_step_summary.all_finite) {
-      v.failures.push_back("chunked_vs_stepwise nonfinite logits");
+    if (!summary_scalars_valid(in.chunk_vs_step_summary)) {
+      v.failures.push_back("chunked_vs_stepwise nonfinite or out-of-range summary");
       return false;
     }
     bool ok = true;

@@ -644,9 +644,9 @@ __global__ void split_q_gate_kernel(const ActIO* __restrict__ q_with_gate, ActIO
   gate_out[dst_idx] = q_with_gate[src_base + head_dim + d];
 }
 
-template <typename ActIO>
+template <typename ActIO, typename KvIO = ActIO>
 __global__ void causal_gqa_gated_attn_kernel(const ActIO* __restrict__ q, const ActIO* __restrict__ gate,
-                                             const ActIO* __restrict__ k_cache, const ActIO* __restrict__ v_cache,
+                                             const KvIO* __restrict__ k_cache, const KvIO* __restrict__ v_cache,
                                              int seq_len, int pos_offset, int num_heads, int num_kv_heads,
                                              int head_dim, ActIO* __restrict__ out_attn) {
   const int h = blockIdx.x;
@@ -985,6 +985,296 @@ __global__ void gather_rows_bf16_kernel(const std::uint16_t* __restrict__ src, c
       src[static_cast<std::size_t>(src_row) * hidden_size + d];
 }
 
+__global__ void quant_fp8_act_f32_kernel(const float* __restrict__ x_in, float inv_scale, float input_scale,
+                                         std::size_t n, float* __restrict__ x_out) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    x_out[i] = dev_decode_e4m3fn(dev_quantize_e4m3fn(x_in[i] * inv_scale)) * input_scale;
+  }
+}
+
+template <int TM, bool kAligned16>
+__global__ void nvfp4_linear_f32_batched_kernel(const float* __restrict__ x, const std::uint8_t* __restrict__ w_packed,
+                                                const std::uint8_t* __restrict__ block_scales, float weight_scale_2,
+                                                int m, int out_features, int in_features, float* __restrict__ out) {
+  const int warp_in_block = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int m0 = blockIdx.y * TM;
+  const int n = blockIdx.x * 4 + warp_in_block;
+  if (m0 >= m || n >= out_features) return;
+  const int tm = min(TM, m - m0);
+
+  const int blocks = in_features >> 4;
+  const std::size_t w_base = static_cast<std::size_t>(n) * static_cast<std::size_t>(in_features >> 1);
+  const std::size_t s_base = static_cast<std::size_t>(n) * static_cast<std::size_t>(blocks);
+
+  float acc[TM]{};
+  for (int b = lane; b < blocks; b += 32) {
+    const float sc = dev_decode_e4m3fn(block_scales[s_base + b]) * weight_scale_2;
+    std::uint32_t packed[2]{};
+    std::memcpy(packed, w_packed + w_base + static_cast<std::size_t>(b << 3), 8);
+    const std::uint16_t words[4] = {
+        static_cast<std::uint16_t>(packed[0] & 0xffffu),
+        static_cast<std::uint16_t>(packed[0] >> 16),
+        static_cast<std::uint16_t>(packed[1] & 0xffffu),
+        static_cast<std::uint16_t>(packed[1] >> 16),
+    };
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      const std::uint16_t word = words[g];
+      const float w0 = dev_decode_e2m1(static_cast<std::uint8_t>(word & 0x0fu)) * sc;
+      const float w1 = dev_decode_e2m1(static_cast<std::uint8_t>((word >> 4) & 0x0fu)) * sc;
+      const float w2 = dev_decode_e2m1(static_cast<std::uint8_t>((word >> 8) & 0x0fu)) * sc;
+      const float w3 = dev_decode_e2m1(static_cast<std::uint8_t>((word >> 12) & 0x0fu)) * sc;
+      const int k_off = (b << 4) + (g << 2);
+      if (tm == TM) {
+        #pragma unroll
+        for (int r = 0; r < TM; ++r) {
+          const std::size_t x_off = static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(in_features) + k_off;
+          float4 xv;
+          if constexpr (kAligned16) {
+            xv = *reinterpret_cast<const float4*>(x + x_off);
+          } else {
+            xv = make_float4(x[x_off], x[x_off + 1], x[x_off + 2], x[x_off + 3]);
+          }
+          acc[r] = fmaf(xv.x, w0, acc[r]);
+          acc[r] = fmaf(xv.y, w1, acc[r]);
+          acc[r] = fmaf(xv.z, w2, acc[r]);
+          acc[r] = fmaf(xv.w, w3, acc[r]);
+        }
+      } else {
+        for (int r = 0; r < tm; ++r) {
+          const std::size_t x_off = static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(in_features) + k_off;
+          float4 xv;
+          if constexpr (kAligned16) {
+            xv = *reinterpret_cast<const float4*>(x + x_off);
+          } else {
+            xv = make_float4(x[x_off], x[x_off + 1], x[x_off + 2], x[x_off + 3]);
+          }
+          acc[r] = fmaf(xv.x, w0, acc[r]);
+          acc[r] = fmaf(xv.y, w1, acc[r]);
+          acc[r] = fmaf(xv.z, w2, acc[r]);
+          acc[r] = fmaf(xv.w, w3, acc[r]);
+        }
+      }
+    }
+  }
+  for (int r = 0; r < tm; ++r) {
+    const float s = warp_sum(acc[r]);
+    if (lane == 0) {
+      out[static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(out_features) + n] = s;
+    }
+  }
+}
+
+template <int TM, bool kVec4, bool kAligned16>
+__global__ void fp8_linear_f32_batched_kernel(const float* __restrict__ x, const std::uint8_t* __restrict__ w_e4m3,
+                                              float weight_scale, float input_scale, int m, int out_features,
+                                              int in_features, float* __restrict__ out) {
+  const int warp_in_block = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int m0 = blockIdx.y * TM;
+  const int n = blockIdx.x * 4 + warp_in_block;
+  if (m0 >= m || n >= out_features) return;
+  const int tm = min(TM, m - m0);
+
+  const std::size_t w_base = static_cast<std::size_t>(n) * static_cast<std::size_t>(in_features);
+  const bool calibrated = (input_scale > 0.0f);
+  const float inv_in = calibrated ? (1.0f / input_scale) : 1.0f;
+
+  float acc[TM]{};
+  if constexpr (kVec4) {
+    const int k4s = in_features >> 2;
+    for (int k4 = lane; k4 < k4s; k4 += 32) {
+      std::uint8_t wb[4]{};
+      std::memcpy(wb, w_e4m3 + w_base + static_cast<std::size_t>(k4 << 2), 4);
+      const float w0 = dev_decode_e4m3fn(wb[0]);
+      const float w1 = dev_decode_e4m3fn(wb[1]);
+      const float w2 = dev_decode_e4m3fn(wb[2]);
+      const float w3 = dev_decode_e4m3fn(wb[3]);
+      const int k_off = k4 << 2;
+      if (tm == TM) {
+        #pragma unroll
+        for (int r = 0; r < TM; ++r) {
+          const std::size_t x_off = static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(in_features) + k_off;
+          float4 xv;
+          if constexpr (kAligned16) {
+            xv = *reinterpret_cast<const float4*>(x + x_off);
+          } else {
+            xv = make_float4(x[x_off], x[x_off + 1], x[x_off + 2], x[x_off + 3]);
+          }
+          if (calibrated) {
+            xv.x = dev_decode_e4m3fn(dev_quantize_e4m3fn(xv.x * inv_in)) * input_scale;
+            xv.y = dev_decode_e4m3fn(dev_quantize_e4m3fn(xv.y * inv_in)) * input_scale;
+            xv.z = dev_decode_e4m3fn(dev_quantize_e4m3fn(xv.z * inv_in)) * input_scale;
+            xv.w = dev_decode_e4m3fn(dev_quantize_e4m3fn(xv.w * inv_in)) * input_scale;
+          }
+          acc[r] = fmaf(xv.x, w0, acc[r]);
+          acc[r] = fmaf(xv.y, w1, acc[r]);
+          acc[r] = fmaf(xv.z, w2, acc[r]);
+          acc[r] = fmaf(xv.w, w3, acc[r]);
+        }
+      } else {
+        for (int r = 0; r < tm; ++r) {
+          const std::size_t x_off = static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(in_features) + k_off;
+          float4 xv;
+          if constexpr (kAligned16) {
+            xv = *reinterpret_cast<const float4*>(x + x_off);
+          } else {
+            xv = make_float4(x[x_off], x[x_off + 1], x[x_off + 2], x[x_off + 3]);
+          }
+          if (calibrated) {
+            xv.x = dev_decode_e4m3fn(dev_quantize_e4m3fn(xv.x * inv_in)) * input_scale;
+            xv.y = dev_decode_e4m3fn(dev_quantize_e4m3fn(xv.y * inv_in)) * input_scale;
+            xv.z = dev_decode_e4m3fn(dev_quantize_e4m3fn(xv.z * inv_in)) * input_scale;
+            xv.w = dev_decode_e4m3fn(dev_quantize_e4m3fn(xv.w * inv_in)) * input_scale;
+          }
+          acc[r] = fmaf(xv.x, w0, acc[r]);
+          acc[r] = fmaf(xv.y, w1, acc[r]);
+          acc[r] = fmaf(xv.z, w2, acc[r]);
+          acc[r] = fmaf(xv.w, w3, acc[r]);
+        }
+      }
+    }
+  } else {
+    for (int k = lane; k < in_features; k += 32) {
+      const float wv = dev_decode_e4m3fn(w_e4m3[w_base + k]);
+      for (int r = 0; r < tm; ++r) {
+        float xv = x[static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(in_features) + k];
+        if (calibrated) xv = dev_decode_e4m3fn(dev_quantize_e4m3fn(xv * inv_in)) * input_scale;
+        acc[r] = fmaf(xv, wv, acc[r]);
+      }
+    }
+  }
+  for (int r = 0; r < tm; ++r) {
+    const float s = warp_sum(acc[r]);
+    if (lane == 0) {
+      out[static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(out_features) + n] = s * weight_scale;
+    }
+  }
+}
+
+template <int TM, bool kVec4, bool kAligned16>
+__global__ void bf16_linear_f32_batched_kernel(const float* __restrict__ x, const std::uint16_t* __restrict__ w_bf16,
+                                               int m, int out_features, int in_features, float* __restrict__ out) {
+  const int warp_in_block = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int m0 = blockIdx.y * TM;
+  const int n = blockIdx.x * 4 + warp_in_block;
+  if (m0 >= m || n >= out_features) return;
+  const int tm = min(TM, m - m0);
+
+  const std::size_t w_base = static_cast<std::size_t>(n) * static_cast<std::size_t>(in_features);
+  float acc[TM]{};
+  if constexpr (kVec4) {
+    const int k4s = in_features >> 2;
+    for (int k4 = lane; k4 < k4s; k4 += 32) {
+      std::uint16_t wb[4]{};
+      std::memcpy(wb, w_bf16 + w_base + static_cast<std::size_t>(k4 << 2), 8);
+      const float w0 = dev_bf16_to_f32(wb[0]);
+      const float w1 = dev_bf16_to_f32(wb[1]);
+      const float w2 = dev_bf16_to_f32(wb[2]);
+      const float w3 = dev_bf16_to_f32(wb[3]);
+      const int k_off = k4 << 2;
+      if (tm == TM) {
+        #pragma unroll
+        for (int r = 0; r < TM; ++r) {
+          const std::size_t x_off = static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(in_features) + k_off;
+          float4 xv;
+          if constexpr (kAligned16) {
+            xv = *reinterpret_cast<const float4*>(x + x_off);
+          } else {
+            xv = make_float4(x[x_off], x[x_off + 1], x[x_off + 2], x[x_off + 3]);
+          }
+          acc[r] = fmaf(xv.x, w0, acc[r]);
+          acc[r] = fmaf(xv.y, w1, acc[r]);
+          acc[r] = fmaf(xv.z, w2, acc[r]);
+          acc[r] = fmaf(xv.w, w3, acc[r]);
+        }
+      } else {
+        for (int r = 0; r < tm; ++r) {
+          const std::size_t x_off = static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(in_features) + k_off;
+          float4 xv;
+          if constexpr (kAligned16) {
+            xv = *reinterpret_cast<const float4*>(x + x_off);
+          } else {
+            xv = make_float4(x[x_off], x[x_off + 1], x[x_off + 2], x[x_off + 3]);
+          }
+          acc[r] = fmaf(xv.x, w0, acc[r]);
+          acc[r] = fmaf(xv.y, w1, acc[r]);
+          acc[r] = fmaf(xv.z, w2, acc[r]);
+          acc[r] = fmaf(xv.w, w3, acc[r]);
+        }
+      }
+    }
+  } else {
+    for (int k = lane; k < in_features; k += 32) {
+      const float wv = dev_bf16_to_f32(w_bf16[w_base + k]);
+      for (int r = 0; r < tm; ++r) {
+        const float xv = x[static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(in_features) + k];
+        acc[r] = fmaf(xv, wv, acc[r]);
+      }
+    }
+  }
+  for (int r = 0; r < tm; ++r) {
+    const float s = warp_sum(acc[r]);
+    if (lane == 0) {
+      out[static_cast<std::size_t>(m0 + r) * static_cast<std::size_t>(out_features) + n] = s;
+    }
+  }
+}
+
+__global__ void embed_lookup_f32_kernel(const std::uint16_t* __restrict__ embed_table,
+                                        const std::int32_t* __restrict__ token_ids, int seq_len, int hidden_size,
+                                        int vocab_size, float* __restrict__ out_hidden) {
+  const int row = blockIdx.y;
+  const int d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= seq_len || d >= hidden_size) return;
+  const std::int32_t tid = token_ids[row];
+  const float val = (tid >= 0 && tid < vocab_size)
+                        ? dev_bf16_to_f32(embed_table[static_cast<std::size_t>(tid) * hidden_size + d])
+                        : 0.0f;
+  out_hidden[static_cast<std::size_t>(row) * hidden_size + d] = val;
+}
+
+__global__ void gather_rows_f32_kernel(const float* __restrict__ src, const int* __restrict__ row_indices,
+                                       int num_rows, int hidden_size, float* __restrict__ dst) {
+  const int row = blockIdx.y;
+  const int d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows || d >= hidden_size) return;
+  const int src_row = row_indices[row];
+  dst[static_cast<std::size_t>(row) * hidden_size + d] =
+      src[static_cast<std::size_t>(src_row) * hidden_size + d];
+}
+
+__global__ void swiglu_mul_f32_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                      float* __restrict__ out, std::size_t n) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = dev_silu(gate[i]) * up[i];
+}
+
+__global__ void add_residual_f32_kernel(float* __restrict__ hidden, const float* __restrict__ residual, std::size_t n) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) hidden[i] += residual[i];
+}
+
+__global__ void split_qkv_sep_f32_kernel(const float* __restrict__ mixed, float* __restrict__ q_sep,
+                                         float* __restrict__ k_sep, float* __restrict__ v_sep, int seq_len, int kd,
+                                         int vd) {
+  const int cd = 2 * kd + vd;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int t = blockIdx.y;
+  if (t >= seq_len || idx >= cd) return;
+  const float val = mixed[static_cast<std::size_t>(t * cd + idx)];
+  if (idx < kd) {
+    q_sep[static_cast<std::size_t>(t * kd + idx)] = val;
+  } else if (idx < 2 * kd) {
+    k_sep[static_cast<std::size_t>(t * kd + (idx - kd))] = val;
+  } else {
+    v_sep[static_cast<std::size_t>(t * vd + (idx - 2 * kd))] = val;
+  }
+}
+
 }  // namespace
 
 void qwen38_cuda_f32_to_bf16(const float* src, __nv_bfloat16* dst, std::size_t n, cudaStream_t stream) {
@@ -1306,6 +1596,202 @@ void qwen38_cuda_bf16_linear_bf16_to_f32(const __nv_bfloat16* x, const __nv_bflo
   bf16_linear_kernel<std::uint16_t, float><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
       reinterpret_cast<const std::uint16_t*>(x), reinterpret_cast<const std::uint16_t*>(w_bf16), m, out_features,
       in_features, out_f32);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_quant_fp8_act_f32(const float* x_in, float input_scale, std::size_t n, float* x_out,
+                                   cudaStream_t stream) {
+  if (n == 0) return;
+  if (!(input_scale > 0.0f)) throw std::invalid_argument("quant_fp8_act_f32 requires positive input_scale");
+  quant_fp8_act_f32_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x_in, 1.0f / input_scale, input_scale, n, x_out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_nvfp4_linear_f32_batched(const float* x, const std::uint8_t* w_packed,
+                                          const std::uint8_t* block_scales_e4m3, float weight_scale_2, int m,
+                                          int out_features, int in_features, float* out, cudaStream_t stream) {
+  if (m <= 0 || out_features <= 0 || in_features <= 0 || in_features % 16 != 0) {
+    throw std::invalid_argument("nvfp4_linear_f32_batched bad shape");
+  }
+  const bool aligned16 = ((reinterpret_cast<std::uintptr_t>(x) & 15u) == 0u);
+  const int gx = (out_features + 3) / 4;
+  if (m == 1) {
+    if (aligned16) {
+      nvfp4_linear_f32_batched_kernel<1, true><<<dim3(gx, 1), 128, 0, stream>>>(
+          x, w_packed, block_scales_e4m3, weight_scale_2, m, out_features, in_features, out);
+    } else {
+      nvfp4_linear_f32_batched_kernel<1, false><<<dim3(gx, 1), 128, 0, stream>>>(
+          x, w_packed, block_scales_e4m3, weight_scale_2, m, out_features, in_features, out);
+    }
+  } else {
+    const int gy = (m + 15) / 16;
+    if (aligned16) {
+      nvfp4_linear_f32_batched_kernel<16, true><<<dim3(gx, gy), 128, 0, stream>>>(
+          x, w_packed, block_scales_e4m3, weight_scale_2, m, out_features, in_features, out);
+    } else {
+      nvfp4_linear_f32_batched_kernel<16, false><<<dim3(gx, gy), 128, 0, stream>>>(
+          x, w_packed, block_scales_e4m3, weight_scale_2, m, out_features, in_features, out);
+    }
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_fp8_linear_f32_batched(const float* x, const std::uint8_t* w_e4m3, float weight_scale,
+                                        float input_scale, int m, int out_features, int in_features, float* out,
+                                        cudaStream_t stream) {
+  if (m <= 0 || out_features <= 0 || in_features <= 0) {
+    throw std::invalid_argument("fp8_linear_f32_batched bad shape");
+  }
+  const bool vec4 = ((in_features & 3) == 0);
+  const bool aligned16 = vec4 && ((reinterpret_cast<std::uintptr_t>(x) & 15u) == 0u);
+  const int gx = (out_features + 3) / 4;
+  if (m == 1) {
+    if (vec4 && aligned16) {
+      fp8_linear_f32_batched_kernel<1, true, true><<<dim3(gx, 1), 128, 0, stream>>>(
+          x, w_e4m3, weight_scale, input_scale, m, out_features, in_features, out);
+    } else if (vec4) {
+      fp8_linear_f32_batched_kernel<1, true, false><<<dim3(gx, 1), 128, 0, stream>>>(
+          x, w_e4m3, weight_scale, input_scale, m, out_features, in_features, out);
+    } else {
+      fp8_linear_f32_batched_kernel<1, false, false><<<dim3(gx, 1), 128, 0, stream>>>(
+          x, w_e4m3, weight_scale, input_scale, m, out_features, in_features, out);
+    }
+  } else {
+    const int gy = (m + 15) / 16;
+    if (vec4 && aligned16) {
+      fp8_linear_f32_batched_kernel<16, true, true><<<dim3(gx, gy), 128, 0, stream>>>(
+          x, w_e4m3, weight_scale, input_scale, m, out_features, in_features, out);
+    } else if (vec4) {
+      fp8_linear_f32_batched_kernel<16, true, false><<<dim3(gx, gy), 128, 0, stream>>>(
+          x, w_e4m3, weight_scale, input_scale, m, out_features, in_features, out);
+    } else {
+      fp8_linear_f32_batched_kernel<16, false, false><<<dim3(gx, gy), 128, 0, stream>>>(
+          x, w_e4m3, weight_scale, input_scale, m, out_features, in_features, out);
+    }
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_bf16_linear_f32_batched(const float* x, const __nv_bfloat16* w_bf16, int m, int out_features,
+                                         int in_features, float* out, cudaStream_t stream) {
+  if (m <= 0 || out_features <= 0 || in_features <= 0) {
+    throw std::invalid_argument("bf16_linear_f32_batched bad shape");
+  }
+  const auto* w_u16 = reinterpret_cast<const std::uint16_t*>(w_bf16);
+  const bool vec4 = ((in_features & 3) == 0);
+  const bool aligned16 = vec4 && ((reinterpret_cast<std::uintptr_t>(x) & 15u) == 0u);
+  const int gx = (out_features + 3) / 4;
+  if (m == 1) {
+    if (vec4 && aligned16) {
+      bf16_linear_f32_batched_kernel<1, true, true><<<dim3(gx, 1), 128, 0, stream>>>(
+          x, w_u16, m, out_features, in_features, out);
+    } else if (vec4) {
+      bf16_linear_f32_batched_kernel<1, true, false><<<dim3(gx, 1), 128, 0, stream>>>(
+          x, w_u16, m, out_features, in_features, out);
+    } else {
+      bf16_linear_f32_batched_kernel<1, false, false><<<dim3(gx, 1), 128, 0, stream>>>(
+          x, w_u16, m, out_features, in_features, out);
+    }
+  } else {
+    const int gy = (m + 15) / 16;
+    if (vec4 && aligned16) {
+      bf16_linear_f32_batched_kernel<16, true, true><<<dim3(gx, gy), 128, 0, stream>>>(
+          x, w_u16, m, out_features, in_features, out);
+    } else if (vec4) {
+      bf16_linear_f32_batched_kernel<16, true, false><<<dim3(gx, gy), 128, 0, stream>>>(
+          x, w_u16, m, out_features, in_features, out);
+    } else {
+      bf16_linear_f32_batched_kernel<16, false, false><<<dim3(gx, gy), 128, 0, stream>>>(
+          x, w_u16, m, out_features, in_features, out);
+    }
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_embed_lookup_f32(const __nv_bfloat16* embed_table, const std::int32_t* token_ids, int seq_len,
+                                  int hidden_size, int vocab_size, float* out_hidden, cudaStream_t stream) {
+  if (seq_len <= 0 || hidden_size <= 0 || vocab_size <= 0) throw std::invalid_argument("embed_lookup_f32 bad shape");
+  embed_lookup_f32_kernel<<<dim3((hidden_size + 255) / 256, seq_len), 256, 0, stream>>>(
+      reinterpret_cast<const std::uint16_t*>(embed_table), token_ids, seq_len, hidden_size, vocab_size, out_hidden);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_gather_rows_f32(const float* src, const int* row_indices, int num_rows, int hidden_size,
+                                 float* dst, cudaStream_t stream) {
+  if (num_rows <= 0 || hidden_size <= 0) return;
+  gather_rows_f32_kernel<<<dim3((hidden_size + 255) / 256, num_rows), 256, 0, stream>>>(
+      src, row_indices, num_rows, hidden_size, dst);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_swiglu_mul_f32(const float* gate, const float* up, float* out, std::size_t n, cudaStream_t stream) {
+  if (n == 0) return;
+  swiglu_mul_f32_kernel<<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_add_residual_f32(float* hidden, const float* residual, std::size_t n, cudaStream_t stream) {
+  if (n == 0) return;
+  add_residual_f32_kernel<<<(n + 255) / 256, 256, 0, stream>>>(hidden, residual, n);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_split_qkv_sep_f32(const float* mixed, float* q_sep, float* k_sep, float* v_sep, int seq_len,
+                                   int kd, int vd, cudaStream_t stream) {
+  if (seq_len <= 0 || kd <= 0 || vd <= 0) throw std::invalid_argument("split_qkv_sep_f32 bad shape");
+  const int cd = 2 * kd + vd;
+  split_qkv_sep_f32_kernel<<<dim3((cd + 255) / 256, seq_len), 256, 0, stream>>>(
+      mixed, q_sep, k_sep, v_sep, seq_len, kd, vd);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_full_attn_gated_f32_kvbf16(const float* q_with_gate, float* k_raw_inout, const float* v_in,
+                                            const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
+                                            float rms_eps, float rope_theta, int seq_len, int pos_offset,
+                                            int num_heads, int num_kv_heads, int head_dim, int rotary_dim,
+                                            __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int max_cache_len,
+                                            float* q_scratch, float* gate_scratch, float* out_attn,
+                                            cudaStream_t stream) {
+  if (seq_len < 1 || pos_offset + seq_len > max_cache_len || head_dim > 256 || num_heads % num_kv_heads != 0) {
+    throw std::invalid_argument("qwen38_cuda_full_attn_gated_f32_kvbf16 invalid dimensions or cache bounds");
+  }
+  const int q_total = num_heads * head_dim;
+  const int kv_stride = num_kv_heads * head_dim;
+
+  split_q_gate_kernel<float><<<dim3((q_total + 255) / 256, seq_len), 256, 0, stream>>>(
+      q_with_gate, q_scratch, gate_scratch, seq_len, num_heads, head_dim);
+  CUDA_CHECK(cudaGetLastError());
+
+  rmsnorm_zero_centered_kernel<float><<<seq_len * num_heads, 256, 0, stream>>>(
+      q_scratch, reinterpret_cast<const std::uint16_t*>(q_norm_w), rms_eps, seq_len * num_heads, head_dim, q_scratch);
+  CUDA_CHECK(cudaGetLastError());
+
+  rmsnorm_zero_centered_kernel<float><<<seq_len * num_kv_heads, 256, 0, stream>>>(
+      k_raw_inout, reinterpret_cast<const std::uint16_t*>(k_norm_w), rms_eps, seq_len * num_kv_heads, head_dim,
+      k_raw_inout);
+  CUDA_CHECK(cudaGetLastError());
+
+  const int half = rotary_dim >> 1;
+  partial_rope_neox_kernel<float><<<dim3((num_heads * half + 127) / 128, seq_len), 128, 0, stream>>>(
+      q_scratch, seq_len, num_heads, head_dim, rotary_dim, pos_offset, rope_theta);
+  CUDA_CHECK(cudaGetLastError());
+  partial_rope_neox_kernel<float><<<dim3((num_kv_heads * half + 127) / 128, seq_len), 128, 0, stream>>>(
+      k_raw_inout, seq_len, num_kv_heads, head_dim, rotary_dim, pos_offset, rope_theta);
+  CUDA_CHECK(cudaGetLastError());
+
+  const std::size_t cache_off = static_cast<std::size_t>(pos_offset) * static_cast<std::size_t>(kv_stride);
+  const std::size_t kv_elems = static_cast<std::size_t>(seq_len) * static_cast<std::size_t>(kv_stride);
+  f32_to_bf16_kernel<<<(kv_elems + 255) / 256, 256, 0, stream>>>(
+      k_raw_inout, reinterpret_cast<std::uint16_t*>(k_cache) + cache_off, kv_elems);
+  CUDA_CHECK(cudaGetLastError());
+  f32_to_bf16_kernel<<<(kv_elems + 255) / 256, 256, 0, stream>>>(
+      v_in, reinterpret_cast<std::uint16_t*>(v_cache) + cache_off, kv_elems);
+  CUDA_CHECK(cudaGetLastError());
+
+  causal_gqa_gated_attn_kernel<float, std::uint16_t><<<dim3(num_heads, seq_len), 256, 0, stream>>>(
+      q_scratch, gate_scratch, reinterpret_cast<const std::uint16_t*>(k_cache),
+      reinterpret_cast<const std::uint16_t*>(v_cache), seq_len, pos_offset, num_heads, num_kv_heads, head_dim,
+      out_attn);
   CUDA_CHECK(cudaGetLastError());
 }
 

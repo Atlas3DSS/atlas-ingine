@@ -26,5 +26,4 @@ target_link_libraries(ingine_qwen38_cuda PUBLIC
   ingine_qwen38_cpu
   ingine_core
   CUDA::cudart
-  CUDA::cublasLt
 )

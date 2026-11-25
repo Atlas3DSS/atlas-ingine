@@ -369,6 +369,7 @@ int main_impl(int argc, char** argv) {
           {"nvfp4_max_abs", gemm_report->nvfp4_max_abs},
           {"fp8_cal_max_abs", gemm_report->fp8_cal_max_abs},
           {"bf16_max_abs", gemm_report->bf16_max_abs},
+          {"batch_invariance_max_abs", gemm_report->batch_invariance_max_abs},
           {"passed", gemm_report->passed},
       };
     }
@@ -592,9 +593,10 @@ int main_impl(int argc, char** argv) {
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       std::printf(
           "  [gemm_parity_self_check] nvfp4_max_abs=%.6g fp8_cal_max_abs=%.6g bf16_max_abs=%.6g "
-          "elapsed_ms=%.1f -> %s\n",
+          "batch_inv=%.6g elapsed_ms=%.1f -> %s\n",
           gemm_report->nvfp4_max_abs, gemm_report->fp8_cal_max_abs, gemm_report->bf16_max_abs,
-          timings.gemm_self_check_ms, gemm_report->passed ? "PASS" : "FAIL");
+          gemm_report->batch_invariance_max_abs, timings.gemm_self_check_ms,
+          gemm_report->passed ? "PASS" : "FAIL");
     }
     if (auto rc = check_early_stop("gemm_parity_self_check")) return *rc;
 

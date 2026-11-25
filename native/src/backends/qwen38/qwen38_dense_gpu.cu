@@ -4,7 +4,6 @@
 #include "backends/qwen38/qwen38_cuda_ops.h"
 #include "core/device.h"
 
-#include <cublasLt.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -17,135 +16,17 @@
 #include <deque>
 #include <fcntl.h>
 #include <limits>
-#include <map>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <sys/resource.h>
 #include <sys/stat.h>
-#include <tuple>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
 
 namespace ingine::backends::qwen38 {
 namespace {
-
-void lt_check(cublasStatus_t status, const char* what) {
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    throw std::runtime_error(std::string("Qwen38 cublasLt ") + what + " failed: status=" +
-                             std::to_string(static_cast<int>(status)));
-  }
-}
-
-class Qwen38CublasGemm {
- public:
-  static constexpr std::size_t kWorkspaceBytes = 32ull << 20;
-
-  Qwen38CublasGemm() {
-    try {
-      lt_check(cublasLtCreate(&handle_), "create");
-      CUDA_CHECK(cudaMalloc(&workspace_, kWorkspaceBytes));
-    } catch (...) {
-      if (workspace_) cudaFree(workspace_);
-      if (handle_) cublasLtDestroy(handle_);
-      workspace_ = nullptr;
-      handle_ = nullptr;
-      throw;
-    }
-  }
-
-  ~Qwen38CublasGemm() {
-    for (auto& [k, p] : plans_) {
-      if (p.la) cublasLtMatrixLayoutDestroy(p.la);
-      if (p.lb) cublasLtMatrixLayoutDestroy(p.lb);
-      if (p.lc) cublasLtMatrixLayoutDestroy(p.lc);
-      if (p.op) cublasLtMatmulDescDestroy(p.op);
-    }
-    if (workspace_) cudaFree(workspace_);
-    if (handle_) cublasLtDestroy(handle_);
-  }
-
-  Qwen38CublasGemm(const Qwen38CublasGemm&) = delete;
-  Qwen38CublasGemm& operator=(const Qwen38CublasGemm&) = delete;
-
-  // Computes row-major C[M, N] (stride ldc) = alpha * (X[M, K] (stride lda) @ W[N, K]^T (stride ldb)).
-  void run(const __nv_bfloat16* x, int lda, const __nv_bfloat16* w, int ldb, void* c, int ldc, bool c_f32, float alpha,
-           int m, int n, int k, cudaStream_t stream) {
-    if (m <= 0 || n <= 0 || k <= 0) throw std::invalid_argument("Qwen38CublasGemm empty shape");
-    const auto key = std::make_tuple(m, n, k, lda, ldb, ldc, c_f32);
-    auto it = plans_.find(key);
-    if (it == plans_.end()) {
-      Plan plan;
-      auto cleanup = [&] {
-        if (plan.la) cublasLtMatrixLayoutDestroy(plan.la);
-        if (plan.lb) cublasLtMatrixLayoutDestroy(plan.lb);
-        if (plan.lc) cublasLtMatrixLayoutDestroy(plan.lc);
-        if (plan.op) cublasLtMatmulDescDestroy(plan.op);
-      };
-      try {
-        lt_check(cublasLtMatmulDescCreate(&plan.op, CUBLAS_COMPUTE_32F, CUDA_R_32F), "desc");
-        const cublasOperation_t ta = CUBLAS_OP_T;
-        const cublasOperation_t tb = CUBLAS_OP_N;
-        lt_check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)), "transa");
-        lt_check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)), "transb");
-        lt_check(cublasLtMatrixLayoutCreate(&plan.la, CUDA_R_16BF, k, n, ldb), "layout a");
-        lt_check(cublasLtMatrixLayoutCreate(&plan.lb, CUDA_R_16BF, k, m, lda), "layout b");
-        lt_check(cublasLtMatrixLayoutCreate(&plan.lc, c_f32 ? CUDA_R_32F : CUDA_R_16BF, n, m, ldc), "layout c");
-
-        cublasLtMatmulPreference_t pref = nullptr;
-        lt_check(cublasLtMatmulPreferenceCreate(&pref), "pref");
-        const std::size_t ws = kWorkspaceBytes;
-        const std::uint32_t red_f32 = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
-        cublasLtMatmulHeuristicResult_t heur{};
-        int found = 0;
-        cublasStatus_t st = cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws,
-                                                                 sizeof(ws));
-        if (st == CUBLAS_STATUS_SUCCESS) {
-          st = cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red_f32,
-                                                    sizeof(red_f32));
-        }
-        if (st == CUBLAS_STATUS_SUCCESS) {
-          st = cublasLtMatmulAlgoGetHeuristic(handle_, plan.op, plan.la, plan.lb, plan.lc, plan.lc, pref, 1, &heur,
-                                              &found);
-        }
-        if (st != CUBLAS_STATUS_SUCCESS || found == 0) {
-          const std::uint32_t any_red = CUBLASLT_REDUCTION_SCHEME_MASK;
-          cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &any_red,
-                                               sizeof(any_red));
-          st = cublasLtMatmulAlgoGetHeuristic(handle_, plan.op, plan.la, plan.lb, plan.lc, plan.lc, pref, 1, &heur,
-                                              &found);
-        }
-        cublasLtMatmulPreferenceDestroy(pref);
-        lt_check(st, "heuristic");
-        if (found == 0) throw std::runtime_error("Qwen38CublasGemm: no heuristic algorithm found");
-        plan.algo = heur.algo;
-        it = plans_.emplace(key, plan).first;
-      } catch (...) {
-        cleanup();
-        throw;
-      }
-    }
-    const Plan& p = it->second;
-    const float beta = 0.0f;
-    lt_check(cublasLtMatmul(handle_, p.op, &alpha, w, p.la, x, p.lb, &beta, c, p.lc, c, p.lc, &p.algo, workspace_,
-                            kWorkspaceBytes, stream),
-             "matmul");
-  }
-
- private:
-  struct Plan {
-    cublasLtMatmulDesc_t op = nullptr;
-    cublasLtMatrixLayout_t la = nullptr;
-    cublasLtMatrixLayout_t lb = nullptr;
-    cublasLtMatrixLayout_t lc = nullptr;
-    cublasLtMatmulAlgo_t algo{};
-  };
-
-  cublasLtHandle_t handle_ = nullptr;
-  void* workspace_ = nullptr;
-  std::map<std::tuple<int, int, int, int, int, int, bool>, Plan> plans_;
-};
 
 template <typename T>
 struct DevBuf {
@@ -371,7 +252,6 @@ struct Qwen38DenseBackend::Impl {
   DeviceContext ctx;
   Qwen38Manifest manifest;
   Qwen38DenseLoadOptions opts;
-  Qwen38CublasGemm cublas;
 
   DevBuf<std::uint8_t> weights_arena;
   DevBuf<float> f32_arena;
@@ -381,38 +261,37 @@ struct Qwen38DenseBackend::Impl {
   DevProj lm_head;
   std::vector<DevLayer> layers;
 
-  // Shared execution scratch buffers (allocated for opts.prefill_chunk and model dims).
-  DevBuf<std::uint16_t> dequant_scratch;  // max(N*K) BF16 weights slice (170 MiB on 27B)
-  DevBuf<std::uint16_t> act_quant_scratch;
+  // Shared execution scratch buffers (FP32 activations for bit-exact batch invariance across M=1..256).
+  DevBuf<float> act_quant_scratch;
   DevBuf<std::int32_t> token_ids_dev;
   DevBuf<int> gather_rows_dev;
-  DevBuf<__nv_bfloat16> hidden;
-  DevBuf<__nv_bfloat16> normed;
-  DevBuf<__nv_bfloat16> residual;
-  DevBuf<__nv_bfloat16> qkv;
-  DevBuf<__nv_bfloat16> conv_out;
-  DevBuf<__nv_bfloat16> q_sep;
-  DevBuf<__nv_bfloat16> k_sep;
-  DevBuf<__nv_bfloat16> v_sep;
-  DevBuf<__nv_bfloat16> z_buf;
-  DevBuf<__nv_bfloat16> a_buf;
-  DevBuf<__nv_bfloat16> b_buf;
-  DevBuf<__nv_bfloat16> core_out;
+  DevBuf<float> hidden;
+  DevBuf<float> normed;
+  DevBuf<float> residual;
+  DevBuf<float> qkv;
+  DevBuf<float> conv_out;
+  DevBuf<float> q_sep;
+  DevBuf<float> k_sep;
+  DevBuf<float> v_sep;
+  DevBuf<float> z_buf;
+  DevBuf<float> a_buf;
+  DevBuf<float> b_buf;
+  DevBuf<float> core_out;
   DevBuf<float> gdn_scratch;
 
-  DevBuf<__nv_bfloat16> q_gate;
-  DevBuf<__nv_bfloat16> k_raw;
-  DevBuf<__nv_bfloat16> v_raw;
-  DevBuf<__nv_bfloat16> q_tmp;
-  DevBuf<__nv_bfloat16> gate_tmp;
-  DevBuf<__nv_bfloat16> attn_out;
+  DevBuf<float> q_gate;
+  DevBuf<float> k_raw;
+  DevBuf<float> v_raw;
+  DevBuf<float> q_tmp;
+  DevBuf<float> gate_tmp;
+  DevBuf<float> attn_out;
 
-  DevBuf<__nv_bfloat16> mlp_gate;
-  DevBuf<__nv_bfloat16> mlp_up;
+  DevBuf<float> mlp_gate;
+  DevBuf<float> mlp_up;
 
   static constexpr int kLogitBatchMax = 64;
-  DevBuf<__nv_bfloat16> cap_hidden;
-  DevBuf<__nv_bfloat16> cap_normed;
+  DevBuf<float> cap_hidden;
+  DevBuf<float> cap_normed;
   DevBuf<float> logits_f32;
   std::vector<float> host_logits_stage;
   std::vector<std::int32_t> decode_single_tok;
@@ -423,85 +302,36 @@ struct Qwen38DenseBackend::Impl {
 
   explicit Impl(int dev_id) : ctx(dev_id) { ctx.bind_to_current_thread(); }
 
-  void proj_forward_bf16(const DevProj& p, const __nv_bfloat16* x, int m, __nv_bfloat16* out) {
-    if (m <= 0) throw std::invalid_argument("proj_forward_bf16 m <= 0");
-    if (m == 1) {
-      if (p.quant == Qwen38LinearQuantKind::Bf16) {
-        qwen38_cuda_bf16_linear_bf16(x, p.w_bf16, 1, p.out_features, p.in_features, out, ctx.stream);
-      } else if (p.quant == Qwen38LinearQuantKind::Fp8E4M3) {
-        const float in_s = opts.use_calibrated_fp8 ? p.input_scale : 0.0f;
-        qwen38_cuda_fp8_linear_bf16(x, p.w_u8, p.weight_scale, in_s, 1, p.out_features, p.in_features, out, ctx.stream);
-      } else {
-        qwen38_cuda_nvfp4_linear_bf16(x, p.w_u8, p.w_scales, p.weight_scale_2, 1, p.out_features, p.in_features, out,
-                                       ctx.stream);
-      }
-      return;
-    }
-
+  void proj_forward_f32(const DevProj& p, const float* x, int m, float* out) {
+    if (m <= 0) throw std::invalid_argument("proj_forward_f32 m <= 0");
     if (p.quant == Qwen38LinearQuantKind::Bf16) {
-      cublas.run(x, p.in_features, p.w_bf16, p.in_features, out, p.out_features, false, 1.0f, m, p.out_features,
-                 p.in_features, ctx.stream);
+      qwen38_cuda_bf16_linear_f32_batched(x, p.w_bf16, m, p.out_features, p.in_features, out, ctx.stream);
     } else if (p.quant == Qwen38LinearQuantKind::Fp8E4M3) {
-      const std::size_t w_elems = static_cast<std::size_t>(p.out_features) * static_cast<std::size_t>(p.in_features);
-      if (w_elems > dequant_scratch.count) throw std::runtime_error("dequant_scratch overflow on FP8 proj");
-      auto* w_bf16 = reinterpret_cast<__nv_bfloat16*>(dequant_scratch.ptr);
-      qwen38_cuda_dequant_fp8_to_bf16(p.w_u8, p.out_features, p.in_features, w_bf16, ctx.stream);
-
-      const __nv_bfloat16* x_use = x;
-      float alpha = p.weight_scale;
+      const float* x_use = x;
       if (opts.use_calibrated_fp8 && p.input_scale > 0.0f) {
         const std::size_t x_elems = static_cast<std::size_t>(m) * static_cast<std::size_t>(p.in_features);
         if (x_elems > act_quant_scratch.count) throw std::runtime_error("act_quant_scratch overflow");
-        auto* x_q = reinterpret_cast<__nv_bfloat16*>(act_quant_scratch.ptr);
-        qwen38_cuda_quant_fp8_act_to_bf16(x, p.input_scale, x_elems, x_q, ctx.stream);
-        x_use = x_q;
-        alpha = p.weight_scale * p.input_scale;
+        qwen38_cuda_quant_fp8_act_f32(x, p.input_scale, x_elems, act_quant_scratch.ptr, ctx.stream);
+        x_use = act_quant_scratch.ptr;
       }
-      cublas.run(x_use, p.in_features, w_bf16, p.in_features, out, p.out_features, false, alpha, m, p.out_features,
-                 p.in_features, ctx.stream);
+      qwen38_cuda_fp8_linear_f32_batched(x_use, p.w_u8, p.weight_scale, 0.0f, m, p.out_features, p.in_features, out,
+                                         ctx.stream);
     } else {
-      const std::size_t w_elems = static_cast<std::size_t>(p.out_features) * static_cast<std::size_t>(p.in_features);
-      if (w_elems > dequant_scratch.count) throw std::runtime_error("dequant_scratch overflow on NVFP4 proj");
-      auto* w_bf16 = reinterpret_cast<__nv_bfloat16*>(dequant_scratch.ptr);
-      qwen38_cuda_dequant_nvfp4_to_bf16(p.w_u8, p.w_scales, p.out_features, p.in_features, w_bf16, ctx.stream);
-      cublas.run(x, p.in_features, w_bf16, p.in_features, out, p.out_features, false, p.weight_scale_2, m,
-                 p.out_features, p.in_features, ctx.stream);
+      qwen38_cuda_nvfp4_linear_f32_batched(x, p.w_u8, p.w_scales, p.weight_scale_2, m, p.out_features, p.in_features,
+                                           out, ctx.stream);
     }
   }
 
-  void lm_head_forward_f32(const __nv_bfloat16* x, int m, float* out_f32) {
+  void lm_head_forward_f32(const float* x, int m, float* out_f32) {
     const DevProj& p = lm_head;
     if (m <= 0) throw std::invalid_argument("lm_head_forward_f32 m <= 0");
-    if (m == 1) {
-      if (p.quant == Qwen38LinearQuantKind::Bf16) {
-        qwen38_cuda_bf16_linear_bf16_to_f32(x, p.w_bf16, 1, p.out_features, p.in_features, out_f32, ctx.stream);
-      } else if (p.quant == Qwen38LinearQuantKind::Nvfp4) {
-        qwen38_cuda_nvfp4_linear_bf16_to_f32(x, p.w_u8, p.w_scales, p.weight_scale_2, 1, p.out_features, p.in_features,
-                                              out_f32, ctx.stream);
-      } else {
-        throw std::invalid_argument("unsupported lm_head quant in decode");
-      }
-      return;
-    }
-
-    const int K = p.in_features;
-    const int V = p.out_features;
-    const int max_tile_rows =
-        std::max(16, static_cast<int>((dequant_scratch.count / static_cast<std::size_t>(K)) & ~std::size_t(15)));
-    for (int v0 = 0; v0 < V; v0 += max_tile_rows) {
-      const int n_tile = std::min(max_tile_rows, V - v0);
-      if (p.quant == Qwen38LinearQuantKind::Bf16) {
-        cublas.run(x, K, p.w_bf16 + static_cast<std::size_t>(v0) * K, K, out_f32 + v0, V, true, 1.0f, m, n_tile, K,
-                   ctx.stream);
-      } else if (p.quant == Qwen38LinearQuantKind::Nvfp4) {
-        const std::uint8_t* wp_tile = p.w_u8 + static_cast<std::size_t>(v0) * static_cast<std::size_t>(K / 2);
-        const std::uint8_t* ws_tile = p.w_scales + static_cast<std::size_t>(v0) * static_cast<std::size_t>(K / 16);
-        auto* w_bf16 = reinterpret_cast<__nv_bfloat16*>(dequant_scratch.ptr);
-        qwen38_cuda_dequant_nvfp4_to_bf16(wp_tile, ws_tile, n_tile, K, w_bf16, ctx.stream);
-        cublas.run(x, K, w_bf16, K, out_f32 + v0, V, true, p.weight_scale_2, m, n_tile, K, ctx.stream);
-      } else {
-        throw std::invalid_argument("unsupported lm_head quant in prefill");
-      }
+    if (p.quant == Qwen38LinearQuantKind::Bf16) {
+      qwen38_cuda_bf16_linear_f32_batched(x, p.w_bf16, m, p.out_features, p.in_features, out_f32, ctx.stream);
+    } else if (p.quant == Qwen38LinearQuantKind::Nvfp4) {
+      qwen38_cuda_nvfp4_linear_f32_batched(x, p.w_u8, p.w_scales, p.weight_scale_2, m, p.out_features, p.in_features,
+                                           out_f32, ctx.stream);
+    } else {
+      throw std::invalid_argument("unsupported lm_head quant");
     }
   }
 
@@ -541,62 +371,62 @@ struct Qwen38DenseBackend::Impl {
       CUDA_CHECK(cudaMemcpyAsync(token_ids_dev.ptr, token_ids.data() + off,
                                  static_cast<std::size_t>(M) * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                  ctx.stream));
-      qwen38_cuda_embed_lookup_bf16(embed_tokens, token_ids_dev.ptr, M, H, V, hidden.ptr, ctx.stream);
+      qwen38_cuda_embed_lookup_f32(embed_tokens, token_ids_dev.ptr, M, H, V, hidden.ptr, ctx.stream);
 
       std::size_t lin_idx = 0;
       std::size_t full_idx = 0;
       for (std::size_t li = 0; li < layers.size(); ++li) {
         const auto& l = layers[li];
-        qwen38_cuda_rmsnorm_zero_centered_bf16(hidden.ptr, l.input_layernorm, c.rms_norm_eps, M, H, normed.ptr,
-                                               ctx.stream);
+        qwen38_cuda_rmsnorm_zero_centered_f32(hidden.ptr, l.input_layernorm, c.rms_norm_eps, M, H, normed.ptr,
+                                              ctx.stream);
         if (l.kind == Qwen38LayerKind::LinearAttention) {
-          proj_forward_bf16(l.in_proj_qkv, normed.ptr, M, qkv.ptr);
-          proj_forward_bf16(l.in_proj_z, normed.ptr, M, z_buf.ptr);
-          proj_forward_bf16(l.in_proj_a, normed.ptr, M, a_buf.ptr);
-          proj_forward_bf16(l.in_proj_b, normed.ptr, M, b_buf.ptr);
+          proj_forward_f32(l.in_proj_qkv, normed.ptr, M, qkv.ptr);
+          proj_forward_f32(l.in_proj_z, normed.ptr, M, z_buf.ptr);
+          proj_forward_f32(l.in_proj_a, normed.ptr, M, a_buf.ptr);
+          proj_forward_f32(l.in_proj_b, normed.ptr, M, b_buf.ptr);
 
           float* conv_st = sess.state_->conv_states[lin_idx].ptr;
           float* rec_st = sess.state_->rec_states[lin_idx].ptr;
           if (M == 1) {
-            qwen38_cuda_causal_conv1d_silu_step_bf16(qkv.ptr, l.conv1d_weight, cd, c.linear_conv_kernel_dim, conv_st,
+            qwen38_cuda_causal_conv1d_silu_step_f32(qkv.ptr, l.conv1d_weight, cd, c.linear_conv_kernel_dim, conv_st,
                                                      conv_out.ptr, ctx.stream);
-            qwen38_cuda_gdn_recurrent_step_bf16(conv_out.ptr, conv_out.ptr + kd, conv_out.ptr + 2 * kd, z_buf.ptr,
-                                                a_buf.ptr, b_buf.ptr, l.a_log, l.dt_bias, l.linear_norm_weight,
-                                                c.rms_norm_eps, nkh, nhv, k_dim, v_dim, rec_st, gdn_scratch.ptr,
-                                                core_out.ptr, ctx.stream);
-          } else {
-            qwen38_cuda_causal_conv1d_silu_prefill_bf16(qkv.ptr, l.conv1d_weight, M, cd, c.linear_conv_kernel_dim,
-                                                        conv_st, conv_out.ptr, ctx.stream);
-            qwen38_cuda_split_qkv_sep_bf16(conv_out.ptr, q_sep.ptr, k_sep.ptr, v_sep.ptr, M, kd, vd, ctx.stream);
-            qwen38_cuda_gdn_chunk_prefill_bf16(q_sep.ptr, k_sep.ptr, v_sep.ptr, z_buf.ptr, a_buf.ptr, b_buf.ptr,
-                                               l.a_log, l.dt_bias, l.linear_norm_weight, c.rms_norm_eps, M,
-                                               std::min(64, M), nkh, nhv, k_dim, v_dim, rec_st, gdn_scratch.ptr,
+            qwen38_cuda_gdn_recurrent_step_f32(conv_out.ptr, conv_out.ptr + kd, conv_out.ptr + 2 * kd, z_buf.ptr,
+                                               a_buf.ptr, b_buf.ptr, l.a_log, l.dt_bias, l.linear_norm_weight,
+                                               c.rms_norm_eps, nkh, nhv, k_dim, v_dim, rec_st, gdn_scratch.ptr,
                                                core_out.ptr, ctx.stream);
+          } else {
+            qwen38_cuda_causal_conv1d_silu_prefill_f32(qkv.ptr, l.conv1d_weight, M, cd, c.linear_conv_kernel_dim,
+                                                       conv_st, conv_out.ptr, ctx.stream);
+            qwen38_cuda_split_qkv_sep_f32(conv_out.ptr, q_sep.ptr, k_sep.ptr, v_sep.ptr, M, kd, vd, ctx.stream);
+            qwen38_cuda_gdn_chunk_prefill_f32(q_sep.ptr, k_sep.ptr, v_sep.ptr, z_buf.ptr, a_buf.ptr, b_buf.ptr,
+                                              l.a_log, l.dt_bias, l.linear_norm_weight, c.rms_norm_eps, M,
+                                              std::min(64, M), nkh, nhv, k_dim, v_dim, rec_st, gdn_scratch.ptr,
+                                              core_out.ptr, ctx.stream);
           }
-          proj_forward_bf16(l.out_proj, core_out.ptr, M, residual.ptr);
+          proj_forward_f32(l.out_proj, core_out.ptr, M, residual.ptr);
           ++lin_idx;
         } else {
-          proj_forward_bf16(l.q_proj, normed.ptr, M, q_gate.ptr);
-          proj_forward_bf16(l.k_proj, normed.ptr, M, k_raw.ptr);
-          proj_forward_bf16(l.v_proj, normed.ptr, M, v_raw.ptr);
-          qwen38_cuda_full_attn_gated_bf16(
+          proj_forward_f32(l.q_proj, normed.ptr, M, q_gate.ptr);
+          proj_forward_f32(l.k_proj, normed.ptr, M, k_raw.ptr);
+          proj_forward_f32(l.v_proj, normed.ptr, M, v_raw.ptr);
+          qwen38_cuda_full_attn_gated_f32_kvbf16(
               q_gate.ptr, k_raw.ptr, v_raw.ptr, l.q_norm, l.k_norm, c.rms_norm_eps, c.rope_theta, M, global_pos,
               c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.rotary_dim,
               sess.state_->k_caches[full_idx].ptr, sess.state_->v_caches[full_idx].ptr, opts.max_ctx, q_tmp.ptr,
               gate_tmp.ptr, attn_out.ptr, ctx.stream);
-          proj_forward_bf16(l.o_proj, attn_out.ptr, M, residual.ptr);
+          proj_forward_f32(l.o_proj, attn_out.ptr, M, residual.ptr);
           ++full_idx;
         }
 
-        qwen38_cuda_add_residual_bf16(hidden.ptr, residual.ptr, static_cast<std::size_t>(M * H), ctx.stream);
-        qwen38_cuda_rmsnorm_zero_centered_bf16(hidden.ptr, l.post_attention_layernorm, c.rms_norm_eps, M, H,
-                                               normed.ptr, ctx.stream);
-        proj_forward_bf16(l.gate_proj, normed.ptr, M, mlp_gate.ptr);
-        proj_forward_bf16(l.up_proj, normed.ptr, M, mlp_up.ptr);
-        qwen38_cuda_swiglu_mul_bf16(mlp_gate.ptr, mlp_up.ptr, mlp_gate.ptr, static_cast<std::size_t>(M * I),
-                                    ctx.stream);
-        proj_forward_bf16(l.down_proj, mlp_gate.ptr, M, residual.ptr);
-        qwen38_cuda_add_residual_bf16(hidden.ptr, residual.ptr, static_cast<std::size_t>(M * H), ctx.stream);
+        qwen38_cuda_add_residual_f32(hidden.ptr, residual.ptr, static_cast<std::size_t>(M * H), ctx.stream);
+        qwen38_cuda_rmsnorm_zero_centered_f32(hidden.ptr, l.post_attention_layernorm, c.rms_norm_eps, M, H,
+                                              normed.ptr, ctx.stream);
+        proj_forward_f32(l.gate_proj, normed.ptr, M, mlp_gate.ptr);
+        proj_forward_f32(l.up_proj, normed.ptr, M, mlp_up.ptr);
+        qwen38_cuda_swiglu_mul_f32(mlp_gate.ptr, mlp_up.ptr, mlp_gate.ptr, static_cast<std::size_t>(M * I),
+                                   ctx.stream);
+        proj_forward_f32(l.down_proj, mlp_gate.ptr, M, residual.ptr);
+        qwen38_cuda_add_residual_f32(hidden.ptr, residual.ptr, static_cast<std::size_t>(M * H), ctx.stream);
       }
 
       std::vector<int> local_rows;
@@ -611,16 +441,16 @@ struct Qwen38DenseBackend::Impl {
       if (!local_rows.empty() && on_logits) {
         for (std::size_t b0 = 0; b0 < local_rows.size(); b0 += kLogitBatchMax) {
           const int bc = static_cast<int>(std::min<std::size_t>(kLogitBatchMax, local_rows.size() - b0));
-          const __nv_bfloat16* x_cap = nullptr;
+          const float* x_cap = nullptr;
           if (bc == 1 && M == 1) {
             x_cap = hidden.ptr;
           } else {
             CUDA_CHECK(cudaMemcpyAsync(gather_rows_dev.ptr, local_rows.data() + b0,
                                        static_cast<std::size_t>(bc) * sizeof(int), cudaMemcpyHostToDevice, ctx.stream));
-            qwen38_cuda_gather_rows_bf16(hidden.ptr, gather_rows_dev.ptr, bc, H, cap_hidden.ptr, ctx.stream);
+            qwen38_cuda_gather_rows_f32(hidden.ptr, gather_rows_dev.ptr, bc, H, cap_hidden.ptr, ctx.stream);
             x_cap = cap_hidden.ptr;
           }
-          qwen38_cuda_rmsnorm_zero_centered_bf16(x_cap, final_norm, c.rms_norm_eps, bc, H, cap_normed.ptr, ctx.stream);
+          qwen38_cuda_rmsnorm_zero_centered_f32(x_cap, final_norm, c.rms_norm_eps, bc, H, cap_normed.ptr, ctx.stream);
           lm_head_forward_f32(cap_normed.ptr, bc, logits_f32.ptr);
           const std::size_t copy_elems = static_cast<std::size_t>(bc) * static_cast<std::size_t>(V);
           CUDA_CHECK(cudaMemcpyAsync(host_logits_stage.data(), logits_f32.ptr, copy_elems * sizeof(float),
@@ -698,13 +528,12 @@ const ingine::model::BackendStateIdentity& Qwen38DenseSession::identity() const 
 Qwen38GemmParityReport Qwen38DenseBackend::self_check_gemm_parity(int device_id) {
   DeviceContext ctx(device_id);
   ctx.bind_to_current_thread();
-  Qwen38CublasGemm cublas;
 
-  constexpr int M = 8, N = 256, K = 5120;
+  constexpr int M = 17, N = 256, K = 5120;
   std::mt19937 rng(20261125u);
   std::normal_distribution<float> dist(0.0f, 0.25f);
-  std::vector<std::uint16_t> x_bits(static_cast<std::size_t>(M * K));
-  for (auto& b : x_bits) b = f32_to_bf16(dist(rng));
+  std::vector<float> x_f32(static_cast<std::size_t>(M * K));
+  for (float& v : x_f32) v = dist(rng);
 
   std::vector<std::uint8_t> nv_p(static_cast<std::size_t>(N * (K / 2)));
   std::vector<std::uint8_t> nv_s(static_cast<std::size_t>(N * (K / 16)));
@@ -720,62 +549,70 @@ Qwen38GemmParityReport Qwen38DenseBackend::self_check_gemm_parity(int device_id)
   std::vector<std::uint16_t> bf_w(static_cast<std::size_t>(N * K));
   for (auto& b : bf_w) b = f32_to_bf16(dist(rng));
 
-  DevBuf<std::uint16_t> d_x(x_bits.size()), d_xq(x_bits.size()), d_w_dq(static_cast<std::size_t>(N * K));
+  DevBuf<float> d_x(x_f32.size()), d_xq(x_f32.size()), d_out_ref(static_cast<std::size_t>(M * N)),
+      d_out_batched(static_cast<std::size_t>(M * N)), d_out_m1_row0(N), d_out_m1_row16(N);
   DevBuf<std::uint8_t> d_nv_p(nv_p.size()), d_nv_s(nv_s.size()), d_fp8_w(fp8_w.size());
-  DevBuf<std::uint16_t> d_bf_w(bf_w.size()), d_out_warp(static_cast<std::size_t>(M * N)),
-      d_out_cublas(static_cast<std::size_t>(M * N));
+  DevBuf<std::uint16_t> d_bf_w(bf_w.size());
 
-  CUDA_CHECK(cudaMemcpy(d_x.ptr, x_bits.data(), x_bits.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_x.ptr, x_f32.data(), x_f32.size() * sizeof(float), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_nv_p.ptr, nv_p.data(), nv_p.size(), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_nv_s.ptr, nv_s.data(), nv_s.size(), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_fp8_w.ptr, fp8_w.data(), fp8_w.size(), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_bf_w.ptr, bf_w.data(), bf_w.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_bf_w.ptr, bf_w.data(), bf_w.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice));
 
-  auto download_diff = [&]() {
-    std::vector<std::uint16_t> a(d_out_warp.count), b(d_out_cublas.count);
-    CUDA_CHECK(cudaMemcpy(a.data(), d_out_warp.ptr, a.size() * 2, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(b.data(), d_out_cublas.ptr, b.size() * 2, cudaMemcpyDeviceToHost));
+  auto dev_max_abs = [&](const float* a_dev, const float* b_dev, std::size_t count) -> float {
+    std::vector<float> a(count), b(count);
+    CUDA_CHECK(cudaMemcpy(a.data(), a_dev, count * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b.data(), b_dev, count * sizeof(float), cudaMemcpyDeviceToHost));
     float mx = 0.0f;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-      const float fa = bf16_to_f32(a[i]);
-      const float fb = bf16_to_f32(b[i]);
-      if (!std::isfinite(fa) || !std::isfinite(fb)) return std::numeric_limits<float>::infinity();
-      mx = std::max(mx, std::fabs(fa - fb));
+    for (std::size_t i = 0; i < count; ++i) {
+      if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return std::numeric_limits<float>::infinity();
+      mx = std::max(mx, std::fabs(a[i] - b[i]));
     }
     return mx;
   };
 
   Qwen38GemmParityReport rep;
+  float max_batch_inv = 0.0f;
 
-  qwen38_cuda_nvfp4_linear_bf16(reinterpret_cast<const __nv_bfloat16*>(d_x.ptr), d_nv_p.ptr, d_nv_s.ptr, kWs2, M, N, K,
-                                 reinterpret_cast<__nv_bfloat16*>(d_out_warp.ptr), ctx.stream);
-  qwen38_cuda_dequant_nvfp4_to_bf16(d_nv_p.ptr, d_nv_s.ptr, N, K, reinterpret_cast<__nv_bfloat16*>(d_w_dq.ptr),
-                                    ctx.stream);
-  cublas.run(reinterpret_cast<const __nv_bfloat16*>(d_x.ptr), K, reinterpret_cast<const __nv_bfloat16*>(d_w_dq.ptr), K,
-             d_out_cublas.ptr, N, false, kWs2, M, N, K, ctx.stream);
+  // 1. NVFP4 batched vs Gate 1 reference F32 + M=1 invariance check on rows 0 and 16.
+  qwen38_cuda_nvfp4_linear_f32(d_x.ptr, d_nv_p.ptr, d_nv_s.ptr, kWs2, M, N, K, d_out_ref.ptr, ctx.stream);
+  qwen38_cuda_nvfp4_linear_f32_batched(d_x.ptr, d_nv_p.ptr, d_nv_s.ptr, kWs2, M, N, K, d_out_batched.ptr, ctx.stream);
+  qwen38_cuda_nvfp4_linear_f32_batched(d_x.ptr, d_nv_p.ptr, d_nv_s.ptr, kWs2, 1, N, K, d_out_m1_row0.ptr, ctx.stream);
+  qwen38_cuda_nvfp4_linear_f32_batched(d_x.ptr + static_cast<std::size_t>(16 * K), d_nv_p.ptr, d_nv_s.ptr, kWs2, 1, N,
+                                       K, d_out_m1_row16.ptr, ctx.stream);
   ctx.synchronize();
-  rep.nvfp4_max_abs = download_diff();
+  rep.nvfp4_max_abs = dev_max_abs(d_out_ref.ptr, d_out_batched.ptr, static_cast<std::size_t>(M * N));
+  max_batch_inv = std::max(max_batch_inv, dev_max_abs(d_out_m1_row0.ptr, d_out_batched.ptr, N));
+  max_batch_inv = std::max(max_batch_inv, dev_max_abs(d_out_m1_row16.ptr, d_out_batched.ptr + 16 * N, N));
 
-  qwen38_cuda_fp8_linear_bf16(reinterpret_cast<const __nv_bfloat16*>(d_x.ptr), d_fp8_w.ptr, kFp8Ws, kFp8In, M, N, K,
-                               reinterpret_cast<__nv_bfloat16*>(d_out_warp.ptr), ctx.stream);
-  qwen38_cuda_dequant_fp8_to_bf16(d_fp8_w.ptr, N, K, reinterpret_cast<__nv_bfloat16*>(d_w_dq.ptr), ctx.stream);
-  qwen38_cuda_quant_fp8_act_to_bf16(reinterpret_cast<const __nv_bfloat16*>(d_x.ptr), kFp8In,
-                                    static_cast<std::size_t>(M * K), reinterpret_cast<__nv_bfloat16*>(d_xq.ptr),
-                                    ctx.stream);
-  cublas.run(reinterpret_cast<const __nv_bfloat16*>(d_xq.ptr), K, reinterpret_cast<const __nv_bfloat16*>(d_w_dq.ptr), K,
-             d_out_cublas.ptr, N, false, kFp8Ws * kFp8In, M, N, K, ctx.stream);
+  // 2. Calibrated FP8 batched vs Gate 1 reference F32 + M=1 invariance check on rows 0 and 16.
+  qwen38_cuda_fp8_linear_f32(d_x.ptr, d_fp8_w.ptr, kFp8Ws, kFp8In, M, N, K, d_out_ref.ptr, ctx.stream);
+  qwen38_cuda_quant_fp8_act_f32(d_x.ptr, kFp8In, static_cast<std::size_t>(M * K), d_xq.ptr, ctx.stream);
+  qwen38_cuda_fp8_linear_f32_batched(d_xq.ptr, d_fp8_w.ptr, kFp8Ws, 0.0f, M, N, K, d_out_batched.ptr, ctx.stream);
+  qwen38_cuda_fp8_linear_f32_batched(d_xq.ptr, d_fp8_w.ptr, kFp8Ws, 0.0f, 1, N, K, d_out_m1_row0.ptr, ctx.stream);
+  qwen38_cuda_fp8_linear_f32_batched(d_xq.ptr + static_cast<std::size_t>(16 * K), d_fp8_w.ptr, kFp8Ws, 0.0f, 1, N, K,
+                                     d_out_m1_row16.ptr, ctx.stream);
   ctx.synchronize();
-  rep.fp8_cal_max_abs = download_diff();
+  rep.fp8_cal_max_abs = dev_max_abs(d_out_ref.ptr, d_out_batched.ptr, static_cast<std::size_t>(M * N));
+  max_batch_inv = std::max(max_batch_inv, dev_max_abs(d_out_m1_row0.ptr, d_out_batched.ptr, N));
+  max_batch_inv = std::max(max_batch_inv, dev_max_abs(d_out_m1_row16.ptr, d_out_batched.ptr + 16 * N, N));
 
-  qwen38_cuda_bf16_linear_bf16(reinterpret_cast<const __nv_bfloat16*>(d_x.ptr),
-                                reinterpret_cast<const __nv_bfloat16*>(d_bf_w.ptr), M, N, K,
-                                reinterpret_cast<__nv_bfloat16*>(d_out_warp.ptr), ctx.stream);
-  cublas.run(reinterpret_cast<const __nv_bfloat16*>(d_x.ptr), K, reinterpret_cast<const __nv_bfloat16*>(d_bf_w.ptr), K,
-             d_out_cublas.ptr, N, false, 1.0f, M, N, K, ctx.stream);
+  // 3. BF16 batched vs Gate 1 reference F32 + M=1 invariance check on rows 0 and 16.
+  const auto* d_bf_w_ptr = reinterpret_cast<const __nv_bfloat16*>(d_bf_w.ptr);
+  qwen38_cuda_bf16_linear_f32(d_x.ptr, d_bf_w_ptr, M, N, K, d_out_ref.ptr, ctx.stream);
+  qwen38_cuda_bf16_linear_f32_batched(d_x.ptr, d_bf_w_ptr, M, N, K, d_out_batched.ptr, ctx.stream);
+  qwen38_cuda_bf16_linear_f32_batched(d_x.ptr, d_bf_w_ptr, 1, N, K, d_out_m1_row0.ptr, ctx.stream);
+  qwen38_cuda_bf16_linear_f32_batched(d_x.ptr + static_cast<std::size_t>(16 * K), d_bf_w_ptr, 1, N, K,
+                                      d_out_m1_row16.ptr, ctx.stream);
   ctx.synchronize();
-  rep.bf16_max_abs = download_diff();
+  rep.bf16_max_abs = dev_max_abs(d_out_ref.ptr, d_out_batched.ptr, static_cast<std::size_t>(M * N));
+  max_batch_inv = std::max(max_batch_inv, dev_max_abs(d_out_m1_row0.ptr, d_out_batched.ptr, N));
+  max_batch_inv = std::max(max_batch_inv, dev_max_abs(d_out_m1_row16.ptr, d_out_batched.ptr + 16 * N, N));
 
-  rep.passed = (rep.nvfp4_max_abs <= 1e-3f && rep.fp8_cal_max_abs <= 1e-3f && rep.bf16_max_abs <= 1e-3f);
+  rep.batch_invariance_max_abs = max_batch_inv;
+  rep.passed = (rep.nvfp4_max_abs <= 1e-4f && rep.fp8_cal_max_abs <= 1e-4f && rep.bf16_max_abs <= 1e-4f &&
+                rep.batch_invariance_max_abs == 0.0f);
   return rep;
 }
 
@@ -809,6 +646,12 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   ropt.dense_fp8 = (c.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4);
   ropt.max_batch = 1;
   profile_ = make_qwen38_worker_profile(m, ropt, "dense_bf16", "dense");
+  profile_.state_identity.act_dtype = ingine::model::ActivationDtype::Fp32;
+  profile_.state_identity.numeric_abi =
+      (c.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4)
+          ? "act=f32;attn=fp8_e4m3_cal;mlp=nvfp4_w4a32;gdn=f32;kv=bf16"
+          : "act=f32;attn=bf16;mlp=bf16;gdn=f32;kv=bf16";
+  profile_.state_identity.kv_format = "gdn_f32_conv_f32_kv_bf16";
 
   load_stats_.pins_verified =
       options.verify_pins && m.checkpoint.verification_level == ingine::model::VerificationLevel::PinnedVerified &&
@@ -1067,13 +910,9 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   const int kv_dim = c.full_kv_proj_out_dim();
   const int attn_dim = c.num_attention_heads * c.head_dim;
 
-  std::size_t max_proj_elems = static_cast<std::size_t>(I) * static_cast<std::size_t>(H);
-  max_proj_elems = std::max(max_proj_elems, static_cast<std::size_t>(std::max(cd, qg_dim)) * static_cast<std::size_t>(H));
-  max_proj_elems = std::max(max_proj_elems, static_cast<std::size_t>(16384) * static_cast<std::size_t>(H));
   const std::size_t max_k_elems =
       static_cast<std::size_t>(P) * static_cast<std::size_t>(std::max({H, I, vd, attn_dim}));
 
-  impl_->dequant_scratch.allocate(max_proj_elems);
   impl_->act_quant_scratch.allocate(max_k_elems);
   impl_->token_ids_dev.allocate(static_cast<std::size_t>(P));
   impl_->gather_rows_dev.allocate(static_cast<std::size_t>(Impl::kLogitBatchMax));
@@ -1108,15 +947,14 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   impl_->decode_single_tok.resize(1);
 
   impl_->scratch_bytes =
-      impl_->dequant_scratch.count * 2 + impl_->act_quant_scratch.count * 2 + impl_->token_ids_dev.count * 4 +
-      impl_->gather_rows_dev.count * 4 +
-      (impl_->hidden.count + impl_->normed.count + impl_->residual.count + impl_->qkv.count + impl_->conv_out.count +
-       impl_->q_sep.count + impl_->k_sep.count + impl_->v_sep.count + impl_->z_buf.count + impl_->a_buf.count +
-       impl_->b_buf.count + impl_->core_out.count + impl_->q_gate.count + impl_->k_raw.count + impl_->v_raw.count +
-       impl_->q_tmp.count + impl_->gate_tmp.count + impl_->attn_out.count + impl_->mlp_gate.count + impl_->mlp_up.count +
-       impl_->cap_hidden.count + impl_->cap_normed.count) *
-          2 +
-      (impl_->gdn_scratch.count + impl_->logits_f32.count) * 4 + Qwen38CublasGemm::kWorkspaceBytes;
+      (impl_->act_quant_scratch.count + impl_->hidden.count + impl_->normed.count + impl_->residual.count +
+       impl_->qkv.count + impl_->conv_out.count + impl_->q_sep.count + impl_->k_sep.count + impl_->v_sep.count +
+       impl_->z_buf.count + impl_->a_buf.count + impl_->b_buf.count + impl_->core_out.count + impl_->q_gate.count +
+       impl_->k_raw.count + impl_->v_raw.count + impl_->q_tmp.count + impl_->gate_tmp.count + impl_->attn_out.count +
+       impl_->mlp_gate.count + impl_->mlp_up.count + impl_->cap_hidden.count + impl_->cap_normed.count +
+       impl_->gdn_scratch.count + impl_->logits_f32.count) *
+          sizeof(float) +
+      (impl_->token_ids_dev.count + impl_->gather_rows_dev.count) * sizeof(std::int32_t);
 
   impl_->default_session.reset(new Qwen38DenseSession(*this));
   impl_->max_state_bytes = impl_->default_session->state_bytes();

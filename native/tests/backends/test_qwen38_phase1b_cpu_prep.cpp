@@ -168,6 +168,24 @@ void test_kld_summary_and_verdict() {
     d.long_summary.all_finite = false;
     CHECK(!evaluate_gate2_verdict(d).long_code_passed);
   }
+  // Regression for hand-built summaries claiming all_finite=true with NaN/Inf/out-of-range scalars:
+  {
+    const double qnan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    for (int tc = 0; tc < 8; ++tc) {
+      auto d = base;
+      if (tc == 0) d.short_summary.kld_mean = qnan;
+      if (tc == 1) d.short_summary.kld_max = qnan;
+      if (tc == 2) d.short_summary.top1_agreement = qnan;
+      if (tc == 3) d.long_summary.kld_p99 = qnan;
+      if (tc == 4) d.chunk_vs_step_summary.kld_max = qnan;
+      if (tc == 5) d.short_summary.kld_mean = inf;
+      if (tc == 6) d.long_summary.kld_mean = -0.001;
+      if (tc == 7) d.short_summary.top1_agreement = 1.01;
+      const auto v = evaluate_gate2_verdict(d);
+      CHECK(!v.executed_checks_passed && !v.qualification_passed && !v.failures.empty());
+    }
+  }
 }
 
 void test_streaming_reference_reader() {

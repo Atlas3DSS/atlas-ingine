@@ -132,6 +132,38 @@ void qwen38_cuda_nvfp4_linear_bf16_to_f32(const __nv_bfloat16* x, const std::uin
 void qwen38_cuda_bf16_linear_bf16_to_f32(const __nv_bfloat16* x, const __nv_bfloat16* w_bf16, int m, int out_features,
                                          int in_features, float* out_f32, cudaStream_t stream = nullptr);
 
+// Phase 1B batch-size-invariant FP32 activation kernels (bit-identical across M=1..256) and BF16-KV attention.
+void qwen38_cuda_quant_fp8_act_f32(const float* x_in, float input_scale, std::size_t n, float* x_out,
+                                   cudaStream_t stream = nullptr);
+void qwen38_cuda_nvfp4_linear_f32_batched(const float* x, const std::uint8_t* w_packed,
+                                          const std::uint8_t* block_scales_e4m3, float weight_scale_2, int m,
+                                          int out_features, int in_features, float* out,
+                                          cudaStream_t stream = nullptr);
+void qwen38_cuda_fp8_linear_f32_batched(const float* x, const std::uint8_t* w_e4m3, float weight_scale,
+                                        float input_scale, int m, int out_features, int in_features, float* out,
+                                        cudaStream_t stream = nullptr);
+void qwen38_cuda_bf16_linear_f32_batched(const float* x, const __nv_bfloat16* w_bf16, int m, int out_features,
+                                         int in_features, float* out, cudaStream_t stream = nullptr);
+
+void qwen38_cuda_embed_lookup_f32(const __nv_bfloat16* embed_table, const std::int32_t* token_ids, int seq_len,
+                                  int hidden_size, int vocab_size, float* out_hidden,
+                                  cudaStream_t stream = nullptr);
+void qwen38_cuda_gather_rows_f32(const float* src, const int* row_indices, int num_rows, int hidden_size,
+                                 float* dst, cudaStream_t stream = nullptr);
+void qwen38_cuda_swiglu_mul_f32(const float* gate, const float* up, float* out, std::size_t n,
+                                cudaStream_t stream = nullptr);
+void qwen38_cuda_add_residual_f32(float* hidden, const float* residual, std::size_t n,
+                                  cudaStream_t stream = nullptr);
+void qwen38_cuda_split_qkv_sep_f32(const float* mixed, float* q_sep, float* k_sep, float* v_sep, int seq_len,
+                                   int kd, int vd, cudaStream_t stream = nullptr);
+void qwen38_cuda_full_attn_gated_f32_kvbf16(const float* q_with_gate, float* k_raw_inout, const float* v_in,
+                                            const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
+                                            float rms_eps, float rope_theta, int seq_len, int pos_offset,
+                                            int num_heads, int num_kv_heads, int head_dim, int rotary_dim,
+                                            __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int max_cache_len,
+                                            float* q_scratch, float* gate_scratch, float* out_attn,
+                                            cudaStream_t stream = nullptr);
+
 // Runs a 1-layer or 4-layer block bundle on the active CUDA device with BF16 activation boundaries
 // and F32 GDN recurrent state. Caller must ensure a valid CUDA device is active.
 Qwen38BlockRunOutput run_qwen38_blocks_gpu(const Qwen38BlockBundleHost& bundle, bool use_chunk_prefill,
