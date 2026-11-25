@@ -9,6 +9,17 @@ Inkling-2-Mini has been benchmarked on real cards across **six NVIDIA GPU genera
 `json_object` / `json_schema`) + automatic tool-ban**, and a standalone **Verified Ledger SDK (`ledger/`)**.
 On the RTX 3090, all 24 BF16 dense output hashes matched between the pre-port build and the FP16 port. Blackwell and V100 runs passed `kernels_bitlock` (`48/48` on Blackwell) and full-model parity; P100 (`sm_60`) and Turing (`sm_75`) passed kernel tests and real-card speed benchmarks (full-model parity ctest was not run on the cloud P100/T4/RTX 6000/A100/H100 instances).
 
+## Checkpoints (Direct Hugging Face Links)
+
+| Checkpoint | Format | Target VRAM / Use | Direct Link |
+|---|---|---|---|
+| **Native `NVFP4+MXFP8`** | Base safetensors (`20.2 GB`) | `24 GB+` cards (`64K–262K`), `32–96 GB` (`1M` ctx) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) |
+| **Elastic `atlas-12g`** | Native `ATLAS2`/`ATLAS3` (`14.05 GB`) | `16 GB–24 GB` cards (`64K–128K` ctx) | [Atlas3D/Inkling-2-Mini-atlas-12g-ingine](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-12g-ingine) |
+| **Elastic `atlas-10g`** | Native `ATLAS2`/`ATLAS3` (`12.01 GB`) | `12 GB–16 GB` cards (`P100`/`T4`/`3090`) | [Atlas3D/Inkling-2-Mini-atlas-10g-ingine](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) |
+| **EXL3 9 GB (FP8-prebaked)** | Native EXL3 + FP8 (`~9 GB`) | **`6 GB–24 GB` 1M-context** (`--kv-q4`, `0.000000` KL vs `--dense-fp8`) | [Atlas3D/Inkling-2-Mini-atlas-exl3-9g-fp8-ingine](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-exl3-9g-fp8-ingine) |
+| **EXL3 9 GB (BF16 dense)** | Native EXL3 + BF16 (`~9 GB`) | `6 GB–24 GB` cards (unquantized dense projections) | [Atlas3D/Inkling-2-Mini-atlas-exl3-9g-ingine](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-exl3-9g-ingine) |
+| **Atlas Elastic GGUF** | GGUF (`llama.cpp` / `atlas-engine`) | `llama.cpp` / [Atlas3DSS/atlas-engine](https://github.com/Atlas3DSS/atlas-engine) serving | [Atlas3D/Inkling-2-Mini-Atlas-Elastic-GGUF](https://huggingface.co/Atlas3D/Inkling-2-Mini-Atlas-Elastic-GGUF) |
+
 ## Measured performance (16K, 64K & 262K context across 6 NVIDIA generations)
 
 ![10-Year NVIDIA Architecture Lineup and Continuous Batching](docs/media/nvidia_10yr_and_batch.png)
@@ -17,26 +28,26 @@ Unless noted, 64K rows use `ingine-bench --max-ctx 65536 --dense-fp8 --kv-fp8 --
 
 | GPU | Arch | Year | Checkpoint / Mode | VRAM | Chat decode | Code decode | Prefill |
 |---|---|---:|---|---:|---:|---:|---:|
-| Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | Elastic `atlas-10g` (16K, `--spec`) | `13.33 GB` | `20.2 tok/s` | `22.9 tok/s` | `282 tok/s` (16K) |
-| Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | Elastic `atlas-10g` (64K, `--spec`) | `14.34 GB` | `11.9 tok/s` | `10.2 tok/s` | `72.8 tok/s` (64K) |
-| Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | Elastic `atlas-10g` (64K, no-spec) | `13.17 GB` | `7.9 tok/s` | `7.5 tok/s` | `70.1 tok/s` (64K) |
-| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | Native `NVFP4+MXFP8` (64K, `901d86e`) | `21.82 GB` | `59.8 tok/s` | `72.2 tok/s` | `717.7 tok/s` (64K) |
-| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | Native `NVFP4+MXFP8` (64K, `feat/sm60-sm70-victory @ 2545a22`) | `21.82 GB` | **`81.0 tok/s`** | **`100.7 tok/s`** | **`2,052 tok/s`** (64K) |
-| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | Native `NVFP4+MXFP8` (262K) | `25.04 GB` | `46.0 tok/s` | `54.9 tok/s` | — |
-| Tesla T4 16 GB | `sm_75` (FP16) | 2018 | Elastic `atlas-10g` (16K, `--spec`) | `13.33 GB` | `23.5 tok/s` | `25.2 tok/s` | `303 tok/s` (16K) |
-| Tesla T4 16 GB | `sm_75` (FP16) | 2018 | Elastic `atlas-10g` (64K, `--spec`) | `14.34 GB` | `22.1 tok/s` | `23.9 tok/s` | `237 tok/s` (64K) |
-| Quadro RTX 6000 24 GB | `sm_75` (FP16) | 2018 | Native `NVFP4+MXFP8` (64K) | `21.83 GB` | `47.9 tok/s` | `64.0 tok/s` | `431 tok/s` (64K) |
-| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Native `NVFP4+MXFP8` (64K) | `21.82 GB` | `154.9 tok/s` | `213.2 tok/s` | `2,980 tok/s` (64K) |
-| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Elastic `atlas-12g` (64K) | `16.37 GB` | `132.4 tok/s` | `161.2 tok/s` | `2,970 tok/s` (64K) |
-| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | Elastic `atlas-10g` (64K) | `14.33 GB` | `145.6 tok/s` | `196.1 tok/s` | `3,012 tok/s` (64K) |
-| A100 80 GB | `sm_80` (BF16) | 2020 | Native `NVFP4+MXFP8` (64K) | `21.82 GB` | `153.0 tok/s` | `194.6 tok/s` | `5,164 tok/s` (64K) |
-| A100 80 GB | `sm_80` (BF16) | 2020 | Native `NVFP4+MXFP8` (262K) | `25.04 GB` | `152.8 tok/s` | `194.2 tok/s` | — |
-| RTX 4090 24 GB | `sm_89` (BF16) | 2022 | Elastic `atlas-12g` (64K) | `16.36 GB` | `236.7 tok/s` | `278.3 tok/s` | `7,031 tok/s` (64K) |
-| H100 80 GB | `sm_90` (BF16) | 2022 | Native `NVFP4+MXFP8` (64K) | `21.79 GB` | `240.8 tok/s` | `300.3 tok/s` | `7,004 tok/s` (64K) |
-| H100 80 GB | `sm_90` (BF16) | 2022 | Native `NVFP4+MXFP8` (262K) | `25.01 GB` | `241.8 tok/s` | `300.8 tok/s` | — |
-| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Native `NVFP4+MXFP8` (B=1, `feat/continuous-batching @ fa4ecb9`) | `20.53 GB` | **`460.6 tok/s`** | **`586.1 tok/s`** | — |
-| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-12g` (64K) | `16.26 GB` | `411.0 tok/s` | `519.9 tok/s` | `11,728 tok/s` (64K) |
-| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | Elastic `atlas-10g` (64K) | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` (64K) |
+| Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (16K, `--spec`) | `13.33 GB` | `20.2 tok/s` | `22.9 tok/s` | `282 tok/s` (16K) |
+| Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (64K, `--spec`) | `14.34 GB` | `11.9 tok/s` | `10.2 tok/s` | `72.8 tok/s` (64K) |
+| Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (64K, no-spec) | `13.17 GB` | `7.9 tok/s` | `7.5 tok/s` | `70.1 tok/s` (64K) |
+| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (64K, `901d86e`) | `21.82 GB` | `59.8 tok/s` | `72.2 tok/s` | `717.7 tok/s` (64K) |
+| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (64K, `feat/sm60-sm70-victory @ 2545a22`) | `21.82 GB` | **`81.0 tok/s`** | **`100.7 tok/s`** | **`2,052 tok/s`** (64K) |
+| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (262K) | `25.04 GB` | `46.0 tok/s` | `54.9 tok/s` | — |
+| Tesla T4 16 GB | `sm_75` (FP16) | 2018 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (16K, `--spec`) | `13.33 GB` | `23.5 tok/s` | `25.2 tok/s` | `303 tok/s` (16K) |
+| Tesla T4 16 GB | `sm_75` (FP16) | 2018 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (64K, `--spec`) | `14.34 GB` | `22.1 tok/s` | `23.9 tok/s` | `237 tok/s` (64K) |
+| Quadro RTX 6000 24 GB | `sm_75` (FP16) | 2018 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (64K) | `21.83 GB` | `47.9 tok/s` | `64.0 tok/s` | `431 tok/s` (64K) |
+| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (64K) | `21.82 GB` | `154.9 tok/s` | `213.2 tok/s` | `2,980 tok/s` (64K) |
+| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | [Elastic `atlas-12g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-12g-ingine) (64K) | `16.37 GB` | `132.4 tok/s` | `161.2 tok/s` | `2,970 tok/s` (64K) |
+| RTX 3090 24 GB | `sm_86` (BF16) | 2020 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (64K) | `14.33 GB` | `145.6 tok/s` | `196.1 tok/s` | `3,012 tok/s` (64K) |
+| A100 80 GB | `sm_80` (BF16) | 2020 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (64K) | `21.82 GB` | `153.0 tok/s` | `194.6 tok/s` | `5,164 tok/s` (64K) |
+| A100 80 GB | `sm_80` (BF16) | 2020 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (262K) | `25.04 GB` | `152.8 tok/s` | `194.2 tok/s` | — |
+| RTX 4090 24 GB | `sm_89` (BF16) | 2022 | [Elastic `atlas-12g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-12g-ingine) (64K) | `16.36 GB` | `236.7 tok/s` | `278.3 tok/s` | `7,031 tok/s` (64K) |
+| H100 80 GB | `sm_90` (BF16) | 2022 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (64K) | `21.79 GB` | `240.8 tok/s` | `300.3 tok/s` | `7,004 tok/s` (64K) |
+| H100 80 GB | `sm_90` (BF16) | 2022 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (262K) | `25.01 GB` | `241.8 tok/s` | `300.8 tok/s` | — |
+| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (B=1, `feat/continuous-batching @ fa4ecb9`) | `20.53 GB` | **`460.6 tok/s`** | **`586.1 tok/s`** | — |
+| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | [Elastic `atlas-12g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-12g-ingine) (64K) | `16.26 GB` | `411.0 tok/s` | `519.9 tok/s` | `11,728 tok/s` (64K) |
+| RTX PRO 6000 96 GB | `sm_120a` (BF16) | 2025 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (64K) | `14.18 GB` | `410.7 tok/s` | `554.3 tok/s` | `11,806 tok/s` (64K) |
 
 External baseline reference points (different hardware, quants, or settings — reported individually):
 
@@ -467,5 +478,6 @@ shoulders of the open-source AI and systems community:
 - **Base model:** [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by **Thinking Machines Lab** (Apache-2.0; model weights are not stored in this Git repository).
 - **Upstream engine, installer, and abliteration tooling:** [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0), with upstream kernel inspirations credited in [NOTICE](NOTICE) (**fngine**, **cinference**, **NInfer**).
 - **Broader Inkling-2-Mini & quantization open-source ecosystem:** **ggml-org / llama.cpp**, **realugbun** (initial Inkling-2-Mini `llama.cpp` support), **turboderp / ExLlamaV3** (QTIP/trellis quantization), **professorpalmer / Kintsugi-Inkling-2-Mini** (community 12 GB GGUF/EXL3 serving work), **mw00 / Project Maya** (Peasant Smith & Project Maya contributors, Niko1221 & Strata contributors — MIT AMD ROCm/HIP & multi-GPU Inkling-2-Mini serving), and **NVIDIA** (CUDA toolkit and 10 years of forward-compatible GPU architecture from Pascal through Blackwell).
+- **Mechanistic interpretability & neuron-basis reference:** [stdlogits/neuron-lens](https://github.com/stdlogits/neuron-lens) by **@_a9lim** and **@treetowntree** (MIT, [neuron-lens.com](https://neuron-lens.com), [stdlogits/rs-lenses](https://huggingface.co/stdlogits/rs-lenses), created 2026-10-30 — open catalog and R-lens/S-lens Jacobian methodology reading MLP neurons and attention heads by input drivers and output/write contributions), cited alongside Jasmine Shone and Lisa Dunlap's two-part Anthropic Fellows work [*Returning to the neuron basis for interpretability*](https://alignment.anthropic.com/2026/neuron-basis-theory/) ([Part 2](https://alignment.anthropic.com/2026/neuron-basis-applications/), 2026-11-23).
 - **10-year multi-architecture (`sm_60`/`61`/`70`/`75`/`80`/`86`/`89`/`90`/`120a`) port, Elastic `ATLAS2`/`ATLAS3` sub-4-bit MoE kernels and converter, native OpenAI `response_format` / tool-ban, and Verified Ledger SDK:** Atlas 3DSS.
 - CUDA runtime/toolkit components remain subject to NVIDIA's license terms. Unofficial open-source community project, not affiliated with or endorsed by Thinking Machines Lab or NVIDIA.
