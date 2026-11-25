@@ -9,6 +9,7 @@ add_library(ingine_model STATIC
   runtime.cpp
   generator.cpp
   batch_engine.cpp
+  tp_engine.cpp
   model_kernels.cu
 )
 # prefill (package Prefill) and the speculative loop (package Spec)
@@ -29,6 +30,10 @@ target_link_libraries(ingine_model PUBLIC
   ingine_kernels_head
   nlohmann_json::nlohmann_json
   CUDA::cudart)
+if(INGINE_TP_SIZE GREATER 1)
+  find_library(NCCL_LIB nccl REQUIRED)
+  target_link_libraries(ingine_model PUBLIC ingine_engine ${NCCL_LIB})
+endif()
 foreach(area prefill draft batch)
   if(TARGET ingine_kernels_${area})
     target_link_libraries(ingine_model PUBLIC ingine_kernels_${area})

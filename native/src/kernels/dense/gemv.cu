@@ -618,14 +618,47 @@ void gemv(const ActT* x, int M, int K, Matrix w, float* out, bool pdl, cudaStrea
   // bytes in flight (measured M = 8, BF16: K = 3072 10.4 -> 8.4 us, K = 9216 28.3 -> 26.0 us vs 8 warps).
   // For BF16, K = 3072, M = 1: as proj_conv; K = 9216: 36 chunks per lane would spill, so M = 1 uses tensor cores.
   if (K == 3072) launch_gemv<3072, 32, 16, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
+  else if (K == 1536) launch_gemv<1536, 32, 8, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
+  else if (K == 768) launch_gemv<768, 32, 4, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
   else if (K == 9216) launch_gemv<9216, 0, 16, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
-  else require(false, "gemv: K must be 3072 or 9216");
+  else require(false, "gemv: K must be 768, 1536, 3072 or 9216");
 }
 
 void fp8_rows(const ActT* w, int rows, int K, void* q, float* scale, cudaStream_t stream) {
   require(rows >= 0 && K > 0, "fp8_rows: bad shape");
   if (rows > 0)
     fp8_rows_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(w, rows, K, static_cast<__nv_fp8_storage_t*>(q), scale);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void static_conv_decode_kernel(const float* __restrict__ x_f32, int M, const float* __restrict__ conv_w,
+                                          float* __restrict__ state, float* __restrict__ out, float* __restrict__ hist) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= H) return;
+  const float4 cw = __ldg(reinterpret_cast<const float4*>(conv_w) + c);
+  float ext[11];
+  ext[0] = state[c];
+  ext[1] = state[H + c];
+  ext[2] = state[2 * H + c];
+  for (int m = 0; m < M; ++m) ext[3 + m] = round_bf16(x_f32[size_t(m) * H + c]);
+  constexpr float inv_sqrt5 = 1.f / 2.2360679774997896f;
+  for (int m = 0; m < M; ++m) {
+    float acc = __fmul_rn(cw.x, ext[m]);
+    acc = __fadd_rn(acc, __fmul_rn(cw.y, ext[m + 1]));
+    acc = __fadd_rn(acc, __fmul_rn(cw.z, ext[m + 2]));
+    acc = __fadd_rn(acc, __fmul_rn(cw.w, ext[m + 3]));
+    out[size_t(m) * H + c] = __fmul_rn(__fadd_rn(acc, ext[m + 3]), inv_sqrt5);
+    if (hist) hist[size_t(m) * H + c] = ext[m + 3];
+  }
+  state[c] = ext[M];
+  state[H + c] = ext[M + 1];
+  state[2 * H + c] = ext[M + 2];
+}
+
+void static_conv_decode(const float* x_f32, int M, const float* conv_w, float* conv_state, float* out,
+                        float* conv_hist, cudaStream_t stream) {
+  require(x_f32 && conv_w && conv_state && out && M >= 1 && M <= 8, "static_conv_decode: bad args");
+  static_conv_decode_kernel<<<(H + 255) / 256, 256, 0, stream>>>(x_f32, M, conv_w, conv_state, out, conv_hist);
   CUDA_CHECK(cudaGetLastError());
 }
 

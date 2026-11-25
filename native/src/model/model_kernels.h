@@ -20,6 +20,9 @@ void f32_to_bf16_rows(const float* src, int rows, int cols, ActT* dst, std::int6
 // Converts `numel` BF16 elements at `data` to ActT in-place on the device (no-op when ActT is BF16;
 // converts BF16 -> FP16 with finite saturation to +-65504 when INGINE_ACT_FP16=1).
 void bf16_to_act_inplace(void* data, std::size_t numel, cudaStream_t stream);
+// Unpacks ncclAllGather [tp_size, B, local_vocab] -> contiguous [B, unpadded_vocab].
+void unpack_tp_logits(const float* gathered, int B, int tp_size, int local_vocab, int unpadded_vocab,
+                      float* out, cudaStream_t stream);
 
 // Device pointers of the recurrent decode state a step overwrites besides the cache rows at its own
 // positions: the conv states (fp32 [48, 3, C], oldest input first; C = KV_DIM for k/v, HIDDEN for attn/mlp)

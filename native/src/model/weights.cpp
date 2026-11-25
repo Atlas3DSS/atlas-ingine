@@ -99,6 +99,16 @@ class Loader {
     pending_.push_back(r);
   }
 
+  // Queues rows [row_begin, row_begin + row_count) of `name` for upload to `dst`.
+  void queue_rows(const std::string& name, std::int64_t row_begin, std::int64_t row_count, void* dst) {
+    const SafetensorsRef ref = m_.at(name);
+    const std::uint64_t row_bytes = ref->bytes / std::uint64_t(ref->shape[0]);
+    UploadRequest r = upload_request(ref, dst);
+    r.offset += std::uint64_t(row_begin) * row_bytes;
+    r.bytes = std::uint64_t(row_count) * row_bytes;
+    pending_.push_back(r);
+  }
+
   // Raw checkpoint tensor (any dtype) in new device memory, uploaded at flush().
   Tensor raw(const std::string& name) {
     const SafetensorsRef ref = m_.at(name);
@@ -527,6 +537,358 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     w.expert_cache = ExpertCache::create(model_dir, w.expert_formats, w.w2_expert_formats, router_biases,
                                          expert_vram_budget, warm_ram_budget, offload, stream);
   }
+  return w;
+}
+
+Layer load_layer_sharded(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, int tp_rank, int tp_size) {
+  const SafetensorsModel& m = ld.model();
+  const std::string p = "model.llm.layers." + std::to_string(l) + ".";
+  Layer layer;
+  layer.idx = l;
+  layer.full = is_full_layer(l);
+  layer.loop = is_loop_layer(l);
+  const int H = HIDDEN;
+  if (tp_size != TP_SIZE) throw std::invalid_argument("load_layer_sharded: tp_size != compile-time TP_SIZE");
+
+  if (layer.full) {
+    layer.q_norm = ld.f32(p + "q_input_norm.weight", {H});
+    layer.k_norm = ld.f32(p + "k_input_norm.weight", {H});
+    layer.v_norm = ld.f32(p + "v_input_norm.weight", {H});
+  } else {
+    layer.attn_norm = ld.f32(p + "attn_norm.weight", {H});
+  }
+  layer.mlp_norm = ld.f32(p + "mlp_norm.weight", {H});
+
+  static const char* seg_names[NUM_SEGS] = {"attn.wq_du.weight",        "attn.gate_attn.weight",
+                                            "attn.wr_du.weight",        "attn.attn_sink_proj.weight",
+                                            "attn.wk_dv.weight",        "attn.wv_dv.weight",
+                                            "attn.k_sconv.weight_proj", "attn.v_sconv.weight_proj"};
+  const int seg_real[NUM_SEGS] = {HEADS * HEAD_DIM, HEADS * HEAD_DIM, HEADS * D_REL, HEADS,
+                                  KV_DIM, KV_DIM, KV_HEADS * CONV_K, KV_HEADS * CONV_K};
+  const int R = proj_rows(layer.full);
+  const bool proj_fp8_disk = m.at(p + seg_names[0])->dtype == "F8_E4M3";
+  const bool wo_fp8_disk = m.at(p + "attn.wo_ud.weight")->dtype == "F8_E4M3";
+  DeviceBuffer proj_tmp, wo_tmp;
+  Tensor wproj_bf16, wo_bf16;
+  if (proj_fp8_disk) {
+    void* q = ld.alloc(std::size_t(R) * H);
+    float* sc = static_cast<float*>(ld.alloc(std::size_t(R) * 4));
+    CUDA_CHECK(cudaMemsetAsync(q, 0, std::size_t(R) * H, ld.stream()));
+    CUDA_CHECK(cudaMemsetAsync(sc, 0, std::size_t(R) * 4, ld.stream()));
+    for (int s = 0; s < num_segs(layer.full); ++s) {
+      const std::int64_t r0 = std::int64_t(tp_rank) * seg_real[s];
+      ld.queue_rows(p + seg_names[s], r0, seg_real[s], static_cast<char*>(q) + std::size_t(SEG_BEGIN[s]) * H);
+      ld.queue_rows(p + std::string(seg_names[s]) + "_scale", r0, seg_real[s], sc + SEG_BEGIN[s]);
+    }
+    layer.wproj = Dense{rm(q, DType::FP8_E4M3FN, {R, H}), rm(sc, DType::FP32, {R})};
+  } else {
+    void* d = dense_fp8 ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p : ld.alloc(std::size_t(R) * H * 2);
+    CUDA_CHECK(cudaMemsetAsync(d, 0, std::size_t(R) * H * 2, ld.stream()));
+    for (int s = 0; s < num_segs(layer.full); ++s) {
+      const std::int64_t r0 = std::int64_t(tp_rank) * seg_real[s];
+      ld.queue_rows(p + seg_names[s], r0, seg_real[s], static_cast<char*>(d) + std::size_t(SEG_BEGIN[s]) * H * 2);
+    }
+    wproj_bf16 = rm(d, kActDType, {R, H});
+  }
+  // Column-sharded wo: [H, TOTAL_HEADS * HEAD_DIM] -> [H, HEADS * HEAD_DIM]
+  {
+    const int full_cols = TOTAL_HEADS * HEAD_DIM;
+    const int local_cols = HEADS * HEAD_DIM;
+    const int col0 = tp_rank * local_cols;
+    const std::string wn = p + "attn.wo_ud.weight";
+    const std::vector<std::byte> raw = m.read(wn);
+    const std::size_t es = wo_fp8_disk ? 1 : 2;
+    std::vector<std::byte> sliced(std::size_t(H) * local_cols * es);
+    for (int r = 0; r < H; ++r) {
+      std::memcpy(sliced.data() + std::size_t(r) * local_cols * es,
+                  raw.data() + (std::size_t(r) * full_cols + col0) * es,
+                  std::size_t(local_cols) * es);
+    }
+    if (wo_fp8_disk) {
+      void* oq = ld.alloc(sliced.size());
+      CUDA_CHECK(cudaMemcpyAsync(oq, sliced.data(), sliced.size(), cudaMemcpyHostToDevice, ld.stream()));
+      Tensor osc = ld.f32(wn + "_scale", {H});
+      layer.wo = Dense{rm(oq, DType::FP8_E4M3FN, {H, local_cols}), osc};
+    } else {
+      void* o = dense_fp8 ? (wo_tmp = DeviceBuffer(sliced.size())).p : ld.alloc(sliced.size());
+      CUDA_CHECK(cudaMemcpyAsync(o, sliced.data(), sliced.size(), cudaMemcpyHostToDevice, ld.stream()));
+      wo_bf16 = rm(o, kActDType, {H, local_cols});
+    }
+  }
+  // Head-sharded scales & KV convolutions
+  {
+    const std::vector<float> qs = host_f32(m, p + "attn.q_l2_clip.scale");
+    std::vector<float> qsl(qs.begin() + std::ptrdiff_t(tp_rank) * HEADS * HEAD_DIM,
+                           qs.begin() + std::ptrdiff_t(tp_rank + 1) * HEADS * HEAD_DIM);
+    layer.q_scale = ld.upload_f32(qsl, {HEADS, HEAD_DIM});
+    const std::vector<float> rs = host_f32(m, p + "attn.rel_l2_clip.scale");
+    std::vector<float> rsl(rs.begin() + std::ptrdiff_t(tp_rank) * HEADS * D_REL,
+                           rs.begin() + std::ptrdiff_t(tp_rank + 1) * HEADS * D_REL);
+    layer.r_scale = ld.upload_f32(rsl, {HEADS, D_REL});
+  }
+  layer.rel_proj = ld.f32(p + "attn.rel_logits_proj.proj", {D_REL, REL_EXTENT});
+  if (layer.full) {
+    const int full_kv = TOTAL_KV_HEADS * HEAD_DIM;
+    auto slice_static = [&](const std::string& name) {
+      const std::vector<float> full = host_f32(m, name);
+      std::vector<float> out(std::size_t(CONV_K) * KV_DIM);
+      for (int lag = 0; lag < CONV_K; ++lag) {
+        std::copy(full.begin() + std::ptrdiff_t(lag) * full_kv + std::ptrdiff_t(tp_rank) * KV_DIM,
+                  full.begin() + std::ptrdiff_t(lag) * full_kv + std::ptrdiff_t(tp_rank + 1) * KV_DIM,
+                  out.begin() + std::ptrdiff_t(lag) * KV_DIM);
+      }
+      return ld.upload_f32(out, {CONV_K, KV_DIM});
+    };
+    layer.k_static = slice_static(p + "attn.k_sconv.static_w");
+    layer.v_static = slice_static(p + "attn.v_sconv.static_w");
+  } else {
+    auto slice_conv = [&](const std::string& name) {
+      const std::vector<float> full = host_f32(m, name);
+      std::vector<float> out(full.begin() + std::ptrdiff_t(tp_rank) * KV_DIM * CONV_K,
+                             full.begin() + std::ptrdiff_t(tp_rank + 1) * KV_DIM * CONV_K);
+      return ld.upload_f32(out, {KV_DIM, CONV_K});
+    };
+    layer.k_conv = slice_conv(p + "attn.k_sconv.weight");
+    layer.v_conv = slice_conv(p + "attn.v_sconv.weight");
+  }
+  layer.attn_conv = ld.f32(p + "attn_sconv.weight", {H, CONV_K});
+  layer.mlp_conv = ld.f32(p + "mlp_sconv.weight", {H, CONV_K});
+  layer.router = ld.f32(p + "mlp.gate.weight", {EXPERTS, H});
+  layer.router_bias = ld.f32(p + "mlp.gate.bias", {EXPERTS});
+  layer.router_bf16 = ld.upload_bf16(host_f32(m, p + "mlp.gate.weight"), {EXPERTS, H});
+  if (l > 0) {
+    const std::string qn = "model.llm.attn_res.attn_queries." + std::to_string(l - 1);
+    const std::int32_t nq = std::int32_t(m.at(qn)->numel() / H);
+    layer.attn_query = ld.f32(qn, {nq, H});
+  }
+  layer.mlp_query = ld.f32("model.llm.attn_res.mlp_queries." + std::to_string(l), {1, H});
+  {
+    std::vector<float> n3(std::size_t(3) * H);
+    if (layer.full) {
+      const char* names[3] = {"q_input_norm.weight", "k_input_norm.weight", "v_input_norm.weight"};
+      for (int g = 0; g < 3; ++g) {
+        const std::vector<float> v = host_f32(m, p + names[g]);
+        std::copy(v.begin(), v.end(), n3.begin() + std::ptrdiff_t(g) * H);
+      }
+    } else {
+      const std::vector<float> v = host_f32(m, p + "attn_norm.weight");
+      for (int g = 0; g < 3; ++g) std::copy(v.begin(), v.end(), n3.begin() + std::ptrdiff_t(g) * H);
+    }
+    layer.attn_norm3 = ld.upload_f32(n3, {3, H});
+    layer.attn_norm_mix = layer.full ? layer.attn_norm3 : rm(layer.attn_norm3.data, DType::FP32, {1, H});
+    layer.mlp_norm1 = rm(layer.mlp_norm.data, DType::FP32, {1, H});
+  }
+  if (layer.loop) {
+    const char* ckpt[4] = {"attn", "k", "v", "mlp"};
+    std::vector<float> down[4], forget[4], gain[4];
+    for (int g = 0; g < 4; ++g) {
+      const std::string c = p + "controllers." + ckpt[g] + ".";
+      down[g] = host_f32(m, c + "down_weight");
+      forget[g] = host_f32(m, c + "forget_weight");
+      gain[g] = host_f32(m, c + "gain_weight");
+    }
+    auto stack = [](std::vector<float>* parts, int n) {
+      std::vector<float> out;
+      for (int i = 0; i < n; ++i) out.insert(out.end(), parts[i].begin(), parts[i].end());
+      return out;
+    };
+    const int D2 = 2 * H;
+    layer.qkv_gate_down = ld.upload_bf16(stack(down, 3), {3, GATE_RANK, D2});
+    layer.qkv_gate_forget = ld.upload_f32(stack(forget, 3), {3, H, GATE_RANK});
+    layer.qkv_gate_gain = ld.upload_f32(stack(gain, 3), {3, H, GATE_RANK});
+    layer.qkv_gate_forget16 = ld.upload_bf16(stack(forget, 3), {3, H, GATE_RANK});
+    layer.qkv_gate_gain16 = ld.upload_bf16(stack(gain, 3), {3, H, GATE_RANK});
+    layer.mlp1_gate_down = ld.upload_bf16(down[3], {1, GATE_RANK, D2});
+    layer.mlp1_gate_forget = ld.upload_f32(forget[3], {1, H, GATE_RANK});
+    layer.mlp1_gate_gain = ld.upload_f32(gain[3], {1, H, GATE_RANK});
+    layer.mlp1_gate_forget16 = ld.upload_bf16(forget[3], {1, H, GATE_RANK});
+    layer.mlp1_gate_gain16 = ld.upload_bf16(gain[3], {1, H, GATE_RANK});
+    auto at = [](const Tensor& stack, int g, DType dt, std::int32_t a, std::int32_t b) {
+      const std::size_t es = dt == DType::FP32 ? 4 : 2;
+      return rm(static_cast<char*>(stack.data) + std::size_t(g) * a * b * es, dt, {a, b});
+    };
+    Tensor* downs[3] = {&layer.q_gate_down, &layer.k_gate_down, &layer.v_gate_down};
+    Tensor* forgets[3] = {&layer.q_gate_forget, &layer.k_gate_forget, &layer.v_gate_forget};
+    Tensor* gains[3] = {&layer.q_gate_gain, &layer.k_gate_gain, &layer.v_gate_gain};
+    for (int g = 0; g < 3; ++g) {
+      *downs[g] = at(layer.qkv_gate_down, g, kActDType, GATE_RANK, D2);
+      *forgets[g] = at(layer.qkv_gate_forget, g, DType::FP32, H, GATE_RANK);
+      *gains[g] = at(layer.qkv_gate_gain, g, DType::FP32, H, GATE_RANK);
+    }
+    layer.mlp_gate_down = at(layer.mlp1_gate_down, 0, kActDType, GATE_RANK, D2);
+    layer.mlp_gate_forget = at(layer.mlp1_gate_forget, 0, DType::FP32, H, GATE_RANK);
+    layer.mlp_gate_gain = at(layer.mlp1_gate_gain, 0, DType::FP32, H, GATE_RANK);
+  }
+
+  // EP-sharded routed experts: load only [e_begin, e_begin + e_per) into device memory
+  const std::string e = p + "mlp.experts.";
+  Experts& ex = layer.experts;
+  ex.fmt = ef.w13;
+  ex.w13_fmt = ef.w13;
+  ex.w2_fmt = ef.w2;
+  ex.ep_rank = tp_rank;
+  ex.ep_size = tp_size;
+  const int e_per = EXPERTS / tp_size;
+  const int e_begin = tp_rank * e_per;
+  auto load_ep_proj = [&](const char* proj, ExpertFormat pfmt, Tensor& wt, Tensor& sc, Tensor& fac,
+                          Tensor& w_ptrs_t, Tensor& s_ptrs_t) {
+    if (is_exl3(pfmt)) throw std::runtime_error("EP sharding supports NVFP4/MXFP8/ATLAS2/ATLAS3 (not EXL3)");
+    const bool mxfp8 = pfmt == ExpertFormat::MXFP8;
+    const SafetensorsRef wref = m.at(e + proj + "_weight");
+    const SafetensorsRef sref = m.at(e + proj + "_weight_scale");
+    const std::uint64_t w_per_exp = wref->bytes / std::uint64_t(EXPERTS);
+    const std::uint64_t s_per_exp = sref->bytes / std::uint64_t(EXPERTS);
+    void* wd = ld.alloc(w_per_exp * std::uint64_t(e_per));
+    void* sd = ld.alloc(s_per_exp * std::uint64_t(e_per));
+    ld.queue_rows(e + proj + "_weight", e_begin, e_per, wd);
+    ld.queue_rows(e + proj + "_weight_scale", e_begin, e_per, sd);
+    wt = rm(wd, wref->ingine_dtype(), {e_per, std::int32_t(w_per_exp)});
+    sc = rm(sd, sref->ingine_dtype(), {e_per, std::int32_t(s_per_exp)});
+    std::vector<const std::uint8_t*> wp(EXPERTS, nullptr), sp(EXPERTS, nullptr);
+    for (int i = 0; i < e_per; ++i) {
+      wp[e_begin + i] = static_cast<const std::uint8_t*>(wd) + std::size_t(i) * w_per_exp;
+      sp[e_begin + i] = static_cast<const std::uint8_t*>(sd) + std::size_t(i) * s_per_exp;
+    }
+    void* wpd = ld.alloc(EXPERTS * sizeof(void*));
+    void* spd = ld.alloc(EXPERTS * sizeof(void*));
+    CUDA_CHECK(cudaMemcpyAsync(wpd, wp.data(), EXPERTS * sizeof(void*), cudaMemcpyHostToDevice, ld.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(spd, sp.data(), EXPERTS * sizeof(void*), cudaMemcpyHostToDevice, ld.stream()));
+    w_ptrs_t = rm(wpd, DType::I64, {EXPERTS});
+    s_ptrs_t = rm(spd, DType::I64, {EXPERTS});
+    if (!mxfp8) {
+      const std::vector<float> amax = host_f32(m, e + proj + "_weight_amax");
+      const std::vector<float> den = host_f32(m, e + proj + "_weight_outer_scale_denominator");
+      std::vector<float> f(EXPERTS);
+      for (int i = 0; i < EXPERTS; ++i) f[i] = amax[i] / den[den.size() == 1 ? 0 : i];
+      fac = ld.upload_f32(f, {EXPERTS});
+    }
+  };
+  load_ep_proj("w13", ef.w13, ex.w13, ex.w13_scale, ex.w13_factor, ex.w13_ptrs, ex.w13_scale_ptrs);
+  load_ep_proj("w2", ef.w2, ex.w2, ex.w2_scale, ex.w2_factor, ex.w2_ptrs, ex.w2_scale_ptrs);
+  {
+    std::vector<std::uint8_t> mask(EXPERTS, 0);
+    for (int i = 0; i < e_per; ++i) mask[e_begin + i] = 1;
+    void* md = ld.alloc(EXPERTS);
+    CUDA_CHECK(cudaMemcpyAsync(md, mask.data(), EXPERTS, cudaMemcpyHostToDevice, ld.stream()));
+    ex.active_mask = rm(md, DType::U8, {EXPERTS});
+  }
+
+  if (!proj_fp8_disk || !wo_fp8_disk) {
+    ld.flush();
+    if (!proj_fp8_disk) {
+      bf16_to_act_inplace(wproj_bf16.data, std::size_t(R) * H, ld.stream());
+      layer.wproj = dense_fp8 ? to_fp8(ld, wproj_bf16, R, H) : Dense{wproj_bf16, {}};
+    }
+    if (!wo_fp8_disk) {
+      bf16_to_act_inplace(wo_bf16.data, std::size_t(H) * HEADS * HEAD_DIM, ld.stream());
+      layer.wo = dense_fp8 ? to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM) : Dense{wo_bf16, {}};
+    }
+    if (dense_fp8) CUDA_CHECK(cudaStreamSynchronize(ld.stream()));
+  }
+  Dense* views[NUM_SEGS] = {&layer.wq, &layer.wgate, &layer.wr, &layer.wsink,
+                            &layer.wk, &layer.wv,    &layer.wk_dyn, &layer.wv_dyn};
+  for (int s = 0; s < num_segs(layer.full); ++s) *views[s] = row_view(layer.wproj, SEG_BEGIN[s], SEG_BEGIN[s + 1]);
+  return layer;
+}
+
+Weights load_weights_sharded(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream,
+                             int tp_rank, int tp_size, bool keep_full_unembed) {
+  if (tp_size == 1) return load_weights(model_dir, dense_fp8, stream);
+  if (tp_size != TP_SIZE || tp_rank < 0 || tp_rank >= tp_size)
+    throw std::invalid_argument("load_weights_sharded: invalid tp_rank/tp_size");
+  const SafetensorsModel m(model_dir);
+  DeviceUploader up;
+  Weights w;
+  w.dense_fp8 = dense_fp8;
+  w.tp_rank = tp_rank;
+  w.tp_size = tp_size;
+  const auto efs = expert_formats(model_dir);
+  for (int l = 0; l < LAYERS; ++l) {
+    w.expert_formats[l] = efs[l].w13;
+    w.w2_expert_formats[l] = efs[l].w2;
+  }
+  w.storage.reserve(4096);
+  Loader ld(m, up, stream, w.storage);
+  const int H = HIDDEN;
+  for (int l = 0; l < LAYERS; ++l) {
+    w.layers.push_back(load_layer_sharded(ld, l, efs[l], dense_fp8, tp_rank, tp_size));
+    w.dense_fp8 = w.dense_fp8 || w.layers.back().wproj.fp8() || w.layers.back().wo.fp8();
+  }
+  {
+    const std::vector<float> q = host_f32(m, "model.llm.middle_cycle_cross_pass_queries");
+    const std::vector<float> kv = host_f32(m, "model.llm.middle_cycle_cross_pass_kv_queries");
+    const int n = int(q.size() / H / 2);
+    std::vector<float> mq(std::size_t(n) * 4 * H);
+    for (int i = 0; i < n; ++i) {
+      const float* rows[4] = {&q[std::size_t(2 * i) * H], &kv[std::size_t(2 * i) * H], &kv[std::size_t(2 * i + 1) * H],
+                              &q[std::size_t(2 * i + 1) * H]};
+      for (int j = 0; j < 4; ++j) std::copy(rows[j], rows[j] + H, mq.begin() + (std::ptrdiff_t(i) * 4 + j) * H);
+    }
+    w.message_queries = ld.upload_f32(mq, {n, 4, H});
+  }
+  w.embed = ld.raw("model.llm.embed.weight");
+  const bool embed_bf16 = w.embed.dtype == DType::BF16;
+  w.embed_norm = ld.f32("model.llm.embed_norm.weight", {H});
+  w.final_query = ld.f32("model.llm.attn_res.output_query", {1, H});
+  w.final_norm = ld.f32("model.llm.norm.weight", {H});
+  // Row-sharded unembed: [LOCAL_VOCAB_CHUNK, H] per rank
+  const int v0 = tp_rank * LOCAL_VOCAB_CHUNK;
+  const int v1 = std::min(UNPADDED_VOCAB, v0 + LOCAL_VOCAB_CHUNK);
+  const int v_real = std::max(0, v1 - v0);
+  w.vocab_begin = v0;
+  w.vocab_rows = v_real;
+  DeviceBuffer unembed_tmp, full_unembed_tmp;
+  {
+    const std::string name = "model.llm.unembed.weight";
+    const SafetensorsRef uref = m.at(name);
+    if (uref->dtype == "F8_E4M3") {
+      void* q = ld.alloc(std::size_t(LOCAL_VOCAB_CHUNK) * H);
+      float* sc = static_cast<float*>(ld.alloc(std::size_t(LOCAL_VOCAB_CHUNK) * 4));
+      CUDA_CHECK(cudaMemsetAsync(q, 0, std::size_t(LOCAL_VOCAB_CHUNK) * H, stream));
+      CUDA_CHECK(cudaMemsetAsync(sc, 0, std::size_t(LOCAL_VOCAB_CHUNK) * 4, stream));
+      if (v_real > 0) {
+        ld.queue_rows(name, v0, v_real, q);
+        ld.queue_rows(name + "_scale", v0, v_real, sc);
+      }
+      void* fq = nullptr; float* fsc = nullptr;
+      if (keep_full_unembed) {
+        fq = ld.alloc(std::size_t(UNPADDED_VOCAB) * H);
+        fsc = static_cast<float*>(ld.alloc(std::size_t(UNPADDED_VOCAB) * 4));
+        ld.queue(name, fq, UNPADDED_VOCAB);
+        ld.queue(name + "_scale", fsc, UNPADDED_VOCAB);
+      }
+      ld.flush();
+      if (embed_bf16) { bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream); w.embed.dtype = kActDType; }
+      w.unembed = Dense{rm(q, DType::FP8_E4M3FN, {LOCAL_VOCAB_CHUNK, H}), rm(sc, DType::FP32, {LOCAL_VOCAB_CHUNK})};
+      if (keep_full_unembed) w.full_unembed = Dense{rm(fq, DType::FP8_E4M3FN, {UNPADDED_VOCAB, H}), rm(fsc, DType::FP32, {UNPADDED_VOCAB})};
+      w.dense_fp8 = true;
+    } else if (uref->dtype == "BF16") {
+      const std::size_t bytes = std::size_t(LOCAL_VOCAB_CHUNK) * H * 2;
+      void* d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.alloc(bytes);
+      CUDA_CHECK(cudaMemsetAsync(d, 0, bytes, stream));
+      if (v_real > 0) ld.queue_rows(name, v0, v_real, d);
+      void* fd = nullptr;
+      if (keep_full_unembed) {
+        const std::size_t fbytes = std::size_t(UNPADDED_VOCAB) * H * 2;
+        fd = dense_fp8 ? (full_unembed_tmp = DeviceBuffer(fbytes)).p : ld.alloc(fbytes);
+        ld.queue(name, fd, UNPADDED_VOCAB);
+      }
+      ld.flush();
+      if (embed_bf16) { bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream); w.embed.dtype = kActDType; }
+      bf16_to_act_inplace(d, std::size_t(LOCAL_VOCAB_CHUNK) * H, stream);
+      const Tensor bf = rm(d, kActDType, {LOCAL_VOCAB_CHUNK, H});
+      w.unembed = dense_fp8 ? to_fp8(ld, bf, LOCAL_VOCAB_CHUNK, H) : Dense{bf, {}};
+      if (keep_full_unembed) {
+        bf16_to_act_inplace(fd, std::size_t(UNPADDED_VOCAB) * H, stream);
+        const Tensor fbf = rm(fd, kActDType, {UNPADDED_VOCAB, H});
+        w.full_unembed = dense_fp8 ? to_fp8(ld, fbf, UNPADDED_VOCAB, H) : Dense{fbf, {}};
+      }
+      if (dense_fp8) CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else {
+      throw std::runtime_error("weights: unembed must be BF16 or F8_E4M3");
+    }
+  }
+  CUDA_CHECK(cudaStreamSynchronize(stream));
   return w;
 }
 

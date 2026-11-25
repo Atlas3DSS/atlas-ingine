@@ -316,6 +316,19 @@ cmake --preset legacy-fp16 -S native
 cmake --build native/build-legacy-fp16 -j
 ```
 
+**Multi-GPU Tensor + Expert Parallel (`-DINGINE_TP_SIZE=2` or `4`, requires `libnccl`):**
+
+```bash
+# Example: 2x RTX 4090 (sm_89, TP2+EP2) or 4x Tesla V100 (sm_70, -DINGINE_ACT_FP16=ON -DINGINE_TP_SIZE=4)
+cmake -S native -B native/build-tp2 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES="89" \
+  -DINGINE_TP_SIZE=2 -DINGINE_BUILD_APPS=ON
+cmake --build native/build-tp2 -j
+```
+
+At startup, `TP2`/`TP4` runs a 4 KiB byte-exact `cudaMemcpyPeer` probe across all P2P-capable GPU pairs before initializing NCCL; on Linux hosts where VT-d/AMD-Vi IOMMU translation mode causes silent P2P corruption (DMAR fault `0x05`), it fails closed by disabling peer access, setting `NCCL_P2P_DISABLE=1`, and warning the operator to boot with `iommu=pt`.
+
 Start the server on a 24 GB card (RTX 3090 / RTX 4090, 64K context with vision + DSpark speculative decoding):
 
 ```bash
@@ -479,7 +492,7 @@ shoulders of the open-source AI and systems community:
 
 - **Base model:** [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by **Thinking Machines Lab** (Apache-2.0; model weights are not stored in this Git repository).
 - **Upstream engine, installer, and abliteration tooling:** [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0), with upstream kernel inspirations credited in [NOTICE](NOTICE) (**fngine**, **cinference**, **NInfer**).
-- **Broader Inkling-2-Mini & quantization open-source ecosystem:** **ggml-org / llama.cpp**, **realugbun** (initial Inkling-2-Mini `llama.cpp` support), **turboderp / ExLlamaV3** (QTIP/trellis quantization), **professorpalmer / Kintsugi-Inkling-2-Mini** (community 12 GB GGUF/EXL3 serving work), **mw00 / Project Maya** (Peasant Smith & Project Maya contributors, Niko1221 & Strata contributors — MIT AMD ROCm/HIP & multi-GPU Inkling-2-Mini serving), and **NVIDIA** (CUDA toolkit and 10 years of forward-compatible GPU architecture from Pascal through Blackwell).
+- **Broader Inkling-2-Mini & quantization open-source ecosystem:** **ggml-org / llama.cpp**, **realugbun** (initial Inkling-2-Mini `llama.cpp` support), **turboderp / ExLlamaV3** (QTIP/trellis quantization), **professorpalmer / Kintsugi-Inkling-2-Mini** (community 12 GB GGUF/EXL3 serving work), **mw00 / Project Maya** (Peasant Smith & Project Maya contributors, Niko1221 & Strata contributors — MIT AMD ROCm/HIP & multi-GPU Inkling-2-Mini serving), **[knapcio/Inkling-2-Mini-4x-DGX-Spark-TP4](https://github.com/knapcio/Inkling-2-Mini-4x-DGX-Spark-TP4)** (`c0f5f1cd`, multi-GPU TP+EP serving architecture and benchmark suite), **Cavemanmining** ([Tesla P40 multi-GPU IOMMU/P2P field report](https://gist.github.com/Cavemanmining/896bd4fa826da665525c9d2f9742bcff), motivating the startup byte-exact P2P probe and fail-closed `iommu=pt` guard), and **NVIDIA** (CUDA toolkit and 10 years of forward-compatible GPU architecture from Pascal through Blackwell).
 - **Mechanistic interpretability & neuron-basis reference:** [stdlogits/neuron-lens](https://github.com/stdlogits/neuron-lens) by **@_a9lim** and **@treetowntree** (MIT, [neuron-lens.com](https://neuron-lens.com), [stdlogits/rs-lenses](https://huggingface.co/stdlogits/rs-lenses), created 2026-10-30 — open catalog and R-lens/S-lens Jacobian methodology reading MLP neurons and attention heads by input drivers and output/write contributions), cited alongside Jasmine Shone and Lisa Dunlap's two-part Anthropic Fellows work [*Returning to the neuron basis for interpretability*](https://alignment.anthropic.com/2026/neuron-basis-theory/) ([Part 2](https://alignment.anthropic.com/2026/neuron-basis-applications/), 2026-11-23).
 - **10-year multi-architecture (`sm_60`/`61`/`70`/`75`/`80`/`86`/`89`/`90`/`120a`) port, Elastic `ATLAS2`/`ATLAS3` sub-4-bit MoE kernels and converter, native OpenAI `response_format` / tool-ban, and Verified Ledger SDK:** Atlas 3DSS.
 - CUDA runtime/toolkit components remain subject to NVIDIA's license terms. Unofficial open-source community project, not affiliated with or endorsed by Thinking Machines Lab or NVIDIA.

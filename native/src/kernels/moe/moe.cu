@@ -654,6 +654,7 @@ moe_up_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, const uin
     const int lo = lane < nslots ? ld_dep(idx + lane) : -1;
     const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
     const int e = ld_dep(idx + slot);
+    if (w_ptrs && !w_ptrs[e]) return;  // EP: non-local expert
     const uint64_t mask = slot_mask(e, lo, hi);
     if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
 
@@ -745,14 +746,21 @@ moe_down_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const
         const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
         uint64_t remaining = nslots == 64 ? ~0ull : ((1ull << nslots) - 1);
         int u = 0;
-        for (; remaining; ++u) {
+        while (remaining) {
             const int s = __ffsll(static_cast<long long>(remaining)) - 1;
             const int e = __shfl_sync(0xffffffffu, s < 32 ? lo : hi, s & 31);
             const uint64_t mask = slot_mask(e, lo, hi);
             remaining &= ~mask;
-            if (lane == 0) uexp[u] = e, umask[u] = mask;
-            if ((mask >> lane) & 1) slot_u[lane] = uint8_t(u);
-            if ((mask >> (lane + 32)) & 1) slot_u[lane + 32] = uint8_t(u);
+            const bool local = !w_ptrs || (w_ptrs[e] != nullptr);
+            if (local) {
+                if (lane == 0) uexp[u] = e, umask[u] = mask;
+                if ((mask >> lane) & 1) slot_u[lane] = uint8_t(u);
+                if ((mask >> (lane + 32)) & 1) slot_u[lane + 32] = uint8_t(u);
+                ++u;
+            } else {
+                if ((mask >> lane) & 1) slot_u[lane] = uint8_t(255);
+                if ((mask >> (lane + 32)) & 1) slot_u[lane + 32] = uint8_t(255);
+            }
         }
         if (lane == 0) nuniq = u;
     }
@@ -851,10 +859,16 @@ moe_down_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, const
 #pragma unroll
         for (int k = 0; k < TOPK; ++k) {
             const int sl = n * TOPK + k;
-            s = __fadd_rn(s, __fmul_rn(ld_dep(wts + sl), ybuf[slot_u[sl]][r][n]));
+            const uint8_t su = slot_u[sl];
+            if (su != 255) s = __fadd_rn(s, __fmul_rn(ld_dep(wts + sl), ybuf[su][r][n]));
+        }
+        if (!conv_w) {
+            out[static_cast<size_t>(n) * H + tile * TILE + r] = s;
+            return;
         }
         sbuf[n][r] = bf16_round(s);
     }
+    if (!conv_w) return;
     __syncthreads();
 
     if (threadIdx.x < TILE) {
@@ -1505,7 +1519,7 @@ void moe_down(const ActT* act, int M, const int* idx, const float* wts, const vo
     const uint8_t* const* wp = ptrs ? ptrs->w2 : nullptr;
     const uint8_t* const* wsp = ptrs ? ptrs->w2_scale : nullptr;
     const uint8_t* const* wroutp = ptrs ? ptrs->w2_rout : nullptr;
-    require(act && idx && wts && ((w2 && w2_scale) || (wp && wsp)) && conv_w && conv_state && out, "moe_down: null argument");
+    require(act && idx && wts && ((w2 && w2_scale) || (wp && wsp)) && ((conv_w && conv_state) || wp) && out, "moe_down: null argument");
     if (fmt == Format::EXL3_2 || fmt == Format::EXL3_3) {
         require((w2_rout != nullptr || wroutp != nullptr) && workspace, "moe_down(EXL3): w2_rout and workspace required");
         const dim3 grid(H / 128, M * TOPK);  // 18 x (M*8)

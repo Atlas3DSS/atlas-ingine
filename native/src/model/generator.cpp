@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "kernels/head/head.h"
 #include "model/batch_engine.h"
+#include "model/tp_engine.h"
 #include "model/drafter.h"
 #include "model/kv_checkpoint.h"
 #include "model/prefill.h"
@@ -686,6 +687,9 @@ class EngineGenerator final : public Generator {
 }  // namespace
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
+#if INGINE_TP_SIZE > 1
+  return make_tp_generator(options);
+#endif
   if (options.max_batch > 1) {
     if (options.enable_persona_hooks) {
       throw std::invalid_argument("persona hooks require --max-batch 1 (continuous batching with hooked persona tables is not yet enabled)");

@@ -1,3 +1,4 @@
+#include <atomic>
 // Prefill attention (flex.attend + model._visit's output gate) as a flash-attention kernel for 24 query /
 // 8 KV heads, head dim 128.
 //
@@ -632,9 +633,16 @@ template <int KV_FMT, bool EXPLICIT>
 void launch(const AttnParams& p, cudaStream_t stream) {
   const dim3 grid((GQA * p.T + BR - 1) / BR, kKvHeads);
   if (current_max_smem_optin() >= int(sizeof(Smem<2>))) {
-    static const cudaError_t attr = cudaFuncSetAttribute(
-        attn_kernel<KV_FMT, EXPLICIT, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem<2>)));
-    if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
+    static std::atomic<uint32_t> attr_done{0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const uint32_t bit = 1u << (dev & 31);
+    if (!(attr_done.load(std::memory_order_acquire) & bit)) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          attn_kernel<KV_FMT, EXPLICIT, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem<2>)));
+      if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
+      attr_done.fetch_or(bit, std::memory_order_release);
+    }
     attn_kernel<KV_FMT, EXPLICIT, 2><<<grid, NT, sizeof(Smem<2>), stream>>>(p);
   } else {
     // Turing (64 KiB opt-in) and Pascal (48 KiB) use single-stage K/V SMEM (34,308 B <= 48 KiB).

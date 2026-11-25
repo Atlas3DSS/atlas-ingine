@@ -1,4 +1,5 @@
 ingine_add_test(NAME model_data SOURCES test_model_data.cpp LIBS ingine_core)
+ingine_add_test(NAME model_tp_p2p SOURCES test_tp_p2p.cpp LIBS ingine_model)
 # one real layer at a time (~1.1 GB of GPU memory)
 ingine_add_test(NAME model_layer SOURCES test_layer.cpp LIBS ingine_model GPU MODEL TIMEOUT 600)
 # the decode runtime (graphs, verify widths, rollback, pipelined steps, device-selected verify) and the Generator's

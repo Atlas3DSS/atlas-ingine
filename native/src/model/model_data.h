@@ -22,14 +22,22 @@ class ExpertCache;
 
 // ------------------------------------------------------------------------------------ weights.py constants
 
+#ifndef INGINE_TP_SIZE
+#define INGINE_TP_SIZE 1
+#endif
+inline constexpr int TP_SIZE = INGINE_TP_SIZE;
+static_assert(TP_SIZE == 1 || TP_SIZE == 2 || TP_SIZE == 4, "INGINE_TP_SIZE must be 1, 2, or 4");
 inline constexpr int HIDDEN = 2304;
-inline constexpr int HEADS = 24, KV_HEADS = 8, HEAD_DIM = 128;
+inline constexpr int TOTAL_HEADS = 24, TOTAL_KV_HEADS = 8, HEAD_DIM = 128;
+inline constexpr int HEADS = TOTAL_HEADS / TP_SIZE, KV_HEADS = TOTAL_KV_HEADS / TP_SIZE;
+inline constexpr int SEG_SINK_PAD = (HEADS + 7) & ~7;
 inline constexpr int D_REL = 16, REL_EXTENT = 1024, WINDOW = 1024;
 inline constexpr int INTER = 1152, EXPERTS = 128, TOP_K = 8;
 inline constexpr int CONV_K = 4;
 inline constexpr int LAYERS = 24, BLOCK = 6;
 inline constexpr int LOOP_START = 6, LOOP_END = 18, PASSES = 3;
 inline constexpr int VOCAB = 201024, UNPADDED_VOCAB = 200058;
+inline constexpr int LOCAL_VOCAB_CHUNK = TP_SIZE == 1 ? UNPADDED_VOCAB : (((UNPADDED_VOCAB + TP_SIZE - 1) / TP_SIZE + 15) & ~15);
 inline constexpr int GATE_RANK = 64;
 inline constexpr float EPS = 1e-6f;
 inline constexpr double QK_CLIP = 22.627416997969522, REL_CLIP = 8.0;
@@ -97,7 +105,7 @@ inline constexpr int NUM_TAPS = 4;
 
 // SEG_ROWS order (KERNELS.md): q | gate | rel | sink | k | v | (full layers) k_dyn | v_dyn
 enum Seg : int { SEG_Q = 0, SEG_GATE, SEG_REL, SEG_SINK, SEG_K, SEG_V, SEG_K_DYN, SEG_V_DYN, NUM_SEGS };
-inline constexpr std::array<int, NUM_SEGS> SEG_ROWS = {HEADS * HEAD_DIM, HEADS * HEAD_DIM, HEADS * D_REL, HEADS,
+inline constexpr std::array<int, NUM_SEGS> SEG_ROWS = {HEADS * HEAD_DIM, HEADS * HEAD_DIM, HEADS * D_REL, SEG_SINK_PAD,
                                                        KV_DIM,           KV_DIM,           KV_HEADS * CONV_K,
                                                        KV_HEADS * CONV_K};
 inline constexpr std::array<int, NUM_SEGS> SEG_INPUT = {0, 0, 0, 0, 1, 2, 1, 2};  // xin index (q, k, v inputs)
@@ -167,6 +175,10 @@ struct Experts {
   Tensor w13, w13_scale, w2, w2_scale;
   Tensor w13_factor, w2_factor;
   Tensor w13_rin, w13_rout, w2_rin, w2_rout;
+  // EP sharding (non-null when ep_size > 1): [128] device pointer tables & active mask
+  Tensor w13_ptrs, w13_scale_ptrs, w2_ptrs, w2_scale_ptrs;
+  Tensor active_mask;
+  int ep_rank = 0, ep_size = 1;
 };
 
 // weights.Layer plus the per-layer derived tensors of fast.FastDecoder (_concat_projections,
@@ -228,6 +240,9 @@ struct Weights {
   Tensor message_queries;     // fp32 [12, 4, H]: q, k, v, mlp per loop layer
   std::array<ExpertFormat, LAYERS> expert_formats{};
   std::array<ExpertFormat, LAYERS> w2_expert_formats{};
+  Dense full_unembed;         // optional full [UNPADDED_VOCAB, H] on TP rank 0 for DSpark drafter
+  int tp_rank = 0, tp_size = 1;
+  int vocab_begin = 0, vocab_rows = UNPADDED_VOCAB;
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
   bool embed_q4() const { return embed.dtype == DType::U8; }
   std::shared_ptr<ExpertCache> expert_cache;  // non-null when tiered MoE offloading is enabled

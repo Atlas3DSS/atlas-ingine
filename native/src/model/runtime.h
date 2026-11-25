@@ -43,6 +43,8 @@ namespace ingine::model {
 // model.Ablation.load/none, model.State)
 Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream,
                      const OffloadConfig& offload = {});
+Weights load_weights_sharded(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream,
+                             int tp_rank, int tp_size, bool keep_full_unembed = false);
 // One layer as weights.load_layer (+ the decoder's derived tensors), for kernel tests; owns its memory.
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage);

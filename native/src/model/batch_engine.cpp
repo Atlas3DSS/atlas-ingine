@@ -336,10 +336,14 @@ class BatchDecoder {
   }
 
   void capture_buckets(cudaStream_t stream) {
-    // Capture power-of-2 buckets up to max_batch_ (plus max_batch_ itself if not power of 2).
+    // Capture power-of-2 + intermediate (24, 48, 96) buckets up to max_batch_.
     std::vector<int> buckets;
     for (int b = 1; b < max_batch_; b <<= 1) buckets.push_back(b);
+    for (int mid : {24, 48, 96})
+      if (mid < max_batch_) buckets.push_back(mid);
     buckets.push_back(max_batch_);
+    std::sort(buckets.begin(), buckets.end());
+    buckets.erase(std::unique(buckets.begin(), buckets.end()), buckets.end());
 
     // Warmup & capture with all slot_ids = -1 so ZERO state is modified.
     std::vector<std::int64_t> ztok(max_batch_, 0);

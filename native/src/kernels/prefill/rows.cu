@@ -14,9 +14,10 @@ namespace {
 
 constexpr int H = kHidden;
 constexpr float kEps = 1e-6f;
-constexpr int OFF_Q = 0, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_V = 7576,
-              OFF_KDYN = 8600, OFF_VDYN = 8632;
-static_assert(OFF_V + kKvDim == OFF_KDYN && OFF_SINK + kHeads == OFF_K);
+constexpr int OFF_Q = 0, OFF_REL = 2 * kHeads * kHeadDim, OFF_SINK = OFF_REL + kHeads * kRel,
+              OFF_K = OFF_SINK + kSinkPad, OFF_V = OFF_K + kKvDim,
+              OFF_KDYN = OFF_V + kKvDim, OFF_VDYN = OFF_KDYN + kKvHeads * 4;
+static_assert(OFF_V + kKvDim == OFF_KDYN && OFF_SINK + kSinkPad == OFF_K);
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -48,10 +49,10 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
   const float tau = 1.f + 0.1f * logf(fmaxf(float(pos + 1) * (1.f / 8192.f), 1.f));
   const float qk_clip = 22.627416997969522f, rel_clip = 8.f;
 
-  // q: heads warp, warp + 8, warp + 16; 4 dims per lane
+  // q: heads warp + kKvHeads * i; 4 dims per lane
 #pragma unroll
   for (int i = 0; i < 3; ++i) {
-    const int h = warp + 8 * i, d = lane * 4;
+    const int h = warp + kKvHeads * i, d = lane * 4;
     float x[4];
     load_bf16x4(row + OFF_Q + h * kHeadDim + d, x);
     const float4 sc = *reinterpret_cast<const float4*>(p.q_scale + h * kHeadDim + d);
@@ -64,10 +65,10 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
     }
     store_bf16x4(reinterpret_cast<uint16_t*>(p.q) + (size_t(t) * kHeads + h) * kHeadDim + d, x);
   }
-  // rel: heads warp, warp + 8, warp + 16; lanes 0-15 one dim each (16-31 duplicate)
+  // rel: heads warp + kKvHeads * i; lanes 0-15 one dim each (16-31 duplicate)
 #pragma unroll
   for (int i = 0; i < 3; ++i) {
-    const int h = warp + 8 * i, j = lane & 15;
+    const int h = warp + kKvHeads * i, j = lane & 15;
     float x = bf2f(row[OFF_REL + h * kRel + j]) * p.r_scale[h * kRel + j];
     float ss = x * x;
 #pragma unroll
@@ -189,7 +190,7 @@ __global__ void __launch_bounds__(256) rel_logits_kernel(const uint16_t* __restr
   }
   const int t1 = min(T, (blockIdx.x + 1) * tpb);
   for (int t = blockIdx.x * tpb; t < t1; ++t) {
-    for (int h = blockIdx.y * 8; h < blockIdx.y * 8 + 8; ++h) {
+    for (int h = blockIdx.y * 8; h < min(kHeads, int(blockIdx.y * 8 + 8)); ++h) {
       const uint16_t* r = rel + (size_t(t) * kHeads + h) * kRel;
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -233,6 +234,35 @@ __global__ void conv_state_kernel(float* __restrict__ state, const uint16_t* __r
   for (int i = 0; i < 3; ++i) {  // in order: reads row T + i of the old state before row i is written
     const int src = T - 3 + i;
     state[i * C + c] = src >= 0 ? bf2f(x[size_t(src) * ld + c]) : state[(3 + src) * C + c];
+  }
+}
+
+__global__ void static_conv_f32_kernel(const float* __restrict__ x, int ld, int T, int C, const float* __restrict__ w,
+                                       const float* __restrict__ state, float* __restrict__ out) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  const int t0 = blockIdx.y * CONV_ROWS, t1 = min(T, t0 + CONV_ROWS);
+  const float4 w4 = *reinterpret_cast<const float4*>(w + size_t(c) * 4);
+  auto in = [&](int src) { return src >= 0 ? round_bf16(x[size_t(src) * ld + c]) : state[(3 + src) * C + c]; };
+  float e0 = in(t0 - 3), e1 = in(t0 - 2), e2 = in(t0 - 1);
+  const float inv = 1.f / 2.2360679774997896f;
+  for (int t = t0; t < t1; ++t) {
+    const float e3 = round_bf16(x[size_t(t) * ld + c]);
+    float acc = __fmul_rn(w4.x, e0);
+    acc = __fadd_rn(acc, __fmul_rn(w4.y, e1));
+    acc = __fadd_rn(acc, __fmul_rn(w4.z, e2));
+    acc = __fadd_rn(acc, __fmul_rn(w4.w, e3));
+    out[size_t(t) * C + c] = __fmul_rn(__fadd_rn(acc, e3), inv);
+    e0 = e1, e1 = e2, e2 = e3;
+  }
+}
+
+__global__ void conv_state_f32_kernel(float* __restrict__ state, const float* __restrict__ x, int ld, int T, int C) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  for (int i = 0; i < 3; ++i) {
+    const int src = T - 3 + i;
+    state[i * C + c] = src >= 0 ? round_bf16(x[size_t(src) * ld + c]) : state[(3 + src) * C + c];
   }
 }
 
@@ -367,12 +397,12 @@ void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
   if (p.T <= 0 || !p.proj || !p.q || !p.rel || !have_kv || !p.conv_k || !p.conv_v)
     throw std::invalid_argument("attn_prep: missing argument");
   if (p.out_fp8 && p.out_q4) throw std::invalid_argument("attn_prep: out_fp8 and out_q4 are mutually exclusive");
-  attn_prep_kernel<<<p.T, 256, 0, stream>>>(p);
+  attn_prep_kernel<<<p.T, kKvHeads * 32, 0, stream>>>(p);
 }
 
 void rel_logits(const ActT* rel, const float* rel_proj, int T, ActT* out, cudaStream_t stream) {
   const int tpb = std::min(16, std::max(1, T / 128));
-  rel_logits_kernel<<<dim3((T + tpb - 1) / tpb, kHeads / 8), 256, 0, stream>>>(
+  rel_logits_kernel<<<dim3((T + tpb - 1) / tpb, (kHeads + 7) / 8), 256, 0, stream>>>(
       reinterpret_cast<const uint16_t*>(rel), rel_proj, T, tpb, reinterpret_cast<uint16_t*>(out));
 }
 
@@ -384,6 +414,13 @@ void static_conv(const ActT* x, int ld, int T, int C, const float* w, const floa
 
 void conv_state_update(float* state, const ActT* x, int ld, int T, int C, cudaStream_t stream) {
   conv_state_kernel<<<(C + 127) / 128, 128, 0, stream>>>(state, reinterpret_cast<const uint16_t*>(x), ld, T, C);
+}
+void static_conv_f32(const float* x, int ld, int T, int C, const float* w, const float* state, float* out, cudaStream_t stream) {
+  const dim3 grid((C + 127) / 128, (T + CONV_ROWS - 1) / CONV_ROWS);
+  static_conv_f32_kernel<<<grid, 128, 0, stream>>>(x, ld, T, C, w, state, out);
+}
+void conv_state_update_f32(float* state, const float* x, int ld, int T, int C, cudaStream_t stream) {
+  conv_state_f32_kernel<<<(C + 127) / 128, 128, 0, stream>>>(state, x, ld, T, C);
 }
 
 void gate_inputs(const GateRows& rows, int G, int T, ActT* gin, cudaStream_t stream) {

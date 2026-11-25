@@ -1,3 +1,4 @@
+#include <atomic>
 // Grouped expert GEMMs of the prefill (model._moe_grouped) over NVFP4 / MXFP8 experts decoded on the fly.
 //
 // Design. A CTA computes up to 128 activation rows x 128 weight rows, K in steps of 64, mma.m16n8k16 BF16 with
@@ -47,19 +48,23 @@ struct Cfg {
   static constexpr int R = WK / BK;  // activation steps per weight chunk
   static constexpr int KC = K / WK;  // weight chunks
   static constexpr int AS_STG = LOW_SMEM ? 2 : AS;
-  // weight slots: the chunk of step s + 1 must have landed (and be published by the barrier) at step s, when its
-  // B fragments are decoded under step s's MMAs: R (WS - 1) >= AS_STG. Small-row tiles prefetch further when
-  // SMEM allows (>=96 KiB); LOW_SMEM fits Pascal 48 KiB (<=48,192 B) and Turing 64 KiB.
-  static constexpr int WS = LOW_SMEM ? (FMT == FMT_MXFP8 ? 3 : 2)
+  // On Volta sm_70 (INGINE_ACT_FP16 && !LOW_SMEM), each warp owns its 16 weight rows exclusively
+  // and cp.async does not exist. Streaming NVFP4/MXFP8 weights + scales directly via __ldg into
+  // registers eliminates w_smem (20 KiB) and sc_smem (18 KiB), dropping TM=32 SMEM from 88 KiB -> 8.2 KiB!
+  static constexpr bool VOLTA_DIRECT = INGINE_ACT_FP16 && !LOW_SMEM && (FMT == FMT_NVFP4 || FMT == FMT_MXFP8);
+  static constexpr bool VOLTA_COMPACT = INGINE_ACT_FP16 && !LOW_SMEM;
+  static constexpr bool STAGE_W = !VOLTA_DIRECT;
+  static constexpr bool STAGE_SC = !VOLTA_COMPACT;
+  static constexpr int WS = (LOW_SMEM || VOLTA_COMPACT) ? (FMT == FMT_MXFP8 ? 3 : 2)
                                      : (TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6)
-                                                 : (INGINE_ACT_FP16 ? 3 : (FMT == FMT_MXFP8 ? 4 : 3)));
+                                                 : (FMT == FMT_MXFP8 ? 4 : 3));
   static_assert(R * (WS - 1) >= AS_STG);
   static constexpr int WCODE = FMT == FMT_NVFP4 ? WK / 2 : (FMT == FMT_MXFP8 ? WK : (FMT == FMT_ATLAS2 ? WK / 4 : (WK * 3) / 8));
   static constexpr int WSTRIDE = WCODE + 16;                    // padded: fragment loads on distinct banks
-  static constexpr int W_BYTES = TN * WSTRIDE;
+  static constexpr int W_BYTES = STAGE_W ? (TN * WSTRIDE) : 0;
   static constexpr int A_BYTES = TM * BK * 2;
-  static constexpr int SC_BYTES = TN * SCALE_ROW;               // block scales of the whole tile
-  static constexpr int OFF_W = AS_STG * A_BYTES, OFF_SC = OFF_W + WS * W_BYTES;
+  static constexpr int SC_BYTES = STAGE_SC ? (TN * SCALE_ROW) : 0;
+  static constexpr int OFF_W = AS_STG * A_BYTES, OFF_SC = OFF_W + (STAGE_W ? WS * W_BYTES : 0);
   static constexpr int OFF_LUT = (OFF_SC + SC_BYTES + 15) / 16 * 16;
   static constexpr int SMEM = OFF_LUT + 64;
   static_assert(K % WK == 0 && SMEM <= (LOW_SMEM ? 49152 : (INGINE_ACT_FP16 ? 98304 : 101376)));
@@ -175,7 +180,11 @@ __device__ __forceinline__ void mma_step_sm70(float (&acc_v)[TM / 16][2][8], con
 // Up: A = x rows of the pairs' tokens (K = H), W = w13 (N = 2I), out act [pairs, I].
 // Down: A = act rows (K = I), W = w2 (N = H), out down [T * 8, H] at pair_dst.
 template <int FMT, Mode MODE, int K, int TM, bool LOW_SMEM = false>
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+__global__ void __launch_bounds__(NT, (TM <= 32 && !LOW_SMEM) ? 2 : 1) wgemm_kernel(const GemmArgs g) {
+#else
 __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
+#endif
   constexpr int KS = K / BK;
   constexpr int NE = MODE == Mode::Up ? 2 * kInter : kHidden;  // expert weight rows
   using C = Cfg<FMT, K, TM, LOW_SMEM>;
@@ -241,11 +250,15 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   };
 
   // the tile's block scales, with the first activation group
-  for (int id = tid; id < C::SC_BYTES / 4; id += NT)
-    cp_async4(sc_smem + id * 4, scale_tile + (id * 4 / C::SCALE_ROW) * int64_t(C::SCALE_ROW) + (id * 4) % C::SCALE_ROW);
+  if constexpr (C::STAGE_SC) {
+    for (int id = tid; id < C::SC_BYTES / 4; id += NT)
+      cp_async4(sc_smem + id * 4, scale_tile + (id * 4 / C::SCALE_ROW) * int64_t(C::SCALE_ROW) + (id * 4) % C::SCALE_ROW);
+  }
+  if constexpr (C::STAGE_W) {
 #pragma unroll
-  for (int j = 0; j < C::WS - 1; ++j)
-    if (j < C::KC) load_w(j);
+    for (int j = 0; j < C::WS - 1; ++j)
+      if (j < C::KC) load_w(j);
+  }
 #pragma unroll
   for (int j = 0; j < C::AS_STG - 1; ++j) issue(j);
 
@@ -253,10 +266,12 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   const float factor = FMT != FMT_MXFP8 ? __ldg(g.factors + e) : 1.f;
   const int mact = min((n + 15) / 16, TM / 16);  // active m16 row blocks (same for every warp)
   float acc[TM / 16][2][4];
+#if !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA))
 #pragma unroll
   for (int a = 0; a < TM / 16; ++a)
 #pragma unroll
     for (int b = 0; b < 2; ++b) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0.f;
+#endif
 
   // B fragments of step ks (k16 group kk) decoded from the staged codes of its weight chunk
   auto scales_of = [&](int ks, float (&sc)[2][4]) {
@@ -330,93 +345,239 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
       for (int v = 0; v < 8; ++v) acc_v[a][b][v] = 0.f;
   const int v_idx = (lane & 3) | ((lane & 16) >> 2);
   const int v_kh = ((lane >> 2) & 1) * 4;
-  auto scales_v = [&](int ks, float (&sc)[2][4]) {
+  if constexpr (C::VOLTA_DIRECT && FMT == FMT_NVFP4) {
+    // Direct __ldg register-pipelined Volta sm_70 NVFP4 path: ZERO w_smem, ZERO sc_smem, ZERO spills!
+    const uint8_t* wrow[2] = {
+        code_tile + int64_t(warp * 16 + v_idx) * C::CODE_ROW,
+        code_tile + int64_t(warp * 16 + 8 + v_idx) * C::CODE_ROW,
+    };
+    const uint8_t* srow[2] = {
+        scale_tile + int64_t(warp * 16 + v_idx) * C::SCALE_ROW,
+        scale_tile + int64_t(warp * 16 + 8 + v_idx) * C::SCALE_ROW,
+    };
+    uint4 w0_cur[2], w1_cur[2];
+    uint32_t s4_cur[2];
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
-      const int row = warp * 16 + nt * 8 + v_idx;
-      if constexpr (FMT != FMT_MXFP8) {
-        const uint32_t s4 = *reinterpret_cast<const uint32_t*>(sc_smem + row * C::SCALE_ROW + ks * 4);
-        const float2 lo = e4m3x2_to_float2(uint16_t(s4 & 0xffff)), hi = e4m3x2_to_float2(uint16_t(s4 >> 16));
-        sc[nt][0] = lo.x, sc[nt][1] = lo.y, sc[nt][2] = hi.x, sc[nt][3] = hi.y;
-      } else {
-        const uint8_t* ms = sc_smem + row * C::SCALE_ROW + ks * 2;
-        sc[nt][0] = sc[nt][1] = exp2f(float(ms[0]) - 127.f);
-        sc[nt][2] = sc[nt][3] = exp2f(float(ms[1]) - 127.f);
+      w0_cur[nt] = __ldg(reinterpret_cast<const uint4*>(wrow[nt]));
+      w1_cur[nt] = __ldg(reinterpret_cast<const uint4*>(wrow[nt] + 16));
+      s4_cur[nt] = __ldg(reinterpret_cast<const uint32_t*>(srow[nt]));
+    }
+#pragma unroll 1
+    for (int ks = 0; ks < KS; ++ks) {
+      __syncthreads();
+      issue(ks + C::AS_STG - 1);
+      const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
+      uint4 w0_nxt[2], w1_nxt[2];
+      uint32_t s4_nxt[2];
+      if (ks + 1 < KS) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          w0_nxt[nt] = __ldg(reinterpret_cast<const uint4*>(wrow[nt] + (ks + 1) * 32));
+          w1_nxt[nt] = __ldg(reinterpret_cast<const uint4*>(wrow[nt] + (ks + 1) * 32 + 16));
+          s4_nxt[nt] = __ldg(reinterpret_cast<const uint32_t*>(srow[nt] + (ks + 1) * 4));
+        }
+      }
+      __half2 sfh_v[2][4];
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+        const float2 lo = e4m3x2_to_float2(uint16_t(s4_cur[nt] & 0xffff));
+        const float2 hi = e4m3x2_to_float2(uint16_t(s4_cur[nt] >> 16));
+        sfh_v[nt][0] = __float2half2_rn(lo.x * factor);
+        sfh_v[nt][1] = __float2half2_rn(lo.y * factor);
+        sfh_v[nt][2] = __float2half2_rn(hi.x * factor);
+        sfh_v[nt][3] = __float2half2_rn(hi.y * factor);
+      }
+      auto decode_v = [&](int kk, unsigned (&b)[2][4]) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          const uint32_t wx = (kk == 0) ? w0_cur[nt].x : (kk == 1) ? w0_cur[nt].z : (kk == 2) ? w1_cur[nt].x : w1_cur[nt].z;
+          const uint32_t wy = (kk == 0) ? w0_cur[nt].y : (kk == 1) ? w0_cur[nt].w : (kk == 2) ? w1_cur[nt].y : w1_cur[nt].w;
+          const uint32_t w4 = ((wx >> (v_kh * 4)) & 0xffffu) | (((wy >> (v_kh * 4)) & 0xffffu) << 16);
+          const __half2 sfh = sfh_v[nt][kk];
+#pragma unroll
+          for (int bi = 0; bi < 4; ++bi) {
+            const uint32_t byte = (w4 >> (8 * bi)) & 0xffu;
+            const uint32_t sel = ((byte & 7u) << 4) | (((byte >> 4) & 7u) << 12);
+            const uint32_t hbits =
+                __byte_perm(0x3E3C3800u, 0x46444240u, sel) | ((byte & 0x08u) << 12) | ((byte & 0x80u) << 24);
+            const __half2 scaled = __hmul2(*reinterpret_cast<const __half2*>(&hbits), sfh);
+            b[nt][bi] = *reinterpret_cast<const unsigned*>(&scaled);
+          }
+        }
+      };
+      switch (mact) {
+        case 1: if constexpr (1 <= TM / 16) mma_step_sm70<1, TM>(acc_v, A, lane, decode_v); break;
+        case 2: if constexpr (2 <= TM / 16) mma_step_sm70<2, TM>(acc_v, A, lane, decode_v); break;
+        case 3: if constexpr (3 <= TM / 16) mma_step_sm70<3, TM>(acc_v, A, lane, decode_v); break;
+        case 4: if constexpr (4 <= TM / 16) mma_step_sm70<4, TM>(acc_v, A, lane, decode_v); break;
+        case 5: if constexpr (5 <= TM / 16) mma_step_sm70<5, TM>(acc_v, A, lane, decode_v); break;
+        case 6: if constexpr (6 <= TM / 16) mma_step_sm70<6, TM>(acc_v, A, lane, decode_v); break;
+        case 7: if constexpr (7 <= TM / 16) mma_step_sm70<7, TM>(acc_v, A, lane, decode_v); break;
+        default: mma_step_sm70<TM / 16, TM>(acc_v, A, lane, decode_v); break;
+      }
+      if (ks + 1 < KS) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          w0_cur[nt] = w0_nxt[nt];
+          w1_cur[nt] = w1_nxt[nt];
+          s4_cur[nt] = s4_nxt[nt];
+        }
       }
     }
-  };
+  } else if constexpr (C::VOLTA_DIRECT && FMT == FMT_MXFP8) {
+    // Direct __ldg Volta sm_70 MXFP8 path: ZERO w_smem, ZERO sc_smem, native FP16x2 __hmul2!
+    const uint8_t* wrow[2] = {
+        code_tile + int64_t(warp * 16 + v_idx) * C::CODE_ROW,
+        code_tile + int64_t(warp * 16 + 8 + v_idx) * C::CODE_ROW,
+    };
+    const uint8_t* srow[2] = {
+        scale_tile + int64_t(warp * 16 + v_idx) * C::SCALE_ROW,
+        scale_tile + int64_t(warp * 16 + 8 + v_idx) * C::SCALE_ROW,
+    };
 #pragma unroll 1
-  for (int ks = 0; ks < KS; ++ks) {
-    cp_wait<C::AS_STG - 2>();
-    __syncthreads();
-    const int chunk = ks / C::R;
-    if (ks % C::R == 0 && chunk + C::WS - 1 < C::KC) load_w(chunk + C::WS - 1);
-    issue(ks + C::AS_STG - 1);
-    const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
-    const unsigned char* ws = w_smem + ((ks / C::R) % C::WS) * C::W_BYTES;
-    float sc[2][4];
-    scales_v(ks, sc);
-    auto decode_v = [&](int kk, unsigned (&b)[2][4]) {
-      const int kc = (ks % C::R) * BK + kk * 16;
+    for (int ks = 0; ks < KS; ++ks) {
+      __syncthreads();
+      issue(ks + C::AS_STG - 1);
+      const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
+      __half2 sh_v[2][2];
+      uint4 qbuf[2][4];
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+        const uint8_t s0 = __ldg(srow[nt] + ks * 2);
+        const uint8_t s1 = __ldg(srow[nt] + ks * 2 + 1);
+        sh_v[nt][0] = __float2half2_rn(s0 ? __uint_as_float(uint32_t(s0) << 23) : __uint_as_float(0x00400000u));
+        sh_v[nt][1] = __float2half2_rn(s1 ? __uint_as_float(uint32_t(s1) << 23) : __uint_as_float(0x00400000u));
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+          qbuf[nt][kk] = __ldg(reinterpret_cast<const uint4*>(wrow[nt] + ks * 64 + kk * 16));
+        }
+      }
+      auto decode_v = [&](int kk, unsigned (&b)[2][4]) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          const uint4 q = qbuf[nt][kk];
+          const uint32_t wm = v_kh ? q.y : q.x;
+          const uint32_t wn = v_kh ? q.w : q.z;
+          const __half2 sh = sh_v[nt][kk >> 1];
+          const uint32_t h0 = e4m3x2_to_half2(uint16_t(wm & 0xffff));
+          const uint32_t h1 = e4m3x2_to_half2(uint16_t(wm >> 16));
+          const uint32_t h2 = e4m3x2_to_half2(uint16_t(wn & 0xffff));
+          const uint32_t h3 = e4m3x2_to_half2(uint16_t(wn >> 16));
+          const __half2 r0 = __hmul2(*reinterpret_cast<const __half2*>(&h0), sh);
+          const __half2 r1 = __hmul2(*reinterpret_cast<const __half2*>(&h1), sh);
+          const __half2 r2 = __hmul2(*reinterpret_cast<const __half2*>(&h2), sh);
+          const __half2 r3 = __hmul2(*reinterpret_cast<const __half2*>(&h3), sh);
+          b[nt][0] = *reinterpret_cast<const unsigned*>(&r0);
+          b[nt][1] = *reinterpret_cast<const unsigned*>(&r1);
+          b[nt][2] = *reinterpret_cast<const unsigned*>(&r2);
+          b[nt][3] = *reinterpret_cast<const unsigned*>(&r3);
+        }
+      };
+      switch (mact) {
+        case 1: if constexpr (1 <= TM / 16) mma_step_sm70<1, TM>(acc_v, A, lane, decode_v); break;
+        case 2: if constexpr (2 <= TM / 16) mma_step_sm70<2, TM>(acc_v, A, lane, decode_v); break;
+        case 3: if constexpr (3 <= TM / 16) mma_step_sm70<3, TM>(acc_v, A, lane, decode_v); break;
+        case 4: if constexpr (4 <= TM / 16) mma_step_sm70<4, TM>(acc_v, A, lane, decode_v); break;
+        case 5: if constexpr (5 <= TM / 16) mma_step_sm70<5, TM>(acc_v, A, lane, decode_v); break;
+        case 6: if constexpr (6 <= TM / 16) mma_step_sm70<6, TM>(acc_v, A, lane, decode_v); break;
+        case 7: if constexpr (7 <= TM / 16) mma_step_sm70<7, TM>(acc_v, A, lane, decode_v); break;
+        default: mma_step_sm70<TM / 16, TM>(acc_v, A, lane, decode_v); break;
+      }
+    }
+  } else {
+    auto scales_v = [&](int ks, float (&sc)[2][4]) {
 #pragma unroll
       for (int nt = 0; nt < 2; ++nt) {
         const int row = warp * 16 + nt * 8 + v_idx;
-        const float s = sc[nt][kk];
-        if constexpr (FMT == FMT_NVFP4) {
-          const uint2 wd = *reinterpret_cast<const uint2*>(ws + row * C::WSTRIDE + kc / 2);
-          const uint32_t m16 = wd.x >> (v_kh * 4);
-          const uint32_t n16 = wd.y >> (v_kh * 4);
-          const uint32_t b0 = m16 & 0xffu, b1 = (m16 >> 8) & 0xffu;
-          const uint32_t b2 = n16 & 0xffu, b3 = (n16 >> 8) & 0xffu;
-          b[nt][0] = pack_bf16x2((lut[b0 & 0xf] * s) * factor, (lut[b0 >> 4] * s) * factor);
-          b[nt][1] = pack_bf16x2((lut[b1 & 0xf] * s) * factor, (lut[b1 >> 4] * s) * factor);
-          b[nt][2] = pack_bf16x2((lut[b2 & 0xf] * s) * factor, (lut[b2 >> 4] * s) * factor);
-          b[nt][3] = pack_bf16x2((lut[b3 & 0xf] * s) * factor, (lut[b3 >> 4] * s) * factor);
-        } else if constexpr (FMT == FMT_MXFP8) {
-          const uint4 q = *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc);
-          const uint32_t wm = v_kh ? q.y : q.x;
-          const uint32_t wn = v_kh ? q.w : q.z;
-          const float2 f0 = e4m3x2_to_float2(uint16_t(wm & 0xffff)), f1 = e4m3x2_to_float2(uint16_t(wm >> 16));
-          const float2 f2 = e4m3x2_to_float2(uint16_t(wn & 0xffff)), f3 = e4m3x2_to_float2(uint16_t(wn >> 16));
-          b[nt][0] = pack_bf16x2(f0.x * s, f0.y * s);
-          b[nt][1] = pack_bf16x2(f1.x * s, f1.y * s);
-          b[nt][2] = pack_bf16x2(f2.x * s, f2.y * s);
-          b[nt][3] = pack_bf16x2(f3.x * s, f3.y * s);
-        } else if constexpr (FMT == FMT_ATLAS2) {
-          const uint32_t wd = *reinterpret_cast<const uint32_t*>(ws + row * C::WSTRIDE + kc / 4);
-          const uint32_t m8 = (wd >> (v_kh * 2)) & 0xffu;
-          const uint32_t n8 = (wd >> (16 + v_kh * 2)) & 0xffu;
-          b[nt][0] = pack_bf16x2((lut[m8 & 3u] * s) * factor, (lut[(m8 >> 2) & 3u] * s) * factor);
-          b[nt][1] = pack_bf16x2((lut[(m8 >> 4) & 3u] * s) * factor, (lut[(m8 >> 6) & 3u] * s) * factor);
-          b[nt][2] = pack_bf16x2((lut[n8 & 3u] * s) * factor, (lut[(n8 >> 2) & 3u] * s) * factor);
-          b[nt][3] = pack_bf16x2((lut[(n8 >> 4) & 3u] * s) * factor, (lut[(n8 >> 6) & 3u] * s) * factor);
+        if constexpr (FMT != FMT_MXFP8) {
+          const uint32_t s4 = C::STAGE_SC
+              ? *reinterpret_cast<const uint32_t*>(sc_smem + row * C::SCALE_ROW + ks * 4)
+              : __ldg(reinterpret_cast<const uint32_t*>(scale_tile + int64_t(row) * C::SCALE_ROW + ks * 4));
+          const float2 lo = e4m3x2_to_float2(uint16_t(s4 & 0xffff)), hi = e4m3x2_to_float2(uint16_t(s4 >> 16));
+          sc[nt][0] = lo.x, sc[nt][1] = lo.y, sc[nt][2] = hi.x, sc[nt][3] = hi.y;
         } else {
-          const unsigned char* blk = ws + row * C::WSTRIDE + (kc / 32) * 12;
-          const int half = (kc >> 4) & 1;
-          const uint32_t lo = *reinterpret_cast<const uint32_t*>(blk + half * 4);
-          const uint16_t hi16 = *reinterpret_cast<const uint16_t*>(blk + 8 + half * 2);
-          const uint32_t mlo = (lo >> (v_kh * 2)) & 0xffu, mhi = (hi16 >> v_kh) & 0xfu;
-          const uint32_t nlo = (lo >> (16 + v_kh * 2)) & 0xffu, nhi = (hi16 >> (8 + v_kh)) & 0xfu;
-          b[nt][0] = pack_bf16x2((lut[(mlo & 3u) | ((mhi & 1u) << 2)] * s) * factor,
-                                 (lut[((mlo >> 2) & 3u) | (((mhi >> 1) & 1u) << 2)] * s) * factor);
-          b[nt][1] = pack_bf16x2((lut[((mlo >> 4) & 3u) | (((mhi >> 2) & 1u) << 2)] * s) * factor,
-                                 (lut[((mlo >> 6) & 3u) | (((mhi >> 3) & 1u) << 2)] * s) * factor);
-          b[nt][2] = pack_bf16x2((lut[(nlo & 3u) | ((nhi & 1u) << 2)] * s) * factor,
-                                 (lut[((nlo >> 2) & 3u) | (((nhi >> 1) & 1u) << 2)] * s) * factor);
-          b[nt][3] = pack_bf16x2((lut[((nlo >> 4) & 3u) | (((nhi >> 2) & 1u) << 2)] * s) * factor,
-                                 (lut[((nlo >> 6) & 3u) | (((nhi >> 3) & 1u) << 2)] * s) * factor);
+          const uint8_t* ms = sc_smem + row * C::SCALE_ROW + ks * 2;
+          sc[nt][0] = sc[nt][1] = exp2f(float(ms[0]) - 127.f);
+          sc[nt][2] = sc[nt][3] = exp2f(float(ms[1]) - 127.f);
         }
       }
     };
-    switch (mact) {
-      case 1: if constexpr (1 <= TM / 16) mma_step_sm70<1, TM>(acc_v, A, lane, decode_v); break;
-      case 2: if constexpr (2 <= TM / 16) mma_step_sm70<2, TM>(acc_v, A, lane, decode_v); break;
-      case 3: if constexpr (3 <= TM / 16) mma_step_sm70<3, TM>(acc_v, A, lane, decode_v); break;
-      case 4: if constexpr (4 <= TM / 16) mma_step_sm70<4, TM>(acc_v, A, lane, decode_v); break;
-      case 5: if constexpr (5 <= TM / 16) mma_step_sm70<5, TM>(acc_v, A, lane, decode_v); break;
-      case 6: if constexpr (6 <= TM / 16) mma_step_sm70<6, TM>(acc_v, A, lane, decode_v); break;
-      case 7: if constexpr (7 <= TM / 16) mma_step_sm70<7, TM>(acc_v, A, lane, decode_v); break;
-      default: mma_step_sm70<TM / 16, TM>(acc_v, A, lane, decode_v); break;
+#pragma unroll 1
+    for (int ks = 0; ks < KS; ++ks) {
+      cp_wait<C::AS_STG - 2>();
+      __syncthreads();
+      const int chunk = ks / C::R;
+      if constexpr (C::STAGE_W) {
+        if (ks % C::R == 0 && chunk + C::WS - 1 < C::KC) load_w(chunk + C::WS - 1);
+      }
+      issue(ks + C::AS_STG - 1);
+      const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
+      const unsigned char* ws = w_smem + ((ks / C::R) % C::WS) * C::W_BYTES;
+      float sc[2][4];
+      scales_v(ks, sc);
+      auto decode_v = [&](int kk, unsigned (&b)[2][4]) {
+        const int kc = (ks % C::R) * BK + kk * 16;
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          const int row = warp * 16 + nt * 8 + v_idx;
+          const float s = sc[nt][kk];
+          if constexpr (FMT == FMT_NVFP4) {
+            const uint2 wd = *reinterpret_cast<const uint2*>(ws + row * C::WSTRIDE + kc / 2);
+            const uint32_t m16 = wd.x >> (v_kh * 4);
+            const uint32_t n16 = wd.y >> (v_kh * 4);
+            const uint32_t b0 = m16 & 0xffu, b1 = (m16 >> 8) & 0xffu;
+            const uint32_t b2 = n16 & 0xffu, b3 = (n16 >> 8) & 0xffu;
+            b[nt][0] = pack_bf16x2((lut[b0 & 0xf] * s) * factor, (lut[b0 >> 4] * s) * factor);
+            b[nt][1] = pack_bf16x2((lut[b1 & 0xf] * s) * factor, (lut[b1 >> 4] * s) * factor);
+            b[nt][2] = pack_bf16x2((lut[b2 & 0xf] * s) * factor, (lut[b2 >> 4] * s) * factor);
+            b[nt][3] = pack_bf16x2((lut[b3 & 0xf] * s) * factor, (lut[b3 >> 4] * s) * factor);
+          } else if constexpr (FMT == FMT_MXFP8) {
+            const uint4 q = *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc);
+            const uint32_t wm = v_kh ? q.y : q.x;
+            const uint32_t wn = v_kh ? q.w : q.z;
+            const float2 f0 = e4m3x2_to_float2(uint16_t(wm & 0xffff)), f1 = e4m3x2_to_float2(uint16_t(wm >> 16));
+            const float2 f2 = e4m3x2_to_float2(uint16_t(wn & 0xffff)), f3 = e4m3x2_to_float2(uint16_t(wn >> 16));
+            b[nt][0] = pack_bf16x2(f0.x * s, f0.y * s);
+            b[nt][1] = pack_bf16x2(f1.x * s, f1.y * s);
+            b[nt][2] = pack_bf16x2(f2.x * s, f2.y * s);
+            b[nt][3] = pack_bf16x2(f3.x * s, f3.y * s);
+          } else if constexpr (FMT == FMT_ATLAS2) {
+            const uint32_t wd = *reinterpret_cast<const uint32_t*>(ws + row * C::WSTRIDE + kc / 4);
+            const uint32_t m8 = (wd >> (v_kh * 2)) & 0xffu;
+            const uint32_t n8 = (wd >> (16 + v_kh * 2)) & 0xffu;
+            b[nt][0] = pack_bf16x2((lut[m8 & 3u] * s) * factor, (lut[(m8 >> 2) & 3u] * s) * factor);
+            b[nt][1] = pack_bf16x2((lut[(m8 >> 4) & 3u] * s) * factor, (lut[(m8 >> 6) & 3u] * s) * factor);
+            b[nt][2] = pack_bf16x2((lut[n8 & 3u] * s) * factor, (lut[(n8 >> 2) & 3u] * s) * factor);
+            b[nt][3] = pack_bf16x2((lut[(n8 >> 4) & 3u] * s) * factor, (lut[(n8 >> 6) & 3u] * s) * factor);
+          } else {
+            const unsigned char* blk = ws + row * C::WSTRIDE + (kc / 32) * 12;
+            const int half = (kc >> 4) & 1;
+            const uint32_t lo = *reinterpret_cast<const uint32_t*>(blk + half * 4);
+            const uint16_t hi16 = *reinterpret_cast<const uint16_t*>(blk + 8 + half * 2);
+            const uint32_t mlo = (lo >> (v_kh * 2)) & 0xffu, mhi = (hi16 >> v_kh) & 0xfu;
+            const uint32_t nlo = (lo >> (16 + v_kh * 2)) & 0xffu, nhi = (hi16 >> (8 + v_kh)) & 0xfu;
+            b[nt][0] = pack_bf16x2((lut[(mlo & 3u) | ((mhi & 1u) << 2)] * s) * factor,
+                                   (lut[((mlo >> 2) & 3u) | (((mhi >> 1) & 1u) << 2)] * s) * factor);
+            b[nt][1] = pack_bf16x2((lut[((mlo >> 4) & 3u) | (((mhi >> 2) & 1u) << 2)] * s) * factor,
+                                   (lut[((mlo >> 6) & 3u) | (((mhi >> 3) & 1u) << 2)] * s) * factor);
+            b[nt][2] = pack_bf16x2((lut[(nlo & 3u) | ((nhi & 1u) << 2)] * s) * factor,
+                                   (lut[((nlo >> 2) & 3u) | (((nhi >> 1) & 1u) << 2)] * s) * factor);
+            b[nt][3] = pack_bf16x2((lut[((nlo >> 4) & 3u) | (((nhi >> 2) & 1u) << 2)] * s) * factor,
+                                   (lut[((nlo >> 6) & 3u) | (((nhi >> 3) & 1u) << 2)] * s) * factor);
+          }
+        }
+      };
+      switch (mact) {
+        case 1: if constexpr (1 <= TM / 16) mma_step_sm70<1, TM>(acc_v, A, lane, decode_v); break;
+        case 2: if constexpr (2 <= TM / 16) mma_step_sm70<2, TM>(acc_v, A, lane, decode_v); break;
+        case 3: if constexpr (3 <= TM / 16) mma_step_sm70<3, TM>(acc_v, A, lane, decode_v); break;
+        case 4: if constexpr (4 <= TM / 16) mma_step_sm70<4, TM>(acc_v, A, lane, decode_v); break;
+        case 5: if constexpr (5 <= TM / 16) mma_step_sm70<5, TM>(acc_v, A, lane, decode_v); break;
+        case 6: if constexpr (6 <= TM / 16) mma_step_sm70<6, TM>(acc_v, A, lane, decode_v); break;
+        case 7: if constexpr (7 <= TM / 16) mma_step_sm70<7, TM>(acc_v, A, lane, decode_v); break;
+        default: mma_step_sm70<TM / 16, TM>(acc_v, A, lane, decode_v); break;
+      }
     }
   }
   cp_wait<0>();
@@ -424,7 +585,10 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   for (int mt = 0; mt < TM / 16; ++mt) {
     if (mt >= mact) continue;
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt) mma::sm70_reduce_acc8_to_d4(acc_v[mt][nt], acc[mt][nt]);
+    for (int nt = 0; nt < 2; ++nt) {
+      acc[mt][nt][0] = acc[mt][nt][1] = acc[mt][nt][2] = acc[mt][nt][3] = 0.f;
+      mma::sm70_reduce_acc8_to_d4(acc_v[mt][nt], acc[mt][nt]);
+    }
   }
 #else
   unsigned bcur[BK / 16][2][2], bnext[BK / 16][2][2];
@@ -498,9 +662,16 @@ template <int FMT, Mode MODE, int K, int TM, bool LOW_SMEM = false>
 void launch(const GemmArgs& g, int grid, cudaStream_t stream) {
   constexpr int SMEM = Cfg<FMT, K, TM, LOW_SMEM>::SMEM;
   if constexpr (SMEM > 49152) {
-    static const cudaError_t attr = cudaFuncSetAttribute(
-        wgemm_kernel<FMT, MODE, K, TM, LOW_SMEM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-    if (attr != cudaSuccess) throw std::runtime_error("prefill wgemm: shared memory attribute failed");
+    static std::atomic<uint32_t> attr_done{0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const uint32_t bit = 1u << (dev & 31);
+    if (!(attr_done.load(std::memory_order_acquire) & bit)) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          wgemm_kernel<FMT, MODE, K, TM, LOW_SMEM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+      if (attr != cudaSuccess) throw std::runtime_error("prefill wgemm: shared memory attribute failed");
+      attr_done.fetch_or(bit, std::memory_order_release);
+    }
   }
   wgemm_kernel<FMT, MODE, K, TM, LOW_SMEM><<<grid, NT, SMEM, stream>>>(g);
 }
@@ -826,9 +997,16 @@ template <int BITS, Mode MODE, int K, int TM>
 void launch_exl3(const Exl3GemmArgs& g, int grid, cudaStream_t stream) {
   constexpr int SMEM = exl3_a_stages<TM>() * TM * 128 * 2 + 2 * 8 * 8 * 32 * BITS;
   if constexpr (SMEM > 49152) {
-    static const cudaError_t attr =
-        cudaFuncSetAttribute(wgemm_exl3_kernel<BITS, MODE, K, TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-    if (attr != cudaSuccess) throw std::runtime_error("prefill wgemm(EXL3): shared memory attribute failed");
+    static std::atomic<uint32_t> attr_done{0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const uint32_t bit = 1u << (dev & 31);
+    if (!(attr_done.load(std::memory_order_acquire) & bit)) {
+      const cudaError_t attr =
+          cudaFuncSetAttribute(wgemm_exl3_kernel<BITS, MODE, K, TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+      if (attr != cudaSuccess) throw std::runtime_error("prefill wgemm(EXL3): shared memory attribute failed");
+      attr_done.fetch_or(bit, std::memory_order_release);
+    }
   }
   wgemm_exl3_kernel<BITS, MODE, K, TM><<<grid, NT, SMEM, stream>>>(g);
 }

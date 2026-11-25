@@ -264,6 +264,24 @@ void f32_to_bf16_rows(const float* src, int rows, int cols, ActT* dst, std::int6
   CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void unpack_tp_logits_kernel(const float* __restrict__ gathered, int B, int tp_size,
+                                        int local_vocab, int unpadded_vocab, float* __restrict__ out) {
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  const int b = blockIdx.y;
+  if (v >= unpadded_vocab || b >= B) return;
+  const int r = v / local_vocab;
+  const int lv = v - r * local_vocab;
+  out[std::size_t(b) * unpadded_vocab + v] = gathered[(std::size_t(r) * B + b) * local_vocab + lv];
+}
+
+void unpack_tp_logits(const float* gathered, int B, int tp_size, int local_vocab, int unpadded_vocab,
+                      float* out, cudaStream_t stream) {
+  if (B <= 0 || unpadded_vocab <= 0) return;
+  const dim3 grid((unpadded_vocab + 255) / 256, B);
+  unpack_tp_logits_kernel<<<grid, 256, 0, stream>>>(gathered, B, tp_size, local_vocab, unpadded_vocab, out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 void bf16_to_act_inplace(void* data, std::size_t numel, cudaStream_t stream) {
 #if INGINE_ACT_FP16
   if (!data || numel == 0) return;

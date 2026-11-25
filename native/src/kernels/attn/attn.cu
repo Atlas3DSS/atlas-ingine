@@ -1,3 +1,4 @@
+#include <atomic>
 // Attention core of one Inkling-2-Mini layer visit for M = 1..8 consecutive decode tokens, in ONE kernel.
 // Contract: native/KERNELS.md, area `attn`.
 //
@@ -96,10 +97,15 @@
 namespace ingine::kernels::attn {
 namespace {
 
-constexpr int HQ = 24, HKV = 8, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA = 3, CONV_C = HKV * D;
-constexpr int OFF_GATE = 3072, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_V = 7576, OFF_KDYN = 8600,
-              OFF_VDYN = 8632;
-constexpr int R_SLIDING = 8600, R_FULL = 8664;
+#ifndef INGINE_TP_SIZE
+#define INGINE_TP_SIZE 1
+#endif
+constexpr int HQ = 24 / INGINE_TP_SIZE, HKV = 8 / INGINE_TP_SIZE, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA = 3, CONV_C = HKV * D;
+constexpr int SINK_PAD = (HQ + 7) & ~7;
+constexpr int OFF_GATE = HQ * D, OFF_REL = 2 * HQ * D, OFF_SINK = OFF_REL + HQ * DREL,
+              OFF_K = OFF_SINK + SINK_PAD, OFF_V = OFF_K + CONV_C, OFF_KDYN = OFF_V + CONV_C,
+              OFF_VDYN = OFF_KDYN + HKV * 4;
+constexpr int R_SLIDING = OFF_KDYN, R_FULL = OFF_VDYN + HKV * 4;
 constexpr int CS = 16;  // blocks per KV head = cluster size; block r outputs dims [8r, 8r + 8)
 constexpr int OD = D / CS;
 constexpr int MAXM = 8;
@@ -1650,22 +1656,29 @@ struct Kernel {
 
 template <int M, bool FULL, bool F8, bool Q4 = false>
 Kernel kernel_of() {
-    static const Kernel k = [] {
-        if (current_sm_major() >= 9) {
-            const KernelFn f = attn_decode_kernel<M, FULL, F8, false, Q4>;
+    static std::atomic<uint32_t> attr_done{0};
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    const uint32_t bit = 1u << (dev & 31);
+    if (current_sm_major() >= 9) {
+        const KernelFn f = attn_decode_kernel<M, FULL, F8, false, Q4>;
+        if (!(attr_done.load(std::memory_order_acquire) & bit)) {
             CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
             CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, Q4>::BYTES)));
-            return Kernel{f, nullptr, M, Smem<M, F8, Q4>::BYTES};
-        } else {
-            const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true, Q4>;
-            const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8, Q4>;
-            if constexpr (Smem<M, F8, Q4>::BYTES > 49152) {
-                CUDA_CHECK(cudaFuncSetAttribute(f1, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, Q4>::BYTES)));
-            }
-            return Kernel{f1, f2, M, Smem<M, F8, Q4>::BYTES};
+            attr_done.fetch_or(bit, std::memory_order_release);
         }
-    }();
-    return k;
+        return Kernel{f, nullptr, M, Smem<M, F8, Q4>::BYTES};
+    } else {
+        const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true, Q4>;
+        const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8, Q4>;
+        if constexpr (Smem<M, F8, Q4>::BYTES > 49152) {
+            if (!(attr_done.load(std::memory_order_acquire) & bit)) {
+                CUDA_CHECK(cudaFuncSetAttribute(f1, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, Q4>::BYTES)));
+                attr_done.fetch_or(bit, std::memory_order_release);
+            }
+        }
+        return Kernel{f1, f2, M, Smem<M, F8, Q4>::BYTES};
+    }
 }
 
 template <int M, bool FULL, bool F8, bool Q4 = false>

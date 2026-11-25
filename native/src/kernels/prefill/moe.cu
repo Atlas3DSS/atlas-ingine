@@ -479,9 +479,35 @@ void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream, int
   route_kernel<<<1, 1024, 0, stream>>>(idx, T, tr, w);
 }
 
+__global__ void __launch_bounds__(kHidden / 4) combine_ep_kernel(
+    const uint2* __restrict__ down, const float* __restrict__ wts,
+    const int* __restrict__ idx, const std::uint8_t* __restrict__ active_mask, float4* __restrict__ out_f32) {
+  const int t = blockIdx.x, c = threadIdx.x;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k) {
+    const int e = idx[size_t(t) * kTopK + k];
+    if (active_mask && !active_mask[e]) continue;
+    const uint2 d = down[(size_t(t) * kTopK + k) * (kHidden / 4) + c];
+    const float wk = wts[size_t(t) * kTopK + k];
+    acc[0] = __fadd_rn(acc[0], __fmul_rn(bf_lo(d.x), wk));
+    acc[1] = __fadd_rn(acc[1], __fmul_rn(bf_hi(d.x), wk));
+    acc[2] = __fadd_rn(acc[2], __fmul_rn(bf_lo(d.y), wk));
+    acc[3] = __fadd_rn(acc[3], __fmul_rn(bf_hi(d.y), wk));
+  }
+  out_f32[size_t(t) * (kHidden / 4) + c] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+}
+
 void moe_combine(const ActT* down, const float* wts, int T, ActT* out, cudaStream_t stream) {
   combine_kernel<<<T, kHidden / 4, 0, stream>>>(reinterpret_cast<const uint2*>(down), wts,
                                                 reinterpret_cast<uint2*>(out));
+}
+
+void moe_combine_ep(const ActT* down, const float* wts, const int* idx, const std::uint8_t* active_mask,
+                    int T, float* out_f32, cudaStream_t stream) {
+  if (T <= 0) return;
+  combine_ep_kernel<<<T, kHidden / 4, 0, stream>>>(
+      reinterpret_cast<const uint2*>(down), wts, idx, active_mask, reinterpret_cast<float4*>(out_f32));
 }
 
 }  // namespace ingine::kernels::prefill

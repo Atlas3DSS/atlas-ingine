@@ -36,9 +36,12 @@ void proj_conv(const ActT* x, int M, Matrix w, const float* conv_w, float* conv_
 // head: out[m, v] = 30 tanh(bf16(w_v . x[m]) / 30), x bf16 [M, H], out fp32 [M, V], V = w.rows.
 void head(const ActT* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream);
 
-// gemv: plain GEMV (drafter o_proj / down_proj). x bf16 [M, K] (row stride K), out fp32 [M, R] =
-// bf16(w[r] . x[m]), R = w.rows; K = 3072 or 9216; same PDL contract as proj.
+// gemv: plain GEMV (drafter o_proj / down_proj, and TP2/TP4 sharded wo). x bf16 [M, K] (row stride K),
+// out fp32 [M, R] = bf16(w[r] . x[m]), R = w.rows; K = 768 (TP4), 1536 (TP2), 3072 or 9216; same PDL contract as proj.
 void gemv(const ActT* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream);
+// Standalone 4-tap static conv + state shift for M=1..8 FP32 inputs (after TP/EP AllReduce).
+void static_conv_decode(const float* x_f32, int M, const float* conv_w, float* conv_state, float* out,
+                        float* conv_hist, cudaStream_t stream);
 
 // fp8_rows: bf16 [rows, K] -> float8_e4m3fn [rows, K] (q) + fp32 scale [rows] = amax / 448.
 void fp8_rows(const ActT* w, int rows, int K, void* q, float* scale, cudaStream_t stream);

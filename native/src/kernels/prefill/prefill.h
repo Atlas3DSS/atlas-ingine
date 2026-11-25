@@ -13,8 +13,13 @@
 
 namespace ingine::kernels::prefill {
 
+#ifndef INGINE_TP_SIZE
+#define INGINE_TP_SIZE 1
+#endif
+inline constexpr int kTpSize = INGINE_TP_SIZE;
 inline constexpr int kHidden = 2304;
-inline constexpr int kHeads = 24, kKvHeads = 8, kHeadDim = 128, kRel = 16, kRelExtent = 1024;
+inline constexpr int kHeads = 24 / kTpSize, kKvHeads = 8 / kTpSize, kHeadDim = 128, kRel = 16, kRelExtent = 1024;
+inline constexpr int kSinkPad = (kHeads + 7) & ~7;
 inline constexpr int kKvDim = kKvHeads * kHeadDim;  // 1024
 inline constexpr int kKvQ4NibbleBytes = kKvDim / 2;              // 512
 inline constexpr int kKvQ4ScaleBytes = kKvHeads * (kHeadDim / 32) * 2;  // 64
@@ -131,6 +136,8 @@ void static_conv(const ActT* x, int ld, int T, int C, const float* w, const floa
 
 // state <- the last three rows of [state, x] (x bf16 [T, ld], C channels). Run after every reader of state.
 void conv_state_update(float* state, const ActT* x, int ld, int T, int C, cudaStream_t stream);
+void static_conv_f32(const float* x, int ld, int T, int C, const float* w, const float* state, float* out, cudaStream_t stream);
+void conv_state_update_f32(float* state, const float* x, int ld, int T, int C, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------------------- message gates
 
@@ -212,6 +219,8 @@ void moe_down(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, Act
               cudaStream_t stream);
 // out[t] = bf16(sum over slots in order of down[t, slot] * wts[t, slot]), bf16 [T, H].
 void moe_combine(const ActT* down, const float* wts, int T, ActT* out, cudaStream_t stream);
+// EP partial combine: sums only slots whose expert has active_mask[e] != 0 into FP32 [T, H].
+void moe_combine_ep(const ActT* down, const float* wts, const int* idx, const std::uint8_t* active_mask, int T, float* out_f32, cudaStream_t stream);
 
 // ------------------------------------------------------------------------------------------------ misc
 

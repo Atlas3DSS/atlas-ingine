@@ -1,3 +1,4 @@
+#include <atomic>
 // Routed-expert decode to BF16 (ported from engine/csrc/prefill/dequant.cu; kernel bodies unchanged).
 //
 // A prefill that multiplies many tokens per expert can decode the selected experts' matrices once into a
@@ -217,9 +218,15 @@ void dequant_experts(const void* codes, const void* scales, const float* factor,
             constexpr int SMEM_F32 = 128 * 128 * sizeof(float);
             constexpr int SMEM_F16 = 128 * 128 * sizeof(__half);
             if (current_max_smem_optin() >= SMEM_F32) {
-                static const cudaError_t a = cudaFuncSetAttribute(
-                    dequant_exl3_kernel<B, float>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_F32);
-                CUDA_CHECK(a);
+                static std::atomic<uint32_t> attr_done{0};
+                int dev = 0;
+                CUDA_CHECK(cudaGetDevice(&dev));
+                const uint32_t bit = 1u << (dev & 31);
+                if (!(attr_done.load(std::memory_order_acquire) & bit)) {
+                    CUDA_CHECK(cudaFuncSetAttribute(
+                        dequant_exl3_kernel<B, float>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_F32));
+                    attr_done.fetch_or(bit, std::memory_order_release);
+                }
                 dequant_exl3_kernel<B, float><<<grid, 128, SMEM_F32, stream>>>(
                     static_cast<const uint8_t*>(codes), static_cast<const __half*>(scales),
                     static_cast<const __half*>(rout), experts, out, rows, cols);

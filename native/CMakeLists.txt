@@ -23,6 +23,11 @@ option(INGINE_BUILD_TESTS "Build ingine tests" OFF)
 option(INGINE_BUILD_APPS "Build the ingine executables (serve, bench, validate)" ON)
 option(INGINE_ACT_FP16 "Use FP16 activations/weights instead of BF16 (required for pre-Ampere sm_60/70/75)" OFF)
 option(INGINE_FORCE_SIMT_MMA "Force FP32-accumulated SIMT MMA fallback on all archs (to oracle-verify Pascal sm_60/61 path on V100)" OFF)
+set(INGINE_TP_SIZE "1" CACHE STRING "Compile-time Tensor+Expert Parallelism world size (1, 2, or 4)")
+if(NOT INGINE_TP_SIZE MATCHES "^(1|2|4)$")
+  message(FATAL_ERROR "INGINE_TP_SIZE must be 1, 2, or 4 (got '${INGINE_TP_SIZE}')")
+endif()
+add_compile_definitions(INGINE_TP_SIZE=${INGINE_TP_SIZE})
 
 # Detect pre-Ampere (< sm_80) and Ampere+ (>= sm_80) architectures.
 set(_ingine_has_pre_sm80 OFF)
@@ -95,8 +100,8 @@ foreach(area ${INGINE_KERNEL_AREAS})
   endif()
 endforeach()
 
-ingine_add_component(src/model)
 ingine_add_component(src/engine)
+ingine_add_component(src/model)
 ingine_add_component(src/serve)
 
 if(INGINE_BUILD_APPS)

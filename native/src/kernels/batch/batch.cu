@@ -18,11 +18,16 @@
 namespace ingine::kernels::batch {
 namespace {
 
-constexpr int HQ = 24, HKV = 8, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA = 3, CONV_C = HKV * D;
+#ifndef INGINE_TP_SIZE
+#define INGINE_TP_SIZE 1
+#endif
+constexpr int HQ = 24 / INGINE_TP_SIZE, HKV = 8 / INGINE_TP_SIZE, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA = 3, CONV_C = HKV * D;
+constexpr int SINK_PAD = (HQ + 7) & ~7;
 constexpr int NUM_FULL_VISITS = 8;
-constexpr int OFF_GATE = 3072, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_V = 7576, OFF_KDYN = 8600,
-              OFF_VDYN = 8632;
-constexpr int R_SLIDING = 8600, R_FULL = 8664;
+constexpr int OFF_GATE = HQ * D, OFF_REL = 2 * HQ * D, OFF_SINK = OFF_REL + HQ * DREL,
+              OFF_K = OFF_SINK + SINK_PAD, OFF_V = OFF_K + CONV_C, OFF_KDYN = OFF_V + CONV_C,
+              OFF_VDYN = OFF_KDYN + HKV * 4;
+constexpr int R_SLIDING = OFF_KDYN, R_FULL = OFF_VDYN + HKV * 4;
 constexpr int NT = 256;
 constexpr int KW = 8;  // 8 warps per block
 constexpr int U = 2;   // key pairs per warp per register buffer
@@ -54,7 +59,7 @@ constexpr std::size_t align256(std::size_t n) { return (n + 255) & ~std::size_t(
 //   saved_nkv: ActT [max_b, HKV, 2, D]
 //   saved_nst: fp32 [max_b, HKV, 3, 2, D]
 std::size_t ws_nkv_off(int max_b) {
-  const int max_ts = std::max(16, max_b);
+  const int max_ts = std::max(16 * INGINE_TP_SIZE + 16, max_b);
   return align256(std::size_t(max_ts) * HKV * GQA * PSTR * sizeof(float));
 }
 std::size_t ws_nst_off(int max_b) {
@@ -923,10 +928,10 @@ void scatter_full_kv(const void* src_k, const void* src_v, int scratch_max_ctx, 
           "scatter_full_kv: bad args");
   const dim3 grid(T, NUM_FULL_VISITS);
   if (kv_fp8) {
-    paged_full_kv_transfer_kernel<true, true><<<grid, 256, 0, stream>>>(
+    paged_full_kv_transfer_kernel<true, true><<<grid, CONV_C / 4, 0, stream>>>(
         src_k, src_v, dst_k_pool, dst_v_pool, scratch_max_ctx, pos0, T, slot, page_table, max_pages_per_slot);
   } else {
-    paged_full_kv_transfer_kernel<true, false><<<grid, 256, 0, stream>>>(
+    paged_full_kv_transfer_kernel<true, false><<<grid, CONV_C / 4, 0, stream>>>(
         src_k, src_v, dst_k_pool, dst_v_pool, scratch_max_ctx, pos0, T, slot, page_table, max_pages_per_slot);
   }
   CUDA_CHECK(cudaGetLastError());
@@ -940,11 +945,11 @@ void gather_full_kv(const void* src_k_pool, const void* src_v_pool, int slot, co
           "gather_full_kv: bad args");
   const dim3 grid(n, NUM_FULL_VISITS);
   if (kv_fp8) {
-    paged_full_kv_transfer_kernel<false, true><<<grid, 256, 0, stream>>>(
+    paged_full_kv_transfer_kernel<false, true><<<grid, CONV_C / 4, 0, stream>>>(
         dst_k, dst_v, const_cast<void*>(src_k_pool), const_cast<void*>(src_v_pool), scratch_max_ctx, 0, n, slot,
         page_table, max_pages_per_slot);
   } else {
-    paged_full_kv_transfer_kernel<false, false><<<grid, 256, 0, stream>>>(
+    paged_full_kv_transfer_kernel<false, false><<<grid, CONV_C / 4, 0, stream>>>(
         dst_k, dst_v, const_cast<void*>(src_k_pool), const_cast<void*>(src_v_pool), scratch_max_ctx, 0, n, slot,
         page_table, max_pages_per_slot);
   }
