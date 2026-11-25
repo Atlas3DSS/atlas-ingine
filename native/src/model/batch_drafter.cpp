@@ -41,13 +41,15 @@ std::vector<float> bf16_to_float(const std::vector<std::byte>& raw) {
   return out;
 }
 
-int choose_draft_ctx(int max_batch, int max_ctx) {
+int choose_draft_ctx(int max_batch, int max_ctx, std::size_t vram_budget_bytes) {
   std::size_t free_b = 0, total_b = 0;
   CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+  if (vram_budget_bytes > 0) free_b = std::min(free_b, vram_budget_bytes);
   int cap = 4096;
-  if (max_batch <= 8) cap = 65536;
+  if (max_batch <= 8 && free_b > (std::size_t(12) << 30)) cap = 65536;
   else if (free_b > (std::size_t(48) << 30)) cap = 16384;
   else if (free_b > (std::size_t(18) << 30)) cap = 8192;
+  else if (free_b < (std::size_t(6) << 30)) cap = 2048;
   return std::max(std::min(max_ctx, 1024), std::min(max_ctx, cap));
 }
 
@@ -59,12 +61,12 @@ void* BatchDrafter::alloc(std::size_t bytes) {
 }
 
 BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights& w, int max_batch, int max_ctx,
-                           int max_verify_width, cudaStream_t stream, int shortlist_rows)
+                           int max_verify_width, cudaStream_t stream, int shortlist_rows, std::size_t vram_budget_bytes)
     : w_(w),
       stream_(stream),
       max_batch_(max_batch),
       max_verify_width_(max_verify_width),
-      ctx_(choose_draft_ctx(max_batch, max_ctx)),
+      ctx_(choose_draft_ctx(max_batch, max_ctx, vram_budget_bytes)),
       gemm_(std::make_unique<pk::Gemm>()),
       draft_meta_host_(std::size_t(max_batch) * sizeof(kd::BatchSlotDraftMeta)),
       commit_meta_host_(std::size_t(max_batch) * sizeof(kd::BatchSlotCommitMeta)) {

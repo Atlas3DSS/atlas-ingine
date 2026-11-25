@@ -7,6 +7,7 @@
 //         item's prompt for len(output) tokens at the temperature: sampled A/B, where forced acceptance by
 //         equality under-counts)
 #include "forced.h"
+#include "ingine/batch_spec_plan.h"
 #include "ingine/generator.h"
 #include "serve/cli.h"
 #include "text/chat.h"
@@ -166,7 +167,8 @@ int main(int argc, char** argv) {
   std::string concurrency_csv;
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
-  int max_batch = 0, max_kv_tokens = 0, park_mb = -1, park_host_mb = 0, loop_passes = 3;
+  int max_batch = 0, max_kv_tokens = 0, vram_limit_mb = 0, stagger_join_tokens = 0, park_mb = -1, park_host_mb = 0,
+      loop_passes = 3;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
@@ -233,9 +235,13 @@ int main(int argc, char** argv) {
   ap.option("--max-batch", "", "override max batch slots (default: max of --concurrency, or 1)", &max_batch);
   ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity (0 = auto)", &max_kv_tokens);
   ap.option("--loop-passes", "", "recurrent loop passes over layers 6..17 (1..8, default 3 = 48 visits)", &loop_passes);
+  ap.option("--vram-limit-mb", "", "bound batched pool/drafter/cache allocations to this VRAM lease cap in MiB (0 = auto)",
+            &vram_limit_mb);
   ap.flag("--ignore-eos", "with --concurrency: decode full --tokens per request (steady-state peak throughput)", &ignore_eos);
   ap.flag("--staggered", "with --concurrency: also run a staggered mid-generation continuous-batching arrival pass", &staggered);
-  ap.flag("--no-prefix-cache", "disable prefix checkpoint caching (cache-off parity baseline)", &no_prefix_cache);
+  ap.option("--stagger-join-tokens", "",
+            "with --staggered: per-request emitted-token milestone in cohort 1 that triggers cohort 2 arrival (default: tokens/4)",
+            &stagger_join_tokens);
   ap.parse(argc, argv);
 
   try {
@@ -253,8 +259,30 @@ int main(int argc, char** argv) {
     }
 
     cudaFree(nullptr);  // create the context before measuring the model's memory
-    size_t free0 = 0, total = 0;
-    cudaMemGetInfo(&free0, &total);
+    struct VramTracker {
+      size_t total = 0;
+      size_t free_before_load = 0;
+      size_t free_after_load = 0;
+      size_t min_free = 0;
+      void init() {
+        cudaMemGetInfo(&free_before_load, &total);
+        free_after_load = free_before_load;
+        min_free = free_before_load;
+      }
+      void mark_after_load() {
+        cudaMemGetInfo(&free_after_load, &total);
+        if (free_after_load < min_free) min_free = free_after_load;
+      }
+      void sample() {
+        size_t f = 0, t = 0;
+        if (cudaMemGetInfo(&f, &t) == cudaSuccess && f < min_free) min_free = f;
+      }
+      double load_delta_gb() const { return double(free_before_load > free_after_load ? free_before_load - free_after_load : 0) / 1e9; }
+      double peak_delta_gb() const { return double(free_before_load > min_free ? free_before_load - min_free : 0) / 1e9; }
+      double peak_delta_mib() const { return double(free_before_load > min_free ? free_before_load - min_free : 0) / double(1 << 20); }
+      double peak_device_used_gb() const { return double(total > min_free ? total - min_free : 0) / 1e9; }
+    } vram;
+    vram.init();
     const auto t0 = Clock::now();
     ingine::model::RuntimeOptions options;
     if (atlas_6g) {
@@ -294,13 +322,14 @@ int main(int argc, char** argv) {
     options.max_kv_tokens = max_kv_tokens;
     options.prefix_cache = !no_prefix_cache;
     options.loop_passes = loop_passes;
+    options.vram_limit_mb = vram_limit_mb;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
-    size_t free1 = 0;
-    cudaMemGetInfo(&free1, &total);
-    const double vram_gb = double(free0 > free1 ? free0 - free1 : 0) / 1e9;
-    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s, loop_passes=%d)\n", load_s, vram_gb,
-                gen->max_batch_size(), ingine::model::to_string(gen->kv_cache_mode()), gen->loop_passes());
+    vram.mark_after_load();
+    const double vram_gb = vram.load_delta_gb();
+    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s, loop_passes=%d, vram_limit_mb=%d)\n",
+                load_s, vram_gb, gen->max_batch_size(), ingine::model::to_string(gen->kv_cache_mode()),
+                gen->loop_passes(), vram_limit_mb);
     std::fflush(stdout);
     if (!forced.empty()) {
       std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace, forced_free).c_str());
@@ -386,6 +415,7 @@ int main(int argc, char** argv) {
             }
           }
           const double prefill_s = std::chrono::duration<double>(Clock::now() - tp0).count();
+          vram.sample();
 
           const auto td0 = Clock::now();
           int decode_tokens = 0;
@@ -396,6 +426,7 @@ int main(int argc, char** argv) {
             results.resize(live.size());
             for (std::size_t i = 0; i < live.size(); ++i) steps[i] = {live[i].slot, live[i].last_tok};
             gen->step_slots_multi(steps, results);
+            vram.sample();
             std::vector<Active> kept;
             kept.reserve(live.size());
             for (std::size_t i = 0; i < live.size(); ++i) {
@@ -421,6 +452,7 @@ int main(int argc, char** argv) {
             live = std::move(kept);
           }
           const double decode_s = std::chrono::duration<double>(Clock::now() - td0).count();
+          vram.sample();
           last_prompt_toks = total_prompt;
           last_gen_toks = total_gen;
           last_prefill_s = prefill_s;
@@ -456,83 +488,188 @@ int main(int argc, char** argv) {
       }
 
       if (staggered && gen->max_batch_size() > 1) {
-        // Staggered continuous-batching pass: start C/2 requests, inject C/2 more after tokens/4 steps.
+        // Staggered continuous-batching pass: offer cohort 1 (C/2) at t=0, and offer cohort 2 (remaining C/2)
+        // when cohort 1's cumulative emitted tokens reach an identical output-token milestone (default: half * tokens/4),
+        // keeping plain (1 tok/round) and spec (k tok/round) on the exact same mid-generation overlap point!
         const int C = resolved_max_batch;
-        const int half = std::max(1, C / 2);
-        const int join_step = std::max(1, tokens / 4);
+        ingine::model::StaggeredBenchmarkState stg;
+        stg.init(C, tokens, stagger_join_tokens);
         struct Active {
+          int req_idx = 0;
           int slot = -1;
           int32_t last_tok = 0;
           int generated = 0;
         };
         std::vector<Active> live;
-        int next_idx = 0, total_gen = 0, step_n = 0, total_spec_rounds = 0, total_spec_accepted = 0;
-        auto admit = [&](int count) {
-          for (int k = 0; k < count && next_idx < C; ++k, ++next_idx) {
+        int total_prompt = 0, total_gen = 0, decode_tokens = 0, step_n = 0, total_spec_rounds = 0,
+            total_spec_accepted = 0;
+        auto is_eos = [&](int32_t t) {
+          return !ignore_eos && std::find(stop.begin(), stop.end(), t) != stop.end();
+        };
+        auto cohort1_active_count = [&]() {
+          int n = 0;
+          for (const auto& a : live)
+            if (a.req_idx < stg.cohort1_size) ++n;
+          return n;
+        };
+        auto try_admit_pending = [&]() {
+          while (!stg.pending.empty()) {
+            const int req_idx = stg.pending.front();
             ingine::model::Sampling s;
             s.temperature = float(temperature);
-            s.seed = uint64_t(777 + next_idx);
+            s.seed = uint64_t(777 + req_idx);
+            const ingine::model::Prompt pr{prompt_bank[std::size_t(req_idx)], {}};
+            if (!gen->can_admit_slot(pr, tokens, s)) {
+              ++stg.deferred_attempts;
+              if (live.empty()) {
+                // Unadmittable even on an empty engine: account explicitly as dropped.
+                stg.pending.pop_front();
+                ++stg.dropped;
+                continue;
+              }
+              break;
+            }
             int32_t tok0 = 0;
             ingine::model::GenerateStats st;
-            const int slot = gen->start_slot(ingine::model::Prompt{prompt_bank[std::size_t(next_idx)], {}}, tokens, s, tok0, st);
-            if (slot >= 0) {
-              ++total_gen;
-              live.push_back(Active{slot, tok0, 1});
+            const int slot = gen->start_slot(pr, tokens, s, tok0, st);
+            if (slot < 0) {
+              ++stg.deferred_attempts;
+              if (live.empty()) {
+                stg.pending.pop_front();
+                ++stg.dropped;
+                continue;
+              }
+              break;
             }
+            stg.pending.pop_front();
+            ++stg.admitted;
+            total_prompt += st.prompt_tokens;
+            ++total_gen;
+            stg.note_emitted(req_idx, 1);
+            const bool hit_eos0 = is_eos(tok0);
+            if (hit_eos0 || tokens <= 1) {
+              if (hit_eos0) {
+                ++stg.eos_first_token;
+                ++stg.eos_stopped;
+              } else {
+                ++stg.max_token_stopped;
+              }
+              ++stg.completed;
+              gen->release_slot(slot);
+            } else {
+              live.push_back(Active{req_idx, slot, tok0, 1});
+            }
+            vram.sample();
           }
         };
+
         const auto ts0 = Clock::now();
-        admit(half);
+        try_admit_pending();
         std::vector<ingine::model::BatchSlotStep> steps;
         std::vector<ingine::model::BatchSlotResult> results;
-        while (!live.empty() || next_idx < C) {
-          if (step_n == join_step && next_idx < C) admit(C - next_idx);
+        while (!live.empty() || !stg.pending.empty() || !stg.cohort2_offered) {
+          stg.maybe_offer_cohort2(step_n, cohort1_active_count());
+          try_admit_pending();
           if (live.empty()) {
-            admit(C - next_idx);
+            if (!stg.cohort2_offered) {
+              stg.maybe_offer_cohort2(step_n, 0);
+              try_admit_pending();
+              if (!live.empty()) continue;
+            }
+            if (stg.pending.empty()) break;
             continue;
           }
           steps.resize(live.size());
           results.resize(live.size());
           for (std::size_t i = 0; i < live.size(); ++i) steps[i] = {live[i].slot, live[i].last_tok};
           gen->step_slots_multi(steps, results);
+          vram.sample();
           ++step_n;
           std::vector<Active> kept;
+          kept.reserve(live.size());
           for (std::size_t i = 0; i < live.size(); ++i) {
             const auto& res = results[i];
             total_spec_rounds += res.spec_rounds;
             total_spec_accepted += res.spec_accepted;
             bool done = false;
+            bool hit_eos = false;
             for (int k = 0; k < res.count; ++k) {
               const int32_t tok_k = res.tokens[k];
               live[i].last_tok = tok_k;
               ++live[i].generated;
               ++total_gen;
-              if (live[i].generated >= tokens ||
-                  (!ignore_eos && std::find(stop.begin(), stop.end(), tok_k) != stop.end())) {
+              ++decode_tokens;
+              stg.note_emitted(live[i].req_idx, 1);
+              if (is_eos(tok_k)) {
+                done = true;
+                hit_eos = true;
+                break;
+              }
+              if (live[i].generated >= tokens) {
                 done = true;
                 break;
               }
             }
-            if (done || res.count == 0) gen->release_slot(live[i].slot);
-            else kept.push_back(live[i]);
+            if (done || res.count == 0) {
+              if (hit_eos) ++stg.eos_stopped;
+              else ++stg.max_token_stopped;
+              ++stg.completed;
+              gen->release_slot(live[i].slot);
+            } else {
+              kept.push_back(live[i]);
+            }
           }
           live = std::move(kept);
         }
+        vram.sample();
         const double wall_s = std::chrono::duration<double>(Clock::now() - ts0).count();
         const double eff_tok_s = double(total_gen) / std::max(wall_s, 1e-9);
-        std::printf("staggered (C=%d, join@%d): %d tokens in %.2fs = %.1f tok/s effective (spec_rounds=%d, spec_accepted=%d)\n",
-                    C, join_step, total_gen, wall_s, eff_tok_s, total_spec_rounds, total_spec_accepted);
+        if (!stg.accounting_consistent()) {
+          throw std::runtime_error("staggered benchmark accounting invariant failed");
+        }
+        std::printf(
+            "staggered (C=%d, join_milestone=%d tok, cohort1@join=%d tok/%d active, round=%d): "
+            "offered=%d admitted=%d completed=%d dropped=%d deferred=%d eos0=%d | %d tok in %.2fs = %.1f tok/s "
+            "(spec_rounds=%d, spec_accepted=%d)\n",
+            C, stg.join_milestone_tokens, stg.cohort1_emitted_at_join, stg.cohort1_active_at_join, stg.join_round,
+            stg.offered, stg.admitted, stg.completed, stg.dropped, stg.deferred_attempts, stg.eos_first_token,
+            total_gen, wall_s, eff_tok_s, total_spec_rounds, total_spec_accepted);
         report["staggered"] = {{"concurrency", C},
-                               {"join_step", join_step},
+                               {"join_policy", "cohort1_emitted_tokens"},
+                               {"join_milestone_tokens", stg.join_milestone_tokens},
+                               {"cohort1_emitted_at_join", stg.cohort1_emitted_at_join},
+                               {"cohort1_active_at_join", stg.cohort1_active_at_join},
+                               {"join_round", stg.join_round},
+                               {"offered", stg.offered},
+                               {"admitted", stg.admitted},
+                               {"completed", stg.completed},
+                               {"dropped", stg.dropped},
+                               {"deferred_attempts", stg.deferred_attempts},
+                               {"eos_first_token", stg.eos_first_token},
+                               {"eos_stopped", stg.eos_stopped},
+                               {"max_token_stopped", stg.max_token_stopped},
+                               {"prompt_tokens", total_prompt},
                                {"generated_tokens", total_gen},
+                               {"decode_tokens", decode_tokens},
                                {"wall_seconds", wall_s},
                                {"effective_tok_s", eff_tok_s},
                                {"spec_rounds", total_spec_rounds},
                                {"spec_accepted", total_spec_accepted}};
       }
 
+      vram.sample();
+      const bool vram_ok = (vram_limit_mb <= 0) || (vram.peak_delta_mib() <= double(vram_limit_mb));
+      report["load_vram_gb"] = vram.load_delta_gb();
+      report["peak_vram_gb"] = vram.peak_delta_gb();
+      report["peak_vram_mib"] = vram.peak_delta_mib();
+      report["peak_device_used_gb"] = vram.peak_device_used_gb();
+      report["vram_limit_mb"] = vram_limit_mb;
+      report["vram_within_limit"] = vram_ok;
+      std::printf("VRAM summary: load=%.2f GB, peak_delta=%.2f GB (%.1f MiB), peak_device_used=%.2f GB%s\n",
+                  vram.load_delta_gb(), vram.peak_delta_gb(), vram.peak_delta_mib(), vram.peak_device_used_gb(),
+                  vram_limit_mb > 0 ? (vram_ok ? " [WITHIN LIMIT]" : " [EXCEEDED LIMIT]") : "");
       std::printf("%s\n", report.dump().c_str());
-      return 0;
+      return vram_ok ? 0 : 1;
     }
 
     std::string json = "{";

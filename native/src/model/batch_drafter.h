@@ -75,7 +75,8 @@ class BatchDrafter {
   };
 
   BatchDrafter(const std::filesystem::path& model_dir, const Weights& w, int max_batch, int max_ctx,
-               int max_verify_width, cudaStream_t stream, int shortlist_rows = SHORTLIST_ROWS);
+               int max_verify_width, cudaStream_t stream, int shortlist_rows = SHORTLIST_ROWS,
+               std::size_t vram_budget_bytes = 0);
   ~BatchDrafter();
   BatchDrafter(const BatchDrafter&) = delete;
   BatchDrafter& operator=(const BatchDrafter&) = delete;
@@ -89,6 +90,9 @@ class BatchDrafter {
   void reset_slot(int slot);
   void set_slot_seed(int slot, std::uint64_t seed);
   int slot_length(int slot) const { return slot_length_.at(std::size_t(slot)); }
+  std::uint64_t slot_seed(int slot) const { return slot_seed_.at(std::size_t(slot)); }
+  std::uint64_t slot_draws(int slot) const { return slot_draws_.at(std::size_t(slot)); }
+  const std::vector<std::int32_t>& slot_extra_ids(int slot) const { return slot_extra_ids_host_.at(std::size_t(slot)); }
 
   // Appends unseen rare tokens (outside immutable ranked shortlist) to THIS slot's private extra_ids list only.
   void note_tokens_slot(int slot, std::span<const std::int32_t> ids);

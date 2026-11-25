@@ -196,6 +196,8 @@ struct RuntimeOptions {
   int max_kv_tokens = 0;
   // Number of recurrent passes over layers 6..17 (default 3 = 48 visits; 1..8 supported for varloop models).
   int loop_passes = 3;
+  // Optional VRAM lease cap in MiB for batched pool/drafter/prefix-cache auto-sizing (0 = unbounded).
+  int vram_limit_mb = 0;
   // Mech-interp / persona hook options: pre-capture hooked CUDA graphs when enabled, and enforce refusal map.
   bool enable_persona_hooks = false;
   std::filesystem::path refusal_map;

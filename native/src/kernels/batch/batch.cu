@@ -233,12 +233,20 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
   const int g = blockIdx.y;
   const int b = blockIdx.z;
   const int slot = p.slot_ids[b];
-  if (slot < 0) return;
+  const int tid = threadIdx.x;
+  if (slot < 0) {
+    if constexpr (!SPLIT) {
+      for (int idx = tid; idx < GQA * D; idx += NT) {
+        const int row = idx / D, dim = idx % D;
+        p.out[std::size_t(b) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(0.f);
+      }
+    }
+    return;
+  }
 
   const int p0 = int(p.slot_pos[slot]);
   if (FULL && p0 >= p.max_ctx) return;
 
-  const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
   const int half = lane >> 4;
@@ -649,12 +657,18 @@ __global__ void __launch_bounds__(NT) batched_attn_reduce_kernel(const BatchedAt
   const int g = blockIdx.y;
   const int b = blockIdx.z;
   const int slot = p.slot_ids[b];
-  if (slot < 0) return;
+  const int tid = threadIdx.x;
+  if (slot < 0) {
+    for (int idx = tid; idx < GQA * D; idx += NT) {
+      const int row = idx / D, dim = idx % D;
+      p.out[std::size_t(b) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(0.f);
+    }
+    return;
+  }
 
   const int p0 = int(p.slot_pos[slot]);
   if (FULL && p0 >= p.max_ctx) return;
 
-  const int tid = threadIdx.x;
   const int R = p.R;
   const std::size_t proj_base = std::size_t(b) * R;
   const float* base_part = p.part + std::size_t((b * HKV + g) * p.splits) * GQA * PSTR;
@@ -730,7 +744,10 @@ __global__ void batched_static_conv_kernel(const void* __restrict__ x, int ld, i
   const int b = blockIdx.y;
   if (c >= C) return;
   const int slot = slot_ids[b];
-  if (slot < 0) return;
+  if (slot < 0) {
+    out[std::size_t(b) * C + c] = 0.f;
+    return;
+  }
 
   float* const st = conv_state_visit + std::size_t(slot) * conv_slot_stride;
   const float e0 = st[0 * C + c];
@@ -1193,13 +1210,23 @@ __global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const Batche
   const int g = blockIdx.y;
   const int b = blockIdx.z;
   const int slot = p.slot_ids[b];
-  if (slot < 0) return;
+  const int tid = threadIdx.x;
+  if (slot < 0) {
+    if constexpr (!SPLIT) {
+      for (int idx = tid; idx < W * GQA * D; idx += NT) {
+        const int w = idx / (GQA * D);
+        const int rem = idx % (GQA * D);
+        const int row = rem / D, dim = rem % D;
+        p.out[std::size_t(b * W + w) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(0.f);
+      }
+    }
+    return;
+  }
 
   const int w_lim = p.slot_w_limit ? min(W, max(1, int(p.slot_w_limit[b]))) : W;
   const int p0 = int(p.slot_pos[slot]);
   if (FULL && p0 + w_lim > p.max_ctx) return;
 
-  const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
   const int half = lane >> 4;
@@ -1629,6 +1656,12 @@ __global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const Batche
       const float gate = 1.f / (1.f + expf(-gate_in));
       p.out[std::size_t(b * W + w) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
     }
+    for (int idx = tid; idx < (W - w_lim) * GQA * D; idx += NT) {
+      const int w = w_lim + idx / (GQA * D);
+      const int rem = idx % (GQA * D);
+      const int row = rem / D, dim = rem % D;
+      p.out[std::size_t(b * W + w) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(0.f);
+    }
 
     // Commit per-head new K/V rows (safe: this CTA is the sole reader & writer of head g for slot `slot`).
     for (int idx = tid; idx < 2 * w_lim * 16; idx += NT) {
@@ -1669,13 +1702,21 @@ __global__ void __launch_bounds__(NT) batched_attn_verify_reduce_kernel(const Ba
   const int g = blockIdx.y;
   const int b = blockIdx.z;
   const int slot = p.slot_ids[b];
-  if (slot < 0) return;
+  const int tid = threadIdx.x;
+  if (slot < 0) {
+    for (int idx = tid; idx < W * GQA * D; idx += NT) {
+      const int w = idx / (GQA * D);
+      const int rem = idx % (GQA * D);
+      const int row = rem / D, dim = rem % D;
+      p.out[std::size_t(b * W + w) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(0.f);
+    }
+    return;
+  }
 
   const int w_lim = p.slot_w_limit ? min(W, max(1, int(p.slot_w_limit[b]))) : W;
   const int p0 = int(p.slot_pos[slot]);
   if (FULL && p0 + w_lim > p.max_ctx) return;
 
-  const int tid = threadIdx.x;
   const int R = p.R;
 
   for (int idx = tid; idx < w_lim * GQA * D; idx += NT) {
@@ -1701,6 +1742,12 @@ __global__ void __launch_bounds__(NT) batched_attn_verify_reduce_kernel(const Ba
     const float gate_in = load_proj_val<PROJ_FP32>(p.proj, pb + OFF_GATE + (g * GQA + row) * D + dim);
     const float gate = 1.f / (1.f + expf(-gate_in));
     p.out[std::size_t(b * W + w) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
+  }
+  for (int idx = tid; idx < (W - w_lim) * GQA * D; idx += NT) {
+    const int w = w_lim + idx / (GQA * D);
+    const int rem = idx % (GQA * D);
+    const int row = rem / D, dim = rem % D;
+    p.out[std::size_t(b * W + w) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(0.f);
   }
 
   float* const conv_k_slot = p.conv_k_visit + std::size_t(slot) * p.conv_slot_stride;
@@ -1801,7 +1848,14 @@ __global__ void batched_static_conv_verify_kernel(const void* __restrict__ x, in
   const int b = blockIdx.y;
   if (c >= C) return;
   const int slot = slot_ids[b];
-  if (slot < 0) return;
+  if (slot < 0) {
+    for (int w = 0; w < W; ++w) {
+      const std::size_t r = std::size_t(b) * W + w;
+      out[r * C + c] = 0.f;
+      if (hist) hist[r * C + c] = 0.f;
+    }
+    return;
+  }
 
   const int w_lim = slot_w_limit ? min(W, max(1, int(slot_w_limit[b]))) : W;
   float* const st = conv_state_visit + std::size_t(slot) * conv_slot_stride;
@@ -1827,6 +1881,11 @@ __global__ void batched_static_conv_verify_kernel(const void* __restrict__ x, in
     e0 = e1;
     e1 = e2;
     e2 = e3;
+  }
+  for (int w = w_lim; w < W; ++w) {
+    const std::size_t r = std::size_t(b) * W + w;
+    out[r * C + c] = 0.f;
+    if (hist) hist[r * C + c] = 0.f;
   }
   st[0 * C + c] = e0;
   st[1 * C + c] = e1;

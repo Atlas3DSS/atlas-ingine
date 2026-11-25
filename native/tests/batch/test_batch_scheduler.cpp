@@ -3,6 +3,7 @@
 // 2. Mid-generation admission & immediate retirement on stop token and client cancellation.
 // 3. KV-page backpressure, error isolation (bad prompt fails without breaking active slots), and clean shutdown.
 #include "engine/scheduler.h"
+#include "ingine/batch_spec_plan.h"
 
 #include <algorithm>
 #include <atomic>
@@ -552,6 +553,143 @@ void test_batched_spec_multi_token_stop_budget_cancel() {
   }
 }
 
+void test_confidence_width_and_page_budget_plan() {
+  using ingine::model::VerifySlotInput;
+  using ingine::model::VerifyWidthPlan;
+  using ingine::model::plan_batch_verify_widths;
+
+  // 1. Review control: 4 confident drafts MUST yield w_cap=5 (4 active drafts + 1 anchor), NEVER 8 (7 active drafts),
+  //    while the shared launch bucket W_batch pads to canonical 8!
+  for (int lead = 0; lead <= 7; ++lead) {
+    const VerifySlotInput s{lead, /*remaining=*/64, /*pos=*/100, /*max_ctx=*/4096, /*max_pos_res=*/256, /*cur_pages=*/4};
+    const VerifyWidthPlan plan = plan_batch_verify_widths(std::span(&s, 1), /*max_verify_width=*/8, /*page_size=*/64,
+                                                          /*spec_page_budget=*/16);
+    CHECK(plan.w_cap.size() == 1);
+    CHECK(plan.w_cap[0] == lead + 1);
+    const int active_drafts = plan.w_cap[0] - 1;
+    CHECK(active_drafts == lead);
+    const int exp_bucket = (lead + 1 <= 1) ? 1 : (lead + 1 <= 2) ? 2 : (lead + 1 <= 4) ? 4 : 8;
+    CHECK(plan.W_batch == exp_bucket);
+  }
+
+  // 2. Heterogeneous batch: slot 0 has 4 confident drafts (w_cap=5), slot 1 has 1 (w_cap=2), slot 2 has 0 (w_cap=1),
+  //    slot 3 has 6 confident drafts but remaining_emissions=3 (clamped to w_cap=3).
+  //    Shared launch bucket pads to W_batch=8 while each active slot keeps its exact bound.
+  {
+    const std::vector<VerifySlotInput> slots = {
+        {4, 64, 100, 4096, 256, 4},
+        {1, 64, 100, 4096, 256, 4},
+        {0, 64, 100, 4096, 256, 4},
+        {6, 3, 100, 4096, 256, 4},
+    };
+    const VerifyWidthPlan plan = plan_batch_verify_widths(slots, 8, 64, 16);
+    CHECK((plan.w_cap == std::vector<int>{5, 2, 1, 3}));
+    CHECK(plan.W_batch == 8);
+    CHECK(plan.total_extra_pages == 0);
+  }
+
+  // 3. Tight spec_page_budget: 2 slots at pos=62 (current_pages=1 -> fits up to +2 tokens without extra page),
+  //    each with lead=4 (wants w_cap=5 -> pos+5=67 -> +1 page each = 2 extra pages), budget=1 -> trims one slot to 2!
+  {
+    const std::vector<VerifySlotInput> slots = {
+        {4, 64, 62, 4096, 192, 1},
+        {4, 64, 62, 4096, 192, 1},
+    };
+    const VerifyWidthPlan plan = plan_batch_verify_widths(slots, 8, 64, /*spec_page_budget=*/1);
+    CHECK(plan.total_extra_pages <= 1);
+    CHECK((plan.w_cap[0] == 2 && plan.w_cap[1] == 5) || (plan.w_cap[0] == 5 && plan.w_cap[1] == 2));
+    CHECK(plan.W_batch == 8);
+  }
+}
+
+void test_staggered_milestone_and_accounting() {
+  using ingine::model::StaggeredBenchmarkState;
+
+  // Compare 32-token cap under 1 tok/round (plain) vs 4 tok/round (spec):
+  // Cohort 2 MUST join at the same output-token milestone (while cohort 1 is mid-generation and still active),
+  // NEVER after cohort 1 already finished at 32 tokens!
+  auto run_sim = [](int tok_per_round, bool first_eos_on_req0, int max_active_cap) {
+    const int C = 8;
+    const int tokens = 32;
+    StaggeredBenchmarkState stg;
+    stg.init(C, tokens, /*join_tokens_per_req=*/8);  // 4 cohort-1 reqs * 8 = 32 emitted tokens
+    struct Active {
+      int req = 0;
+      int gen = 0;
+    };
+    std::vector<Active> live;
+    int round = 0;
+    auto c1_active = [&]() {
+      int n = 0;
+      for (const auto& a : live)
+        if (a.req < stg.cohort1_size) ++n;
+      return n;
+    };
+    auto try_admit = [&]() {
+      while (!stg.pending.empty()) {
+        if (int(live.size()) >= max_active_cap) {
+          ++stg.deferred_attempts;
+          break;
+        }
+        const int r = stg.pending.front();
+        stg.pending.pop_front();
+        ++stg.admitted;
+        stg.note_emitted(r, 1);
+        if (first_eos_on_req0 && r == 0) {
+          ++stg.eos_first_token;
+          ++stg.eos_stopped;
+          ++stg.completed;
+        } else {
+          live.push_back({r, 1});
+        }
+      }
+    };
+    try_admit();
+    while (!live.empty() || !stg.pending.empty() || !stg.cohort2_offered) {
+      stg.maybe_offer_cohort2(round, c1_active());
+      try_admit();
+      if (live.empty()) continue;
+      ++round;
+      std::vector<Active> kept;
+      for (auto& a : live) {
+        for (int k = 0; k < tok_per_round && a.gen < tokens; ++k) {
+          ++a.gen;
+          stg.note_emitted(a.req, 1);
+        }
+        if (a.gen >= tokens) {
+          ++stg.max_token_stopped;
+          ++stg.completed;
+        } else {
+          kept.push_back(a);
+        }
+      }
+      live = std::move(kept);
+    }
+    return stg;
+  };
+
+  const auto plain = run_sim(1, false, 8);
+  const auto spec = run_sim(4, false, 8);
+  CHECK(plain.accounting_consistent());
+  CHECK(spec.accounting_consistent());
+  CHECK(plain.offered == 8 && plain.admitted == 8 && plain.completed == 8 && plain.dropped == 0);
+  CHECK(spec.offered == 8 && spec.admitted == 8 && spec.completed == 8 && spec.dropped == 0);
+  // Both join mid-generation while ALL 4 cohort-1 requests are still active (~8-9 tokens/req, well below 32)!
+  CHECK(plain.cohort1_active_at_join == 4);
+  CHECK(spec.cohort1_active_at_join == 4);
+  CHECK(plain.cohort1_emitted_at_join == 32);
+  CHECK(spec.cohort1_emitted_at_join >= 32 && spec.cohort1_emitted_at_join <= 36);
+  CHECK(plain.join_round == 7);
+  CHECK(spec.join_round == 2);
+
+  // First-token EOS on req 0 + tight capacity cap (4) forcing deferral of cohort 2 until slots free!
+  const auto constrained = run_sim(4, true, 4);
+  CHECK(constrained.accounting_consistent());
+  CHECK(constrained.offered == 8 && constrained.admitted == 8 && constrained.completed == 8 && constrained.dropped == 0);
+  CHECK(constrained.eos_first_token == 1);
+  CHECK(constrained.deferred_attempts > 0);
+}
+
 }  // namespace
 
 int main() {
@@ -562,6 +700,8 @@ int main() {
   test_admission_exception_isolated_from_active_work();
   test_admission_throw_during_shutdown_single_end();
   test_batched_spec_multi_token_stop_budget_cancel();
+  test_confidence_width_and_page_budget_plan();
+  test_staggered_milestone_and_accounting();
   std::printf(g_failures ? "FAILED (%d checks)\n" : "batch_scheduler ok\n", g_failures);
   return g_failures ? 1 : 0;
 }

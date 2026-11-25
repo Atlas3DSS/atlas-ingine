@@ -8,6 +8,7 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/ops.h"
+#include "ingine/batch_spec_plan.h"
 #include "kernels/batch/batch.h"
 #include "kernels/dense/dense.h"
 #include "kernels/draft/batch_draft.h"
@@ -16,6 +17,7 @@
 #include "kernels/prefill/prefill.h"
 #include "model/batch_drafter.h"
 #include "model/batch_prefix_cache.h"
+#include "model/batch_spec_trace.h"
 #include "model/kv_checkpoint.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
@@ -46,6 +48,14 @@ std::vector<int> g_test_prefill_splits;
 std::vector<int> snapshot_test_prefill_splits() {
   std::lock_guard<std::mutex> lock(g_test_splits_mu);
   return g_test_prefill_splits;
+}
+
+std::mutex g_spec_trace_mu;
+BatchSpecTraceConfig g_spec_trace_cfg;
+
+BatchSpecTraceConfig snapshot_spec_trace_cfg() {
+  std::lock_guard<std::mutex> lock(g_spec_trace_mu);
+  return g_spec_trace_cfg;
 }
 
 namespace bk = kernels::batch;
@@ -169,7 +179,8 @@ struct BatchStatePool {
   std::vector<int> slot_pos_host;
   std::vector<bool> slot_in_use;
 
-  void init(int max_b, int ctx, bool fp8, int max_kv_tokens, std::size_t extra_reserve_bytes = 0) {
+  void init(int max_b, int ctx, bool fp8, int max_kv_tokens, std::size_t extra_reserve_bytes = 0,
+            std::size_t vram_budget_bytes = 0) {
     max_batch = max_b;
     max_ctx = ctx;
     kv_fp8 = fp8;
@@ -211,6 +222,13 @@ struct BatchStatePool {
     } else {
       std::size_t free_bytes = 0, total_bytes = 0;
       CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+      if (vram_budget_bytes > 0) {
+        const std::size_t fixed_used = k_ring.bytes + v_ring.bytes + ring_pos.bytes + conv_k.bytes + conv_v.bytes +
+                                       conv_attn.bytes + conv_mlp.bytes + slot_pos.bytes + scratch_k_full.bytes +
+                                       scratch_v_full.bytes;
+        const std::size_t rem_budget = vram_budget_bytes > fixed_used ? (vram_budget_bytes - fixed_used) : 0;
+        free_bytes = std::min(free_bytes, rem_budget);
+      }
       const std::size_t base_reserve = std::min<std::size_t>(std::size_t(2560) << 20, free_bytes / 4);
       const std::size_t reserve = base_reserve + extra_reserve_bytes;
       const std::size_t avail = free_bytes > reserve ? free_bytes - reserve : 0;
@@ -1133,6 +1151,8 @@ class BatchGenerator final : public Generator {
     if (options.offload_vram_mb > 0)
       throw std::invalid_argument("continuous batching (--max-batch > 1) requires resident weights (not --offload-vram-mb/--atlas-6g)");
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+    std::size_t total_b = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_at_entry_, &total_b));
     weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
     ablation_ = load_ablation(options.ablation);
     init();
@@ -1150,6 +1170,8 @@ class BatchGenerator final : public Generator {
     if (options.offload_vram_mb > 0)
       throw std::invalid_argument("continuous batching (--max-batch > 1) requires resident weights (not --offload-vram-mb/--atlas-6g)");
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+    std::size_t total_b = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_at_entry_, &total_b));
     init();
   }
 
@@ -1528,14 +1550,13 @@ class BatchGenerator final : public Generator {
     const float* logits = nullptr;
     const ActT* taps = nullptr;
     int B_cap = B;
-    std::vector<int> old_pos;
+    std::vector<int> old_pos(static_cast<std::size_t>(B), 0);
+    for (int i = 0; i < B; ++i) old_pos[std::size_t(i)] = pool_.slot_pos_host[inputs[i].slot];
     if (drafter_) {
       // Keep drafter taps & position synchronized even when legacy 1-token step_slots() is called!
-      old_pos.resize(static_cast<std::size_t>(B));
       std::vector<std::int64_t> toks(static_cast<std::size_t>(B), 0);
       std::vector<std::int32_t> sids(static_cast<std::size_t>(B), -1), wlims(static_cast<std::size_t>(B), 1);
       for (int i = 0; i < B; ++i) {
-        old_pos[std::size_t(i)] = pool_.slot_pos_host[inputs[i].slot];
         toks[std::size_t(i)] = inputs[i].token;
         sids[std::size_t(i)] = inputs[i].slot;
       }
@@ -1587,6 +1608,11 @@ class BatchGenerator final : public Generator {
                                cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     const auto* host_out = static_cast<const std::int32_t*>(sampled_host_.data());
+
+    const BatchSpecTraceConfig trace_cfg = snapshot_spec_trace_cfg();
+    std::vector<BatchSpecSlotTrace> traces;
+    if (trace_cfg.on_step) traces.resize(static_cast<std::size_t>(B));
+
     for (int i = 0; i < B; ++i) {
       SlotMeta& meta = slot_meta_[inputs[i].slot];
       std::int32_t tok = host_out[i];
@@ -1595,7 +1621,35 @@ class BatchGenerator final : public Generator {
       if (meta.remaining_emissions > 0) --meta.remaining_emissions;
       out_tokens[i] = tok;
       if (drafter_) drafter_->note_tokens_slot(inputs[i].slot, std::span<const std::int32_t>(&tok, 1));
+      if (trace_cfg.on_step) {
+        auto& tr = traces[std::size_t(i)];
+        tr.slot = inputs[i].slot;
+        tr.pos = old_pos[std::size_t(i)];
+        tr.anchor = inputs[i].token;
+        tr.temperature = meta.params.temperature;
+        tr.top_k = meta.params.top_k;
+        tr.top_p = meta.params.top_p;
+        for (int bi = 0; bi < meta.params.banned.count; ++bi) tr.banned.push_back(meta.params.banned.ids[bi]);
+        tr.w_cap = 1;
+        tr.W_batch = 1;
+        tr.accepted = 0;
+        tr.next_token = tok;
+        tr.commit = 1;
+        if (trace_cfg.capture_target_logits && logits) {
+          tr.target_logits.resize(std::size_t(UNPADDED_VOCAB));
+          CUDA_CHECK(cudaMemcpy(tr.target_logits.data(), logits + std::size_t(i) * UNPADDED_VOCAB,
+                                std::size_t(UNPADDED_VOCAB) * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+        if (trace_cfg.capture_target_taps && taps) {
+          std::vector<ActT> raw(std::size_t(NUM_TAPS) * H);
+          CUDA_CHECK(cudaMemcpy(raw.data(), taps + std::size_t(i) * NUM_TAPS * H, raw.size() * sizeof(ActT),
+                                cudaMemcpyDeviceToHost));
+          tr.target_taps.resize(raw.size());
+          for (std::size_t k = 0; k < raw.size(); ++k) tr.target_taps[k] = act::host_to_float(raw[k]);
+        }
+      }
     }
+    if (trace_cfg.on_step) trace_cfg.on_step(traces);
   }
 
   void step_slots_multi(std::span<const BatchSlotStep> inputs, std::span<BatchSlotResult> out) override {
@@ -1608,6 +1662,7 @@ class BatchGenerator final : public Generator {
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    const BatchSpecTraceConfig trace_cfg = snapshot_spec_trace_cfg();
 
     // 1. Validate slots and guarantee mandatory 1-token progress page for EVERY active slot first.
     std::vector<bool> in_batch(std::size_t(options_.max_batch), false);
@@ -1629,9 +1684,26 @@ class BatchGenerator final : public Generator {
 
     // 2. Run batched drafter across all B active slots simultaneously.
     std::vector<BatchDrafter::DraftRequest> dreqs(static_cast<std::size_t>(B));
+    std::vector<BatchSpecSlotTrace> traces;
+    if (trace_cfg.on_step) traces.resize(static_cast<std::size_t>(B));
     for (int b = 0; b < B; ++b) {
       const int s = inputs[b].slot;
       dreqs[std::size_t(b)] = {s, inputs[b].token, slot_meta_[s].params.temperature};
+      if (trace_cfg.on_step) {
+        auto& tr = traces[std::size_t(b)];
+        tr.slot = s;
+        tr.pos = pool_.slot_pos_host[s];
+        tr.anchor = inputs[b].token;
+        tr.temperature = slot_meta_[s].params.temperature;
+        tr.top_k = slot_meta_[s].params.top_k;
+        tr.top_p = slot_meta_[s].params.top_p;
+        for (int bi = 0; bi < slot_meta_[s].params.banned.count; ++bi)
+          tr.banned.push_back(slot_meta_[s].params.banned.ids[bi]);
+        tr.has_draft = true;
+        tr.draft_seed = drafter_->slot_seed(s);
+        tr.draft_draws = drafter_->slot_draws(s);
+        tr.slot_extra_ids = drafter_->slot_extra_ids(s);
+      }
     }
     const BatchDrafter::BatchDraftOutput dout = drafter_->draft_batch(dreqs);
     std::vector<std::int32_t> h_drafts(std::size_t(B) * kd::GAMMA);
@@ -1642,11 +1714,35 @@ class BatchGenerator final : public Generator {
                                cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 
-    // 3. Choose per-slot verify width w_cap[b] respecting confidence, remaining emissions, max_ctx,
-    //    and each slot's reserved lifetime page ceiling (prevents stealing pages from siblings!).
-    std::vector<std::int32_t> w_cap(std::size_t(B), 1);
+    if (trace_cfg.on_step) {
+      std::vector<float> h_qstats(std::size_t(B) * kd::GAMMA * 2);
+      CUDA_CHECK(cudaMemcpy(h_qstats.data(), dout.qstats, h_qstats.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      for (int b = 0; b < B; ++b) {
+        auto& tr = traces[std::size_t(b)];
+        for (int g = 0; g < kd::GAMMA; ++g) {
+          tr.draft_tokens[g] = h_drafts[std::size_t(b) * kd::GAMMA + g];
+          tr.draft_conf[g] = h_conf[std::size_t(b) * kd::GAMMA + g];
+          tr.draft_qstats[g][0] = h_qstats[(std::size_t(b) * kd::GAMMA + g) * 2 + 0];
+          tr.draft_qstats[g][1] = h_qstats[(std::size_t(b) * kd::GAMMA + g) * 2 + 1];
+        }
+        if (trace_cfg.capture_candidates) {
+          const std::size_t ncand = std::size_t(kd::GAMMA) * kd::CANDIDATES;
+          tr.draft_cand_idx.resize(ncand);
+          tr.draft_cand_logits.resize(ncand);
+          CUDA_CHECK(cudaMemcpy(tr.draft_cand_idx.data(), dout.cand_idx + std::size_t(b) * ncand,
+                                ncand * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(tr.draft_cand_logits.data(), dout.cand_logits + std::size_t(b) * ncand,
+                                ncand * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+      }
+    }
+
+    // 3-5. Plan exact per-slot verify widths w_cap[b] <= lead + 1 (respecting confidence, remaining emissions,
+    //      max_ctx, reserved lifetime page ceiling, and aggregate spec_page_budget) and pad ONLY the shared launch
+    //      shape W_batch in {1, 2, 4, 8}.
     std::vector<std::int32_t> slot_ids(std::size_t(B), -1);
     std::vector<int> old_pos(std::size_t(B), 0);
+    std::vector<VerifySlotInput> slot_plan_inputs(static_cast<std::size_t>(B));
     for (int b = 0; b < B; ++b) {
       const int s = inputs[b].slot;
       slot_ids[std::size_t(b)] = s;
@@ -1654,30 +1750,24 @@ class BatchGenerator final : public Generator {
       old_pos[std::size_t(b)] = pos;
       const SlotMeta& meta = slot_meta_[s];
 
-      int w_lim = max_verify_width_;
-      if (meta.forced_idx >= meta.forced.size()) {
-        int lead = 0;
-        while (lead < kd::GAMMA && h_conf[std::size_t(b) * kd::GAMMA + lead] > options_.spec_threshold) ++lead;
-        // Pick smallest canonical verify width >= lead + 1 (clamped to max_verify_width_).
-        int w_conf = max_verify_width_;
-        for (int cw : {8, 4, 2, 1}) {
-          if (cw <= max_verify_width_ && cw >= lead + 1) w_conf = cw;
-        }
-        w_lim = std::min(w_lim, w_conf);
-      }
-      if (meta.remaining_emissions > 0) {
-        w_lim = std::min(w_lim, meta.remaining_emissions);
+      int lead = 0;
+      if (meta.forced_idx < meta.forced.size() && options_.spec_threshold <= 0.f) {
+        lead = kd::GAMMA;
       } else {
-        w_lim = 1;
+        while (lead < kd::GAMMA && h_conf[std::size_t(b) * kd::GAMMA + lead] > options_.spec_threshold) ++lead;
       }
-      w_lim = std::min(w_lim, std::max(1, options_.max_ctx - pos));
+      if (trace_cfg.on_step) traces[std::size_t(b)].lead = lead;
+
       const int max_pages_res = (meta.max_pos + bk::kPageSize - 1) / bk::kPageSize;
       const int max_pos_res = max_pages_res * bk::kPageSize;
-      w_lim = std::min(w_lim, std::max(1, max_pos_res - pos));
-      w_cap[std::size_t(b)] = std::clamp(w_lim, 1, max_verify_width_);
+      slot_plan_inputs[std::size_t(b)] = VerifySlotInput{lead,
+                                                         meta.remaining_emissions,
+                                                         pos,
+                                                         options_.max_ctx,
+                                                         max_pos_res,
+                                                         int(pool_.slot_pages[s].size())};
     }
 
-    // 4. Plan total speculative page demand across ALL live slots BEFORE allocating a single page!
     int other_reserved = 0;
     for (int s = 0; s < options_.max_batch; ++s) {
       if (!pool_.slot_in_use[s] || in_batch[std::size_t(s)]) continue;
@@ -1688,31 +1778,13 @@ class BatchGenerator final : public Generator {
     const int avail_pages = pool_.pages.free_count() + prefix_cache_.reclaimable_pages_excluding(pool_.pages, 0);
     const int spec_page_budget = std::max(0, avail_pages - other_reserved);
 
-    auto calc_total_extra = [&]() {
-      int sum = 0;
-      for (int b = 0; b < B; ++b) {
-        sum += pool_.additional_pages_needed(slot_ids[std::size_t(b)], old_pos[std::size_t(b)] + w_cap[std::size_t(b)]);
-      }
-      return sum;
-    };
-    int total_extra = calc_total_extra();
-    while (total_extra > spec_page_budget) {
-      int best_b = -1;
-      int best_w = 1;
-      for (int b = 0; b < B; ++b) {
-        const int need =
-            pool_.additional_pages_needed(slot_ids[std::size_t(b)], old_pos[std::size_t(b)] + w_cap[std::size_t(b)]);
-        if (need > 0 && w_cap[std::size_t(b)] > best_w) {
-          best_w = w_cap[std::size_t(b)];
-          best_b = b;
-        }
-      }
-      if (best_b < 0) break;
-      const int s = slot_ids[std::size_t(best_b)];
-      const int fit_in_cur_pages = int(pool_.slot_pages[s].size()) * bk::kPageSize - old_pos[std::size_t(best_b)];
-      w_cap[std::size_t(best_b)] = std::max(1, std::min(w_cap[std::size_t(best_b)] - 1, fit_in_cur_pages));
-      total_extra = calc_total_extra();
-    }
+    const VerifyWidthPlan width_plan =
+        plan_batch_verify_widths(slot_plan_inputs, max_verify_width_, bk::kPageSize, spec_page_budget);
+    std::vector<std::int32_t> w_cap(std::size_t(B), 1);
+    for (int b = 0; b < B; ++b) w_cap[std::size_t(b)] = width_plan.w_cap[std::size_t(b)];
+    const int W_batch = width_plan.W_batch;
+    const int total_extra = width_plan.total_extra_pages;
+
     if (total_extra > 0) {
       if (pool_.pages.free_count() < total_extra) {
         prefix_cache_.ensure_free_pages(pool_.pages, total_extra);
@@ -1722,14 +1794,6 @@ class BatchGenerator final : public Generator {
           throw std::runtime_error("step_slots_multi: planned page allocation failed");
         }
       }
-    }
-
-    // 5. Pick batch verify width W_batch in {1, 2, 4, 8} >= max(w_cap).
-    int max_w_active = 1;
-    for (int b = 0; b < B; ++b) max_w_active = std::max(max_w_active, int(w_cap[std::size_t(b)]));
-    int W_batch = max_verify_width_;
-    for (int cw : {8, 4, 2, 1}) {
-      if (cw <= max_verify_width_ && cw >= max_w_active) W_batch = cw;
     }
 
     // 6. Populate verify input tokens [B * W_batch] and execute batched target verification.
@@ -1829,16 +1893,35 @@ class BatchGenerator final : public Generator {
             const float* slot_clog = dout.cand_logits + std::size_t(b) * kd::GAMMA * kd::CANDIDATES;
             kd::scatter_slot_draft_logits(slot_cidx, slot_clog, UNPADDED_VOCAB, ascr.draft_logits, stream_);
             head::sampling_probs(slot_logits, wl, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params, ascr.probs, stream_);
+            const std::uint64_t rng_seed = meta.rng.seed;
+            const std::uint64_t rng_cnt_u = meta.rng.counter;
             head::uniform(wl - 1, meta.rng, ascr.uniforms, stream_);
             kd::sampled_accept(ascr.probs, ascr.draft_logits, UNPADDED_VOCAB, dout.tokens + std::size_t(b) * kd::GAMMA,
                                wl - 1, meta.params.temperature, dout.qstats + std::size_t(b) * kd::GAMMA * 2,
                                ascr.uniforms, ascr.ws, ascr.resid, ascr.one_res, stream_);
+            const std::uint64_t rng_cnt_resid = meta.rng.counter;
             head::sample_from_probs(ascr.resid, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.rng, &ascr.one_res->next,
                                     stream_);
             kd::clear_slot_draft_logits(slot_cidx, UNPADDED_VOCAB, ascr.draft_logits, stream_);
             kd::AcceptResult res_h{};
             CUDA_CHECK(cudaMemcpyAsync(&res_h, ascr.one_res, sizeof(res_h), cudaMemcpyDeviceToHost, stream_));
             CUDA_CHECK(cudaStreamSynchronize(stream_));
+            if (trace_cfg.on_step && trace_cfg.capture_sampled_details) {
+              auto& tr = traces[std::size_t(b)];
+              tr.has_sampled_details = true;
+              tr.accept_rng_seed = rng_seed;
+              tr.accept_rng_counter_u = rng_cnt_u;
+              tr.accept_rng_counter_resid = rng_cnt_resid;
+              tr.uniforms.resize(std::size_t(wl - 1));
+              tr.target_probs.resize(std::size_t(wl) * UNPADDED_VOCAB);
+              tr.residual_probs.resize(std::size_t(UNPADDED_VOCAB));
+              CUDA_CHECK(cudaMemcpy(tr.uniforms.data(), ascr.uniforms, std::size_t(wl - 1) * sizeof(float),
+                                    cudaMemcpyDeviceToHost));
+              CUDA_CHECK(cudaMemcpy(tr.target_probs.data(), ascr.probs,
+                                    std::size_t(wl) * UNPADDED_VOCAB * sizeof(float), cudaMemcpyDeviceToHost));
+              CUDA_CHECK(cudaMemcpy(tr.residual_probs.data(), ascr.resid, std::size_t(UNPADDED_VOCAB) * sizeof(float),
+                                    cudaMemcpyDeviceToHost));
+            }
             h_acc[std::size_t(b)] = res_h.accepted;
             h_next[std::size_t(b)] = res_h.next;
             h_commit[std::size_t(b)] = res_h.accepted + 1;
@@ -1857,6 +1940,27 @@ class BatchGenerator final : public Generator {
     }
     drafter_->commit_batch(cmetas, vout.taps, W_batch);
 
+    if (trace_cfg.on_step && (trace_cfg.capture_target_logits || trace_cfg.capture_target_taps)) {
+      CUDA_CHECK(cudaStreamSynchronize(stream_));
+      for (int b = 0; b < B; ++b) {
+        auto& tr = traces[std::size_t(b)];
+        const int wl = w_cap[std::size_t(b)];
+        const int cm = h_commit[std::size_t(b)];
+        if (trace_cfg.capture_target_logits && vout.logits) {
+          tr.target_logits.resize(std::size_t(wl) * UNPADDED_VOCAB);
+          CUDA_CHECK(cudaMemcpy(tr.target_logits.data(), vout.logits + std::size_t(b) * W_batch * UNPADDED_VOCAB,
+                                std::size_t(wl) * UNPADDED_VOCAB * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+        if (trace_cfg.capture_target_taps && vout.taps) {
+          std::vector<ActT> raw(std::size_t(cm) * NUM_TAPS * H);
+          CUDA_CHECK(cudaMemcpy(raw.data(), vout.taps + std::size_t(b) * W_batch * NUM_TAPS * H,
+                                raw.size() * sizeof(ActT), cudaMemcpyDeviceToHost));
+          tr.target_taps.resize(raw.size());
+          for (std::size_t k = 0; k < raw.size(); ++k) tr.target_taps[k] = act::host_to_float(raw[k]);
+        }
+      }
+    }
+
     // 9. Update host state, slot-local dynamic shortlists, and output results.
     for (int b = 0; b < B; ++b) {
       const int s = slot_ids[std::size_t(b)];
@@ -1874,8 +1978,18 @@ class BatchGenerator final : public Generator {
       res.spec_accepted = acc;
       out[b] = res;
 
+      if (trace_cfg.on_step) {
+        auto& tr = traces[std::size_t(b)];
+        tr.w_cap = w_cap[std::size_t(b)];
+        tr.W_batch = W_batch;
+        tr.accepted = acc;
+        tr.next_token = h_next[std::size_t(b)];
+        tr.commit = commit;
+      }
+
       drafter_->note_tokens_slot(s, std::span<const std::int32_t>(res.tokens, std::size_t(res.count)));
     }
+    if (trace_cfg.on_step) trace_cfg.on_step(traces);
   }
 
   void release_slot(int slot) override {
@@ -2123,12 +2237,21 @@ class BatchGenerator final : public Generator {
     }
     model_sha256_ = sha256_bytes(id_buf.data(), id_buf.size());
 
+    auto remaining_lease_bytes = [&]() -> std::size_t {
+      std::size_t free_b = 0, total_b = 0;
+      CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+      if (options_.vram_limit_mb <= 0) return free_b;
+      const std::size_t limit_b = std::size_t(options_.vram_limit_mb) << 20;
+      const std::size_t used_since_entry = free_at_entry_ > free_b ? (free_at_entry_ - free_b) : 0;
+      const std::size_t rem = limit_b > used_since_entry ? (limit_b - used_since_entry) : 0;
+      return std::min(free_b, rem);
+    };
+
     // Size and allocate BatchDrafter BEFORE BatchStatePool page reservation so VRAM headroom is exact.
     max_verify_width_ = 1;
     std::size_t decoder_reserve_bytes = 0;
     if (options_.spec) {
-      std::size_t free_b = 0, total_b = 0;
-      CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+      const std::size_t free_b = remaining_lease_bytes();
       max_verify_width_ = 8;
       // Only step down from W=8 if dense verify activations + rollback + drafter would crowd out VRAM.
       const std::size_t min_kv_headroom = std::size_t(2048) << 20;
@@ -2141,13 +2264,15 @@ class BatchGenerator final : public Generator {
         max_verify_width_ = cand_w;
       }
       drafter_ = std::make_unique<BatchDrafter>(options_.model_dir, weights_, options_.max_batch, options_.max_ctx,
-                                                max_verify_width_, stream_);
+                                                max_verify_width_, stream_, BatchDrafter::SHORTLIST_ROWS,
+                                                options_.vram_limit_mb > 0 ? remaining_lease_bytes() : 0);
       prefill_taps_ = DeviceBuffer(std::size_t(prefill_chunk_) * NUM_TAPS * H * sizeof(ActT));
       decoder_reserve_bytes =
           BatchDecoder::estimate_bytes(options_.max_batch, max_verify_width_, options_.dense_fp8, true);
     }
 
-    pool_.init(options_.max_batch, options_.max_ctx, options_.kv_fp8, options_.max_kv_tokens, decoder_reserve_bytes);
+    pool_.init(options_.max_batch, options_.max_ctx, options_.kv_fp8, options_.max_kv_tokens, decoder_reserve_bytes,
+               options_.vram_limit_mb > 0 ? remaining_lease_bytes() : 0);
     slot_meta_.resize(options_.max_batch);
 
     decoder_ = std::make_unique<BatchDecoder>(weights_, ablation_, pool_, options_.max_batch, max_verify_width_,
@@ -2161,10 +2286,11 @@ class BatchGenerator final : public Generator {
     if (!options_.prefix_cache || options_.park_mb == 0) {
       prefix_cache_.set_vram_budget(0);
     } else if (options_.park_mb > 0) {
-      prefix_cache_.set_vram_budget(std::size_t(options_.park_mb) << 20);
+      std::size_t cap = std::size_t(options_.park_mb) << 20;
+      if (options_.vram_limit_mb > 0) cap = std::min(cap, remaining_lease_bytes() / 2);
+      prefix_cache_.set_vram_budget(cap);
     } else {
-      std::size_t free_b = 0, total_b = 0;
-      CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+      const std::size_t free_b = remaining_lease_bytes();
       const std::size_t reserve = std::min<std::size_t>(std::size_t(1024) << 20, free_b / 4);
       const std::size_t avail = free_b > reserve ? free_b - reserve : 0;
       const std::size_t auto_cap = std::min<std::size_t>(std::size_t(2048) << 20, avail / 2);
@@ -2228,6 +2354,7 @@ class BatchGenerator final : public Generator {
   std::array<std::uint8_t, 32> model_sha256_{};
   int prefill_chunk_ = 3072;
   int max_verify_width_ = 1;
+  std::size_t free_at_entry_ = 0;
   std::unique_ptr<VisionEncoder> vision_;
   std::unique_ptr<Prefiller> prefiller_;
   std::unique_ptr<BatchDrafter> drafter_;
@@ -2259,6 +2386,16 @@ bool copy_batch_prefill_logits_for_test(const Generator& gen, std::vector<float>
 bool copy_batch_step_logits_for_test(const Generator& gen, int lane_idx, std::vector<float>& out) {
   const auto* bg = dynamic_cast<const BatchGenerator*>(&gen);
   return bg ? bg->copy_last_step_logits(lane_idx, out) : false;
+}
+
+void set_batch_spec_trace_hook_for_test(BatchSpecTraceConfig cfg) {
+  std::lock_guard<std::mutex> lock(g_spec_trace_mu);
+  g_spec_trace_cfg = std::move(cfg);
+}
+
+void clear_batch_spec_trace_hook_for_test() {
+  std::lock_guard<std::mutex> lock(g_spec_trace_mu);
+  g_spec_trace_cfg = BatchSpecTraceConfig{};
 }
 
 std::unique_ptr<Generator> make_batch_generator(const RuntimeOptions& options) {
