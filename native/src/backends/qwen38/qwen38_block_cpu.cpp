@@ -17,6 +17,7 @@
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ingine::backends::qwen38 {
 namespace {
@@ -93,8 +94,18 @@ std::vector<float> decode_bf16_vec(std::span<const std::uint16_t> src) {
 
 float silu_f32(float x) noexcept { return x / (1.0f + std::exp(-x)); }
 
+template <typename WarpFn>
+float warp_reduce_32(WarpFn&& fn) {
+  float lane_acc[32]{};
+  for (int lane = 0; lane < 32; ++lane) lane_acc[lane] = fn(lane);
+  for (int off = 16; off > 0; off >>= 1) {
+    for (int lane = 0; lane < off; ++lane) lane_acc[lane] += lane_acc[lane + off];
+  }
+  return lane_acc[0];
+}
+
 void run_proj_host(const Qwen38ProjWeightsHost& w, std::span<const float> x_row, std::span<float> out_row,
-                   bool bf16_boundaries, bool use_calibrated_fp8, int num_threads) {
+                   bool bf16_boundaries, bool use_calibrated_fp8, int num_threads, bool fp32_accum_sim) {
   if (static_cast<int>(x_row.size()) != w.in_features || static_cast<int>(out_row.size()) != w.out_features) {
     throw std::invalid_argument("run_proj_host dimension mismatch");
   }
@@ -105,8 +116,8 @@ void run_proj_host(const Qwen38ProjWeightsHost& w, std::span<const float> x_row,
   if (w.quant == Qwen38LinearQuantKind::Fp8E4M3 && use_calibrated_fp8 && w.input_scale > 0.0f) {
     const float inv = 1.0f / w.input_scale;
     for (int k = 0; k < K; ++k) {
-      x_eff[static_cast<std::size_t>(k)] = decode_e4m3fn(quantize_e4m3fn_fast(x_eff[static_cast<std::size_t>(k)] * inv)) *
-                                           w.input_scale;
+      x_eff[static_cast<std::size_t>(k)] =
+          decode_e4m3fn(quantize_e4m3fn_fast(x_eff[static_cast<std::size_t>(k)] * inv)) * w.input_scale;
     }
   }
 
@@ -115,11 +126,22 @@ void run_proj_host(const Qwen38ProjWeightsHost& w, std::span<const float> x_row,
     parallel_rows(N, work, num_threads, [&](int r0, int r1) {
       for (int r = r0; r < r1; ++r) {
         const std::uint16_t* row = w.bf16_w.data() + static_cast<std::size_t>(r) * static_cast<std::size_t>(K);
-        double acc = 0.0;
-        for (int k = 0; k < K; ++k) {
-          acc += static_cast<double>(x_eff[static_cast<std::size_t>(k)]) * static_cast<double>(bf16_to_f32(row[k]));
+        float val = 0.0f;
+        if (fp32_accum_sim) {
+          val = warp_reduce_32([&](int lane) {
+            float acc = 0.0f;
+            for (int k = lane; k < K; k += 32) {
+              acc += x_eff[static_cast<std::size_t>(k)] * bf16_to_f32(row[k]);
+            }
+            return acc;
+          });
+        } else {
+          double acc = 0.0;
+          for (int k = 0; k < K; ++k) {
+            acc += static_cast<double>(x_eff[static_cast<std::size_t>(k)]) * static_cast<double>(bf16_to_f32(row[k]));
+          }
+          val = static_cast<float>(acc);
         }
-        float val = static_cast<float>(acc);
         out_row[static_cast<std::size_t>(r)] = bf16_boundaries ? bf16_to_f32(f32_to_bf16(val)) : val;
       }
     });
@@ -127,12 +149,23 @@ void run_proj_host(const Qwen38ProjWeightsHost& w, std::span<const float> x_row,
     parallel_rows(N, work, num_threads, [&](int r0, int r1) {
       for (int r = r0; r < r1; ++r) {
         const std::uint8_t* row = w.fp8_w.data() + static_cast<std::size_t>(r) * static_cast<std::size_t>(K);
-        double acc = 0.0;
-        for (int k = 0; k < K; ++k) {
-          acc += static_cast<double>(x_eff[static_cast<std::size_t>(k)]) *
-                 static_cast<double>(decode_e4m3fn(row[k]));
+        float val = 0.0f;
+        if (fp32_accum_sim) {
+          const float acc_f = warp_reduce_32([&](int lane) {
+            float acc = 0.0f;
+            for (int k = lane; k < K; k += 32) {
+              acc += x_eff[static_cast<std::size_t>(k)] * decode_e4m3fn(row[k]);
+            }
+            return acc;
+          });
+          val = acc_f * w.weight_scale;
+        } else {
+          double acc = 0.0;
+          for (int k = 0; k < K; ++k) {
+            acc += static_cast<double>(x_eff[static_cast<std::size_t>(k)]) * static_cast<double>(decode_e4m3fn(row[k]));
+          }
+          val = static_cast<float>(acc * static_cast<double>(w.weight_scale));
         }
-        float val = static_cast<float>(acc * static_cast<double>(w.weight_scale));
         out_row[static_cast<std::size_t>(r)] = bf16_boundaries ? bf16_to_f32(f32_to_bf16(val)) : val;
       }
     });
@@ -145,21 +178,40 @@ void run_proj_host(const Qwen38ProjWeightsHost& w, std::span<const float> x_row,
         const std::uint8_t* prow = w.nvfp4_packed.data() + static_cast<std::size_t>(r) * static_cast<std::size_t>(half_k);
         const std::uint8_t* srow =
             w.nvfp4_scales.data() + static_cast<std::size_t>(r) * static_cast<std::size_t>(blocks_per_row);
-        double acc = 0.0;
-        for (int b = 0; b < blocks_per_row; ++b) {
-          const float scale = decode_e4m3fn(srow[b]) * w.weight_scale_2;
-          double bsum = 0.0;
-          const int kbase = b * 16;
-          for (int i = 0; i < 8; ++i) {
-            const std::uint8_t byte = prow[b * 8 + i];
-            bsum += static_cast<double>(x_eff[static_cast<std::size_t>(kbase + 2 * i)]) *
-                    static_cast<double>(decode_e2m1(byte & 0x0fu));
-            bsum += static_cast<double>(x_eff[static_cast<std::size_t>(kbase + 2 * i + 1)]) *
-                    static_cast<double>(decode_e2m1((byte >> 4) & 0x0fu));
+        float val = 0.0f;
+        if (fp32_accum_sim) {
+          val = warp_reduce_32([&](int lane) {
+            float acc = 0.0f;
+            for (int b = lane; b < blocks_per_row; b += 32) {
+              const float scale = decode_e4m3fn(srow[b]) * w.weight_scale_2;
+              float bsum = 0.0f;
+              const int kbase = b * 16;
+              for (int i = 0; i < 8; ++i) {
+                const std::uint8_t byte = prow[b * 8 + i];
+                bsum += x_eff[static_cast<std::size_t>(kbase + 2 * i)] * decode_e2m1(byte & 0x0fu);
+                bsum += x_eff[static_cast<std::size_t>(kbase + 2 * i + 1)] * decode_e2m1((byte >> 4) & 0x0fu);
+              }
+              acc += bsum * scale;
+            }
+            return acc;
+          });
+        } else {
+          double acc = 0.0;
+          for (int b = 0; b < blocks_per_row; ++b) {
+            const float scale = decode_e4m3fn(srow[b]) * w.weight_scale_2;
+            double bsum = 0.0;
+            const int kbase = b * 16;
+            for (int i = 0; i < 8; ++i) {
+              const std::uint8_t byte = prow[b * 8 + i];
+              bsum += static_cast<double>(x_eff[static_cast<std::size_t>(kbase + 2 * i)]) *
+                      static_cast<double>(decode_e2m1(byte & 0x0fu));
+              bsum += static_cast<double>(x_eff[static_cast<std::size_t>(kbase + 2 * i + 1)]) *
+                      static_cast<double>(decode_e2m1((byte >> 4) & 0x0fu));
+            }
+            acc += bsum * static_cast<double>(scale);
           }
-          acc += bsum * static_cast<double>(scale);
+          val = static_cast<float>(acc);
         }
-        float val = static_cast<float>(acc);
         out_row[static_cast<std::size_t>(r)] = bf16_boundaries ? bf16_to_f32(f32_to_bf16(val)) : val;
       }
     });
@@ -740,7 +792,7 @@ Qwen38BlockBundleHost load_qwen38_block_bundle(const std::filesystem::path& mode
 
 Qwen38BlockRunOutput run_qwen38_blocks_cpu(const Qwen38BlockBundleHost& bundle, bool bf16_boundaries,
                                            bool use_chunk_prefill, int chunk_size, bool use_calibrated_fp8_input_scale,
-                                           int num_threads) {
+                                           int num_threads, bool fp32_accum_sim) {
   const auto t0 = std::chrono::steady_clock::now();
   const Qwen38Config& c = bundle.cfg;
   c.validate();
@@ -787,13 +839,13 @@ Qwen38BlockRunOutput run_qwen38_blocks_cpu(const Qwen38BlockBundleHost& bundle, 
       for (int t = 0; t < S; ++t) {
         const auto x_t = std::span<const float>(normed.data() + static_cast<std::size_t>(t * H), H);
         run_proj_host(lw.in_proj_qkv, x_t, std::span<float>(qkv_seq.data() + static_cast<std::size_t>(t * cd), cd),
-                      bf16_boundaries, use_calibrated_fp8_input_scale, num_threads);
+                      bf16_boundaries, use_calibrated_fp8_input_scale, num_threads, fp32_accum_sim);
         run_proj_host(lw.in_proj_z, x_t, std::span<float>(z_seq.data() + static_cast<std::size_t>(t * vd), vd),
-                      bf16_boundaries, use_calibrated_fp8_input_scale, num_threads);
+                      bf16_boundaries, use_calibrated_fp8_input_scale, num_threads, fp32_accum_sim);
         run_proj_host(lw.in_proj_a, x_t, std::span<float>(a_seq.data() + static_cast<std::size_t>(t * nhv), nhv),
-                      bf16_boundaries, false, num_threads);
+                      bf16_boundaries, false, num_threads, fp32_accum_sim);
         run_proj_host(lw.in_proj_b, x_t, std::span<float>(b_seq.data() + static_cast<std::size_t>(t * nhv), nhv),
-                      bf16_boundaries, false, num_threads);
+                      bf16_boundaries, false, num_threads, fp32_accum_sim);
       }
 
       out.conv_states[li].assign(static_cast<std::size_t>(cd * c.linear_conv_kernel_dim), 0.0f);
@@ -847,7 +899,7 @@ Qwen38BlockRunOutput run_qwen38_blocks_cpu(const Qwen38BlockBundleHost& bundle, 
       for (int t = 0; t < S; ++t) {
         run_proj_host(lw.out_proj, std::span<const float>(core_out.data() + static_cast<std::size_t>(t * vd), vd),
                       std::span<float>(residual.data() + static_cast<std::size_t>(t * H), H), bf16_boundaries,
-                      use_calibrated_fp8_input_scale, num_threads);
+                      use_calibrated_fp8_input_scale, num_threads, fp32_accum_sim);
       }
     } else {
       const int qg_dim = c.full_q_proj_out_dim();
@@ -862,28 +914,80 @@ Qwen38BlockRunOutput run_qwen38_blocks_cpu(const Qwen38BlockBundleHost& bundle, 
       std::vector<float> k_raw(static_cast<std::size_t>(kv_dim));
       std::vector<float> v_raw(static_cast<std::size_t>(kv_dim));
       std::vector<float> attn_out(static_cast<std::size_t>(attn_dim));
+      std::vector<float> q_step(static_cast<std::size_t>(attn_dim));
+      std::vector<float> gate_step(static_cast<std::size_t>(attn_dim));
 
       for (int t = 0; t < S; ++t) {
         const auto x_t = std::span<const float>(normed.data() + static_cast<std::size_t>(t * H), H);
-        run_proj_host(lw.q_proj, x_t, q_gate, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads);
-        run_proj_host(lw.k_proj, x_t, k_raw, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads);
-        run_proj_host(lw.v_proj, x_t, v_raw, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads);
-        full_attn_gated_step(q_gate, k_raw, v_raw, qnw, knw, c.rms_norm_eps, c.rope_theta, c.num_attention_heads,
-                             c.num_key_value_heads, c.head_dim, c.rotary_dim, t, out.k_caches[li], out.v_caches[li],
-                             attn_out);
+        run_proj_host(lw.q_proj, x_t, q_gate, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads,
+                      fp32_accum_sim);
+        run_proj_host(lw.k_proj, x_t, k_raw, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads,
+                      fp32_accum_sim);
+        run_proj_host(lw.v_proj, x_t, v_raw, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads,
+                      fp32_accum_sim);
         if (bf16_boundaries) {
-          // Match GPU BF16 KV cache storage granularity cleanly.
-          const std::size_t kv_off = static_cast<std::size_t>(t * kv_dim);
-          for (int d = 0; d < kv_dim; ++d) {
-            out.k_caches[li][kv_off + static_cast<std::size_t>(d)] =
-                bf16_to_f32(f32_to_bf16(out.k_caches[li][kv_off + static_cast<std::size_t>(d)]));
-            out.v_caches[li][kv_off + static_cast<std::size_t>(d)] =
-                bf16_to_f32(f32_to_bf16(out.v_caches[li][kv_off + static_cast<std::size_t>(d)]));
+          for (int h = 0; h < c.num_attention_heads; ++h) {
+            const float* src = q_gate.data() + static_cast<std::size_t>(h * 2 * c.head_dim);
+            std::copy_n(src, c.head_dim, q_step.data() + static_cast<std::size_t>(h * c.head_dim));
+            std::copy_n(src + c.head_dim, c.head_dim, gate_step.data() + static_cast<std::size_t>(h * c.head_dim));
+            auto qh = std::span<float>(q_step.data() + static_cast<std::size_t>(h * c.head_dim), c.head_dim);
+            rmsnorm_zero_centered(qh, qnw, c.rms_norm_eps, qh);
+          }
+          bf16_round_vec(q_step);
+          apply_partial_rope_neox(q_step, c.num_attention_heads, c.head_dim, c.rotary_dim, t, c.rope_theta);
+          bf16_round_vec(q_step);
+
+          std::vector<float> k_step = k_raw;
+          for (int kvh = 0; kvh < c.num_key_value_heads; ++kvh) {
+            auto kh = std::span<float>(k_step.data() + static_cast<std::size_t>(kvh * c.head_dim), c.head_dim);
+            rmsnorm_zero_centered(kh, knw, c.rms_norm_eps, kh);
+          }
+          bf16_round_vec(k_step);
+          apply_partial_rope_neox(k_step, c.num_key_value_heads, c.head_dim, c.rotary_dim, t, c.rope_theta);
+          bf16_round_vec(k_step);
+
+          out.k_caches[li].insert(out.k_caches[li].end(), k_step.begin(), k_step.end());
+          out.v_caches[li].insert(out.v_caches[li].end(), v_raw.begin(), v_raw.end());
+
+          const float scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
+          const int group = c.num_attention_heads / c.num_key_value_heads;
+          const int cache_len = t + 1;
+          std::vector<float> scores(static_cast<std::size_t>(cache_len), 0.0f);
+          for (int h = 0; h < c.num_attention_heads; ++h) {
+            const int kvh = h / group;
+            const float* qh = q_step.data() + static_cast<std::size_t>(h * c.head_dim);
+            float max_s = -std::numeric_limits<float>::infinity();
+            for (int ti = 0; ti < cache_len; ++ti) {
+              const float* kt = out.k_caches[li].data() + static_cast<std::size_t>(ti * kv_dim + kvh * c.head_dim);
+              double dot = 0.0;
+              for (int d = 0; d < c.head_dim; ++d) dot += static_cast<double>(qh[d]) * static_cast<double>(kt[d]);
+              scores[static_cast<std::size_t>(ti)] = static_cast<float>(dot) * scale;
+              max_s = std::max(max_s, scores[static_cast<std::size_t>(ti)]);
+            }
+            double denom = 0.0;
+            for (int ti = 0; ti < cache_len; ++ti) {
+              scores[static_cast<std::size_t>(ti)] = std::exp(scores[static_cast<std::size_t>(ti)] - max_s);
+              denom += static_cast<double>(scores[static_cast<std::size_t>(ti)]);
+            }
+            const float inv_denom = static_cast<float>(1.0 / denom);
+            float* oh = attn_out.data() + static_cast<std::size_t>(h * c.head_dim);
+            const float* gh = gate_step.data() + static_cast<std::size_t>(h * c.head_dim);
+            std::fill_n(oh, c.head_dim, 0.0f);
+            for (int ti = 0; ti < cache_len; ++ti) {
+              const float w = scores[static_cast<std::size_t>(ti)] * inv_denom;
+              const float* vt = out.v_caches[li].data() + static_cast<std::size_t>(ti * kv_dim + kvh * c.head_dim);
+              for (int d = 0; d < c.head_dim; ++d) oh[d] += w * vt[d];
+            }
+            for (int d = 0; d < c.head_dim; ++d) oh[d] *= (1.0f / (1.0f + std::exp(-gh[d])));
           }
           bf16_round_vec(attn_out);
+        } else {
+          full_attn_gated_step(q_gate, k_raw, v_raw, qnw, knw, c.rms_norm_eps, c.rope_theta, c.num_attention_heads,
+                               c.num_key_value_heads, c.head_dim, c.rotary_dim, t, out.k_caches[li], out.v_caches[li],
+                               attn_out);
         }
         run_proj_host(lw.o_proj, attn_out, std::span<float>(residual.data() + static_cast<std::size_t>(t * H), H),
-                      bf16_boundaries, use_calibrated_fp8_input_scale, num_threads);
+                      bf16_boundaries, use_calibrated_fp8_input_scale, num_threads, fp32_accum_sim);
       }
     }
 
@@ -903,14 +1007,16 @@ Qwen38BlockRunOutput run_qwen38_blocks_cpu(const Qwen38BlockBundleHost& bundle, 
     std::vector<float> up_buf(static_cast<std::size_t>(I));
     for (int t = 0; t < S; ++t) {
       const auto x_t = std::span<const float>(normed.data() + static_cast<std::size_t>(t * H), H);
-      run_proj_host(lw.gate_proj, x_t, gate_buf, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads);
-      run_proj_host(lw.up_proj, x_t, up_buf, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads);
+      run_proj_host(lw.gate_proj, x_t, gate_buf, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads,
+                    fp32_accum_sim);
+      run_proj_host(lw.up_proj, x_t, up_buf, bf16_boundaries, use_calibrated_fp8_input_scale, num_threads,
+                    fp32_accum_sim);
       for (int i = 0; i < I; ++i) {
         const float sw = silu_f32(gate_buf[static_cast<std::size_t>(i)]) * up_buf[static_cast<std::size_t>(i)];
         gate_buf[static_cast<std::size_t>(i)] = bf16_boundaries ? bf16_to_f32(f32_to_bf16(sw)) : sw;
       }
       run_proj_host(lw.down_proj, gate_buf, std::span<float>(residual.data() + static_cast<std::size_t>(t * H), H),
-                    bf16_boundaries, use_calibrated_fp8_input_scale, num_threads);
+                    bf16_boundaries, use_calibrated_fp8_input_scale, num_threads, fp32_accum_sim);
     }
 
     for (std::size_t i = 0; i < out.hidden_seq.size(); ++i) {
@@ -922,6 +1028,394 @@ Qwen38BlockRunOutput run_qwen38_blocks_cpu(const Qwen38BlockBundleHost& bundle, 
   const auto t1 = std::chrono::steady_clock::now();
   out.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
   return out;
+}
+
+Qwen38BlockBundleHost slice_qwen38_block_layer(const Qwen38BlockBundleHost& bundle, std::size_t layer_pos) {
+  if (layer_pos >= bundle.layers.size()) {
+    throw std::out_of_range("slice_qwen38_block_layer layer_pos out of range");
+  }
+  Qwen38BlockBundleHost out;
+  out.cfg = bundle.cfg;
+  out.token_ids = bundle.token_ids;
+  out.prompt_embeddings_bf16 = bundle.prompt_embeddings_bf16;
+  out.layers.push_back(bundle.layers[layer_pos]);
+  return out;
+}
+
+std::uint32_t bf16_ulp_distance(std::uint16_t a, std::uint16_t b) noexcept {
+  auto is_nonfinite = [](std::uint16_t u) noexcept -> bool { return (u & 0x7f80u) == 0x7f80u; };
+  if (is_nonfinite(a) || is_nonfinite(b)) {
+    return std::numeric_limits<std::uint32_t>::max();
+  }
+  auto ord = [](std::uint16_t u) noexcept -> std::int32_t {
+    const std::int32_t mag = static_cast<std::int32_t>(u & 0x7fffu);
+    return (u & 0x8000u) ? -mag : mag;
+  };
+  const std::int32_t diff = ord(a) - ord(b);
+  return static_cast<std::uint32_t>(diff < 0 ? -diff : diff);
+}
+
+Qwen38Bf16CompareStats compare_bf16_against_rounded_oracle(std::span<const std::uint16_t> got_bf16_bits,
+                                                           std::span<const float> ref_f32, std::uint32_t max_ulp,
+                                                           float abs_floor) {
+  if (got_bf16_bits.size() != ref_f32.size()) {
+    throw std::invalid_argument("compare_bf16_against_rounded_oracle size mismatch");
+  }
+  Qwen38Bf16CompareStats stats;
+  for (std::size_t i = 0; i < ref_f32.size(); ++i) {
+    const std::uint16_t ref_bits = f32_to_bf16(ref_f32[i]);
+    const float ref_b = bf16_to_f32(ref_bits);
+    const float got_b = bf16_to_f32(got_bf16_bits[i]);
+    if (!std::isfinite(ref_f32[i]) || !std::isfinite(ref_b) || !std::isfinite(got_b)) {
+      ++stats.criterion_violations;
+      ++stats.non_exact_bf16_count;
+      stats.max_bf16_ulp = std::numeric_limits<std::uint32_t>::max();
+      continue;
+    }
+    const float abs_d = std::fabs(got_b - ref_b);
+    const std::uint32_t ulp = bf16_ulp_distance(got_bf16_bits[i], ref_bits);
+    stats.max_abs_vs_bf16_oracle = std::max(stats.max_abs_vs_bf16_oracle, abs_d);
+    if (ulp == 0) {
+      ++stats.exact_bf16_matches;
+    } else {
+      ++stats.non_exact_bf16_count;
+    }
+    if (abs_d > abs_floor || ulp <= max_ulp) {
+      stats.max_bf16_ulp = std::max(stats.max_bf16_ulp, ulp);
+    }
+    if (ulp > max_ulp && abs_d > abs_floor) {
+      ++stats.criterion_violations;
+    }
+  }
+  stats.passed = (stats.criterion_violations == 0);
+  return stats;
+}
+
+Qwen38Gate1LinearFixtures make_gate1_linear_fixtures(std::uint32_t seed) {
+  Qwen38Gate1LinearFixtures fx;
+  const int M = fx.m;
+  const int N = fx.n;
+  const int K = fx.k;
+  std::mt19937 rng(seed);
+  auto rand_vec = [&](std::size_t n, float stddev) {
+    std::normal_distribution<float> d(0.0f, stddev);
+    std::vector<float> v(n);
+    for (float& x : v) x = d(rng);
+    return v;
+  };
+  auto to_bf16_vec = [](std::span<const float> src) {
+    std::vector<std::uint16_t> out(src.size());
+    for (std::size_t i = 0; i < src.size(); ++i) out[i] = f32_to_bf16(src[i]);
+    return out;
+  };
+
+  // 1. NVFP4 fixture (M=4, N=256, K=5120) — exact RNG sequence preserved.
+  {
+    const auto x_f = rand_vec(static_cast<std::size_t>(M * K), 0.25f);
+    fx.nvfp4_x_bf16 = to_bf16_vec(x_f);
+    fx.nvfp4_x_q = decode_bf16_vec(fx.nvfp4_x_bf16);
+    fx.nvfp4_packed.resize(static_cast<std::size_t>(N * (K / 2)));
+    fx.nvfp4_scales.resize(static_cast<std::size_t>(N * (K / 16)));
+    for (auto& p : fx.nvfp4_packed) p = static_cast<std::uint8_t>(rng() & 0xffu);
+    for (auto& s : fx.nvfp4_scales) s = static_cast<std::uint8_t>(0x38u + (rng() % 20));
+    fx.nvfp4_ref_f32.assign(static_cast<std::size_t>(M * N), 0.0f);
+    for (int m = 0; m < M; ++m) {
+      nvfp4_weight_only_linear(std::span<const float>(fx.nvfp4_x_q.data() + static_cast<std::size_t>(m * K), K),
+                               fx.nvfp4_packed, fx.nvfp4_scales, fx.nvfp4_ws2, N, K,
+                               std::span<float>(fx.nvfp4_ref_f32.data() + static_cast<std::size_t>(m * N), N));
+    }
+    fx.nvfp4_ref_bf16 = to_bf16_vec(fx.nvfp4_ref_f32);
+  }
+
+  // 2. FP8 fixture (M=4, N=256, K=5120) — weight-only and calibrated references.
+  {
+    const auto x_f = rand_vec(static_cast<std::size_t>(M * K), 0.3f);
+    fx.fp8_x_bf16 = to_bf16_vec(x_f);
+    fx.fp8_x_q = decode_bf16_vec(fx.fp8_x_bf16);
+    fx.fp8_w.resize(static_cast<std::size_t>(N * K));
+    for (auto& b : fx.fp8_w) b = quantize_e4m3fn_fast(static_cast<float>(static_cast<int>(rng() % 200) - 100) * 0.01f);
+    fx.fp8_wo_ref_f32.assign(static_cast<std::size_t>(M * N), 0.0f);
+    fx.fp8_cal_ref_f32.assign(static_cast<std::size_t>(M * N), 0.0f);
+    for (int m = 0; m < M; ++m) {
+      const auto xm = std::span<const float>(fx.fp8_x_q.data() + static_cast<std::size_t>(m * K), K);
+      fp8_weight_only_linear(xm, fx.fp8_w, fx.fp8_ws, N, K,
+                             std::span<float>(fx.fp8_wo_ref_f32.data() + static_cast<std::size_t>(m * N), N));
+      fp8_calibrated_linear(xm, fx.fp8_in_sc, fx.fp8_w, fx.fp8_ws, N, K,
+                            std::span<float>(fx.fp8_cal_ref_f32.data() + static_cast<std::size_t>(m * N), N));
+    }
+    fx.fp8_wo_ref_bf16 = to_bf16_vec(fx.fp8_wo_ref_f32);
+    fx.fp8_cal_ref_bf16 = to_bf16_vec(fx.fp8_cal_ref_f32);
+  }
+  return fx;
+}
+
+void simulate_warp_f32_nvfp4_linear(std::span<const float> x_in, std::span<const std::uint8_t> packed_u8,
+                                    std::span<const std::uint8_t> block_scales_e4m3, float weight_scale_2, int m,
+                                    int out_features, int in_features, std::span<float> out) {
+  if (m <= 0 || out_features <= 0 || in_features <= 0 || in_features % 16 != 0 ||
+      x_in.size() != static_cast<std::size_t>(m * in_features) ||
+      packed_u8.size() != static_cast<std::size_t>(out_features * (in_features / 2)) ||
+      block_scales_e4m3.size() != static_cast<std::size_t>(out_features * (in_features / 16)) ||
+      out.size() != static_cast<std::size_t>(m * out_features)) {
+    throw std::invalid_argument("simulate_warp_f32_nvfp4_linear shape mismatch");
+  }
+  const int blocks = in_features / 16;
+  const int half_k = in_features / 2;
+  for (int row = 0; row < m; ++row) {
+    const float* x_row = x_in.data() + static_cast<std::size_t>(row * in_features);
+    parallel_rows(out_features, static_cast<std::size_t>(out_features * in_features), 0, [&](int r0, int r1) {
+      for (int n = r0; n < r1; ++n) {
+        const std::uint8_t* prow = packed_u8.data() + static_cast<std::size_t>(n * half_k);
+        const std::uint8_t* srow = block_scales_e4m3.data() + static_cast<std::size_t>(n * blocks);
+        out[static_cast<std::size_t>(row * out_features + n)] = warp_reduce_32([&](int lane) {
+          float acc = 0.0f;
+          for (int b = lane; b < blocks; b += 32) {
+            const float sc = decode_e4m3fn(srow[b]) * weight_scale_2;
+            float bsum = 0.0f;
+            const int k0 = b * 16;
+            const int p0 = b * 8;
+            for (int i = 0; i < 8; ++i) {
+              const std::uint8_t pb = prow[p0 + i];
+              bsum += x_row[k0 + 2 * i] * decode_e2m1(pb & 0x0fu);
+              bsum += x_row[k0 + 2 * i + 1] * decode_e2m1((pb >> 4) & 0x0fu);
+            }
+            acc += bsum * sc;
+          }
+          return acc;
+        });
+      }
+    });
+  }
+}
+
+void simulate_warp_f32_fp8_linear(std::span<const float> x_in, std::span<const std::uint8_t> w_e4m3,
+                                  float weight_scale, float input_scale, int m, int out_features, int in_features,
+                                  std::span<float> out) {
+  if (m <= 0 || out_features <= 0 || in_features <= 0 ||
+      x_in.size() != static_cast<std::size_t>(m * in_features) ||
+      w_e4m3.size() != static_cast<std::size_t>(out_features * in_features) ||
+      out.size() != static_cast<std::size_t>(m * out_features)) {
+    throw std::invalid_argument("simulate_warp_f32_fp8_linear shape mismatch");
+  }
+  const bool calibrated = (input_scale > 0.0f);
+  const float inv_in = calibrated ? (1.0f / input_scale) : 1.0f;
+  for (int row = 0; row < m; ++row) {
+    std::vector<float> x_eff(static_cast<std::size_t>(in_features));
+    const float* x_row = x_in.data() + static_cast<std::size_t>(row * in_features);
+    for (int k = 0; k < in_features; ++k) {
+      x_eff[static_cast<std::size_t>(k)] =
+          calibrated ? (decode_e4m3fn(quantize_e4m3fn_fast(x_row[k] * inv_in)) * input_scale) : x_row[k];
+    }
+    parallel_rows(out_features, static_cast<std::size_t>(out_features * in_features), 0, [&](int r0, int r1) {
+      for (int n = r0; n < r1; ++n) {
+        const std::uint8_t* wrow = w_e4m3.data() + static_cast<std::size_t>(n * in_features);
+        const float acc_f = warp_reduce_32([&](int lane) {
+          float acc = 0.0f;
+          for (int k = lane; k < in_features; k += 32) {
+            acc += x_eff[static_cast<std::size_t>(k)] * decode_e4m3fn(wrow[k]);
+          }
+          return acc;
+        });
+        out[static_cast<std::size_t>(row * out_features + n)] = acc_f * weight_scale;
+      }
+    });
+  }
+}
+
+const std::vector<std::string>& qwen38_gate1_required_row_names() {
+  static const std::vector<std::string> kRows = {
+      "unit_nvfp4_linear_f32",
+      "unit_nvfp4_linear_bf16",
+      "unit_fp8_linear_weight_only_f32",
+      "unit_fp8_linear_weight_only_bf16",
+      "unit_fp8_linear_calibrated_f32",
+      "unit_fp8_linear_calibrated_bf16",
+      "unit_rmsnorm_zero_centered",
+      "unit_rmsnorm_gated_silu",
+      "unit_partial_rope_neox",
+      "unit_causal_conv1d_silu",
+      "unit_gdn_recurrent_step",
+      "unit_gdn_chunk_prefill",
+      "unit_full_attn_gated",
+      "synth_bf16_1L_gdn",
+      "synth_bf16_1L_full",
+      "synth_bf16_4L_stepwise",
+      "synth_bf16_4L_chunk",
+      "synth_nvfp4_fp8_1L_gdn",
+      "synth_nvfp4_fp8_1L_full",
+      "synth_nvfp4_fp8_4L_stepwise",
+      "synth_nvfp4_fp8_4L_chunk",
+      "qwen08b_1L_gdn",
+      "qwen08b_1L_full",
+      "qwen08b_4L_stepwise",
+      "qwen08b_4L_chunk",
+      "qwen27b_1L_gdn",
+      "qwen27b_1L_full",
+      "qwen27b_4L_stepwise",
+      "qwen27b_4L_chunk",
+  };
+  return kRows;
+}
+
+Qwen38Gate1CoverageSummary evaluate_gate1_coverage(std::span<const Qwen38Gate1RowStatus> rows, bool diagnostic_mode,
+                                                   bool qwen27b_pins_verified) {
+  Qwen38Gate1CoverageSummary summary;
+  const auto& required = qwen38_gate1_required_row_names();
+  summary.mode = diagnostic_mode ? "diagnostic" : "qualification";
+  summary.qwen27b_pins_verified = qwen27b_pins_verified;
+  summary.required_row_count = required.size();
+
+  std::unordered_map<std::string, const Qwen38Gate1RowStatus*> by_name;
+  std::unordered_set<std::string> failed_set;
+  auto push_failed = [&](const std::string& name) {
+    if (failed_set.insert(name).second) summary.failed_rows.push_back(name);
+  };
+
+  std::size_t executed_count = 0;
+  for (const auto& r : rows) {
+    if (!by_name.emplace(r.name, &r).second) {
+      push_failed(r.name);
+      continue;
+    }
+    if (r.status == "pass") {
+      ++executed_count;
+      if (!r.passed) push_failed(r.name);
+    } else if (r.status == "fail") {
+      ++executed_count;
+      push_failed(r.name);
+    } else if (r.status == "skipped_diagnostic" || r.status == "missing_checkpoint") {
+      if (r.passed) push_failed(r.name);
+    } else {
+      push_failed(r.name);
+    }
+  }
+
+  for (const std::string& req : required) {
+    const auto it = by_name.find(req);
+    if (it == by_name.end()) {
+      summary.missing_required_rows.push_back(req);
+      continue;
+    }
+    const auto* r = it->second;
+    if (r->status == "pass" && r->passed) {
+      ++summary.passed_required_row_count;
+    } else if (r->status == "skipped_diagnostic" || r->status == "missing_checkpoint") {
+      summary.missing_required_rows.push_back(req);
+    }
+  }
+
+  summary.complete_coverage = summary.missing_required_rows.empty();
+  summary.executed_checks_passed = summary.failed_rows.empty() && (executed_count > 0);
+  summary.qualification_passed =
+      !diagnostic_mode && summary.complete_coverage && summary.executed_checks_passed && qwen27b_pins_verified;
+  summary.all_passed = summary.qualification_passed;
+  if (summary.qualification_passed) {
+    summary.coverage_status = "complete_qualified";
+  } else if (diagnostic_mode && summary.executed_checks_passed) {
+    summary.coverage_status = "incomplete_diagnostic";
+  } else {
+    summary.coverage_status = "failed";
+  }
+  return summary;
+}
+
+Qwen38VectorCompareStats compare_f32_vectors(std::span<const float> got, std::span<const float> ref) {
+  Qwen38VectorCompareStats s;
+  if (got.size() != ref.size()) {
+    s.finite = false;
+    s.max_abs = std::numeric_limits<float>::infinity();
+    s.rel_max_abs = std::numeric_limits<float>::infinity();
+    s.rel_l2 = std::numeric_limits<float>::infinity();
+    s.cosine_sim = 0.0;
+    return s;
+  }
+  double diff_sq = 0.0;
+  double got_sq = 0.0;
+  double ref_sq = 0.0;
+  double dot = 0.0;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float g = got[i];
+    const float r = ref[i];
+    if (!std::isfinite(g) || !std::isfinite(r)) {
+      s.finite = false;
+      s.max_abs = std::numeric_limits<float>::infinity();
+      s.rel_max_abs = std::numeric_limits<float>::infinity();
+      s.rel_l2 = std::numeric_limits<float>::infinity();
+      s.cosine_sim = 0.0;
+      return s;
+    }
+    const double dg = static_cast<double>(g);
+    const double dr = static_cast<double>(r);
+    const double d = dg - dr;
+    s.max_abs = std::max(s.max_abs, std::fabs(g - r));
+    s.ref_max_abs = std::max(s.ref_max_abs, std::fabs(r));
+    diff_sq += d * d;
+    got_sq += dg * dg;
+    ref_sq += dr * dr;
+    dot += dg * dr;
+  }
+  const double diff_l2 = std::sqrt(diff_sq);
+  const double got_l2 = std::sqrt(got_sq);
+  const double ref_l2 = std::sqrt(ref_sq);
+  s.rel_max_abs =
+      static_cast<float>(static_cast<double>(s.max_abs) / std::max(1e-6, static_cast<double>(s.ref_max_abs)));
+  s.rel_l2 = static_cast<float>(diff_l2 / std::max(1e-6, ref_l2));
+  if (got_l2 == 0.0 && ref_l2 == 0.0) {
+    s.cosine_sim = 1.0;
+  } else if (got_l2 == 0.0 || ref_l2 == 0.0) {
+    s.cosine_sim = 0.0;
+  } else {
+    s.cosine_sim = dot / (got_l2 * ref_l2);
+  }
+  return s;
+}
+
+Qwen38BlockParityResult evaluate_block_parity(const Qwen38BlockBundleHost& bundle, const Qwen38BlockRunOutput& got,
+                                              const Qwen38BlockRunOutput& ref, Qwen38BlockParityTier tier) {
+  Qwen38BlockParityResult res;
+  res.hidden = compare_f32_vectors(got.hidden_seq, ref.hidden_seq);
+  if (got.hidden_seq.size() == ref.hidden_seq.size()) {
+    std::vector<std::uint16_t> got_bits(got.hidden_seq.size());
+    for (std::size_t i = 0; i < got.hidden_seq.size(); ++i) got_bits[i] = f32_to_bf16(got.hidden_seq[i]);
+    res.hidden_bf16 = compare_bf16_against_rounded_oracle(got_bits, ref.hidden_seq, 1u, 1e-3f);
+  }
+  if (got.recurrent_states.size() != bundle.layers.size() || ref.recurrent_states.size() != bundle.layers.size()) {
+    res.gdn_finite = false;
+  } else {
+    for (std::size_t li = 0; li < bundle.layers.size(); ++li) {
+      if (bundle.layers[li].kind != Qwen38LayerKind::LinearAttention) continue;
+      const auto st = compare_f32_vectors(got.recurrent_states[li], ref.recurrent_states[li]);
+      if (!st.finite) {
+        res.gdn_finite = false;
+        continue;
+      }
+      if (li == 0) {
+        res.layer0_gdn_max_abs = std::max(res.layer0_gdn_max_abs, st.max_abs);
+      } else {
+        res.stacked_gdn_max_abs = std::max(res.stacked_gdn_max_abs, st.max_abs);
+        res.stacked_gdn_rel_l2 = std::max(res.stacked_gdn_rel_l2, st.rel_l2);
+      }
+    }
+  }
+  if (tier == Qwen38BlockParityTier::SyntheticStrict) {
+    res.criterion = "synth_strict: hidden_max_abs <= 1e-3 && gdn_max_abs <= 2e-4 && bf16_ulp <= 1 || abs <= 1e-3";
+    res.passed = res.hidden.finite && res.gdn_finite && res.hidden.max_abs <= 1e-3f &&
+                 res.layer0_gdn_max_abs <= 2e-4f && res.stacked_gdn_max_abs <= 2e-4f && res.hidden_bf16.passed;
+  } else if (tier == Qwen38BlockParityTier::RealSingleLayer) {
+    res.criterion =
+        "real_1L_bf16: layer0_gdn_max_abs <= 2e-4 && hidden_rel_l2 <= 2e-3 && hidden_cosine >= 0.99999 && "
+        "hidden_rel_max_abs <= 1e-2";
+    res.passed = res.hidden.finite && res.gdn_finite && res.layer0_gdn_max_abs <= 2e-4f &&
+                 res.hidden.rel_l2 <= 2e-3f && res.hidden.cosine_sim >= 0.99999 && res.hidden.rel_max_abs <= 1e-2f;
+  } else {
+    res.criterion =
+        "real_4L_bf16: layer0_gdn_max_abs <= 2e-4 && stacked_gdn_max_abs <= 1e-2 && stacked_gdn_rel_l2 <= 2.5e-2 && "
+        "hidden_rel_l2 <= 1.5e-2 && hidden_cosine >= 0.99985 && hidden_rel_max_abs <= 2.5e-2";
+    res.passed = res.hidden.finite && res.gdn_finite && res.layer0_gdn_max_abs <= 2e-4f &&
+                 res.stacked_gdn_max_abs <= 1e-2f && res.stacked_gdn_rel_l2 <= 2.5e-2f &&
+                 res.hidden.rel_l2 <= 1.5e-2f && res.hidden.cosine_sim >= 0.99985 && res.hidden.rel_max_abs <= 2.5e-2f;
+  }
+  return res;
 }
 
 }  // namespace ingine::backends::qwen38

@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace ingine::backends::qwen38 {
@@ -92,9 +94,118 @@ Qwen38BlockBundleHost load_qwen38_block_bundle(const std::filesystem::path& mode
                                                std::span<const std::int32_t> token_ids);
 
 // Executes the block bundle on CPU with deterministic row-partitioned multi-threading and FP64
-// inner products (bit-identical output across thread counts).
+// inner products (or optional 32-lane warp FP32 simulation when fp32_accum_sim=true).
 Qwen38BlockRunOutput run_qwen38_blocks_cpu(const Qwen38BlockBundleHost& bundle, bool bf16_boundaries,
                                            bool use_chunk_prefill, int chunk_size = 64,
-                                           bool use_calibrated_fp8_input_scale = true, int num_threads = 0);
+                                           bool use_calibrated_fp8_input_scale = true, int num_threads = 0,
+                                           bool fp32_accum_sim = false);
+
+// Extracts a single layer bundle (keeping config, tokens, and prompt embeddings) to avoid re-reading shards.
+Qwen38BlockBundleHost slice_qwen38_block_layer(const Qwen38BlockBundleHost& bundle, std::size_t layer_pos);
+
+// Computes finite BF16 ULP distance (+0.0 == -0.0); returns UINT32_MAX if either operand is Inf or NaN.
+std::uint32_t bf16_ulp_distance(std::uint16_t a, std::uint16_t b) noexcept;
+
+struct Qwen38Bf16CompareStats {
+  float max_abs_vs_bf16_oracle = 0.0f;
+  std::uint32_t max_bf16_ulp = 0;
+  std::size_t exact_bf16_matches = 0;
+  std::size_t non_exact_bf16_count = 0;
+  std::size_t criterion_violations = 0;
+  bool passed = false;
+};
+
+// Compares BF16 outputs against explicit round-to-nearest-even BF16 conversion of ref_f32.
+// Each element fails iff ULP distance > max_ulp AND abs diff vs rounded oracle > abs_floor (or non-finite).
+Qwen38Bf16CompareStats compare_bf16_against_rounded_oracle(std::span<const std::uint16_t> got_bf16_bits,
+                                                           std::span<const float> ref_f32,
+                                                           std::uint32_t max_ulp = 1,
+                                                           float abs_floor = 1e-3f);
+
+struct Qwen38Gate1LinearFixtures {
+  int m = 4;
+  int n = 256;
+  int k = 5120;
+
+  std::vector<std::uint16_t> nvfp4_x_bf16;
+  std::vector<float> nvfp4_x_q;
+  std::vector<std::uint8_t> nvfp4_packed;
+  std::vector<std::uint8_t> nvfp4_scales;
+  float nvfp4_ws2 = 0.015f;
+  std::vector<float> nvfp4_ref_f32;
+  std::vector<std::uint16_t> nvfp4_ref_bf16;
+
+  std::vector<std::uint16_t> fp8_x_bf16;
+  std::vector<float> fp8_x_q;
+  std::vector<std::uint8_t> fp8_w;
+  float fp8_ws = 0.025f;
+  float fp8_in_sc = 0.125f;
+  std::vector<float> fp8_wo_ref_f32;
+  std::vector<std::uint16_t> fp8_wo_ref_bf16;
+  std::vector<float> fp8_cal_ref_f32;
+  std::vector<std::uint16_t> fp8_cal_ref_bf16;
+};
+
+// Generates the deterministic Gate 1 NVFP4 + FP8 unit fixtures (seed=20261125u) and CPU FP64-accum references.
+Qwen38Gate1LinearFixtures make_gate1_linear_fixtures(std::uint32_t seed = 20261125u);
+
+// Simulates the 32-lane warp strided FP32 accumulation + butterfly reduction order of qwen38_cuda_ops.cu.
+void simulate_warp_f32_nvfp4_linear(std::span<const float> x_in, std::span<const std::uint8_t> packed_u8,
+                                    std::span<const std::uint8_t> block_scales_e4m3, float weight_scale_2, int m,
+                                    int out_features, int in_features, std::span<float> out);
+void simulate_warp_f32_fp8_linear(std::span<const float> x_in, std::span<const std::uint8_t> w_e4m3,
+                                  float weight_scale, float input_scale, int m, int out_features, int in_features,
+                                  std::span<float> out);
+
+struct Qwen38Gate1RowStatus {
+  std::string name;
+  std::string status;  // "pass", "fail", "skipped_diagnostic", or "missing_checkpoint"
+  bool passed = false;
+};
+
+struct Qwen38Gate1CoverageSummary {
+  std::string mode;             // "qualification" or "diagnostic"
+  std::string coverage_status;  // "complete_qualified", "incomplete_diagnostic", or "failed"
+  bool complete_coverage = false;
+  bool executed_checks_passed = false;
+  bool qwen27b_pins_verified = false;
+  bool qualification_passed = false;
+  bool all_passed = false;
+  std::size_t required_row_count = 0;
+  std::size_t passed_required_row_count = 0;
+  std::vector<std::string> missing_required_rows;
+  std::vector<std::string> failed_rows;
+};
+
+const std::vector<std::string>& qwen38_gate1_required_row_names();
+Qwen38Gate1CoverageSummary evaluate_gate1_coverage(std::span<const Qwen38Gate1RowStatus> rows, bool diagnostic_mode,
+                                                   bool qwen27b_pins_verified);
+
+struct Qwen38VectorCompareStats {
+  float max_abs = 0.0f;
+  float ref_max_abs = 0.0f;
+  float rel_max_abs = 0.0f;
+  float rel_l2 = 0.0f;
+  double cosine_sim = 1.0;
+  bool finite = true;
+};
+
+Qwen38VectorCompareStats compare_f32_vectors(std::span<const float> got, std::span<const float> ref);
+
+enum class Qwen38BlockParityTier { SyntheticStrict, RealSingleLayer, RealStacked4Layer };
+
+struct Qwen38BlockParityResult {
+  Qwen38VectorCompareStats hidden;
+  Qwen38Bf16CompareStats hidden_bf16;
+  float layer0_gdn_max_abs = 0.0f;
+  float stacked_gdn_max_abs = 0.0f;
+  float stacked_gdn_rel_l2 = 0.0f;
+  bool gdn_finite = true;
+  std::string criterion;
+  bool passed = false;
+};
+
+Qwen38BlockParityResult evaluate_block_parity(const Qwen38BlockBundleHost& bundle, const Qwen38BlockRunOutput& got,
+                                              const Qwen38BlockRunOutput& ref, Qwen38BlockParityTier tier);
 
 }  // namespace ingine::backends::qwen38
