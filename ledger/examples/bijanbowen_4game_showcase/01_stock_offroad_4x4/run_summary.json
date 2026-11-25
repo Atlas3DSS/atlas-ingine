@@ -1,0 +1,171 @@
+{
+  "game_kind": "stock_offroad_4x4",
+  "task_id": "bijan_01_stock_offroad_4x4",
+  "title": "Isometric 4x4 Off-Road Driving Game on a Live 5-Day Stock Price Curve 3D Terrain",
+  "rival": "Claude",
+  "solved": true,
+  "attempt0_passed": false,
+  "attempt0_score": 2.0,
+  "attempt0_error": "TOKEN_TRUNCATION",
+  "champion": "round_02/agent_physics",
+  "best_score": 95.54,
+  "champion_summary": "Stock 4x4 Off-Road PASS: dist_delta=51.54, prices=[121.07, 142.88, 166.09], max_pitch=0.2917, motion_mad=0.119, colors=479, entropy=4.01 | vision_qa=86/100",
+  "stop_reason": "converged_verified_champion",
+  "total_candidates": 7,
+  "ledger_stats": {
+    "db_path": "/home/orwel/dev_genius/experiments/kernals/results/bijanbowen_showcase_854/verified_ledger.sqlite",
+    "env_version": "v1_bijan_array_webgl2",
+    "active_facts": 5,
+    "stale_facts": 0,
+    "active_winners": 1,
+    "stale_winners": 0,
+    "active_repairs": 1,
+    "failures_logged": 5,
+    "drift_events": 0
+  },
+  "records": [
+    {
+      "round": 0,
+      "agent_id": "stock_oneshot",
+      "ok": false,
+      "score": 2.0,
+      "error_signature": "TOKEN_TRUNCATION",
+      "error_detail": "Stock one-shot hit max_tokens before closing </html>.",
+      "summary": "",
+      "elapsed_s": 162.33,
+      "completion_tokens": 16384,
+      "finish_reason": "length",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "TOKEN_TRUNCATION"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 12.0,
+      "error_signature": "SHADER_COMPILE_ERROR",
+      "error_detail": "vertex shader compile error: ERROR: 0:2: 'position' : undeclared identifier\nERROR: 0:2: 'xy' :  field selection requires structure, vector, or interface block on left hand side\nERROR: 0:2: 'constructor' : not enough data provided for construction\n",
+      "summary": "",
+      "elapsed_s": 127.34,
+      "completion_tokens": 15220,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "SHADER_COMPILE_ERROR"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 12.0,
+      "error_signature": "SHADER_COMPILE_ERROR",
+      "error_detail": "vertex shader compile error: ERROR: 0:2: 'position' : undeclared identifier\nERROR: 0:2: 'xy' :  field selection requires structure, vector, or interface block on left hand side\nERROR: 0:2: 'constructor' : not enough data provided for construction\n",
+      "summary": "",
+      "elapsed_s": 112.7,
+      "completion_tokens": 13409,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "SHADER_COMPILE_ERROR"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": false,
+      "score": 12.0,
+      "error_signature": "SHADER_COMPILE_ERROR",
+      "error_detail": "vertex shader compile error: ERROR: 0:2: 'position' : undeclared identifier\nERROR: 0:2: 'xy' :  field selection requires structure, vector, or interface block on left hand side\nERROR: 0:2: 'constructor' : not enough data provided for construction\n",
+      "summary": "",
+      "elapsed_s": 99.37,
+      "completion_tokens": 12188,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "SHADER_COMPILE_ERROR"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 12.0,
+      "error_signature": "SHADER_COMPILE_ERROR",
+      "error_detail": "vertex shader compile error: ERROR: 0:7: 'cameraPosition' : undeclared identifier\n",
+      "summary": "",
+      "elapsed_s": 148.01,
+      "completion_tokens": 14533,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "SHADER_COMPILE_ERROR"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": true,
+      "score": 95.54,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "Stock 4x4 Off-Road PASS: dist_delta=51.54, prices=[121.07, 142.88, 166.09], max_pitch=0.2917, motion_mad=0.119, colors=479, entropy=4.01 | vision_qa=86/100",
+      "elapsed_s": 135.51,
+      "completion_tokens": 13121,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": true,
+        "failure_logged": false
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": true,
+      "score": 94.55,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "Stock 4x4 Off-Road PASS: dist_delta=53.02, prices=[123.97, 150.55, 183.9], max_pitch=0.2143, motion_mad=0.111, colors=374, entropy=3.93 | vision_qa=82/100",
+      "elapsed_s": 99.36,
+      "completion_tokens": 13289,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": true,
+        "failure_logged": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,206 @@
+{
+  "meta": [
+    {
+      "k": "env_version",
+      "v": "v1_bijan_array_webgl2"
+    }
+  ],
+  "facts": [
+    {
+      "fact_key": "runtime_webgl2",
+      "category": "hardware",
+      "value": "Headless Chromium WebGL2 (GLSL ES 3.00, ANGLE SwiftShader Vulkan, 1280x720).",
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "fact_key": "glsl_es_300",
+      "category": "webgl2",
+      "value": "WebGL2 '#version 300 es' MUST start on line 1 col 0 (no leading newline), use 'in'/'out' (NEVER 'attribute'/'varying'), and declare 'out vec4 fragColor' (NEVER 'gl_FragColor').",
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "fact_key": "offline_html",
+      "category": "runtime",
+      "value": "100% self-contained single HTML file; ZERO external CDN fetches allowed.",
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "fact_key": "webgl_col_major",
+      "category": "webgl2",
+      "value": "WebGL Float32Array(16) is column-major: m[3]=0, m[7]=0, m[11]=0, m[15]=1 for affine/view/ortho matrices! Exact lookAt(eye,target,up) Float32Array(16) with f=norm(eye-target), r=norm(cross(up,f)), u=cross(f,r): [rx,ux,fx,0,  ry,uy,fy,0,  rz,uz,fz,0,  -dot(r,eye),-dot(u,eye),-dot(f,eye),1]. NEVER put -dot(...) at m[3],m[7],m[11]! Upload every active mat4 uniform before draw.",
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "fact_key": "game_start_ready",
+      "category": "gameplay",
+      "value": "Game must start immediately playable (state='playing') on load without blocking modals, and update window.__GAME_STATE__ every frame.",
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    }
+  ],
+  "winners": [
+    {
+      "task_id": "bijan_01_stock_offroad_4x4",
+      "task_text": "Isometric 4x4 Off-Road Driving Game on a Live 5-Day Stock Price Curve 3D Terrain",
+      "score": 95.54,
+      "summary": "Stock 4x4 Off-Road PASS: dist_delta=51.54, prices=[121.07, 142.88, 166.09], max_pitch=0.2917, motion_mad=0.119, colors=479, entropy=4.01 | vision_qa=86/100",
+      "tags_json": "[\"stock_offroad_4x4\", \"r2\", \"agent_physics\"]",
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "task_id": "bijan_02_bowling_horror_3d",
+      "task_text": "3D Haunted Bowling Alley Horror Game with Rigid-Body 10-Pin Physics",
+      "score": 84.16,
+      "summary": "Bowling Horror 3D PASS: ball_dz=35.61, pins_knocked=2/10, score=0, motion_mad=0.010, colors=336, entropy=2.77 | vision_qa=82/100",
+      "tags_json": "[\"bowling_horror_3d\", \"r4\", \"agent_polish\"]",
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "task_id": "bijan_03_skate_to_gta_city",
+      "task_text": "3D Skate-to-GTA Open-City Sandbox (Tricks + Enter/Drive/Exit Cars)",
+      "score": 92.23,
+      "summary": "Skate-to-GTA 3D PASS: skate_dist=23.64, tricks=1, score=250, entered_car=True, car_dist=23.67, exited_to_skate=True, colors=305, entropy=3.37 | vision_qa=78/100",
+      "tags_json": "[\"skate_to_gta_city\", \"r3\", \"agent_graphics\"]",
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "task_id": "bijan_04_multiplayer_3d_racing",
+      "task_text": "High-Speed Multiplayer 3D Arcade Racer (2P Split-Screen + BroadcastChannel + AI Pack)",
+      "score": 100.0,
+      "summary": "Multiplayer 3D Racing PASS: splitScreen=True, BroadcastChannel=True, P1_dist=54.43, P2_dist=60.98, AI=3, motion_mad=0.098, colors=647, entropy=5.31 | vision_qa=88/100",
+      "tags_json": "[\"multiplayer_3d_racing\", \"r2\", \"agent_polish\"]",
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    }
+  ],
+  "repairs": [
+    {
+      "error_signature": "SHADER_COMPILE_ERROR",
+      "rule": "Stock 4x4 Off-Road PASS: dist_delta=53.02, prices=[123.97, 150.55, 183.9], max_pitch=0.2143, motion_mad=0.111, colors=374, entropy=3.93 | vision_qa=82/100",
+      "hits": 2,
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "error_signature": "BOWLING_BALL_NOT_ROLLING",
+      "rule": "Bowling Horror 3D PASS: ball_dz=35.18, pins_knocked=2/10, score=2, motion_mad=0.005, colors=361, entropy=2.13 | vision_qa=78/100",
+      "hits": 1,
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "error_signature": "CAR_ENTRY_BROKEN",
+      "rule": "Skate-to-GTA 3D PASS: skate_dist=23.64, tricks=1, score=250, entered_car=True, car_dist=23.67, exited_to_skate=True, colors=305, entropy=3.37 | vision_qa=78/100",
+      "hits": 1,
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    },
+    {
+      "error_signature": "EMPTY_OR_OFFCAMERA_3D_SCENE",
+      "rule": "Multiplayer 3D Racing PASS: splitScreen=True, BroadcastChannel=True, P1_dist=54.43, P2_dist=60.98, AI=3, motion_mad=0.098, colors=647, entropy=5.31 | vision_qa=88/100",
+      "hits": 1,
+      "env_version": "v1_bijan_array_webgl2",
+      "status": "active"
+    }
+  ],
+  "failure_log_count": 31,
+  "failures_by_sig": [
+    {
+      "task_id": "bijan_01_stock_offroad_4x4",
+      "error_signature": "SHADER_COMPILE_ERROR",
+      "n": 4
+    },
+    {
+      "task_id": "bijan_01_stock_offroad_4x4",
+      "error_signature": "TOKEN_TRUNCATION",
+      "n": 1
+    },
+    {
+      "task_id": "bijan_02_bowling_horror_3d",
+      "error_signature": "WEBGL_RUNTIME_ERROR",
+      "n": 2
+    },
+    {
+      "task_id": "bijan_02_bowling_horror_3d",
+      "error_signature": "VISION_QA_DEFECT",
+      "n": 2
+    },
+    {
+      "task_id": "bijan_02_bowling_horror_3d",
+      "error_signature": "TOKEN_TRUNCATION",
+      "n": 2
+    },
+    {
+      "task_id": "bijan_02_bowling_horror_3d",
+      "error_signature": "JS_PAGE_ERROR",
+      "n": 2
+    },
+    {
+      "task_id": "bijan_02_bowling_horror_3d",
+      "error_signature": "BOWLING_BALL_NOT_ROLLING",
+      "n": 2
+    },
+    {
+      "task_id": "bijan_02_bowling_horror_3d",
+      "error_signature": "BLANK_OR_FLAT_3D_VIEW",
+      "n": 1
+    },
+    {
+      "task_id": "bijan_03_skate_to_gta_city",
+      "error_signature": "JS_PAGE_ERROR",
+      "n": 5
+    },
+    {
+      "task_id": "bijan_03_skate_to_gta_city",
+      "error_signature": "TOKEN_TRUNCATION",
+      "n": 2
+    },
+    {
+      "task_id": "bijan_03_skate_to_gta_city",
+      "error_signature": "EMPTY_OR_OFFCAMERA_3D_SCENE",
+      "n": 1
+    },
+    {
+      "task_id": "bijan_03_skate_to_gta_city",
+      "error_signature": "CAR_ENTRY_BROKEN",
+      "n": 1
+    },
+    {
+      "task_id": "bijan_04_multiplayer_3d_racing",
+      "error_signature": "WEBGL_RUNTIME_ERROR",
+      "n": 1
+    },
+    {
+      "task_id": "bijan_04_multiplayer_3d_racing",
+      "error_signature": "VISION_QA_DEFECT",
+      "n": 1
+    },
+    {
+      "task_id": "bijan_04_multiplayer_3d_racing",
+      "error_signature": "TOKEN_TRUNCATION",
+      "n": 1
+    },
+    {
+      "task_id": "bijan_04_multiplayer_3d_racing",
+      "error_signature": "SHADER_COMPILE_ERROR",
+      "n": 1
+    },
+    {
+      "task_id": "bijan_04_multiplayer_3d_racing",
+      "error_signature": "JS_PAGE_ERROR",
+      "n": 1
+    },
+    {
+      "task_id": "bijan_04_multiplayer_3d_racing",
+      "error_signature": "EMPTY_OR_OFFCAMERA_3D_SCENE",
+      "n": 1
+    }
+  ]
+}

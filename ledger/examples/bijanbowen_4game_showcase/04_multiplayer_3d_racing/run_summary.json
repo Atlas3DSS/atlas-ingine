@@ -1,0 +1,172 @@
+{
+  "game_kind": "multiplayer_3d_racing",
+  "task_id": "bijan_04_multiplayer_3d_racing",
+  "title": "High-Speed Multiplayer 3D Arcade Racer (2P Split-Screen + BroadcastChannel + AI Pack)",
+  "rival": "Gemini Carbon",
+  "solved": true,
+  "attempt0_passed": false,
+  "attempt0_score": 2.0,
+  "attempt0_error": "TOKEN_TRUNCATION",
+  "champion": "round_02/agent_polish",
+  "best_score": 100.0,
+  "champion_summary": "Multiplayer 3D Racing PASS: splitScreen=True, BroadcastChannel=True, P1_dist=54.43, P2_dist=60.98, AI=3, motion_mad=0.098, colors=647, entropy=5.31 | vision_qa=88/100",
+  "stop_reason": "converged_verified_champion",
+  "total_candidates": 7,
+  "ledger_stats": {
+    "db_path": "/home/orwel/dev_genius/experiments/kernals/results/bijanbowen_showcase_854/verified_ledger.sqlite",
+    "env_version": "v1_bijan_array_webgl2",
+    "active_facts": 5,
+    "stale_facts": 0,
+    "active_winners": 4,
+    "stale_winners": 0,
+    "active_repairs": 4,
+    "failures_logged": 31,
+    "drift_events": 0
+  },
+  "records": [
+    {
+      "round": 0,
+      "agent_id": "stock_oneshot",
+      "ok": false,
+      "score": 2.0,
+      "error_signature": "TOKEN_TRUNCATION",
+      "error_detail": "Stock one-shot hit max_tokens before closing </html>.",
+      "summary": "",
+      "elapsed_s": 159.2,
+      "completion_tokens": 16384,
+      "finish_reason": "length",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "TOKEN_TRUNCATION"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 28.0,
+      "error_signature": "EMPTY_OR_OFFCAMERA_3D_SCENE",
+      "error_detail": "3D viewport center shows only smooth sky/background with almost zero visible 3D geometry edges (center_edge_pct=0.244%, center_edge_p99=2.77)! Check camera mat4LookAt (in column-major WebGL, basis ROWS go at m[0],m[4],m[8]=right; m[1],m[5],m[9]=up; m[2],m[6],m[10]=forward, NOT m[0..2]!) and verify t",
+      "summary": "",
+      "elapsed_s": 119.28,
+      "completion_tokens": 13962,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "EMPTY_OR_OFFCAMERA_3D_SCENE"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 6.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught JS pageerror: Failed to execute 'uniformMatrix4fv' on 'WebGL2RenderingContext': The provided value cannot be converted to a sequence.",
+      "summary": "",
+      "elapsed_s": 124.43,
+      "completion_tokens": 14330,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": false,
+      "score": 12.0,
+      "error_signature": "SHADER_COMPILE_ERROR",
+      "error_detail": "vertex shader compile error: ERROR: 0:4: 'varying' : Illegal use of reserved word\n",
+      "summary": "",
+      "elapsed_s": 116.43,
+      "completion_tokens": 13800,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "SHADER_COMPILE_ERROR"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 34.0,
+      "error_signature": "VISION_QA_DEFECT",
+      "error_detail": "Inkling-2-Mini native vision QA rejected rendered 3D scene (visual_score=30.0): Right split-screen half is empty/black in all frames; only left half shows track and cars",
+      "summary": "",
+      "elapsed_s": 103.52,
+      "completion_tokens": 13576,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "VISION_QA_DEFECT"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 16.0,
+      "error_signature": "WEBGL_RUNTIME_ERROR",
+      "error_detail": "WebGL gl.getError(): GL_INVALID_OPERATION, GL_INVALID_OPERATION",
+      "summary": "",
+      "elapsed_s": 130.52,
+      "completion_tokens": 12928,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "WEBGL_RUNTIME_ERROR"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": true,
+      "score": 100.0,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "Multiplayer 3D Racing PASS: splitScreen=True, BroadcastChannel=True, P1_dist=54.43, P2_dist=60.98, AI=3, motion_mad=0.098, colors=647, entropy=5.31 | vision_qa=88/100",
+      "elapsed_s": 107.5,
+      "completion_tokens": 13875,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": true,
+        "failure_logged": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,235 @@
+{
+  "game_kind": "skate_to_gta_city",
+  "task_id": "bijan_03_skate_to_gta_city",
+  "title": "3D Skate-to-GTA Open-City Sandbox (Tricks + Enter/Drive/Exit Cars)",
+  "rival": "GPT 6.2 Astra",
+  "solved": true,
+  "attempt0_passed": false,
+  "attempt0_score": 2.0,
+  "attempt0_error": "TOKEN_TRUNCATION",
+  "champion": "round_03/agent_graphics",
+  "best_score": 92.23,
+  "champion_summary": "Skate-to-GTA 3D PASS: skate_dist=23.64, tricks=1, score=250, entered_car=True, car_dist=23.67, exited_to_skate=True, colors=305, entropy=3.37 | vision_qa=78/100",
+  "stop_reason": "converged_verified_champion",
+  "total_candidates": 10,
+  "ledger_stats": {
+    "db_path": "/home/orwel/dev_genius/experiments/kernals/results/bijanbowen_showcase_854/verified_ledger.sqlite",
+    "env_version": "v1_bijan_array_webgl2",
+    "active_facts": 5,
+    "stale_facts": 0,
+    "active_winners": 3,
+    "stale_winners": 0,
+    "active_repairs": 3,
+    "failures_logged": 25,
+    "drift_events": 0
+  },
+  "records": [
+    {
+      "round": 0,
+      "agent_id": "stock_oneshot",
+      "ok": false,
+      "score": 2.0,
+      "error_signature": "TOKEN_TRUNCATION",
+      "error_detail": "Stock one-shot hit max_tokens before closing </html>.",
+      "summary": "",
+      "elapsed_s": 156.08,
+      "completion_tokens": 16384,
+      "finish_reason": "length",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "TOKEN_TRUNCATION"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 6.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught JS pageerror: Maximum call stack size exceeded",
+      "summary": "",
+      "elapsed_s": 121.64,
+      "completion_tokens": 14826,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 6.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught JS pageerror: Maximum call stack size exceeded",
+      "summary": "",
+      "elapsed_s": 140.15,
+      "completion_tokens": 16175,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": false,
+      "score": 6.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught JS pageerror: Maximum call stack size exceeded",
+      "summary": "",
+      "elapsed_s": 131.26,
+      "completion_tokens": 15906,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 6.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught JS pageerror: M.ramp is not a function",
+      "summary": "",
+      "elapsed_s": 117.39,
+      "completion_tokens": 12272,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 52.0,
+      "error_signature": "CAR_ENTRY_BROKEN",
+      "error_detail": "Pressing F/E did not enter a nearby 3D drivable car (keep a hero sports car parked within quick reach of spawn or let F snap to nearest parked car within generous radius)! state_skate={'state': 'playing', 'mode': 'skate', 'playerX': 0, 'playerY': 0, 'playerZ': 24.46149770104121, 'speed': 19.61714031",
+      "summary": "",
+      "elapsed_s": 121.9,
+      "completion_tokens": 11925,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "CAR_ENTRY_BROKEN"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": false,
+      "score": 6.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught JS pageerror: Maximum call stack size exceeded",
+      "summary": "",
+      "elapsed_s": 108.68,
+      "completion_tokens": 14297,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      }
+    },
+    {
+      "round": 3,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": true,
+      "score": 92.23,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "Skate-to-GTA 3D PASS: skate_dist=23.64, tricks=1, score=250, entered_car=True, car_dist=23.67, exited_to_skate=True, colors=305, entropy=3.37 | vision_qa=78/100",
+      "elapsed_s": 78.71,
+      "completion_tokens": 10422,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": true,
+        "failure_logged": false
+      }
+    },
+    {
+      "round": 3,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 2.0,
+      "error_signature": "TOKEN_TRUNCATION",
+      "error_detail": "Hit max_tokens before closing </html>.",
+      "summary": "",
+      "elapsed_s": 169.97,
+      "completion_tokens": 16384,
+      "finish_reason": "length",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "TOKEN_TRUNCATION"
+      }
+    },
+    {
+      "round": 3,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": false,
+      "score": 28.0,
+      "error_signature": "EMPTY_OR_OFFCAMERA_3D_SCENE",
+      "error_detail": "3D viewport center shows only smooth sky/background with almost zero visible 3D geometry edges (center_edge_pct=1.128%, center_edge_p99=12.43)! Check camera mat4LookAt (in column-major WebGL, basis ROWS go at m[0],m[4],m[8]=right; m[1],m[5],m[9]=up; m[2],m[6],m[10]=forward, NOT m[0..2]!) and verify ",
+      "summary": "",
+      "elapsed_s": 87.33,
+      "completion_tokens": 11125,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "EMPTY_OR_OFFCAMERA_3D_SCENE"
+      }
+    }
+  ]
+}

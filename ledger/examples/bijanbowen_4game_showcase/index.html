@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inkling-2-Mini 3-GPU Array + Verified Ledger — @bijanbowen 4-Game Showcase</title>
+<style>
+  :root { --bg:#080c14; --card:#101726; --border:#23324d; --accent:#58c4ff; --ok:#3fb950; --bad:#f85149; --text:#e6edf3; --muted:#9fb0c8; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; line-height:1.55; padding:32px; max-width:1440px; margin:0 auto; }
+  h1 { font-size:28px; margin-bottom:8px; color:#fff; }
+  h2 { font-size:20px; margin:28px 0 12px; color:var(--accent); border-bottom:1px solid var(--border); padding-bottom:6px; }
+  p.lead { color:var(--muted); margin-bottom:16px; max-width:1050px; }
+  .pills { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:24px; }
+  .pill { background:#162033; border:1px solid var(--border); border-radius:999px; padding:5px 14px; font-size:13px; color:#cfe3ff; }
+  .pill.ok { border-color:rgba(63,185,80,0.45); color:#8be99c; }
+  .badge { font-size:12px; background:#1e293b; border:1px solid #38bdf8; color:#7dd3fc; padding:2px 9px; border-radius:999px; margin-left:8px; vertical-align:middle; }
+  .grid { display:grid; grid-template-columns:1fr; gap:26px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:22px; }
+  .card-head { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px; }
+  .links { display:flex; flex-wrap:wrap; gap:10px; }
+  .btn { display:inline-block; padding:6px 12px; border-radius:8px; background:#1c2a42; border:1px solid #35507a; color:#dff0ff; text-decoration:none; font-size:13px; font-weight:600; }
+  .btn.primary { background:#1d4ed8; border-color:#3b82f6; color:#fff; }
+  .media-row { display:grid; grid-template-columns:1.15fr 1fr; gap:16px; margin-top:10px; align-items:start; }
+  @media (max-width:980px) { .media-row { grid-template-columns:1fr; } }
+  img, video { width:100%; border-radius:10px; border:1px solid var(--border); background:#000; display:block; }
+  table { width:100%; border-collapse:collapse; margin-top:14px; font-size:12.5px; }
+  th, td { border:1px solid var(--border); padding:7px 9px; text-align:left; vertical-align:top; }
+  th { background:#151f30; color:#b8d4f4; }
+  .ok-tag { color:var(--ok); font-weight:700; }
+  .bad-tag { color:var(--bad); font-weight:700; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; }
+</style>
+</head>
+<body>
+  <h1>Inkling-2-Mini 3-GPU Array + Shared Verified Ledger — @bijanbowen 4-Game Showcase</h1>
+  <p class="lead">
+    All four 3D WebGL2 games below were <strong>100% authored and self-repaired by local Inkling-2-Mini</strong> (zero hand-written target game code) running as a 3-archetype parallel tournament array (<em>Graphics Architect</em>, <em>Physics Engineer</em>, <em>VFX/Polish Director</em>) across 3 local NVIDIA Tesla V100 GPUs (<code>atlas-ingine</code> native C++ engine with speculative decoding + native vision tower, <strong>$0.00 cloud spend</strong>), sharing ONE SQLite <strong>Verified Ledger</strong> and verified by an automated headless Chromium WebGL2 state-machine inspector &amp; live gameplay oracle.
+  </p>
+  <div class="pills">
+    <span class='pill ok'>Isometric 4x4 Off-Road Driving Gam: 2.0 &rarr; 95.54/100</span><span class='pill ok'>3D Haunted Bowling Alley Horror Ga: 2.0 &rarr; 84.16/100</span><span class='pill ok'>3D Skate-to-GTA Open-City Sandbox : 2.0 &rarr; 92.23/100</span><span class='pill ok'>High-Speed Multiplayer 3D Arcade R: 2.0 &rarr; 100.0/100</span>
+    <span class="pill">Shared Ledger Winners: 4 | Linked Repairs: 4 | Logged Failures: 31</span>
+  </div>
+  <div class="grid">
+        <div class="card">
+          <div class="card-head">
+            <h3>Isometric 4x4 Off-Road Driving Game on a Live 5-Day Stock Price Curve 3D Terrain <span class="badge">vs Claude</span></h3>
+            <div class="links">
+              <a class="btn primary" href="01_stock_offroad_4x4/final_verified.html" target="_blank">Play Verified 3D Game</a>
+              
+              <a class="btn" href="01_stock_offroad_4x4/run_summary.json" target="_blank">Tournament Receipt</a>
+            </div>
+          </div>
+          <p class="lead">Stock 4x4 Off-Road PASS: dist_delta=51.54, prices=[121.07, 142.88, 166.09], max_pitch=0.2917, motion_mad=0.119, colors=479, entropy=4.01 | vision_qa=86/100</p>
+          <div class="media-row">
+            <div><img src="before_after_01_stock_offroad.png" alt="Isometric 4x4 Off-Road Driving Game on a Live 5-Day Stock Price Curve 3D Terrain Before/After"></div>
+            <div><video controls loop muted playsinline src="01_stock_offroad_4x4/stock_offroad_4x4_gameplay.mp4"></video></div>
+          </div>
+          <table>
+            <thead><tr><th>Round</th><th>Specialist</th><th>Result</th><th>Score</th><th>Host WebGL2 &amp; Live Playtest Oracle</th></tr></thead>
+            <tbody><tr><td class='mono'>R0</td><td class='mono'>stock_oneshot</td><td class='bad-tag'>FAIL</td><td class='mono'>2.0</td><td class='mono'>TOKEN_TRUNCATION: Stock one-shot hit max_tokens before closing &lt;/html&gt;.</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>12.0</td><td class='mono'>SHADER_COMPILE_ERROR: vertex shader compile error: ERROR: 0:2: &#x27;position&#x27; : undeclared identifier
+ERROR: 0:2: &#x27;xy&#x27; :  field selection requires structure, vector, or interface block</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>12.0</td><td class='mono'>SHADER_COMPILE_ERROR: vertex shader compile error: ERROR: 0:2: &#x27;position&#x27; : undeclared identifier
+ERROR: 0:2: &#x27;xy&#x27; :  field selection requires structure, vector, or interface block</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_polish</td><td class='bad-tag'>FAIL</td><td class='mono'>12.0</td><td class='mono'>SHADER_COMPILE_ERROR: vertex shader compile error: ERROR: 0:2: &#x27;position&#x27; : undeclared identifier
+ERROR: 0:2: &#x27;xy&#x27; :  field selection requires structure, vector, or interface block</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>12.0</td><td class='mono'>SHADER_COMPILE_ERROR: vertex shader compile error: ERROR: 0:7: &#x27;cameraPosition&#x27; : undeclared identifier
+</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_physics</td><td class='ok-tag'>PASS</td><td class='mono'>95.54</td><td class='mono'>Stock 4x4 Off-Road PASS: dist_delta=51.54, prices=[121.07, 142.88, 166.09], max_pitch=0.2917, motion_mad=0.119, colors=479, entropy=4.01 | vision_qa=86/100</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_polish</td><td class='ok-tag'>PASS</td><td class='mono'>94.55</td><td class='mono'>Stock 4x4 Off-Road PASS: dist_delta=53.02, prices=[123.97, 150.55, 183.9], max_pitch=0.2143, motion_mad=0.111, colors=374, entropy=3.93 | vision_qa=82/100</td></tr></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h3>3D Haunted Bowling Alley Horror Game with Rigid-Body 10-Pin Physics <span class="badge">vs GLM-5.4</span></h3>
+            <div class="links">
+              <a class="btn primary" href="02_bowling_horror_3d/final_verified.html" target="_blank">Play Verified 3D Game</a>
+              
+              <a class="btn" href="02_bowling_horror_3d/run_summary.json" target="_blank">Tournament Receipt</a>
+            </div>
+          </div>
+          <p class="lead">Bowling Horror 3D PASS: ball_dz=35.61, pins_knocked=2/10, score=0, motion_mad=0.010, colors=336, entropy=2.77 | vision_qa=82/100</p>
+          <div class="media-row">
+            <div><img src="before_after_02_bowling_horror.png" alt="3D Haunted Bowling Alley Horror Game with Rigid-Body 10-Pin Physics Before/After"></div>
+            <div><video controls loop muted playsinline src="02_bowling_horror_3d/bowling_horror_3d_gameplay.mp4"></video></div>
+          </div>
+          <table>
+            <thead><tr><th>Round</th><th>Specialist</th><th>Result</th><th>Score</th><th>Host WebGL2 &amp; Live Playtest Oracle</th></tr></thead>
+            <tbody><tr><td class='mono'>R0</td><td class='mono'>stock_oneshot</td><td class='bad-tag'>FAIL</td><td class='mono'>2.0</td><td class='mono'>TOKEN_TRUNCATION: Stock one-shot hit max_tokens before closing &lt;/html&gt;.</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>16.0</td><td class='mono'>WEBGL_RUNTIME_ERROR: WebGL gl.getError(): GL_INVALID_VALUE</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>6.0</td><td class='mono'>JS_PAGE_ERROR: Uncaught JS pageerror: Cannot access &#x27;aimTarget&#x27; before initialization</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_polish</td><td class='bad-tag'>FAIL</td><td class='mono'>16.0</td><td class='mono'>WEBGL_RUNTIME_ERROR: WebGL gl.getError(): GL_INVALID_OPERATION</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>2.0</td><td class='mono'>TOKEN_TRUNCATION: Hit max_tokens before closing &lt;/html&gt;.</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>25.0</td><td class='mono'>BLANK_OR_FLAT_3D_VIEW: 3D viewport looks blank or flat! image={&#x27;width&#x27;: 1280, &#x27;height&#x27;: 720, &#x27;distinct_colors_q16&#x27;: 124, &#x27;shannon_entropy&#x27;: 0.205, &#x27;mean_luma&#x27;: 5.86, &#x27;std_luma&#x27;: 6.</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_polish</td><td class='bad-tag'>FAIL</td><td class='mono'>42.0</td><td class='mono'>BOWLING_BALL_NOT_ROLLING: Charging/releasing Space did not launch the 3D bowling ball down the lane! ball_moved=True, max_z_delta=35.52, motion={&#x27;mad&#x27;: 0.00682, &#x27;changed_ratio&#x27;: 0.</td></tr><tr><td class='mono'>R3</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>42.0</td><td class='mono'>BOWLING_BALL_NOT_ROLLING: Charging/releasing Space did not launch the 3D bowling ball down the lane! ball_moved=True, max_z_delta=35.37, motion={&#x27;mad&#x27;: 0.00365, &#x27;changed_ratio&#x27;: 0.</td></tr><tr><td class='mono'>R3</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>6.0</td><td class='mono'>JS_PAGE_ERROR: Uncaught JS pageerror: Illegal return statement</td></tr><tr><td class='mono'>R3</td><td class='mono'>agent_polish</td><td class='ok-tag'>PASS</td><td class='mono'>82.09</td><td class='mono'>Bowling Horror 3D PASS: ball_dz=35.18, pins_knocked=2/10, score=2, motion_mad=0.005, colors=361, entropy=2.13 | vision_qa=78/100</td></tr><tr><td class='mono'>R4</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>34.0</td><td class='mono'>VISION_QA_DEFECT: Inkling-2-Mini native vision QA rejected rendered 3D scene (visual_score=62.0): Lane and ball are visible but white pins are not clearly distinguishable at the fa</td></tr><tr><td class='mono'>R4</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>34.0</td><td class='mono'>VISION_QA_DEFECT: Inkling-2-Mini native vision QA rejected rendered 3D scene (visual_score=58.0): Lane and ball are visible, but far-end pins are tiny/dark and not clearly white or</td></tr><tr><td class='mono'>R4</td><td class='mono'>agent_polish</td><td class='ok-tag'>PASS</td><td class='mono'>84.16</td><td class='mono'>Bowling Horror 3D PASS: ball_dz=35.61, pins_knocked=2/10, score=0, motion_mad=0.010, colors=336, entropy=2.77 | vision_qa=82/100</td></tr></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h3>3D Skate-to-GTA Open-City Sandbox (Tricks + Enter/Drive/Exit Cars) <span class="badge">vs GPT 6.2 Astra</span></h3>
+            <div class="links">
+              <a class="btn primary" href="03_skate_to_gta_city/final_verified.html" target="_blank">Play Verified 3D Game</a>
+              
+              <a class="btn" href="03_skate_to_gta_city/run_summary.json" target="_blank">Tournament Receipt</a>
+            </div>
+          </div>
+          <p class="lead">Skate-to-GTA 3D PASS: skate_dist=23.64, tricks=1, score=250, entered_car=True, car_dist=23.67, exited_to_skate=True, colors=305, entropy=3.37 | vision_qa=78/100</p>
+          <div class="media-row">
+            <div><img src="before_after_03_skate_to_gta.png" alt="3D Skate-to-GTA Open-City Sandbox (Tricks + Enter/Drive/Exit Cars) Before/After"></div>
+            <div><video controls loop muted playsinline src="03_skate_to_gta_city/skate_to_gta_city_gameplay.mp4"></video></div>
+          </div>
+          <table>
+            <thead><tr><th>Round</th><th>Specialist</th><th>Result</th><th>Score</th><th>Host WebGL2 &amp; Live Playtest Oracle</th></tr></thead>
+            <tbody><tr><td class='mono'>R0</td><td class='mono'>stock_oneshot</td><td class='bad-tag'>FAIL</td><td class='mono'>2.0</td><td class='mono'>TOKEN_TRUNCATION: Stock one-shot hit max_tokens before closing &lt;/html&gt;.</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>6.0</td><td class='mono'>JS_PAGE_ERROR: Uncaught JS pageerror: Maximum call stack size exceeded</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>6.0</td><td class='mono'>JS_PAGE_ERROR: Uncaught JS pageerror: Maximum call stack size exceeded</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_polish</td><td class='bad-tag'>FAIL</td><td class='mono'>6.0</td><td class='mono'>JS_PAGE_ERROR: Uncaught JS pageerror: Maximum call stack size exceeded</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>6.0</td><td class='mono'>JS_PAGE_ERROR: Uncaught JS pageerror: M.ramp is not a function</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>52.0</td><td class='mono'>CAR_ENTRY_BROKEN: Pressing F/E did not enter a nearby 3D drivable car (keep a hero sports car parked within quick reach of spawn or let F snap to nearest parked car within generous</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_polish</td><td class='bad-tag'>FAIL</td><td class='mono'>6.0</td><td class='mono'>JS_PAGE_ERROR: Uncaught JS pageerror: Maximum call stack size exceeded</td></tr><tr><td class='mono'>R3</td><td class='mono'>agent_graphics</td><td class='ok-tag'>PASS</td><td class='mono'>92.23</td><td class='mono'>Skate-to-GTA 3D PASS: skate_dist=23.64, tricks=1, score=250, entered_car=True, car_dist=23.67, exited_to_skate=True, colors=305, entropy=3.37 | vision_qa=78/100</td></tr><tr><td class='mono'>R3</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>2.0</td><td class='mono'>TOKEN_TRUNCATION: Hit max_tokens before closing &lt;/html&gt;.</td></tr><tr><td class='mono'>R3</td><td class='mono'>agent_polish</td><td class='bad-tag'>FAIL</td><td class='mono'>28.0</td><td class='mono'>EMPTY_OR_OFFCAMERA_3D_SCENE: 3D viewport center shows only smooth sky/background with almost zero visible 3D geometry edges (center_edge_pct=1.128%, center_edge_p99=12.43)! Check c</td></tr></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h3>High-Speed Multiplayer 3D Arcade Racer (2P Split-Screen + BroadcastChannel + AI Pack) <span class="badge">vs Gemini Carbon</span></h3>
+            <div class="links">
+              <a class="btn primary" href="04_multiplayer_3d_racing/final_verified.html" target="_blank">Play Verified 3D Game</a>
+              
+              <a class="btn" href="04_multiplayer_3d_racing/run_summary.json" target="_blank">Tournament Receipt</a>
+            </div>
+          </div>
+          <p class="lead">Multiplayer 3D Racing PASS: splitScreen=True, BroadcastChannel=True, P1_dist=54.43, P2_dist=60.98, AI=3, motion_mad=0.098, colors=647, entropy=5.31 | vision_qa=88/100</p>
+          <div class="media-row">
+            <div><img src="before_after_04_multiplayer_racing.png" alt="High-Speed Multiplayer 3D Arcade Racer (2P Split-Screen + BroadcastChannel + AI Pack) Before/After"></div>
+            <div><video controls loop muted playsinline src="04_multiplayer_3d_racing/multiplayer_3d_racing_gameplay.mp4"></video></div>
+          </div>
+          <table>
+            <thead><tr><th>Round</th><th>Specialist</th><th>Result</th><th>Score</th><th>Host WebGL2 &amp; Live Playtest Oracle</th></tr></thead>
+            <tbody><tr><td class='mono'>R0</td><td class='mono'>stock_oneshot</td><td class='bad-tag'>FAIL</td><td class='mono'>2.0</td><td class='mono'>TOKEN_TRUNCATION: Stock one-shot hit max_tokens before closing &lt;/html&gt;.</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>28.0</td><td class='mono'>EMPTY_OR_OFFCAMERA_3D_SCENE: 3D viewport center shows only smooth sky/background with almost zero visible 3D geometry edges (center_edge_pct=0.244%, center_edge_p99=2.77)! Check ca</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>6.0</td><td class='mono'>JS_PAGE_ERROR: Uncaught JS pageerror: Failed to execute &#x27;uniformMatrix4fv&#x27; on &#x27;WebGL2RenderingContext&#x27;: The provided value cannot be converted to a sequence.</td></tr><tr><td class='mono'>R1</td><td class='mono'>agent_polish</td><td class='bad-tag'>FAIL</td><td class='mono'>12.0</td><td class='mono'>SHADER_COMPILE_ERROR: vertex shader compile error: ERROR: 0:4: &#x27;varying&#x27; : Illegal use of reserved word
+</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_graphics</td><td class='bad-tag'>FAIL</td><td class='mono'>34.0</td><td class='mono'>VISION_QA_DEFECT: Inkling-2-Mini native vision QA rejected rendered 3D scene (visual_score=30.0): Right split-screen half is empty/black in all frames; only left half shows track a</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_physics</td><td class='bad-tag'>FAIL</td><td class='mono'>16.0</td><td class='mono'>WEBGL_RUNTIME_ERROR: WebGL gl.getError(): GL_INVALID_OPERATION, GL_INVALID_OPERATION</td></tr><tr><td class='mono'>R2</td><td class='mono'>agent_polish</td><td class='ok-tag'>PASS</td><td class='mono'>100.0</td><td class='mono'>Multiplayer 3D Racing PASS: splitScreen=True, BroadcastChannel=True, P1_dist=54.43, P2_dist=60.98, AI=3, motion_mad=0.098, colors=647, entropy=5.31 | vision_qa=88/100</td></tr></tbody>
+          </table>
+        </div></div>
+  <h2>Shared SQLite Verified Ledger (<code>verified_ledger_dump.json</code>)</h2>
+  <table>
+    <thead><tr><th>Error Signature</th><th>Verified Repair Rule (Cross-Agent / Cross-Game)</th><th>Hits</th></tr></thead>
+    <tbody>
+      <tr><td class='mono'>SHADER_COMPILE_ERROR</td><td class='mono'>Stock 4x4 Off-Road PASS: dist_delta=53.02, prices=[123.97, 150.55, 183.9], max_pitch=0.2143, motion_mad=0.111, colors=374, entropy=3.93 | vision_qa=82/100</td><td class='mono'>2</td></tr><tr><td class='mono'>BOWLING_BALL_NOT_ROLLING</td><td class='mono'>Bowling Horror 3D PASS: ball_dz=35.18, pins_knocked=2/10, score=2, motion_mad=0.005, colors=361, entropy=2.13 | vision_qa=78/100</td><td class='mono'>1</td></tr><tr><td class='mono'>CAR_ENTRY_BROKEN</td><td class='mono'>Skate-to-GTA 3D PASS: skate_dist=23.64, tricks=1, score=250, entered_car=True, car_dist=23.67, exited_to_skate=True, colors=305, entropy=3.37 | vision_qa=78/100</td><td class='mono'>1</td></tr><tr><td class='mono'>EMPTY_OR_OFFCAMERA_3D_SCENE</td><td class='mono'>Multiplayer 3D Racing PASS: splitScreen=True, BroadcastChannel=True, P1_dist=54.43, P2_dist=60.98, AI=3, motion_mad=0.098, colors=647, entropy=5.31 | vision_qa=88/100</td><td class='mono'>1</td></tr>
+    </tbody>
+  </table>
+</body>
+</html>

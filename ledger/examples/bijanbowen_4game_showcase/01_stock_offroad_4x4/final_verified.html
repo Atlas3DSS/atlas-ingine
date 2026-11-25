@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>BULL RUN 4x4</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:linear-gradient(180deg,#071f1a 0%,#0d3a2a 45%,#1a5c3a 70%,#c98a1e 100%);font-family:monospace;}
+  #gl{position:absolute;inset:0;width:100%;height:100%;display:block;}
+  #hud{position:absolute;top:10px;right:10px;background:rgba(4,20,14,.82);border:1px solid #2f6b4a;border-radius:8px;padding:8px;color:#d9ffe9;font-size:11px;width:250px;}
+  #hud h1{font-size:13px;margin:0 0 4px;color:#ffd24a;letter-spacing:1px;}
+  #chart{display:block;width:100%;height:110px;background:#061a12;border:1px solid #1d4a33;border-radius:4px;}
+  #stats{margin-top:5px;line-height:1.5;}
+  #title{position:absolute;top:10px;left:12px;color:#ffd24a;font-size:18px;letter-spacing:2px;text-shadow:0 2px 6px #000;}
+  #title small{display:block;color:#8fe6b0;font-size:10px;letter-spacing:1px;}
+  #controls{position:absolute;bottom:10px;left:12px;color:#cfeeda;font-size:11px;background:rgba(4,20,14,.7);padding:6px 10px;border-radius:6px;border:1px solid #2f6b4a;}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="title">BULL RUN 4x4<small>5-DAY STOCK TERRAIN // $ATLS</small></div>
+<div id="hud"><h1>$ATLS <span id="px">$118.00</span></h1><canvas id="chart" width="234" height="110"></canvas><div id="stats"></div></div>
+<div id="controls">&#8594;/D accelerate &nbsp; &#8592;/A brake &nbsp; SPACE boost &nbsp; R reset</div>
+<script>
+"use strict";
+// ---------- price curve ----------
+const DAYS=["MON","TUE","WED","THU","FRI"];
+const ANCH=[118,168,142,196,215];
+function priceAt(t){
+  t=Math.max(0,Math.min(1,t));
+  const d=t*4, i=Math.min(3,Math.floor(d)), f=d-i;
+  const s=f*f*(3-2*f);
+  let p=ANCH[i]+(ANCH[i+1]-ANCH[i])*s;
+  p+=Math.sin(t*38)*4.5+Math.sin(t*91+1.7)*2.6;
+  if(t>0.18&&t<0.22)p-=14; if(t>0.5&&t<0.56)p-=11; if(t>0.78&&t<0.82)p-=9;
+  return Math.max(112,Math.min(218,p));
+}
+const N=160, LEN=220, W=11;
+function terrainY(t){ return 2+(priceAt(t)-112)/(218-112)*15; }
+function priceAtX(x){ return priceAt(x/LEN); }
+function terrainYAtX(x){ return terrainY(x/LEN); }
+// ---------- GL ----------
+const canvas=document.getElementById('gl');
+const gl=canvas.getContext('webgl2',{alpha:true,antialias:true});
+const VSH=`#version 300 es
+in vec3 position; in vec3 normal; in vec3 color;
+uniform mat4 mvp;
+out vec3 vN; out vec3 vC;
+void main(){ vN=normal; vC=color; gl_Position=mvp*vec4(position,1.0); }`;
+const FSH=`#version 300 es
+precision mediump float;
+in vec3 vN; in vec3 vC;
+uniform vec3 lightDir; uniform float alpha;
+out vec4 fragColor;
+void main(){
+  vec3 n=normalize(vN);
+  float d=max(dot(n,normalize(lightDir)),0.0);
+  float rim=pow(1.0-max(dot(n,vec3(0.0,0.35,0.94)),0.0),2.0);
+  vec3 col=vC*(0.32+0.78*d)+vec3(1.0,0.82,0.35)*rim*0.22;
+  fragColor=vec4(col,alpha);
+}`;
+function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){console.error(gl.getShaderInfoLog(s));}return s;}
+const prog=gl.createProgram();
+gl.attachShader(prog,sh(gl.VERTEX_SHADER,VSH));gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FSH));
+gl.linkProgram(prog);gl.useProgram(prog);
+const aPos=gl.getAttribLocation(prog,'position'),aNor=gl.getAttribLocation(prog,'normal'),aCol=gl.getAttribLocation(prog,'color');
+const uMvp=gl.getUniformLocation(prog,'mvp'),uLight=gl.getUniformLocation(prog,'lightDir'),uAlpha=gl.getUniformLocation(prog,'alpha');
+gl.enable(gl.DEPTH_TEST);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+// ---------- geometry ----------
+function boxGeo(sx,sy,sz,c){
+  const x=sx/2,y=sy/2,z=sz/2;
+  const F=[[[1,0,0],[[x,-y,-z],[x,y,-z],[x,y,z],[x,-y,z]]],
+           [[-1,0,0],[[-x,-y,z],[-x,y,z],[-x,y,-z],[-x,-y,-z]]],
+           [[0,1,0],[[-x,y,-z],[x,y,-z],[x,y,z],[-x,y,z]]],
+           [[0,-1,0],[[-x,-y,z],[x,-y,z],[x,-y,-z],[-x,-y,-z]]],
+           [[0,0,1],[[-x,-y,z],[x,-y,z],[x,y,z],[-x,y,z]]],
+           [[0,0,-1],[[x,-y,-z],[-x,-y,-z],[-x,y,-z],[x,y,-z]]]];
+  const pos=[],nor=[],col=[],idx=[];
+  F.forEach((f,fi)=>{const n=f[0],v=f[1];
+    const base=pos.length/3;
+    v.forEach(p=>{pos.push(p[0],p[1],p[2]);nor.push(n[0],n[1],n[2]);col.push(c[0],c[1],c[2]);});
+    idx.push(base,base+1,base+2,base,base+2,base+3);});
+  return {pos:new Float32Array(pos),nor:new Float32Array(nor),col:new Float32Array(col),idx:new Uint16Array(idx)};
+}
+function makeMesh(g){
+  const o={n:g.idx.length};
+  o.vbo=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,o.vbo);gl.bufferData(gl.ARRAY_BUFFER,g.pos,gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer()); // placeholder replaced below
+  o.nbo=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,o.nbo);gl.bufferData(gl.ARRAY_BUFFER,g.nor,gl.STATIC_DRAW);
+  o.cbo=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,o.cbo);gl.bufferData(gl.ARRAY_BUFFER,g.col,gl.STATIC_DRAW);
+  o.ibo=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,o.ibo);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,g.idx,gl.STATIC_DRAW);
+  return o;
+}
+function drawMesh(m,mvp,alpha){
+  gl.uniformMatrix4fv(uMvp,false,mvp);gl.uniform1f(uAlpha,alpha);
+  gl.bindBuffer(gl.ARRAY_BUFFER,m.vbo);gl.enableVertexAttribArray(aPos);gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,m.nbo);gl.enableVertexAttribArray(aNor);gl.vertexAttribPointer(aNor,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,m.cbo);gl.enableVertexAttribArray(aCol);gl.vertexAttribPointer(aCol,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,m.ibo);gl.drawElements(gl.TRIANGLES,m.n,gl.UNSIGNED_SHORT,0);
+}
+// ---------- matrices ----------
+function m4Persp(fov,asp,n,f){const t=1/Math.tan(fov/2),nf=1/(n-f);
+  return new Float32Array([t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)*nf,-1, 0,0,2*f*n*nf,0]);}
+function m4LookAt(e,tg,up){
+  let f=[e[0]-tg[0],e[1]-tg[1],e[2]-tg[2]];let l=Math.hypot(...f);f=f.map(v=>v/l);
+  let r=[up[1]*f[2]-up[2]*f[1],up[2]*f[0]-up[0]*f[2],up[0]*f[1]-up[1]*f[0]];l=Math.hypot(...r);r=r.map(v=>v/l);
+  let u=[f[1]*r[2]-f[2]*r[1],f[2]*r[0]-f[0]*r[2],f[0]*r[1]-f[1]*r[0]];
+  return new Float32Array([r[0],u[0],f[0],0, r[1],u[1],f[1],0, r[2],u[2],f[2],0, -(r[0]*e[0]+r[1]*e[1]+r[2]*e[2]), -(u[0]*e[0]+u[1]*e[1]+u[2]*e[2]), -(f[0]*e[0]+f[1]*e[1]+f[2]*e[2]),1]);
+}
+function m4Mul(a,b){const o=new Float32Array(16);
+  for(let c=0;c<4;c++)for(let r=0;r<4;r++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o[c*4+r]=s;}return o;}
+function m4T(x,y,z){return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]);}
+function m4S(x,y,z){return new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]);}
+function m4RZ(a){const c=Math.cos(a),s=Math.sin(a);return new Float32Array([c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]);}
+function m4RY(a){const c=Math.cos(a),s=Math.sin(a);return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);}
+// ---------- static world ----------
+function buildTerrain(){
+  const cols=6, rows=N+1, pos=[],nor=[],col=[],idx=[];
+  for(let i=0;i<rows;i++){
+    const t=i/N, x=t*LEN, y=terrainY(t);
+    const slope=(terrainY(Math.min(1,t+0.01))-terrainY(Math.max(0,t-0.01)));
+    const bull=slope>=0;
+    const base=bull?[0.10,0.72,0.36]:[0.78,0.16,0.22];
+    for(let j=0;j<=cols;j++){
+      const z=(j/cols-0.5)*W;
+      pos.push(x,y,z);
+      const edge=Math.abs(j/cols-0.5)*2;
+      const shade=1.0-edge*0.35;
+      col.push(base[0]*shade,base[1]*shade,base[2]*shade);
+      nor.push(0,1,0);
+    }
+  }
+  for(let i=0;i<N;i++)for(let j=0;j<cols;j++){
+    const a=i*(cols+1)+j,b=a+1,c=a+cols+1,d=c+1;
+    idx.push(a,c,b,b,c,d);
+  }
+  // recompute normals
+  for(let i=0;i<rows;i++)for(let j=0;j<=cols;j++){
+    const i0=Math.max(0,i-1),i1=Math.min(N,i+1),j0=Math.max(0,j-1),j1=Math.min(cols,j+1);
+    const p=(ii,jj)=>[(ii/N)*LEN,terrainY(ii/N),(jj/cols-0.5)*W];
+    const A=p(i1,j),B=p(i0,j),C=p(i,j1),D=p(i,j0);
+    const dx=[A[0]-B[0],A[1]-B[1],A[2]-B[2]],dz=[C[0]-D[0],C[1]-D[1],C[2]-D[2]];
+    let n=[dz[1]*dx[2]-dz[2]*dx[1], dz[2]*dx[0]-dz[0]*dx[2], dz[0]*dx[1]-dz[1]*dx[0]];
+    let l=Math.hypot(...n)||1;n=n.map(v=>v/l);
+    if(n[1]<0)n=n.map(v=>-v);
+    const k=(i*(cols+1)+j)*3;nor[k]=n[0];nor[k+1]=n[1];nor[k+2]=n[2];
+  }
+  return {pos:new Float32Array(pos),nor:new Float32Array(nor),col:new Float32Array(col),idx:new Uint16Array(idx)};
+}
+const terrainMesh=makeMesh(buildTerrain());
+// floor
+const floorGeo=(()=>{const g=boxGeo(LEN+60,0.5,90,[0.05,0.16,0.11]);return g;})();
+const floorMesh=makeMesh(floorGeo);
+// grid lines
+function mergedBoxes(list){
+  const pos=[],nor=[],col=[],idx=[];let off=0;
+  list.forEach(b=>{
+    const g=boxGeo(b.sx,b.sy,b.sz,b.c);
+    for(let i=0;i<g.pos.length;i++){
+      if(i%3===0)g.pos[i]+=b.x; else if(i%3===1)g.pos[i]+=b.y; else g.pos[i]+=b.z;
+      pos.push(g.pos[i]);
+    }
+    for(let i=0;i<g.nor.length;i++)nor.push(g.nor[i]);
+    for(let i=0;i<g.col.length;i++)col.push(g.col[i]);
+    for(let i=0;i<g.idx.length;i++)idx.push(g.idx[i]+off);
+    off+=g.pos.length/3;
+  });
+  return {pos:new Float32Array(pos),nor:new Float32Array(nor),col:new Float32Array(col),idx:new Uint16Array(idx)};
+}
+const gridList=[];
+for(let x=0;x<=LEN;x+=10)gridList.push({x:x,y:0.05,z:0,sx:0.25,sy:0.08,sz:90,c:[0.12,0.38,0.24]});
+for(let z=-40;z<=40;z+=10)gridList.push({x:LEN/2,y:0.05,z:z,sx:LEN,sy:0.08,sz:0.25,c:[0.12,0.38,0.24]});
+const gridMesh=makeMesh(mergedBoxes(gridList));
+// candlestick pillars
+const pillarList=[];
+for(let i=0;i<=N;i+=8){
+  const t=i/N,x=t*LEN,y=terrainY(t),p=priceAt(t);
+  const bull=priceAt(Math.min(1,t+0.02))>=priceAt(Math.max(0,t-0.02));
+  const c=bull?[0.15,0.85,0.45]:[0.9,0.2,0.3];
+  const h=3+((i*7)%5);
+  pillarList.push({x:x,y:y+h/2-1,z:-(W/2+2.5),sx:1.6,sy:h,sz:1.6,c:c});
+  pillarList.push({x:x,y:y+h/2-1,z:(W/2+2.5),sx:1.6,sy:h,sz:1.6,c:c});
+}
+const pillarMesh=makeMesh(mergedBoxes(pillarList));
+// arches at day boundaries
+const archList=[];
+for(let d=1;d<5;d++){
+  const x=d/5*LEN,y=terrainY(d/5);
+  archList.push({x:x,y:y+4.5,z:-(W/2+1),sx:1.2,sy:9,sz:1.2,c:[1.0,0.78,0.25]});
+  archList.push({x:x,y:y+4.5,z:(W/2+1),sx:1.2,sy:9,sz:1.2,c:[1.0,0.78,0.25]});
+  archList.push({x:x,y:y+9,z:0,sx:1.2,sy:1.2,sz:W+3.4,c:[1.0,0.85,0.35]});
+}
+const archMesh=makeMesh(mergedBoxes(archList));
+// ramps
+const ramps=[{t:0.32,ang:0.42},{t:0.66,ang:0.5}];
+const rampMeshes=ramps.map(r=>{
+  const x=r.t*LEN,y=terrainY(r.t);
+  const g=boxGeo(7,0.6,W*0.7,[0.95,0.7,0.2]);
+  return {mesh:makeMesh(g),x:x,y:y+0.8,ang:r.ang};
+});
+// ---------- truck ----------
+const truckParts=[
+  {x:0,y:1.05,z:0,sx:3.1,sy:0.55,sz:1.7,c:[0.15,0.45,0.85]},       // chassis
+  {x:0.35,y:1.75,z:0,sx:1.7,sy:0.95,sz:1.5,c:[0.2,0.55,0.95]},     // cabin
+  {x:1.25,y:1.7,z:0,sx:0.35,sy:0.7,sz:1.3,c:[0.65,0.9,1.0]},       // windshield
+  {x:-0.55,y:2.35,z:0,sx:0.35,sy:0.7,sz:1.4,c:[0.1,0.12,0.15]},    // rollbar
+  {x:0.35,y:2.35,z:0,sx:1.3,sy:0.18,sz:1.45,c:[0.1,0.12,0.15]},    // roof bar
+  {x:0.35,y:2.55,z:0,sx:0.9,sy:0.22,sz:1.1,c:[1.0,0.9,0.3]},       // lightbar
+  {x:1.6,y:1.15,z:0.55,sx:0.15,sy:0.25,sz:0.4,c:[1.0,0.95,0.6]},   // headlight L
+  {x:1.6,y:1.15,z:-0.55,sx:0.15,sy:0.25,sz:0.4,c:[1.0,0.95,0.6]},  // headlight R
+  {x:-1.6,y:1.15,z:0.55,sx:0.12,sy:0.22,sz:0.4,c:[1.0,0.15,0.15]}, // taillight L
+  {x:-1.6,y:1.15,z:-0.55,sx:0.12,sy:0.22,sz:0.4,c:[1.0,0.15,0.15]} // taillight R
+];
+const truckMeshes=truckParts.map(p=>makeMesh(boxGeo(p.sx,p.sy,p.sz,p.c)));
+const wheelGeo=boxGeo(0.9,1.1,0.7,[0.08,0.08,0.1]);
+const wheelMesh=makeMesh(wheelGeo);
+const wheelHubGeo=boxGeo(0.95,0.4,0.75,[0.7,0.72,0.78]);
+const wheelHubMesh=makeMesh(wheelHubGeo);
+// ---------- state ----------
+const S={x:4,speed:0,vy:0,airY:0,grounded:true,pitch:0,checkpoints:0,score:0,boost:0,wheelRot:0,susp:[0,0,0,0]};
+const keys={};
+addEventListener('keydown',e=>{keys[e.code]=true;if(e.code==='Space')e.preventDefault();initAudio();});
+addEventListener('keyup',e=>{keys[e.code]=false;});
+addEventListener('keydown',e=>{if(e.code==='KeyR')reset();});
+function reset(){S.x=4;S.speed=0;S.vy=0;S.airY=0;S.grounded=true;S.checkpoints=0;S.score=0;S.boost=0;}
+// ---------- audio ----------
+let AC=null,engOsc=null,engGain=null;
+function initAudio(){
+  if(AC)return;
+  try{
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    engOsc=AC.createOscillator();engOsc.type='sawtooth';engOsc.frequency.value=70;
+    engGain=AC.createGain();engGain.gain.value=0.0;
+    const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=500;
+    engOsc.connect(f);f.connect(engGain);engGain.connect(AC.destination);engOsc.start();
+  }catch(e){}
+}
+// ---------- particles ----------
+const particles=[];
+function spawnParticles(){
+  for(let i=0;i<3;i++)particles.push({x:S.x-1.9,y:truckY()+1.0,z:(Math.random()-0.5)*0.8,vx:-4-Math.random()*3,vy:1+Math.random()*2,life:0.6});
+}
+// ---------- physics ----------
+function truckY(){return terrainYAtX(S.x)+1.35+S.airY;}
+let lastTime=performance.now();
+function update(dt){
+  const fwd=(keys['ArrowRight']||keys['KeyD'])?1:0;
+  const back=(keys['ArrowLeft']||keys['KeyA'])?1:0;
+  const boost=keys['Space']?1:0;
+  if(fwd)S.speed+=14*dt;
+  if(back)S.speed-=18*dt;
+  if(boost&&S.speed>-2){S.boost=Math.min(1,S.boost+dt*3);S.speed+=22*dt;spawnParticles();}
+  else S.boost=Math.max(0,S.boost-dt*2);
+  S.speed-=S.speed*0.55*dt; // drag
+  S.speed=Math.max(-8,Math.min(boost?34:26,S.speed));
+  S.x+=S.speed*dt;
+  if(S.x>LEN-2){S.x=LEN-2;S.speed=Math.min(S.speed,0);}
+  if(S.x<2){S.x=2;S.speed=Math.max(S.speed,0);}
+  // ramps
+  ramps.forEach(r=>{
+    const rx=r.t*LEN;
+    if(S.grounded&&Math.abs(S.x-rx)<1.2&&S.speed>4){S.vy=7.5;S.grounded=false;}
+  });
+  if(!S.grounded){
+    S.vy-=22*dt;S.airY+=S.vy*dt;
+    if(S.airY<=0){S.airY=0;S.grounded=true;S.vy=0;}
+  }
+  // checkpoints
+  const t=S.x/LEN,cp=Math.floor(t*5);
+  if(cp>S.checkpoints&&cp<5){S.checkpoints=cp;S.score+=500;}
+  S.score=Math.floor(S.x)+S.checkpoints*500;
+  // wheel rotation & suspension
+  S.wheelRot+=S.speed*dt*1.6;
+  const frontY=terrainYAtX(S.x+1.35),rearY=terrainYAtX(S.x-1.35);
+  const targetPitch=Math.atan2(frontY-rearY,2.7);
+  S.pitch+=(targetPitch-S.pitch)*Math.min(1,dt*8);
+  S.susp[0]=S.susp[0]*0.7+(frontY-terrainYAtX(S.x))*0.3;
+  S.susp[1]=S.susp[1]*0.7+(rearY-terrainYAtX(S.x))*0.3;
+  // particles
+  for(let i=particles.length-1;i>=0;i--){const p=particles[i];p.life-=dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy-=4*dt;if(p.life<=0)particles.splice(i,1);}
+  // audio
+  if(AC&&engGain){engGain.gain.value=0.03+Math.abs(S.speed)*0.002+S.boost*0.05;engOsc.frequency.value=60+Math.abs(S.speed)*5+S.boost*60;}
+}
+// ---------- render ----------
+function resize(){const d=Math.min(devicePixelRatio||1,2);canvas.width=innerWidth*d;canvas.height=innerHeight*d;gl.viewport(0,0,canvas.width,canvas.height);}
+addEventListener('resize',resize);resize();
+const lightDir=new Float32Array([0.5,1.0,0.35]);
+function frame(now){
+  const dt=Math.min(0.05,(now-lastTime)/1000);lastTime=now;
+  update(dt);
+  gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  const ty=truckY();
+  const eye=[S.x-17,ty+12.5,17],tgt=[S.x+6,ty+1,0];
+  const view=m4LookAt(eye,tgt,[0,1,0]);
+  const proj=m4Persp(0.62,canvas.width/canvas.height,0.1,400);
+  const mvp=m4Mul(proj,view);
+  gl.uniform3fv(uLight,lightDir);
+  // floor
+  drawMesh(floorMesh,m4Mul(mvp,m4T(LEN/2,-0.25,0)),1);
+  drawMesh(gridMesh,mvp,1);
+  drawMesh(terrainMesh,mvp,1);
+  drawMesh(pillarMesh,mvp,0.45);
+  drawMesh(archMesh,mvp,1);
+  rampMeshes.forEach(r=>{drawMesh(r.mesh,m4Mul(mvp,m4Mul(m4T(r.x,r.y,0),m4RZ(r.ang))),1);});
+  // truck
+  const bodyM=m4Mul(mvp,m4Mul(m4T(S.x,ty,0),m4RZ(S.pitch)));
+  truckMeshes.forEach((m,i)=>{const p=truckParts[i];drawMesh(m,m4Mul(bodyM,m4T(p.x,p.y,p.z)),1);});
+  // wheels
+  const offs=[[1.35,0.95],[1.35,-0.95],[-1.35,0.95],[-1.35,-0.95]];
+  const wy=[terrainYAtX(S.x+1.35),terrainYAtX(S.x+1.35),terrainYAtX(S.x-1.35),terrainYAtX(S.x-1.35)];
+  offs.forEach((o,i)=>{
+    const wx=S.x+o[0],wz=o[1];
+    const wy2=(S.grounded?wy[i]:terrainYAtX(wx))+0.55+S.airY;
+    const wm=m4Mul(mvp,m4Mul(m4T(wx,wy2,wz),m4Mul(m4RZ(S.pitch),m4RY(S.wheelRot))));
+    drawMesh(wheelMesh,wm,1);drawMesh(wheelHubMesh,wm,1);
+  });
+  // particles
+  const pMesh=makeMeshCache('p');
+  particles.forEach(p=>{
+    drawMesh(pMesh,m4Mul(mvp,m4Mul(m4T(p.x,p.y,p.z),m4S(p.life*0.8,p.life*0.8,p.life*0.8))),Math.min(1,p.life*1.6));
+  });
+  // HUD
+  updateHUD();
+  // telemetry
+  const t=S.x/LEN,price=priceAt(t);
+  window.__GAME_STATE__={state:'playing',distance:S.x,progressPct:t*100,currentPrice:price,speed:S.speed,truckX:S.x,truckY:ty,pitch:S.pitch,grounded:S.grounded,checkpoints:S.checkpoints,score:S.score};
+  requestAnimationFrame(frame);
+}
+const _pCache={};
+function makeMeshCache(k){if(!_pCache[k])_pCache[k]=makeMesh(boxGeo(1,1,1,[1.0,0.55,0.15]));return _pCache[k];}
+// ---------- HUD ----------
+const chart=document.getElementById('chart'),cctx=chart.getContext('2d');
+const stats=document.getElementById('stats'),pxEl=document.getElementById('px');
+function updateHUD(){
+  const t=S.x/LEN,price=priceAt(t);
+  const pct=(price-118)/118*100;
+  pxEl.textContent='$'+price.toFixed(2);
+  pxEl.style.color=pct>=0?'#4ade80':'#f87171';
+  const day=DAYS[Math.min(4,Math.floor(t*5))];
+  stats.innerHTML='DAY <b>'+day+'</b> &nbsp; CHK <b>'+S.checkpoints+'/4</b><br>SPEED <b>'+Math.abs(S.speed).toFixed(1)+'</b> &nbsp; SCORE <b>'+S.score+'</b><br>CHG <b style="color:'+(pct>=0?'#4ade80':'#f87171')+'">'+(pct>=0?'+':'')+pct.toFixed(1)+'%</b> &nbsp; SUSP <b>'+(S.grounded?'OK':'AIR')+'</b>';
+  cctx.clearRect(0,0,chart.width,chart.height);
+  cctx.strokeStyle='#1d4a33';cctx.strokeRect(0.5,0.5,chart.width-1,chart.height-1);
+  const pts=[];for(let i=0;i<=120;i++){const tt=i/120;pts.push([6+tt*(chart.width-12),chart.height-8-((priceAt(tt)-112)/(218-112))*(chart.height-16)]);}
+  cctx.beginPath();cctx.moveTo(pts[0][0],pts[0][1]);pts.forEach(p=>cctx.lineTo(p[0],p[1]));
+  cctx.strokeStyle='#ffd24a';cctx.lineWidth=2;cctx.stroke();
+  // day ticks
+  for(let d=1;d<5;d++){const x=6+(d/5)*(chart.width-12);cctx.strokeStyle='rgba(255,210,74,.35)';cctx.beginPath();cctx.moveTo(x,0);cctx.lineTo(x,chart.height);cctx.stroke();}
+  const cx=6+t*(chart.width-12),cy=chart.height-8-((price-112)/(218-112))*(chart.height-16);
+  cctx.fillStyle=price>=priceAt(Math.max(0,t-0.01))?'#4ade80':'#f87171';
+  cctx.beginPath();cctx.arc(cx,cy,4,0,7);cctx.fill();
+  cctx.strokeStyle='#fff';cctx.lineWidth=1;cctx.stroke();
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

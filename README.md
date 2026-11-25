@@ -449,7 +449,8 @@ updating ledgers. See [`ledger/README.md`](ledger/README.md), [`ledger/examples/
 and our end-to-end multimodal GPU-vision examples in [`ledger/examples/blender_celebration_hillclimb/`](ledger/examples/blender_celebration_hillclimb/README.md)
 (16-iteration Blender 4.5 LTS hillclimb on RTX PRO 6000 Blackwell with audited add/subtract Verified Ledger, 3-tier rolling
 context compression, and rendered 1080p MP4 showcase) and [`ledger/examples/webgl_self_repair_showcase/`](ledger/examples/webgl_self_repair_showcase/README.md)
-(side-by-side stock one-shot vs Verified Ledger + native vision self-repair across WebGL2 3D Gaussian Splatting, a 31-joint articulated 3D dragon, and a Playwright-playtested Atari arcade game on a single local V100).
+(side-by-side stock one-shot vs Verified Ledger + native vision self-repair across WebGL2 3D Gaussian Splatting, a 31-joint articulated 3D dragon, and a Playwright-playtested Atari arcade game on a single local V100) and [`ledger/examples/bijanbowen_4game_showcase/`](ledger/examples/bijanbowen_4game_showcase/README.md)
+(4 playable pure-WebGL2 3D games — isometric 4×4 stock terrain, haunted 3D bowling, skate-to-GTA city sandbox, and 2P split-screen multiplayer racer — authored and self-repaired locally by a 3-archetype Inkling-2-Mini array across 3 Tesla V100 GPUs sharing one Verified Ledger and native vision QA).
 
 ## Related: `Atlas3DSS/atlas-engine`
 

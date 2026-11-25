@@ -1,0 +1,297 @@
+{
+  "game_kind": "bowling_horror_3d",
+  "task_id": "bijan_02_bowling_horror_3d",
+  "title": "3D Haunted Bowling Alley Horror Game with Rigid-Body 10-Pin Physics",
+  "rival": "GLM-5.4",
+  "solved": true,
+  "attempt0_passed": false,
+  "attempt0_score": 2.0,
+  "attempt0_error": "TOKEN_TRUNCATION",
+  "champion": "round_04/agent_polish",
+  "best_score": 84.16,
+  "champion_summary": "Bowling Horror 3D PASS: ball_dz=35.61, pins_knocked=2/10, score=0, motion_mad=0.010, colors=336, entropy=2.77 | vision_qa=82/100",
+  "stop_reason": "converged_verified_champion",
+  "total_candidates": 13,
+  "ledger_stats": {
+    "db_path": "/home/orwel/dev_genius/experiments/kernals/results/bijanbowen_showcase_854/verified_ledger.sqlite",
+    "env_version": "v1_bijan_array_webgl2",
+    "active_facts": 5,
+    "stale_facts": 0,
+    "active_winners": 2,
+    "stale_winners": 0,
+    "active_repairs": 2,
+    "failures_logged": 16,
+    "drift_events": 0
+  },
+  "records": [
+    {
+      "round": 0,
+      "agent_id": "stock_oneshot",
+      "ok": false,
+      "score": 2.0,
+      "error_signature": "TOKEN_TRUNCATION",
+      "error_detail": "Stock one-shot hit max_tokens before closing </html>.",
+      "summary": "",
+      "elapsed_s": 167.63,
+      "completion_tokens": 16384,
+      "finish_reason": "length",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "TOKEN_TRUNCATION"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 16.0,
+      "error_signature": "WEBGL_RUNTIME_ERROR",
+      "error_detail": "WebGL gl.getError(): GL_INVALID_VALUE",
+      "summary": "",
+      "elapsed_s": 109.74,
+      "completion_tokens": 13362,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "WEBGL_RUNTIME_ERROR"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 6.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught JS pageerror: Cannot access 'aimTarget' before initialization",
+      "summary": "",
+      "elapsed_s": 121.01,
+      "completion_tokens": 14075,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      }
+    },
+    {
+      "round": 1,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": false,
+      "score": 16.0,
+      "error_signature": "WEBGL_RUNTIME_ERROR",
+      "error_detail": "WebGL gl.getError(): GL_INVALID_OPERATION",
+      "summary": "",
+      "elapsed_s": 105.6,
+      "completion_tokens": 12982,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "WEBGL_RUNTIME_ERROR"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 2.0,
+      "error_signature": "TOKEN_TRUNCATION",
+      "error_detail": "Hit max_tokens before closing </html>.",
+      "summary": "",
+      "elapsed_s": 130.8,
+      "completion_tokens": 16384,
+      "finish_reason": "length",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "TOKEN_TRUNCATION"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 25.0,
+      "error_signature": "BLANK_OR_FLAT_3D_VIEW",
+      "error_detail": "3D viewport looks blank or flat! image={'width': 1280, 'height': 720, 'distinct_colors_q16': 124, 'shannon_entropy': 0.205, 'mean_luma': 5.86, 'std_luma': 6.2, 'center_std_luma': 2.57, 'center_p95_luma': 5.34, 'center_p95_chroma': 3.0, 'center_edge_pct': 0.136, 'center_edge_p99': 2.05}",
+      "summary": "",
+      "elapsed_s": 140.5,
+      "completion_tokens": 13744,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "BLANK_OR_FLAT_3D_VIEW"
+      }
+    },
+    {
+      "round": 2,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": false,
+      "score": 42.0,
+      "error_signature": "BOWLING_BALL_NOT_ROLLING",
+      "error_detail": "Charging/releasing Space did not launch the 3D bowling ball down the lane! ball_moved=True, max_z_delta=35.52, motion={'mad': 0.00682, 'changed_ratio': 0.0476}",
+      "summary": "",
+      "elapsed_s": 99.01,
+      "completion_tokens": 12866,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "BOWLING_BALL_NOT_ROLLING"
+      }
+    },
+    {
+      "round": 3,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 42.0,
+      "error_signature": "BOWLING_BALL_NOT_ROLLING",
+      "error_detail": "Charging/releasing Space did not launch the 3D bowling ball down the lane! ball_moved=True, max_z_delta=35.37, motion={'mad': 0.00365, 'changed_ratio': 0.0224}",
+      "summary": "",
+      "elapsed_s": 99.78,
+      "completion_tokens": 12878,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "BOWLING_BALL_NOT_ROLLING"
+      }
+    },
+    {
+      "round": 3,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 6.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught JS pageerror: Illegal return statement",
+      "summary": "",
+      "elapsed_s": 136.93,
+      "completion_tokens": 13310,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      }
+    },
+    {
+      "round": 3,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": true,
+      "score": 82.09,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "Bowling Horror 3D PASS: ball_dz=35.18, pins_knocked=2/10, score=2, motion_mad=0.005, colors=361, entropy=2.13 | vision_qa=78/100",
+      "elapsed_s": 94.31,
+      "completion_tokens": 12322,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": true,
+        "failure_logged": false
+      }
+    },
+    {
+      "round": 4,
+      "agent_id": "agent_graphics",
+      "archetype": "Graphics & WebGL2 Shader Architect",
+      "gpu_port": 18604,
+      "ok": false,
+      "score": 34.0,
+      "error_signature": "VISION_QA_DEFECT",
+      "error_detail": "Inkling-2-Mini native vision QA rejected rendered 3D scene (visual_score=62.0): Lane and ball are visible but white pins are not clearly distinguishable at the far end",
+      "summary": "",
+      "elapsed_s": 100.12,
+      "completion_tokens": 13138,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "VISION_QA_DEFECT"
+      }
+    },
+    {
+      "round": 4,
+      "agent_id": "agent_physics",
+      "archetype": "3D Physics & Gameplay Systems Engineer",
+      "gpu_port": 18605,
+      "ok": false,
+      "score": 34.0,
+      "error_signature": "VISION_QA_DEFECT",
+      "error_detail": "Inkling-2-Mini native vision QA rejected rendered 3D scene (visual_score=58.0): Lane and ball are visible, but far-end pins are tiny/dark and not clearly white or pin-like.",
+      "summary": "",
+      "elapsed_s": 103.26,
+      "completion_tokens": 13332,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "VISION_QA_DEFECT"
+      }
+    },
+    {
+      "round": 4,
+      "agent_id": "agent_polish",
+      "archetype": "Visual Polish, Atmosphere & VFX Director",
+      "gpu_port": 18606,
+      "ok": true,
+      "score": 84.16,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "Bowling Horror 3D PASS: ball_dz=35.61, pins_knocked=2/10, score=0, motion_mad=0.010, colors=336, entropy=2.77 | vision_qa=82/100",
+      "elapsed_s": 101.61,
+      "completion_tokens": 13099,
+      "finish_reason": "stop",
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": false,
+        "failure_logged": false
+      }
+    }
+  ]
+}
