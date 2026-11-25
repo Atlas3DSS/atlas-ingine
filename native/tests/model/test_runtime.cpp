@@ -10,6 +10,7 @@
 // gate equal the plain file, a gate that is never reached equals no ablation, a reachable one differs.
 #include "common/test_util.h"
 #include "core/fixture.h"
+#include "core/hal.h"
 
 #include "kernels/dense/dense.h"
 #include "model/model_kernels.h"
@@ -160,6 +161,45 @@ Weights synthetic_weights(cudaStream_t stream) {
   INGINE_TEST_CUDA(cudaMemcpyAsync(sc, used.scale.data, std::size_t(kVocab) * 4, cudaMemcpyDeviceToDevice, stream));
   INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
   w.unembed = Dense{rm(q, DType::FP8_E4M3FN, {UNPADDED_VOCAB, H}), rm(sc, DType::FP32, {UNPADDED_VOCAB})};
+  return w;
+}
+
+Weights synthetic_weights_q4_equiv(cudaStream_t stream, bool packed_q4) {
+  Weights w = synthetic_weights(stream);
+  Rng rng(177);
+  constexpr float kScale = 0.0625f;
+  const std::uint16_t scale_bits = ingine::act::host_float_to_fp16_bits(kScale);
+  if (packed_q4) {
+    std::vector<std::uint8_t> packed(std::size_t(kVocab) * EMBED_Q4_ROW_BYTES, 0);
+    for (int r = 0; r < kVocab; ++r) {
+      std::uint8_t* dst = packed.data() + std::size_t(r) * EMBED_Q4_ROW_BYTES;
+      for (int j = 0; j < H; j += 2) {
+        const std::uint8_t q0 = static_cast<std::uint8_t>(rng.next() & 0xfu);
+        const std::uint8_t q1 = static_cast<std::uint8_t>(rng.next() & 0xfu);
+        dst[j >> 1] = static_cast<std::uint8_t>(q0 | (q1 << 4));
+      }
+      for (int b = 0; b < H / 32; ++b) {
+        std::memcpy(dst + EMBED_Q4_NIBBLE_BYTES + std::size_t(b) * 2, &scale_bits, 2);
+      }
+    }
+    w.storage.emplace_back(packed.size());
+    w.storage.back().copy_from_host(packed.data(), packed.size());
+    w.embed = rm(w.storage.back().p, DType::U8, {kVocab, EMBED_Q4_ROW_BYTES});
+  } else {
+    std::vector<ingine::ActT> dense_emb(std::size_t(kVocab) * H);
+    for (int r = 0; r < kVocab; ++r) {
+      ingine::ActT* dst = dense_emb.data() + std::size_t(r) * H;
+      for (int j = 0; j < H; j += 2) {
+        const std::uint8_t q0 = static_cast<std::uint8_t>(rng.next() & 0xfu);
+        const std::uint8_t q1 = static_cast<std::uint8_t>(rng.next() & 0xfu);
+        dst[j] = float_to_bf16((float(q0) - 8.0f) * kScale);
+        dst[j + 1] = float_to_bf16((float(q1) - 8.0f) * kScale);
+      }
+    }
+    w.storage.emplace_back(dense_emb.size() * sizeof(ingine::ActT));
+    w.storage.back().copy_from_host(dense_emb.data(), dense_emb.size() * sizeof(ingine::ActT));
+    w.embed = rm(w.storage.back().p, ingine::kActDType, {kVocab, H});
+  }
   return w;
 }
 
@@ -373,7 +413,7 @@ bool run(bool kv_fp8) {
     std::copy(vw.begin(), vw.end(), widths.w);
     GraphExec verify = rt.capture_switch(
         [&](cudaStream_t cs, cudaGraphConditionalHandle h) {
-          width_select(static_cast<const std::int32_t*>(width.p), widths, h, cs);
+          return width_select(static_cast<const std::int32_t*>(width.p), widths, h, cs);
         },
         [&](cudaStream_t cs, int m) {
           rt.record_save_verify(m, cs);
@@ -478,13 +518,13 @@ bool run(bool kv_fp8) {
     auto mark = [&](cudaStream_t cs, int m) { INGINE_TEST_CUDA(cudaMemsetAsync(marker.p, m, 1, cs)); };
     GraphExec select = rt.capture_switch(
         [&](cudaStream_t cs, cudaGraphConditionalHandle h) {
-          verify_select(static_cast<const float*>(conf.p), static_cast<const std::int32_t*>(drafts.p), 0.8f, widths,
-                        rt.tokens(), static_cast<std::int32_t*>(m_out.p), h, cs);
+          return verify_select(static_cast<const float*>(conf.p), static_cast<const std::int32_t*>(drafts.p), 0.8f,
+                               widths, rt.tokens(), static_cast<std::int32_t*>(m_out.p), h, cs);
         },
         mark);
     GraphExec by_width = rt.capture_switch(
         [&](cudaStream_t cs, cudaGraphConditionalHandle h) {
-          width_select(static_cast<const std::int32_t*>(m_in.p), widths, h, cs);
+          return width_select(static_cast<const std::int32_t*>(m_in.p), widths, h, cs);
         },
         mark);
     const std::int32_t d[7] = {101, 102, 103, 104, 105, 106, 107};
@@ -1069,6 +1109,362 @@ bool run_persona_hooks() {
   return ok;
 }
 
+bool run_switch_error_and_fallback_tests() {
+  bool ok = true;
+  // Verify classifier covers 12.8+ driver/PTX SWITCH errors without #ifdef constant-masking bugs.
+  const bool cls_ok = is_conditional_switch_unsupported_error(cudaErrorCallRequiresNewerDriver) &&
+                      is_conditional_switch_unsupported_error(cudaErrorUnsupportedPtxVersion) &&
+                      is_conditional_switch_unsupported_error(cudaErrorNotSupported) &&
+                      is_conditional_switch_unsupported_error(cudaErrorInsufficientDriver) &&
+                      is_conditional_switch_unsupported_error(cudaErrorNotPermitted) &&
+                      is_conditional_switch_unsupported_error(cudaErrorOperatingSystem) &&
+                      !is_conditional_switch_unsupported_error(cudaSuccess) &&
+                      !is_conditional_switch_unsupported_error(cudaErrorMemoryAllocation) &&
+                      !is_conditional_switch_unsupported_error(cudaErrorIllegalAddress) &&
+                      !is_conditional_switch_unsupported_error(cudaErrorInvalidValue);
+  ok &= report(cls_ok, "conditional SWITCH unsupported error classifier handles enum constants");
+
+  struct ResetInjectGuard {
+    ~ResetInjectGuard() { fail_next_switch_capture(cudaSuccess); }
+  } guard;
+
+  const bool hal_switch_ok = hal::conditional_graphs_enabled(0);
+  if (!hal_switch_ok) {
+    std::printf("INFO conditional graphs disabled/unsupported by HAL; skipping induced capture injection\n");
+    return ok;
+  }
+
+  for (const cudaError_t injected : {cudaErrorCallRequiresNewerDriver, cudaErrorUnsupportedPtxVersion}) {
+    reset_spec_execution_counters();
+    RuntimeOptions opt;
+    opt.max_ctx = 512;
+    opt.prefill_chunk = 64;
+    opt.kv_fp8 = true;
+    opt.spec = true;
+    cudaStream_t s0 = nullptr;
+    INGINE_TEST_CUDA(cudaStreamCreate(&s0));
+    Weights w = synthetic_weights(s0);
+    Runtime rt(opt, std::move(w), load_ablation({}));
+    INGINE_TEST_CUDA(cudaStreamDestroy(s0));
+
+    DeviceBuffer width(sizeof(std::int32_t));
+    const std::span<const int> vw = rt.verify_widths();
+    Widths widths;
+    widths.n = int(vw.size());
+    std::copy(vw.begin(), vw.end(), widths.w);
+
+    cudaStream_t captured_stream = nullptr;
+    fail_next_switch_capture(injected);
+    GraphExec exec = rt.try_capture_switch(
+        [&](cudaStream_t cs, cudaGraphConditionalHandle h) {
+          captured_stream = cs;
+          return width_select(static_cast<const std::int32_t*>(width.p), widths, h, cs);
+        },
+        [&](cudaStream_t cs, int m) {
+          (void)cs;
+          (void)m;
+        });
+
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    const cudaError_t cap_q = captured_stream ? cudaStreamIsCapturing(captured_stream, &cap_status) : cudaSuccess;
+    const SpecExecutionCounters cnt = spec_execution_counters();
+    const bool probe_after = !exec && !rt.supports_conditional_graphs() && !rt.has_verify_graph() &&
+                             cnt.switch_capture_fallbacks == 1 && cap_q == cudaSuccess &&
+                             cap_status == cudaStreamCaptureStatusNone && cudaGetLastError() == cudaSuccess;
+    reset_state(rt.state(), rt.stream());
+    rt.decode_logits(1, 0);
+    const bool eager_ok = finite(logits_row(rt, 1, 0));
+    ok &= report(probe_after && eager_ok,
+                 std::string("induced SWITCH failure after HAL probe falls back cleanly (") +
+                     cudaGetErrorName(injected) + ")");
+  }
+
+  // Non-recoverable CUDA errors must still surface rather than downgrading to eager fallback.
+  {
+    reset_spec_execution_counters();
+    RuntimeOptions opt;
+    opt.max_ctx = 512;
+    opt.prefill_chunk = 64;
+    opt.kv_fp8 = true;
+    opt.spec = true;
+    cudaStream_t s0 = nullptr;
+    INGINE_TEST_CUDA(cudaStreamCreate(&s0));
+    Weights w = synthetic_weights(s0);
+    Runtime rt(opt, std::move(w), load_ablation({}));
+    INGINE_TEST_CUDA(cudaStreamDestroy(s0));
+
+    DeviceBuffer width(sizeof(std::int32_t));
+    Widths widths;
+    const std::span<const int> vw = rt.verify_widths();
+    widths.n = int(vw.size());
+    std::copy(vw.begin(), vw.end(), widths.w);
+
+    bool threw = false;
+    fail_next_switch_capture(cudaErrorMemoryAllocation);
+    try {
+      (void)rt.try_capture_switch(
+          [&](cudaStream_t cs, cudaGraphConditionalHandle h) {
+            return width_select(static_cast<const std::int32_t*>(width.p), widths, h, cs);
+          },
+          [&](cudaStream_t cs, int m) {
+            (void)cs;
+            (void)m;
+          });
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    (void)cudaGetLastError();
+    const SpecExecutionCounters cnt = spec_execution_counters();
+    ok &= report(threw && rt.supports_conditional_graphs() && cnt.switch_capture_fallbacks == 0,
+                 "non-recoverable CUDA error during try_capture_switch rethrows");
+  }
+  return ok;
+}
+
+template <class Ex, class Fn>
+bool expect_throws(Fn&& fn) {
+  try {
+    fn();
+  } catch (const Ex&) {
+    return true;
+  }
+  return false;
+}
+
+bool run_batch_admission_and_q4() {
+  bool ok = true;
+  RuntimeOptions opt;
+  opt.max_ctx = 512;
+  opt.prefill_chunk = 64;
+  opt.kv_fp8 = true;
+  opt.max_batch = 4;
+  opt.max_kv_tokens = 2048;
+
+  const std::vector<std::int32_t> p0 = {1, 2, 3, 4, 5, 6, 7, 8};
+  const std::vector<std::int32_t> p1 = {9, 10, 11, 12, 13, 14, 15, 16};
+  const std::vector<std::int32_t> bad_high = {1, VOCAB};
+  const std::vector<std::int32_t> bad_neg = {1, -1};
+  const std::vector<std::int32_t> forced_bad_high = {5, VOCAB};
+  const std::vector<std::int32_t> forced_bad_neg = {5, -1};
+  Sampling greedy;
+  greedy.temperature = 0.f;
+
+  auto collect_gen = [](Generator& g, std::span<const std::int32_t> prompt, int max_new, const Sampling& sp) {
+    std::vector<std::int32_t> out;
+    g.generate(prompt, max_new, sp, {}, [&](std::span<const std::int32_t> t) {
+      out.insert(out.end(), t.begin(), t.end());
+      return true;
+    });
+    return out;
+  };
+
+  // Capture clean reference outputs first so peak VRAM never holds two full synthetic models at once.
+  std::int32_t ref_f0 = -1, ref_f1 = -1;
+  std::vector<std::int32_t> ref_step(2, -1);
+  {
+    cudaStream_t s0 = nullptr;
+    INGINE_TEST_CUDA(cudaStreamCreate(&s0));
+    Weights w = synthetic_weights(s0);
+    INGINE_TEST_CUDA(cudaStreamDestroy(s0));
+    auto bref = make_generator(opt, std::move(w), load_ablation({}));
+    GenerateStats st0, st1;
+    const int r0 = bref->start_slot(Prompt{p0, {}}, 8, greedy, ref_f0, st0);
+    const int r1 = bref->start_slot(Prompt{p1, {}}, 8, greedy, ref_f1, st1);
+    const BatchSlotStep ref_steps[2] = {{r0, ref_f0}, {r1, ref_f1}};
+    bref->step_slots(ref_steps, ref_step);
+    bref->release_slot(r0);
+    bref->release_slot(r1);
+  }
+
+  // Test BatchGenerator admission via make_generator(max_batch > 1).
+  {
+    cudaStream_t s0 = nullptr;
+    INGINE_TEST_CUDA(cudaStreamCreate(&s0));
+    Weights w = synthetic_weights(s0);
+    INGINE_TEST_CUDA(cudaStreamDestroy(s0));
+    auto bgen = make_generator(opt, std::move(w), load_ablation({}));
+    bool batch_check = bgen->max_batch_size() == 4;
+
+    Sampling bad_fhi = greedy;
+    bad_fhi.forced = forced_bad_high;
+    Sampling bad_flo = greedy;
+    bad_flo.forced = forced_bad_neg;
+
+    batch_check &= expect_throws<std::out_of_range>([&] { (void)collect_gen(*bgen, bad_high, 4, greedy); });
+    batch_check &= expect_throws<std::invalid_argument>([&] { (void)collect_gen(*bgen, bad_neg, 4, greedy); });
+    batch_check &= expect_throws<std::out_of_range>([&] { (void)collect_gen(*bgen, p0, 4, bad_fhi); });
+    batch_check &= expect_throws<std::out_of_range>([&] { (void)collect_gen(*bgen, p0, 4, bad_flo); });
+    const auto post_gen = collect_gen(*bgen, p0, 4, greedy);
+    batch_check &= post_gen.size() == 4 && post_gen[0] == ref_f0 && post_gen[0] >= 0 && post_gen[0] < kVocab;
+    ok &= report(batch_check, "BatchGenerator::generate rejects OOB prompt/forced tokens and recovers cleanly");
+
+    // start_slot rejection must leak zero slots (all max_batch slots remain available afterwards).
+    std::int32_t dummy_tok = -1;
+    GenerateStats dummy_st;
+    bool slot_check = expect_throws<std::out_of_range>(
+        [&] { (void)bgen->start_slot(Prompt{bad_high, {}}, 4, greedy, dummy_tok, dummy_st); });
+    slot_check &= expect_throws<std::invalid_argument>(
+        [&] { (void)bgen->start_slot(Prompt{bad_neg, {}}, 4, greedy, dummy_tok, dummy_st); });
+    slot_check &= expect_throws<std::out_of_range>(
+        [&] { (void)bgen->start_slot(Prompt{p0, {}}, 4, bad_fhi, dummy_tok, dummy_st); });
+    slot_check &= expect_throws<std::out_of_range>(
+        [&] { (void)bgen->start_slot(Prompt{p0, {}}, 4, bad_flo, dummy_tok, dummy_st); });
+    std::vector<int> all_slots;
+    for (int i = 0; i < 4; ++i) {
+      std::int32_t tok = -1;
+      GenerateStats st;
+      const int s = bgen->start_slot(Prompt{p0, {}}, 4, greedy, tok, st);
+      slot_check &= (s >= 0 && tok == ref_f0);
+      if (s >= 0) all_slots.push_back(s);
+    }
+    slot_check &= bgen->start_slot(Prompt{p0, {}}, 4, greedy, dummy_tok, dummy_st) == -1;
+    for (int s : all_slots) bgen->release_slot(s);
+    ok &= report(slot_check, "BatchGenerator::start_slot rejects OOB tokens without leaking slots");
+
+    // step_slots must validate the whole batch before mutating any slot state.
+    std::int32_t f0 = -1, f1 = -1;
+    GenerateStats s0_st, s1_st;
+    const int s0_id = bgen->start_slot(Prompt{p0, {}}, 8, greedy, f0, s0_st);
+    const int s1_id = bgen->start_slot(Prompt{p1, {}}, 8, greedy, f1, s1_st);
+    bool step_atomic = (s0_id >= 0 && s1_id >= 0 && f0 == ref_f0 && f1 == ref_f1);
+    std::vector<std::int32_t> out_step(2, -999);
+    const BatchSlotStep bad_hi_step[2] = {{s0_id, f0}, {s1_id, VOCAB}};
+    const BatchSlotStep bad_lo_step[2] = {{s0_id, f0}, {s1_id, -1}};
+    const BatchSlotStep dup_slot_step[2] = {{s0_id, f0}, {s0_id, f0}};
+    const BatchSlotStep bad_slot_step[2] = {{s0_id, f0}, {99, f1}};
+    step_atomic &= expect_throws<std::out_of_range>([&] { bgen->step_slots(bad_hi_step, out_step); });
+    step_atomic &= expect_throws<std::out_of_range>([&] { bgen->step_slots(bad_lo_step, out_step); });
+    step_atomic &= expect_throws<std::invalid_argument>([&] { bgen->step_slots(dup_slot_step, out_step); });
+    step_atomic &= expect_throws<std::invalid_argument>([&] { bgen->step_slots(bad_slot_step, out_step); });
+
+    const BatchSlotStep good_step[2] = {{s0_id, f0}, {s1_id, f1}};
+    bgen->step_slots(good_step, out_step);
+    step_atomic &= (out_step == ref_step);
+    bgen->release_slot(s0_id);
+    bgen->release_slot(s1_id);
+    const auto after_atomic = collect_gen(*bgen, p1, 4, greedy);
+    step_atomic &= after_atomic.size() == 4 && after_atomic[0] == ref_f1;
+    ok &= report(step_atomic, "BatchGenerator::step_slots validates atomically and preserves clean recovery");
+  }
+
+  // Packed Q4_0 embeddings through make_generator(max_batch=1) and make_generator(max_batch=4)
+  // vs bit-exact dequantized BF16 BatchGenerator reference.
+  {
+    const std::vector<std::int32_t> qp0 = {1, 2, 3, 4, 5, 6, 7, 4090};
+    const std::vector<std::int32_t> qp1 = {9, 10, 11, 12, 13, 14, 15, 4091};
+
+    std::vector<std::int32_t> q4_b1_p0, q4_b1_p1;
+    {
+      RuntimeOptions opt1 = opt;
+      opt1.max_batch = 1;
+      opt1.max_kv_tokens = 0;
+      cudaStream_t s0 = nullptr;
+      INGINE_TEST_CUDA(cudaStreamCreate(&s0));
+      Weights w = synthetic_weights_q4_equiv(s0, /*packed_q4=*/true);
+      INGINE_TEST_CUDA(cudaStreamDestroy(s0));
+      auto gen1 = make_generator(opt1, std::move(w), load_ablation({}));
+      q4_b1_p0 = collect_gen(*gen1, qp0, 5, greedy);
+      q4_b1_p1 = collect_gen(*gen1, qp1, 5, greedy);
+    }
+
+    std::vector<std::int32_t> bf16_b4_p0, bf16_b4_p1, bf16_got0, bf16_got1;
+    {
+      cudaStream_t s0 = nullptr;
+      INGINE_TEST_CUDA(cudaStreamCreate(&s0));
+      Weights wb = synthetic_weights_q4_equiv(s0, /*packed_q4=*/false);
+      INGINE_TEST_CUDA(cudaStreamDestroy(s0));
+      auto bgen_bf16 = make_generator(opt, std::move(wb), load_ablation({}));
+      bf16_b4_p0 = collect_gen(*bgen_bf16, qp0, 5, greedy);
+      bf16_b4_p1 = collect_gen(*bgen_bf16, qp1, 5, greedy);
+
+      std::int32_t f0 = -1, f1 = -1;
+      GenerateStats st0, st1;
+      const int s0_id = bgen_bf16->start_slot(Prompt{qp0, {}}, 6, greedy, f0, st0);
+      const int s1_id = bgen_bf16->start_slot(Prompt{qp1, {}}, 6, greedy, f1, st1);
+      bf16_got0 = {f0};
+      bf16_got1 = {f1};
+      std::vector<std::int32_t> step_out(2, -1);
+      for (int k = 1; k < 5; ++k) {
+        const BatchSlotStep cur[2] = {{s0_id, bf16_got0.back()}, {s1_id, bf16_got1.back()}};
+        bgen_bf16->step_slots(cur, step_out);
+        bf16_got0.push_back(step_out[0]);
+        bf16_got1.push_back(step_out[1]);
+      }
+      bgen_bf16->release_slot(s0_id);
+      bgen_bf16->release_slot(s1_id);
+    }
+
+    cudaStream_t s0 = nullptr;
+    INGINE_TEST_CUDA(cudaStreamCreate(&s0));
+    Weights w4 = synthetic_weights_q4_equiv(s0, /*packed_q4=*/true);
+    INGINE_TEST_CUDA(cudaStreamDestroy(s0));
+    auto bgen_q4 = make_generator(opt, std::move(w4), load_ablation({}));
+    const auto q4_b4_p0 = collect_gen(*bgen_q4, qp0, 5, greedy);
+    const auto q4_b4_p1 = collect_gen(*bgen_q4, qp1, 5, greedy);
+
+    bool q4_ok = true;
+    auto check_sub = [&](bool cond, const char* msg) {
+      if (!cond) std::fprintf(stderr, "Q4_0 batch subcheck failed: %s\n", msg);
+      q4_ok &= cond;
+    };
+    check_sub(q4_b1_p0.size() == 5 && q4_b1_p1.size() == 5 && q4_b4_p0.size() == 5 && q4_b4_p1.size() == 5,
+              "sequence lengths == 5");
+    check_sub(q4_b4_p0 == bf16_b4_p0 && q4_b4_p1 == bf16_b4_p1,
+              "BatchGenerator packed Q4_0 matches exact-dequantized BF16 ref solo");
+    check_sub(!q4_b4_p0.empty() && !q4_b1_p0.empty() && q4_b4_p0[0] == q4_b1_p0[0] &&
+                  !q4_b4_p1.empty() && !q4_b1_p1.empty() && q4_b4_p1[0] == q4_b1_p1[0],
+              "Q4_0 first token matches B=1 EngineGenerator prefill");
+    bool in_vocab = true;
+    for (auto t : q4_b4_p0) in_vocab &= (t >= 0 && t < kVocab);
+    for (auto t : q4_b4_p1) in_vocab &= (t >= 0 && t < kVocab);
+    check_sub(in_vocab, "generated Q4_0 tokens in [0, kVocab)");
+
+    // Concurrent B=2 batched Q4_0 decode across start_slot + step_slots + post-OOB recovery.
+    std::int32_t c0 = -1, c1 = -1;
+    GenerateStats cs0, cs1;
+    const int s0_id = bgen_q4->start_slot(Prompt{qp0, {}}, 6, greedy, c0, cs0);
+    const int s1_id = bgen_q4->start_slot(Prompt{qp1, {}}, 6, greedy, c1, cs1);
+    check_sub(s0_id >= 0 && s1_id >= 0 && c0 == q4_b4_p0[0] && c1 == q4_b4_p1[0], "start_slot Q4_0 first tokens");
+    std::vector<std::int32_t> q4_got0 = {c0}, q4_got1 = {c1};
+    std::vector<std::int32_t> step_out(2, -1);
+    const BatchSlotStep bad_step[2] = {{s0_id, c0}, {s1_id, VOCAB}};
+    check_sub(expect_throws<std::out_of_range>([&] { bgen_q4->step_slots(bad_step, step_out); }),
+              "Q4_0 step_slots rejects OOB");
+    for (int k = 1; k < 5; ++k) {
+      const BatchSlotStep cur[2] = {{s0_id, q4_got0.back()}, {s1_id, q4_got1.back()}};
+      bgen_q4->step_slots(cur, step_out);
+      q4_got0.push_back(step_out[0]);
+      q4_got1.push_back(step_out[1]);
+    }
+    bgen_q4->release_slot(s0_id);
+    bgen_q4->release_slot(s1_id);
+    check_sub(q4_got0 == bf16_got0 && q4_got1 == bf16_got1,
+              "concurrent B=2 Q4_0 step_slots matches exact-dequantized BF16 ref");
+
+    // Replicate invariance on Q4_0 B=2 concurrent decode.
+    std::int32_t rp0 = -1, rp1 = -1;
+    GenerateStats rs0, rs1;
+    const int r0_id = bgen_q4->start_slot(Prompt{qp0, {}}, 6, greedy, rp0, rs0);
+    const int r1_id = bgen_q4->start_slot(Prompt{qp0, {}}, 6, greedy, rp1, rs1);
+    std::vector<std::int32_t> rep0 = {rp0}, rep1 = {rp1};
+    for (int k = 1; k < 5; ++k) {
+      const BatchSlotStep cur[2] = {{r0_id, rep0.back()}, {r1_id, rep1.back()}};
+      bgen_q4->step_slots(cur, step_out);
+      rep0.push_back(step_out[0]);
+      rep1.push_back(step_out[1]);
+    }
+    bgen_q4->release_slot(r0_id);
+    bgen_q4->release_slot(r1_id);
+    check_sub(rep0 == rep1 && rep0.size() == 5, "Q4_0 concurrent replicates match identically");
+
+    check_sub(expect_throws<std::out_of_range>([&] { (void)collect_gen(*bgen_q4, bad_high, 4, greedy); }),
+              "Q4_0 generate rejects OOB");
+    check_sub(collect_gen(*bgen_q4, qp0, 5, greedy) == q4_b4_p0, "Q4_0 post-OOB recovery generate matches");
+    ok &= report(q4_ok, "BatchGenerator dispatches packed Q4_0 embed with B=1/B>1 parity and OOB admission");
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -1084,6 +1480,8 @@ int main() {
   ok &= run_generator();
   ok &= run_ablation_layouts();
   ok &= run_persona_hooks();
+  ok &= run_switch_error_and_fallback_tests();
+  ok &= run_batch_admission_and_q4();
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

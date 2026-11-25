@@ -1,20 +1,21 @@
 // DeviceUploader round trip: a ~9 MiB fixture checkpoint uploaded with small staging chunks (many
 // chunks per tensor, more chunks than staging buffers) and compared byte for byte; raw ranges,
-// reuse, empty requests and invalid requests.
+// reuse, empty requests, invalid requests, and partial worker-startup failure recovery.
 //
 // Optional bandwidth run: INGINE_UPLOAD_BENCH=<.safetensors file or model dir> streams every tensor
 // through a 1 GiB device buffer (batches of <= 1 GiB) and prints GiB/s (cold or page-cache speed).
 
 #include "common/test_util.h"
 #include "core/arena.h"
-#include "core/device.h"
 #include "core/fixture.h"
+#include "core/hal.h"
 #include "core/safetensors.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -25,6 +26,7 @@ using ingine::SafetensorsFile;
 using ingine::UploadRequest;
 using ingine::test::FixtureTensor;
 using ingine::test::pattern_bytes;
+namespace hal = ingine::hal;
 
 bool throws(const std::function<void()>& fn) {
     try {
@@ -33,7 +35,15 @@ bool throws(const std::function<void()>& fn) {
     return false;
 }
 
-void round_trip(const std::filesystem::path& dir, cudaStream_t stream) {
+template <class Ex>
+bool throws_type(const std::function<void()>& fn) {
+    try {
+        fn();
+    } catch (const Ex&) { return true; }
+    return false;
+}
+
+void round_trip(const std::filesystem::path& dir, hal::StreamHandle stream) {
     std::vector<FixtureTensor> tensors = {
         {"a.bf16", "BF16", {1024, 1500}, pattern_bytes(1024 * 1500 * 2, 11)}, // ~2.9 MiB
         {"b.fp8", "F8_E4M3", {3000, 1001}, pattern_bytes(3000 * 1001, 12)},  // ~2.9 MiB
@@ -112,7 +122,40 @@ void round_trip(const std::filesystem::path& dir, cudaStream_t stream) {
     INGINE_CHECK(throws([] { DeviceUploader bad(ingine::UploadOptions{0, 1, 1}); }));
 }
 
-int bench(const char* target, cudaStream_t stream) {
+void test_partial_startup_recovery(const std::filesystem::path& dir, hal::StreamHandle stream) {
+    const std::vector<FixtureTensor> tensors = {
+        {"recover.u8", "U8", {4096}, pattern_bytes(4096, 77)},
+    };
+    const auto path = dir / "recover.safetensors";
+    ingine::test::write_safetensors(path, tensors, {});
+    const SafetensorsFile file(path);
+
+    ingine::UploadOptions opts;
+    opts.chunk_bytes     = 1024;
+    opts.staging_buffers = 2;
+    opts.reader_threads  = 4;
+
+    // Failure on worker 0 (zero workers started).
+    ingine::fail_next_uploader_worker_start(0);
+    INGINE_CHECK(throws_type<std::system_error>([&] { DeviceUploader failed(opts); }));
+
+    // Failure on worker 2 (two live workers started; must stop/wake/join cleanly without std::terminate).
+    ingine::fail_next_uploader_worker_start(2);
+    INGINE_CHECK(throws_type<std::system_error>([&] { DeviceUploader partial(opts); }));
+
+    // Subsequent uploader constructs and uploads cleanly.
+    DeviceUploader healthy(opts);
+    DeviceBuffer dev(4096);
+    dev.fill(0);
+    const UploadRequest req = ingine::upload_request(file, file.at("recover.u8"), dev.p);
+    const ingine::UploadStats st = healthy.upload({&req, 1}, stream);
+    INGINE_CHECK(st.bytes == 4096);
+    std::vector<std::uint8_t> back(4096);
+    dev.copy_to_host(back.data(), back.size());
+    INGINE_CHECK(std::memcmp(back.data(), tensors[0].data.data(), 4096) == 0);
+}
+
+int bench(const char* target, hal::StreamHandle stream) {
     const ingine::SafetensorsModel model{std::filesystem::path(target)};
     constexpr std::size_t kWindow = std::size_t(1) << 30;
     DeviceBuffer dev(kWindow);
@@ -159,13 +202,24 @@ int bench(const char* target, cudaStream_t stream) {
 } // namespace
 
 int main() {
+#if INGINE_BACKEND_CUDA
     if (ingine::test::skip_without_gpu()) { return ingine::test::kSkip; }
-    ingine::DeviceContext ctx(0);
-    ingine::test::TempDir tmp;
-    round_trip(tmp.path, ctx.transfer_stream);
-    if (const char* target = std::getenv("INGINE_UPLOAD_BENCH"); target != nullptr && *target) {
-        return bench(target, ctx.transfer_stream);
+#endif
+    hal::DeviceCaps caps{};
+    try {
+        caps = hal::query_device_caps(0);
+    } catch (const std::exception& e) {
+        std::printf("skip: HAL device unavailable (%s)\n", e.what());
+        return ingine::test::kSkip;
     }
-    std::printf("PASS core_upload\n");
+
+    hal::Stream stream(0);
+    ingine::test::TempDir tmp;
+    round_trip(tmp.path, stream.handle());
+    test_partial_startup_recovery(tmp.path, stream.handle());
+    if (const char* target = std::getenv("INGINE_UPLOAD_BENCH"); target != nullptr && *target) {
+        return bench(target, stream.handle());
+    }
+    std::printf("PASS core_upload (%s)\n", hal::backend_name(caps.backend));
     return 0;
 }

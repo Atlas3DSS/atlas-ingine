@@ -10,6 +10,7 @@
 #include "model/prefill.h"
 
 #include "core/device.h"
+#include "core/ops.h"
 #include "ingine/generator.h"
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
@@ -253,8 +254,14 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   };
 
   pk::widen_ids(tokens, T, ids_, IMAGE_PLACEHOLDER_ID, s);
-  if (w.embed_q4()) dense::embed_q4(ids_, T, w.embed.data, f32p(w.embed_norm), B0_, false, s);
-  else dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
+  if (w.embed_q4()) {
+    auto desc = ops::make_inkling_embed_q4_desc(T, VOCAB, false);
+    desc.token_bounds = ops::TokenBoundsMode::PreValidated;
+    const ops::EmbedQ4RmsNormArgs args{ids_, w.embed.data, f32p(w.embed_norm), B0_};
+    ops::run_embed_q4_rmsnorm(desc, args, s);
+  } else {
+    dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
+  }
   // image tokens: the vision tower's rows take the place of the placeholder's embedding (model.forward's
   // masked_scatter into the normed embeddings); every later read of the embedding block sees them
   for (const EmbedRows& r : rows) {

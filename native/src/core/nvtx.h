@@ -3,7 +3,17 @@
 // ingine: categories and range names for the Inkling-2-Mini engine.
 #pragma once
 
+#ifndef INGINE_BACKEND_CUDA
+#if defined(INGINE_BACKEND_CPU) || defined(INGINE_BACKEND_HIP) || defined(INGINE_BACKEND_MLX) || defined(INGINE_BACKEND_SYCL)
+#define INGINE_BACKEND_CUDA 0
+#else
+#define INGINE_BACKEND_CUDA 1
+#endif
+#endif
+
+#if INGINE_BACKEND_CUDA
 #include <nvtx3/nvToolsExt.h>
+#endif
 
 #include <array>
 #include <cstddef>
@@ -77,6 +87,8 @@ enum class Name : std::size_t {
     }
     return 0xff9c9c9cu;
 }
+
+#if INGINE_BACKEND_CUDA
 
 [[nodiscard]] inline nvtxDomainHandle_t domain() noexcept {
     static nvtxDomainHandle_t handle = [] {
@@ -187,5 +199,27 @@ private:
     nvtxDomainHandle_t domain_;
     nvtxRangeId_t id_{};
 };
+
+#else
+
+class ScopedRange {
+public:
+    explicit ScopedRange(Name, Category, std::uint64_t = 0) noexcept {}
+    ScopedRange(const ScopedRange&)            = delete;
+    ScopedRange& operator=(const ScopedRange&) = delete;
+    ScopedRange(ScopedRange&&)                 = delete;
+    ScopedRange& operator=(ScopedRange&&)      = delete;
+};
+
+class ScopedAsyncRange {
+public:
+    explicit ScopedAsyncRange(Name, Category, std::uint64_t = 0) noexcept {}
+    ScopedAsyncRange(const ScopedAsyncRange&)            = delete;
+    ScopedAsyncRange& operator=(const ScopedAsyncRange&) = delete;
+    ScopedAsyncRange(ScopedAsyncRange&&)                 = delete;
+    ScopedAsyncRange& operator=(ScopedAsyncRange&&)      = delete;
+};
+
+#endif
 
 } // namespace ingine::nvtx

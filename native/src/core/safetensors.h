@@ -8,24 +8,18 @@
 // then the data region; data_offsets are relative to the start of the data region.
 
 #include "core/dtype.h"
+#include "core/hal.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
-
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <exception>
 #include <filesystem>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -174,51 +168,20 @@ public:
     DeviceUploader& operator=(const DeviceUploader&) = delete;
 
     // Copies every request (on `stream`, after the work already queued there) and returns once all
-    // bytes have arrived on the device. Destinations must not overlap. The calling thread's current
-    // CUDA device must be the one current at construction. One upload() at a time per uploader.
-    UploadStats upload(std::span<const UploadRequest> requests, cudaStream_t stream);
+    // bytes have arrived on the device. Destinations must not overlap. On CUDA builds, the calling
+    // thread's current device must match the device at construction. One upload() at a time per uploader.
+    UploadStats upload(std::span<const UploadRequest> requests, hal::StreamHandle stream);
 
     [[nodiscard]] const UploadOptions& options() const noexcept { return options_; }
 
 private:
-    struct Chunk {
-        const SafetensorsFile* file;
-        std::uint64_t offset;
-        std::uint64_t bytes;
-        void* dst;
-    };
-    struct Slot {
-        std::byte* host    = nullptr;
-        cudaEvent_t done   = nullptr; // recorded after the slot's last copy
-        bool copy_inflight = false;
-    };
-
-    void worker_main();
-    void run_chunks();
-    int acquire_slot();
-    void release_slot(int slot);
-
+    struct Impl;
     UploadOptions options_;
-    void* pinned_ = nullptr;
-    std::vector<Slot> slots_;
-    std::deque<int> free_slots_; // FIFO: reuse the slot whose copy was issued longest ago
-    std::vector<std::thread> workers_;
-
-    std::mutex mutex_;
-    std::condition_variable work_cv_;
-    std::condition_variable done_cv_;
-    std::condition_variable slot_cv_;
-    std::mutex stream_mutex_;
-
-    // Current job (guarded by mutex_ unless noted).
-    std::uint64_t generation_ = 0;
-    bool stopping_            = false;
-    int active_workers_       = 0;
-    std::vector<Chunk> chunks_;
-    std::size_t next_chunk_ = 0;
-    cudaStream_t stream_    = nullptr;
-    int device_             = 0; // CUDA device current at construction (owns the events)
-    std::exception_ptr error_;
+    std::unique_ptr<Impl> impl_;
 };
+
+// Test hook: causes the next DeviceUploader worker startup loop to fail with std::system_error when
+// launching worker `worker_index` (0-based; negative disables).
+void fail_next_uploader_worker_start(int worker_index) noexcept;
 
 } // namespace ingine

@@ -18,4 +18,6 @@ endif()
 # Teacher-forced replay through the Generator (full model).
 if(TARGET ingine_model)
   ingine_add_test(NAME spec_forced SOURCES test_forced.cpp LIBS ingine_model CUDA::cudart GPU MODEL TIMEOUT 600)
+  ingine_add_test(NAME spec_conditional_fallback SOURCES test_spec_fallback.cpp LIBS ingine_model ingine_persona CUDA::cudart
+                  GPU MODEL TIMEOUT 900)
 endif()

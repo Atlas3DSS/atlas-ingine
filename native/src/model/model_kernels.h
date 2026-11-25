@@ -86,8 +86,10 @@ struct Widths {
 // Verify width selection on the device (engine._generate_spec): lead = leading conf[i] > threshold (i < 7),
 // m = the smallest width >= lead + 1; token[1 + i] = drafts[i] (i < 7), *m_out = m, and the switch
 // condition `handle` = index of m in `widths`. Captured into the graph that owns `handle`.
-void verify_select(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
-                   std::int64_t* token, std::int32_t* m_out, cudaGraphConditionalHandle handle, cudaStream_t stream);
+// Returns cudaGetLastError() without aborting so try_capture_switch can fall back on unsupported SWITCH errors.
+[[nodiscard]] cudaError_t verify_select(const float* conf, const std::int32_t* drafts, float threshold,
+                                        const Widths& widths, std::int64_t* token, std::int32_t* m_out,
+                                        cudaGraphConditionalHandle handle, cudaStream_t stream);
 
 // Eager counterpart of verify_select for host-dispatched low-VRAM / streamed-KV verify steps: writes *m_out
 // (device) and *m_host (mapped host memory) without setting a CUDA graph conditional handle.
@@ -95,8 +97,9 @@ void verify_select_eager(const float* conf, const std::int32_t* drafts, float th
                          std::int64_t* token, std::int32_t* m_out, std::int32_t* m_host, cudaStream_t stream);
 
 // The switch condition `handle` = index of *m in `widths`. Captured into the graph that owns `handle`.
-void width_select(const std::int32_t* m, const Widths& widths, cudaGraphConditionalHandle handle,
-                  cudaStream_t stream);
+// Returns cudaGetLastError() without aborting so try_capture_switch can fall back on unsupported SWITCH errors.
+[[nodiscard]] cudaError_t width_select(const std::int32_t* m, const Widths& widths,
+                                       cudaGraphConditionalHandle handle, cudaStream_t stream);
 
 // The host's view of a speculative round: written to mapped host memory by verify_publish.
 struct VerifyRecord {

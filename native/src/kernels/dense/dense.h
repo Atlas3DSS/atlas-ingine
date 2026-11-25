@@ -123,7 +123,11 @@ void embed(const std::int64_t* token, int M, const ActT* table, const float* nor
            bool pdl, cudaStream_t stream);
 
 // embed_q4: Q4_0 SoA embedding table u8 [V, 1296] ([1152B nibbles | 72 FP16 scales]) -> identical RMS norm output.
-void embed_q4(const std::int64_t* token, int M, const void* table_q4, const float* norm_w, float* out,
-              bool pdl, cudaStream_t stream);
+// Guards out-of-range token IDs against [0, vocab_size) and sets *oob_flag = 1 if non-null.
+void embed_q4(const std::int64_t* token, int M, int vocab_size, const void* table_q4, const float* norm_w, float* out,
+              bool pdl, cudaStream_t stream, std::uint32_t* oob_flag = nullptr);
+
+// decode_q4_0: Q4_0 SoA table u8 [rows, row_bytes] -> float[rows * hidden_size] via canonical fmaf lane decode.
+void decode_q4_0(const void* table_q4, int rows, int hidden_size, float* out_f32, cudaStream_t stream);
 
 }  // namespace ingine::kernels::dense
