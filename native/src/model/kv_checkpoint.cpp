@@ -562,14 +562,15 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
     constexpr std::size_t kChunkBytes = PagedKvCache::kPageBytes;
     std::vector<std::uint8_t> buf(kChunkBytes);
 
-    // 2. SWA rings + ring_pos + conv states
+    // 2. SWA rings + ring_pos + conv states (strictly stream-ordered; caller stream may be cudaStreamNonBlocking)
     for (const Tensor* t : swa_tensors(st)) {
       const auto* dev = static_cast<const std::uint8_t*>(t->data);
       std::size_t rem = t->bytes();
       std::size_t off = 0;
       while (rem > 0) {
         const std::size_t take = std::min(rem, kChunkBytes);
-        CUDA_CHECK(cudaMemcpy(buf.data(), dev + off, take, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(buf.data(), dev + off, take, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         write_all(fd, buf.data(), take);
         off += take;
         rem -= take;
@@ -602,7 +603,8 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
             std::size_t off = 0;
             while (rem > 0) {
               const std::size_t take = std::min(rem, kChunkBytes);
-              CUDA_CHECK(cudaMemcpy(buf.data(), dev + off, take, cudaMemcpyDeviceToHost));
+              CUDA_CHECK(cudaMemcpyAsync(buf.data(), dev + off, take, cudaMemcpyDeviceToHost, stream));
+              CUDA_CHECK(cudaStreamSynchronize(stream));
               write_all(fd, buf.data(), take);
               off += take;
               rem -= take;
@@ -616,7 +618,8 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
     if (d_logits) {
       const std::size_t lbytes = std::size_t(UNPADDED_VOCAB) * sizeof(float);
       std::vector<std::uint8_t> lbuf(lbytes);
-      CUDA_CHECK(cudaMemcpy(lbuf.data(), d_logits, lbytes, cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpyAsync(lbuf.data(), d_logits, lbytes, cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
       write_all(fd, lbuf.data(), lbytes);
     }
 
@@ -700,7 +703,10 @@ KvCheckpointLoadResult load_kv_checkpoint_checked(
     std::vector<std::uint8_t> buf(kChunkBytes);
     std::uint64_t off = hdr.header_bytes;
 
-    // 1. Restore SWA rings + ring_pos + conv states
+    // 1. Restore SWA rings + ring_pos + conv states.
+    // All H2D copies MUST be queued on `stream` (never stream-0 cudaMemcpy): Runtime::stream() is
+    // cudaStreamNonBlocking and does not synchronize with stream 0, so a pageable H2D cudaMemcpy can return
+    // while DMA is still in flight and race against subsequent kernels on `stream`.
     state_mutated = true;
     for (Tensor* t : swa_tensors_mut(st)) {
       auto* dev = static_cast<std::uint8_t*>(t->data);
@@ -709,7 +715,8 @@ KvCheckpointLoadResult load_kv_checkpoint_checked(
       while (rem > 0) {
         const std::size_t take = std::min(rem, kChunkBytes);
         pread_all(fd, buf.data(), take, off);
-        CUDA_CHECK(cudaMemcpy(dev + dst_off, buf.data(), take, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(dev + dst_off, buf.data(), take, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         off += take;
         dst_off += take;
         rem -= take;
@@ -752,7 +759,8 @@ KvCheckpointLoadResult load_kv_checkpoint_checked(
             while (rem > 0) {
               const std::size_t take = std::min(rem, kChunkBytes);
               pread_all(fd, buf.data(), take, off);
-              CUDA_CHECK(cudaMemcpy(dev + dst_off, buf.data(), take, cudaMemcpyHostToDevice));
+              CUDA_CHECK(cudaMemcpyAsync(dev + dst_off, buf.data(), take, cudaMemcpyHostToDevice, stream));
+              CUDA_CHECK(cudaStreamSynchronize(stream));
               off += take;
               dst_off += take;
               rem -= take;
@@ -767,7 +775,8 @@ KvCheckpointLoadResult load_kv_checkpoint_checked(
       const std::size_t lbytes = std::size_t(UNPADDED_VOCAB) * sizeof(float);
       std::vector<std::uint8_t> lbuf(lbytes);
       pread_all(fd, lbuf.data(), lbytes, off);
-      CUDA_CHECK(cudaMemcpy(d_logits, lbuf.data(), lbytes, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpyAsync(d_logits, lbuf.data(), lbytes, cudaMemcpyHostToDevice, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
     st.length = hdr.pos;
