@@ -94,7 +94,7 @@ class Tokenizer {
   std::size_t vocab_size() const noexcept { return token_bytes_.size(); }
 
   enum class NormalizerKind : std::uint8_t { None = 0, Nfc = 1 };
-  enum class SplitMode : std::uint8_t { O200k = 0, Qwen2 = 1 };
+  enum class SplitMode : std::uint8_t { O200k = 0, Qwen2 = 1, ChatGlm4 = 2 };
 
   NormalizerKind normalizer_kind() const noexcept { return normalizer_; }
   SplitMode split_mode() const noexcept { return split_mode_; }

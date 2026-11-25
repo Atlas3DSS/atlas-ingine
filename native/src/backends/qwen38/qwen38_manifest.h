@@ -35,7 +35,8 @@ struct Qwen38Manifest {
   Qwen38Config config;
   ingine::model::CheckpointIdentity checkpoint;
   std::vector<std::string> shard_files;
-  std::unordered_map<std::string, std::string> shard_sha256;  // populated when verify_shard_sha256=true
+  std::unordered_map<std::string, std::uint64_t> shard_sizes;
+  std::unordered_map<std::string, std::string> shard_sha256;  // populated when hash_shards=true or inspect_pinned()
   std::unordered_map<std::string, Qwen38TensorInfo> active_tensors;
   std::size_t total_index_tensors = 0;
   std::size_t active_text_tensor_count = 0;
@@ -44,9 +45,20 @@ struct Qwen38Manifest {
   Qwen38MemoryBudget memory_budget;
   bool shard_payloads_verified = false;
 
-  static Qwen38Manifest inspect(const std::filesystem::path& model_dir, bool verify_shard_sha256 = false,
+  // Header inspection (hash_shards=false -> HeadersOnly; hash_shards=true -> SelfHashed).
+  // Neither sets VerificationLevel::PinnedVerified nor shard_digests_verified=true.
+  static Qwen38Manifest inspect(const std::filesystem::path& model_dir, bool hash_shards = false,
                                 const std::string& revision = "");
+
+  // Expected-vs-consumed shard/config verification: hashes all shards on disk and verifies exact
+  // filenames, byte sizes, and SHA-256 digests against `expected_pins`. Sets PinnedVerified on pass;
+  // throws std::invalid_argument fail-closed on any mismatch.
+  static Qwen38Manifest inspect_pinned(const std::filesystem::path& model_dir,
+                                       const ingine::model::CheckpointPinSpec& expected_pins,
+                                       const std::string& revision = "");
 };
+
+ingine::model::CheckpointPinSpec qwen38_27b_nvfp4_pin_spec();
 
 std::string sha256_bytes_hex(const void* data, std::size_t size);
 std::string sha256_file_hex_streaming(const std::filesystem::path& path);

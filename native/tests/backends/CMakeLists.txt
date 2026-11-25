@@ -26,3 +26,10 @@ ingine_add_test(
   LABELS backend qwen38 cpu
   ORACLE
 )
+
+ingine_add_test(
+  NAME backend_multifamily_tokenizer
+  SOURCES test_multifamily_tokenizer.cpp
+  LIBS ingine_text nlohmann_json::nlohmann_json
+  LABELS backend text cpu
+)

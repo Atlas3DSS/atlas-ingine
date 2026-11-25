@@ -295,7 +295,7 @@ std::string sha256_file_hex_streaming(const std::filesystem::path& path) {
   return to_hex(sha256_file_digest(path));
 }
 
-Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, bool verify_shard_sha256,
+Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, bool hash_shards,
                                         const std::string& revision) {
   if (!std::filesystem::is_directory(model_dir)) {
     throw std::invalid_argument("qwen38 checkpoint directory does not exist: " + model_dir.string());
@@ -314,6 +314,8 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
   Qwen38Manifest manifest;
   manifest.config = Qwen38Config::load(cfg_path);
   manifest.checkpoint.format = ingine::model::CheckpointFormat::Safetensors;
+  manifest.checkpoint.verification_level =
+      hash_shards ? ingine::model::VerificationLevel::SelfHashed : ingine::model::VerificationLevel::HeadersOnly;
   manifest.checkpoint.schema_variant =
       manifest.config.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4 ? "qwen3_5_mixed_fp8_nvfp4"
                                                                               : "qwen3_5_bf16";
@@ -367,8 +369,9 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
       throw std::invalid_argument("missing safetensors shard: " + sp.string());
     }
     auto hdr = parse_safetensors_header(sp, shard);
+    manifest.shard_sizes.emplace(shard, hdr.file_size);
     std::string digest_note = "header_verified";
-    if (verify_shard_sha256) {
+    if (hash_shards) {
       digest_note = sha256_file_hex_streaming(sp);
       manifest.shard_sha256.emplace(shard, digest_note);
     }
@@ -377,7 +380,7 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
     parsed_shards.emplace(shard, std::move(hdr));
   }
   manifest.checkpoint.shard_set_sha256 = shard_set_hash.finalize();
-  manifest.shard_payloads_verified = verify_shard_sha256;
+  manifest.shard_payloads_verified = hash_shards;
 
   // Reconcile index weight_map against shard headers, partitioning active text vs visual/MTP.
   if (!index_entries.empty()) {
@@ -510,7 +513,8 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
   manifest.checkpoint.weight_manifest_sha256 = mh.finalize();
   manifest.checkpoint.weight_manifest_verified = true;
   manifest.checkpoint.shard_count = static_cast<std::uint32_t>(manifest.shard_files.size());
-  manifest.checkpoint.shard_digests_verified = verify_shard_sha256;
+  // Self-computed hashes do NOT verify expected pins; only inspect_pinned() sets shard_digests_verified=true.
+  manifest.checkpoint.shard_digests_verified = false;
 
   manifest.memory_budget.gdn_recurrent_bytes =
       static_cast<std::uint64_t>(c.num_linear_layers) * static_cast<std::uint64_t>(c.linear_num_value_heads) *
@@ -523,6 +527,80 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
       static_cast<std::uint64_t>(c.head_dim) * 2ull;
 
   return manifest;
+}
+
+Qwen38Manifest Qwen38Manifest::inspect_pinned(const std::filesystem::path& model_dir,
+                                               const ingine::model::CheckpointPinSpec& expected_pins,
+                                               const std::string& revision) {
+  if (expected_pins.shards.empty()) {
+    throw std::invalid_argument("inspect_pinned requires non-empty expected shard pins");
+  }
+  Qwen38Manifest m = inspect(model_dir, true, revision);
+  if (expected_pins.config_sha256.has_value() && m.checkpoint.config_sha256 != *expected_pins.config_sha256) {
+    throw std::invalid_argument("config.json SHA-256 mismatch against expected pin");
+  }
+  if (expected_pins.tokenizer_sha256.has_value() && m.checkpoint.tokenizer_sha256 != *expected_pins.tokenizer_sha256) {
+    throw std::invalid_argument("tokenizer.json SHA-256 mismatch against expected pin");
+  }
+  if (expected_pins.chat_template_sha256.has_value() &&
+      m.checkpoint.chat_template_sha256 != *expected_pins.chat_template_sha256) {
+    throw std::invalid_argument("chat_template.jinja SHA-256 mismatch against expected pin");
+  }
+  if (expected_pins.shards.size() != m.shard_files.size()) {
+    throw std::invalid_argument("shard count mismatch against expected pin set");
+  }
+
+  std::unordered_map<std::string, const ingine::model::ExpectedShardDigest*> pin_by_name;
+  for (const auto& sp : expected_pins.shards) {
+    bool zero = true;
+    for (std::uint8_t b : sp.sha256) {
+      if (b != 0) {
+        zero = false;
+        break;
+      }
+    }
+    if (sp.filename.empty() || sp.byte_size == 0 || zero) {
+      throw std::invalid_argument("expected shard pin requires non-empty filename, positive size, and non-zero sha256");
+    }
+    if (!pin_by_name.emplace(sp.filename, &sp).second) {
+      throw std::invalid_argument("duplicate expected shard filename in pin spec: " + sp.filename);
+    }
+  }
+  for (const std::string& shard : m.shard_files) {
+    const auto it = pin_by_name.find(shard);
+    if (it == pin_by_name.end()) {
+      throw std::invalid_argument("unexpected shard missing from pin spec: " + shard);
+    }
+    const auto& exp = *it->second;
+    if (m.shard_sizes.at(shard) != exp.byte_size) {
+      throw std::invalid_argument("shard byte size mismatch for '" + shard + "'");
+    }
+    if (m.shard_sha256.at(shard) != to_hex(exp.sha256)) {
+      throw std::invalid_argument("shard SHA-256 mismatch for '" + shard + "' (corrupted or unpinned weights)");
+    }
+  }
+  m.checkpoint.verification_level = ingine::model::VerificationLevel::PinnedVerified;
+  m.checkpoint.shard_digests_verified = true;
+  return m;
+}
+
+ingine::model::CheckpointPinSpec qwen38_27b_nvfp4_pin_spec() {
+  ingine::model::CheckpointPinSpec spec;
+  spec.config_sha256 =
+      ingine::model::parse_sha256_hex("71fa01bb64de20971045cd82a82c0ebb25a54e1b0a3f09ef23cf5479e9c54df8");
+  spec.tokenizer_sha256 =
+      ingine::model::parse_sha256_hex("0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3");
+  spec.chat_template_sha256 =
+      ingine::model::parse_sha256_hex("c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041");
+  spec.shards = {
+      {"model-00001-of-00003.safetensors", 9965652544ull,
+       ingine::model::parse_sha256_hex("7d0fd155118901373eb0fd13ed3aae68f95be747bc205be72ebc41739c25ee80")},
+      {"model-00002-of-00003.safetensors", 9985757064ull,
+       ingine::model::parse_sha256_hex("98a7e9486baa860c792c9463a770cb9d017696bdd17606300a5b9334149f4c27")},
+      {"model-00003-of-00003.safetensors", 1970287672ull,
+       ingine::model::parse_sha256_hex("0506ad35dc21469708e7813bd76c592cef08bd0317b4a1fe899745ebe2435271")},
+  };
+  return spec;
 }
 
 }  // namespace ingine::backends::qwen38

@@ -4,12 +4,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -213,27 +215,105 @@ void test_config_validation() {
 void test_synthetic_manifest() {
   TempDir ok("ok");
   write_synthetic_safetensors_dir(ok.path, false);
-  const auto m1 = Qwen38Manifest::inspect(ok.path, true, "synth-r1");
-  const auto m2 = Qwen38Manifest::inspect(ok.path, false, "synth-r1");
-  const auto m3 = Qwen38Manifest::inspect(ok.path, false, "synth-r1");
-  CHECK(m1.checkpoint.format == ingine::model::CheckpointFormat::Safetensors);
-  CHECK(m1.checkpoint.schema_variant == "qwen3_5_bf16");
-  CHECK(m1.checkpoint.weight_manifest_verified);
-  CHECK(m1.checkpoint.shard_digests_verified);
-  CHECK(!m2.checkpoint.shard_digests_verified);
-  CHECK(m1.checkpoint.weight_manifest_sha256 == m2.checkpoint.weight_manifest_sha256);
-  CHECK(m2.checkpoint.shard_set_sha256 == m3.checkpoint.shard_set_sha256);
-  CHECK(m1.checkpoint.shard_set_sha256 != m2.checkpoint.shard_set_sha256);
-  CHECK((m1.checkpoint.shard_set_sha256 != std::array<std::uint8_t, 32>{}));
-  CHECK(m1.shard_sha256.at("model.safetensors").size() == 64);
-  CHECK(m1.active_text_tensor_count == 27);
-  CHECK(m1.excluded_visual_tensor_count == 1);
-  CHECK(m1.excluded_mtp_tensor_count == 1);
+  const auto m_hdr = Qwen38Manifest::inspect(ok.path, false, "synth-r1");
+  const auto m_hdr2 = Qwen38Manifest::inspect(ok.path, false, "synth-r1");
+  const auto m_self = Qwen38Manifest::inspect(ok.path, true, "synth-r1");
+  CHECK(m_hdr.checkpoint.format == ingine::model::CheckpointFormat::Safetensors);
+  CHECK(m_hdr.checkpoint.schema_variant == "qwen3_5_bf16");
+  CHECK(m_hdr.checkpoint.verification_level == ingine::model::VerificationLevel::HeadersOnly);
+  CHECK(m_hdr.checkpoint.weight_manifest_verified);
+  CHECK(!m_hdr.checkpoint.shard_digests_verified);
+  CHECK(m_self.checkpoint.verification_level == ingine::model::VerificationLevel::SelfHashed);
+  // Self-computed hashes NEVER unlock shard_digests_verified or state reuse without an external pin spec.
+  CHECK(!m_self.checkpoint.shard_digests_verified);
+  CHECK(m_self.checkpoint.weight_manifest_sha256 == m_hdr.checkpoint.weight_manifest_sha256);
+  CHECK(m_hdr.checkpoint.shard_set_sha256 == m_hdr2.checkpoint.shard_set_sha256);
+  CHECK(m_self.checkpoint.shard_set_sha256 != m_hdr.checkpoint.shard_set_sha256);
+  CHECK((m_self.checkpoint.shard_set_sha256 != std::array<std::uint8_t, 32>{}));
+  CHECK(m_self.shard_sha256.at("model.safetensors").size() == 64);
+  CHECK(m_self.active_text_tensor_count == 27);
+  CHECK(m_self.excluded_visual_tensor_count == 1);
+  CHECK(m_self.excluded_mtp_tensor_count == 1);
 
-  const auto prof = make_qwen38_worker_profile(m1, ingine::model::RuntimeOptions{});
+  ingine::model::RuntimeOptions bf16_opts;
+  bf16_opts.dense_fp8 = false;
+  bf16_opts.max_ctx = 128;
+  // HeadersOnly and SelfHashed profiles are strictly non-reusable.
+  CHECK(!make_qwen38_state_identity(m_hdr, bf16_opts).is_reusable_with(make_qwen38_state_identity(m_hdr, bf16_opts)));
+  CHECK(!make_qwen38_state_identity(m_self, bf16_opts).is_reusable_with(make_qwen38_state_identity(m_self, bf16_opts)));
+
+  // Reject dense_fp8=true on BF16, max_ctx > model limit, and unsupported KV/offload/hook options fail-closed.
+  {
+    ingine::model::RuntimeOptions bad_fp8;
+    bad_fp8.dense_fp8 = true;
+    bad_fp8.max_ctx = 128;
+    CHECK_THROWS(make_qwen38_worker_profile(m_self, bad_fp8), std::invalid_argument);
+  }
+  {
+    ingine::model::RuntimeOptions bad_ctx = bf16_opts;
+    bad_ctx.max_ctx = 256;
+    CHECK_THROWS(validate_qwen38_runtime_options(m_self.config, bad_ctx), std::invalid_argument);
+  }
+  for (const auto& mutator : std::vector<std::function<void(ingine::model::RuntimeOptions&)>>{
+           [](auto& o) { o.kv_vram_mb = 256; },
+           [](auto& o) { o.park_mb = 512; },
+           [](auto& o) { o.max_kv_tokens = 1024; },
+           [](auto& o) { o.refusal_map = "/tmp/refusal.json"; },
+       }) {
+    ingine::model::RuntimeOptions bad = bf16_opts;
+    mutator(bad);
+    CHECK_THROWS(validate_qwen38_runtime_options(m_self.config, bad), std::invalid_argument);
+  }
+
+  // External expected-vs-consumed pinning: ONLY inspect_pinned() unlocks reuse!
+  ingine::model::CheckpointPinSpec pins;
+  pins.config_sha256 = m_self.checkpoint.config_sha256;
+  pins.tokenizer_sha256 = m_self.checkpoint.tokenizer_sha256;
+  pins.chat_template_sha256 = m_self.checkpoint.chat_template_sha256;
+  pins.shards = {
+      {"model.safetensors", m_self.shard_sizes.at("model.safetensors"),
+       ingine::model::parse_sha256_hex(m_self.shard_sha256.at("model.safetensors"))},
+  };
+  const auto m_pinned = Qwen38Manifest::inspect_pinned(ok.path, pins, "synth-r1");
+  CHECK(m_pinned.checkpoint.verification_level == ingine::model::VerificationLevel::PinnedVerified);
+  CHECK(m_pinned.checkpoint.shard_digests_verified);
+  const auto prof = make_qwen38_worker_profile(m_pinned, bf16_opts);
   CHECK(prof.family == ingine::model::ModelFamily::Qwen3_5);
   CHECK(prof.state_identity.state_layout_id == "qwen3_5_gdn_kv_v1");
   CHECK(prof.state_identity.act_dtype == ingine::model::ActivationDtype::Bf16);
+  CHECK(prof.state_identity.is_reusable_with(prof.state_identity));
+
+  // Mutate 1 byte inside active embed_tokens.weight payload on disk (leaving headers untouched):
+  //   - HeadersOnly inspect(false) has identical header metadata yet MUST NOT reuse.
+  //   - SelfHashed inspect(true) changes shard_set_sha256 and MUST NOT reuse.
+  //   - inspect_pinned(pins) catches the 1-byte mutation fail-closed.
+  {
+    const std::filesystem::path st_path = ok.path / "model.safetensors";
+    const auto st_size = std::filesystem::file_size(st_path);
+    std::fstream rw(st_path, std::ios::in | std::ios::out | std::ios::binary);
+    CHECK(rw.good());
+    rw.seekg(static_cast<std::streamoff>(st_size - 128), std::ios::beg);
+    char b = 0;
+    rw.read(&b, 1);
+    b ^= 0x01;
+    rw.seekp(static_cast<std::streamoff>(st_size - 128), std::ios::beg);
+    rw.write(&b, 1);
+    rw.flush();
+    rw.close();
+
+    const auto mut_hdr = Qwen38Manifest::inspect(ok.path, false, "synth-r1");
+    CHECK(!make_qwen38_state_identity(mut_hdr, bf16_opts).is_reusable_with(prof.state_identity));
+    const auto mut_self = Qwen38Manifest::inspect(ok.path, true, "synth-r1");
+    CHECK(mut_self.checkpoint.shard_set_sha256 != m_pinned.checkpoint.shard_set_sha256);
+    CHECK(!make_qwen38_state_identity(mut_self, bf16_opts).is_reusable_with(prof.state_identity));
+    CHECK_THROWS(Qwen38Manifest::inspect_pinned(ok.path, pins, "synth-r1"), std::invalid_argument);
+  }
+
+  // Verify pinned 27B spec carries 3 expected shards + config/tokenizer/chat_template digests.
+  const auto spec27 = qwen38_27b_nvfp4_pin_spec();
+  CHECK(spec27.shards.size() == 3);
+  CHECK(spec27.config_sha256.has_value() && spec27.tokenizer_sha256.has_value() &&
+        spec27.chat_template_sha256.has_value());
 
   TempDir stray("stray");
   write_synthetic_safetensors_dir(stray.path, true);

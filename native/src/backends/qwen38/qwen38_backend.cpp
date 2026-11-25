@@ -28,6 +28,9 @@ ingine::model::BackendCapabilities qwen38_dense_capabilities(const Qwen38Config&
   } else {
     caps.supported_quant_layouts = {"bf16"};
   }
+  if (config.vocab_size > 248057) {
+    caps.media_token_ids = {248053, 248054, 248056, 248057};
+  }
   caps.vocab_size = config.vocab_size;
   caps.max_position_embeddings = config.max_position_embeddings;
   return caps;
@@ -37,13 +40,16 @@ ingine::model::BackendStateIdentity make_qwen38_state_identity(const Qwen38Manif
                                                               const ingine::model::RuntimeOptions& options,
                                                               std::string_view kv_cache_mode, std::string_view gear,
                                                               std::string_view cache_namespace) {
-  manifest.config.validate();
+  validate_qwen38_runtime_options(manifest.config, options);
   ingine::model::BackendStateIdentity id;
   id.family = ingine::model::ModelFamily::Qwen3_5;
   id.backend_name = "qwen38-dense";
   id.checkpoint = manifest.checkpoint;
   id.state_layout_id = "qwen3_5_gdn_kv_v1";
   id.act_dtype = ingine::model::ActivationDtype::Bf16;
+  id.numeric_abi = manifest.config.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4
+                       ? "act=bf16;attn=fp8_e4m3_cal;mlp=nvfp4_w4a16;gdn=f32;kv=bf16"
+                       : "act=bf16;attn=bf16;mlp=bf16;gdn=f32;kv=bf16";
   id.weight_precision = to_string(manifest.config.weight_precision);
   id.kv_format = "gdn_f32_conv_bf16_kv_bf16";
   id.kv_cache_mode = std::string(kv_cache_mode);
@@ -66,6 +72,7 @@ ingine::model::BackendStateIdentity make_qwen38_state_identity(const Qwen38Manif
 ingine::model::WorkerProfile make_qwen38_worker_profile(const Qwen38Manifest& manifest,
                                                         const ingine::model::RuntimeOptions& options,
                                                         std::string_view kv_cache_mode, std::string_view gear) {
+  validate_qwen38_runtime_options(manifest.config, options);
   ingine::model::WorkerProfile prof;
   prof.family = ingine::model::ModelFamily::Qwen3_5;
   prof.model_id = manifest.checkpoint.model_id;
@@ -84,6 +91,12 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
   const auto caps = qwen38_dense_capabilities(config);
   ingine::model::validate_runtime_options_against_capabilities(caps, options);
 
+  if (config.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4 && !options.dense_fp8) {
+    throw std::invalid_argument("qwen38-dense MixedFp8Nvfp4 requires dense_fp8=true (attention uses calibrated FP8)");
+  }
+  if (config.weight_precision == Qwen38WeightPrecision::Bf16 && options.dense_fp8) {
+    throw std::invalid_argument("qwen38-dense BF16 checkpoint rejects dense_fp8=true (effective numeric ABI mismatch)");
+  }
   if (options.kv_fp8) {
     throw std::invalid_argument("qwen38-dense does not yet support kv_fp8");
   }
@@ -93,8 +106,23 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
   if (options.kv_paged) {
     throw std::invalid_argument("qwen38-dense Phase 1 requires contiguous dense KV/GDN slots (kv_paged unsupported)");
   }
-  if (options.offload_vram_mb > 0) {
+  if (options.kv_vram_mb != 0 || !options.kv_swap_dir.empty()) {
+    throw std::invalid_argument("qwen38-dense does not support tiered KV swap options");
+  }
+  if (options.offload_vram_mb != 0) {
     throw std::invalid_argument("qwen38-dense does not support offload_vram_mb in Phase 1");
+  }
+  if (options.park_mb > 0) {
+    throw std::invalid_argument("qwen38-dense does not support host/VRAM conversation parking yet");
+  }
+  if (options.max_kv_tokens != 0) {
+    throw std::invalid_argument("qwen38-dense does not support shared paged pool max_kv_tokens in Phase 1");
+  }
+  if (!options.expert_ranking.empty() || !options.dump_router_stats.empty()) {
+    throw std::invalid_argument("qwen38-dense has no MoE router/expert ranking hooks");
+  }
+  if (!options.refusal_map.empty()) {
+    throw std::invalid_argument("qwen38-dense does not support refusal_map hooks");
   }
 }
 

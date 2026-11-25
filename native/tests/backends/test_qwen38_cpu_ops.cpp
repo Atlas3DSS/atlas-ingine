@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -178,13 +179,36 @@ void test_mini_model_prefill_reuse_and_isolation() {
   const std::vector<std::int32_t> suffix_a = {9, 14};
   const std::vector<std::int32_t> suffix_b = {21, 6, 33};
 
-  // Cold full sequence prefix + suffix_b.
+  auto argmax_tok = [](const std::vector<float>& logits) -> std::int32_t {
+    CHECK(!logits.empty());
+    for (float x : logits) CHECK(std::isfinite(x));
+    std::int32_t best = 0;
+    for (std::size_t i = 1; i < logits.size(); ++i) {
+      if (logits[i] > logits[static_cast<std::size_t>(best)]) best = static_cast<std::int32_t>(i);
+    }
+    return best;
+  };
+  auto assert_logits_byte_identical = [&](const std::vector<float>& a, const std::vector<float>& b) {
+    CHECK(a.size() == b.size());
+    for (float x : a) CHECK(std::isfinite(x));
+    for (float x : b) CHECK(std::isfinite(x));
+    CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+  };
+
+  // Cold full sequence prefix + suffix_b plus 4 subsequent greedy steps.
   std::vector<std::int32_t> full_b = prefix;
   full_b.insert(full_b.end(), suffix_b.begin(), suffix_b.end());
   Qwen38MiniSession s_cold(model.config());
   const auto logits_cold = s_cold.prefill_last_logits(model, full_b);
+  std::vector<std::vector<float>> cold_steps = {logits_cold};
+  std::vector<std::int32_t> cold_greedy = {argmax_tok(logits_cold)};
+  for (int k = 0; k < 4; ++k) {
+    const auto nxt = s_cold.step(model, cold_greedy.back());
+    cold_steps.push_back(nxt);
+    cold_greedy.push_back(argmax_tok(nxt));
+  }
 
-  // Prefix -> branch A -> restore snapshot -> branch B must match cold identically.
+  // Prefix -> branch A -> restore snapshot -> branch B + 4 greedy decode steps MUST match cold bytes bit-for-bit.
   Qwen38MiniSession s_reuse(model.config());
   (void)s_reuse.prefill_last_logits(model, prefix);
   const auto snap = s_reuse.snapshot();
@@ -192,17 +216,30 @@ void test_mini_model_prefill_reuse_and_isolation() {
   CHECK(s_reuse.state_bytes() > 0);
   (void)s_reuse.prefill_last_logits(model, suffix_a);
   s_reuse.restore(snap);
-  const auto logits_reused = s_reuse.prefill_last_logits(model, suffix_b);
-  CHECK(logits_cold.size() == logits_reused.size());
-  for (std::size_t i = 0; i < logits_cold.size(); ++i) CHECK_NEAR(logits_cold[i], logits_reused[i], 1e-6);
+  auto logits_reused = s_reuse.prefill_last_logits(model, suffix_b);
+  assert_logits_byte_identical(cold_steps[0], logits_reused);
+  std::vector<std::int32_t> reused_greedy = {argmax_tok(logits_reused)};
+  for (int k = 0; k < 4; ++k) {
+    logits_reused = s_reuse.step(model, reused_greedy.back());
+    assert_logits_byte_identical(cold_steps[static_cast<std::size_t>(k + 1)], logits_reused);
+    reused_greedy.push_back(argmax_tok(logits_reused));
+  }
+  CHECK(reused_greedy == cold_greedy);
 
-  // Fresh-session isolation after unrelated conversation + reset().
+  // Fresh-session isolation after unrelated conversation + reset() matches cold full-vocab bytes & greedy IDs.
   Qwen38MiniSession s_dirty(model.config());
   (void)s_dirty.prefill_last_logits(model, std::vector<std::int32_t>{1, 2, 3, 4, 5, 6, 7});
   s_dirty.reset();
   CHECK(s_dirty.position() == 0);
-  const auto logits_clean = s_dirty.prefill_last_logits(model, full_b);
-  for (std::size_t i = 0; i < logits_cold.size(); ++i) CHECK_NEAR(logits_cold[i], logits_clean[i], 1e-6);
+  auto logits_clean = s_dirty.prefill_last_logits(model, full_b);
+  assert_logits_byte_identical(cold_steps[0], logits_clean);
+  std::vector<std::int32_t> clean_greedy = {argmax_tok(logits_clean)};
+  for (int k = 0; k < 4; ++k) {
+    logits_clean = s_dirty.step(model, clean_greedy.back());
+    assert_logits_byte_identical(cold_steps[static_cast<std::size_t>(k + 1)], logits_clean);
+    clean_greedy.push_back(argmax_tok(logits_clean));
+  }
+  CHECK(clean_greedy == cold_greedy);
 
   // Out-of-vocab token fails closed.
   bool threw = false;

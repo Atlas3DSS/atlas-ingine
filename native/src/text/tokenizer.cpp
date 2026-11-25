@@ -33,6 +33,10 @@ constexpr std::string_view kQwen2SplitPattern =
     "| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*"
     "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
+constexpr std::string_view kChatGlm4SplitPattern =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}"
+    "| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
 void require(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(std::string("tokenizer.json: unsupported ") + what);
 }
@@ -69,6 +73,8 @@ PipelineSpec validate_pipeline(const Json& root, const Json& model) {
     spec.split = Tokenizer::SplitMode::O200k;
   } else if (regex == kQwen2SplitPattern) {
     spec.split = Tokenizer::SplitMode::Qwen2;
+  } else if (regex == kChatGlm4SplitPattern) {
+    spec.split = Tokenizer::SplitMode::ChatGlm4;
   } else {
     require(false, "pre_tokenizer.Split");
   }
@@ -157,6 +163,7 @@ bool c_number(std::uint16_t m) { return (m & kN) != 0; }                        
 bool c_blank(std::uint16_t m) { return (m & kBlank) != 0; }                              // ' '
 bool c_symbol(std::uint16_t m) { return !(m & (kSpace | kLetter | kN)); }                // [^\s\p{L}\p{N}]
 bool c_letter_or_mark(std::uint16_t m) { return (m & (kLetter | kM)) != 0; }             // [\p{L}\p{M}]
+bool c_letter(std::uint16_t m) { return (m & kLetter) != 0; }                            // \p{L}
 bool c_qwen_symbol(std::uint16_t m) { return !(m & (kSpace | kLetter | kM | kN)); }      // [^\s\p{L}\p{M}\p{N}]
 bool c_crlf_slash(std::uint16_t m) { return (m & (kCrLf | kSlash)) != 0; }               // [\r\n/]
 bool c_crlf(std::uint16_t m) { return (m & kCrLf) != 0; }                                // [\r\n]
@@ -242,6 +249,23 @@ std::size_t piece_end_qwen2(const Text& t, std::size_t pos) {
   if (match_elements(t, kA5, pos, false, end)) return end;
   if (match_elements(t, kA6, pos, true, end)) return end;
   if (match_elements(t, kA6, pos, false, end)) return end;
+  return pos + 1;
+}
+
+std::size_t piece_end_chatglm4(const Text& t, std::size_t pos) {
+  static constexpr Element kG2[] = {{c_prefix, 0, 1}, {c_letter, 1, kMany}};
+  static constexpr Element kG3[] = {{c_number, 1, 3}};
+  static constexpr Element kG4[] = {{c_blank, 0, 1}, {c_symbol, 1, kMany}, {c_crlf, 0, kMany}};
+  static constexpr Element kG5[] = {{c_space, 0, kMany}, {c_crlf, 1, kMany}};
+  static constexpr Element kG6[] = {{c_space, 1, kMany}};
+  if (const std::size_t cont = contraction(t, pos); cont > pos) return cont;
+  std::size_t end = pos;
+  if (match_elements(t, kG2, pos, false, end)) return end;
+  if (match_elements(t, kG3, pos, false, end)) return end;
+  if (match_elements(t, kG4, pos, false, end)) return end;
+  if (match_elements(t, kG5, pos, false, end)) return end;
+  if (match_elements(t, kG6, pos, true, end)) return end;
+  if (match_elements(t, kG6, pos, false, end)) return end;
   return pos + 1;
 }
 
@@ -471,7 +495,12 @@ void Tokenizer::encode_ordinary(std::string_view text, std::vector<int32_t>& ids
   }
   const Text t{cps, cls};
   for (std::size_t pos = 0; pos < cps.size();) {
-    const std::size_t end = split_mode_ == SplitMode::Qwen2 ? piece_end_qwen2(t, pos) : piece_end(t, pos);
+    std::size_t end = pos + 1;
+    switch (split_mode_) {
+      case SplitMode::Qwen2: end = piece_end_qwen2(t, pos); break;
+      case SplitMode::ChatGlm4: end = piece_end_chatglm4(t, pos); break;
+      default: end = piece_end(t, pos); break;
+    }
     const std::size_t b = spans[pos].offset;
     const std::size_t e = end < spans.size() ? spans[end].offset : text.size();
     encode_piece(text.substr(b, e - b), ids);
