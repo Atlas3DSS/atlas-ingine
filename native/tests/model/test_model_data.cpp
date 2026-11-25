@@ -235,37 +235,64 @@ int main() {
     expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16, id_fp16_spec, prod_fp16, 256, 2048, false),
            "same-FP16 declines when spec_enabled");
 
-    // Model-package fingerprint distinguishes packages sharing identical config.json (e.g. native vs EXL3-9G)
+    // Model-package fingerprint binds 100% of actual weight bytes (no reliance on optional SHA256SUMS text):
+    // two valid same-layout safetensors with identical config.json/index/headers and weights 1.0 vs 2.0 MUST differ,
+    // and empty/weightless directories fail closed to std::nullopt (unverified).
     const std::filesystem::path pkg_base =
         std::filesystem::temp_directory_path() / "ingine_test_model_pkg_sha";
     std::error_code ec;
     std::filesystem::remove_all(pkg_base, ec);
-    const auto pkg_a = pkg_base / "native_pkg";
-    const auto pkg_b = pkg_base / "exl3_pkg";
-    std::filesystem::create_directories(pkg_a);
-    std::filesystem::create_directories(pkg_b);
+    const auto pkg_rev1 = pkg_base / "rev1_pkg";
+    const auto pkg_rev2 = pkg_base / "rev2_pkg";
+    const auto pkg_empty = pkg_base / "no_weights_pkg";
+    std::filesystem::create_directories(pkg_rev1);
+    std::filesystem::create_directories(pkg_rev2);
+    std::filesystem::create_directories(pkg_empty);
     auto write_str = [](const std::filesystem::path& p, const std::string& s) {
       std::ofstream out(p, std::ios::binary | std::ios::trunc);
       out.write(s.data(), std::streamsize(s.size()));
     };
+    auto write_single_f32_safetensors = [](const std::filesystem::path& p, float val) {
+      const std::string hdr = R"({"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})";
+      const std::uint64_t hlen = std::uint64_t(hdr.size());
+      std::ofstream out(p, std::ios::binary | std::ios::trunc);
+      out.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
+      out.write(hdr.data(), std::streamsize(hdr.size()));
+      out.write(reinterpret_cast<const char*>(&val), sizeof(val));
+    };
     const std::string shared_cfg = R"({"architectures":["Inkling2ForCausalLM"],"hidden_size":2304})";
-    write_str(pkg_a / "config.json", shared_cfg);
-    write_str(pkg_b / "config.json", shared_cfg);
-    write_str(pkg_a / "model.safetensors.index.json", R"({"weight_map":{"embed":"model-00001-of-00001.safetensors"}})");
-    write_str(pkg_b / "model.safetensors.index.json", R"({"weight_map":{"embed":"model-00001-of-00002.safetensors"}})");
-    expect(sha256_file_or_zero(pkg_a / "config.json") == sha256_file_or_zero(pkg_b / "config.json"),
-           "synthetic packages share identical config.json SHA");
-    expect(compute_model_package_sha256(pkg_a) != compute_model_package_sha256(pkg_b),
-           "compute_model_package_sha256 distinguishes packages with identical config.json");
-    std::filesystem::remove_all(pkg_base, ec);
+    const std::string shared_idx = R"({"weight_map":{"w":"model-00001-of-00001.safetensors"}})";
+    write_str(pkg_rev1 / "config.json", shared_cfg);
+    write_str(pkg_rev2 / "config.json", shared_cfg);
+    write_str(pkg_empty / "config.json", shared_cfg);
+    write_str(pkg_rev1 / "model.safetensors.index.json", shared_idx);
+    write_str(pkg_rev2 / "model.safetensors.index.json", shared_idx);
+    write_single_f32_safetensors(pkg_rev1 / "model-00001-of-00001.safetensors", 1.0f);
+    write_single_f32_safetensors(pkg_rev2 / "model-00001-of-00001.safetensors", 2.0f);
 
-    // If local native and EXL3 Inkling packages are both present, verify they get distinct package SHAs
-    const std::filesystem::path real_native = "/mnt/storage/models/Inkling-2-Mini-ingine";
-    const std::filesystem::path real_exl3 = "/mnt/storage/models/Inkling-2-Mini-atlas-exl3-9g";
-    if (std::filesystem::exists(real_native / "config.json") && std::filesystem::exists(real_exl3 / "config.json")) {
-      expect(compute_model_package_sha256(real_native) != compute_model_package_sha256(real_exl3),
-             "compute_model_package_sha256 distinguishes local Inkling native vs EXL3-9G packages");
-    }
+    const auto sha_rev1 = compute_model_package_sha256_opt(pkg_rev1);
+    const auto sha_rev2 = compute_model_package_sha256_opt(pkg_rev2);
+    expect(sha_rev1.has_value() && sha_rev2.has_value(), "valid safetensors packages produce verified content SHA");
+    expect(*sha_rev1 != *sha_rev2,
+           "same-layout safetensors with weights 1.0 vs 2.0 (no SHA256SUMS) produce distinct package SHAs");
+    StateIdentity id_rev1 = id_fp16, id_rev2 = id_fp16;
+    id_rev1.model_sha256 = *sha_rev1;
+    id_rev2.model_sha256 = *sha_rev2;
+    expect(compute_disk_producer_sha256(id_rev1) != compute_disk_producer_sha256(id_rev2),
+           "same-layout safetensors with weights 1.0 vs 2.0 produce distinct disk producer SHAs");
+    expect(!compute_model_package_sha256_opt({}).has_value() && !compute_model_package_sha256_opt(pkg_empty).has_value(),
+           "empty or weightless model directories fail closed to std::nullopt (unverified)");
+
+    // Verify load_weights-style tensor digest assembly matches standalone compute_model_package_sha256_opt bit-for-bit
+    const float v1 = 1.0f;
+    const std::array<std::uint8_t, 32> csha = sha256_bytes(&v1, sizeof(v1));
+    const std::array<std::int64_t, 1> sh1 = {1};
+    const std::array<std::array<std::uint8_t, 32>, 1> cshas = {csha};
+    std::map<std::string, std::array<std::uint8_t, 32>> tmap;
+    tmap["w"] = sha256_tensor_from_chunk_digests("w", "F32", sh1, sizeof(v1), cshas);
+    expect(compute_model_package_sha256_from_tensors(pkg_rev1, tmap) == *sha_rev1,
+           "in-flight tensor digest assembly matches standalone compute_model_package_sha256_opt bit-for-bit");
+    std::filesystem::remove_all(pkg_base, ec);
   }
 
   std::printf("%s model_data constants\n", ok ? "PASS" : "FAIL");

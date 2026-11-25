@@ -2,6 +2,7 @@
 
 #include "core/act.h"
 #include "core/device.h"
+#include "core/safetensors.h"
 #include "model/paged_kv.h"
 
 #include <errno.h>
@@ -220,44 +221,25 @@ void hash_optional_file(Sha256& ctx, const char* tag, const std::filesystem::pat
 
 void pread_all(int fd, void* buf, std::size_t n, std::uint64_t off);
 
-void hash_safetensors_header(Sha256& ctx, const std::filesystem::path& path) {
-  const std::string fname = path.filename().string();
-  hash_tagged_bytes(ctx, "shard_name", fname.data(), fname.size());
-  std::error_code ec;
-  const std::uint64_t fsize = std::filesystem::file_size(path, ec);
-  if (ec) {
-    const std::uint64_t zero = 0;
-    hash_tagged_bytes(ctx, "shard_err", &zero, sizeof(zero));
-    return;
-  }
-  hash_tagged_bytes(ctx, "shard_size", &fsize, sizeof(fsize));
-  const int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) return;
-  try {
-    if (fsize >= 8) {
-      std::uint64_t hdr_len = 0;
-      pread_all(fd, &hdr_len, sizeof(hdr_len), 0);
-      hash_tagged_bytes(ctx, "st_hdr_len", &hdr_len, sizeof(hdr_len));
-      // Bound header read to safetensors reference limit (64 MiB here) and actual file size.
-      constexpr std::uint64_t kMaxStHdr = 64ull << 20;
-      const std::uint64_t read_len = std::min<std::uint64_t>(hdr_len, std::min<std::uint64_t>(kMaxStHdr, fsize - 8));
-      std::vector<std::uint8_t> buf(std::size_t(std::min<std::uint64_t>(read_len, 65536ull)));
-      std::uint64_t off = 8;
-      std::uint64_t rem = read_len;
-      Sha256 hctx;
-      while (rem > 0) {
-        const std::size_t take = std::size_t(std::min<std::uint64_t>(rem, buf.size()));
-        pread_all(fd, buf.data(), take, off);
-        hctx.update(buf.data(), take);
-        off += take;
-        rem -= take;
-      }
-      const auto hsha = hctx.finish();
-      hash_tagged_bytes(ctx, "st_hdr_sha", hsha.data(), hsha.size());
+std::array<std::uint8_t, 32> hash_safetensors_tensor_file(const SafetensorsFile& file,
+                                                          const SafetensorsTensor& tensor,
+                                                          std::vector<std::byte>& scratch) {
+  std::vector<std::array<std::uint8_t, 32>> chunk_shas;
+  if (tensor.bytes > 0) {
+    const std::size_t n_chunks =
+        std::size_t((tensor.bytes + kSafetensorsHashChunkBytes - 1) / kSafetensorsHashChunkBytes);
+    chunk_shas.reserve(n_chunks);
+    std::uint64_t done = 0;
+    while (done < tensor.bytes) {
+      const std::size_t take =
+          std::size_t(std::min<std::uint64_t>(tensor.bytes - done, kSafetensorsHashChunkBytes));
+      if (scratch.size() < take) scratch.resize(take);
+      file.read_range(tensor.offset + done, take, scratch.data());
+      chunk_shas.push_back(sha256_bytes(scratch.data(), take));
+      done += take;
     }
-  } catch (...) {
   }
-  ::close(fd);
+  return sha256_tensor_from_chunk_digests(tensor.name, tensor.dtype, tensor.shape, tensor.bytes, chunk_shas);
 }
 
 std::uint32_t state_kv_format(const State& st) noexcept {
@@ -379,42 +361,88 @@ std::array<std::uint8_t, 32> sha256_file_or_zero(const std::filesystem::path& pa
   return ctx.finish();
 }
 
-std::array<std::uint8_t, 32> compute_model_package_sha256(const std::filesystem::path& model_dir) {
+std::array<std::uint8_t, 32> sha256_tensor_from_chunk_digests(
+    std::string_view name, std::string_view dtype, std::span<const std::int64_t> shape, std::uint64_t bytes,
+    std::span<const std::array<std::uint8_t, 32>> chunk_shas) noexcept {
   Sha256 ctx;
-  static constexpr char kDomain[] = "INGINE_MODEL_PKG_V1";
+  static constexpr char kDomain[] = "INGINE_TENSOR_V1";
   ctx.update(kDomain, sizeof(kDomain) - 1);
-  if (model_dir.empty()) {
-    const std::uint8_t synthetic = 1;
-    hash_tagged_bytes(ctx, "synthetic_empty_dir", &synthetic, 1);
-    return ctx.finish();
-  }
+  hash_tagged_bytes(ctx, "name", name.data(), name.size());
+  hash_tagged_bytes(ctx, "dtype", dtype.data(), dtype.size());
+  const std::uint64_t rank = std::uint64_t(shape.size());
+  hash_tagged_bytes(ctx, "rank", &rank, sizeof(rank));
+  if (!shape.empty()) hash_tagged_bytes(ctx, "shape", shape.data(), shape.size_bytes());
+  hash_tagged_bytes(ctx, "bytes", &bytes, sizeof(bytes));
+  const std::uint64_t n_chunks = std::uint64_t(chunk_shas.size());
+  hash_tagged_bytes(ctx, "n_chunks", &n_chunks, sizeof(n_chunks));
+  for (const auto& c : chunk_shas) ctx.update(c.data(), c.size());
+  return ctx.finish();
+}
+
+std::array<std::uint8_t, 32> compute_model_package_sha256_from_tensors(
+    const std::filesystem::path& model_dir,
+    const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas) {
+  Sha256 ctx;
+  static constexpr char kDomain[] = "INGINE_MODEL_PKG_V2";
+  ctx.update(kDomain, sizeof(kDomain) - 1);
+  // Hash authoritative model config/quant/index metadata + 100% of verified weight tensor contents.
+  // Never rely on optional SHA256SUMS text files as a proxy for weight bytes.
   hash_optional_file(ctx, "config.json", model_dir / "config.json");
   hash_optional_file(ctx, "hf_quant_config.json", model_dir / "hf_quant_config.json");
   hash_optional_file(ctx, "model.safetensors.index.json", model_dir / "model.safetensors.index.json");
-  hash_optional_file(ctx, "SHA256SUMS", model_dir / "SHA256SUMS");
-
-  std::vector<std::filesystem::path> shards;
-  std::error_code ec;
-  if (std::filesystem::is_directory(model_dir, ec)) {
-    for (const auto& entry : std::filesystem::directory_iterator(model_dir, ec)) {
-      if (ec) break;
-      if (!entry.is_regular_file(ec)) continue;
-      const auto p = entry.path();
-      if (p.extension() != ".safetensors") continue;
-      const std::string name = p.filename().string();
-      // Exclude optional drafter and ablation sidecar files (drafter/ablation are pinned separately in StateIdentity).
-      if (name == "mtp.safetensors" || name.find("abliterated") != std::string::npos) continue;
-      shards.push_back(p);
-    }
-  }
-  std::sort(shards.begin(), shards.end(),
-            [](const std::filesystem::path& a, const std::filesystem::path& b) { return a.filename() < b.filename(); });
-  const std::uint64_t n_shards = std::uint64_t(shards.size());
-  hash_tagged_bytes(ctx, "num_shards", &n_shards, sizeof(n_shards));
-  for (const auto& shard : shards) {
-    hash_safetensors_header(ctx, shard);
+  const std::uint64_t n_tensors = std::uint64_t(tensor_shas.size());
+  hash_tagged_bytes(ctx, "num_tensors", &n_tensors, sizeof(n_tensors));
+  for (const auto& [name, tsha] : tensor_shas) {
+    hash_tagged_bytes(ctx, "tensor_name", name.data(), name.size());
+    ctx.update(tsha.data(), tsha.size());
   }
   return ctx.finish();
+}
+
+std::optional<std::array<std::uint8_t, 32>> compute_model_package_sha256_opt(const std::filesystem::path& model_dir) {
+  if (model_dir.empty()) return std::nullopt;
+  std::error_code ec;
+  if (!std::filesystem::is_directory(model_dir, ec) || ec) return std::nullopt;
+  try {
+    std::map<std::string, std::array<std::uint8_t, 32>> tensor_shas;
+    std::vector<std::byte> scratch;
+    if (std::filesystem::exists(model_dir / "model.safetensors.index.json", ec) ||
+        std::filesystem::exists(model_dir / "model.safetensors", ec)) {
+      const SafetensorsModel m(model_dir);
+      for (const std::string& name : m.names()) {
+        const SafetensorsRef ref = m.at(name);
+        tensor_shas.emplace(name, hash_safetensors_tensor_file(*ref.file, *ref.tensor, scratch));
+      }
+    } else {
+      std::vector<std::filesystem::path> shards;
+      for (const auto& entry : std::filesystem::directory_iterator(model_dir, ec)) {
+        if (ec) return std::nullopt;
+        if (!entry.is_regular_file(ec)) continue;
+        const auto p = entry.path();
+        if (p.extension() != ".safetensors") continue;
+        const std::string fname = p.filename().string();
+        if (fname == "mtp.safetensors" || fname.find("abliterated") != std::string::npos) continue;
+        shards.push_back(p);
+      }
+      std::sort(shards.begin(), shards.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+        return a.filename() < b.filename();
+      });
+      for (const auto& shard : shards) {
+        const SafetensorsFile sf(shard);
+        for (const SafetensorsTensor& t : sf.tensors()) {
+          tensor_shas.emplace(t.name, hash_safetensors_tensor_file(sf, t, scratch));
+        }
+      }
+    }
+    if (tensor_shas.empty()) return std::nullopt;
+    return compute_model_package_sha256_from_tensors(model_dir, tensor_shas);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::array<std::uint8_t, 32> compute_model_package_sha256(const std::filesystem::path& model_dir) {
+  return compute_model_package_sha256_opt(model_dir).value_or(std::array<std::uint8_t, 32>{});
 }
 
 std::array<std::uint8_t, 32> compute_disk_producer_sha256(const StateIdentity& identity) noexcept {

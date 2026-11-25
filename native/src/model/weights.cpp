@@ -12,14 +12,17 @@
 #include "core/device.h"
 #include "core/safetensors.h"
 #include "kernels/dense/dense.h"
+#include "model/kv_checkpoint.h"
 #include "model/model_kernels.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -96,7 +99,9 @@ class Loader {
     const SafetensorsRef ref = m_.at(name);
     UploadRequest r = upload_request(ref, dst);
     if (rows >= 0) r.bytes = ref->bytes / std::uint64_t(ref->shape[0]) * std::uint64_t(rows);
+    const bool full_tensor = (rows < 0 && r.offset == ref->offset && r.bytes == ref->bytes);
     pending_.push_back(r);
+    pending_meta_.push_back(PendingMeta{name, ref.tensor, full_tensor});
   }
 
   // Raw checkpoint tensor (any dtype) in new device memory, uploaded at flush().
@@ -108,19 +113,52 @@ class Loader {
   }
 
   void flush() {
-    if (!pending_.empty()) up_.upload(pending_, stream_);
+    if (!pending_.empty()) {
+      const bool hash_in_flight = (up_.options().chunk_bytes == kSafetensorsHashChunkBytes);
+      if (hash_in_flight) {
+        std::vector<std::vector<std::array<std::uint8_t, 32>>> chunk_shas(pending_.size());
+        for (std::size_t ri = 0; ri < pending_.size(); ++ri) {
+          if (pending_meta_[ri].full_tensor && pending_[ri].bytes > 0) {
+            const std::size_t nc =
+                std::size_t((pending_[ri].bytes + kSafetensorsHashChunkBytes - 1) / kSafetensorsHashChunkBytes);
+            chunk_shas[ri].resize(nc);
+          }
+        }
+        up_.upload(pending_, stream_,
+                   [&](std::size_t ri, std::size_t ci, const void* data, std::size_t bytes) {
+                     if (ci < chunk_shas[ri].size()) chunk_shas[ri][ci] = sha256_bytes(data, bytes);
+                   });
+        for (std::size_t ri = 0; ri < pending_.size(); ++ri) {
+          if (!pending_meta_[ri].full_tensor) continue;
+          const SafetensorsTensor* t = pending_meta_[ri].tensor;
+          tensor_shas_[pending_meta_[ri].name] =
+              sha256_tensor_from_chunk_digests(t->name, t->dtype, t->shape, t->bytes, chunk_shas[ri]);
+        }
+      } else {
+        up_.upload(pending_, stream_);
+      }
+    }
     pending_.clear();
+    pending_meta_.clear();
   }
 
   const SafetensorsModel& model() const { return m_; }
   cudaStream_t stream() const { return stream_; }
+  const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas() const { return tensor_shas_; }
 
  private:
+  struct PendingMeta {
+    std::string name;
+    const SafetensorsTensor* tensor = nullptr;
+    bool full_tensor = false;
+  };
   const SafetensorsModel& m_;
   DeviceUploader& up_;
   cudaStream_t stream_;
   std::vector<DeviceBuffer>& storage_;
   std::vector<UploadRequest> pending_;
+  std::vector<PendingMeta> pending_meta_;
+  std::map<std::string, std::array<std::uint8_t, 32>> tensor_shas_;
 };
 
 struct LayerExpertFormats {
@@ -526,6 +564,34 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
         offload.ram_mb > 512 ? (std::size_t(offload.ram_mb - 256) << 20) : std::size_t(0);
     w.expert_cache = ExpertCache::create(model_dir, w.expert_formats, w.w2_expert_formats, router_biases,
                                          expert_vram_budget, warm_ram_budget, offload, stream);
+  }
+  // Complete verified weight-content digest over 100% of tensors in `m` (most already hashed in-flight during upload).
+  {
+    std::map<std::string, std::array<std::uint8_t, 32>> tensor_shas = ld.tensor_shas();
+    std::vector<std::byte> scratch;
+    for (const std::string& name : m.names()) {
+      if (tensor_shas.contains(name)) continue;
+      const SafetensorsRef ref = m.at(name);
+      std::vector<std::array<std::uint8_t, 32>> cshas;
+      if (ref->bytes > 0) {
+        const std::size_t nc =
+            std::size_t((ref->bytes + kSafetensorsHashChunkBytes - 1) / kSafetensorsHashChunkBytes);
+        cshas.reserve(nc);
+        std::uint64_t done = 0;
+        while (done < ref->bytes) {
+          const std::size_t take =
+              std::size_t(std::min<std::uint64_t>(ref->bytes - done, kSafetensorsHashChunkBytes));
+          if (scratch.size() < take) scratch.resize(take);
+          ref.file->read_range(ref->offset + done, take, scratch.data());
+          cshas.push_back(sha256_bytes(scratch.data(), take));
+          done += take;
+        }
+      }
+      tensor_shas.emplace(name, sha256_tensor_from_chunk_digests(ref->name, ref->dtype, ref->shape, ref->bytes, cshas));
+    }
+    if (!tensor_shas.empty()) {
+      w.content_sha256 = compute_model_package_sha256_from_tensors(model_dir, tensor_shas);
+    }
   }
   return w;
 }

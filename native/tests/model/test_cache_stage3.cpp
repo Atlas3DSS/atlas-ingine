@@ -741,7 +741,7 @@ int main(int argc, char** argv) {
       double vram_ttft_ms = 0;
       double host_xfer_ms = 0;
       double vram_xfer_ms = 0;
-      std::vector<std::int32_t> cold_tok;
+      std::array<std::vector<std::int32_t>, kReps> cold_toks;
       bool host_ok = true;
       bool vram_ok = true;
     };
@@ -749,7 +749,7 @@ int main(int argc, char** argv) {
     PrefixCacheStats ch, cv;
     std::size_t dev_vram_host_snap = 0, dev_vram_vram_snap = 0;
 
-    // Pass 1: Cold recompute + Tier-1 Pinned Host-RAM restore (single model resident)
+    // Pass 1: Pure cold recompute (bypass_prefix_cache=true) + Tier-1 Pinned Host-RAM restore on IDENTICAL in-vocab IDs
     {
       auto gen_host = make_generator(opt);
       dev_vram_host_snap = device_wide_vram_used_bytes();
@@ -759,24 +759,23 @@ int main(int argc, char** argv) {
         const bool use_root = (L < 256);  // bracket below kMinParked=256 where root parking (kMinRootTokens=64) applies
         const int root_hint = use_root ? L : 0;
         std::vector<std::int32_t> p(master.begin(), master.begin() + L);
-        p[0] = 20000 + L;
         rows[i].L = L;
         rows[i].is_root_bracket = use_root;
 
         std::vector<double> cold_samples, host_ttft_samples, host_xfer_samples;
         for (int rep = 0; rep < kReps; ++rep) {
-          // 1) Pure cold recompute measurement (bypass_prefix_cache=true -> zero pin/root-capture overhead at all L)
-          std::vector<std::int32_t> pc_cold = p;
-          pc_cold[0] = 40000 + L * 10 + rep;
-          const RunOut pure_cold = run_prompt(*gen_host, Prompt{pc_cold, {}, 0, "", /*bypass_prefix_cache=*/true}, 1, greedy);
-          cold_samples.push_back(pure_cold.stats.prefill_seconds * 1e3);
-
-          // 2) Populate parked entry for pc (distinct from pc_cold), flush live, then time HostParked restore
+          // Strictly in-vocabulary IDs (< UNPADDED_VOCAB) identical across pure cold, host restore, and VRAM restore
           std::vector<std::int32_t> pc = p;
-          pc[0] = 30000 + L * 10 + rep;
+          pc[0] = 1000 + int(i) * 10 + rep;
+
+          // 1) Pure cold recompute measurement on identical IDs (bypass_prefix_cache=true -> zero pin/root overhead)
+          const RunOut pure_cold = run_prompt(*gen_host, Prompt{pc, {}, 0, "", /*bypass_prefix_cache=*/true}, 1, greedy);
+          cold_samples.push_back(pure_cold.stats.prefill_seconds * 1e3);
+          rows[i].cold_toks[static_cast<std::size_t>(rep)] = pure_cold.tokens;
+
+          // 2) Populate parked entry for the exact same `pc`, flush live, then time HostParked restore
           run_prompt(*gen_host, Prompt{flush_ids, {}, 0}, 1, greedy);
           const RunOut pop = run_prompt(*gen_host, Prompt{pc, {}, root_hint}, 1, greedy);
-          if (rep == 0) rows[i].cold_tok = pop.tokens;
 
           run_prompt(*gen_host, Prompt{flush_ids, {}, 0}, 1, greedy);  // parks pc (non-root) or flushes live (root already parked)
           const std::uint64_t h2d_before = gen_host->cache_stats().h2d_restore_bytes;
@@ -785,8 +784,9 @@ int main(int argc, char** argv) {
           if (rep == 0) rows[i].h2d_bytes = h2d_after - h2d_before;
           host_ttft_samples.push_back(hres.stats.prefill_seconds * 1e3);
           host_xfer_samples.push_back(hres.stats.restore_seconds.value_or(0.0) * 1e3);
-          rows[i].host_ok &= (hres.stats.reuse == Reuse::HostParked && hres.stats.reused_tokens == L &&
-                              hres.tokens == pop.tokens);
+          rows[i].host_ok &= (pure_cold.stats.reuse == Reuse::None && pure_cold.stats.reused_tokens == 0 &&
+                              hres.stats.reuse == Reuse::HostParked && hres.stats.reused_tokens == L &&
+                              pop.tokens == pure_cold.tokens && hres.tokens == pure_cold.tokens);
         }
         rows[i].cold_ttft_ms = median_of(cold_samples);
         rows[i].host_ttft_ms = median_of(host_ttft_samples);
@@ -795,7 +795,7 @@ int main(int argc, char** argv) {
       ch = gen_host->cache_stats();
     }
 
-    // Pass 2: Tier-0 VRAM parked restore (separate single-model instance)
+    // Pass 2: Tier-0 VRAM parked restore on the EXACT SAME in-vocab IDs, directly compared to Pass 1 pure_cold.tokens
     {
       auto gen_vram = make_generator(opt_vram);
       dev_vram_vram_snap = device_wide_vram_used_bytes();
@@ -808,16 +808,17 @@ int main(int argc, char** argv) {
         std::vector<double> vram_ttft_samples, vram_xfer_samples;
         for (int rep = 0; rep < kReps; ++rep) {
           std::vector<std::int32_t> pc = p;
-          pc[0] = 30000 + L * 10 + rep;
+          pc[0] = 1000 + int(i) * 10 + rep;
           run_prompt(*gen_vram, Prompt{flush_ids, {}, 0}, 1, greedy);
-          const RunOut cold = run_prompt(*gen_vram, Prompt{pc, {}, root_hint}, 1, greedy);
+          const RunOut pop = run_prompt(*gen_vram, Prompt{pc, {}, root_hint}, 1, greedy);
           run_prompt(*gen_vram, Prompt{flush_ids, {}, 0}, 1, greedy);
           const RunOut vres = run_prompt(*gen_vram, Prompt{pc, {}, 0}, 1, greedy);
           vram_ttft_samples.push_back(vres.stats.prefill_seconds * 1e3);
           vram_xfer_samples.push_back(vres.stats.restore_seconds.value_or(0.0) * 1e3);
           const Reuse expected_vram = use_root ? Reuse::RootCheckpoint : Reuse::Parked;
+          const auto& cold_ref = rows[i].cold_toks[static_cast<std::size_t>(rep)];
           rows[i].vram_ok &= (vres.stats.reuse == expected_vram && vres.stats.reused_tokens == L &&
-                              vres.tokens == cold.tokens);
+                              pop.tokens == cold_ref && vres.tokens == cold_ref);
         }
         rows[i].vram_ttft_ms = median_of(vram_ttft_samples);
         rows[i].vram_xfer_ms = median_of(vram_xfer_samples);

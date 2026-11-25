@@ -13,7 +13,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 
 namespace ingine::model {
 
@@ -89,9 +93,21 @@ void clear_kv_checkpoint_sigterm() noexcept;
 std::array<std::uint8_t, 32> sha256_bytes(const void* data, std::size_t len) noexcept;
 std::array<std::uint8_t, 32> sha256_file_or_zero(const std::filesystem::path& path);
 
-// Fast verified model-package fingerprint over config.json, hf_quant_config.json, model.safetensors.index.json,
-// SHA256SUMS, and every weight shard's filename + byte size + safetensors JSON metadata header (distinguishes
-// native vs EXL3/ATLAS/FP8-disk packages that share identical config.json without hashing multi-GB weight payloads).
+// Combine per-32MiB-chunk SHA-256 digests of one safetensors tensor into its canonical content digest.
+std::array<std::uint8_t, 32> sha256_tensor_from_chunk_digests(
+    std::string_view name, std::string_view dtype, std::span<const std::int64_t> shape, std::uint64_t bytes,
+    std::span<const std::array<std::uint8_t, 32>> chunk_shas) noexcept;
+
+// Combine model metadata (config.json, hf_quant_config.json, model.safetensors.index.json; never trusting
+// optional SHA256SUMS text) with sorted per-tensor content digests over 100% of weight bytes.
+std::array<std::uint8_t, 32> compute_model_package_sha256_from_tensors(
+    const std::filesystem::path& model_dir,
+    const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas);
+
+// Verified cryptographic model-package fingerprint over config.json, hf_quant_config.json,
+// model.safetensors.index.json, and 100% of every weight tensor's actual bytes (32 MiB chunked SHA-256;
+// bit-identical to load_weights). Returns std::nullopt when model_dir is empty or has no readable weight tensors.
+std::optional<std::array<std::uint8_t, 32>> compute_model_package_sha256_opt(const std::filesystem::path& model_dir);
 std::array<std::uint8_t, 32> compute_model_package_sha256(const std::filesystem::path& model_dir);
 
 // Compute the verified disk-checkpoint producer digest over (model_sha256, act_dtype, dense_fp8, kv_format,

@@ -55,11 +55,12 @@ const RuntimeOptions& without_spec(const RuntimeOptions& options) {
   return options;
 }
 
-std::array<std::uint8_t, 32> compute_model_identity_sha(const RuntimeOptions& opt) {
+std::array<std::uint8_t, 32> compute_model_identity_sha(const RuntimeOptions& opt, const Weights& weights) {
   std::array<std::uint8_t, 64> buf{};
-  const auto pkg_sha = compute_model_package_sha256(opt.model_dir);
+  if (weights.content_sha256.has_value()) {
+    std::memcpy(buf.data(), weights.content_sha256->data(), 32);
+  }
   const auto abl_sha = opt.ablation.empty() ? std::array<std::uint8_t, 32>{} : sha256_file_or_zero(opt.ablation);
-  std::memcpy(buf.data(), pkg_sha.data(), 32);
   std::memcpy(buf.data() + 32, abl_sha.data(), 32);
   return sha256_bytes(buf.data(), buf.size());
 }
@@ -194,14 +195,19 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaEventCreate(&restore_end_));
 
     // Build fail-closed runtime/model identity pinned for all prefix-cache lookups.
-    base_identity_.model_sha256 = compute_model_identity_sha(options_);
+    // File-backed models loaded via load_weights carry verified weight-content SHA-256; caller-supplied/synthetic
+    // Weights without content_sha256 remain unverified for disk checkpoint producer stamps and auto-resume.
+    has_verified_producer_ = rt_.weights().content_sha256.has_value();
+    base_identity_.model_sha256 = compute_model_identity_sha(options_, rt_.weights());
     base_identity_.act_dtype = (kActDType == DType::FP16) ? 1u : 0u;
     base_identity_.dense_fp8 = options_.dense_fp8;
     base_identity_.kv_format = options_.kv_q4 ? 2u : (options_.kv_fp8 ? 1u : 0u);
     base_identity_.max_ctx = options_.max_ctx;
     base_identity_.prefill_chunk = options_.prefill_chunk;
     base_identity_.spec_enabled = (drafter_ != nullptr);
-    disk_producer_sha_ = compute_disk_producer_sha256(base_identity_);
+    if (has_verified_producer_) {
+      disk_producer_sha_ = compute_disk_producer_sha256(base_identity_);
+    }
 
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, rt_.stream());
@@ -483,6 +489,7 @@ class EngineGenerator final : public Generator {
     Parked* parked = bypass_reuse ? nullptr : find_parked(ids, req_images, live_match, req_identity);
     std::size_t start = 0;
     bool resumed_has_full_state = true;
+    bool resumed_unverified_legacy = false;
     request_evictions_ = 0;
     if (parked) {
       // Pin the selected parked node across park_live() and unpark() so neither LRU eviction nor a re-entrant
@@ -573,7 +580,7 @@ class EngineGenerator final : public Generator {
               if (!kv_checkpoint_runtime_matches(info, req_identity)) {
                 throw std::runtime_error("--kv-ckpt-resume runtime dtype/kv_format mismatch");
               }
-              if (info.has_producer_identity && info.producer_sha256 != disk_producer_sha_) {
+              if (has_verified_producer_ && info.has_producer_identity && info.producer_sha256 != disk_producer_sha_) {
                 throw std::runtime_error(
                     "--kv-ckpt-resume producer identity mismatch (weights package, dense_fp8, or prefill_chunk)");
               }
@@ -588,15 +595,17 @@ class EngineGenerator final : public Generator {
               return true;
             });
         start = std::size_t(res.info.pos);
-        const bool verified_producer = res.info.has_producer_identity && res.info.producer_sha256 == disk_producer_sha_;
+        const bool verified_producer =
+            has_verified_producer_ && res.info.has_producer_identity && res.info.producer_sha256 == disk_producer_sha_;
         resumed_has_full_state = res.info.has_logits && !drafter_ && verified_producer;
+        resumed_unverified_legacy = !verified_producer;
         stats.reuse = Reuse::Checkpoint;
         stats.restored_bytes = std::nullopt;  // disk payload transfer bytes not counted inside load_kv_checkpoint
         stats.restore_seconds = seconds_since(tr);
         std::fprintf(stderr, "[kv-ckpt] resumed %d / %zu tokens from %s (has_logits=%s, verified_producer=%s)\n",
                      res.info.pos, n, options_.kv_ckpt_resume.c_str(), res.info.has_logits ? "true" : "false",
                      verified_producer ? "true" : "false");
-      } else if (baseline_disk_ok && !drafter_ && !options_.kv_ckpt_path.empty() &&
+      } else if (has_verified_producer_ && baseline_disk_ok && !drafter_ && !options_.kv_ckpt_path.empty() &&
                  std::filesystem::exists(options_.kv_ckpt_path)) {
         try {
           const auto tr = std::chrono::steady_clock::now();
@@ -613,8 +622,10 @@ class EngineGenerator final : public Generator {
           if (res.loaded) {
             start = std::size_t(res.info.pos);
             const bool verified_producer =
-                res.info.has_producer_identity && res.info.producer_sha256 == disk_producer_sha_;
+                has_verified_producer_ && res.info.has_producer_identity &&
+                res.info.producer_sha256 == disk_producer_sha_;
             resumed_has_full_state = res.info.has_logits && !drafter_ && verified_producer;
+            resumed_unverified_legacy = !verified_producer;
             stats.reuse = Reuse::Checkpoint;
             stats.restored_bytes = std::nullopt;
             stats.restore_seconds = seconds_since(tr);
@@ -627,6 +638,7 @@ class EngineGenerator final : public Generator {
           if (drafter_) drafter_->reset();
           start = 0;
           resumed_has_full_state = false;
+          resumed_unverified_legacy = false;
           stats.reuse = Reuse::None;
           stats.restored_bytes = 0u;
           stats.restore_seconds = 0.0;
@@ -637,15 +649,15 @@ class EngineGenerator final : public Generator {
     }
 
     // Verified root-prefix snapshot boundary: only capture if we have parking budget, a valid verified root
-    // boundary >= kMinRootTokens, and no exact parked copy already exists for (ids[0..root_len), images, identity).
+    // boundary >= kMinRootTokens, no unverified legacy disk provenance, and no exact parked copy already exists.
     const std::size_t root_len =
-        (!bypass_reuse && can_park_any() && root_prefix_tokens >= int(kMinRootTokens))
+        (!bypass_reuse && !resumed_unverified_legacy && can_park_any() && root_prefix_tokens >= int(kMinRootTokens))
             ? std::size_t(root_prefix_tokens)
             : 0u;
     const std::vector<VerifiedImageSpan> root_images =
         root_len > 0 ? filter_images_in_prefix(req_images, root_len) : std::vector<VerifiedImageSpan>{};
-    bool need_root_capture =
-        root_len > 0 && !has_exact_parked(ids.subspan(0, root_len), root_images, req_identity, /*mark_root=*/true);
+    bool need_root_capture = !resumed_unverified_legacy && root_len > 0 &&
+                             !has_exact_parked(ids.subspan(0, root_len), root_images, req_identity, /*mark_root=*/true);
     // Only promote an exact-length restored checkpoint to a reusable root when full runtime/drafter state AND
     // boundary logits at root_len - 1 are proved (never promote a logit-less or drafter-less disk resume).
     if (need_root_capture && start == root_len && stats.reuse == Reuse::Checkpoint && resumed_has_full_state) {
@@ -719,11 +731,15 @@ class EngineGenerator final : public Generator {
         const bool sigterm = kv_checkpoint_sigterm_requested();
         const bool periodic = (options_.kv_ckpt_every > 0 && done >= next_ckpt && done < n);
         if (periodic || sigterm) {
-          const KvCheckpointProducer producer{true, options_.dense_fp8, options_.prefill_chunk, disk_producer_sha_};
+          // Never stamp verified producer identity on checkpoints from unverified given weights or legacy descendants.
+          const bool stamp_verified_producer = has_verified_producer_ && !resumed_unverified_legacy;
+          const KvCheckpointProducer producer{stamp_verified_producer, options_.dense_fp8, options_.prefill_chunk,
+                                              disk_producer_sha_};
           save_kv_checkpoint(st, options_.model_dir, ids.subspan(0, done), static_cast<const float*>(logits_.p),
-                             options_.kv_ckpt_path, stream, &producer);
-          std::fprintf(stderr, "[kv-ckpt] %s saved atomic checkpoint at pos=%zu / %zu -> %s\n",
-                       sigterm ? "SIGTERM" : "periodic", done, n, options_.kv_ckpt_path.c_str());
+                             options_.kv_ckpt_path, stream, stamp_verified_producer ? &producer : nullptr);
+          std::fprintf(stderr, "[kv-ckpt] %s saved atomic checkpoint at pos=%zu / %zu -> %s (verified_producer=%s)\n",
+                       sigterm ? "SIGTERM" : "periodic", done, n, options_.kv_ckpt_path.c_str(),
+                       stamp_verified_producer ? "true" : "false");
           if (options_.kv_ckpt_every > 0) {
             while (next_ckpt <= done) next_ckpt += std::size_t(options_.kv_ckpt_every);
           }
@@ -738,8 +754,11 @@ class EngineGenerator final : public Generator {
     tokens_in_state_.assign(ids.begin(), ids.end());
     live_images_ = req_images;
     live_identity_ = req_identity;
-    live_bypass_reuse_ = bypass_reuse;
-    if (bypass_reuse) {
+    // Isolate explicit legacy-resumed descendants from all reusable state (live Extend, last-prefill Checkpoint,
+    // and parked Tier-0/Tier-1 entries) until a subsequent verified cold recompute replaces the live state.
+    const bool isolate_reuse = bypass_reuse || resumed_unverified_legacy;
+    live_bypass_reuse_ = isolate_reuse;
+    if (isolate_reuse) {
       checkpoint_ids_.clear();
       checkpoint_images_.clear();
       checkpoint_identity_ = StateIdentity{};
@@ -1259,6 +1278,7 @@ class EngineGenerator final : public Generator {
   };
 
   StateIdentity base_identity_;
+  bool has_verified_producer_ = false;
   std::array<std::uint8_t, 32> disk_producer_sha_{};
   StateIdentity live_identity_;
   StateIdentity checkpoint_identity_;

@@ -1084,10 +1084,14 @@ bool run_disk_checkpoint_dtype() {
   const std::filesystem::path ckpt_mixed = tmp_dir / "mixed.bin";
   const std::filesystem::path ckpt_fp32 = tmp_dir / "fp32_bogus.bin";
   const std::filesystem::path ckpt_legacy = tmp_dir / "legacy.bin";
+  const std::filesystem::path ckpt_legacy_desc = tmp_dir / "legacy_desc_96.bin";
+  const std::filesystem::path ckpt_unverified = tmp_dir / "unverified_given.bin";
   std::filesystem::remove(ckpt_same);
   std::filesystem::remove(ckpt_mixed);
   std::filesystem::remove(ckpt_fp32);
   std::filesystem::remove(ckpt_legacy);
+  std::filesystem::remove(ckpt_legacy_desc);
+  std::filesystem::remove(ckpt_unverified);
 
   auto patch_act_dtype = [](const std::filesystem::path& src, const std::filesystem::path& dst,
                             std::uint32_t new_act_dtype) {
@@ -1116,17 +1120,22 @@ bool run_disk_checkpoint_dtype() {
     out.close();
   };
 
-  auto make_synth_gen = [](const RuntimeOptions& opt) {
+  const std::array<std::uint8_t, 32> synth_verified_sha = sha256_bytes("SYNTH_VERIFIED_TEST_WEIGHTS_77", 30);
+  auto make_synth_gen = [&](const RuntimeOptions& opt, bool verified = true) {
     cudaStream_t s;
     INGINE_TEST_CUDA(cudaStreamCreate(&s));
     Weights w = synthetic_weights(s);
     INGINE_TEST_CUDA(cudaStreamDestroy(s));
+    if (verified) w.content_sha256 = synth_verified_sha;
     return make_generator(opt, std::move(w), load_ablation({}));
   };
 
   Rng rng(91);
-  std::vector<std::int32_t> prompt(100);
+  std::vector<std::int32_t> prompt(144);
   for (auto& t : prompt) t = std::int32_t(rng.next() % kVocab);
+  const std::span<const std::int32_t> prompt100(prompt.data(), 100);  // saves only at pos=64 when kv_ckpt_every=64
+  std::vector<std::int32_t> sibling = prompt;
+  sibling[96] = (sibling[96] + 1) % kVocab;  // diverges at R = 96 (> pos=64)
   Sampling greedy;
   greedy.temperature = 0.f;
 
@@ -1146,13 +1155,37 @@ bool run_disk_checkpoint_dtype() {
   base.park_mb = 0;
   base.park_host_mb = 0;
 
-  // 1. Save real disk checkpoint at pos = 64 (< 100, with boundary logits) and record greedy reference
+  // 0. Given weights with NO content_sha256 identity MUST stay unverified (save !has_producer_identity, decline auto)
+  {
+    RuntimeOptions opt = base;
+    opt.kv_ckpt_path = ckpt_unverified;
+    opt.kv_ckpt_every = 64;
+    auto gen = make_synth_gen(opt, /*verified=*/false);
+    (void)run_once(*gen, prompt100);
+    const KvCheckpointInfo ui = inspect_kv_checkpoint(ckpt_unverified);
+
+    RuntimeOptions aopt = base;
+    aopt.kv_ckpt_path = ckpt_unverified;
+    aopt.kv_ckpt_every = 0;
+    auto gen2 = make_synth_gen(aopt, /*verified=*/false);
+    const auto [toks2, st2] = run_once(*gen2, prompt100);
+    ok &= report(ui.pos == 64 && !ui.has_producer_identity && st2.reuse == Reuse::None && st2.reused_tokens == 0 &&
+                     toks2.size() == 16,
+                 "given weights with no content identity stay unverified (no producer stamp & auto-resume declined)" +
+                     tag);
+  }
+
+  // 1. Save real disk checkpoint at pos = 64 (< 100, with boundary logits) and record greedy reference for 144-tok prompt
   std::vector<std::int32_t> ref_tokens;
   {
     RuntimeOptions opt = base;
     opt.kv_ckpt_path = ckpt_same;
     opt.kv_ckpt_every = 64;
     auto gen = make_synth_gen(opt);
+    (void)run_once(*gen, prompt100);
+  }
+  {
+    auto gen = make_synth_gen(base);
     const auto [toks, st] = run_once(*gen, prompt);
     ref_tokens = toks;
   }
@@ -1185,23 +1218,51 @@ bool run_disk_checkpoint_dtype() {
                  "same-dtype auto --kv-ckpt-path resumes with exact parity (deliberate max_ctx=4096)" + tag);
   }
 
-  // 4. Legacy checkpoint (zeroed producer trailer): explicit preserved without root promotion; auto declined
+  // 4. Legacy checkpoint (zeroed producer trailer at pos=64):
+  //    - explicit resume with R=96 and 144-token prompt MUST preserve legacy execution while isolating descendants:
+  //      root_entries==0, no Extend/Checkpoint/Parked reuse, periodic pos-96 save has !has_producer_identity,
+  //      and a fresh generator MUST decline auto-resume on that pos-96 descendant!
   strip_producer_trailer(ckpt_same, ckpt_legacy);
   {
     const KvCheckpointInfo li = inspect_kv_checkpoint(ckpt_legacy);
-    bool explicit_ok = false;
+    bool explicit_isolated = false;
     {
       RuntimeOptions opt = base;
+      opt.prefill_chunk = 32;  // hits done=96 cleanly after pos=64
       opt.park_mb = 256;
       opt.kv_ckpt_resume = ckpt_legacy;
+      opt.kv_ckpt_path = ckpt_legacy_desc;
+      opt.kv_ckpt_every = 96;
       auto gen = make_synth_gen(opt);
       std::vector<std::int32_t> out;
-      const GenerateStats st = gen->generate(Prompt{prompt, {}, 64}, 16, greedy, {}, [&](std::span<const std::int32_t> t) {
-        out.insert(out.end(), t.begin(), t.end());
-        return true;
-      });
-      explicit_ok = (st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && out == ref_tokens &&
-                     gen->cache_stats().root_entries == 0);
+      const GenerateStats st =
+          gen->generate(Prompt{prompt, {}, 96}, 16, greedy, {}, [&](std::span<const std::int32_t> t) {
+            out.insert(out.end(), t.begin(), t.end());
+            return true;
+          });
+      // Sibling sharing [0, 96) MUST NOT hit RootCheckpoint/Parked/Checkpoint/Extend from the legacy descendant!
+      std::vector<std::int32_t> sib_out;
+      const GenerateStats sib_st =
+          gen->generate(Prompt{sibling, {}, 96}, 4, greedy, {}, [&](std::span<const std::int32_t> t) {
+            sib_out.insert(sib_out.end(), t.begin(), t.end());
+            return true;
+          });
+      const PrefixCacheStats cs = gen->cache_stats();
+      const KvCheckpointInfo di = inspect_kv_checkpoint(ckpt_legacy_desc);
+      explicit_isolated = (st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && out.size() == 16 &&
+                           cs.root_entries == 0 && cs.vram_entries == 0 && cs.host_entries == 0 &&
+                           sib_st.reuse == Reuse::Checkpoint && sib_st.reused_tokens == 64 &&
+                           di.pos == 96 && !di.has_producer_identity);
+    }
+    bool desc_auto_declined = false;
+    {
+      RuntimeOptions opt = base;
+      opt.prefill_chunk = 32;
+      opt.kv_ckpt_path = ckpt_legacy_desc;
+      opt.kv_ckpt_every = 0;
+      auto gen = make_synth_gen(opt);
+      const auto [toks, st] = run_once(*gen, prompt);
+      desc_auto_declined = (st.reuse == Reuse::None && st.reused_tokens == 0 && toks.size() == 16);
     }
     bool auto_declined = false;
     {
@@ -1212,8 +1273,9 @@ bool run_disk_checkpoint_dtype() {
       const auto [toks, st] = run_once(*gen, prompt);
       auto_declined = (st.reuse == Reuse::None && st.reused_tokens == 0 && toks == ref_tokens);
     }
-    ok &= report(!li.has_producer_identity && explicit_ok && auto_declined,
-                 "legacy disk checkpoint: explicit resume preserved (no root promotion) & auto-resume declined" + tag);
+    ok &= report(!li.has_producer_identity && explicit_isolated && desc_auto_declined && auto_declined,
+                 "legacy disk checkpoint & pos-96 descendant isolated from root/parked/auto-resume & producer stamp" +
+                     tag);
   }
 
   // 5. Verified checkpoint with mismatched producer (prefill_chunk 64 -> 32): explicit throws, auto declines
