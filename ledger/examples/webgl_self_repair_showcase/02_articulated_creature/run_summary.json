@@ -1,0 +1,276 @@
+{
+  "target_kind": "articulated_creature",
+  "task_id": "loktar_02_articulated_creature",
+  "title": "Articulated 3D Winged Mechanical-Organic Dragon/Griffin with Hierarchical Kinematics",
+  "model": "inkling-2-mini",
+  "solved": true,
+  "attempt0_passed": false,
+  "attempt0_score": 0.0,
+  "attempt0_error": "TOKEN_TRUNCATION",
+  "best_iter": 8,
+  "best_score": 85.25,
+  "stop_reason": "converged_verified_pass",
+  "total_iters": 9,
+  "ledger_stats": {
+    "db_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/verified_ledger.sqlite",
+    "env_version": "v1_chromium1248_webgl2",
+    "active_facts": 3,
+    "stale_facts": 0,
+    "active_winners": 2,
+    "stale_winners": 0,
+    "active_repairs": 3,
+    "failures_logged": 15,
+    "drift_events": 0
+  },
+  "records": [
+    {
+      "iter": 0,
+      "mode": "attempt0_stock_oneshot",
+      "ok": false,
+      "score": 0.0,
+      "error_signature": "TOKEN_TRUNCATION",
+      "error_detail": "Could not extract valid complete HTML (finish_reason=length, chars=0). Keep code concise and close </html> cleanly.",
+      "summary": "",
+      "finish_reason": "length",
+      "elapsed_s": 178.9,
+      "usage": {
+        "prompt_tokens": 750,
+        "completion_tokens": 16384,
+        "total_tokens": 17134,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "TOKEN_TRUNCATION"
+      },
+      "html_path": ""
+    },
+    {
+      "iter": 1,
+      "mode": "verified_ledger_pivot_repair",
+      "ok": false,
+      "score": 2.0,
+      "error_signature": "TOKEN_TRUNCATION",
+      "error_detail": "Generation hit max_tokens before closing </html>! Make code cleaner and more compact so the entire file completes.",
+      "summary": "",
+      "finish_reason": "length",
+      "elapsed_s": 154.54,
+      "usage": {
+        "prompt_tokens": 1227,
+        "completion_tokens": 16384,
+        "total_tokens": 17611,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": true,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "TOKEN_TRUNCATION"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/02_articulated_creature/iter_01/app.html"
+    },
+    {
+      "iter": 2,
+      "mode": "verified_ledger_pivot_repair",
+      "ok": false,
+      "score": 5.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught pageerror(s): Identifier 'hw' has already been declared",
+      "summary": "",
+      "finish_reason": "stop",
+      "elapsed_s": 84.94,
+      "usage": {
+        "prompt_tokens": 8380,
+        "completion_tokens": 10450,
+        "total_tokens": 18830,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": true,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/02_articulated_creature/iter_02/app.html"
+    },
+    {
+      "iter": 3,
+      "mode": "verified_ledger_repair",
+      "ok": false,
+      "score": 5.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught pageerror(s): Identifier 'bw' has already been declared",
+      "summary": "",
+      "finish_reason": "stop",
+      "elapsed_s": 77.03,
+      "usage": {
+        "prompt_tokens": 11143,
+        "completion_tokens": 10464,
+        "total_tokens": 21607,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/02_articulated_creature/iter_03/app.html"
+    },
+    {
+      "iter": 4,
+      "mode": "verified_ledger_pivot_repair",
+      "ok": true,
+      "score": 92.76,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "WebGL2 Articulated Creature PASS: 11 hierarchical joints animating, motion_mad=0.0390, orbit_mad=0.164, buttons=['Walk', 'Flap', 'Roar'], entropy=3.43, colors=367",
+      "finish_reason": "stop",
+      "elapsed_s": 72.4,
+      "usage": {
+        "prompt_tokens": 11304,
+        "completion_tokens": 10201,
+        "total_tokens": 21505,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": true,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": true,
+        "failure_logged": false
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/02_articulated_creature/iter_04/app.html"
+    },
+    {
+      "iter": 5,
+      "mode": "verified_ledger_visual_polish",
+      "ok": true,
+      "score": 92.95,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "WebGL2 Articulated Creature PASS: 11 hierarchical joints animating, motion_mad=0.0462, orbit_mad=0.200, buttons=['Walk', 'Flap', 'Roar'], entropy=3.42, colors=430",
+      "finish_reason": "stop",
+      "elapsed_s": 85.68,
+      "usage": {
+        "prompt_tokens": 11661,
+        "completion_tokens": 11533,
+        "total_tokens": 23194,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": false,
+        "failure_logged": false
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/02_articulated_creature/iter_05/app.html"
+    },
+    {
+      "iter": 6,
+      "mode": "verified_ledger_framing_repair",
+      "ok": false,
+      "score": 52.0,
+      "error_signature": "CAMERA_TOO_CLOSE_CROPPED",
+      "error_detail": "Creature is cropped at the top edge of the viewport (top_edge_fg=0.9983)! Pull the camera back and frame a clean 3/4 side-front full-body view so the entire head, wings, legs, and tail stay well inside the 1280x720 frame.",
+      "summary": "",
+      "finish_reason": "stop",
+      "elapsed_s": 79.34,
+      "usage": {
+        "prompt_tokens": 13159,
+        "completion_tokens": 11301,
+        "total_tokens": 24460,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "CAMERA_TOO_CLOSE_CROPPED"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/02_articulated_creature/iter_06/app.html"
+    },
+    {
+      "iter": 7,
+      "mode": "verified_ledger_framing_repair",
+      "ok": false,
+      "score": 52.0,
+      "error_signature": "CAMERA_TOO_CLOSE_CROPPED",
+      "error_detail": "Creature is cropped at the top edge of the viewport (top_edge_fg=0.9997)! Pull the camera back and frame a clean 3/4 side-front full-body view so the entire head, wings, legs, and tail stay well inside the 1280x720 frame.",
+      "summary": "",
+      "finish_reason": "stop",
+      "elapsed_s": 86.07,
+      "usage": {
+        "prompt_tokens": 13161,
+        "completion_tokens": 11867,
+        "total_tokens": 25028,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "CAMERA_TOO_CLOSE_CROPPED"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/02_articulated_creature/iter_07/app.html"
+    },
+    {
+      "iter": 8,
+      "mode": "verified_ledger_framing_repair",
+      "ok": true,
+      "score": 85.25,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "WebGL2 Articulated Creature PASS: 11 hierarchical joints animating, motion_mad=0.0118, orbit_mad=0.140, buttons=['Walk', 'Flap', 'Roar'], entropy=2.38, colors=446",
+      "finish_reason": "stop",
+      "elapsed_s": 78.56,
+      "usage": {
+        "prompt_tokens": 13098,
+        "completion_tokens": 11258,
+        "total_tokens": 24356,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": true,
+        "failure_logged": false
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/02_articulated_creature/iter_08/app.html"
+    }
+  ]
+}

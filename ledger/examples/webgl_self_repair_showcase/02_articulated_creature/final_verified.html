@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><title>Celestial Dragon — WebGL2</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#0a0a12;font-family:system-ui,sans-serif}
+canvas{display:block;width:100vw;height:100vh}
+#panel{position:fixed;top:12px;left:12px;background:rgba(15,15,25,.85);border:1px solid #3a3a55;border-radius:10px;padding:10px 12px;color:#e8e0d0;font-size:12px;user-select:none;backdrop-filter:blur(4px)}
+#panel h1{font-size:13px;margin:0 0 8px;color:#ffd27a;letter-spacing:1px}
+.row{display:flex;gap:6px;margin:6px 0;flex-wrap:wrap}
+button{background:#23233a;color:#ffe9c4;border:1px solid #4a4a6a;border-radius:6px;padding:4px 9px;cursor:pointer;font-size:11px;transition:all .15s}
+button:hover{border-color:#ffb060}
+button.on{background:#7a2a2a;border-color:#ffb060;color:#fff;box-shadow:0 0 8px rgba(255,176,96,.35)}
+label{display:flex;align-items:center;gap:6px;margin:5px 0;font-size:11px}
+input[type=range]{width:120px;accent-color:#ffb060}
+#dbg{position:fixed;bottom:10px;left:12px;color:#9ad;font-size:10px;font-family:monospace;background:rgba(0,0,0,.55);padding:4px 8px;border-radius:6px;border:1px solid #2a2a3a}
+</style></head>
+<body>
+<canvas id="c"></canvas>
+<div id="panel"><h1>CELESTIAL DRAGON</h1>
+<div class="row"><button id="bGait">Walk</button><button id="bWing">Flap</button><button id="bRoar">Roar</button><button id="bIdle">Idle</button></div>
+<label>Speed <input id="sSpeed" type="range" min="0.2" max="2" step="0.05" value="1"></label>
+<label>Wingspan <input id="sWing" type="range" min="0.3" max="1.6" step="0.05" value="1"></label>
+</div><div id="dbg"></div>
+<script>
+"use strict";
+const M4=()=>new Float32Array(16);
+const mI=()=>{const m=M4();m[0]=m[5]=m[10]=m[15]=1;return m;};
+const mMul=(a,b)=>{const o=M4();for(let c=0;c<4;c++)for(let r=0;r<4;r++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o[c*4+r]=s;}return o;};
+const mT=(x,y,z)=>{const m=mI();m[12]=x;m[13]=y;m[14]=z;return m;};
+const mRx=a=>{const m=mI(),c=Math.cos(a),s=Math.sin(a);m[5]=c;m[6]=s;m[9]=-s;m[10]=c;return m;};
+const mRy=a=>{const m=mI(),c=Math.cos(a),s=Math.sin(a);m[0]=c;m[2]=s;m[8]=-s;m[10]=c;return m;};
+const mRz=a=>{const m=mI(),c=Math.cos(a),s=Math.sin(a);m[0]=c;m[1]=s;m[4]=-s;m[5]=c;return m;};
+const mS=(x,y,z)=>{const m=mI();m[0]=x;m[5]=y;m[10]=z;return m;};
+const mCompose=(p,rx,ry,rz,s)=>mMul(mT(p[0],p[1],p[2]),mMul(mRx(rx),mMul(mRy(ry),mMul(mRz(rz),mS(s[0],s[1],s[2])))));
+const mNormal=m=>{const r00=m[0],r01=m[4],r02=m[8],r10=m[1],r11=m[5],r12=m[9],r20=m[2],r21=m[6],r22=m[10];
+const c00=r11*r22-r12*r21,c01=-(r01*r22-r02*r21),c02=r01*r12-r02*r11,c10=-(r10*r22-r12*r20),c11=r00*r22-r02*r20,c12=-(r00*r12-r02*r10),c20=r10*r21-r11*r20,c21=-(r00*r21-r01*r20),c22=r00*r11-r01*r10;
+const det=r00*c00+r01*c10+r02*c20||1e-8;return new Float32Array([c00/det,c10/det,c20/det,c01/det,c11/det,c21/det,c02/det,c12/det,c22/det]);};
+const mLookAt=(e,c,up)=>{const f=[c[0]-e[0],c[1]-e[1],c[2]-e[2]];const fl=Math.hypot(f[0],f[1],f[2]);f[0]/=fl;f[1]/=fl;f[2]/=fl;
+const s=[f[1]*up[2]-f[2]*up[1],f[2]*up[0]-f[0]*up[2],f[0]*up[1]-f[1]*up[0]];const sl=Math.hypot(s[0],s[1],s[2]);s[0]/=sl;s[1]/=sl;s[2]/=sl;
+const u=[s[1]*f[2]-s[2]*f[1],s[2]*f[0]-s[0]*f[2],s[0]*f[1]-s[1]*f[0]];const m=M4();
+m[0]=s[0];m[4]=s[1];m[8]=s[2];m[12]=-(s[0]*e[0]+s[1]*e[1]+s[2]*e[2]);m[1]=u[0];m[5]=u[1];m[9]=u[2];m[13]=-(u[0]*e[0]+u[1]*e[1]+u[2]*e[2]);
+m[2]=-f[0];m[6]=-f[1];m[10]=-f[2];m[14]=f[0]*e[0]+f[1]*e[1]+f[2]*e[2];m[15]=1;return m;};
+const mPersp=(fov,a,n,fr)=>{const f=1/Math.tan(fov/2),nf=1/(n-fr);const m=M4();m[0]=f/a;m[5]=f;m[10]=(fr+n)*nf;m[11]=-1;m[14]=2*fr*n*nf;return m;};
+function sphereGeo(r,ws,hs){const p=[],n=[],ix=[];for(let i=0;i<=hs;i++){const ph=i/hs*Math.PI;for(let j=0;j<=ws;j++){const th=j/ws*Math.PI*2;const x=Math.sin(ph)*Math.cos(th),y=Math.cos(ph),z=Math.sin(ph)*Math.sin(th);p.push(x*r,y*r,z*r);n.push(x,y,z);}}for(let i=0;i<hs;i++)for(let j=0;j<ws;j++){const a=i*(ws+1)+j,b=a+ws+1;ix.push(a,b,a+1,b,b+1,a+1);}return{p,n,ix};}
+function cylGeo(r1,r2,h,seg){const p=[],n=[],ix=[];for(let i=0;i<=1;i++){const y=-h*i,r=r1+(r2-r1)*i;for(let j=0;j<=seg;j++){const t=j/seg*Math.PI*2,x=Math.cos(t),z=Math.sin(t);p.push(x*r,y,z*r);n.push(x,0,z);}}for(let j=0;j<seg;j++){const a=j,b=j+seg+1;ix.push(a,b,a+1,b,b+1,a+1);}const top=p.length/3;p.push(0,0,0);n.push(0,1,0);for(let j=0;j<seg;j++)ix.push(top,j+1,j);const bot=p.length/3;p.push(0,-h,0);n.push(0,-1,0);for(let j=0;j<seg;j++)ix.push(bot,seg+1+j,seg+1+((j+1)%seg));return{p,n,ix};}
+function boxGeo(w,h,d){const hw=w/2,hh=h/2,hd=d/2;const F=[[[[hw,-hh,-hd],[hw,hh,-hd],[hw,hh,hd],[hw,-hh,hd]],[1,0,0]],[[[-hw,-hh,hd],[-hw,hh,hd],[-hw,hh,-hd],[-hw,-hh,-hd]],[-1,0,0]],[[[-hw,hh,-hd],[hw,hh,-hd],[hw,hh,hd],[-hw,hh,hd]],[0,1,0]],[[[-hw,-hh,hd],[hw,-hh,hd],[hw,-hh,-hd],[-hw,-hh,-hd]],[0,-1,0]],[[[-hw,-hh,hd],[hw,-hh,hd],[hw,hh,hd],[-hw,hh,hd]],[0,0,1]],[[[hw,-hh,-hd],[-hw,-hh,-hd],[-hw,hh,-hd],[hw,hh,-hd]],[0,0,-1]]];const p=[],n=[],ix=[];for(const fd of F){const v=fd[0],nm=fd[1];const b=p.length/3;for(let i=0;i<4;i++){p.push(v[i][0],v[i][1],v[i][2]);n.push(nm[0],nm[1],nm[2]);}ix.push(b,b+1,b+2,b,b+2,b+3);}return{p,n,ix};}
+function planeGeo(w,h){return{p:[0,-h/2,0,w,-h/2,0,0,h/2,0,w,h/2,0],n:[0,0,1,0,0,1,0,0,1,0,0,1],ix:[0,1,2,1,3,2]};}
+function circleGeo(r,seg){const p=[0,0,0],n=[0,1,0],ix=[];for(let j=0;j<=seg;j++){const t=j/seg*Math.PI*2;p.push(Math.cos(t)*r,0,Math.sin(t)*r);n.push(0,1,0);}for(let j=0;j<seg;j++)ix.push(0,1+j+1,1+j);return{p,n,ix};}
+function ringGeo(r1,r2,seg){const p=[],n=[],ix=[];for(let j=0;j<=seg;j++){const t=j/seg*Math.PI*2,c=Math.cos(t),s=Math.sin(t);p.push(c*r1,0,s*r1);n.push(0,1,0);p.push(c*r2,0,s*r2);n.push(0,1,0);}for(let j=0;j<seg;j++){const a=j*2,b=a+2;ix.push(a,b,a+1,b,b+1,a+1);}return{p,n,ix};}
+function coneGeo(r,h,seg){const p=[0,h/2,0],n=[0,1,0],ix=[];for(let j=0;j<=seg;j++){const t=j/seg*Math.PI*2,x=Math.cos(t),z=Math.sin(t);p.push(x*r,-h/2,z*r);n.push(x,0.35,z);}const base=p.length/3;p.push(0,-h/2,0);n.push(0,-1,0);for(let j=0;j<seg;j++)ix.push(0,1+j+1,1+j);for(let j=0;j<seg;j++)ix.push(base,base+1+j,base+1+((j+1)%seg));return{p,n,ix};}
+const cv=document.getElementById('c'),gl=cv.getContext('webgl2');
+gl.enable(gl.DEPTH_TEST);gl.disable(gl.CULL_FACE);
+const VS=`#version 300 es
+layout(location=0)in vec3 aPos;layout(location=1)in vec3 aNormal;
+uniform mat4 uMVP;uniform mat4 uModel;uniform mat3 uNM;
+out vec3 vN;out vec3 vW;
+void main(){vec4 w=uModel*vec4(aPos,1.0);vW=w.xyz;vN=normalize(uNM*aNormal);gl_Position=uMVP*vec4(aPos,1.0);}`;
+const FS=`#version 300 es
+precision highp float;in vec3 vN;in vec3 vW;
+uniform vec3 uColor;uniform vec3 uEmissive;uniform float uAlpha;uniform vec3 uCam;out vec4 frag;
+void main(){vec3 N=normalize(vN);vec3 V=normalize(uCam-vW);vec3 L=normalize(vec3(0.6,1.0,0.4));
+vec3 L2=normalize(vec3(-0.7,0.4,-0.6));
+float diff=max(dot(N,L),0.0);float fill=max(dot(N,L2),0.0)*0.35;
+float hemi=0.5+0.5*N.y;float rim=pow(max(dot(reflect(-L,N),V),0.0),3.0);
+vec3 col=uColor*(0.28*hemi+0.85*diff+fill)+uColor*rim*0.75+uEmissive;
+frag=vec4(col,uAlpha);}`;
+function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(o));return o;}
+const prog=gl.createProgram();gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));gl.linkProgram(prog);gl.useProgram(prog);
+const U={};['uMVP','uModel','uNM','uColor','uEmissive','uAlpha','uCam'].forEach(nm=>U[nm]=gl.getUniformLocation(prog,nm));
+const aPos=gl.getAttribLocation(prog,'aPos'),aN=gl.getAttribLocation(prog,'aNormal');
+function makeMesh(geo,joint,local,color,emissive,alpha){
+const vbo=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vbo);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(geo.p),gl.STATIC_DRAW);
+const nbo=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,nbo);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(geo.n),gl.STATIC_DRAW);
+const ibo=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ibo);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(geo.ix),gl.STATIC_DRAW);
+return{vbo,nbo,ibo,count:geo.ix.length,joint,local,color,emissive,alpha};}
+const joints=[],Jmap={};
+function J(name,parent,x,y,z){const j={name,parent:parent?Jmap[parent]:null,base:[x,y,z],rx:0,ry:0,rz:0,sx:1,sy:1,sz:1,world:mI()};joints.push(j);Jmap[name]=j;return j;}
+J('pelvis',null,0,1.35,0);J('midSpine','pelvis',0,0.18,-0.38);J('chest','midSpine',0,0.18,-0.38);
+J('neck1','chest',0,0.28,-0.32);J('neck2','neck1',0,0.26,-0.28);J('head','neck2',0,0.22,-0.32);J('jaw','head',0,-0.12,-0.28);
+J('earL','head',0.14,0.2,0.02);J('earR','head',-0.14,0.2,0.02);
+J('tail1','pelvis',0,0.05,0.45);J('tail2','tail1',0,0,0.42);J('tail3','tail2',0,0,0.42);J('tail4','tail3',0,0,0.42);
+J('legFL_hip','pelvis',0.3,-0.18,-0.32);J('legFL_knee','legFL_hip',0,-0.55,0);J('legFL_ankle','legFL_knee',0,-0.55,0);
+J('legFR_hip','pelvis',-0.3,-0.18,-0.32);J('legFR_knee','legFR_hip',0,-0.55,0);J('legFR_ankle','legFR_knee',0,-0.55,0);
+J('legBL_hip','pelvis',0.3,-0.12,0.35);J('legBL_knee','legBL_hip',0,-0.55,0);J('legBL_ankle','legBL_knee',0,-0.55,0);
+J('legBR_hip','pelvis',-0.3,-0.12,0.35);J('legBR_knee','legBR_hip',0,-0.55,0);J('legBR_ankle','legBR_knee',0,-0.55,0);
+J('wingL_shoulder','chest',0.26,0.28,-0.05);J('wingL_elbow','wingL_shoulder',0.55,0.08,0);J('wingL_tip','wingL_elbow',0.6,0.05,0);
+J('wingR_shoulder','chest',-0.26,0.28,-0.05);J('wingR_elbow','wingR_shoulder',-0.55,0.08,0);J('wingR_tip','wingR_elbow',-0.6,0.05,0);
+J('stage',null,0,0,0);
+const CRIM=[0.62,0.1,0.14],OBS=[0.09,0.09,0.14],GOLD=[0.95,0.68,0.22],AMBER=[1.0,0.62,0.12],CYAN=[0.25,0.9,1.0],WING=[0.78,0.3,0.48];
+const meshes=[];
+function add(geo,joint,local,color,em,alpha){meshes.push(makeMesh(geo,Jmap[joint],local,color,em,alpha===undefined?1:alpha));}
+add(boxGeo(0.52,0.36,0.62),'pelvis',mI(),CRIM,[0,0,0]);
+add(boxGeo(0.56,0.1,0.66),'pelvis',mT(0,0.2,0),GOLD,[0,0,0]);
+add(boxGeo(0.42,0.32,0.5),'midSpine',mI(),OBS,[0,0,0]);
+add(sphereGeo(0.12,8,6),'midSpine',mT(0,0.16,0),AMBER,[0.8,0.45,0.08]);
+add(boxGeo(0.58,0.46,0.55),'chest',mI(),CRIM,[0,0,0]);
+add(boxGeo(0.6,0.1,0.57),'chest',mT(0,0.24,0),GOLD,[0,0,0]);
+add(boxGeo(0.64,0.08,0.4),'chest',mT(0,-0.22,0),OBS,[0,0,0]);
+add(sphereGeo(0.14,10,8),'chest',mT(0,0.05,-0.28),AMBER,[0.9,0.5,0.08]);
+add(cylGeo(0.15,0.11,0.42,10),'neck1',mRx(1.1),OBS,[0,0,0]);
+add(cylGeo(0.16,0.13,0.1,10),'neck1',mMul(mRx(1.1),mT(0,-0.1,0)),GOLD,[0,0,0]);
+add(cylGeo(0.11,0.09,0.36,10),'neck2',mRx(1.0),CRIM,[0,0,0]);
+add(boxGeo(0.3,0.26,0.42),'head',mT(0,0,-0.1),CRIM,[0,0,0]);
+add(boxGeo(0.16,0.14,0.3),'head',mT(0,-0.04,-0.38),OBS,[0,0,0]);
+add(boxGeo(0.34,0.06,0.3),'head',mT(0,0.16,-0.05),GOLD,[0,0,0]);
+add(sphereGeo(0.045,8,6),'head',mT(0.1,0.05,-0.26),CYAN,[0.2,0.85,1.0]);
+add(sphereGeo(0.045,8,6),'head',mT(-0.1,0.05,-0.26),CYAN,[0.2,0.85,1.0]);
+add(coneGeo(0.05,0.22,6),'head',mT(0,0.24,-0.05),GOLD,[0.3,0.2,0.05]);
+add(boxGeo(0.18,0.07,0.34),'jaw',mT(0,-0.02,-0.12),OBS,[0,0,0]);
+add(cylGeo(0.05,0.001,0.3,6),'earL',mRz(-0.5),GOLD,[0.3,0.2,0.05]);
+add(cylGeo(0.05,0.001,0.3,6),'earR',mRz(0.5),GOLD,[0.3,0.2,0.05]);
+add(cylGeo(0.17,0.12,0.45,10),'tail1',mRx(-1.35),OBS,[0,0,0]);
+add(cylGeo(0.18,0.14,0.08,10),'tail1',mMul(mRx(-1.35),mT(0,-0.15,0)),GOLD,[0,0,0]);
+add(cylGeo(0.12,0.08,0.45,10),'tail2',mRx(-1.35),CRIM,[0,0,0]);
+add(cylGeo(0.08,0.05,0.45,10),'tail3',mRx(-1.35),OBS,[0,0,0]);
+add(cylGeo(0.05,0.001,0.45,6),'tail4',mRx(-1.35),GOLD,[0.5,0.3,0.05]);
+add(coneGeo(0.07,0.28,8),'tail4',mMul(mRx(-1.35),mT(0,-0.4,0)),CYAN,[0.15,0.6,0.8]);
+function leg(p){add(sphereGeo(0.13,8,6),p+'_hip',mI(),AMBER,[0.85,0.45,0.08]);add(cylGeo(0.11,0.08,0.55,10),p+'_hip',mT(0,-0.05,0),CRIM,[0,0,0]);add(sphereGeo(0.1,8,6),p+'_knee',mI(),AMBER,[0.85,0.45,0.08]);add(cylGeo(0.08,0.05,0.55,10),p+'_knee',mT(0,-0.05,0),OBS,[0,0,0]);add(sphereGeo(0.08,8,6),p+'_ankle',mI(),CYAN,[0.1,0.6,0.75]);add(boxGeo(0.16,0.1,0.26),p+'_ankle',mT(0,-0.06,-0.06),GOLD,[0,0,0]);add(coneGeo(0.035,0.14,6),p+'_ankle',mMul(mRx(-1.57),mT(0.05,-0.08,-0.2)),GOLD,[0.2,0.12,0.03]);add(coneGeo(0.035,0.14,6),p+'_ankle',mMul(mRx(-1.57),mT(-0.05,-0.08,-0.2)),GOLD,[0.2,0.12,0.03]);}
+leg('legFL');leg('legFR');leg('legBL');leg('legBR');
+function wing(p,side){add(sphereGeo(0.13,8,6),p+'_shoulder',mI(),AMBER,[0.85,0.45,0.08]);add(cylGeo(0.09,0.06,0.55,10),p+'_shoulder',mMul(mRz(side*1.5),mT(0,-0.02,0)),OBS,[0,0,0]);add(sphereGeo(0.09,8,6),p+'_elbow',mI(),AMBER,[0.85,0.45,0.08]);add(cylGeo(0.06,0.03,0.6,10),p+'_elbow',mMul(mRz(side*1.5),mT(0,-0.02,0)),OBS,[0,0,0]);
+add(planeGeo(0.95,0.55),p+'_elbow',mMul(mRy(side<0?Math.PI:0),mRz(side*0.35)),WING,[0.12,0.03,0.08],0.6);
+add(planeGeo(0.6,0.3),p+'_shoulder',mMul(mRy(side<0?Math.PI:0),mRz(side*0.5)),WING,[0.1,0.03,0.07],0.5);
+add(cylGeo(0.04,0.001,0.35,6),p+'_tip',mMul(mRz(side*1.5),mT(0,-0.02,0)),GOLD,[0.4,0.25,0.05]);}
+wing('wingL',1);wing('wingR',-1);
+add(circleGeo(3.4,56),'stage',mT(0,0,0),[0.13,0.13,0.2],[0,0,0]);
+add(ringGeo(2.35,2.5,56),'stage',mT(0,0.005,0),[0.95,0.68,0.22],[0.35,0.2,0.04],0.85);
+add(ringGeo(1.5,1.56,56),'stage',mT(0,0.005,0),[0.25,0.9,1.0],[0.08,0.35,0.45],0.7);
+add(circleGeo(2.35,56),'stage',mT(0,0.002,0),[0.24,0.2,0.13],[0.04,0.025,0],0.92);
+const state={gait:'walk',wing:'flap',roar:false,idle:false,speed:1,wingspan:1};
+const bGait=document.getElementById('bGait'),bWing=document.getElementById('bWing'),bRoar=document.getElementById('bRoar'),bIdle=document.getElementById('bIdle');
+const sSpeed=document.getElementById('sSpeed'),sWing=document.getElementById('sWing');
+bGait.onclick=()=>{state.gait=state.gait==='walk'?'trot':'walk';state.idle=false;bIdle.classList.remove('on');bGait.classList.add('on');};
+bWing.onclick=()=>{state.wing=state.wing==='flap'?'hover':'flap';bWing.classList.add('on');};
+bRoar.onclick=()=>{state.roar=!state.roar;bRoar.classList.toggle('on',state.roar);};
+bIdle.onclick=()=>{state.idle=!state.idle;bIdle.classList.toggle('on',state.idle);if(state.idle){bGait.classList.remove('on');}};
+sSpeed.oninput=e=>state.speed=+e.target.value;sWing.oninput=e=>state.wingspan=+e.target.value;
+let theta=0.65,phi=1.18,radius=18.5,drag=false,px=0,py=0;
+cv.addEventListener('pointerdown',e=>{drag=true;px=e.clientX;py=e.clientY;});
+window.addEventListener('pointermove',e=>{if(!drag)return;theta-=(e.clientX-px)*0.005;phi=Math.max(0.35,Math.min(1.5,phi-(e.clientY-py)*0.005));px=e.clientX;py=e.clientY;});
+window.addEventListener('pointerup',()=>drag=false);
+cv.addEventListener('wheel',e=>{e.preventDefault();radius=Math.max(8,Math.min(26,radius+e.deltaY*0.005));},{passive:false});
+function resize(){const d=window.devicePixelRatio||1;cv.width=innerWidth*d;cv.height=innerHeight*d;gl.viewport(0,0,cv.width,cv.height);}
+window.addEventListener('resize',resize);resize();
+const dbg=document.getElementById('dbg');
+function setJ(name,rx,ry,rz,sx,sy,sz){const j=Jmap[name];j.rx=rx;j.ry=ry;j.rz=rz;j.sx=sx===undefined?1:sx;j.sy=sy===undefined?1:sy;j.sz=sz===undefined?1:sz;}
+const start=performance.now();
+function frame(now){
+ const t=(now-start)/1000,ts=t*state.speed;
+ const idle=state.idle,walk=state.gait==='trot'?1.7:1;
+ const gaitAmp=idle?0.06:0.5*walk,ph=ts*(idle?1.2:4.5)*walk;
+ const offs={legFL_hip:0,legFR_hip:Math.PI,legBL_hip:Math.PI,legBR_hip:0};
+ for(const p of['legFL','legFR','legBL','legBR']){
+  const o=offs[p+'_hip'],s=Math.sin(ph+o);
+  setJ(p+'_hip',s*gaitAmp,0,0);setJ(p+'_knee',Math.max(0,-s)*0.9*(idle?0.2:1)+0.15,0,0);setJ(p+'_ankle',-Math.max(0,-s)*0.5,0,0);}
+ const hover=state.wing==='hover';
+ const flapSpd=hover?9:4.5,flapAmp=hover?0.85:0.55,flap=Math.sin(ts*flapSpd)*flapAmp;
+ const ws=state.wingspan;
+ setJ('wingL_shoulder',0,0,(0.35+flap)*ws);setJ('wingL_elbow',0,0,(0.5+flap*0.6)*ws);setJ('wingL_tip',0,0,flap*0.4);
+ setJ('wingR_shoulder',0,0,-(0.35+flap)*ws);setJ('wingR_elbow',0,0,-(0.5+flap*0.6)*ws);setJ('wingR_tip',0,0,-flap*0.4);
+ for(let i=1;i<=4;i++)setJ('tail'+i,0,Math.sin(ts*3-i*0.75)*0.4,0);
+ const breathe=Math.sin(ts*2)*0.05;
+ setJ('midSpine',breathe,0,0);setJ('chest',breathe*1.4+(hover?-0.1:0),0,0);
+ setJ('neck1',Math.sin(ts*0.9)*0.12+(state.roar?-0.25:0),Math.sin(ts*0.7)*0.18,0);
+ setJ('neck2',Math.sin(ts*1.1+1)*0.1+(state.roar?-0.2:0),Math.sin(ts*0.9+0.5)*0.15,0);
+ setJ('head',Math.sin(ts*1.3)*0.08,Math.sin(ts*0.6+2)*0.25,0);
+ setJ('jaw',state.roar?0.55+Math.sin(ts*20)*0.08:0.08+Math.sin(ts*2.2)*0.05,0,0);
+ setJ('earL',0,0,Math.sin(ts*2.4)*0.15);setJ('earR',0,0,-Math.sin(ts*2.4+0.6)*0.15);
+ setJ('pelvis',(hover?-0.12:0)+Math.sin(ts*2)*0.02,Math.sin(ts*0.5)*0.06,0);
+ const bodyY=hover?1.85:1.35+Math.sin(ts*2)*0.03;
+ Jmap.pelvis.base[1]=bodyY;
+ for(const j of joints){const l=mCompose(j.base,j.rx,j.ry,j.rz,[j.sx,j.sy,j.sz]);j.world=j.parent?mMul(j.parent.world,l):l;}
+ const eye=[Math.sin(theta)*Math.cos(phi),Math.cos(phi),Math.cos(theta)*Math.cos(phi)].map(v=>v*radius);
+ eye[1]+=1.35;const target=[0,1.35,0];
+ const view=mLookAt(eye,target,[0,1,0]);
+ const proj=mPersp(0.55,cv.width/cv.height,0.1,100);
+ const mvp=mMul(proj,view);
+ gl.clearColor(0.045,0.045,0.09,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+ gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+ for(const m of meshes){
+  const model=mMul(mI(),mMul(m.joint.world,m.local));
+  const vp=mMul(mvp,model);
+  gl.uniformMatrix4fv(U.uMVP,false,vp);gl.uniformMatrix4fv(U.uModel,false,model);
+  const nmat=mNormal(model);gl.uniformMatrix3fv(U.uNM,false,nmat);
+  gl.uniform3fv(U.uColor,m.color);gl.uniform3fv(U.uEmissive,m.emissive);
+  gl.uniform1f(U.uAlpha,m.alpha);gl.uniform3fv(U.uCam,eye);
+  gl.bindBuffer(gl.ARRAY_BUFFER,m.vbo);gl.enableVertexAttribArray(aPos);gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,m.nbo);gl.enableVertexAttribArray(aN);gl.vertexAttribPointer(aN,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,m.ibo);gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_SHORT,0);}
+ gl.disable(gl.BLEND);
+ window.__CREATURE_DEBUG__={jointCount:joints.length-1,gaitMode:state.idle?'idle':state.gait,time:t,joints:{spine:Jmap.midSpine.rx,neck:Jmap.neck1.rx,jaw:Jmap.jaw.rx,wingL1:Jmap.wingL_shoulder.rz,wingR1:Jmap.wingR_shoulder.rz,tail1:Jmap.tail1.ry,legFL:Jmap.legFL_hip.rx,legFR:Jmap.legFR_hip.rx,legBL:Jmap.legBL_hip.rx,legBR:Jmap.legBR_hip.rx,head:Jmap.head.ry}};
+ dbg.textContent=`joints=${window.__CREATURE_DEBUG__.jointCount} gait=${window.__CREATURE_DEBUG__.gaitMode} t=${t.toFixed(1)}s`;
+ requestAnimationFrame(frame);}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,82 @@
+{
+  "target_kind": "atari_arcade",
+  "task_id": "loktar_03_atari_arcade",
+  "title": "Playable Retro Atari-Style Space Arcade Game with Full Collision/Score/Lives/Restart Loop",
+  "model": "inkling-2-mini",
+  "solved": true,
+  "attempt0_passed": false,
+  "attempt0_score": 46.0,
+  "attempt0_error": "NO_SCORING_OR_COLLISIONS",
+  "best_iter": 1,
+  "best_score": 94.2,
+  "stop_reason": "converged_verified_pass",
+  "total_iters": 2,
+  "ledger_stats": {
+    "db_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/verified_ledger.sqlite",
+    "env_version": "v1_chromium1248_webgl2",
+    "active_facts": 3,
+    "stale_facts": 0,
+    "active_winners": 2,
+    "stale_winners": 0,
+    "active_repairs": 2,
+    "failures_logged": 11,
+    "drift_events": 0
+  },
+  "records": [
+    {
+      "iter": 0,
+      "mode": "attempt0_stock_oneshot",
+      "ok": false,
+      "score": 46.0,
+      "error_signature": "NO_SCORING_OR_COLLISIONS",
+      "error_detail": "Live playtest steered under enemies and fired Space for 5.5s, but score stayed 0 (collisions=0). Check Space firing rate, bullet speed, hitbox collision, and enemy coordinates in __GAME_STATE__.",
+      "summary": "",
+      "finish_reason": "stop",
+      "elapsed_s": 97.9,
+      "usage": {
+        "prompt_tokens": 817,
+        "completion_tokens": 9817,
+        "total_tokens": 10634,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "NO_SCORING_OR_COLLISIONS"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/03_atari_arcade/iter_00/app.html"
+    },
+    {
+      "iter": 1,
+      "mode": "verified_ledger_repair",
+      "ok": true,
+      "score": 94.2,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "Atari Arcade PLAYTEST PASS: ArrowR=+190.6px ArrowL=-256.6px, live_score=1000, collisions=12, lives 3->0->gameover->clean restart, entropy=2.06",
+      "finish_reason": "stop",
+      "elapsed_s": 97.23,
+      "usage": {
+        "prompt_tokens": 10045,
+        "completion_tokens": 11186,
+        "total_tokens": 21231,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": true,
+        "failure_logged": false
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/03_atari_arcade/iter_01/app.html"
+    }
+  ]
+}

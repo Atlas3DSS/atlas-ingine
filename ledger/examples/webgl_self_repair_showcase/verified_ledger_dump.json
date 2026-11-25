@@ -1,0 +1,155 @@
+{
+  "meta": [
+    {
+      "k": "env_version",
+      "v": "v1_chromium1248_webgl2"
+    }
+  ],
+  "facts": [
+    {
+      "fact_key": "runtime_webgl2",
+      "category": "hardware",
+      "value": "Headless Chromium-1248 WebGL2 (GLSL ES 3.00, ANGLE SwiftShader Vulkan 1.3.0, MAX_TEXTURE_SIZE=8192, EXT_color_buffer_float=true).",
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    },
+    {
+      "fact_key": "offline_single_file",
+      "category": "runtime",
+      "value": "Zero external network/CDN fetches allowed; all JS/CSS/WebGL2/WebAudio code must be 100% self-contained inside one HTML file.",
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    },
+    {
+      "fact_key": "viewport_framing",
+      "category": "runtime",
+      "value": "Target viewport is 1280x720; ensure canvas fills viewport cleanly and subject occupies central 35%-75% of frame with strong lighting contrast.",
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    }
+  ],
+  "winners": [
+    {
+      "task_id": "loktar_02_articulated_creature",
+      "task_text": "Articulated 3D Winged Mechanical-Organic Dragon/Griffin with Hierarchical Kinematics",
+      "score": 92.95,
+      "summary": "WebGL2 Articulated Creature PASS: 11 hierarchical joints animating, motion_mad=0.0462, orbit_mad=0.200, buttons=['Walk', 'Flap', 'Roar'], entropy=3.42, colors=430",
+      "tags_json": "[\"articulated_creature\", \"verified_ledger_visual_polish\"]",
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    },
+    {
+      "task_id": "loktar_03_atari_arcade",
+      "task_text": "Playable Retro Atari-Style Space Arcade Game with Full Collision/Score/Lives/Restart Loop",
+      "score": 94.2,
+      "summary": "Atari Arcade PLAYTEST PASS: ArrowR=+190.6px ArrowL=-256.6px, live_score=1000, collisions=12, lives 3->0->gameover->clean restart, entropy=2.06",
+      "tags_json": "[\"atari_arcade\", \"verified_ledger_repair\"]",
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    },
+    {
+      "task_id": "loktar_01_gaussian_splats",
+      "task_text": "Real-Time WebGL2 3D Gaussian Splatting Viewer & Multi-Object Scene",
+      "score": 95.42,
+      "summary": "WebGL2 3DGS PASS: 7221 instanced splats, 0 GL/console errors, blend=['blendFunc(ONE, ONE_MINUS_SRC_ALPHA)'], depthMask(false)=1, orbit_sort_uploads=23, orbit_mad=0.081, entropy=3.42, colors=899",
+      "tags_json": "[\"gaussian_splats\", \"quad_repair\"]",
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    }
+  ],
+  "repairs": [
+    {
+      "error_signature": "JS_PAGE_ERROR",
+      "rule": "WebGL2 Articulated Creature PASS: 11 hierarchical joints animating, motion_mad=0.0390, orbit_mad=0.164, buttons=['Walk', 'Flap', 'Roar'], entropy=3.43, colors=367",
+      "hits": 1,
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    },
+    {
+      "error_signature": "NO_SCORING_OR_COLLISIONS",
+      "rule": "Atari Arcade PLAYTEST PASS: ArrowR=+190.6px ArrowL=-256.6px, live_score=1000, collisions=12, lives 3->0->gameover->clean restart, entropy=2.06",
+      "hits": 1,
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    },
+    {
+      "error_signature": "CAMERA_TOO_CLOSE_CROPPED",
+      "rule": "WebGL2 Articulated Creature PASS: 11 hierarchical joints animating, motion_mad=0.0118, orbit_mad=0.140, buttons=['Walk', 'Flap', 'Roar'], entropy=2.38, colors=446",
+      "hits": 1,
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    },
+    {
+      "error_signature": "TRANSPOSED_VIEW_MATRIX_LAYOUT",
+      "rule": "WebGL2 3DGS PASS: 6216 instanced splats, 0 GL/console errors, blend=['blendFunc(ONE, ONE_MINUS_SRC_ALPHA)'], depthMask(false)=1, orbit_sort_uploads=29, orbit_mad=0.050, entropy=2.27, colors=804",
+      "hits": 1,
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    },
+    {
+      "error_signature": "WEBGL_PER_VERTEX_BUFFER_MISMATCH",
+      "rule": "WebGL2 3DGS PASS: 7221 instanced splats, 0 GL/console errors, blend=['blendFunc(ONE, ONE_MINUS_SRC_ALPHA)'], depthMask(false)=1, orbit_sort_uploads=23, orbit_mad=0.081, entropy=3.42, colors=899",
+      "hits": 1,
+      "env_version": "v1_chromium1248_webgl2",
+      "status": "active"
+    }
+  ],
+  "failure_log_count": 21,
+  "failures_by_sig": [
+    {
+      "task_id": "loktar_01_gaussian_splats",
+      "error_signature": "TOKEN_TRUNCATION",
+      "n": 4
+    },
+    {
+      "task_id": "loktar_01_gaussian_splats",
+      "error_signature": "ORBIT_CAMERA_BROKEN",
+      "n": 3
+    },
+    {
+      "task_id": "loktar_01_gaussian_splats",
+      "error_signature": "BLANK_3D_SCENE_ZERO_VISIBLE_SPLATS",
+      "n": 3
+    },
+    {
+      "task_id": "loktar_01_gaussian_splats",
+      "error_signature": "WEBGL_PER_VERTEX_BUFFER_MISMATCH",
+      "n": 1
+    },
+    {
+      "task_id": "loktar_01_gaussian_splats",
+      "error_signature": "TRANSPOSED_VIEW_MATRIX_LAYOUT",
+      "n": 1
+    },
+    {
+      "task_id": "loktar_01_gaussian_splats",
+      "error_signature": "SPLAT_SCALE_OR_PROJECTION_BLOWUP",
+      "n": 1
+    },
+    {
+      "task_id": "loktar_01_gaussian_splats",
+      "error_signature": "JS_PAGE_ERROR",
+      "n": 1
+    },
+    {
+      "task_id": "loktar_02_articulated_creature",
+      "error_signature": "TOKEN_TRUNCATION",
+      "n": 2
+    },
+    {
+      "task_id": "loktar_02_articulated_creature",
+      "error_signature": "JS_PAGE_ERROR",
+      "n": 2
+    },
+    {
+      "task_id": "loktar_02_articulated_creature",
+      "error_signature": "CAMERA_TOO_CLOSE_CROPPED",
+      "n": 2
+    },
+    {
+      "task_id": "loktar_03_atari_arcade",
+      "error_signature": "NO_SCORING_OR_COLLISIONS",
+      "n": 1
+    }
+  ]
+}

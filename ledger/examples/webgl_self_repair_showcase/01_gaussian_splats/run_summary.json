@@ -1,0 +1,220 @@
+{
+  "target_kind": "gaussian_splats",
+  "task_id": "loktar_01_gaussian_splats",
+  "title": "Real-Time WebGL2 3D Gaussian Splatting Viewer & Multi-Object Scene",
+  "model": "inkling-2-mini",
+  "solved": true,
+  "attempt0_passed": false,
+  "attempt0_score": 5.0,
+  "attempt0_error": "JS_PAGE_ERROR",
+  "best_iter": 6,
+  "best_score": 95.42,
+  "stop_reason": "converged_verified_pass",
+  "total_iters": 7,
+  "ledger_stats": {
+    "db_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/verified_ledger.sqlite",
+    "env_version": "v1_chromium1248_webgl2",
+    "active_facts": 3,
+    "stale_facts": 0,
+    "active_winners": 3,
+    "stale_winners": 0,
+    "active_repairs": 5,
+    "failures_logged": 21,
+    "drift_events": 0
+  },
+  "records": [
+    {
+      "iter": 0,
+      "mode": "attempt0_stock_oneshot",
+      "ok": false,
+      "score": 5.0,
+      "error_signature": "JS_PAGE_ERROR",
+      "error_detail": "Uncaught pageerror(s): ERROR: 0:42: '*' : wrong operand types - no operation '*' exists that takes a left-hand operand of type 'highp 2X2 matrix of float' and a right operand of type 'highp 3X3 matrix of float' (or there is no acceptable conversion)\n",
+      "summary": "",
+      "finish_reason": "stop",
+      "elapsed_s": 138.94,
+      "usage": {
+        "prompt_tokens": 867,
+        "completion_tokens": 14091,
+        "total_tokens": 14958,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "JS_PAGE_ERROR"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/01_gaussian_splats/iter_00/app.html"
+    },
+    {
+      "iter": 1,
+      "mode": "verified_ledger_repair",
+      "ok": false,
+      "score": 24.0,
+      "error_signature": "SPLAT_SCALE_OR_PROJECTION_BLOWUP",
+      "error_detail": "Rendered splats are massively oversized / blown up across the entire 1280x720 viewport and corners (corner_mean_luma=46.45, corner_std_luma=47.17, mean_luma=100.82), causing severe quad overdraw. Inspect the attached screenshot and check view-space Z sign/lookAt matrix row vs column convention, focal/viewport NDC conversion, and clamp maximum splat",
+      "summary": "",
+      "finish_reason": "stop",
+      "elapsed_s": 66.27,
+      "usage": {
+        "prompt_tokens": 11112,
+        "completion_tokens": 9196,
+        "total_tokens": 20308,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "SPLAT_SCALE_OR_PROJECTION_BLOWUP"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/01_gaussian_splats/iter_01/app.html"
+    },
+    {
+      "iter": 2,
+      "mode": "verified_ledger_repair",
+      "ok": false,
+      "score": 21.0,
+      "error_signature": "TRANSPOSED_VIEW_MATRIX_LAYOUT",
+      "error_detail": "WebGL2 uniformMatrix4fv inspector caught a ROW-MAJOR view/affine matrix passed to column-major WebGL! mat4 has m[15]=1 with translation in row3 [m[3]=0.00, m[7]=-1.79, m[11]=-13.13] and zero col3 [m[12..14]=0] (row-major layout passed to column-major WebGL!). In WebGL column-major Float32Array(16), columns are contiguous: [s0,u0,-f0,0,  s1,u1,-f1,0",
+      "summary": "",
+      "finish_reason": "stop",
+      "elapsed_s": 71.16,
+      "usage": {
+        "prompt_tokens": 10598,
+        "completion_tokens": 9376,
+        "total_tokens": 19974,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "TRANSPOSED_VIEW_MATRIX_LAYOUT"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/01_gaussian_splats/iter_02/app.html"
+    },
+    {
+      "iter": 3,
+      "mode": "verified_ledger_repair",
+      "ok": true,
+      "score": 91.34,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "WebGL2 3DGS PASS: 6216 instanced splats, 0 GL/console errors, blend=['blendFunc(ONE, ONE_MINUS_SRC_ALPHA)'], depthMask(false)=1, orbit_sort_uploads=29, orbit_mad=0.050, entropy=2.27, colors=804",
+      "finish_reason": "stop",
+      "elapsed_s": 83.61,
+      "usage": {
+        "prompt_tokens": 10826,
+        "completion_tokens": 10721,
+        "total_tokens": 21547,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": true,
+        "failure_logged": false
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/01_gaussian_splats/iter_03/app.html"
+    },
+    {
+      "iter": 4,
+      "mode": "verified_ledger_visual_polish",
+      "ok": true,
+      "score": 92.71,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "WebGL2 3DGS PASS: 7221 instanced splats, 0 GL/console errors, blend=['blendFunc(ONE, ONE_MINUS_SRC_ALPHA)'], depthMask(false)=1, orbit_sort_uploads=28, orbit_mad=0.066, entropy=2.29, colors=826",
+      "finish_reason": "stop",
+      "elapsed_s": 62.86,
+      "usage": {
+        "prompt_tokens": 10799,
+        "completion_tokens": 8845,
+        "total_tokens": 19644,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": false,
+        "failure_logged": false
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/01_gaussian_splats/iter_04/app.html"
+    },
+    {
+      "iter": 5,
+      "mode": "verified_ledger_quad_repair",
+      "ok": false,
+      "score": 56.0,
+      "error_signature": "WEBGL_PER_VERTEX_BUFFER_MISMATCH",
+      "error_detail": "WebGL2 state inspector caught per-vertex quad attribute bound to instanced splat buffer! per-vertex attrib(0) (divisor=0) shares the exact same ARRAY_BUFFER (404376 bytes) as instanced (divisor=1) attributes! Bind the static quad corner buffer BEFORE calling vertexAttribPointer(0, ...). Also ensure quad corners use proper TRIANGLE_STRIP order [-1,-",
+      "summary": "",
+      "finish_reason": "stop",
+      "elapsed_s": 87.42,
+      "usage": {
+        "prompt_tokens": 11181,
+        "completion_tokens": 11311,
+        "total_tokens": 22492,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": false,
+        "repair_linked": false,
+        "failure_logged": true,
+        "error_signature": "WEBGL_PER_VERTEX_BUFFER_MISMATCH"
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/01_gaussian_splats/iter_05/app.html"
+    },
+    {
+      "iter": 6,
+      "mode": "verified_ledger_quad_repair",
+      "ok": true,
+      "score": 95.42,
+      "error_signature": "",
+      "error_detail": "",
+      "summary": "WebGL2 3DGS PASS: 7221 instanced splats, 0 GL/console errors, blend=['blendFunc(ONE, ONE_MINUS_SRC_ALPHA)'], depthMask(false)=1, orbit_sort_uploads=23, orbit_mad=0.081, entropy=3.42, colors=899",
+      "finish_reason": "stop",
+      "elapsed_s": 88.49,
+      "usage": {
+        "prompt_tokens": 11226,
+        "completion_tokens": 11407,
+        "total_tokens": 22633,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "pivot_triggered": false,
+      "ledger_update": {
+        "facts": 0,
+        "winner_admitted": true,
+        "repair_linked": true,
+        "failure_logged": false
+      },
+      "html_path": "/home/orwel/dev_genius/experiments/kernals/results/loktar_showcase_848/01_gaussian_splats/iter_06/app.html"
+    }
+  ]
+}
