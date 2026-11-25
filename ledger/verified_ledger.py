@@ -90,19 +90,27 @@ class VerifiedLedger:
     def __init__(
         self,
         db_path: str | Path,
-        env_version: str = "v1",
+        env_version: Optional[str] = None,
         max_context_chars: int = 4000,
+        read_only: bool = False,
     ) -> None:
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.max_context_chars = max(512, int(max_context_chars))
+        self.read_only = bool(read_only)
+        if self.read_only:
+            if not self.db_path.exists():
+                raise FileNotFoundError(f"VerifiedLedger database does not exist: {self.db_path}")
+            self.conn = sqlite3.connect(f"file:{self.db_path.resolve()}?mode=ro", uri=True)
+            self.conn.row_factory = sqlite3.Row
+            return
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
         cur_ver = self.get_env_version()
         if cur_ver is None:
-            self._set_meta("env_version", env_version)
-        elif cur_ver != env_version:
+            self._set_meta("env_version", env_version or "v1")
+        elif env_version is not None and cur_ver != env_version:
             self.bump_env_version(env_version, f"Environment version changed {cur_ver} -> {env_version}")
 
     def close(self) -> None:
@@ -559,9 +567,14 @@ def run_verified_loop(
 def _cli() -> int:
     ap = argparse.ArgumentParser(description="Inspect and update a SQLite VerifiedLedger.")
     ap.add_argument("--db", required=True, help="Path to ledger SQLite file")
+    ap.add_argument(
+        "--env-version",
+        default=None,
+        help="Optional explicit env_version (default: preserve existing DB env_version, or 'v1' on new DB)",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("inspect", help="Print ledger counts and active entries")
+    sub.add_parser("inspect", help="Print ledger counts and active entries (read-only)")
 
     p_fact = sub.add_parser("add-fact", help="Add or update a host-verified environment/schema fact")
     p_fact.add_argument("--key", required=True)
@@ -577,12 +590,13 @@ def _cli() -> int:
     p_bump.add_argument("--version", required=True)
     p_bump.add_argument("--note", default="")
 
-    p_render = sub.add_parser("render", help="Preview rendered ledger context for a task query")
+    p_render = sub.add_parser("render", help="Preview rendered ledger context for a task query (read-only)")
     p_render.add_argument("--query", required=True)
     p_render.add_argument("--max-chars", type=int, default=4000)
 
     args = ap.parse_args()
-    with VerifiedLedger(args.db) as ledger:
+    ro = args.cmd in ("inspect", "render") and args.env_version is None and Path(args.db).exists()
+    with VerifiedLedger(args.db, env_version=args.env_version, read_only=ro) as ledger:
         if args.cmd == "inspect":
             print(json.dumps(ledger.stats(), indent=2))
         elif args.cmd == "add-fact":

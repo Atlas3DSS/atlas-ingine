@@ -253,7 +253,7 @@ Additional verified architecture, branch, and live-serving details:
    - Mixed-precision MoE tier converter ([`tools/quantize_elastic_ingine.py`](tools/quantize_elastic_ingine.py)) that compresses the 20.2 GB base checkpoint to **`atlas-12g` (`14.05 GB` on disk incl. vision + `mtp.safetensors`)** or **`atlas-10g` (`12.01 GB` on disk incl. vision + `mtp.safetensors`)**.
    - Native fused decode (`native/src/kernels/moe/moe.cu`) and prefill (`native/src/kernels/prefill/wgemm.cu`) kernels verified against FP64 oracles (`kernels_moe`, `prefill_moe`).
 3. **Structured outputs, tool-ban, and standalone Verified Ledger SDK:**
-   - Native OpenAI `response_format` (`text`, `json_object`, `json_schema`) constrained decoding in `ingine-serve` (`serve_server` 22/22 PASS).
+   - OpenAI `response_format` (`text`, `json_object`, `json_schema`) prompt-guided JSON formatting in `ingine-serve` (`json_schema` compiles into an instance skeleton + field constraints; token-level grammar-constrained decoding is tracked separately).
    - Automatic `<|content_invoke_tool_json|>` token banning when `tools` is absent from the request.
    - Zero-dependency SQLite Verified Ledger SDK in [`ledger/`](ledger/README.md).
 
@@ -393,7 +393,7 @@ No API key is required and there is no authentication; keep the server bound to 
 
 * `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (mapped to `0, 0.1, 0.2, 0.7, 0.9, 0.99, 0.99`) or a float in `[0, 0.99]`.
 * `enable_thinking: false` (also accepted in `chat_template_kwargs`) to answer without reasoning.
-* `response_format`: `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` for grammar-constrained JSON output.
+* `response_format`: `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` for prompt-guided JSON output (`json_schema` renders an instance skeleton + field constraints rather than dumping raw schema meta-keys; token-level grammar constraints are not yet implemented).
 * `tools` (function calling through the chat template). When `tools` is omitted, `<|content_invoke_tool_json|>` is automatically banned.
 * `stop`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`.
 * `stream: true` (SSE with `reasoning_content` and `content` deltas; `stream_options.include_usage` adds usage).

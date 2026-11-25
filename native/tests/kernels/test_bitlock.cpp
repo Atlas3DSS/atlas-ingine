@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <numeric>
 
 using namespace ingine::test;
@@ -296,55 +297,79 @@ constexpr uint64_t kLock[8][kLocks] = {
 int main() {
   if (skip_without_gpu()) return kSkip;
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
+  int dev = 0;
+  cudaDeviceProp prop{};
+  INGINE_TEST_CUDA(cudaGetDevice(&dev));
+  INGINE_TEST_CUDA(cudaGetDeviceProperties(&prop, dev));
+  const int sm = prop.major * 10 + prop.minor;
+  const bool strict_env = std::getenv("INGINE_STRICT_BITLOCK") != nullptr;
+  const bool check_reference_klock =
+      strict_env || (!INGINE_ACT_FP16 && sm == 120 && CUDART_VERSION >= 13000);
+
   bool ok = true;
   uint64_t got[8][kLocks];
+  uint64_t got2[8][kLocks];
   {
     LockGen gw{0x10c50000ull};
     const DenseWeight wproj(gw, 8664, H), wo(gw, H, 3072);
     for (int M = 1; M <= 8; ++M) {
-      LockGen g{0x10c51000ull + uint64_t(M)};
-      got[M - 1][0] = lock_proj(g, wproj, M);
-      got[M - 1][1] = lock_proj_conv(g, wo, M);
-      got[M - 1][2] = lock_head(g, wproj, M);
+      for (int run = 0; run < 2; ++run) {
+        auto& dst = run == 0 ? got : got2;
+        LockGen g{0x10c51000ull + uint64_t(M)};
+        dst[M - 1][0] = lock_proj(g, wproj, M);
+        dst[M - 1][1] = lock_proj_conv(g, wo, M);
+        dst[M - 1][2] = lock_head(g, wproj, M);
+      }
     }
   }
   for (int nv = 1; nv >= 0; --nv) {
     LockGen gw{0x10c52000ull + uint64_t(nv)};
     const ExpertWeight w13(gw, 2 * I, H, nv), w2(gw, H, I, nv);
     for (int M = 1; M <= 8; ++M) {
-      LockGen g{0x10c53000ull + uint64_t(8 * nv + M)};
-      got[M - 1][nv ? 3 : 4] = lock_moe(g, w13, w2, nv, M);
+      for (int run = 0; run < 2; ++run) {
+        auto& dst = run == 0 ? got : got2;
+        LockGen g{0x10c53000ull + uint64_t(8 * nv + M)};
+        dst[M - 1][nv ? 3 : 4] = lock_moe(g, w13, w2, nv, M);
+      }
     }
   }
   for (int M = 1; M <= 8; ++M) {
     LockGen g{0x10c54000ull + uint64_t(M)};
     got[M - 1][5] = lock_attn_sliding(g, M);
     LockGen g2{0x10c54000ull + uint64_t(M)};
-    if (lock_attn_sliding(g2, M) != got[M - 1][5]) {
-      std::printf("FAIL attn sliding M=%d: two runs differ\n", M);
-      ok = false;
-    }
+    got2[M - 1][5] = lock_attn_sliding(g2, M);
   }
   for (int M = 1; M <= 8; ++M) {
-#if INGINE_ACT_FP16
-    std::printf("PASS bit lock M=%d (FP16 mode: determinism checked, BF16 kLock skipped): {", M);
-    for (int i = 0; i < kLocks; ++i)
-      std::printf("%s0x%016llxull", i ? ", " : "", static_cast<unsigned long long>(got[M - 1][i]));
-    std::printf("}\n");
-#else
-    bool same = true;
-    std::string diff;
-    for (int i = 0; i < kLocks; ++i)
-      if (got[M - 1][i] != kLock[M - 1][i]) {
-        same = false;
-        diff += std::string(diff.empty() ? " differs: " : ", ") + kNames[i];
+    bool det = true;
+    std::string nondet;
+    for (int i = 0; i < kLocks; ++i) {
+      if (got[M - 1][i] != got2[M - 1][i]) {
+        det = false;
+        nondet += std::string(nondet.empty() ? " nondeterministic: " : ", ") + kNames[i];
       }
-    std::printf("%s bit lock M=%d: {", same ? "PASS" : "FAIL", M);
-    for (int i = 0; i < kLocks; ++i)
-      std::printf("%s0x%016llxull", i ? ", " : "", static_cast<unsigned long long>(got[M - 1][i]));
-    std::printf("},%s\n", diff.c_str());
-    ok = ok && same;
-#endif
+    }
+    if (!check_reference_klock) {
+      std::printf("%s bit lock M=%d (sm_%d CUDA %d.%d %s: two-run determinism %s, sm_120/CUDA13 kLock skipped): {",
+                  det ? "PASS" : "FAIL", M, sm, CUDART_VERSION / 1000, (CUDART_VERSION % 1000) / 10,
+                  INGINE_ACT_FP16 ? "FP16" : "BF16", det ? "ok" : nondet.c_str());
+      for (int i = 0; i < kLocks; ++i)
+        std::printf("%s0x%016llxull", i ? ", " : "", static_cast<unsigned long long>(got[M - 1][i]));
+      std::printf("}\n");
+      ok = ok && det;
+    } else {
+      bool same = true;
+      std::string diff;
+      for (int i = 0; i < kLocks; ++i)
+        if (got[M - 1][i] != kLock[M - 1][i]) {
+          same = false;
+          diff += std::string(diff.empty() ? " differs: " : ", ") + kNames[i];
+        }
+      std::printf("%s bit lock M=%d: {", same && det ? "PASS" : "FAIL", M);
+      for (int i = 0; i < kLocks; ++i)
+        std::printf("%s0x%016llxull", i ? ", " : "", static_cast<unsigned long long>(got[M - 1][i]));
+      std::printf("},%s%s\n", diff.c_str(), nondet.c_str());
+      ok = ok && same && det;
+    }
   }
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

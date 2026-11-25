@@ -858,11 +858,49 @@ void test_response_format_and_tool_ban() {
   const std::string decoded_obj = g_fmt->decode(s->gen->calls().back().prompt_ids);
   CHECK(decoded_obj.find("single valid JSON object") != std::string::npos);
 
-  const Json schema = {{"type", "object"}, {"properties", {{"answer", {{"type", "string"}}}}}, {"required", Json::array({"answer"})}};
+  const Json schema = {
+      {"type", "object"},
+      {"additionalProperties", false},
+      {"$defs", {{"Score", {{"type", "object"}, {"properties", {{"joy", {{"type", "number"}}}}}}}}},
+      {"properties",
+       {{"polarity", {{"type", "string"}, {"enum", Json::array({"positive", "negative", "neutral", "mixed"})}}},
+        {"tags", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+        {"scores", {{"$ref", "#/$defs/Score"}}},
+        {"answer", {{"type", "string"}}}}},
+      {"required", Json::array({"polarity", "tags", "scores", "answer"})}};
   r = chat(s->port(), {{"response_format", {{"type", "json_schema"}, {"json_schema", {{"name", "ans"}, {"schema", schema}}}}}});
   CHECK(r.status == 200);
   const std::string decoded_schema = g_fmt->decode(s->gen->calls().back().prompt_ids);
-  CHECK(decoded_schema.find("\"answer\"") != std::string::npos);
+  // Compiles into an instance skeleton + field constraints instead of echoing raw JSON Schema meta-object.
+  CHECK(decoded_schema.find("\"answer\":\"<string>\"") != std::string::npos);
+  CHECK(decoded_schema.find("\"polarity\":\"positive\"") != std::string::npos);
+  CHECK(decoded_schema.find("\"tags\":[\"<string>\"]") != std::string::npos);
+  CHECK(decoded_schema.find("\"scores\":{\"joy\":0.0}") != std::string::npos);
+  CHECK(decoded_schema.find("polarity: one of [\"positive\",\"negative\",\"neutral\",\"mixed\"]") != std::string::npos);
+  CHECK(decoded_schema.find("\"$defs\"") == std::string::npos);
+  CHECK(decoded_schema.find("\"additionalProperties\":false") == std::string::npos);
+
+  // Issue #2: enable_thinking=false without reasoning_effort clamps template effort to 0 and bans <|content_thinking|>.
+  const int32_t think_tok = g_fmt->content_thinking_id();
+  r = chat(s->port(), {{"enable_thinking", false}});
+  CHECK(r.status == 200);
+  {
+    const auto calls = s->gen->calls();
+    const auto& call = calls.back();
+    const std::string decoded_nt = g_fmt->decode(call.prompt_ids);
+    CHECK(decoded_nt.find("Thinking effort level: 0<|end_message|>") != std::string::npos);
+    CHECK(decoded_nt.find("Thinking effort level: 0.9") == std::string::npos);
+    CHECK(std::find(call.sampling.banned_tokens.begin(), call.sampling.banned_tokens.end(), think_tok) !=
+          call.sampling.banned_tokens.end());
+  }
+  // When enable_thinking=true (default), <|content_thinking|> is NOT banned.
+  r = chat(s->port(), Json::object());
+  CHECK(r.status == 200);
+  {
+    const auto calls = s->gen->calls();
+    const auto& ban = calls.back().sampling.banned_tokens;
+    CHECK(std::find(ban.begin(), ban.end(), think_tok) == ban.end());
+  }
 
   // Invalid response_format -> 400
   CHECK(chat(s->port(), {{"response_format", "json_object"}}).status == 400);

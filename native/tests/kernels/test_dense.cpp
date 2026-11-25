@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 
@@ -659,17 +660,45 @@ constexpr uint64_t kLock[8][3] = {
 #endif
 
 bool test_bit_lock() {
+  int dev = 0;
+  cudaDeviceProp prop{};
+  INGINE_TEST_CUDA(cudaGetDevice(&dev));
+  INGINE_TEST_CUDA(cudaGetDeviceProperties(&prop, dev));
+  const int sm = prop.major * 10 + prop.minor;
+  const bool strict_env = std::getenv("INGINE_STRICT_BITLOCK") != nullptr;
+#if INGINE_ACT_FP16
+  const bool check_reference_klock = strict_env || (sm == 70);
+  const char* ref_label = "sm_70 FP16";
+#else
+  const bool check_reference_klock = strict_env || (sm == 120 && CUDART_VERSION >= 13000);
+  const char* ref_label = "sm_120/CUDA13 BF16";
+#endif
   bool ok = true;
   for (int M = 1; M <= 8; ++M) {
+    bool pair_ok = true, pair_ok2 = true;
     LockGen gm{0x5eed0000ull + uint64_t(M)}, gg{0x5eed1000ull + uint64_t(M)}, gr{0x5eed2000ull + uint64_t(M)};
-    bool pair_ok = true;
     const uint64_t got[3] = {lock_mix(gm, M, pair_ok), lock_gates(gg, M), lock_router(gr, M)};
-    const bool same = got[0] == kLock[M - 1][0] && got[1] == kLock[M - 1][1] && got[2] == kLock[M - 1][2];
-    std::printf("%s bit lock M=%d: {0x%016llxull, 0x%016llxull, 0x%016llxull}%s%s\n", same && pair_ok ? "PASS" : "FAIL", M,
-                static_cast<unsigned long long>(got[0]), static_cast<unsigned long long>(got[1]),
-                static_cast<unsigned long long>(got[2]), same ? "" : " differs from the recorded hashes",
-                pair_ok ? "" : "; mix_pair differs from two mix launches");
-    ok = ok && same && pair_ok;
+    LockGen gm2{0x5eed0000ull + uint64_t(M)}, gg2{0x5eed1000ull + uint64_t(M)}, gr2{0x5eed2000ull + uint64_t(M)};
+    const uint64_t got2[3] = {lock_mix(gm2, M, pair_ok2), lock_gates(gg2, M), lock_router(gr2, M)};
+    const bool det = got[0] == got2[0] && got[1] == got2[1] && got[2] == got2[2];
+    pair_ok = pair_ok && pair_ok2;
+    if (!check_reference_klock) {
+      std::printf("%s bit lock M=%d (sm_%d CUDA %d.%d: two-run determinism %s, %s kLock skipped): "
+                  "{0x%016llxull, 0x%016llxull, 0x%016llxull}%s\n",
+                  det && pair_ok ? "PASS" : "FAIL", M, sm, CUDART_VERSION / 1000, (CUDART_VERSION % 1000) / 10,
+                  det ? "ok" : "FAILED", ref_label, static_cast<unsigned long long>(got[0]),
+                  static_cast<unsigned long long>(got[1]), static_cast<unsigned long long>(got[2]),
+                  pair_ok ? "" : "; mix_pair differs from two mix launches");
+      ok = ok && det && pair_ok;
+    } else {
+      const bool same = got[0] == kLock[M - 1][0] && got[1] == kLock[M - 1][1] && got[2] == kLock[M - 1][2];
+      std::printf("%s bit lock M=%d: {0x%016llxull, 0x%016llxull, 0x%016llxull}%s%s%s\n",
+                  same && det && pair_ok ? "PASS" : "FAIL", M, static_cast<unsigned long long>(got[0]),
+                  static_cast<unsigned long long>(got[1]), static_cast<unsigned long long>(got[2]),
+                  same ? "" : " differs from the recorded hashes", det ? "" : "; two runs differ",
+                  pair_ok ? "" : "; mix_pair differs from two mix launches");
+      ok = ok && same && det && pair_ok;
+    }
   }
   return ok;
 }

@@ -180,8 +180,122 @@ void expand_images(const std::vector<ImagePart>& parts, const ImageOptions& opti
   ids = std::move(expanded);
 }
 
-// Parses OpenAI response_format ("text", "json_object", "json_schema") and returns an instruction to append
-// to the last user turn when JSON output is requested (empty string for default/text).
+// Resolves a local JSON Pointer `$ref` (e.g. "#/$defs/Item" or "#/definitions/Item") inside `root`.
+const Json* resolve_local_ref(const Json& root, const std::string& ref) {
+  if (!ref.starts_with("#/")) return nullptr;
+  const Json* cur = &root;
+  std::size_t pos = 2;
+  while (pos <= ref.size()) {
+    const std::size_t slash = ref.find('/', pos);
+    std::string seg = ref.substr(pos, slash == std::string::npos ? std::string::npos : slash - pos);
+    // Unescape RFC 6901 JSON pointer tokens (~1 -> /, ~0 -> ~).
+    std::string key;
+    key.reserve(seg.size());
+    for (std::size_t i = 0; i < seg.size(); ++i) {
+      if (seg[i] == '~' && i + 1 < seg.size() && (seg[i + 1] == '0' || seg[i + 1] == '1')) {
+        key.push_back(seg[i + 1] == '1' ? '/' : '~');
+        ++i;
+      } else {
+        key.push_back(seg[i]);
+      }
+    }
+    if (!cur->is_object()) return nullptr;
+    const auto it = cur->find(key);
+    if (it == cur->end()) return nullptr;
+    cur = &*it;
+    if (slash == std::string::npos) break;
+    pos = slash + 1;
+  }
+  return cur;
+}
+
+// Compiles a JSON Schema into a concrete JSON instance skeleton plus concise field constraints so models do not
+// echo JSON Schema meta-keywords ("type", "properties", "additionalProperties", "$defs") in their output.
+Json build_schema_skeleton(const Json& node, const Json& root, std::vector<std::string>& constraints,
+                           const std::string& path, int depth = 0) {
+  if (!node.is_object() || depth > 12) return Json();
+  if (const std::string* ref = string_at(node, "$ref")) {
+    if (const Json* target = resolve_local_ref(root, *ref)) {
+      return build_schema_skeleton(*target, root, constraints, path, depth + 1);
+    }
+  }
+  for (const char* comb : {"anyOf", "oneOf"}) {
+    if (const auto it = node.find(comb); it != node.end() && it->is_array() && !it->empty()) {
+      const Json* chosen = nullptr;
+      bool nullable = false;
+      for (const Json& branch : *it) {
+        if (branch.is_object()) {
+          const std::string* bt = string_at(branch, "type");
+          if (bt && *bt == "null") {
+            nullable = true;
+            continue;
+          }
+          if (!chosen) chosen = &branch;
+        }
+      }
+      if (chosen) {
+        if (nullable && !path.empty()) constraints.push_back(path + ": nullable");
+        return build_schema_skeleton(*chosen, root, constraints, path, depth + 1);
+      }
+      return nullptr;
+    }
+  }
+  if (const auto it = node.find("const"); it != node.end()) {
+    if (!path.empty()) constraints.push_back(path + ": must equal " + it->dump());
+    return *it;
+  }
+  if (const auto it = node.find("enum"); it != node.end() && it->is_array() && !it->empty()) {
+    if (!path.empty()) constraints.push_back(path + ": one of " + it->dump());
+    return (*it)[0];
+  }
+  std::string type;
+  if (const std::string* t = string_at(node, "type")) {
+    type = *t;
+  } else if (const auto it = node.find("type"); it != node.end() && it->is_array()) {
+    bool nullable = false;
+    for (const Json& elem : *it) {
+      if (elem.is_string()) {
+        if (elem == "null") nullable = true;
+        else if (type.empty()) type = elem.get<std::string>();
+      }
+    }
+    if (nullable && !path.empty()) constraints.push_back(path + ": nullable");
+  }
+  if (type.empty() && node.contains("properties")) type = "object";
+  if (type.empty() && node.contains("items")) type = "array";
+
+  if (type == "object") {
+    Json obj = Json::object();
+    if (const auto props = node.find("properties"); props != node.end() && props->is_object()) {
+      for (const auto& [k, v] : props->items()) {
+        const std::string child_path = path.empty() ? k : (path + "." + k);
+        obj[k] = build_schema_skeleton(v, root, constraints, child_path, depth + 1);
+      }
+    }
+    if (const auto req = node.find("required"); req != node.end() && req->is_array() && !req->empty()) {
+      constraints.push_back((path.empty() ? std::string("root") : path) + " required keys: " + req->dump());
+    }
+    if (const auto ap = node.find("additionalProperties"); ap != node.end() && ap->is_boolean() && !ap->get<bool>()) {
+      constraints.push_back((path.empty() ? std::string("root") : path) + ": no extra keys");
+    }
+    return obj;
+  }
+  if (type == "array") {
+    Json arr = Json::array();
+    if (const auto items = node.find("items"); items != node.end() && items->is_object()) {
+      arr.push_back(build_schema_skeleton(*items, root, constraints, path + "[]", depth + 1));
+    }
+    return arr;
+  }
+  if (type == "string") return "<string>";
+  if (type == "integer") return 0;
+  if (type == "number") return 0.0;
+  if (type == "boolean") return false;
+  return nullptr;
+}
+
+// Parses OpenAI response_format ("text", "json_object", "json_schema") and returns a prompt-guided formatting
+// instruction to append to the last user turn when JSON output is requested (empty string for default/text).
 std::string parse_response_format_instruction(const Json& body) {
   const Json* rf = get(body, "response_format");
   if (!rf) return {};
@@ -201,9 +315,18 @@ std::string parse_response_format_instruction(const Json& body) {
     if (schema_it == js_it->end() || !schema_it->is_object()) {
       throw BadRequest("'response_format.json_schema.schema' must be an object", "response_format");
     }
-    return "\n\nRespond with a single valid JSON object matching this exact JSON schema, with no markdown fences or "
-           "surrounding text:\n" +
-           schema_it->dump();
+    std::vector<std::string> constraints;
+    const Json skeleton = build_schema_skeleton(*schema_it, *schema_it, constraints, "");
+    std::string out =
+        "\n\nRespond with a single valid JSON object matching this exact instance structure (replace placeholder values "
+        "with your answer; do NOT wrap the output in JSON Schema keywords such as \"type\", \"properties\", "
+        "\"required\", or \"additionalProperties\"), with no markdown fences, duplicates, or surrounding text:\n" +
+        skeleton.dump();
+    if (!constraints.empty()) {
+      out += "\nField constraints:";
+      for (const std::string& c : constraints) out += "\n- " + c;
+    }
+    return out;
   }
   throw BadRequest("'response_format.type' must be 'text', 'json_object', or 'json_schema'", "response_format");
 }
@@ -272,10 +395,16 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
     kwargs.erase("enable_thinking");
   }
   if (!enable_thinking.is_boolean()) throw BadRequest("'enable_thinking' must be a boolean", "enable_thinking");
+  const bool thinking_enabled = enable_thinking.get<bool>();
+  // When thinking is disabled and the caller omitted reasoning_effort, clamp to "none" so chat_template.jinja
+  // emits "Thinking effort level: 0" instead of its default "0.9".
+  if (!thinking_enabled && effort.is_null()) {
+    effort = "none";
+  }
 
   text::ChatOptions options;
   options.reasoning_effort = std::move(effort);
-  options.enable_thinking = enable_thinking.get<bool>();
+  options.enable_thinking = thinking_enabled;
   options.template_kwargs = std::move(kwargs);
   const auto messages = body.find("messages");
   const auto tools = body.find("tools");
@@ -313,6 +442,10 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   const bool has_tools = effective_tools.is_array() && !effective_tools.empty();
   if (!has_tools) {
     req.sampling.banned_tokens.push_back(fmt.content_invoke_tool_json_id());
+  }
+  // When thinking is disabled, ban <|content_thinking|> so the model cannot spontaneously enter a reasoning turn.
+  if (!thinking_enabled) {
+    req.sampling.banned_tokens.push_back(fmt.content_thinking_id());
   }
 
   if (const Json* stop = get(body, "stop")) {

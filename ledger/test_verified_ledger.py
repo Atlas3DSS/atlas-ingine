@@ -98,6 +98,53 @@ class TestVerifiedLedger(unittest.TestCase):
         )
         self.assertEqual(json.loads(out2)["active_facts"], 1)
 
+    def test_cli_preserves_non_v1_env_version(self) -> None:
+        # Regression test for issue #3: CLI commands must not silently bump non-v1 DBs back to 'v1'.
+        script = str(Path(__file__).resolve().parent / "verified_ledger.py")
+        with VerifiedLedger(self.db, env_version="py3-v1") as led:
+            led.set_fact("runtime", "Python 3.12")
+            led.record_outcome("t1", "task 1", "pass", VerifyResult(ok=True, score=1.0, summary="ok"))
+
+        out_inspect = json.loads(
+            subprocess.check_output([sys.executable, script, "--db", str(self.db), "inspect"], text=True)
+        )
+        self.assertEqual(out_inspect["env_version"], "py3-v1")
+        self.assertEqual(out_inspect["active_facts"], 1)
+        self.assertEqual(out_inspect["stale_facts"], 0)
+        self.assertEqual(out_inspect["active_winners"], 1)
+        self.assertEqual(out_inspect["stale_winners"], 0)
+        self.assertEqual(out_inspect["drift_events"], 0)
+
+        out_render = subprocess.check_output(
+            [sys.executable, script, "--db", str(self.db), "render", "--query", "task 1"], text=True
+        )
+        self.assertIn("[VERIFIED_LEDGER env=py3-v1]", out_render)
+        self.assertIn("Python 3.12", out_render)
+
+        out_add = json.loads(
+            subprocess.check_output(
+                [sys.executable, script, "--db", str(self.db), "add-fact", "--key", "gpu", "--value", "4090"],
+                text=True,
+            )
+        )
+        self.assertEqual(out_add["env_version"], "py3-v1")
+
+        out_bump = json.loads(
+            subprocess.check_output(
+                [sys.executable, script, "--db", str(self.db), "bump-env", "--version", "py3-v2", "--note", "upgrade"],
+                text=True,
+            )
+        )
+        self.assertEqual(out_bump["env_version"], "py3-v2")
+        self.assertEqual(out_bump["stale_facts"], 2)
+        self.assertEqual(out_bump["stale_winners"], 1)
+
+        out_after = json.loads(
+            subprocess.check_output([sys.executable, script, "--db", str(self.db), "inspect"], text=True)
+        )
+        self.assertEqual(out_after["env_version"], "py3-v2")
+        self.assertEqual(out_after["drift_events"], 1)  # exactly one drift event (no double-bump via v1)
+
 
 if __name__ == "__main__":
     unittest.main()
