@@ -420,7 +420,18 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   const Json& effective_tools = tools == body.end() ? kAbsent : *tools;
   text::RenderedPrompt prompt = fmt.render(effective_messages, effective_tools, options);
   ChatRequest req;
-  if (!image_parts.empty()) expand_images(image_parts, image_options, prompt.ids, req.images);
+  int root_prefix_tokens = prompt.root_prefix_tokens;
+  if (!image_parts.empty()) {
+    // Images are only permitted in user/tool turns (strictly at or after the leading system root);
+    // defensively zero root_prefix_tokens if any placeholder somehow preceded it.
+    const std::size_t r = std::min(std::size_t(std::max(0, root_prefix_tokens)), prompt.ids.size());
+    if (std::find(prompt.ids.begin(), prompt.ids.begin() + std::ptrdiff_t(r), model::IMAGE_PLACEHOLDER_ID) !=
+        prompt.ids.begin() + std::ptrdiff_t(r)) {
+      root_prefix_tokens = 0;
+    }
+    expand_images(image_parts, image_options, prompt.ids, req.images);
+  }
+  req.root_prefix_tokens = model::validate_root_prefix_tokens(prompt.ids, req.images, root_prefix_tokens);
 
   const int64_t room = int64_t(max_model_len) - int64_t(prompt.ids.size());
   if (room <= 0) {
@@ -462,13 +473,13 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
     if (!p->is_string()) throw BadRequest("'persona' must be a string", "persona");
     req.persona_name = p->get<std::string>();
   }
-  if (const Json* u = get(body, "user")) {
-    if (!u->is_string()) throw BadRequest("'user' must be a string", "user");
-    if (!u->get_ref<const std::string&>().empty()) req.has_isolation_hint = true;
-  }
-  if (const Json* pk = get(body, "prompt_cache_key")) {
-    if (!pk->is_string()) throw BadRequest("'prompt_cache_key' must be a string", "prompt_cache_key");
-    if (!pk->get_ref<const std::string&>().empty()) req.has_isolation_hint = true;
+  for (const char* scope_key : {"user", "prompt_cache_key"}) {
+    if (const Json* v = get(body, scope_key); v != nullptr && !v->is_null()) {
+      if (!v->is_string() || !v->get_ref<const std::string&>().empty()) {
+        req.has_isolation_hint = true;
+        req.has_user_or_cache_key = true;
+      }
+    }
   }
   if (auto it = body.find("stream"); it != body.end()) {
     if (!it->is_boolean()) throw BadRequest("'stream' must be a boolean", "stream");

@@ -12,14 +12,17 @@
 #include "core/device.h"
 #include "core/safetensors.h"
 #include "kernels/dense/dense.h"
+#include "model/kv_checkpoint.h"
 #include "model/model_kernels.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -42,24 +45,29 @@ std::uint16_t float_to_bf16_bits(float f) {  // round to nearest even (torch .to
   return std::uint16_t((w + 0x7fffu + ((w >> 16) & 1u)) >> 16);
 }
 
-// Checkpoint values widened to FP32 on the host (BF16 -> FP32 exact, F32 as is).
-std::vector<float> host_f32(const SafetensorsModel& m, const std::string& name) {
-  const SafetensorsRef ref = m.at(name);
-  const std::vector<std::byte> raw = m.read(name);
-  const std::size_t n = std::size_t(ref->numel());
+// Checkpoint values widened to FP32 on the host (BF16 -> FP32 exact, F32 as is) from an already-read raw buffer.
+std::vector<float> decode_host_f32(const SafetensorsTensor& t, std::span<const std::byte> raw) {
+  const std::size_t n = std::size_t(t.numel());
   std::vector<float> out(n);
-  if (ref->dtype == "F32") {
+  if (t.dtype == "F32") {
     std::memcpy(out.data(), raw.data(), n * 4);
-  } else if (ref->dtype == "BF16") {
+  } else if (t.dtype == "BF16") {
     for (std::size_t i = 0; i < n; ++i) {
       std::uint16_t b;
       std::memcpy(&b, raw.data() + 2 * i, 2);
       out[i] = bf16_bits_to_float(b);
     }
   } else {
-    throw std::runtime_error("weights: " + name + " has unsupported dtype " + ref->dtype);
+    throw std::runtime_error("weights: " + t.name + " has unsupported dtype " + t.dtype);
   }
   return out;
+}
+
+// Standalone helper for load_ablation (outside Loader).
+std::vector<float> host_f32(const SafetensorsModel& m, const std::string& name) {
+  const SafetensorsRef ref = m.at(name);
+  const std::vector<std::byte> raw = m.read(name);
+  return decode_host_f32(*ref.tensor, raw);
 }
 
 class Loader {
@@ -86,9 +94,29 @@ class Loader {
     return rm(d, kActDType, shape);
   }
 
+  // Reads a host-converted tensor AT MOST ONCE, hashes the exact consumed bytes into `tensor_shas_`, and caches the
+  // decoded FP32 values so repeated reads (e.g. norm stacks, router+router_bf16) never re-read from disk.
+  const std::vector<float>& read_f32(const std::string& name) {
+    if (auto it = f32_cache_.find(name); it != f32_cache_.end()) return it->second;
+    const SafetensorsRef ref = m_.at(name);
+    const std::vector<std::byte> raw = m_.read(name);
+    std::vector<std::array<std::uint8_t, 32>> cshas;
+    if (!raw.empty()) {
+      const std::size_t nc = (raw.size() + kSafetensorsHashChunkBytes - 1) / kSafetensorsHashChunkBytes;
+      cshas.reserve(nc);
+      for (std::size_t off = 0; off < raw.size(); off += kSafetensorsHashChunkBytes) {
+        const std::size_t take = std::min(raw.size() - off, kSafetensorsHashChunkBytes);
+        cshas.push_back(sha256_bytes(raw.data() + off, take));
+      }
+    }
+    record_tensor_sha(name, sha256_tensor_from_chunk_digests(ref->name, ref->dtype, ref->shape, raw.size(), cshas));
+    auto [it, _] = f32_cache_.emplace(name, decode_host_f32(*ref.tensor, raw));
+    return it->second;
+  }
+
   // f32(name): checkpoint tensor as FP32 (weights.load_layer's `f32`), viewed with `shape`.
   Tensor f32(const std::string& name, std::initializer_list<std::int32_t> shape) {
-    return upload_f32(host_f32(m_, name), shape);
+    return upload_f32(read_f32(name), shape);
   }
 
   // Queues the raw bytes of `name` (rows [0, rows) if rows >= 0) for upload to `dst`.
@@ -97,6 +125,7 @@ class Loader {
     UploadRequest r = upload_request(ref, dst);
     if (rows >= 0) r.bytes = ref->bytes / std::uint64_t(ref->shape[0]) * std::uint64_t(rows);
     pending_.push_back(r);
+    pending_meta_.push_back(PendingMeta{name, ref.tensor, r.bytes});
   }
 
   // Raw checkpoint tensor (any dtype) in new device memory, uploaded at flush().
@@ -108,19 +137,60 @@ class Loader {
   }
 
   void flush() {
-    if (!pending_.empty()) up_.upload(pending_, stream_);
+    if (!pending_.empty()) {
+      if (up_.options().chunk_bytes == kSafetensorsHashChunkBytes) {
+        std::vector<std::vector<std::array<std::uint8_t, 32>>> chunk_shas(pending_.size());
+        for (std::size_t ri = 0; ri < pending_.size(); ++ri) {
+          if (pending_[ri].bytes > 0) {
+            const std::size_t nc =
+                std::size_t((pending_[ri].bytes + kSafetensorsHashChunkBytes - 1) / kSafetensorsHashChunkBytes);
+            chunk_shas[ri].resize(nc);
+          }
+        }
+        up_.upload(pending_, stream_,
+                   [&](std::size_t ri, std::size_t ci, const void* data, std::size_t bytes) {
+                     if (ci < chunk_shas[ri].size()) chunk_shas[ri][ci] = sha256_bytes(data, bytes);
+                   });
+        for (std::size_t ri = 0; ri < pending_.size(); ++ri) {
+          const SafetensorsTensor* t = pending_meta_[ri].tensor;
+          record_tensor_sha(pending_meta_[ri].name,
+                            sha256_tensor_from_chunk_digests(t->name, t->dtype, t->shape,
+                                                             pending_meta_[ri].consumed_bytes, chunk_shas[ri]));
+        }
+      } else {
+        content_changed_ = true;
+        up_.upload(pending_, stream_);
+      }
+    }
     pending_.clear();
+    pending_meta_.clear();
   }
 
   const SafetensorsModel& model() const { return m_; }
   cudaStream_t stream() const { return stream_; }
+  const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas() const { return tensor_shas_; }
+  bool content_changed() const { return content_changed_; }
 
  private:
+  void record_tensor_sha(const std::string& name, const std::array<std::uint8_t, 32>& sha) {
+    auto [it, inserted] = tensor_shas_.emplace(name, sha);
+    if (!inserted && it->second != sha) content_changed_ = true;
+  }
+
+  struct PendingMeta {
+    std::string name;
+    const SafetensorsTensor* tensor = nullptr;
+    std::uint64_t consumed_bytes = 0;
+  };
   const SafetensorsModel& m_;
   DeviceUploader& up_;
   cudaStream_t stream_;
   std::vector<DeviceBuffer>& storage_;
   std::vector<UploadRequest> pending_;
+  std::vector<PendingMeta> pending_meta_;
+  std::map<std::string, std::array<std::uint8_t, 32>> tensor_shas_;
+  std::map<std::string, std::vector<float>> f32_cache_;
+  bool content_changed_ = false;
 };
 
 struct LayerExpertFormats {
@@ -138,10 +208,13 @@ ExpertFormat parse_expert_dtype(const std::string& dt) {
   throw std::runtime_error("weights: unsupported expert format " + dt);
 }
 
-std::array<LayerExpertFormats, LAYERS> expert_formats(const fs::path& model_dir) {
-  std::ifstream in(model_dir / "hf_quant_config.json");
+std::array<LayerExpertFormats, LAYERS> expert_formats(const fs::path& model_dir,
+                                                      std::array<std::uint8_t, 32>* quant_sha_out = nullptr) {
+  std::ifstream in(model_dir / "hf_quant_config.json", std::ios::binary);
   if (!in) throw std::runtime_error("weights: cannot open " + (model_dir / "hf_quant_config.json").string());
-  const nlohmann::json q = nlohmann::json::parse(in);
+  const std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (quant_sha_out) *quant_sha_out = sha256_bytes(raw.data(), raw.size());
+  const nlohmann::json q = nlohmann::json::parse(raw);
   std::array<LayerExpertFormats, LAYERS> fmt{};
   std::array<bool, LAYERS> seen13{}, seen2{};
   const std::string s13 = "mlp.experts.w13_weight";
@@ -276,11 +349,11 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
   layer.mlp_conv = ld.f32(p + "mlp_sconv.weight", {H, CONV_K});
   layer.router = ld.f32(p + "mlp.gate.weight", {EXPERTS, H});
   {
-    const std::vector<float> rb = host_f32(m, p + "mlp.gate.bias");
+    const std::vector<float>& rb = ld.read_f32(p + "mlp.gate.bias");
     if (router_bias_out) *router_bias_out = rb;
     layer.router_bias = ld.upload_f32(rb, {EXPERTS});
   }
-  layer.router_bf16 = ld.upload_bf16(host_f32(m, p + "mlp.gate.weight"), {EXPERTS, H});  // exact
+  layer.router_bf16 = ld.upload_bf16(ld.read_f32(p + "mlp.gate.weight"), {EXPERTS, H});  // exact
   if (l > 0) {
     const std::string qn = "model.llm.attn_res.attn_queries." + std::to_string(l - 1);
     const std::int32_t nq = std::int32_t(m.at(qn)->numel() / H);
@@ -294,11 +367,11 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
     if (layer.full) {
       const char* names[3] = {"q_input_norm.weight", "k_input_norm.weight", "v_input_norm.weight"};
       for (int g = 0; g < 3; ++g) {
-        const std::vector<float> v = host_f32(m, p + names[g]);
+        const std::vector<float>& v = ld.read_f32(p + names[g]);
         std::copy(v.begin(), v.end(), n3.begin() + std::ptrdiff_t(g) * H);
       }
     } else {
-      const std::vector<float> v = host_f32(m, p + "attn_norm.weight");
+      const std::vector<float>& v = ld.read_f32(p + "attn_norm.weight");
       for (int g = 0; g < 3; ++g) std::copy(v.begin(), v.end(), n3.begin() + std::ptrdiff_t(g) * H);
     }
     layer.attn_norm3 = ld.upload_f32(n3, {3, H});
@@ -312,9 +385,9 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
     std::vector<float> down[4], forget[4], gain[4];
     for (int g = 0; g < 4; ++g) {
       const std::string c = p + "controllers." + ckpt[g] + ".";
-      down[g] = host_f32(m, c + "down_weight");
-      forget[g] = host_f32(m, c + "forget_weight");
-      gain[g] = host_f32(m, c + "gain_weight");
+      down[g] = ld.read_f32(c + "down_weight");
+      forget[g] = ld.read_f32(c + "forget_weight");
+      gain[g] = ld.read_f32(c + "gain_weight");
     }
     auto stack = [](std::vector<float>* parts, int n) {
       std::vector<float> out;
@@ -377,8 +450,8 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
       sc = ld.raw(e + proj + "_weight_scale");
     }
     if (!mxfp8) {
-      const std::vector<float> amax = host_f32(m, e + proj + "_weight_amax");
-      const std::vector<float> den = host_f32(m, e + proj + "_weight_outer_scale_denominator");
+      const std::vector<float>& amax = ld.read_f32(e + proj + "_weight_amax");
+      const std::vector<float>& den = ld.read_f32(e + proj + "_weight_outer_scale_denominator");
       std::vector<float> f(EXPERTS);
       for (int i = 0; i < EXPERTS; ++i) f[i] = amax[i] / den[den.size() == 1 ? 0 : i];  // FP32 division
       fac = ld.upload_f32(f, {EXPERTS});
@@ -409,11 +482,13 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
 
 Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream,
                      const OffloadConfig& offload) {
+  const auto cfg_sha = sha256_file_or_zero(model_dir / "config.json");
+  std::array<std::uint8_t, 32> quant_sha{};
+  const auto efs = expert_formats(model_dir, &quant_sha);
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
   w.dense_fp8 = dense_fp8;
-  const auto efs = expert_formats(model_dir);
   for (int l = 0; l < LAYERS; ++l) {
     w.expert_formats[l] = efs[l].w13;
     w.w2_expert_formats[l] = efs[l].w2;
@@ -431,8 +506,8 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
   {
-    const std::vector<float> q = host_f32(m, "model.llm.middle_cycle_cross_pass_queries");
-    const std::vector<float> kv = host_f32(m, "model.llm.middle_cycle_cross_pass_kv_queries");
+    const std::vector<float>& q = ld.read_f32("model.llm.middle_cycle_cross_pass_queries");
+    const std::vector<float>& kv = ld.read_f32("model.llm.middle_cycle_cross_pass_kv_queries");
     const int n = int(q.size() / H / 2);
     std::vector<float> mq(std::size_t(n) * 4 * H);
     for (int i = 0; i < n; ++i) {
@@ -526,6 +601,11 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
         offload.ram_mb > 512 ? (std::size_t(offload.ram_mb - 256) << 20) : std::size_t(0);
     w.expert_cache = ExpertCache::create(model_dir, w.expert_formats, w.w2_expert_formats, router_biases,
                                          expert_vram_budget, warm_ram_budget, offload, stream);
+  }
+  // Bind verified producer identity strictly to the exact bytes consumed into GPU memory (zero post-load file re-reads).
+  // Tiered offload streams cold experts from disk on demand, so leave its upfront content identity unverified.
+  if (!tiered && !ld.content_changed() && !ld.tensor_shas().empty()) {
+    w.content_sha256 = compute_consumed_weights_sha256(cfg_sha, quant_sha, ld.tensor_shas());
   }
   return w;
 }

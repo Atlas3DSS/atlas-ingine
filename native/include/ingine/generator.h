@@ -52,7 +52,7 @@ struct PromptImage {
 };
 
 // A prompt: token ids, images in position order (without overlap), optional verified root-prefix snapshot
-// boundary hint (0 = none; never a trust key), and optional cache isolation namespace.
+// boundary hint (0 = none; never a trust key), optional cache isolation namespace, and per-request bypass.
 struct Prompt {
   std::span<const std::int32_t> ids;
   std::span<const PromptImage> images;

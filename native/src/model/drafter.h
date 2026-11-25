@@ -106,7 +106,8 @@ class Drafter {
   // tokens in the shortlist); the global slots are copied back only if a commit or draft since the save wrote
   // one of them.
   std::size_t checkpoint_bytes() const;
-  void save_checkpoint(void* dst);
+  // Saves the current drafter checkpoint and returns the exact number of bytes copied via cudaMemcpyAsync.
+  std::size_t save_checkpoint(void* dst);
   // Restores the saved checkpoint and returns the exact number of bytes copied via cudaMemcpyAsync.
   std::size_t restore_checkpoint(const void* src);
 

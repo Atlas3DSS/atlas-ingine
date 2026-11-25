@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace ingine::model {
@@ -231,6 +232,9 @@ struct Weights {
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
   bool embed_q4() const { return embed.dtype == DType::U8; }
   std::shared_ptr<ExpertCache> expert_cache;  // non-null when tiered MoE offloading is enabled
+  // Verified cryptographic digest over model metadata + 100% of weight tensor contents, populated only by
+  // load_weights(model_dir, ...). Absent (std::nullopt) for caller-supplied/synthetic Weights with no identity.
+  std::optional<std::array<std::uint8_t, 32>> content_sha256;
 
   std::vector<DeviceBuffer> storage;  // device allocations behind the views
 };

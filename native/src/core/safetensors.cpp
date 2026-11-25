@@ -426,7 +426,8 @@ DeviceUploader::~DeviceUploader() {
     (void)cudaFreeHost(pinned_);
 }
 
-UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cudaStream_t stream) {
+UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cudaStream_t stream,
+                                   UploadChunkObserver observer) {
     nvtx::ScopedRange range(nvtx::Name::WeightUpload, nvtx::Category::Load);
     const auto start = std::chrono::steady_clock::now();
     int current      = 0;
@@ -438,7 +439,8 @@ UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cuda
 
     std::vector<Chunk> chunks;
     UploadStats stats;
-    for (const UploadRequest& r : requests) {
+    for (std::size_t ri = 0; ri < requests.size(); ++ri) {
+        const UploadRequest& r = requests[ri];
         if (r.bytes == 0) { continue; }
         if (r.file == nullptr || r.dst == nullptr) {
             throw std::invalid_argument("DeviceUploader::upload: request without file or destination");
@@ -446,9 +448,10 @@ UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cuda
         if (r.offset > r.file->file_size() || r.bytes > r.file->file_size() - r.offset) {
             throw std::out_of_range("DeviceUploader::upload: range exceeds " + r.file->path().string());
         }
-        for (std::uint64_t done = 0; done < r.bytes;) {
+        std::size_t ci = 0;
+        for (std::uint64_t done = 0; done < r.bytes; ++ci) {
             const std::uint64_t n = std::min<std::uint64_t>(r.bytes - done, options_.chunk_bytes);
-            chunks.push_back(Chunk{r.file, r.offset + done, n, static_cast<std::byte*>(r.dst) + done});
+            chunks.push_back(Chunk{r.file, r.offset + done, n, static_cast<std::byte*>(r.dst) + done, ri, ci});
             done += n;
         }
         stats.bytes += r.bytes;
@@ -460,12 +463,14 @@ UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cuda
         chunks_         = std::move(chunks);
         next_chunk_     = 0;
         stream_         = stream;
+        observer_       = std::move(observer);
         error_          = nullptr;
         active_workers_ = static_cast<int>(workers_.size());
         ++generation_;
         work_cv_.notify_all();
         done_cv_.wait(lock, [this] { return active_workers_ == 0; });
         chunks_.clear();
+        observer_ = {};
     }
 
     // Every chunk's copy has been issued (or the job failed); wait until the data has landed so the
@@ -526,6 +531,9 @@ void DeviceUploader::run_chunks() {
             {
                 nvtx::ScopedRange read_range(nvtx::Name::WeightRead, nvtx::Category::Load, chunk.bytes);
                 chunk.file->read_range(chunk.offset, chunk.bytes, slot.host);
+                if (observer_) {
+                    observer_(chunk.req_idx, chunk.chunk_idx, slot.host, static_cast<std::size_t>(chunk.bytes));
+                }
             }
             {
                 std::lock_guard lock(stream_mutex_);

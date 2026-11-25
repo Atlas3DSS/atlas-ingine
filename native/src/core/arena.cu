@@ -67,11 +67,18 @@ ReleaseHooks& release_hooks() {
     return h;
 }
 std::atomic<int> g_fail_next{0};
+std::atomic<int> g_fail_next_pinned{0};
 
 cudaError_t try_malloc(void** ptr, std::size_t bytes) {
     for (int left = g_fail_next.load(); left > 0;)
         if (g_fail_next.compare_exchange_weak(left, left - 1)) return cudaErrorMemoryAllocation;
     return cudaMalloc(ptr, bytes);
+}
+
+cudaError_t try_malloc_host(void** ptr, std::size_t bytes) {
+    for (int left = g_fail_next_pinned.load(); left > 0;)
+        if (g_fail_next_pinned.compare_exchange_weak(left, left - 1)) return cudaErrorMemoryAllocation;
+    return cudaMallocHost(ptr, bytes);
 }
 
 } // namespace
@@ -90,6 +97,7 @@ void remove_release_hook(int id) {
 }
 
 void fail_next_allocations(int n) { g_fail_next = n; }
+void fail_next_pinned_allocations(int n) { g_fail_next_pinned = n; }
 
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     if (bytes == 0) { return; }
@@ -301,7 +309,7 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
     void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    const cudaError_t err = try_malloc_host(&ptr, size_bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
     }

@@ -472,7 +472,8 @@ void Scheduler::run(Job& job) {
   try {
     const auto on_prefill = [&](const model::GenerateStats& pst) { job.set_prefill_stats(pst); };
     const model::GenerateStats st = generator_.generate(
-        model::Prompt{job.prompt_ids, job.images, job.root_prefix_tokens, job.cache_namespace, job.bypass_prefix_cache},
+        model::Prompt{job.prompt_ids, job.images, job.root_prefix_tokens, job.cache_namespace,
+                      job.bypass_prefix_cache},
         job.max_new_tokens, job.sampling, stop_list_, on_tokens, on_prefill);
     job.set_prefill_stats(st);
     // prefix reuse of the prompt: the path, the tokens reused and recomputed, restored bytes, prefill time

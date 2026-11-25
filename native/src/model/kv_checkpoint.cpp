@@ -2,6 +2,7 @@
 
 #include "core/act.h"
 #include "core/device.h"
+#include "core/safetensors.h"
 #include "model/paged_kv.h"
 
 #include <errno.h>
@@ -133,6 +134,7 @@ struct Sha256 {
 constexpr char kMagic[8] = {'I', 'N', 'G', 'C', 'K', 'P', 'T', '1'};
 constexpr std::uint32_t kVersion = 1;
 constexpr std::uint32_t kHeaderBytes = 4096;
+constexpr std::uint32_t kProducerFlagValid = 1u;
 
 struct alignas(8) RawHeader {
   char magic[8];
@@ -153,9 +155,92 @@ struct alignas(8) RawHeader {
   std::uint64_t full_kv_bytes;
   std::uint8_t prompt_sha256[32];
   std::uint8_t model_sha256[32];
+  // Optional v1 extended producer trailer inside the existing zero-padded 4096-byte header page.
+  // Legacy INGCKPT1 files have bytes 144..4095 zeroed (producer_flags == 0).
+  std::uint32_t producer_flags;
+  std::uint32_t producer_dense_fp8;
+  std::int32_t producer_prefill_chunk;
+  std::uint32_t producer_reserved;
+  std::uint8_t producer_sha256[32];
 };
 
 static_assert(sizeof(RawHeader) <= kHeaderBytes, "RawHeader exceeds 4 KiB page");
+
+KvCheckpointInfo info_from_raw_header(const RawHeader& hdr) noexcept {
+  KvCheckpointInfo info;
+  info.pos = hdr.pos;
+  info.max_ctx_at_save = hdr.max_ctx_at_save;
+  info.act_dtype = hdr.act_dtype;
+  info.kv_format = hdr.kv_format;
+  info.has_logits = hdr.has_logits != 0;
+  info.has_producer_identity = (hdr.producer_flags & kProducerFlagValid) != 0;
+  if (info.has_producer_identity) {
+    info.producer_dense_fp8 = hdr.producer_dense_fp8 != 0;
+    info.producer_prefill_chunk = hdr.producer_prefill_chunk;
+    std::memcpy(info.producer_sha256.data(), hdr.producer_sha256, 32);
+  }
+  std::memcpy(info.prompt_sha256.data(), hdr.prompt_sha256, 32);
+  std::memcpy(info.model_sha256.data(), hdr.model_sha256, 32);
+  return info;
+}
+
+void reset_state_noexcept(State& st, cudaStream_t stream) noexcept {
+  try {
+    (void)cudaMemsetAsync(st.ring_pos.data, 0xff, st.ring_pos.bytes(), stream);
+    for (Tensor* t : {&st.conv_k, &st.conv_v, &st.conv_attn, &st.conv_mlp}) {
+      (void)cudaMemsetAsync(t->data, 0, t->bytes(), stream);
+    }
+    if (st.paged_kv) st.paged_kv->reset();
+    st.length = 0;
+    (void)cudaStreamSynchronize(stream);
+  } catch (...) {
+    st.length = 0;
+  }
+}
+
+void hash_tagged_bytes(Sha256& ctx, const char* tag, const void* data, std::uint64_t len) noexcept {
+  const std::uint64_t tag_len = std::uint64_t(std::strlen(tag));
+  ctx.update(&tag_len, sizeof(tag_len));
+  ctx.update(tag, std::size_t(tag_len));
+  ctx.update(&len, sizeof(len));
+  if (len > 0) ctx.update(data, std::size_t(len));
+}
+
+void hash_optional_file(Sha256& ctx, const char* tag, const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    const std::uint8_t absent = 0;
+    hash_tagged_bytes(ctx, tag, &absent, 1);
+    return;
+  }
+  const std::uint8_t present = 1;
+  hash_tagged_bytes(ctx, tag, &present, 1);
+  const auto file_sha = sha256_file_or_zero(path);
+  hash_tagged_bytes(ctx, "sha256", file_sha.data(), file_sha.size());
+}
+
+void pread_all(int fd, void* buf, std::size_t n, std::uint64_t off);
+
+std::array<std::uint8_t, 32> hash_safetensors_tensor_file(const SafetensorsFile& file,
+                                                          const SafetensorsTensor& tensor,
+                                                          std::vector<std::byte>& scratch) {
+  std::vector<std::array<std::uint8_t, 32>> chunk_shas;
+  if (tensor.bytes > 0) {
+    const std::size_t n_chunks =
+        std::size_t((tensor.bytes + kSafetensorsHashChunkBytes - 1) / kSafetensorsHashChunkBytes);
+    chunk_shas.reserve(n_chunks);
+    std::uint64_t done = 0;
+    while (done < tensor.bytes) {
+      const std::size_t take =
+          std::size_t(std::min<std::uint64_t>(tensor.bytes - done, kSafetensorsHashChunkBytes));
+      if (scratch.size() < take) scratch.resize(take);
+      file.read_range(tensor.offset + done, take, scratch.data());
+      chunk_shas.push_back(sha256_bytes(scratch.data(), take));
+      done += take;
+    }
+  }
+  return sha256_tensor_from_chunk_digests(tensor.name, tensor.dtype, tensor.shape, tensor.bytes, chunk_shas);
+}
 
 std::uint32_t state_kv_format(const State& st) noexcept {
   if (st.kv_q4) return 2u;
@@ -276,6 +361,120 @@ std::array<std::uint8_t, 32> sha256_file_or_zero(const std::filesystem::path& pa
   return ctx.finish();
 }
 
+std::array<std::uint8_t, 32> sha256_tensor_from_chunk_digests(
+    std::string_view name, std::string_view dtype, std::span<const std::int64_t> shape, std::uint64_t bytes,
+    std::span<const std::array<std::uint8_t, 32>> chunk_shas) noexcept {
+  Sha256 ctx;
+  static constexpr char kDomain[] = "INGINE_TENSOR_V1";
+  ctx.update(kDomain, sizeof(kDomain) - 1);
+  hash_tagged_bytes(ctx, "name", name.data(), name.size());
+  hash_tagged_bytes(ctx, "dtype", dtype.data(), dtype.size());
+  const std::uint64_t rank = std::uint64_t(shape.size());
+  hash_tagged_bytes(ctx, "rank", &rank, sizeof(rank));
+  if (!shape.empty()) hash_tagged_bytes(ctx, "shape", shape.data(), shape.size_bytes());
+  hash_tagged_bytes(ctx, "bytes", &bytes, sizeof(bytes));
+  const std::uint64_t n_chunks = std::uint64_t(chunk_shas.size());
+  hash_tagged_bytes(ctx, "n_chunks", &n_chunks, sizeof(n_chunks));
+  for (const auto& c : chunk_shas) ctx.update(c.data(), c.size());
+  return ctx.finish();
+}
+
+std::array<std::uint8_t, 32> compute_model_package_sha256_from_tensors(
+    const std::filesystem::path& model_dir,
+    const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas) {
+  Sha256 ctx;
+  static constexpr char kDomain[] = "INGINE_MODEL_PKG_V2";
+  ctx.update(kDomain, sizeof(kDomain) - 1);
+  // Hash authoritative model config/quant/index metadata + 100% of verified weight tensor contents.
+  // Never rely on optional SHA256SUMS text files as a proxy for weight bytes.
+  hash_optional_file(ctx, "config.json", model_dir / "config.json");
+  hash_optional_file(ctx, "hf_quant_config.json", model_dir / "hf_quant_config.json");
+  hash_optional_file(ctx, "model.safetensors.index.json", model_dir / "model.safetensors.index.json");
+  const std::uint64_t n_tensors = std::uint64_t(tensor_shas.size());
+  hash_tagged_bytes(ctx, "num_tensors", &n_tensors, sizeof(n_tensors));
+  for (const auto& [name, tsha] : tensor_shas) {
+    hash_tagged_bytes(ctx, "tensor_name", name.data(), name.size());
+    ctx.update(tsha.data(), tsha.size());
+  }
+  return ctx.finish();
+}
+
+std::array<std::uint8_t, 32> compute_consumed_weights_sha256(
+    const std::array<std::uint8_t, 32>& config_sha, const std::array<std::uint8_t, 32>& quant_config_sha,
+    const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas) noexcept {
+  Sha256 ctx;
+  static constexpr char kDomain[] = "INGINE_CONSUMED_WEIGHTS_V1";
+  ctx.update(kDomain, sizeof(kDomain) - 1);
+  hash_tagged_bytes(ctx, "config_sha256", config_sha.data(), config_sha.size());
+  hash_tagged_bytes(ctx, "quant_config_sha256", quant_config_sha.data(), quant_config_sha.size());
+  const std::uint64_t n_tensors = std::uint64_t(tensor_shas.size());
+  hash_tagged_bytes(ctx, "num_tensors", &n_tensors, sizeof(n_tensors));
+  for (const auto& [name, tsha] : tensor_shas) {
+    hash_tagged_bytes(ctx, "tensor_name", name.data(), name.size());
+    ctx.update(tsha.data(), tsha.size());
+  }
+  return ctx.finish();
+}
+
+std::optional<std::array<std::uint8_t, 32>> compute_model_package_sha256_opt(const std::filesystem::path& model_dir) {
+  if (model_dir.empty()) return std::nullopt;
+  std::error_code ec;
+  if (!std::filesystem::is_directory(model_dir, ec) || ec) return std::nullopt;
+  try {
+    std::map<std::string, std::array<std::uint8_t, 32>> tensor_shas;
+    std::vector<std::byte> scratch;
+    if (std::filesystem::exists(model_dir / "model.safetensors.index.json", ec) ||
+        std::filesystem::exists(model_dir / "model.safetensors", ec)) {
+      const SafetensorsModel m(model_dir);
+      for (const std::string& name : m.names()) {
+        const SafetensorsRef ref = m.at(name);
+        tensor_shas.emplace(name, hash_safetensors_tensor_file(*ref.file, *ref.tensor, scratch));
+      }
+    } else {
+      std::vector<std::filesystem::path> shards;
+      for (const auto& entry : std::filesystem::directory_iterator(model_dir, ec)) {
+        if (ec) return std::nullopt;
+        if (!entry.is_regular_file(ec)) continue;
+        const auto p = entry.path();
+        if (p.extension() != ".safetensors") continue;
+        const std::string fname = p.filename().string();
+        if (fname == "mtp.safetensors" || fname.find("abliterated") != std::string::npos) continue;
+        shards.push_back(p);
+      }
+      std::sort(shards.begin(), shards.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+        return a.filename() < b.filename();
+      });
+      for (const auto& shard : shards) {
+        const SafetensorsFile sf(shard);
+        for (const SafetensorsTensor& t : sf.tensors()) {
+          tensor_shas.emplace(t.name, hash_safetensors_tensor_file(sf, t, scratch));
+        }
+      }
+    }
+    if (tensor_shas.empty()) return std::nullopt;
+    return compute_model_package_sha256_from_tensors(model_dir, tensor_shas);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::array<std::uint8_t, 32> compute_model_package_sha256(const std::filesystem::path& model_dir) {
+  return compute_model_package_sha256_opt(model_dir).value_or(std::array<std::uint8_t, 32>{});
+}
+
+std::array<std::uint8_t, 32> compute_disk_producer_sha256(const StateIdentity& identity) noexcept {
+  Sha256 ctx;
+  static constexpr char kDomain[] = "INGCKPT1_PRODUCER_V1";
+  ctx.update(kDomain, sizeof(kDomain) - 1);
+  ctx.update(identity.model_sha256.data(), identity.model_sha256.size());
+  ctx.update(&identity.act_dtype, sizeof(identity.act_dtype));
+  const std::uint8_t dense_fp8 = identity.dense_fp8 ? 1u : 0u;
+  ctx.update(&dense_fp8, sizeof(dense_fp8));
+  ctx.update(&identity.kv_format, sizeof(identity.kv_format));
+  ctx.update(&identity.prefill_chunk, sizeof(identity.prefill_chunk));
+  return ctx.finish();
+}
+
 KvCheckpointInfo inspect_kv_checkpoint(const std::filesystem::path& path) {
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) {
@@ -294,20 +493,13 @@ KvCheckpointInfo inspect_kv_checkpoint(const std::filesystem::path& path) {
     throw;
   }
   ::close(fd);
-  KvCheckpointInfo info;
-  info.pos = hdr.pos;
-  info.max_ctx_at_save = hdr.max_ctx_at_save;
-  info.act_dtype = hdr.act_dtype;
-  info.kv_format = hdr.kv_format;
-  info.has_logits = hdr.has_logits != 0;
-  std::memcpy(info.prompt_sha256.data(), hdr.prompt_sha256, 32);
-  std::memcpy(info.model_sha256.data(), hdr.model_sha256, 32);
-  return info;
+  return info_from_raw_header(hdr);
 }
 
 void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
                         std::span<const std::int32_t> prompt_prefix, const float* d_logits,
-                        const std::filesystem::path& out_path, cudaStream_t stream) {
+                        const std::filesystem::path& out_path, cudaStream_t stream,
+                        const KvCheckpointProducer* producer) {
   const int pos = int(prompt_prefix.size());
   if (pos < 0 || pos > st.max_ctx) {
     throw std::invalid_argument("kv_checkpoint: save pos=" + std::to_string(pos) + " outside [0, " +
@@ -352,6 +544,13 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
   const auto msha = sha256_file_or_zero(model_dir / "config.json");
   std::memcpy(hdr.prompt_sha256, psha.data(), 32);
   std::memcpy(hdr.model_sha256, msha.data(), 32);
+  if (producer && producer->valid) {
+    hdr.producer_flags = kProducerFlagValid;
+    hdr.producer_dense_fp8 = producer->dense_fp8 ? 1u : 0u;
+    hdr.producer_prefill_chunk = producer->prefill_chunk;
+    hdr.producer_reserved = 0u;
+    std::memcpy(hdr.producer_sha256, producer->producer_sha256.data(), 32);
+  }
 
   try {
     // 1. 4 KiB header
@@ -363,14 +562,15 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
     constexpr std::size_t kChunkBytes = PagedKvCache::kPageBytes;
     std::vector<std::uint8_t> buf(kChunkBytes);
 
-    // 2. SWA rings + ring_pos + conv states
+    // 2. SWA rings + ring_pos + conv states (strictly stream-ordered; caller stream may be cudaStreamNonBlocking)
     for (const Tensor* t : swa_tensors(st)) {
       const auto* dev = static_cast<const std::uint8_t*>(t->data);
       std::size_t rem = t->bytes();
       std::size_t off = 0;
       while (rem > 0) {
         const std::size_t take = std::min(rem, kChunkBytes);
-        CUDA_CHECK(cudaMemcpy(buf.data(), dev + off, take, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(buf.data(), dev + off, take, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         write_all(fd, buf.data(), take);
         off += take;
         rem -= take;
@@ -403,7 +603,8 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
             std::size_t off = 0;
             while (rem > 0) {
               const std::size_t take = std::min(rem, kChunkBytes);
-              CUDA_CHECK(cudaMemcpy(buf.data(), dev + off, take, cudaMemcpyDeviceToHost));
+              CUDA_CHECK(cudaMemcpyAsync(buf.data(), dev + off, take, cudaMemcpyDeviceToHost, stream));
+              CUDA_CHECK(cudaStreamSynchronize(stream));
               write_all(fd, buf.data(), take);
               off += take;
               rem -= take;
@@ -417,7 +618,8 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
     if (d_logits) {
       const std::size_t lbytes = std::size_t(UNPADDED_VOCAB) * sizeof(float);
       std::vector<std::uint8_t> lbuf(lbytes);
-      CUDA_CHECK(cudaMemcpy(lbuf.data(), d_logits, lbytes, cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpyAsync(lbuf.data(), d_logits, lbytes, cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
       write_all(fd, lbuf.data(), lbytes);
     }
 
@@ -439,19 +641,26 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
   }
 }
 
-int load_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
-                       std::span<const std::int32_t> full_prompt, float* d_logits,
-                       const std::filesystem::path& path, cudaStream_t stream) {
+KvCheckpointLoadResult load_kv_checkpoint_checked(
+    State& st, const std::filesystem::path& model_dir, std::span<const std::int32_t> full_prompt, float* d_logits,
+    const std::filesystem::path& path, cudaStream_t stream,
+    const std::function<bool(const KvCheckpointInfo&)>& eligibility) {
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) {
     throw std::runtime_error("kv_checkpoint: cannot open " + path.string() + ": " + std::strerror(errno));
   }
+  bool state_mutated = false;
   try {
     struct stat st_buf{};
     if (::fstat(fd, &st_buf) != 0) {
       throw std::runtime_error("kv_checkpoint: fstat failed for " + path.string());
     }
     const RawHeader hdr = read_and_validate_raw_header(fd, std::uint64_t(st_buf.st_size));
+    const KvCheckpointInfo info = info_from_raw_header(hdr);
+    if (eligibility && !eligibility(info)) {
+      ::close(fd);
+      return KvCheckpointLoadResult{false, info};
+    }
 
     if (hdr.act_dtype != static_cast<std::uint32_t>(kActDType)) {
       throw std::runtime_error("kv_checkpoint: activation dtype mismatch (ckpt=" + std::to_string(hdr.act_dtype) +
@@ -494,7 +703,11 @@ int load_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
     std::vector<std::uint8_t> buf(kChunkBytes);
     std::uint64_t off = hdr.header_bytes;
 
-    // 1. Restore SWA rings + ring_pos + conv states
+    // 1. Restore SWA rings + ring_pos + conv states.
+    // All H2D copies MUST be queued on `stream` (never stream-0 cudaMemcpy): Runtime::stream() is
+    // cudaStreamNonBlocking and does not synchronize with stream 0, so a pageable H2D cudaMemcpy can return
+    // while DMA is still in flight and race against subsequent kernels on `stream`.
+    state_mutated = true;
     for (Tensor* t : swa_tensors_mut(st)) {
       auto* dev = static_cast<std::uint8_t*>(t->data);
       std::size_t rem = t->bytes();
@@ -502,7 +715,8 @@ int load_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
       while (rem > 0) {
         const std::size_t take = std::min(rem, kChunkBytes);
         pread_all(fd, buf.data(), take, off);
-        CUDA_CHECK(cudaMemcpy(dev + dst_off, buf.data(), take, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(dev + dst_off, buf.data(), take, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         off += take;
         dst_off += take;
         rem -= take;
@@ -545,7 +759,8 @@ int load_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
             while (rem > 0) {
               const std::size_t take = std::min(rem, kChunkBytes);
               pread_all(fd, buf.data(), take, off);
-              CUDA_CHECK(cudaMemcpy(dev + dst_off, buf.data(), take, cudaMemcpyHostToDevice));
+              CUDA_CHECK(cudaMemcpyAsync(dev + dst_off, buf.data(), take, cudaMemcpyHostToDevice, stream));
+              CUDA_CHECK(cudaStreamSynchronize(stream));
               off += take;
               dst_off += take;
               rem -= take;
@@ -560,17 +775,25 @@ int load_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
       const std::size_t lbytes = std::size_t(UNPADDED_VOCAB) * sizeof(float);
       std::vector<std::uint8_t> lbuf(lbytes);
       pread_all(fd, lbuf.data(), lbytes, off);
-      CUDA_CHECK(cudaMemcpy(d_logits, lbuf.data(), lbytes, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpyAsync(d_logits, lbuf.data(), lbytes, cudaMemcpyHostToDevice, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
     st.length = hdr.pos;
     CUDA_CHECK(cudaStreamSynchronize(stream));
     ::close(fd);
-    return hdr.pos;
+    return KvCheckpointLoadResult{true, info};
   } catch (...) {
+    if (state_mutated) reset_state_noexcept(st, stream);
     ::close(fd);
     throw;
   }
+}
+
+int load_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
+                       std::span<const std::int32_t> full_prompt, float* d_logits,
+                       const std::filesystem::path& path, cudaStream_t stream) {
+  return load_kv_checkpoint_checked(st, model_dir, full_prompt, d_logits, path, stream, nullptr).info.pos;
 }
 
 }  // namespace ingine::model

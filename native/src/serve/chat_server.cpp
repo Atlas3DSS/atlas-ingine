@@ -310,10 +310,10 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
   } else {
     // Single-trusted-scope server mode: fail closed for requests signaling caller/tenant isolation.
     const bool has_auth = req.has_header("Authorization") && !req.get_header_value("Authorization").empty();
-    if (request.has_isolation_hint || has_auth) bypass_prefix_cache = true;
+    if (request.has_isolation_hint || request.has_user_or_cache_key || has_auth) bypass_prefix_cache = true;
   }
   auto job = std::make_shared<engine::Job>(request.prompt_ids, request.max_new_tokens, request.sampling,
-                                           std::move(request.images), /*root_prefix_tokens=*/0,
+                                           std::move(request.images), request.root_prefix_tokens,
                                            std::move(cache_namespace), bypass_prefix_cache);
   if (!scheduler_.submit(job)) {
     res.set_header("Retry-After", "1");
