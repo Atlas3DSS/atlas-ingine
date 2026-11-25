@@ -196,6 +196,11 @@ void Scheduler::loop_batched() {
     int max_new_tokens = 0;
   };
   std::vector<SlotEntry> live;
+  live.reserve(std::size_t(max_batch_));
+  {
+    std::lock_guard lock(mutex_);
+    active_.reserve(std::size_t(max_batch_));
+  }
 
   auto remove_active_job = [&](const std::shared_ptr<Job>& job) {
     std::lock_guard lock(mutex_);
@@ -249,8 +254,8 @@ void Scheduler::loop_batched() {
           need_admit_check = true;
         } else {
           candidate = front;
-          waiting_.pop_front();
           active_.push_back(candidate);
+          waiting_.pop_front();
         }
       }
       if (!need_admit_check && candidate->cancelled()) {
@@ -280,25 +285,34 @@ void Scheduler::loop_batched() {
           admit_err = "generation failed: unknown exception";
         }
         if (admit_err) {
+          bool owned = false;
           {
             std::lock_guard lock(mutex_);
             auto it = std::find(waiting_.begin(), waiting_.end(), candidate);
-            if (it != waiting_.end()) waiting_.erase(it);
+            if (it != waiting_.end()) {
+              waiting_.erase(it);
+              owned = true;
+            }
           }
-          candidate->fail(*admit_err);
-          candidate->finish();
+          // Only fail/finish `candidate` if we still owned it in waiting_; close() or withdraw()
+          // may already have finalized it while can_admit_slot() was running.
+          if (owned) {
+            candidate->fail(*admit_err);
+            candidate->finish();
+          }
           continue;
         }
         if (!admitted) break;  // wait until an active slot frees KV pages
         {
           std::lock_guard lock(mutex_);
           if (closed_ || waiting_.empty() || waiting_.front() != candidate) continue;
-          waiting_.pop_front();
           if (candidate->cancelled()) {
+            waiting_.pop_front();
             candidate->finish();
             continue;
           }
           active_.push_back(candidate);
+          waiting_.pop_front();
         }
       }
       std::shared_ptr<Job> job = std::move(candidate);

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -325,6 +326,70 @@ void test_admission_exception_isolated_from_active_work() {
   CHECK(gen.free_pages() == 16);
 }
 
+void test_admission_throw_during_shutdown_single_end() {
+  // Deterministic regression for close() racing with a throwing can_admit_slot():
+  // close() fails/finishes the waiting job and removes it from waiting_; when can_admit_slot()
+  // subsequently throws, loop_batched() must NOT emit a second failure or end event.
+  class PendingAdmission final : public ingine::model::Generator {
+   public:
+    mutable std::promise<void> entered;
+    std::promise<void> resume;
+    std::shared_future<void> resumed = resume.get_future().share();
+    std::atomic<int> releases{0};
+
+    std::string model_id() const override { return "pending-admission"; }
+    int max_model_len() const override { return 512; }
+    int max_batch_size() const override { return 2; }
+
+    bool can_admit_slot(const Prompt&, int, const Sampling&) const override {
+      entered.set_value();
+      if (resumed.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+        throw std::logic_error("fixture timed out");
+      throw std::runtime_error("admission check failed");
+    }
+    int start_slot(const Prompt&, int, const Sampling&, int32_t& first, GenerateStats&) override {
+      first = 1;
+      return 0;
+    }
+    void step_slots(std::span<const BatchSlotStep> steps, std::span<int32_t> out) override {
+      for (std::size_t i = 0; i < steps.size(); ++i) out[i] = 1;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    void release_slot(int) override { ++releases; }
+    GenerateStats generate(std::span<const int32_t>, int, const Sampling&, std::span<const int32_t>,
+                           const std::function<bool(std::span<const int32_t>)>&) override {
+      throw std::logic_error("unexpected single-slot entry");
+    }
+  };
+
+  PendingAdmission gen;
+  auto entered = gen.entered.get_future();
+  Scheduler sched(gen, {}, 2);
+  auto live = std::make_shared<Job>(std::vector<int32_t>{1}, 128, Sampling{});
+  auto pending = std::make_shared<Job>(std::vector<int32_t>{2}, 8, Sampling{});
+  CHECK(sched.submit(live));
+  CHECK(sched.submit(pending));
+  CHECK(entered.wait_for(std::chrono::seconds(4)) == std::future_status::ready);
+
+  std::thread closer([&] { sched.close(); });
+  bool first_end = false;
+  std::string first_failure;
+  const auto deadline = ingine::engine::Clock::now() + std::chrono::seconds(4);
+  while (!first_end && ingine::engine::Clock::now() < deadline) {
+    auto batch = pending->take(std::chrono::milliseconds(50));
+    if (batch.failure) first_failure = *batch.failure;
+    first_end = batch.end;
+  }
+  gen.resume.set_value();
+  closer.join();
+
+  const auto later = pending->take(std::chrono::milliseconds(20));
+  CHECK(first_end);
+  CHECK(first_failure == "server shutting down");
+  CHECK(later.empty());
+  CHECK(gen.releases.load() == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -333,6 +398,7 @@ int main() {
   test_error_isolation_and_backpressure();
   test_on_prefill_exception_releases_slot_for_reuse();
   test_admission_exception_isolated_from_active_work();
+  test_admission_throw_during_shutdown_single_end();
   std::printf(g_failures ? "FAILED (%d checks)\n" : "batch_scheduler ok\n", g_failures);
   return g_failures ? 1 : 0;
 }
