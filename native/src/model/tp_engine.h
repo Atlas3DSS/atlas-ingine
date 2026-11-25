@@ -36,6 +36,10 @@ constexpr std::uint32_t tp_p2p_probe_word(int src, std::size_t k) {
 // disables peer access on all pairs (fail-closed) and reports `corrupted = true`.
 TpP2pProbeResult probe_and_enable_tp_p2p(int tp_size, bool force_fail = false);
 
+// Rejects RuntimeOptions unsupported by TP2/TP4 (e.g. --kv-q4, --kv-paged, --kv-vram-mb, --vision, offloading,
+// disk KV checkpoints, persona hooks) before any CUDA/NCCL allocation occurs.
+void validate_tp_runtime_options(const RuntimeOptions& options, int tp_size);
+
 std::unique_ptr<Generator> make_tp_generator(const RuntimeOptions& options);
 
 }  // namespace ingine::model

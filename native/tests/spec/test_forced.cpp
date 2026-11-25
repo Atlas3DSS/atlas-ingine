@@ -84,6 +84,13 @@ int main() {
     forced.forced = other;
     run(*gen, tokens, forced, out);
     expect(out == other, "speculative forced replay of an arbitrary output");
+    // forced length cap: requesting more tokens than forced.size() caps emission at forced.size()
+    const std::vector<std::int32_t> short_forced(other.begin(), other.begin() + 17);
+    forced.forced = short_forced;
+    const model::GenerateStats cap_st = run(*gen, tokens, forced, out);
+    expect(out == short_forced && cap_st.generated_tokens == int(short_forced.size()) &&
+               cap_st.spec_trace.size() == std::size_t(cap_st.spec_rounds),
+           "speculative forced replay caps max_new_tokens at forced.size()");
   }
   {
     o.spec = false;
@@ -94,6 +101,11 @@ int main() {
     forced.forced = greedy_out;
     const model::GenerateStats st = run(*gen, tokens, forced, out);
     expect(out == greedy_out && st.spec_trace.empty(), "plain forced replay emits the forced output");
+    const std::vector<std::int32_t> short_forced(greedy_out.begin(), greedy_out.begin() + 17);
+    forced.forced = short_forced;
+    const model::GenerateStats cap_st = run(*gen, tokens, forced, out);
+    expect(out == short_forced && cap_st.generated_tokens == int(short_forced.size()) && cap_st.spec_trace.empty(),
+           "plain forced replay caps max_new_tokens at forced.size()");
   }
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
   return g_failures ? 1 : 0;

@@ -174,6 +174,28 @@ TpP2pProbeResult probe_and_enable_tp_p2p(int tp_size, bool force_fail) {
   return res;
 }
 
+void validate_tp_runtime_options(const RuntimeOptions& options, int tp_size) {
+  const std::string tag = "TP" + std::to_string(tp_size);
+  if (options.max_batch < 1) throw std::invalid_argument(tag + ": max_batch must be >= 1");
+  if (options.max_ctx < 16) throw std::invalid_argument(tag + ": max_ctx must be >= 16");
+  if (options.kv_q4 || options.kv_paged || options.kv_vram_mb > 0 || !options.kv_swap_dir.empty()) {
+    throw std::invalid_argument(
+        tag + " mode supports BF16/FP16 or --kv-fp8 KV cache (not --kv-q4, --kv-paged, --kv-vram-mb, or --kv-swap-dir)");
+  }
+  if (options.vision) {
+    throw std::invalid_argument(tag + " mode does not support --vision");
+  }
+  if (options.offload_vram_mb > 0 || !options.expert_ranking.empty() || !options.dump_router_stats.empty()) {
+    throw std::invalid_argument(tag + " mode does not support dynamic MoE offloading or router stats dumping");
+  }
+  if (!options.kv_ckpt_path.empty() || !options.kv_ckpt_resume.empty() || options.kv_ckpt_every > 0) {
+    throw std::invalid_argument(tag + " mode does not support disk KV checkpoints");
+  }
+  if (options.enable_persona_hooks || !options.refusal_map.empty()) {
+    throw std::invalid_argument(tag + " mode does not support persona hooks or refusal maps");
+  }
+}
+
 #if INGINE_TP_SIZE <= 1
 
 std::unique_ptr<Generator> make_tp_generator(const RuntimeOptions&) {
@@ -1344,10 +1366,7 @@ class TpBatchGenerator final : public Generator {
  public:
   explicit TpBatchGenerator(const RuntimeOptions& options)
       : options_(options), sampled_host_(std::size_t(std::max(1, options.max_batch)) * sizeof(std::int32_t)) {
-    if (options.max_batch < 1) throw std::invalid_argument("max_batch must be >= 1");
-    if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be >= 16");
-    if (options.kv_q4 || options.kv_paged || options.kv_vram_mb > 0)
-      throw std::invalid_argument("TP" + std::to_string(TP_SIZE) + " continuous batching supports BF16 or --kv-fp8 KV cache");
+    validate_tp_runtime_options(options, TP_SIZE);
     prefill_chunk_ = std::min(options.prefill_chunk, options.max_ctx);
     max_pages_per_slot_ = (options.max_ctx + bk::kPageSize - 1) / bk::kPageSize;
 
@@ -1472,6 +1491,7 @@ class TpBatchGenerator final : public Generator {
   int start_slot(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
                  std::int32_t& first_token, GenerateStats& stats) override {
     if (!full_prompt.images.empty()) throw std::invalid_argument("TP mode does not support vision inputs");
+    if (sampling.persona) throw std::invalid_argument("TP mode does not support persona profiles");
     const std::span<const std::int32_t> prompt = full_prompt.ids;
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     const int n = int(prompt.size());
@@ -1945,6 +1965,7 @@ class TpSpecGenerator final : public Generator {
   explicit TpSpecGenerator(const RuntimeOptions& options)
       : options_(options), host_token_(sizeof(std::int32_t)), host_m_(sizeof(std::int32_t)),
         host_drafts_(kd::GAMMA * sizeof(std::int32_t)), host_accept_(sizeof(kd::AcceptResult)) {
+    validate_tp_runtime_options(options, TP_SIZE);
     prefill_chunk_ = std::min(options.prefill_chunk, options.max_ctx);
     const std::vector<int> widths = options.spec ? std::vector<int>{1, 2, 4, 8} : std::vector<int>{1};
 
@@ -2102,8 +2123,10 @@ class TpSpecGenerator final : public Generator {
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
                          const PrefillCallback& on_prefill) override {
     if (!full_prompt.images.empty()) throw std::invalid_argument("TP mode does not support vision inputs");
+    if (sampling.persona) throw std::invalid_argument("TP mode does not support persona profiles");
     const std::span<const std::int32_t> prompt = full_prompt.ids;
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
+    if (!sampling.forced.empty()) max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
     const int n = int(prompt.size());
     const int reserve = drafter_ ? 8 : 0;
     if (n + std::int64_t(max_new_tokens) + reserve > options_.max_ctx) {
@@ -2327,13 +2350,15 @@ class TpSpecGenerator final : public Generator {
       tokens_in_state_.push_back(tok);
       ++P;
       tok = sample_r0(f32p(ranks_[0].buffers.at(1).logits), sampling, rng);
+      if (std::size_t(emitted) < sampling.forced.size()) tok = sampling.forced[emitted];
     }
   }
 
   void generate_spec(std::int32_t token, int max_new_tokens, const Sampling& sampling, head::SamplerRng& rng,
                      std::span<const std::int32_t> stop_ids,
                      const std::function<bool(std::span<const std::int32_t>)>& on_tokens, GenerateStats& stats) {
-    const bool greedy = sampling.temperature <= 0.f;
+    const bool forced = !sampling.forced.empty();
+    const bool greedy = sampling.temperature <= 0.f || forced;
     const head::SamplingParams params = to_head_params(sampling);
     const int V = drafter_->vocab();
     const Drafter::AcceptScratch& scratch = drafter_->accept_scratch();
@@ -2390,7 +2415,8 @@ class TpSpecGenerator final : public Generator {
       step_toks[0] = anchor;
       for (int i = 1; i < m; ++i) step_toks[i] = drafts[i - 1];
 
-      // Run 4-GPU TP4 verify step (with backup for rollback)
+      const auto t_verify0 = std::chrono::steady_clock::now();
+      // Run TP verify step across all ranks (with backup for rollback)
       run_decode_step(step_toks, m, P, true);
 
       // Accept on rank 0
@@ -2401,13 +2427,22 @@ class TpSpecGenerator final : public Generator {
       int acc = 0;
       if (greedy) {
         head::argmax(logits, m, V, V, scratch.target, pool_.stream(0), params.banned);
-        kd::greedy_accept(scratch.target, dr.tokens, n_draft, scratch.result, pool_.stream(0));
-        CUDA_CHECK(cudaMemcpyAsync(host_accept_.data(), scratch.result, sizeof(kd::AcceptResult),
-                                   cudaMemcpyDeviceToHost, pool_.stream(0)));
-        CUDA_CHECK(cudaStreamSynchronize(pool_.stream(0)));
-        const auto* ar = static_cast<const kd::AcceptResult*>(host_accept_.data());
-        acc = ar->accepted;
-        next_tok = ar->next;
+        if (forced) {
+          CUDA_CHECK(cudaStreamSynchronize(pool_.stream(0)));
+          while (acc < n_draft && std::size_t(emitted + acc) < sampling.forced.size() &&
+                 drafts[acc] == sampling.forced[emitted + acc]) {
+            ++acc;
+          }
+          next_tok = std::size_t(emitted + acc) < sampling.forced.size() ? sampling.forced[emitted + acc] : 0;
+        } else {
+          kd::greedy_accept(scratch.target, dr.tokens, n_draft, scratch.result, pool_.stream(0));
+          CUDA_CHECK(cudaMemcpyAsync(host_accept_.data(), scratch.result, sizeof(kd::AcceptResult),
+                                     cudaMemcpyDeviceToHost, pool_.stream(0)));
+          CUDA_CHECK(cudaStreamSynchronize(pool_.stream(0)));
+          const auto* ar = static_cast<const kd::AcceptResult*>(host_accept_.data());
+          acc = ar->accepted;
+          next_tok = ar->next;
+        }
       } else {
         head::uniform(kd::GAMMA, rng, scratch.uniforms, pool_.stream(0));
         head::sampling_probs(logits, m, V, V, params, scratch.probs, pool_.stream(0));
@@ -2422,10 +2457,14 @@ class TpSpecGenerator final : public Generator {
         acc = static_cast<const kd::AcceptResult*>(host_accept_.data())->accepted;
         next_tok = *static_cast<const std::int32_t*>(host_token_.data());
       }
+      const float verify_ms =
+          forced ? float(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_verify0).count())
+                 : 0.f;
 
       const int commit = acc + 1;
       rollback_all(P, commit, m);
       CUDA_CHECK(cudaSetDevice(0));
+      const auto t_draft0 = std::chrono::steady_clock::now();
       drafter_->commit(ptr<const ActT>(ranks_[0].buffers.at(m).taps), commit, P);
 
       round_P = P;
@@ -2442,6 +2481,17 @@ class TpSpecGenerator final : public Generator {
       out.push_back(next_tok);
       P += commit;
       dr = drafter_->draft(next_tok, P, sampling.temperature);
+      if (forced) {
+        CUDA_CHECK(cudaStreamSynchronize(pool_.stream(0)));
+        const float draft_ms =
+            float(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_draft0).count());
+        int all = 0;
+        while (all < kd::GAMMA && std::size_t(emitted + all) < sampling.forced.size() &&
+               drafts[all] == sampling.forced[emitted + all]) {
+          ++all;
+        }
+        stats.spec_trace.push_back({m, acc, all, verify_ms, draft_ms});
+      }
     }
     stats.spec_rounds = rounds;
     stats.spec_accepted = accepted_tot;
@@ -2464,6 +2514,7 @@ class TpSpecGenerator final : public Generator {
 }  // namespace
 
 std::unique_ptr<Generator> make_tp_generator(const RuntimeOptions& options) {
+  validate_tp_runtime_options(options, TP_SIZE);
   if (options.max_batch > 1 || !options.spec) {
     return std::make_unique<TpBatchGenerator>(options);
   }
