@@ -177,6 +177,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
         return images;
       }()),
       personas_(std::move(options.personas)),
+      cache_namespace_header_(std::move(options.cache_namespace_header)),
       created_(std::time(nullptr)),
       scheduler_(generator, fmt.stop_ids(), options.max_queue) {
   // Size the HTTP pool for concurrent active slots + waiting requests + /health probes (never starve at B=64).
@@ -298,8 +299,22 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
 }
 
 void ChatServer::complete(const httplib::Request& req, httplib::Response& res, ChatRequest request) {
+  std::string cache_namespace;
+  bool bypass_prefix_cache = false;
+  if (!cache_namespace_header_.empty()) {
+    // Trusted reverse-proxy scope mode: require the configured header; fail closed if absent/empty.
+    if (req.has_header(cache_namespace_header_)) {
+      cache_namespace = req.get_header_value(cache_namespace_header_);
+    }
+    if (cache_namespace.empty()) bypass_prefix_cache = true;
+  } else {
+    // Single-trusted-scope server mode: fail closed for requests signaling caller/tenant isolation.
+    const bool has_auth = req.has_header("Authorization") && !req.get_header_value("Authorization").empty();
+    if (request.has_isolation_hint || has_auth) bypass_prefix_cache = true;
+  }
   auto job = std::make_shared<engine::Job>(request.prompt_ids, request.max_new_tokens, request.sampling,
-                                           std::move(request.images));
+                                           std::move(request.images), /*root_prefix_tokens=*/0,
+                                           std::move(cache_namespace), bypass_prefix_cache);
   if (!scheduler_.submit(job)) {
     res.set_header("Retry-After", "1");
     send_error(res, 503, "server busy: request queue is full");

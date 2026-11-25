@@ -163,6 +163,44 @@ class BatchPrefixCache {
   void record_d2d_restore(std::size_t bytes) noexcept { stats_.d2d_restore_bytes += bytes; }
   void record_d2d_park(std::size_t bytes) noexcept { stats_.d2d_park_bytes += bytes; }
 
+  // Non-mutating longest-prefix lookup for prompt-aware admission checks (does not touch LRU or stats).
+  const Entry* find_longest_prefix_const(const StateIdentity& identity,
+                                         std::span<const std::int32_t> prompt_ids) const {
+    if (prompt_ids.empty() || entries_.empty()) return nullptr;
+    const std::uint64_t id_hash = hash_state_identity(identity);
+    const Entry* best = nullptr;
+    std::size_t best_len = 0;
+    for (const Entry& e : entries_) {
+      if (e.identity_hash != id_hash) continue;
+      const std::size_t len = e.tokens.size();
+      if (len == 0 || len > prompt_ids.size() || len <= best_len) continue;
+      if (!(e.identity == identity)) continue;
+      if (std::equal(e.tokens.begin(), e.tokens.end(), prompt_ids.begin())) {
+        best = &e;
+        best_len = len;
+        if (best_len == prompt_ids.size()) break;
+      }
+    }
+    return best;
+  }
+
+  // Counts physical KV pages with active_refs == 0 that can be freed by evicting cached entries other than
+  // `protected_entry_id` (0 = none). Used by prompt-aware admission checks so shared committed pages of the
+  // matched hit are never counted as evictable while non-overlapping cached pages are.
+  int reclaimable_pages_excluding(const PagedKvPagePool& pool, std::uint64_t protected_entry_id = 0) const {
+    const int base = pool.evictable_count();
+    if (protected_entry_id == 0 || base == 0) return base;
+    int held_by_protected = 0;
+    for (const Entry& e : entries_) {
+      if (e.id != protected_entry_id) continue;
+      for (int p : e.committed_pages) {
+        if (pool.active_refs(p) == 0 && pool.cache_refs(p) > 0) ++held_by_protected;
+      }
+      break;
+    }
+    return base > held_by_protected ? (base - held_by_protected) : 0;
+  }
+
   // Finds the longest exact prefix entry matching both StateIdentity::operator== and exact token IDs.
   // Moves the matched entry to MRU position on hit. Returns nullptr on miss.
   const Entry* find_longest_prefix(const StateIdentity& identity, std::span<const std::int32_t> prompt_ids) {
@@ -257,16 +295,20 @@ class BatchPrefixCache {
     if (stats_.vram_used_bytes + entry.private_vram_bytes > stats_.vram_budget_bytes) {
       return {false, evicted};
     }
-    entry.id = ++next_id_;
-    entry.identity_hash = hash_state_identity(entry.identity);
-    entry.prefix_hash = hash_token_prefix(entry.tokens);
-    for (int p : entry.committed_pages) pool.pin_for_cache(p);
+    // Transactional publish: allocate list node first (only throwing step), then commit refs/counters + noexcept splice.
+    std::list<Entry> node;
+    node.push_front(std::move(entry));
+    Entry& inserted = node.front();
+    inserted.id = ++next_id_;
+    inserted.identity_hash = hash_state_identity(inserted.identity);
+    inserted.prefix_hash = hash_token_prefix(inserted.tokens);
+    for (int p : inserted.committed_pages) pool.pin_for_cache(p);
 
-    stats_.vram_used_bytes += entry.private_vram_bytes;
+    stats_.vram_used_bytes += inserted.private_vram_bytes;
     stats_.vram_peak_bytes = std::max(stats_.vram_peak_bytes, stats_.vram_used_bytes);
     ++stats_.vram_entries;
-    if (entry.is_root) ++stats_.root_entries;
-    entries_.push_front(std::move(entry));
+    if (inserted.is_root) ++stats_.root_entries;
+    entries_.splice(entries_.begin(), node);
     return {true, evicted};
   }
 

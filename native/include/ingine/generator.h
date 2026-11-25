@@ -58,6 +58,7 @@ struct Prompt {
   std::span<const PromptImage> images;
   int root_prefix_tokens = 0;
   std::string cache_namespace;
+  bool bypass_prefix_cache = false;
 };
 
 // Validates that `root_prefix_tokens` lies inside [0, ids.size()] and does not straddle any PromptImage.
@@ -213,6 +214,10 @@ class Generator {
   // ---- Optional continuous-batching interface (used by Scheduler and ingine-bench when max_batch_size() > 1)
   virtual int max_batch_size() const { return 1; }
   virtual bool can_admit_slot(int /*prompt_tokens*/, int /*max_new_tokens*/) const { return false; }
+  // Prompt-aware admission check accounting for reusable shared committed KV pages (defaults to cold estimate).
+  virtual bool can_admit_slot(const Prompt& prompt, int max_new_tokens, const Sampling& /*sampling*/) const {
+    return can_admit_slot(int(prompt.ids.size()), max_new_tokens);
+  }
   // Allocates a free slot, prefills `prompt`, samples `first_token` and fills `stats`. Returns slot id >= 0,
   // or -1 if no slot / KV pages are currently available. Throws std::invalid_argument on invalid prompt.
   virtual int start_slot(const Prompt& /*prompt*/, int /*max_new_tokens*/, const Sampling& /*sampling*/,

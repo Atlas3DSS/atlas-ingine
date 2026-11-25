@@ -280,6 +280,119 @@ void test_private_vram_budget_and_root_validation() {
   CHECK(ingine::model::validate_root_prefix_tokens(ids, imgs, 100) == 100);
 }
 
+struct ThrowingMovePayload {
+  bool fail_on_move = false;
+  ThrowingMovePayload() = default;
+  explicit ThrowingMovePayload(bool fail) : fail_on_move(fail) {}
+  ThrowingMovePayload(ThrowingMovePayload&& other) {
+    if (other.fail_on_move) throw std::bad_alloc();
+    fail_on_move = false;
+  }
+  ThrowingMovePayload& operator=(ThrowingMovePayload&& other) {
+    if (other.fail_on_move) throw std::bad_alloc();
+    fail_on_move = false;
+    return *this;
+  }
+};
+
+void test_transactional_publish_and_prompt_aware_admission() {
+  // 1. Transactional publish(): throwing during node move must leave zero leaked cache_refs or stats.
+  {
+    PagedKvPagePool pool;
+    pool.init(4);
+    BatchPrefixCache<ThrowingMovePayload> cache;
+    cache.set_vram_budget(1024);
+
+    int p0 = pool.alloc_private_page();
+    BatchPrefixEntry<ThrowingMovePayload> bad;
+    bad.identity = make_id("tx");
+    bad.tokens = make_tokens(64, 10);
+    bad.committed_pages = {p0};
+    bad.private_vram_bytes = 256;
+    bad.payload.fail_on_move = true;
+
+    bool threw = false;
+    try {
+      (void)cache.publish(pool, std::move(bad));
+    } catch (const std::bad_alloc&) {
+      threw = true;
+    }
+    CHECK(threw);
+    CHECK(pool.cache_refs(p0) == 0);
+    CHECK(cache.size() == 0);
+    CHECK(cache.stats().vram_entries == 0);
+    CHECK(cache.stats().vram_used_bytes == 0);
+
+    // Subsequent valid publish on the same page succeeds cleanly.
+    BatchPrefixEntry<ThrowingMovePayload> good;
+    good.identity = make_id("tx");
+    good.tokens = make_tokens(64, 10);
+    good.committed_pages = {p0};
+    good.private_vram_bytes = 256;
+    good.payload.fail_on_move = false;
+    auto [ok, ev] = cache.publish(pool, std::move(good));
+    CHECK(ok && ev == 0);
+    CHECK(pool.cache_refs(p0) == 1);
+    CHECK(cache.stats().vram_entries == 1);
+    pool.release_active_page(p0);
+    cache.clear(pool);
+    CHECK(pool.free_count() == 4);
+  }
+
+  // 2. Prompt-aware admission on a 6-page pool (astartes-maxima review scenario):
+  //    Live sibling 1 owns 3 shared committed pages (192-tok exact prefix) + 1 private decode page -> 2 pages free.
+  //    Sibling 2 with identical 192-tok prompt needs only 1 fresh page (4 - 3 = 1 <= 2 free), whereas a cold
+  //    192-tok request needs 4 fresh pages (> 2 free).
+  {
+    PagedKvPagePool pool;
+    pool.init(6);
+    BatchPrefixCache<DummyPayload> cache;
+    cache.set_vram_budget(4096);
+
+    int p0 = pool.alloc_private_page();
+    int p1 = pool.alloc_private_page();
+    int p2 = pool.alloc_private_page();
+    BatchPrefixEntry<DummyPayload> e192;
+    e192.identity = make_id("sib");
+    e192.tokens = make_tokens(192, 500);
+    e192.committed_pages = {p0, p1, p2};
+    e192.private_vram_bytes = 128;
+    CHECK(cache.publish(pool, std::move(e192)).first);
+    pool.release_active_page(p0);
+    pool.release_active_page(p1);
+    pool.release_active_page(p2);
+
+    // Live sibling 1 retains the 3 shared pages + allocates 1 private decode page -> 2 free pages left.
+    pool.retain_committed_page(p0);
+    pool.retain_committed_page(p1);
+    pool.retain_committed_page(p2);
+    int p_dec1 = pool.alloc_private_page();
+    CHECK(pool.free_count() == 2);
+
+    const auto sib_tokens = make_tokens(192, 500);
+    const auto* hit = cache.find_longest_prefix_const(make_id("sib"), sib_tokens);
+    CHECK(hit != nullptr && hit->tokens.size() == 192);
+    const int F = int(hit->tokens.size()) / 64;
+    const int total_pages = (192 + 1 + 63) / 64;  // 4
+    const int fresh_needed = total_pages - F;     // 1
+    const int avail_for_sib = pool.free_count() + cache.reclaimable_pages_excluding(pool, hit->id);
+    CHECK(fresh_needed == 1 && avail_for_sib == 2 && avail_for_sib >= fresh_needed);
+
+    // Meanwhile an unrelated 192-tok prompt gets no hit and needs 4 > 2 pages -> cannot admit yet.
+    const auto cold_tokens = make_tokens(192, 900);
+    CHECK(cache.find_longest_prefix_const(make_id("sib"), cold_tokens) == nullptr);
+    const int avail_for_cold = pool.free_count() + cache.reclaimable_pages_excluding(pool, 0);
+    CHECK(avail_for_cold == 2 && avail_for_cold < total_pages);
+
+    pool.release_active_page(p_dec1);
+    pool.release_active_page(p0);
+    pool.release_active_page(p1);
+    pool.release_active_page(p2);
+    cache.clear(pool);
+    CHECK(pool.free_count() == 6);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -287,6 +400,7 @@ int main() {
   test_non_starvation_and_protected_hit();
   test_identity_isolation_and_exact_prefix_boundaries();
   test_private_vram_budget_and_root_validation();
+  test_transactional_publish_and_prompt_aware_admission();
   std::printf(g_failures ? "FAILED (%d checks)\n" : "batch_prefix_cache ok\n", g_failures);
   return g_failures ? 1 : 0;
 }

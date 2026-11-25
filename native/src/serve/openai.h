@@ -44,6 +44,7 @@ struct ChatRequest {
   std::vector<std::string> stop;
   std::string persona_name;  // optional per-request persona profile selector (empty = server default)
   text::RenderStats render_stats;  // CPU tokenization cache stats (distinct from GPU prefix reuse)
+  bool has_isolation_hint = false;  // true if request carries "user" or "prompt_cache_key" (signals tenant isolation)
   bool stream = false;
   bool include_usage = false;
 };

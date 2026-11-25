@@ -806,6 +806,8 @@ class BatchGenerator final : public Generator {
     decoder_.reset();
     prefiller_.reset();
     vision_.reset();
+    if (restore_ev_stop_) cudaEventDestroy(restore_ev_stop_);
+    if (restore_ev_start_) cudaEventDestroy(restore_ev_start_);
     if (stream_) cudaStreamDestroy(stream_);
   }
 
@@ -828,6 +830,28 @@ class BatchGenerator final : public Generator {
     return pool_.pages.available_for_admission() >= need_pages;
   }
 
+  bool can_admit_slot(const Prompt& full_prompt, int /*max_new_tokens*/, const Sampling& sampling) const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pool_.free_slot_count() <= 0) return false;
+    const int n = int(full_prompt.ids.size());
+    const int total_pages = (n + 1 + bk::kPageSize - 1) / bk::kPageSize;
+    const bool cache_eligible = options_.prefix_cache && !full_prompt.bypass_prefix_cache && !options_.spec &&
+                                !options_.enable_persona_hooks && sampling.persona == nullptr &&
+                                full_prompt.images.empty() && prefix_cache_.vram_budget_bytes() > 0;
+    int F = 0;
+    std::uint64_t hit_id = 0;
+    if (cache_eligible && n > 0) {
+      const StateIdentity identity = build_identity(full_prompt);
+      if (const auto* hit = prefix_cache_.find_longest_prefix_const(identity, full_prompt.ids)) {
+        F = int(hit->tokens.size()) / bk::kPageSize;
+        hit_id = hit->id;
+      }
+    }
+    const int fresh_needed = std::max(0, total_pages - F);
+    const int avail = pool_.pages.free_count() + prefix_cache_.reclaimable_pages_excluding(pool_.pages, hit_id);
+    return avail >= fresh_needed;
+  }
+
   int start_slot(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
                  std::int32_t& first_token, GenerateStats& stats) override {
     const std::span<const std::int32_t> prompt = full_prompt.ids;
@@ -842,10 +866,10 @@ class BatchGenerator final : public Generator {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pool_.free_slot_count() <= 0) return -1;
 
-    // Stage 2 fail-closed eligibility: text + supported resident KV modes, speculation off, unhooked.
-    const bool cache_eligible = options_.prefix_cache && !options_.spec && !options_.enable_persona_hooks &&
-                                sampling.persona == nullptr && full_prompt.images.empty() &&
-                                prefix_cache_.vram_budget_bytes() > 0;
+    // Stage 2 fail-closed eligibility: text + supported resident KV modes, speculation off, unhooked, not bypassed.
+    const bool cache_eligible = options_.prefix_cache && !full_prompt.bypass_prefix_cache && !options_.spec &&
+                                !options_.enable_persona_hooks && sampling.persona == nullptr &&
+                                full_prompt.images.empty() && prefix_cache_.vram_budget_bytes() > 0;
     const StateIdentity identity = build_identity(full_prompt);
     const auto* hit = cache_eligible ? prefix_cache_.find_longest_prefix(identity, prompt) : nullptr;
 
@@ -864,65 +888,77 @@ class BatchGenerator final : public Generator {
 
     const int s = pool_.alloc_slot();
     if (s < 0) return -1;
-    if (F > 0 && !pool_.attach_committed_pages(s, hit->committed_pages, stream_)) {
-      pool_.free_slot(s);
-      return -1;
-    }
-    if (!pool_.ensure_pages(s, n + 1, stream_)) {
-      pool_.free_slot(s);
-      return -1;
-    }
+
+    // Exception-safe slot guard: covers attach_committed_pages, ensure_pages, restore, prefill, scatter, and sample.
+    bool slot_committed = false;
+    struct SlotGuard {
+      BatchStatePool& pool;
+      cudaStream_t stream;
+      int slot;
+      bool& committed;
+      ~SlotGuard() {
+        if (!committed && slot >= 0) {
+          if (stream) cudaStreamSynchronize(stream);
+          pool.free_slot(slot);
+        }
+      }
+    } slot_guard{pool_, stream_, s, slot_committed};
+
+    if (F > 0 && !pool_.attach_committed_pages(s, hit->committed_pages, stream_)) return -1;
+    if (!pool_.ensure_pages(s, n + 1, stream_)) return -1;
 
     const auto t0 = std::chrono::steady_clock::now();
     std::uint64_t restored_bytes = 0;
     double restore_seconds = 0.0;
+    bool recorded_restore_events = false;
     const int root_boundary =
         cache_eligible ? validate_root_prefix_tokens(prompt, full_prompt.images, full_prompt.root_prefix_tokens) : 0;
 
-    try {
-      if (L == n && hit != nullptr) {
-        // Exact prompt hit: zero prefill compute and zero full-KV scratch gather.
-        const auto tr0 = std::chrono::steady_clock::now();
+    if (L == n && hit != nullptr) {
+      // Exact prompt hit: zero prefill compute and zero full-KV scratch gather.
+      CUDA_CHECK(cudaEventRecord(restore_ev_start_, stream_));
+      restored_bytes += restore_recurrent_state(s, hit->payload);
+      if (tail > 0) {
+        bk::copy_tail_kv_to_pool_page(hit->payload.tail_k.p, hit->payload.tail_v.p, tail, pool_.kv_fp8,
+                                      pool_.slot_pages[s][std::size_t(F)], pool_.k_full_pool.p, pool_.v_full_pool.p,
+                                      stream_);
+        restored_bytes += hit->payload.tail_k.bytes + hit->payload.tail_v.bytes;
+      }
+      CUDA_CHECK(cudaMemcpyAsync(prefill_logits_.p, hit->payload.logits.p, prefill_logits_.bytes,
+                                 cudaMemcpyDeviceToDevice, stream_));
+      restored_bytes += prefill_logits_.bytes;
+      CUDA_CHECK(cudaEventRecord(restore_ev_stop_, stream_));
+      recorded_restore_events = true;
+      pool_.set_slot_pos(s, n, stream_);
+      prefix_cache_.record_d2d_restore(restored_bytes);
+    } else {
+      State st = pool_.prefill_view(s);
+      int scatter_from = 0;
+      if (L == 0) {
+        reset_state(st, stream_);
+      } else {
+        CUDA_CHECK(cudaEventRecord(restore_ev_start_, stream_));
         restored_bytes += restore_recurrent_state(s, hit->payload);
+        const std::size_t es = pool_.kv_fp8 ? 1 : 2;
+        if (F > 0) {
+          bk::gather_full_kv(pool_.k_full_pool.p, pool_.v_full_pool.p, s,
+                             static_cast<const std::int32_t*>(pool_.page_table.p), pool_.max_pages_per_slot,
+                             F * bk::kPageSize, pool_.kv_fp8, pool_.scratch_k_full.p, pool_.scratch_v_full.p,
+                             pool_.max_ctx, stream_);
+          restored_bytes += std::size_t(2) * NUM_FULL_VISITS * std::size_t(F * bk::kPageSize) * KV_DIM * es;
+        }
         if (tail > 0) {
-          bk::copy_tail_kv_to_pool_page(hit->payload.tail_k.p, hit->payload.tail_v.p, tail, pool_.kv_fp8,
-                                        pool_.slot_pages[s][std::size_t(F)], pool_.k_full_pool.p, pool_.v_full_pool.p,
-                                        stream_);
+          bk::copy_tail_kv_to_scratch(hit->payload.tail_k.p, hit->payload.tail_v.p, tail, pool_.kv_fp8,
+                                      pool_.scratch_k_full.p, pool_.scratch_v_full.p, pool_.max_ctx, F * bk::kPageSize,
+                                      stream_);
           restored_bytes += hit->payload.tail_k.bytes + hit->payload.tail_v.bytes;
         }
-        CUDA_CHECK(cudaMemcpyAsync(prefill_logits_.p, hit->payload.logits.p, prefill_logits_.bytes,
-                                   cudaMemcpyDeviceToDevice, stream_));
-        restored_bytes += prefill_logits_.bytes;
-        pool_.set_slot_pos(s, n, stream_);
+        CUDA_CHECK(cudaEventRecord(restore_ev_stop_, stream_));
+        recorded_restore_events = true;
+        st.length = L;
+        scatter_from = F * bk::kPageSize;  // never overwrite shared committed pages [0..F-1]
         prefix_cache_.record_d2d_restore(restored_bytes);
-        restore_seconds = seconds_since(tr0);
-      } else {
-        State st = pool_.prefill_view(s);
-        int scatter_from = 0;
-        if (L == 0) {
-          reset_state(st, stream_);
-        } else {
-          const auto tr0 = std::chrono::steady_clock::now();
-          restored_bytes += restore_recurrent_state(s, hit->payload);
-          const std::size_t es = pool_.kv_fp8 ? 1 : 2;
-          if (F > 0) {
-            bk::gather_full_kv(pool_.k_full_pool.p, pool_.v_full_pool.p, s,
-                               static_cast<const std::int32_t*>(pool_.page_table.p), pool_.max_pages_per_slot,
-                               F * bk::kPageSize, pool_.kv_fp8, pool_.scratch_k_full.p, pool_.scratch_v_full.p,
-                               pool_.max_ctx, stream_);
-            restored_bytes += std::size_t(2) * NUM_FULL_VISITS * std::size_t(F * bk::kPageSize) * KV_DIM * es;
-          }
-          if (tail > 0) {
-            bk::copy_tail_kv_to_scratch(hit->payload.tail_k.p, hit->payload.tail_v.p, tail, pool_.kv_fp8,
-                                        pool_.scratch_k_full.p, pool_.scratch_v_full.p, pool_.max_ctx,
-                                        F * bk::kPageSize, stream_);
-            restored_bytes += hit->payload.tail_k.bytes + hit->payload.tail_v.bytes;
-          }
-          st.length = L;
-          scatter_from = F * bk::kPageSize;  // never overwrite shared committed pages [0..F-1]
-          prefix_cache_.record_d2d_restore(restored_bytes);
-          restore_seconds = seconds_since(tr0);
-        }
+      }
 
         const std::size_t chunk = std::size_t(prefill_chunk_);
         struct Encoded {
@@ -1011,6 +1047,11 @@ class BatchGenerator final : public Generator {
                    meta.rng, sampled, stream_);
       CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled, sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream_));
       CUDA_CHECK(cudaStreamSynchronize(stream_));
+      if (recorded_restore_events) {
+        float restore_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&restore_ms, restore_ev_start_, restore_ev_stop_));
+        restore_seconds = double(restore_ms) * 1e-3;
+      }
       first_token = static_cast<const std::int32_t*>(sampled_host_.data())[0];
       if (!meta.forced.empty()) {
         first_token = meta.forced[0];
@@ -1030,12 +1071,8 @@ class BatchGenerator final : public Generator {
       stats.cache_evictions = evictions;
       stats.image_tokens = image_tokens;
       stats.prefill_seconds = seconds_since(t0);
+      slot_committed = true;
       return s;
-    } catch (...) {
-      cudaStreamSynchronize(stream_);
-      pool_.free_slot(s);
-      throw;
-    }
   }
 
   void step_slots(std::span<const BatchSlotStep> inputs, std::span<std::int32_t> out_tokens) override {
@@ -1300,6 +1337,8 @@ class BatchGenerator final : public Generator {
 
     decoder_ = std::make_unique<BatchDecoder>(weights_, ablation_, pool_, options_.max_batch);
     decoder_->capture_buckets(stream_);
+    CUDA_CHECK(cudaEventCreate(&restore_ev_start_));
+    CUDA_CHECK(cudaEventCreate(&restore_ev_stop_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 
     // Size private recurrent/tail/logits VRAM budget for prefix checkpoints (never starves active pool).
@@ -1346,6 +1385,8 @@ class BatchGenerator final : public Generator {
 
   RuntimeOptions options_;
   cudaStream_t stream_ = nullptr;
+  cudaEvent_t restore_ev_start_ = nullptr;
+  cudaEvent_t restore_ev_stop_ = nullptr;
   Weights weights_;
   Ablation ablation_;
   std::array<std::uint8_t, 32> model_sha256_{};

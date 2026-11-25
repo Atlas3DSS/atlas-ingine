@@ -37,12 +37,14 @@ std::string type_name(const std::exception& e) {
 }  // namespace
 
 Job::Job(std::vector<int32_t> prompt_ids_, int max_new_tokens_, model::Sampling sampling_,
-         std::vector<model::PromptImage> images_, int root_prefix_tokens_, std::string cache_namespace_)
+         std::vector<model::PromptImage> images_, int root_prefix_tokens_, std::string cache_namespace_,
+         bool bypass_prefix_cache_)
     : id("chatcmpl-" + random_hex32()),
       prompt_ids(std::move(prompt_ids_)),
       images(std::move(images_)),
       root_prefix_tokens(root_prefix_tokens_),
       cache_namespace(std::move(cache_namespace_)),
+      bypass_prefix_cache(bypass_prefix_cache_),
       max_new_tokens(max_new_tokens_),
       sampling(sampling_),
       t_submit(Clock::now()) {}
@@ -241,7 +243,11 @@ void Scheduler::loop_batched() {
         if (front->cancelled()) {
           job = front;
           waiting_.pop_front();
-        } else if (!live.empty() && !generator_.can_admit_slot(int(front->prompt_ids.size()), front->max_new_tokens)) {
+        } else if (!live.empty() &&
+                   !generator_.can_admit_slot(
+                       model::Prompt{front->prompt_ids, front->images, front->root_prefix_tokens,
+                                     front->cache_namespace, front->bypass_prefix_cache},
+                       front->max_new_tokens, front->sampling)) {
           break;  // wait until an active slot frees KV pages
         } else {
           job = front;
@@ -267,8 +273,9 @@ void Scheduler::loop_batched() {
         int32_t first_tok = 0;
         model::GenerateStats st;
         const int slot = generator_.start_slot(
-            model::Prompt{job->prompt_ids, job->images, job->root_prefix_tokens, job->cache_namespace}, eff_max,
-            job->sampling, first_tok, st);
+            model::Prompt{job->prompt_ids, job->images, job->root_prefix_tokens, job->cache_namespace,
+                          job->bypass_prefix_cache},
+            eff_max, job->sampling, first_tok, st);
         if (slot < 0) {
           // Put back at front of queue; retry after next step frees resources.
           std::lock_guard lock(mutex_);
@@ -407,8 +414,9 @@ void Scheduler::run(Job& job) {
   };
   try {
     const auto on_prefill = [&](const model::GenerateStats& pst) { job.set_prefill_stats(pst); };
-    const model::GenerateStats st = generator_.generate(model::Prompt{job.prompt_ids, job.images}, job.max_new_tokens,
-                                                        job.sampling, stop_list_, on_tokens, on_prefill);
+    const model::GenerateStats st = generator_.generate(
+        model::Prompt{job.prompt_ids, job.images, job.root_prefix_tokens, job.cache_namespace, job.bypass_prefix_cache},
+        job.max_new_tokens, job.sampling, stop_list_, on_tokens, on_prefill);
     job.set_prefill_stats(st);
     // prefix reuse of the prompt: the path, the tokens reused and recomputed, restored bytes, prefill time
     const int recomputed = std::max(0, st.prompt_tokens - std::clamp(st.reused_tokens, 0, st.prompt_tokens));
