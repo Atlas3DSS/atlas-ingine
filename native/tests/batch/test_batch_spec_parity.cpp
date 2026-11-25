@@ -152,6 +152,41 @@ void run_validator_negative_controls() {
   bad.draft_tokens[0] = 421;
   CHECK(!sv::validate_sampled_trace(bad, V).ok);
 
+  // All-zero target tensor + zero residual + token 0 -> MUST fail!
+  {
+    BatchSpecSlotTrace zall = tr;
+    zall.target_probs.assign(std::size_t(zall.w_cap) * V, 0.f);
+    zall.accepted = 0;
+    zall.residual_probs.assign(V, 0.f);
+    zall.next_token = 0;
+    CHECK(!sv::validate_sampled_trace(zall, V).ok);
+  }
+  // Valid first target row + all-zero bonus row + zero residual + token 0 -> MUST fail!
+  {
+    BatchSpecSlotTrace zbonus = tr;
+    for (int v = 0; v < V; ++v) zbonus.target_probs[std::size_t(V + v)] = 0.f;
+    zbonus.accepted = 1;
+    zbonus.residual_probs.assign(V, 0.f);
+    zbonus.next_token = 0;
+    CHECK(!sv::validate_sampled_trace(zbonus, V).ok);
+  }
+  // Valid zero-residual fallback to normalized target row -> MUST pass!
+  {
+    BatchSpecSlotTrace fb = tr;
+    const float q_unif = 1.0f / float(sv::kCandidates);
+    const float p_sub = q_unif * 0.9995f;
+    std::uint64_t high_u_ctr = 0;
+    while (sv::head_uniform(fb.accept_rng_seed, high_u_ctr, 0u) < 0.9996f) ++high_u_ctr;
+    fb.accept_rng_counter_u = high_u_ctr;
+    fb.uniforms = {sv::head_uniform(fb.accept_rng_seed, fb.accept_rng_counter_u, 0u)};
+    for (int v = 0; v < V; ++v) fb.target_probs[std::size_t(v)] = p_sub;
+    fb.accepted = 0;
+    fb.residual_probs.assign(fb.target_probs.begin(), fb.target_probs.begin() + V);
+    fb.next_token = sv::head_sample_from_probs(fb.residual_probs, fb.accept_rng_seed, fb.accept_rng_counter_resid);
+    fb.commit = 1;
+    CHECK(sv::validate_sampled_trace(fb, V).ok);
+  }
+
   // 2. Cross-gear identical-row [0, 0, 3] control for claimed tokens 0 vs 1 MUST fail!
   const std::vector<float> id_row = {0.f, 0.f, 3.f};
   CHECK(!sv::validate_cross_gear_divergence(id_row, id_row, 0, 1, 3, 0.6f).ok);
@@ -356,6 +391,32 @@ int main(int argc, char** argv) {
 
   const int kGenLen = 48;
   const int bs[] = {1, 4, 8, 12};
+
+  // ---- PHASE 0: Near-cap VRAM preflight rejection (MUST fail closed BEFORE load_weights crosses the cap!) ----
+  {
+    RuntimeOptions opt_tiny;
+    opt_tiny.model_dir = model_dir;
+    opt_tiny.max_ctx = 2048;
+    opt_tiny.prefill_chunk = 512;
+    opt_tiny.dense_fp8 = true;
+    opt_tiny.kv_fp8 = true;
+    opt_tiny.max_batch = 12;
+    opt_tiny.max_kv_tokens = 12 * 512;
+    opt_tiny.vram_limit_mb = 2048;  // far below weights peak; must reject before allocating weights!
+    opt_tiny.spec = true;
+    bool rejected = false;
+    try {
+      auto gen_fail = ingine::model::make_generator(opt_tiny);
+      (void)gen_fail;
+    } catch (const std::runtime_error& e) {
+      rejected = (std::string(e.what()).find("VRAM lease cap exceeded before load_weights") != std::string::npos);
+    }
+    vram.sample();
+    CHECK(rejected);
+    CHECK(vram.peak_delta_mib() < 512.0);
+    std::printf("preflight VRAM near-cap rejection (limit=2048 MiB): rejected=%d peak_delta=%.1f MiB\n",
+                int(rejected), vram.peak_delta_mib());
+  }
 
   // ---- PHASE A: Single resident plain generator (collects plain references, then FULLY RELEASES before spec!) ----
   std::vector<std::vector<std::vector<int32_t>>> plain_refs;

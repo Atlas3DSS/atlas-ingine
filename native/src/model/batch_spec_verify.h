@@ -25,6 +25,7 @@ namespace ingine::model::spec_verify {
 
 inline constexpr int kGamma = 7;
 inline constexpr int kCandidates = 1024;
+inline constexpr double kProbRowMassTol = 1e-3;  // stated unit-mass tolerance per active target probability row
 
 // ---- Exact CPU mirror of kernels/draft/rng.h (Philox4x32-10 + Gumbel) & draft_device.cuh (pack_argmax) ----
 
@@ -190,6 +191,24 @@ inline ValidationResult validate_sampled_trace(const BatchSpecSlotTrace& tr, int
   if (!all_fin(tr.residual_probs)) return fail_res("nonfinite residual_probs");
   if (!all_fin(tr.draft_cand_logits)) return fail_res("nonfinite draft_cand_logits");
 
+  // 0. Every active target probability row 0..w_cap-1 (draft check rows + bonus row) MUST be finite, nonnegative,
+  //    and sum to 1.0 within kProbRowMassTol (rejects all-zero tensors, missing bonus rows, negative entries).
+  for (int r = 0; r < tr.w_cap; ++r) {
+    const float* row = tr.target_probs.data() + std::size_t(r) * vocab_size;
+    double row_sum = 0.0;
+    for (int x = 0; x < vocab_size; ++x) {
+      const float p = row[x];
+      if (!std::isfinite(p) || p < 0.f || p > 1.0f + 1e-5f) {
+        return fail_res("invalid target_probs entry at row " + std::to_string(r) + " token " + std::to_string(x));
+      }
+      row_sum += double(p);
+    }
+    if (!std::isfinite(row_sum) || std::fabs(row_sum - 1.0) > kProbRowMassTol) {
+      return fail_res("target_probs row " + std::to_string(r) + " mass out of unit tolerance: sum=" +
+                      std::to_string(row_sum));
+    }
+  }
+
   const float T = tr.temperature;
   std::vector<std::unordered_map<std::int32_t, float>> q_maps(static_cast<std::size_t>(kGamma));
 
@@ -254,6 +273,8 @@ inline ValidationResult validate_sampled_trace(const BatchSpecSlotTrace& tr, int
   }
 
   // 4. Verify exact residual distribution (including all-zero fallback) and Gumbel-max residual choice.
+  //    Unnormalized rejection residuals max(p - q, 0) need NOT sum to 1, but post-fallback distributions
+  //    MUST be finite, nonnegative, and have strictly positive mass (unit mass on bonus / fallback rows).
   std::vector<float> ref_resid(static_cast<std::size_t>(vocab_size), 0.f);
   double resid_sum = 0.0;
   const float* pa = tr.target_probs.data() + std::size_t(ref_acc) * vocab_size;
@@ -267,18 +288,37 @@ inline ValidationResult validate_sampled_trace(const BatchSpecSlotTrace& tr, int
     ref_resid[std::size_t(x)] = w;
     resid_sum += double(w);
   }
-  if (!(resid_sum > 0.0)) {
-    for (int x = 0; x < vocab_size; ++x) ref_resid[std::size_t(x)] = pa[x];
+  const bool used_fallback = (ref_acc < n && !(resid_sum > 0.0));
+  double post_fallback_ref_sum = resid_sum;
+  if (used_fallback) {
+    post_fallback_ref_sum = 0.0;
+    for (int x = 0; x < vocab_size; ++x) {
+      ref_resid[std::size_t(x)] = pa[x];
+      post_fallback_ref_sum += double(pa[x]);
+    }
   }
+  if (!(post_fallback_ref_sum > 0.0)) return fail_res("post-fallback reference residual has non-positive mass");
 
+  double got_resid_sum = 0.0;
   float max_rdiff = 0.f;
   for (int x = 0; x < vocab_size; ++x) {
-    const float d = std::fabs(tr.residual_probs[std::size_t(x)] - ref_resid[std::size_t(x)]);
+    const float rv = tr.residual_probs[std::size_t(x)];
+    if (!std::isfinite(rv) || rv < 0.f) return fail_res("invalid negative or nonfinite residual_probs entry");
+    got_resid_sum += double(rv);
+    const float d = std::fabs(rv - ref_resid[std::size_t(x)]);
     if (!std::isfinite(d)) return fail_res("nonfinite residual diff");
     if (d > max_rdiff) max_rdiff = d;
   }
+  if (!(got_resid_sum > 0.0)) return fail_res("observed residual_probs has non-positive mass");
+  if ((ref_acc == n || used_fallback) && std::fabs(got_resid_sum - 1.0) > kProbRowMassTol) {
+    return fail_res("normalized fallback/bonus residual mass out of unit tolerance: sum=" +
+                    std::to_string(got_resid_sum));
+  }
   if (max_rdiff > 1e-5f) return fail_res("residual distribution mismatch: max_diff=" + std::to_string(max_rdiff));
 
+  if (tr.next_token < 0 || tr.next_token >= vocab_size || !(ref_resid[std::size_t(tr.next_token)] > 0.f)) {
+    return fail_res("next_token out of range or zero probability under post-fallback residual");
+  }
   const std::int32_t next_gpu_resid =
       head_sample_from_probs(tr.residual_probs, tr.accept_rng_seed, tr.accept_rng_counter_resid);
   const std::int32_t next_cpu_resid =

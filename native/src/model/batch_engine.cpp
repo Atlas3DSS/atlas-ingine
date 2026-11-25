@@ -8,6 +8,7 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/ops.h"
+#include "core/safetensors.h"
 #include "ingine/batch_spec_plan.h"
 #include "kernels/batch/batch.h"
 #include "kernels/dense/dense.h"
@@ -443,7 +444,8 @@ class BatchDecoder {
   }
 
   BatchDecoder(const Weights& w, const Ablation& abl, BatchStatePool& pool, int max_batch, int max_verify_width = 1,
-               bool spec_enabled = false)
+               bool spec_enabled = false, std::optional<std::size_t> vram_limit_bytes = std::nullopt,
+               std::size_t free_at_entry = 0)
       : w_(w),
         abl_(abl),
         pool_(pool),
@@ -451,6 +453,8 @@ class BatchDecoder {
         max_verify_width_(spec_enabled ? std::max(1, max_verify_width) : 1),
         max_rows_(max_batch * max_verify_width_),
         spec_enabled_(spec_enabled),
+        vram_limit_bytes_(vram_limit_bytes),
+        free_at_entry_(free_at_entry),
         gemm_(std::make_unique<pk::Gemm>()),
         tokens_host_(std::size_t(max_rows_) * sizeof(std::int64_t)),
         slots_host_(std::size_t(max_batch_) * sizeof(std::int32_t)),
@@ -617,9 +621,11 @@ class BatchDecoder {
     B_cap_out = B_cap;
 
     // Lazily capture CUDA graph for (B_cap, W) using padded slot_ids=-1 (ZERO mutation of live slots).
+    // If a process VRAM lease cap is active, require >= 64 MiB remaining headroom before capturing a lazy graph;
+    // otherwise fall back safely to eager verify without ever crossing the lease.
     const std::pair<int, int> key{B_cap, W};
     auto it = verify_graphs_.find(key);
-    if (it == verify_graphs_.end() && verify_graphs_.size() < 24) {
+    if (it == verify_graphs_.end() && verify_graphs_.size() < 24 && lazy_graph_within_lease()) {
       ensure_verify_graph(B_cap, W, stream);
       it = verify_graphs_.find(key);
     }
@@ -664,6 +670,15 @@ class BatchDecoder {
   const std::int32_t* slot_w_limit_dev() const { return slot_w_limit_dev_; }
 
  private:
+  bool lazy_graph_within_lease() const {
+    if (!vram_limit_bytes_.has_value()) return true;
+    std::size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+    const std::size_t used = free_at_entry_ > free_b ? (free_at_entry_ - free_b) : 0;
+    const std::size_t rem = *vram_limit_bytes_ > used ? (*vram_limit_bytes_ - used) : 0;
+    return rem >= (std::size_t(64) << 20);
+  }
+
   bk::BatchedVerifyStatePtrs state_ptrs() const {
     bk::BatchedVerifyStatePtrs st{};
     st.conv_k = static_cast<float*>(pool_.conv_k.p);
@@ -1124,6 +1139,8 @@ class BatchDecoder {
   int max_verify_width_;
   int max_rows_;
   bool spec_enabled_;
+  std::optional<std::size_t> vram_limit_bytes_;
+  std::size_t free_at_entry_ = 0;
   std::unique_ptr<pk::Gemm> gemm_;
 
   std::vector<DeviceBuffer> storage_;
@@ -1187,6 +1204,27 @@ class BatchGenerator final : public Generator {
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     std::size_t total_b = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_at_entry_, &total_b));
+    if (options.vram_limit_mb > 0) {
+      // Preflight weights peak BEFORE allocating a single byte on GPU (header-only safetensors scan).
+      SafetensorsModel hdr(options.model_dir);
+      std::size_t non_vision_bytes = 0;
+      for (const auto& f : hdr.files()) {
+        for (const auto& t : f->tensors()) {
+          const bool is_vis =
+              (t.name.rfind("vision", 0) == 0 || t.name.rfind("visual", 0) == 0 || t.name.rfind("model.visual", 0) == 0);
+          if (!is_vis || options.vision) non_vision_bytes += std::size_t(t.bytes);
+        }
+      }
+      const std::size_t cap = std::size_t(options.vram_limit_mb) << 20;
+      const std::size_t est_weights_peak = estimate_weights_peak_bytes(non_vision_bytes, options.dense_fp8,
+                                                                       UNPADDED_VOCAB, HIDDEN);
+      const VramLeaseCheck chk = check_vram_lease_fit(std::min(free_at_entry_, cap), est_weights_peak);
+      if (!chk.ok) {
+        throw std::runtime_error("BatchGenerator: VRAM lease cap exceeded before load_weights (peak_need=" +
+                                 std::to_string(chk.planned_bytes >> 20) + " MiB, budget=" +
+                                 std::to_string(chk.remaining_bytes >> 20) + " MiB)");
+      }
+    }
     weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
     ablation_ = load_ablation(options.ablation);
     init();
@@ -2256,21 +2294,6 @@ class BatchGenerator final : public Generator {
   void init() {
     prefill_chunk_ = std::min(options_.prefill_chunk, options_.max_ctx);
     if (prefill_chunk_ < 1) throw std::invalid_argument("prefill_chunk must be positive");
-    if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, stream_);
-    prefiller_ = std::make_unique<Prefiller>(weights_, ablation_, prefill_chunk_, stream_);
-    chunk_tokens_ = DeviceBuffer(std::size_t(prefill_chunk_) * sizeof(std::int32_t));
-    prefill_logits_ = DeviceBuffer(std::size_t(UNPADDED_VOCAB) * sizeof(float));
-    sampled_dev_ = DeviceBuffer(std::size_t(options_.max_batch) * sizeof(std::int32_t));
-
-    // Pin model identity digest over config.json + optional ablation file (fail-closed across models/ablations).
-    std::array<std::uint8_t, 64> id_buf{};
-    const auto cfg_h = sha256_file_or_zero(options_.model_dir / "config.json");
-    std::memcpy(id_buf.data(), cfg_h.data(), 32);
-    if (!options_.ablation.empty()) {
-      const auto abl_h = sha256_file_or_zero(options_.ablation);
-      std::memcpy(id_buf.data() + 32, abl_h.data(), 32);
-    }
-    model_sha256_ = sha256_bytes(id_buf.data(), id_buf.size());
 
     const std::optional<std::size_t> vram_limit_bytes =
         options_.vram_limit_mb > 0 ? std::optional<std::size_t>(std::size_t(options_.vram_limit_mb) << 20)
@@ -2301,6 +2324,32 @@ class BatchGenerator final : public Generator {
                                  std::to_string(*vram_limit_bytes >> 20) + " MiB)");
       }
     };
+    enforce_lease_now("weights");
+
+    {
+      const std::size_t est_prefill = estimate_prefiller_peak_bytes(prefill_chunk_, UNPADDED_VOCAB, options_.max_batch);
+      const VramLeaseCheck chk = check_vram_lease_fit(remaining_lease_opt(), est_prefill);
+      if (!chk.ok) {
+        throw std::runtime_error("BatchGenerator: VRAM lease cap exceeded before Prefiller allocation (peak_need=" +
+                                 std::to_string(chk.planned_bytes >> 20) + " MiB, remaining=" +
+                                 std::to_string(chk.remaining_bytes >> 20) + " MiB)");
+      }
+    }
+    if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, stream_);
+    prefiller_ = std::make_unique<Prefiller>(weights_, ablation_, prefill_chunk_, stream_);
+    chunk_tokens_ = DeviceBuffer(std::size_t(prefill_chunk_) * sizeof(std::int32_t));
+    prefill_logits_ = DeviceBuffer(std::size_t(UNPADDED_VOCAB) * sizeof(float));
+    sampled_dev_ = DeviceBuffer(std::size_t(options_.max_batch) * sizeof(std::int32_t));
+
+    // Pin model identity digest over config.json + optional ablation file (fail-closed across models/ablations).
+    std::array<std::uint8_t, 64> id_buf{};
+    const auto cfg_h = sha256_file_or_zero(options_.model_dir / "config.json");
+    std::memcpy(id_buf.data(), cfg_h.data(), 32);
+    if (!options_.ablation.empty()) {
+      const auto abl_h = sha256_file_or_zero(options_.ablation);
+      std::memcpy(id_buf.data() + 32, abl_h.data(), 32);
+    }
+    model_sha256_ = sha256_bytes(id_buf.data(), id_buf.size());
     enforce_lease_now("weights+prefiller");
 
     // Size and allocate BatchDrafter BEFORE BatchStatePool page reservation so VRAM headroom is exact.
@@ -2343,27 +2392,30 @@ class BatchGenerator final : public Generator {
       }
     }
     decoder_ = std::make_unique<BatchDecoder>(weights_, ablation_, pool_, options_.max_batch, max_verify_width_,
-                                              drafter_ != nullptr);
+                                              drafter_ != nullptr, vram_limit_bytes, free_at_entry_);
     decoder_->capture_buckets(stream_);
     CUDA_CHECK(cudaEventCreate(&restore_ev_start_));
     CUDA_CHECK(cudaEventCreate(&restore_ev_stop_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     enforce_lease_now("BatchDecoder+graphs");
 
-    // Size private recurrent/tail/logits VRAM budget for prefix checkpoints (never starves active pool or exceeds lease).
+    // Size private recurrent/tail/logits VRAM budget for prefix checkpoints while reserving headroom for lazy
+    // verify CUDA graphs so neither runtime checkpoints nor lazy graph capture can ever exceed the lease.
+    const std::size_t lazy_graph_reserve = std::size_t(drafter_ ? 256 : 64) << 20;
     if (!options_.prefix_cache || options_.park_mb == 0) {
       prefix_cache_.set_vram_budget(0);
     } else if (options_.park_mb > 0) {
       const std::size_t cap = std::size_t(options_.park_mb) << 20;
-      const VramLeaseCheck chk = check_vram_lease_fit(remaining_lease_opt(), cap);
+      const VramLeaseCheck chk = check_vram_lease_fit(remaining_lease_opt(), cap + lazy_graph_reserve);
       if (!chk.ok) {
         throw std::runtime_error("BatchGenerator: explicit --park-mb=" + std::to_string(options_.park_mb) +
-                                 " exceeds remaining VRAM lease (" + std::to_string(chk.remaining_bytes >> 20) + " MiB)");
+                                 " + lazy graph reserve exceeds remaining VRAM lease (" +
+                                 std::to_string(chk.remaining_bytes >> 20) + " MiB)");
       }
       prefix_cache_.set_vram_budget(cap);
     } else {
       const std::size_t free_b = effective_free_bytes();
-      const std::size_t reserve = std::min<std::size_t>(std::size_t(1024) << 20, free_b / 4);
+      const std::size_t reserve = std::max(lazy_graph_reserve, std::min<std::size_t>(std::size_t(1024) << 20, free_b / 4));
       const std::size_t avail = free_b > reserve ? free_b - reserve : 0;
       const std::size_t auto_cap = std::min<std::size_t>(std::size_t(2048) << 20, avail / 2);
       prefix_cache_.set_vram_budget(auto_cap);

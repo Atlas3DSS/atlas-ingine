@@ -4,10 +4,12 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <deque>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ingine::model {
@@ -52,6 +54,86 @@ struct VramLeaseCheck {
 inline VramLeaseCheck check_vram_lease_fit(std::optional<std::size_t> remaining_budget, std::size_t planned_bytes) {
   if (!remaining_budget.has_value()) return {true, planned_bytes, 0};
   return {planned_bytes <= *remaining_budget, planned_bytes, *remaining_budget};
+}
+
+// Conservative preflight peak VRAM bound for load_weights() BEFORE any GPU tensor is allocated.
+// Accounts for all non-vision checkpoint tensors plus transient BF16->FP8 quantization coexistence (unembed + layer)
+// and CUDA runtime/allocator overhead.
+inline std::size_t estimate_weights_peak_bytes(std::size_t safetensors_non_vision_bytes, bool dense_fp8, int vocab,
+                                               int hidden) {
+  const std::size_t transient_fp8 =
+      dense_fp8 ? (std::size_t(vocab) * std::size_t(hidden) * 2 + (std::size_t(128) << 20)) : 0;
+  const std::size_t runtime_slack = std::size_t(256) << 20;
+  return safetensors_non_vision_bytes + transient_fp8 + runtime_slack;
+}
+
+// Conservative preflight peak VRAM bound for Prefiller + auxiliary prefill buffers + cuBLASLt workspace.
+inline std::size_t estimate_prefiller_peak_bytes(int prefill_chunk, int vocab, int max_batch) {
+  const std::size_t C = std::size_t(std::max(1, prefill_chunk));
+  const std::size_t arena_and_persist = C * std::size_t(280) * 1024 + (std::size_t(64) << 20);
+  const std::size_t aux = C * sizeof(int) + std::size_t(vocab) * sizeof(float) +
+                          std::size_t(std::max(1, max_batch)) * sizeof(int);
+  const std::size_t cublas_slack = std::size_t(64) << 20;
+  return arena_and_persist + aux + cublas_slack;
+}
+
+struct DrafterVramPeakEstimate {
+  std::size_t load_peak_bytes = 0;   // peak while raw mtp.safetensors + cat + persistent MTP weights + fold_head coexist
+  std::size_t steady_bytes = 0;      // steady-state resident MTP weights + shortlist + KV rings + scratch + accept bufs
+  std::size_t peak_bytes = 0;        // max(load_peak_bytes, steady_bytes)
+};
+
+// Conservative preflight peak VRAM bound for BatchDrafter BEFORE allocating the raw mtp.safetensors buffer.
+// Matches BatchDrafter::load() and BatchDrafter::BatchDrafter() exact buffer geometry.
+inline DrafterVramPeakEstimate estimate_drafter_peak_bytes(std::size_t mtp_raw_bytes, int inter, int max_batch,
+                                                           int draft_ctx, int vocab, int shortlist_rows,
+                                                           int max_verify_width, bool fp8_head) {
+  constexpr std::size_t kH = 2048;
+  constexpr std::size_t kRank = 256;
+  constexpr std::size_t kGamma = 7;
+  constexpr std::size_t kBlock = 8;
+  constexpr std::size_t kKvDim = 512;
+  constexpr std::size_t kQDim = 2048;
+  constexpr std::size_t kQkvRows = kQDim + 2 * kKvDim;
+  constexpr std::size_t kLocalSlots = 2048;
+  constexpr std::size_t kGlobalSlotBytes = 1024;  // FP8 KV_DIM + scale/metadata
+  constexpr std::size_t kMaxSlotExtra = 1024;
+  constexpr std::size_t kShortChunk = 2048;
+  const std::size_t B = std::size_t(std::max(1, max_batch));
+  const std::size_t I = std::size_t(std::max(1, inter));
+  const std::size_t V = std::size_t(std::max(1, vocab));
+  const std::size_t W = std::size_t(std::max(1, max_verify_width));
+  const std::size_t ctx = std::size_t(std::max(16, draft_ctx));
+  const std::size_t short_K = std::size_t(std::max(0, shortlist_rows)) + 256;
+
+  // During BatchDrafter::load(), `raw` (mtp_raw_bytes) and `cat` (2 * I * H * 2) coexist with all persisted
+  // MTP weights (<= mtp_raw_bytes + 16 MiB for wkv_all FP8) plus fold_w_ and fold_b_.
+  const std::size_t cat_bytes = 2 * I * kH * 2;
+  const std::size_t persistent_mtp_upper = mtp_raw_bytes + (std::size_t(16) << 20);
+  const std::size_t fold_head_bytes = V * (kRank + 1) * 2;
+  const std::size_t slack = std::size_t(64) << 20;
+  const std::size_t load_peak = mtp_raw_bytes + cat_bytes + persistent_mtp_upper + fold_head_bytes + slack;
+
+  // Steady-state after `raw` and `cat` are freed:
+  const std::size_t shortlist_bytes = short_K * (fp8_head ? (kH + 4) : (2 * kH)) + short_K * 8;
+  const std::size_t local_kv = B * 4 * kLocalSlots * kKvDim * 2 + B * 2 * kLocalSlots * 4;
+  const std::size_t global_kv = B * 2 * ctx * kGlobalSlotBytes;
+  const std::size_t max_rows = B * kBlock;
+  const std::size_t max_gamma = B * kGamma;
+  const std::size_t max_commit = B * W;
+  const std::size_t act_scratch =
+      max_rows * (2 * kH + 2 * kQDim + I + kQkvRows + kH + 2 * I) * 2 +
+      max_gamma * (kH + kShortChunk) * 2 +
+      max_gamma * (short_K + kMaxSlotExtra) * 4 +
+      std::max({kQkvRows * kH, 2 * I * kH, kH * kQDim, kH * I, kShortChunk * kH}) * 2 +
+      max_commit * (3 * kH + 2 * kKvDim) * 2 +
+      (std::size_t(32) << 20);  // attn_ws + topk_ws + commit_piece + candidates
+  const std::size_t accept_bufs = (kBlock + kGamma + 1) * V * 4 + (std::size_t(16) << 20);
+  const std::size_t steady =
+      persistent_mtp_upper + fold_head_bytes + shortlist_bytes + local_kv + global_kv + act_scratch + accept_bufs +
+      slack;
+
+  return {load_peak, steady, std::max(load_peak, steady)};
 }
 
 // Plans per-slot active verify widths w_cap[b] and shared launch bucket W_batch.
@@ -154,6 +236,7 @@ struct StaggeredBenchmarkState {
   int cohort1_emitted = 0;
   int cohort1_emitted_at_join = 0;
   int cohort1_active_at_join = 0;
+  int cohort1_parked_steps = 0;
   int join_round = -1;
   double join_elapsed_ms = 0.0;
 
@@ -175,6 +258,14 @@ struct StaggeredBenchmarkState {
   }
 
   void init_external_trace(std::vector<double> trace_ms) {
+    for (std::size_t i = 0; i < trace_ms.size(); ++i) {
+      if (!std::isfinite(trace_ms[i]) || trace_ms[i] < 0.0) {
+        throw std::invalid_argument("arrival trace timestamps must be finite and >= 0");
+      }
+      if (i > 0 && trace_ms[i] < trace_ms[i - 1]) {
+        throw std::invalid_argument("arrival trace timestamps must be nondecreasing");
+      }
+    }
     *this = StaggeredBenchmarkState{};
     use_external_trace = true;
     arrival_ms = std::move(trace_ms);
@@ -187,13 +278,25 @@ struct StaggeredBenchmarkState {
     offer_arrivals_at_ms(0.0, 0, 0);
   }
 
+  // Returns true when cohort-1 lane `req_idx` has already reached `join_tokens_per_req` and must be parked
+  // until the rest of cohort 1 catches up so heterogeneous acceptance widths NEVER overshoot the join milestone.
+  // Never parks while cohort-1 requests remain deferred in `pending` (admitted < cohort1_size) to prevent deadlock.
+  bool is_parked_at_milestone(int req_idx, int generated) const {
+    if (use_external_trace || cohort2_offered) return false;
+    if (!pending.empty() || admitted < cohort1_size) return false;
+    return req_idx < cohort1_size && generated >= join_tokens_per_req;
+  }
+
+  bool should_step_lane(int req_idx, int generated) const { return !is_parked_at_milestone(req_idx, generated); }
+
   // Per-step emission cap for slot `req_idx` (currently at `generated` tokens).
   // In exact emission-point mode, caps cohort-1 slots before join so they NEVER overshoot `join_tokens_per_req`.
-  // Returns 0 when unconstrained.
+  // Parked lanes must be excluded from stepping via `should_step_lane()`. Returns 0 when unconstrained.
   int step_max_tokens_for(int req_idx, int generated) const {
     if (use_external_trace || cohort2_offered) return 0;
     if (req_idx >= cohort1_size) return 0;
-    if (generated >= join_tokens_per_req) return 1;  // shouldn't happen once cohort 2 triggers
+    if (!pending.empty() || admitted < cohort1_size) return 0;
+    if (generated >= join_tokens_per_req) return 0;
     return join_tokens_per_req - generated;
   }
 

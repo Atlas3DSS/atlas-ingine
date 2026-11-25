@@ -616,20 +616,21 @@ void test_staggered_milestone_and_accounting() {
     CHECK(check_vram_lease_fit(std::nullopt, 1ull << 40).ok);
   }
 
-  // 2. Compare 32-token cap under 1 tok/round (plain) vs 4 tok/round (spec):
-  //    Using step_max_tokens_for(), BOTH plain and spec MUST hit cohort1_emitted_at_join == 32 EXACTLY (ZERO overshoot!)
-  //    while ALL 4 cohort-1 requests remain active mid-generation!
-  auto run_sim = [](int tok_per_round, bool first_eos_on_req0, int max_active_cap, bool inject_zero_result_req1) {
-    const int C = 8;
-    const int tokens = 32;
+  // 2. Compare homogeneous plain [1,1,1,1], uniform spec [4,4,4,4], and heterogeneous spec [4,1,1,1]:
+  //    By parking completed-at-milestone cohort-1 lanes until the cohort catches up, ALL THREE hit the EXACT
+  //    join milestone (32/32 for join=8 and 128/128 for join=32) with ZERO overshoot!
+  auto run_sim = [](std::vector<int> c1_widths, int default_w, int tokens, int join_per_req,
+                    bool first_eos_on_req0, int max_active_cap, bool inject_zero_result_req1,
+                    std::vector<int>* c1_at_join_out = nullptr) {
     StaggeredBenchmarkState stg;
-    stg.init(C, tokens, /*join_per_req=*/8);  // 4 cohort-1 reqs * 8 = 32 emitted tokens EXACT!
+    stg.init(8, tokens, join_per_req);
     struct Active {
       int req = 0;
       int gen = 0;
     };
     std::vector<Active> live;
     int round = 0;
+    bool recorded_c1 = false;
     auto c1_counts = [&]() -> std::pair<int, int> {
       int act = 0, below = 0;
       for (const auto& a : live) {
@@ -662,14 +663,28 @@ void test_staggered_milestone_and_accounting() {
     try_admit();
     while (!live.empty() || !stg.pending.empty() || stg.has_unoffered()) {
       const auto [act, below] = c1_counts();
+      const bool was_offered = stg.cohort2_offered;
       stg.maybe_offer_cohort2(round, act, below);
+      if (!was_offered && stg.cohort2_offered && c1_at_join_out && !recorded_c1) {
+        recorded_c1 = true;
+        c1_at_join_out->assign(static_cast<std::size_t>(stg.cohort1_size), 0);
+        for (const auto& a : live) {
+          if (a.req < stg.cohort1_size) (*c1_at_join_out)[std::size_t(a.req)] = a.gen;
+        }
+      }
       try_admit();
       if (live.empty()) continue;
-      ++round;
+      bool any_stepped = false;
       std::vector<Active> kept;
       for (auto& a : live) {
+        if (!stg.should_step_lane(a.req, a.gen)) {
+          ++stg.cohort1_parked_steps;
+          kept.push_back(a);
+          continue;
+        }
+        any_stepped = true;
         const int step_cap = stg.step_max_tokens_for(a.req, a.gen);
-        int emit = tok_per_round;
+        int emit = (a.req < int(c1_widths.size())) ? c1_widths[std::size_t(a.req)] : default_w;
         if (step_cap > 0) emit = std::min(emit, step_cap);
         if (inject_zero_result_req1 && a.req == 1 && a.gen == 1) emit = 0;
         for (int k = 0; k < emit && a.gen < tokens; ++k) {
@@ -686,40 +701,51 @@ void test_staggered_milestone_and_accounting() {
           kept.push_back(a);
         }
       }
+      if (any_stepped) ++round;
       live = std::move(kept);
     }
     return stg;
   };
 
-  const auto plain = run_sim(1, false, 8, false);
-  const auto spec = run_sim(4, false, 8, false);
-  CHECK(plain.accounting_consistent());
-  CHECK(spec.accounting_consistent());
-  CHECK(plain.offered == 8 && plain.admitted == 8 && plain.completed == 8 && plain.aborted_zero_result == 0 && plain.dropped == 0);
-  CHECK(spec.offered == 8 && spec.admitted == 8 && spec.completed == 8 && spec.aborted_zero_result == 0 && spec.dropped == 0);
-  // EXACT zero-overshoot match across plain and spec: 32 == 32, both with 4 active cohort-1 slots!
-  CHECK(plain.cohort1_active_at_join == 4);
-  CHECK(spec.cohort1_active_at_join == 4);
-  CHECK(plain.cohort1_emitted_at_join == 32);
-  CHECK(spec.cohort1_emitted_at_join == 32);
-  CHECK(plain.join_round == 7);
-  CHECK(spec.join_round == 2);
+  {
+    std::vector<int> c1_p8, c1_h8, c1_p32, c1_h32;
+    const auto plain8 = run_sim({1, 1, 1, 1}, 1, 32, 8, false, 8, false, &c1_p8);
+    const auto spec8 = run_sim({4, 4, 4, 4}, 4, 32, 8, false, 8, false);
+    const auto het8 = run_sim({4, 1, 1, 1}, 4, 32, 8, false, 8, false, &c1_h8);
+    CHECK(plain8.accounting_consistent() && spec8.accounting_consistent() && het8.accounting_consistent());
+    CHECK(plain8.cohort1_emitted_at_join == 32 && spec8.cohort1_emitted_at_join == 32 && het8.cohort1_emitted_at_join == 32);
+    CHECK(c1_p8 == std::vector<int>({8, 8, 8, 8}) && c1_h8 == std::vector<int>({8, 8, 8, 8}));
+    CHECK(het8.cohort1_parked_steps > 0);
+
+    const auto plain32 = run_sim({1, 1, 1, 1}, 1, 128, 32, false, 8, false, &c1_p32);
+    const auto het32 = run_sim({4, 1, 1, 1}, 4, 128, 32, false, 8, false, &c1_h32);
+    CHECK(plain32.accounting_consistent() && het32.accounting_consistent());
+    CHECK(plain32.cohort1_emitted_at_join == 128 && het32.cohort1_emitted_at_join == 128);
+    CHECK(c1_p32 == std::vector<int>({32, 32, 32, 32}) && c1_h32 == std::vector<int>({32, 32, 32, 32}));
+    CHECK(het32.cohort1_parked_steps > 0);
+  }
 
   // First-token EOS on req 0 + tight capacity cap (4) forcing deferral
-  const auto constrained = run_sim(4, true, 4, false);
+  const auto constrained = run_sim({4, 1, 1, 1}, 4, 32, 8, true, 4, false);
   CHECK(constrained.accounting_consistent());
   CHECK(constrained.offered == 8 && constrained.admitted == 8 && constrained.completed == 8 && constrained.dropped == 0);
   CHECK(constrained.eos_first_token == 1);
   CHECK(constrained.deferred_attempts > 0);
 
+  // Deferred cohort-1 admissions (max_batch=2 < cohort1_size=4) with heterogeneous widths: MUST NOT deadlock!
+  const auto deferred_c1 = run_sim({4, 1, 1, 1}, 4, 32, 8, false, 2, false);
+  CHECK(deferred_c1.accounting_consistent());
+  CHECK(deferred_c1.offered == 8 && deferred_c1.admitted == 8 && deferred_c1.completed == 8 && deferred_c1.dropped == 0);
+  CHECK(deferred_c1.deferred_attempts > 0);
+
   // Zero-result step below budget: MUST be classified as aborted_zero_result=1, completed=7, max_token_stopped=7!
-  const auto zero_step = run_sim(4, false, 8, true);
+  const auto zero_step = run_sim({4, 4, 4, 4}, 4, 32, 8, false, 8, true);
   CHECK(zero_step.accounting_consistent());
   CHECK(zero_step.offered == 8 && zero_step.admitted == 8);
   CHECK(zero_step.completed == 7 && zero_step.max_token_stopped == 7);
   CHECK(zero_step.aborted_zero_result == 1);
 
-  // External arrival trace mode: frozen timestamps replayed identically
+  // External arrival trace mode: frozen timestamps replayed identically + rejects negative/decreasing/NaN traces
   {
     StaggeredBenchmarkState tr;
     tr.init_external_trace({0.0, 0.0, 50.0, 50.0});
@@ -728,6 +754,36 @@ void test_staggered_milestone_and_accounting() {
     CHECK(tr.offered == 2 && tr.has_unoffered());
     tr.maybe_offer_cohort2(2, 2, 2, 50.0);
     CHECK(tr.offered == 4 && !tr.has_unoffered() && tr.join_round == 2);
+
+    bool threw_neg = false, threw_dec = false, threw_nan = false;
+    try { tr.init_external_trace({-1.0, 0.0}); } catch (const std::invalid_argument&) { threw_neg = true; }
+    try { tr.init_external_trace({10.0, 5.0}); } catch (const std::invalid_argument&) { threw_dec = true; }
+    try { tr.init_external_trace({0.0, std::numeric_limits<double>::quiet_NaN()}); } catch (const std::invalid_argument&) { threw_nan = true; }
+    CHECK(threw_neg && threw_dec && threw_nan);
+  }
+
+  // Peak VRAM preflight checks (accounts for raw 635,795,744 B mtp.safetensors transient + persistent weights + fold_head!)
+  {
+    constexpr std::size_t kMtpRawBytes = 635795744ull;
+    const auto d_est = ingine::model::estimate_drafter_peak_bytes(
+        kMtpRawBytes, 8192, 12, 2048, 200064, 16384, 8, true);
+    CHECK(d_est.load_peak_bytes > kMtpRawBytes);
+    CHECK(d_est.peak_bytes >= d_est.load_peak_bytes && d_est.peak_bytes >= d_est.steady_bytes);
+    // 400 MiB remaining MUST fail closed BEFORE allocating the 606.34 MiB raw buffer!
+    CHECK(!ingine::model::check_vram_lease_fit(std::size_t(400) << 20, d_est.peak_bytes).ok);
+    // Near-cap rejection: 1 byte below peak_bytes fails, exact peak_bytes passes!
+    CHECK(!ingine::model::check_vram_lease_fit(d_est.peak_bytes - 1, d_est.peak_bytes).ok);
+    CHECK(ingine::model::check_vram_lease_fit(d_est.peak_bytes, d_est.peak_bytes).ok);
+
+    // Weights & Prefiller preflight peak checks (near-cap rejection before load_weights / Prefiller!)
+    const std::size_t w_est = ingine::model::estimate_weights_peak_bytes(19526019168ull, true, 200064, 2048);
+    CHECK(w_est > 19526019168ull);
+    CHECK(!ingine::model::check_vram_lease_fit(w_est - 1, w_est).ok);
+    CHECK(ingine::model::check_vram_lease_fit(std::size_t(28) << 30, w_est).ok);
+
+    const std::size_t p_est = ingine::model::estimate_prefiller_peak_bytes(512, 200064, 12);
+    CHECK(p_est > (std::size_t(200) << 20));
+    CHECK(!ingine::model::check_vram_lease_fit(p_est - 1, p_est).ok);
   }
 }
 
@@ -795,6 +851,82 @@ void test_philox_sampled_and_cross_gear_controls() {
     BatchSpecSlotTrace bad_next = tr;
     bad_next.next_token = (bad_next.next_token + 1) % V;
     CHECK(!sv::validate_sampled_trace(bad_next, V).ok);
+
+    // Invalid control A: all-zero target tensor + zero residual + token 0 -> MUST FAIL!
+    {
+      BatchSpecSlotTrace zall = tr;
+      zall.target_probs.assign(std::size_t(zall.w_cap) * V, 0.0f);
+      zall.accepted = 0;
+      zall.residual_probs.assign(V, 0.0f);
+      zall.next_token = 0;
+      const auto rz = sv::validate_sampled_trace(zall, V);
+      CHECK(!rz.ok);
+      CHECK(rz.reason.find("mass out of unit tolerance") != std::string::npos);
+    }
+
+    // Invalid control B: valid first target row + all-zero bonus row + zero residual + token 0 -> MUST FAIL!
+    {
+      BatchSpecSlotTrace zbonus = tr;
+      for (int v = 0; v < V; ++v) zbonus.target_probs[std::size_t(V + v)] = 0.0f;
+      zbonus.accepted = 1;
+      zbonus.residual_probs.assign(V, 0.0f);
+      zbonus.next_token = 0;
+      const auto rzb = sv::validate_sampled_trace(zbonus, V);
+      CHECK(!rzb.ok);
+      CHECK(rzb.reason.find("mass out of unit tolerance") != std::string::npos);
+    }
+
+    // Invalid control C: negative target probability -> MUST FAIL!
+    {
+      BatchSpecSlotTrace negp = tr;
+      negp.target_probs[0] = -0.1f;
+      negp.target_probs[1] = 0.1f;
+      CHECK(!sv::validate_sampled_trace(negp, V).ok);
+    }
+
+    // Valid control D: normal unnormalized rejection residual max(p - q, 0) with sum < 1.0 -> MUST PASS!
+    {
+      BatchSpecSlotTrace rej = tr;
+      // Pick target row 0 with p(420)=0 (forces reject at r=0), p(100)=0.6, p(200)=0.4 -> residual sum < 1.0!
+      for (int v = 0; v < V; ++v) rej.target_probs[std::size_t(v)] = 0.0f;
+      rej.target_probs[100] = 0.6f;
+      rej.target_probs[200] = 0.4f;
+      rej.accepted = 0;
+      rej.residual_probs.assign(V, 0.0f);
+      const float q_unif = 1.0f / float(sv::kCandidates);
+      rej.residual_probs[100] = std::max(0.6f - q_unif, 0.0f);
+      rej.residual_probs[200] = std::max(0.4f - q_unif, 0.0f);
+      rej.next_token = sv::head_sample_from_probs(rej.residual_probs, rej.accept_rng_seed, rej.accept_rng_counter_resid);
+      rej.commit = 1;
+      CHECK(sv::validate_sampled_trace(rej, V).ok);
+    }
+
+    // Valid control E: zero-residual fallback (p == q identically on rejected row -> max(p-q, 0)==0 everywhere,
+    // falls back to normalized target row p with unit mass) -> MUST PASS!
+    {
+      BatchSpecSlotTrace fb = tr;
+      // Make target row 0 equal q identically (1/1024 on all V=1024) AND pick uniform counter where u >= 1? No,
+      // wait: u in [0,1) so u * q(420) < p(420) when p == q. To force reject AND max(p - q, 0) == 0 everywhere,
+      // make q(k) == 1/1024 for all k and p(420) = 0, p(other) <= 1/1024? No, sum(p)=1 & sum(q)=1 implies
+      // if p != q there is some x with p(x) > q(x). The real fallback occurs from FP rounding when p == q
+      // or when p(d) is slightly below u*q(d) while max(p-q, 0) flushes to 0!
+      // Construct exact case: u = 0.999... or p(x) = q(x) = 1/1024 and set accept_rng_counter_u so u == 0? No:
+      // Find a counter where head_uniform >= 0.99? Even simpler: set q slightly higher on non-420? No, sum(q)=1.
+      // With q_unif = 1/1024 and target_probs[k] = 1/1024 - eps (so sum = 1 - 1024*eps within kProbRowMassTol = 1e-3!),
+      // p(x) <= q(x) for ALL x -> max(p - q, 0) == 0 everywhere! And pick counter_u with u > p(420)/q(420) -> rejected!
+      const float q_unif = 1.0f / float(sv::kCandidates);
+      const float p_slightly_below = q_unif * 0.9995f;  // sum = 0.9995 (within 1e-3 tolerance!), p(x) < q(x) for all x!
+      std::uint64_t high_u_ctr = 0;
+      while (sv::head_uniform(fb.accept_rng_seed, high_u_ctr, 0u) < 0.9996f) ++high_u_ctr;
+      fb.accept_rng_counter_u = high_u_ctr;
+      fb.uniforms = {sv::head_uniform(fb.accept_rng_seed, fb.accept_rng_counter_u, 0u)};
+      for (int v = 0; v < V; ++v) fb.target_probs[std::size_t(v)] = p_slightly_below;
+      fb.accepted = 0;
+      fb.residual_probs.assign(fb.target_probs.begin(), fb.target_probs.begin() + V);
+      fb.next_token = sv::head_sample_from_probs(fb.residual_probs, fb.accept_rng_seed, fb.accept_rng_counter_resid);
+      fb.commit = 1;
+      CHECK(sv::validate_sampled_trace(fb, V).ok);
+    }
   }
 
   // 2. Cross-gear divergence binding controls:

@@ -3,6 +3,7 @@
 #include "core/act.h"
 #include "core/device.h"
 #include "core/safetensors.h"
+#include "ingine/batch_spec_plan.h"
 #include "kernels/draft/shortlist.h"
 #include "kernels/prefill/prefill.h"
 #include "model/model_kernels.h"
@@ -53,17 +54,6 @@ int choose_draft_ctx(int max_batch, int max_ctx, std::optional<std::size_t> vram
   return std::max(std::min(max_ctx, 1024), std::min(max_ctx, cap));
 }
 
-std::size_t estimate_drafter_bytes(int max_batch, int draft_ctx, int vocab, int shortlist_rows) {
-  // Conservative lower-bound estimate before allocating: weights/folded head + per-slot KV rings + acceptance scratch.
-  const std::size_t folded_head = std::size_t(vocab) * (kd::RANK + 1) * sizeof(ActT);
-  const std::size_t shortlist_w = std::size_t(shortlist_rows + 256) * H;
-  const std::size_t local_kv = std::size_t(max_batch) * 4 * LOCAL_SLOTS * kd::KV_DIM * sizeof(ActT);
-  const std::size_t global_kv = std::size_t(max_batch) * 2 * std::size_t(draft_ctx) * GLOBAL_SLOT_BYTES;
-  const std::size_t accept_bufs = std::size_t(kd::BLOCK + kd::GAMMA + 1) * std::size_t(vocab) * sizeof(float);
-  const std::size_t base_buf = std::size_t(max_batch) * kd::GAMMA * std::size_t(shortlist_rows + kd::kMaxSlotExtra) * sizeof(float);
-  return folded_head + shortlist_w + local_kv + global_kv + accept_bufs + base_buf;
-}
-
 }  // namespace
 
 void* BatchDrafter::alloc(std::size_t bytes) {
@@ -85,11 +75,20 @@ BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights
   if (max_batch < 1) throw std::invalid_argument("BatchDrafter: max_batch must be >= 1");
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("BatchDrafter: max_ctx must hold two blocks");
   if (vram_budget_bytes.has_value()) {
-    const std::size_t est = estimate_drafter_bytes(max_batch, ctx_, w.unembed.rows(), shortlist_rows);
-    if (est > *vram_budget_bytes) {
-      throw std::runtime_error("BatchDrafter: VRAM lease cap exceeded before allocation (need >= " +
-                               std::to_string(est >> 20) + " MiB, remaining " +
-                               std::to_string(*vram_budget_bytes >> 20) + " MiB)");
+    // Header-only inspection (0 GPU bytes) to account for BOTH the transient raw mtp.safetensors upload buffer
+    // (635.8 MiB) + cat + persistent MTP weights + fold_head peak AND steady-state KV/scratch/accept buffers!
+    SafetensorsFile mtp_hdr(model_dir / "mtp.safetensors");
+    const std::size_t mtp_raw_bytes = std::size_t(mtp_hdr.file_size() - mtp_hdr.data_offset());
+    const int inter_hdr = int(mtp_hdr.at("layers.0.mlp.gate_proj.weight").shape.at(0));
+    const DrafterVramPeakEstimate est = estimate_drafter_peak_bytes(
+        mtp_raw_bytes, inter_hdr, max_batch, ctx_, w.unembed.rows(), shortlist_rows, max_verify_width, w.unembed.fp8());
+    const VramLeaseCheck chk = check_vram_lease_fit(vram_budget_bytes, est.peak_bytes);
+    if (!chk.ok) {
+      throw std::runtime_error(
+          "BatchDrafter: VRAM lease cap exceeded before allocation (peak_need=" +
+          std::to_string(est.peak_bytes >> 20) + " MiB [load_peak=" + std::to_string(est.load_peak_bytes >> 20) +
+          " MiB, steady=" + std::to_string(est.steady_bytes >> 20) + " MiB], remaining=" +
+          std::to_string(chk.remaining_bytes >> 20) + " MiB)");
     }
   }
   head_ = {w.unembed.w.data, w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,

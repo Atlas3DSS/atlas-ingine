@@ -620,19 +620,36 @@ int main(int argc, char** argv) {
             if (stg.pending.empty() && !stg.has_unoffered()) break;
             continue;
           }
-          steps.resize(live.size());
-          results.resize(live.size());
+          std::vector<std::size_t> step_indices;
+          step_indices.reserve(live.size());
+          steps.clear();
           for (std::size_t i = 0; i < live.size(); ++i) {
+            if (!stg.should_step_lane(live[i].req_idx, live[i].generated)) {
+              ++stg.cohort1_parked_steps;
+              continue;
+            }
             const int cap = stg.step_max_tokens_for(live[i].req_idx, live[i].generated);
-            steps[i] = {live[i].slot, live[i].last_tok, cap};
+            step_indices.push_back(i);
+            steps.push_back({live[i].slot, live[i].last_tok, cap});
           }
+          if (steps.empty()) {
+            // All live cohort-1 lanes are parked at the milestone; next loop iteration offers cohort 2 and unparks.
+            continue;
+          }
+          results.resize(steps.size());
           gen->step_slots_multi(steps, results);
           vram.sample();
           ++step_n;
+          std::vector<int> step_pos(live.size(), -1);
+          for (std::size_t si = 0; si < step_indices.size(); ++si) step_pos[step_indices[si]] = int(si);
           std::vector<Active> kept;
           kept.reserve(live.size());
           for (std::size_t i = 0; i < live.size(); ++i) {
-            const auto& res = results[i];
+            if (step_pos[i] < 0) {
+              kept.push_back(live[i]);
+              continue;
+            }
+            const auto& res = results[std::size_t(step_pos[i])];
             total_spec_rounds += res.spec_rounds;
             total_spec_accepted += res.spec_accepted;
             bool done = false;
@@ -677,19 +694,21 @@ int main(int argc, char** argv) {
         }
         staggered_aborted_zero = stg.aborted_zero_result;
         std::printf(
-            "staggered (C=%d, policy=%s, join_milestone=%d tok, cohort1@join=%d tok/%d active, round=%d): "
+            "staggered (C=%d, policy=%s, join_milestone=%d tok, cohort1@join=%d tok/%d active, parked_steps=%d, round=%d): "
             "offered=%d admitted=%d completed=%d aborted_zero=%d dropped=%d deferred=%d eos0=%d | %d tok in %.2fs = %.1f tok/s "
             "(spec_rounds=%d, spec_accepted=%d)\n",
-            C, stg.use_external_trace ? "external_arrival_trace" : "exact_cohort1_emission_point",
-            stg.join_milestone_tokens, stg.cohort1_emitted_at_join, stg.cohort1_active_at_join, stg.join_round,
+            C, stg.use_external_trace ? "external_arrival_trace" : "exact_cohort1_emission_point_parked",
+            stg.join_milestone_tokens, stg.cohort1_emitted_at_join, stg.cohort1_active_at_join,
+            stg.cohort1_parked_steps, stg.join_round,
             stg.offered, stg.admitted, stg.completed, stg.aborted_zero_result, stg.dropped, stg.deferred_attempts,
             stg.eos_first_token, total_gen, wall_s, eff_tok_s, total_spec_rounds, total_spec_accepted);
         report["staggered"] = {{"concurrency", C},
                                {"join_policy",
-                                stg.use_external_trace ? "external_arrival_trace" : "exact_cohort1_emission_point"},
+                                stg.use_external_trace ? "external_arrival_trace" : "exact_cohort1_emission_point_parked"},
                                {"join_milestone_tokens", stg.join_milestone_tokens},
                                {"cohort1_emitted_at_join", stg.cohort1_emitted_at_join},
                                {"cohort1_active_at_join", stg.cohort1_active_at_join},
+                               {"cohort1_parked_steps", stg.cohort1_parked_steps},
                                {"join_round", stg.join_round},
                                {"join_elapsed_ms", stg.join_elapsed_ms},
                                {"offered", stg.offered},
