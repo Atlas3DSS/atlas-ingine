@@ -9,6 +9,13 @@ ingine_add_test(NAME model_reuse SOURCES test_reuse.cpp LIBS ingine_model GPU MO
 # Stage 3 (#826): verified root-prefix checkpoint, forks, exact-root, byte-capped pinned host-RAM parking,
 # LRU eviction, memory-pressure fallback, and restore-vs-recompute latency crossover
 ingine_add_test(NAME model_cache_stage3 SOURCES test_cache_stage3.cpp LIBS ingine_model ingine_text GPU MODEL TIMEOUT 1200)
+if(UNIX AND NOT APPLE)
+  # Test-only deterministic synchronization wrappers for Suite 2h-consumed-weight-toctou (mutates private embed_norm
+  # immediately after SafetensorsModel::read returns its payload and records actual GPU norm[0] + content_sha256).
+  target_link_options(model_cache_stage3 PRIVATE
+    -Wl,--wrap=_ZNK6ingine16SafetensorsModel4readESt17basic_string_viewIcSt11char_traitsIcEE
+    -Wl,--wrap=_ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP11CUstream_stRKNS0_13OffloadConfigE)
+endif()
 # full-model parity against the Python engine's goldens (tools/goldens_model.py); ~20 GB of GPU memory
 if(TARGET ingine-validate)
   set(_validate ingine-validate --model-dir ${INGINE_TEST_MODEL_DIR} --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)

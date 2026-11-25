@@ -95,6 +95,12 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
 Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablation)
     : options_(options), weights_(std::move(weights)), ablation_(std::move(ablation)) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  // Decoder/Prefiller always dereference the ablation buffers (zeroed when inactive); materialize an
+  // empty device ablation if the caller passed a default-constructed Ablation{}.
+  if (!ablation_.active && (!ablation_.attn_dirs.data || !ablation_.attn_w.data || !ablation_.mlp_dirs.data ||
+                            !ablation_.mlp_w.data)) {
+    ablation_ = load_ablation({});
+  }
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   init();
 }

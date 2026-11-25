@@ -27,25 +27,79 @@
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
-#include <poll.h>
-#include <sys/inotify.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 using namespace ingine::model;
 using Json = nlohmann::ordered_json;
+
+#if defined(__linux__)
+namespace {
+constexpr std::string_view kToctouNormName = "model.llm.embed_norm.weight";
+std::filesystem::path g_toctou_priv_shard;
+bool g_toctou_armed = false;
+bool g_toctou_flipped = false;
+bool g_observe_loads = false;
+std::vector<float> g_observed_norm0;
+std::vector<std::optional<std::array<std::uint8_t, 32>>> g_observed_shas;
+}  // namespace
+
+extern "C" std::vector<std::byte> s3_real_st_read(const ingine::SafetensorsModel*, std::string_view)
+    asm("__real__ZNK6ingine16SafetensorsModel4readESt17basic_string_viewIcSt11char_traitsIcEE");
+extern "C" std::vector<std::byte> s3_wrap_st_read(const ingine::SafetensorsModel*, std::string_view)
+    asm("__wrap__ZNK6ingine16SafetensorsModel4readESt17basic_string_viewIcSt11char_traitsIcEE");
+
+std::vector<std::byte> s3_wrap_st_read(const ingine::SafetensorsModel* model, std::string_view name) {
+  auto original = s3_real_st_read(model, name);
+  if (!g_toctou_armed || name != kToctouNormName) return original;
+  const ingine::SafetensorsRef ref = model->at(name);
+  if (ref.file->path() != g_toctou_priv_shard) return original;
+  auto flipped = original;
+  if (ref->dtype == "BF16") {
+    for (std::size_t i = 1; i < flipped.size(); i += 2) flipped[i] ^= std::byte{0x80};
+  } else if (ref->dtype == "F32") {
+    for (std::size_t i = 3; i < flipped.size(); i += 4) flipped[i] ^= std::byte{0x80};
+  } else {
+    throw std::runtime_error("unexpected embed_norm dtype for during-load TOCTOU test: " + ref->dtype);
+  }
+  std::fstream out(g_toctou_priv_shard, std::ios::in | std::ios::out | std::ios::binary);
+  out.exceptions(std::ios::failbit | std::ios::badbit);
+  out.seekp(static_cast<std::streamoff>(ref->offset));
+  out.write(reinterpret_cast<const char*>(flipped.data()), std::streamsize(flipped.size()));
+  out.close();
+  g_toctou_armed = false;
+  g_toctou_flipped = true;
+  return original;
+}
+
+extern "C" Weights s3_real_load_weights(const std::filesystem::path&, bool, cudaStream_t, const OffloadConfig&)
+    asm("__real__ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP11CUstream_stRKNS0_13OffloadConfigE");
+extern "C" Weights s3_wrap_load_weights(const std::filesystem::path&, bool, cudaStream_t, const OffloadConfig&)
+    asm("__wrap__ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP11CUstream_stRKNS0_13OffloadConfigE");
+
+Weights s3_wrap_load_weights(const std::filesystem::path& dir, bool dense, cudaStream_t stream,
+                             const OffloadConfig& cfg) {
+  Weights w = s3_real_load_weights(dir, dense, stream, cfg);
+  if (g_observe_loads) {
+    float first = 0.f;
+    INGINE_TEST_CUDA(cudaMemcpy(&first, w.embed_norm.data, sizeof(first), cudaMemcpyDeviceToHost));
+    g_observed_norm0.push_back(first);
+    g_observed_shas.push_back(w.content_sha256);
+  }
+  return w;
+}
+#endif
 
 namespace {
 
@@ -693,75 +747,59 @@ int main(int argc, char** argv) {
     }
 
     // 2h-consumed-weight-toctou + unknown-reader explicit-resume gating:
-    //   1. Mutate private 4608-byte embed_norm shard on disk DURING Load 1 (triggered via inotify IN_ACCESS on
-    //      final_norm_priv.safetensors right after load_weights reads embed_norm and before flush/digest complete).
-    //      Load 1's checkpoint MUST bind Load 1's consumed +embed_norm bytes so Load 2 (which consumes -embed_norm)
-    //      declines auto-resume and throws on explicit resume.
+    //   1. Deterministically flip the private 4608-byte embed_norm shard on disk DURING Load 1 right after
+    //      SafetensorsModel::read("model.llm.embed_norm.weight") returns its +norm payload (before flush/digest).
+    //      Assert actual GPU device norm[0] differs between Load 1 (+norm) and Load 2 (-norm), their verified
+    //      consumed-weight digests differ, Load 2 declines auto-resume, and Load 3 throws on explicit resume.
     //   2. Unknown-reader explicit resume (tiered expert offload AND caller-supplied given weights) MUST reject
     //      Load 1's stamped checkpoint BEFORE import (even on mismatched prompts), while preserving explicit resume
     //      for unstamped legacy checkpoints.
+#if defined(__linux__)
     if (std::filesystem::exists(dir / "model.safetensors.index.json")) {
+      const std::string pid_tag = std::to_string(int(::getpid()));
       const std::filesystem::path priv_dir =
-          std::filesystem::temp_directory_path() / ("s3_priv_toctou_" + std::string(use_kv_q4 ? "q4" : "fp8"));
+          std::filesystem::temp_directory_path() /
+          ("s3_priv_toctou_" + std::string(use_kv_q4 ? "q4" : "fp8") + "_" + pid_tag);
       const std::filesystem::path ckpt_toctou = priv_dir / "toctou_pos64.bin";
       const std::filesystem::path ckpt_toctou_legacy = priv_dir / "toctou_pos64_legacy.bin";
       std::error_code ec;
       std::filesystem::remove_all(priv_dir, ec);
       std::filesystem::create_directories(priv_dir);
-      // Symlink large weight shard(s) and config/quant files; override embed_norm and final_norm into tiny shards.
+      // Symlink large weight shard(s) and config/quant files; override embed_norm into a tiny private shard.
       for (const auto& entry : std::filesystem::directory_iterator(dir)) {
         const std::string fname = entry.path().filename().string();
         if (fname == "model.safetensors.index.json") continue;
         std::filesystem::create_symlink(entry.path(), priv_dir / fname, ec);
       }
-      const std::string en_name = "model.llm.embed_norm.weight";
-      const std::string fn_name = "model.llm.norm.weight";
+      const std::string en_name(kToctouNormName);
       const std::filesystem::path priv_shard = priv_dir / "embed_norm_priv.safetensors";
-      const std::filesystem::path fn_shard = priv_dir / "final_norm_priv.safetensors";
-      std::vector<std::byte> en_raw, fn_raw;
-      std::string en_dtype, fn_dtype;
-      std::vector<std::int64_t> en_shape, fn_shape;
+      std::vector<std::byte> en_raw;
+      std::string en_dtype;
+      std::vector<std::int64_t> en_shape;
       {
         const ingine::SafetensorsModel orig_m(dir);
         const ingine::SafetensorsRef eref = orig_m.at(en_name);
         en_dtype = eref->dtype;
         en_shape = eref->shape;
         en_raw = orig_m.read(en_name);
-        const ingine::SafetensorsRef fref = orig_m.at(fn_name);
-        fn_dtype = fref->dtype;
-        fn_shape = fref->shape;
-        fn_raw = orig_m.read(fn_name);
       }
-      auto write_single_shard = [](const std::filesystem::path& p, const std::string& tname, const std::string& dt,
-                                   const std::vector<std::int64_t>& shape, const std::vector<std::byte>& raw) {
+      {
         Json sh = Json::array();
-        for (auto d : shape) sh.push_back(d);
-        Json hdr = {{tname, {{"dtype", dt}, {"shape", sh}, {"data_offsets", Json::array({0, raw.size()})}}}};
+        for (auto d : en_shape) sh.push_back(d);
+        Json hdr = {{en_name, {{"dtype", en_dtype}, {"shape", sh}, {"data_offsets", Json::array({0, en_raw.size()})}}}};
         const std::string hdr_s = hdr.dump();
         const std::uint64_t hlen = std::uint64_t(hdr_s.size());
-        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        std::ofstream out(priv_shard, std::ios::binary | std::ios::trunc);
         out.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
         out.write(hdr_s.data(), std::streamsize(hdr_s.size()));
-        out.write(reinterpret_cast<const char*>(raw.data()), std::streamsize(raw.size()));
-        out.flush();
-      };
-      write_single_shard(priv_shard, en_name, en_dtype, en_shape, en_raw);
-      write_single_shard(fn_shard, fn_name, fn_dtype, fn_shape, fn_raw);
+        out.write(reinterpret_cast<const char*>(en_raw.data()), std::streamsize(en_raw.size()));
+      }
       {
         std::ifstream in(dir / "model.safetensors.index.json");
         Json idx = Json::parse(in);
         idx["weight_map"][en_name] = "embed_norm_priv.safetensors";
-        idx["weight_map"][fn_name] = "final_norm_priv.safetensors";
         std::ofstream out(priv_dir / "model.safetensors.index.json", std::ios::trunc);
         out << idx.dump();
-      }
-
-      // Build flipped -embed_norm bytes (flip sign bit of BF16 or FP32 elements)
-      std::vector<std::byte> en_neg = en_raw;
-      if (en_dtype == "BF16") {
-        for (std::size_t i = 1; i < en_neg.size(); i += 2) en_neg[i] ^= std::byte{0x80};
-      } else if (en_dtype == "F32") {
-        for (std::size_t i = 3; i < en_neg.size(); i += 4) en_neg[i] ^= std::byte{0x80};
       }
 
       const std::vector<std::int32_t> short_p(rp_root.ids.begin(), rp_root.ids.begin() + 100);
@@ -776,41 +814,21 @@ int main(int argc, char** argv) {
       toctou_base.park_mb = 0;
       toctou_base.park_host_mb = 0;
 
+      g_toctou_priv_shard = priv_shard;
+      g_toctou_armed = true;
+      g_toctou_flipped = false;
+      g_observe_loads = true;
+      g_observed_norm0.clear();
+      g_observed_shas.clear();
+
       RunOut out1_exact, out2_auto;
-      bool mutated_during_load = false;
       bool toctou_saved = false;
       bool toctou_explicit_threw = false;
       {
         RuntimeOptions topt = toctou_base;
         topt.kv_ckpt_path = ckpt_toctou;
         topt.kv_ckpt_every = 64;
-        // Watch final_norm_priv.safetensors: load_weights reads embed_norm first, then final_norm, then flushes
-        // ~1.8 GB embed/unembed and computes content_sha256. Overwrite embed_norm_priv.safetensors mid-load!
-        std::atomic<bool> load_done{false};
-        std::atomic<bool> flipped_mid_load{false};
-        const int ifd = ::inotify_init1(IN_NONBLOCK);
-        const int wd = (ifd >= 0) ? ::inotify_add_watch(ifd, fn_shard.c_str(), IN_ACCESS) : -1;
-        std::thread mutator([&] {
-          if (ifd < 0 || wd < 0) return;
-          char ibuf[512];
-          while (!load_done.load(std::memory_order_acquire)) {
-            struct pollfd pfd{ifd, POLLIN, 0};
-            if (::poll(&pfd, 1, 20) > 0 && (pfd.revents & POLLIN)) {
-              const ssize_t nr = ::read(ifd, ibuf, sizeof(ibuf));
-              if (nr > 0) {
-                write_single_shard(priv_shard, en_name, en_dtype, en_shape, en_neg);
-                flipped_mid_load.store(!load_done.load(std::memory_order_acquire), std::memory_order_release);
-                break;
-              }
-            }
-          }
-        });
-        auto gen1 = make_generator(topt);  // consumes +embed_norm; shard flips to -embed_norm mid-load!
-        load_done.store(true, std::memory_order_release);
-        mutator.join();
-        if (wd >= 0) ::inotify_rm_watch(ifd, wd);
-        if (ifd >= 0) ::close(ifd);
-        mutated_during_load = flipped_mid_load.load(std::memory_order_acquire);
+        auto gen1 = make_generator(topt);  // consumes +embed_norm; wrapper flips shard to -embed_norm mid-load
         (void)run_prompt(*gen1, Prompt{short_p, {}, 0}, 8, greedy);
         out1_exact = run_prompt(*gen1, Prompt{exact_p, {}, 0, "", true}, 16, greedy);
         toctou_saved = std::filesystem::exists(ckpt_toctou) && inspect_kv_checkpoint(ckpt_toctou).pos == 64 &&
@@ -820,7 +838,7 @@ int main(int argc, char** argv) {
         RuntimeOptions topt = toctou_base;
         topt.kv_ckpt_path = ckpt_toctou;
         topt.kv_ckpt_every = 0;
-        auto gen2 = make_generator(topt);  // consumes -embed_norm -> different consumed producer digest!
+        auto gen2 = make_generator(topt);  // consumes -embed_norm -> different consumed producer digest
         out2_auto = run_prompt(*gen2, Prompt{exact_p, {}, 0}, 16, greedy);
       }
       {
@@ -834,24 +852,38 @@ int main(int argc, char** argv) {
               std::string(e.what()).find("producer identity mismatch") != std::string::npos;
         }
       }
-      check(mutated_during_load && toctou_saved && out2_auto.stats.reuse == Reuse::None &&
+      const bool resident_norms_and_shas_distinct =
+          g_toctou_flipped && !g_toctou_armed && g_observed_norm0.size() == 3 && g_observed_shas.size() == 3 &&
+          g_observed_norm0[0] != g_observed_norm0[1] && g_observed_norm0[1] == g_observed_norm0[2] &&
+          g_observed_shas[0].has_value() && g_observed_shas[1].has_value() && g_observed_shas[2].has_value() &&
+          *g_observed_shas[0] != *g_observed_shas[1] && *g_observed_shas[1] == *g_observed_shas[2];
+      std::printf("[Suite 2h-toctou] flipped_during_load=%d norm0=(%.6g, %.6g, %.6g) distinct_sha=%d auto_reuse=%d\n",
+                  int(g_toctou_flipped), g_observed_norm0.size() > 0 ? g_observed_norm0[0] : 0.f,
+                  g_observed_norm0.size() > 1 ? g_observed_norm0[1] : 0.f,
+                  g_observed_norm0.size() > 2 ? g_observed_norm0[2] : 0.f,
+                  int(g_observed_shas.size() > 1 && g_observed_shas[0] && g_observed_shas[1] &&
+                      *g_observed_shas[0] != *g_observed_shas[1]),
+                  int(out2_auto.stats.reuse));
+      check(resident_norms_and_shas_distinct && toctou_saved && out2_auto.stats.reuse == Reuse::None &&
                 out2_auto.stats.reused_tokens == 0 && out2_auto.tokens != out1_exact.tokens && toctou_explicit_threw,
-            "Suite 2h-consumed-weight-toctou: during-load embed_norm mutation yields distinct consumed producer SHA (auto declines & explicit throws)");
+            "Suite 2h-consumed-weight-toctou: during-load embed_norm mutation yields distinct resident norm & consumed producer SHA (auto declines & explicit throws)");
 
       // Unknown-reader explicit-resume gating on revision B (-embed_norm) against revision A's stamped checkpoint:
-      //   * Branch 1: tiered expert offload (offload_vram_mb=12288, offload_ram_mb=512)
-      //   * Branch 2: caller-supplied given-weights overload (make_generator(opt, load_weights(...), Ablation{}))
+      //   * Branch 1: tiered expert offload (offload_vram_mb=12288, offload_ram_mb=512) -> content_sha256 unknown
+      //   * Branch 2: caller-supplied given-weights overload (make_generator(opt, load_weights(...), load_ablation({})))
       //   * Unstamped legacy checkpoint remains explicitly resumable (isolated, root_entries==0).
       bool tiered_stamped_rejected = false;
       bool given_stamped_rejected = false;
       bool unknown_legacy_preserved = false;
-      if (toctou_saved) {
+      if (toctou_saved && resident_norms_and_shas_distinct) {
         {
           RuntimeOptions topt = toctou_base;
           topt.offload_vram_mb = 12288;
           topt.offload_ram_mb = 512;
           topt.kv_ckpt_resume = ckpt_toctou;
           auto gen_t = make_generator(topt);
+          const bool tiered_obs_ok = !g_observed_norm0.empty() && g_observed_norm0.back() == g_observed_norm0[1] &&
+                                     !g_observed_shas.empty() && !g_observed_shas.back().has_value();
           bool threw_match = false, threw_other = false;
           try {
             run_prompt(*gen_t, Prompt{exact_p, {}, 0}, 16, greedy);
@@ -864,8 +896,8 @@ int main(int argc, char** argv) {
             threw_other = std::string(e.what()).find("cannot verify stamped checkpoint producer") != std::string::npos;
           }
           const PrefixCacheStats cs = gen_t->cache_stats();
-          tiered_stamped_rejected =
-              threw_match && threw_other && cs.root_entries == 0 && cs.vram_entries == 0 && cs.host_entries == 0;
+          tiered_stamped_rejected = tiered_obs_ok && threw_match && threw_other && cs.root_entries == 0 &&
+                                    cs.vram_entries == 0 && cs.host_entries == 0;
         }
         {
           RuntimeOptions gopt = toctou_base;
@@ -874,8 +906,9 @@ int main(int argc, char** argv) {
           INGINE_TEST_CUDA(cudaStreamCreate(&s));
           Weights w = load_weights(priv_dir, gopt.dense_fp8, s);
           INGINE_TEST_CUDA(cudaStreamDestroy(s));
-          const bool w_has_sha = w.content_sha256.has_value();
-          auto gen_g = make_generator(gopt, std::move(w), Ablation{});
+          const bool w_obs_ok = w.content_sha256.has_value() && *w.content_sha256 == *g_observed_shas[1] &&
+                                !g_observed_norm0.empty() && g_observed_norm0.back() == g_observed_norm0[1];
+          auto gen_g = make_generator(gopt, std::move(w), load_ablation({}));
           bool threw_match = false, threw_other = false;
           try {
             run_prompt(*gen_g, Prompt{exact_p, {}, 0}, 16, greedy);
@@ -888,7 +921,7 @@ int main(int argc, char** argv) {
             threw_other = std::string(e.what()).find("cannot verify stamped checkpoint producer") != std::string::npos;
           }
           const PrefixCacheStats cs = gen_g->cache_stats();
-          given_stamped_rejected = w_has_sha && threw_match && threw_other && cs.root_entries == 0 &&
+          given_stamped_rejected = w_obs_ok && threw_match && threw_other && cs.root_entries == 0 &&
                                    cs.vram_entries == 0 && cs.host_entries == 0;
         }
         strip_producer_from_kv_checkpoint(ckpt_toctou, ckpt_toctou_legacy);
@@ -900,16 +933,19 @@ int main(int argc, char** argv) {
           INGINE_TEST_CUDA(cudaStreamCreate(&s));
           Weights w = load_weights(priv_dir, lopt.dense_fp8, s);
           INGINE_TEST_CUDA(cudaStreamDestroy(s));
-          auto gen_l = make_generator(lopt, std::move(w), Ablation{});
+          auto gen_l = make_generator(lopt, std::move(w), load_ablation({}));
           const RunOut leg = run_prompt(*gen_l, Prompt{short_p, {}, 64}, 8, greedy);
           unknown_legacy_preserved = (leg.stats.reuse == Reuse::Checkpoint && leg.stats.reused_tokens == 64 &&
                                       gen_l->cache_stats().root_entries == 0);
         }
       }
+      g_observe_loads = false;
+      g_toctou_armed = false;
       std::filesystem::remove_all(priv_dir, ec);
       check(tiered_stamped_rejected && given_stamped_rejected && unknown_legacy_preserved,
             "Suite 2h-unknown-reader-explicit: tiered offload & given-weights reject stamped ckpt pre-import while preserving unstamped legacy");
     }
+#endif
   }
 
   // ---- Suite 2g: DSpark --spec host-parked root + fork parity & speculative disk-resume rejection/decline ----
