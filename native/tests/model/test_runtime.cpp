@@ -12,6 +12,7 @@
 #include "core/fixture.h"
 
 #include "kernels/dense/dense.h"
+#include "model/kv_checkpoint.h"
 #include "model/model_kernels.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
@@ -23,6 +24,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1069,6 +1072,234 @@ bool run_persona_hooks() {
   return ok;
 }
 
+// End-to-end EngineGenerator disk KV checkpoint save + same-dtype explicit/auto resume + mixed-dtype rejection/decline
+// on the synthetic model (runs on both SM80+ BF16 and SM70 FP16 builds without requiring the full 22 GB checkpoint).
+bool run_disk_checkpoint_dtype() {
+  bool ok = true;
+  const std::string tag = (kActDType == DType::FP16) ? " (FP16)" : " (BF16)";
+  const std::filesystem::path tmp_dir =
+      std::filesystem::temp_directory_path() / ("ingine_rt_ckpt_dtype_" + std::to_string(kActIsFP16 ? 16 : 80));
+  std::filesystem::create_directories(tmp_dir);
+  const std::filesystem::path ckpt_same = tmp_dir / "same.bin";
+  const std::filesystem::path ckpt_mixed = tmp_dir / "mixed.bin";
+  const std::filesystem::path ckpt_fp32 = tmp_dir / "fp32_bogus.bin";
+  const std::filesystem::path ckpt_legacy = tmp_dir / "legacy.bin";
+  std::filesystem::remove(ckpt_same);
+  std::filesystem::remove(ckpt_mixed);
+  std::filesystem::remove(ckpt_fp32);
+  std::filesystem::remove(ckpt_legacy);
+
+  auto patch_act_dtype = [](const std::filesystem::path& src, const std::filesystem::path& dst,
+                            std::uint32_t new_act_dtype) {
+    std::ifstream in(src, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open checkpoint: " + src.string());
+    std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (bytes.size() < 4096) throw std::runtime_error("checkpoint smaller than 4096-byte header");
+    // RawHeader::act_dtype sits at byte offset 16 (8-byte magic + 4-byte version + 4-byte header_bytes).
+    std::memcpy(bytes.data() + 16, &new_act_dtype, sizeof(new_act_dtype));
+    std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("cannot write patched checkpoint: " + dst.string());
+    out.write(bytes.data(), std::streamsize(bytes.size()));
+    out.close();
+  };
+
+  auto strip_producer_trailer = [](const std::filesystem::path& src, const std::filesystem::path& dst) {
+    std::ifstream in(src, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open checkpoint: " + src.string());
+    std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (bytes.size() < 4096) throw std::runtime_error("checkpoint smaller than 4096-byte header");
+    // Legacy INGCKPT1 files zero bytes 144..4095 (no v1 producer trailer).
+    std::memset(bytes.data() + 144, 0, 4096 - 144);
+    std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("cannot write legacy checkpoint: " + dst.string());
+    out.write(bytes.data(), std::streamsize(bytes.size()));
+    out.close();
+  };
+
+  auto make_synth_gen = [](const RuntimeOptions& opt) {
+    cudaStream_t s;
+    INGINE_TEST_CUDA(cudaStreamCreate(&s));
+    Weights w = synthetic_weights(s);
+    INGINE_TEST_CUDA(cudaStreamDestroy(s));
+    return make_generator(opt, std::move(w), load_ablation({}));
+  };
+
+  Rng rng(91);
+  std::vector<std::int32_t> prompt(100);
+  for (auto& t : prompt) t = std::int32_t(rng.next() % kVocab);
+  Sampling greedy;
+  greedy.temperature = 0.f;
+
+  auto run_once = [&](Generator& gen, std::span<const std::int32_t> ids) {
+    std::vector<std::int32_t> out;
+    const GenerateStats st = gen.generate(ids, 16, greedy, {}, [&](std::span<const std::int32_t> t) {
+      out.insert(out.end(), t.begin(), t.end());
+      return true;
+    });
+    return std::pair{out, st};
+  };
+
+  RuntimeOptions base;
+  base.max_ctx = 2048;
+  base.kv_fp8 = true;
+  base.prefill_chunk = 64;
+  base.park_mb = 0;
+  base.park_host_mb = 0;
+
+  // 1. Save real disk checkpoint at pos = 64 (< 100, with boundary logits) and record greedy reference
+  std::vector<std::int32_t> ref_tokens;
+  {
+    RuntimeOptions opt = base;
+    opt.kv_ckpt_path = ckpt_same;
+    opt.kv_ckpt_every = 64;
+    auto gen = make_synth_gen(opt);
+    const auto [toks, st] = run_once(*gen, prompt);
+    ref_tokens = toks;
+  }
+  const KvCheckpointInfo saved_info = inspect_kv_checkpoint(ckpt_same);
+  const std::uint32_t expected_disk_dtype = static_cast<std::uint32_t>(kActDType);
+  ok &= report(saved_info.pos == 64 && saved_info.has_logits && saved_info.has_producer_identity &&
+                   saved_info.act_dtype == expected_disk_dtype,
+               "disk checkpoint writes raw kActDType (" + std::to_string(expected_disk_dtype) +
+                   ") + verified producer identity at pos=64" + tag);
+
+  // 2. Same-dtype explicit --kv-ckpt-resume MUST succeed and reproduce exact greedy tokens
+  {
+    RuntimeOptions opt = base;
+    opt.kv_ckpt_resume = ckpt_same;
+    auto gen = make_synth_gen(opt);
+    const auto [toks, st] = run_once(*gen, prompt);
+    ok &= report(st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && toks == ref_tokens,
+                 "same-dtype explicit --kv-ckpt-resume succeeds with exact parity" + tag);
+  }
+
+  // 3. Same-dtype auto --kv-ckpt-path MUST auto-resume (including deliberate max_ctx increase 2048 -> 4096)
+  {
+    RuntimeOptions opt = base;
+    opt.max_ctx = 4096;  // deliberate compatible case: pos=64 <= max_ctx with matching producer identity
+    opt.kv_ckpt_path = ckpt_same;
+    opt.kv_ckpt_every = 0;
+    auto gen = make_synth_gen(opt);
+    const auto [toks, st] = run_once(*gen, prompt);
+    ok &= report(st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && toks == ref_tokens,
+                 "same-dtype auto --kv-ckpt-path resumes with exact parity (deliberate max_ctx=4096)" + tag);
+  }
+
+  // 4. Legacy checkpoint (zeroed producer trailer): explicit preserved without root promotion; auto declined
+  strip_producer_trailer(ckpt_same, ckpt_legacy);
+  {
+    const KvCheckpointInfo li = inspect_kv_checkpoint(ckpt_legacy);
+    bool explicit_ok = false;
+    {
+      RuntimeOptions opt = base;
+      opt.park_mb = 256;
+      opt.kv_ckpt_resume = ckpt_legacy;
+      auto gen = make_synth_gen(opt);
+      std::vector<std::int32_t> out;
+      const GenerateStats st = gen->generate(Prompt{prompt, {}, 64}, 16, greedy, {}, [&](std::span<const std::int32_t> t) {
+        out.insert(out.end(), t.begin(), t.end());
+        return true;
+      });
+      explicit_ok = (st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && out == ref_tokens &&
+                     gen->cache_stats().root_entries == 0);
+    }
+    bool auto_declined = false;
+    {
+      RuntimeOptions opt = base;
+      opt.kv_ckpt_path = ckpt_legacy;
+      opt.kv_ckpt_every = 0;
+      auto gen = make_synth_gen(opt);
+      const auto [toks, st] = run_once(*gen, prompt);
+      auto_declined = (st.reuse == Reuse::None && st.reused_tokens == 0 && toks == ref_tokens);
+    }
+    ok &= report(!li.has_producer_identity && explicit_ok && auto_declined,
+                 "legacy disk checkpoint: explicit resume preserved (no root promotion) & auto-resume declined" + tag);
+  }
+
+  // 5. Verified checkpoint with mismatched producer (prefill_chunk 64 -> 32): explicit throws, auto declines
+  {
+    bool explicit_threw = false;
+    {
+      RuntimeOptions opt = base;
+      opt.prefill_chunk = 32;
+      opt.kv_ckpt_resume = ckpt_same;
+      auto gen = make_synth_gen(opt);
+      try {
+        (void)run_once(*gen, prompt);
+      } catch (const std::exception&) {
+        explicit_threw = true;
+      }
+    }
+    bool auto_declined = false;
+    {
+      RuntimeOptions opt = base;
+      opt.prefill_chunk = 32;
+      opt.kv_ckpt_path = ckpt_same;
+      opt.kv_ckpt_every = 0;
+      auto gen = make_synth_gen(opt);
+      const auto [toks, st] = run_once(*gen, prompt);
+      auto_declined = (st.reuse == Reuse::None && st.reused_tokens == 0 && toks.size() == 16);
+    }
+    ok &= report(explicit_threw && auto_declined,
+                 "verified disk checkpoint with mismatched prefill_chunk throws on explicit & declines on auto" + tag);
+  }
+
+  // 6. Host-only root capture books live-to-staging D2D capture bytes into d2d_park_bytes (> 0) as well as d2h_park_bytes
+  {
+    RuntimeOptions opt = base;
+    opt.park_mb = 0;
+    opt.park_host_mb = 256;
+    auto gen = make_synth_gen(opt);
+    std::vector<std::int32_t> out;
+    gen->generate(Prompt{prompt, {}, 64}, 4, greedy, {}, [&](std::span<const std::int32_t> t) {
+      out.insert(out.end(), t.begin(), t.end());
+      return true;
+    });
+    const PrefixCacheStats cs = gen->cache_stats();
+    ok &= report(cs.root_entries == 1 && cs.host_entries == 1 && cs.vram_entries == 0 &&
+                     cs.d2d_park_bytes > 0 && cs.d2h_park_bytes > 0,
+                 "host-only root capture books live-to-staging d2d_park_bytes > 0 and d2h_park_bytes > 0" + tag);
+  }
+
+  // 7. Mixed-dtype (opposite BF16/FP16) & bogus FP32(1) checkpoints: explicit MUST throw, auto MUST decline cleanly
+  const std::uint32_t other_disk_dtype =
+      (kActDType == DType::FP16) ? static_cast<std::uint32_t>(DType::BF16) : static_cast<std::uint32_t>(DType::FP16);
+  patch_act_dtype(ckpt_same, ckpt_mixed, other_disk_dtype);
+  patch_act_dtype(ckpt_same, ckpt_fp32, static_cast<std::uint32_t>(DType::FP32));
+
+  for (const auto& [label, path, want_code] :
+       {std::tuple{"mixed-dtype", ckpt_mixed, other_disk_dtype},
+        std::tuple{"raw-FP32(1)", ckpt_fp32, static_cast<std::uint32_t>(DType::FP32)}}) {
+    const KvCheckpointInfo pi = inspect_kv_checkpoint(path);
+    bool explicit_threw = false;
+    {
+      RuntimeOptions opt = base;
+      opt.kv_ckpt_resume = path;
+      auto gen = make_synth_gen(opt);
+      try {
+        (void)run_once(*gen, prompt);
+      } catch (const std::exception&) {
+        explicit_threw = true;
+      }
+    }
+    bool auto_declined = false;
+    {
+      RuntimeOptions opt = base;
+      opt.kv_ckpt_path = path;
+      opt.kv_ckpt_every = 0;
+      auto gen = make_synth_gen(opt);
+      const auto [toks, st] = run_once(*gen, prompt);
+      auto_declined = (st.reuse == Reuse::None && st.reused_tokens == 0 && toks == ref_tokens);
+    }
+    ok &= report(pi.act_dtype == want_code && explicit_threw && auto_declined,
+                 std::string(label) + " disk checkpoint rejected on explicit resume & declined on auto resume" + tag);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove_all(tmp_dir, ec);
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -1082,6 +1313,7 @@ int main() {
   bool ok = run(false);
   ok &= run(true);
   ok &= run_generator();
+  ok &= run_disk_checkpoint_dtype();
   ok &= run_ablation_layouts();
   ok &= run_persona_hooks();
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

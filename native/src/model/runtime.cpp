@@ -365,12 +365,15 @@ std::size_t Runtime::checkpoint_bytes() const {
   return n;
 }
 
-void Runtime::save_checkpoint(void* dst) {
+std::size_t Runtime::save_checkpoint(void* dst) {
   char* p = static_cast<char*>(dst);
+  std::size_t copied = 0;
   for (const Tensor* t : checkpoint_tensors(state_)) {
     CUDA_CHECK(cudaMemcpyAsync(p, t->data, t->bytes(), cudaMemcpyDefault, stream_));
+    copied += t->bytes();
     p += carved(t->bytes());
   }
+  return copied;
 }
 
 std::size_t Runtime::restore_checkpoint(const void* src) {

@@ -158,7 +158,7 @@ class Runtime {
   // long); restore_checkpoint puts it back, so the state equals the one at the save up to rows past its
   // length, which nothing reads before overwriting. Stream-ordered.
   std::size_t checkpoint_bytes() const;
-  void save_checkpoint(void* dst);
+  std::size_t save_checkpoint(void* dst);
   std::size_t restore_checkpoint(const void* src);
 
   // Conversation parking: a checkpoint holds everything but the full-attention caches; save_full_rows copies

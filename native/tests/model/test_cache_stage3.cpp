@@ -16,6 +16,7 @@
 //   3. Measured apples-to-apples wall TTFT crossover (kReps=3 medians) across L in {64, 128, 256..16384}, with
 //      separate CUDA transfer-event timing and separate prefix-cache vs device-wide VRAM reporting.
 #include "common/test_util.h"
+#include "core/act.h"
 #include "core/arena.h"
 #include "ingine/generator.h"
 #include "model/kv_checkpoint.h"
@@ -102,6 +103,33 @@ void strip_logits_from_kv_checkpoint(const std::filesystem::path& src, const std
   bytes.resize(bytes.size() - logits_bytes);
   std::ofstream out(dst, std::ios::binary | std::ios::trunc);
   if (!out) throw std::runtime_error("cannot write stripped checkpoint: " + dst.string());
+  out.write(bytes.data(), std::streamsize(bytes.size()));
+  out.close();
+}
+
+// Create a disk KV checkpoint copy with RawHeader::act_dtype (byte offset 16) patched to `new_act_dtype`.
+void patch_act_dtype_in_kv_checkpoint(const std::filesystem::path& src, const std::filesystem::path& dst,
+                                      std::uint32_t new_act_dtype) {
+  std::ifstream in(src, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open source checkpoint: " + src.string());
+  std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (bytes.size() < 4096) throw std::runtime_error("source checkpoint smaller than 4096-byte header");
+  std::memcpy(bytes.data() + 16, &new_act_dtype, sizeof(new_act_dtype));
+  std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+  if (!out) throw std::runtime_error("cannot write patched checkpoint: " + dst.string());
+  out.write(bytes.data(), std::streamsize(bytes.size()));
+  out.close();
+}
+
+// Create a legacy disk KV checkpoint copy with bytes 144..4095 zeroed (no v1 producer identity trailer).
+void strip_producer_from_kv_checkpoint(const std::filesystem::path& src, const std::filesystem::path& dst) {
+  std::ifstream in(src, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open source checkpoint: " + src.string());
+  std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (bytes.size() < 4096) throw std::runtime_error("source checkpoint smaller than 4096-byte header");
+  std::memset(bytes.data() + 144, 0, 4096 - 144);
+  std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+  if (!out) throw std::runtime_error("cannot write legacy checkpoint: " + dst.string());
   out.write(bytes.data(), std::streamsize(bytes.size()));
   out.close();
 }
@@ -332,8 +360,9 @@ int main(int argc, char** argv) {
     check(ha.stats.reuse == Reuse::None && hb.stats.reuse == Reuse::HostParked && hb.stats.reused_tokens == R &&
               hb.stats.restored_bytes.value_or(0) > 0 && dma_delta == hb.stats.restored_bytes.value_or(0) &&
               hb.stats.restore_seconds.value_or(0.0) > 0.0 && hb.tokens == ref_fork_b.tokens &&
-              cs_h1.vram_used_bytes == 0 && cs_h1.vram_peak_bytes == 0 &&
-              cs_h1.host_used_bytes <= cs_h1.host_budget_bytes && cs_h1.host_peak_bytes <= cs_h1.host_budget_bytes,
+              cs_h1.vram_used_bytes == 0 && cs_h1.vram_peak_bytes == 0 && cs_h1.d2d_park_bytes > 0 &&
+              cs_h1.d2h_park_bytes > 0 && cs_h1.host_used_bytes <= cs_h1.host_budget_bytes &&
+              cs_h1.host_peak_bytes <= cs_h1.host_budget_bytes,
           "Suite 2a: direct host-only parking (park_mb=0) hits Reuse::HostParked with exact parity & copy-site DMA match");
 
     const RunOut hroot = run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 32, greedy);
@@ -433,13 +462,19 @@ int main(int argc, char** argv) {
     std::printf("[Suite 2e-2f stats] %s\n", gen->offload_summary().c_str());
   }
 
-  // ---- Suite 2h: Disk checkpoint gating (has_logits=false exact-root & non-promotion; save real ckpt at R) ----
+  // ---- Suite 2h: Disk checkpoint gating (verified producer, legacy handling, mixed-dtype, has_logits=false) ----
   const std::filesystem::path ckpt_with_logits =
       std::filesystem::temp_directory_path() / ("s3_ckpt_logits_" + std::string(use_kv_q4 ? "q4" : "fp8") + ".bin");
   const std::filesystem::path ckpt_no_logits =
       std::filesystem::temp_directory_path() / ("s3_ckpt_nologits_" + std::string(use_kv_q4 ? "q4" : "fp8") + ".bin");
+  const std::filesystem::path ckpt_wrong_dtype =
+      std::filesystem::temp_directory_path() / ("s3_ckpt_wrongdtype_" + std::string(use_kv_q4 ? "q4" : "fp8") + ".bin");
+  const std::filesystem::path ckpt_legacy =
+      std::filesystem::temp_directory_path() / ("s3_ckpt_legacy_" + std::string(use_kv_q4 ? "q4" : "fp8") + ".bin");
   std::filesystem::remove(ckpt_with_logits);
   std::filesystem::remove(ckpt_no_logits);
+  std::filesystem::remove(ckpt_wrong_dtype);
+  std::filesystem::remove(ckpt_legacy);
   {
     // Save a real disk checkpoint at exact pos = R (with logits) via periodic checkpoint on rp_b (root split hits R)
     RuntimeOptions opt = base_opt;
@@ -453,11 +488,100 @@ int main(int argc, char** argv) {
     }
     const bool saved_ok = std::filesystem::exists(ckpt_with_logits) &&
                           inspect_kv_checkpoint(ckpt_with_logits).pos == R &&
-                          inspect_kv_checkpoint(ckpt_with_logits).has_logits;
+                          inspect_kv_checkpoint(ckpt_with_logits).has_logits &&
+                          inspect_kv_checkpoint(ckpt_with_logits).act_dtype ==
+                              static_cast<std::uint32_t>(ingine::kActDType);
     if (saved_ok) strip_logits_from_kv_checkpoint(ckpt_with_logits, ckpt_no_logits);
     const bool stripped_ok = saved_ok && std::filesystem::exists(ckpt_no_logits) &&
                              inspect_kv_checkpoint(ckpt_no_logits).pos == R &&
                              !inspect_kv_checkpoint(ckpt_no_logits).has_logits;
+
+    // 2h-0: Same-dtype explicit & auto resume succeed with exact parity; mixed-dtype explicit throws & auto declines
+    bool same_dtype_resume_ok = false;
+    bool mixed_dtype_explicit_threw = false;
+    bool mixed_dtype_auto_declined = false;
+    if (saved_ok) {
+      {
+        RuntimeOptions ropt = base_opt;
+        ropt.park_mb = 0;
+        ropt.park_host_mb = 0;
+        ropt.kv_ckpt_resume = ckpt_with_logits;
+        auto gen = make_generator(ropt);
+        const RunOut er = run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 32, greedy);
+        same_dtype_resume_ok =
+            (er.stats.reuse == Reuse::Checkpoint && er.stats.reused_tokens == R && er.tokens == ref_exact_root.tokens);
+      }
+      {
+        RuntimeOptions aopt = base_opt;
+        aopt.park_mb = 0;
+        aopt.park_host_mb = 0;
+        aopt.kv_ckpt_path = ckpt_with_logits;
+        aopt.kv_ckpt_every = 0;
+        auto gen = make_generator(aopt);
+        const RunOut er = run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 32, greedy);
+        same_dtype_resume_ok &=
+            (er.stats.reuse == Reuse::Checkpoint && er.stats.reused_tokens == R && er.tokens == ref_exact_root.tokens);
+      }
+      const std::uint32_t other_dtype = (ingine::kActDType == ingine::DType::FP16)
+                                            ? static_cast<std::uint32_t>(ingine::DType::BF16)
+                                            : static_cast<std::uint32_t>(ingine::DType::FP16);
+      patch_act_dtype_in_kv_checkpoint(ckpt_with_logits, ckpt_wrong_dtype, other_dtype);
+      {
+        RuntimeOptions ropt = base_opt;
+        ropt.park_mb = 0;
+        ropt.park_host_mb = 0;
+        ropt.kv_ckpt_resume = ckpt_wrong_dtype;
+        auto gen = make_generator(ropt);
+        try {
+          run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 8, greedy);
+        } catch (const std::exception&) {
+          mixed_dtype_explicit_threw = true;
+        }
+      }
+      {
+        RuntimeOptions aopt = base_opt;
+        aopt.park_mb = 0;
+        aopt.park_host_mb = 0;
+        aopt.kv_ckpt_path = ckpt_wrong_dtype;
+        aopt.kv_ckpt_every = 0;
+        auto gen = make_generator(aopt);
+        const RunOut er = run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 32, greedy);
+        mixed_dtype_auto_declined =
+            (er.stats.reuse == Reuse::None && er.stats.reused_tokens == 0 && er.tokens == ref_exact_root.tokens);
+      }
+    }
+    check(saved_ok && same_dtype_resume_ok && mixed_dtype_explicit_threw && mixed_dtype_auto_declined,
+          "Suite 2h-dtype: same-dtype disk resume succeeds & mixed-dtype throws on explicit / declines on auto");
+
+    // 2h-legacy: Legacy checkpoint (no producer identity trailer): explicit preserved without root promotion; auto declined
+    bool legacy_explicit_no_promote = false;
+    bool legacy_auto_declined = false;
+    if (saved_ok) {
+      strip_producer_from_kv_checkpoint(ckpt_with_logits, ckpt_legacy);
+      {
+        RuntimeOptions ropt = base_opt;
+        ropt.park_mb = 512;
+        ropt.park_host_mb = 0;
+        ropt.kv_ckpt_resume = ckpt_legacy;
+        auto gen = make_generator(ropt);
+        const RunOut fb = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
+        legacy_explicit_no_promote = (fb.stats.reuse == Reuse::Checkpoint && fb.stats.reused_tokens == R &&
+                                      fb.tokens == ref_fork_b.tokens && gen->cache_stats().root_entries == 0);
+      }
+      {
+        RuntimeOptions aopt = base_opt;
+        aopt.park_mb = 512;
+        aopt.park_host_mb = 0;
+        aopt.kv_ckpt_path = ckpt_legacy;
+        aopt.kv_ckpt_every = 0;
+        auto gen = make_generator(aopt);
+        const RunOut fb = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
+        legacy_auto_declined =
+            (fb.stats.reuse == Reuse::None && fb.stats.reused_tokens == 0 && fb.tokens == ref_fork_b.tokens);
+      }
+    }
+    check(saved_ok && legacy_explicit_no_promote && legacy_auto_declined,
+          "Suite 2h-legacy: legacy disk ckpt preserved on explicit (no root promotion) & declined on auto");
 
     // 2h-1: Explicit --kv-ckpt-resume on exact-root with has_logits=false MUST throw
     bool explicit_nologits_threw = false;
@@ -549,6 +673,8 @@ int main(int argc, char** argv) {
   }
   std::filesystem::remove(ckpt_with_logits);
   std::filesystem::remove(ckpt_no_logits);
+  std::filesystem::remove(ckpt_wrong_dtype);
+  std::filesystem::remove(ckpt_legacy);
 
   // ---- Suite 2i: Verified media SHA-256 identity binding (same negative token ID, different RGB fails closed) ----
   {
@@ -639,13 +765,18 @@ int main(int argc, char** argv) {
 
         std::vector<double> cold_samples, host_ttft_samples, host_xfer_samples;
         for (int rep = 0; rep < kReps; ++rep) {
-          // Use distinct token 0 per cold rep so cold never hits a previously parked entry
+          // 1) Pure cold recompute measurement (bypass_prefix_cache=true -> zero pin/root-capture overhead at all L)
+          std::vector<std::int32_t> pc_cold = p;
+          pc_cold[0] = 40000 + L * 10 + rep;
+          const RunOut pure_cold = run_prompt(*gen_host, Prompt{pc_cold, {}, 0, "", /*bypass_prefix_cache=*/true}, 1, greedy);
+          cold_samples.push_back(pure_cold.stats.prefill_seconds * 1e3);
+
+          // 2) Populate parked entry for pc (distinct from pc_cold), flush live, then time HostParked restore
           std::vector<std::int32_t> pc = p;
           pc[0] = 30000 + L * 10 + rep;
           run_prompt(*gen_host, Prompt{flush_ids, {}, 0}, 1, greedy);
-          const RunOut cold = run_prompt(*gen_host, Prompt{pc, {}, root_hint}, 1, greedy);
-          cold_samples.push_back(cold.stats.prefill_seconds * 1e3);
-          if (rep == 0) rows[i].cold_tok = cold.tokens;
+          const RunOut pop = run_prompt(*gen_host, Prompt{pc, {}, root_hint}, 1, greedy);
+          if (rep == 0) rows[i].cold_tok = pop.tokens;
 
           run_prompt(*gen_host, Prompt{flush_ids, {}, 0}, 1, greedy);  // parks pc (non-root) or flushes live (root already parked)
           const std::uint64_t h2d_before = gen_host->cache_stats().h2d_restore_bytes;
@@ -655,7 +786,7 @@ int main(int argc, char** argv) {
           host_ttft_samples.push_back(hres.stats.prefill_seconds * 1e3);
           host_xfer_samples.push_back(hres.stats.restore_seconds.value_or(0.0) * 1e3);
           rows[i].host_ok &= (hres.stats.reuse == Reuse::HostParked && hres.stats.reused_tokens == L &&
-                              hres.tokens == cold.tokens);
+                              hres.tokens == pop.tokens);
         }
         rows[i].cold_ttft_ms = median_of(cold_samples);
         rows[i].host_ttft_ms = median_of(host_ttft_samples);

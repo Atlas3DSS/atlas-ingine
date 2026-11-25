@@ -1,12 +1,16 @@
 // model_data.h constants against weights.py / model.py / fast.py (CPU only): the visit plan, ring/full cache
 // indices, tap visits and the projection layout.
+#include "core/act.h"
 #include "ingine/generator.h"
+#include "model/kv_checkpoint.h"
 #include "model/model_data.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 using namespace ingine::model;
@@ -104,6 +108,164 @@ int main() {
            "Reuse enum to_string contract");
     expect(hash_token_prefix(std::span(ids).subspan(0, 3)) != hash_token_prefix(std::span(ids).subspan(0, 4)),
            "hash_token_prefix distinguishes prefix lengths");
+  }
+
+  // Disk KV checkpoint boundary dtype & eligibility checks (BF16=0 vs FP16=6 raw DType vs StateIdentity 0/1).
+  {
+    const std::uint32_t kDiskBf16 = static_cast<std::uint32_t>(ingine::DType::BF16);
+    const std::uint32_t kDiskFp16 = static_cast<std::uint32_t>(ingine::DType::FP16);
+    const std::uint32_t kDiskFp32 = static_cast<std::uint32_t>(ingine::DType::FP32);
+    expect(kDiskBf16 == 0u && kDiskFp32 == 1u && kDiskFp16 == 6u, "DType raw codes (BF16=0, FP32=1, FP16=6)");
+
+    const std::uint32_t build_id_act = (ingine::kActDType == ingine::DType::FP16) ? 1u : 0u;
+    const std::uint32_t build_disk_act = static_cast<std::uint32_t>(ingine::kActDType);
+    expect(kv_checkpoint_act_dtype_matches(build_disk_act, build_id_act),
+           "active build kActDType matches its own StateIdentity::act_dtype");
+
+    // Same-dtype matches
+    expect(kv_checkpoint_act_dtype_matches(kDiskBf16, 0u), "same-BF16 disk(0) == identity(0)");
+    expect(kv_checkpoint_act_dtype_matches(kDiskFp16, 1u), "same-FP16 disk(6) == identity(1)");
+
+    // Mixed-dtype & raw-code collision rejections (fail-closed)
+    expect(!kv_checkpoint_act_dtype_matches(kDiskFp16, 0u), "mixed BF16 engine rejects FP16 disk(6)");
+    expect(!kv_checkpoint_act_dtype_matches(kDiskBf16, 1u), "mixed FP16 engine rejects BF16 disk(0)");
+    expect(!kv_checkpoint_act_dtype_matches(kDiskFp32, 1u), "FP16 engine rejects raw FP32 disk(1) collision");
+    expect(!kv_checkpoint_act_dtype_matches(kDiskFp32, 0u), "BF16 engine rejects raw FP32 disk(1)");
+    expect(!kv_checkpoint_act_dtype_matches(kDiskFp16, 6u), "unknown StateIdentity::act_dtype(6) fails closed");
+    expect(!kv_checkpoint_act_dtype_matches(99u, 0u) && !kv_checkpoint_act_dtype_matches(99u, 1u),
+           "unknown disk act_dtype(99) fails closed");
+
+    StateIdentity id_bf16;
+    id_bf16.model_sha256[0] = 0x42;
+    id_bf16.act_dtype = 0u;
+    id_bf16.dense_fp8 = true;
+    id_bf16.kv_format = 1u;
+    id_bf16.max_ctx = 65536;
+    id_bf16.prefill_chunk = 3072;
+    StateIdentity id_fp16 = id_bf16;
+    id_fp16.act_dtype = 1u;
+
+    const auto prod_bf16 = compute_disk_producer_sha256(id_bf16);
+    const auto prod_fp16 = compute_disk_producer_sha256(id_fp16);
+    expect(prod_bf16 != prod_fp16, "producer SHA distinguishes BF16 vs FP16");
+
+    // Deliberate compatible case: max_ctx differs (pos <= max_ctx) -> identical producer SHA
+    StateIdentity id_fp16_bigctx = id_fp16;
+    id_fp16_bigctx.max_ctx = 131072;
+    expect(compute_disk_producer_sha256(id_fp16_bigctx) == prod_fp16,
+           "producer SHA deliberately invariant to max_ctx (pos <= runtime.max_ctx checked at load)");
+
+    // Producer-affecting changes MUST alter producer SHA
+    StateIdentity id_fp16_densebf = id_fp16;
+    id_fp16_densebf.dense_fp8 = false;
+    StateIdentity id_fp16_chunk = id_fp16;
+    id_fp16_chunk.prefill_chunk = 1024;
+    StateIdentity id_fp16_otherpkg = id_fp16;
+    id_fp16_otherpkg.model_sha256[0] = 0x99;
+    expect(compute_disk_producer_sha256(id_fp16_densebf) != prod_fp16 &&
+               compute_disk_producer_sha256(id_fp16_chunk) != prod_fp16 &&
+               compute_disk_producer_sha256(id_fp16_otherpkg) != prod_fp16,
+           "producer SHA pins weights/model_sha256, dense_fp8, and prefill_chunk");
+
+    KvCheckpointInfo ckpt_bf16;
+    ckpt_bf16.pos = 128;
+    ckpt_bf16.max_ctx_at_save = 8192;
+    ckpt_bf16.act_dtype = kDiskBf16;
+    ckpt_bf16.kv_format = 1u;
+    ckpt_bf16.has_logits = true;
+    ckpt_bf16.has_producer_identity = true;
+    ckpt_bf16.producer_dense_fp8 = true;
+    ckpt_bf16.producer_prefill_chunk = 3072;
+    ckpt_bf16.producer_sha256 = prod_bf16;
+
+    KvCheckpointInfo ckpt_fp16 = ckpt_bf16;
+    ckpt_fp16.act_dtype = kDiskFp16;
+    ckpt_fp16.producer_sha256 = prod_fp16;
+
+    KvCheckpointInfo ckpt_fp32_bogus = ckpt_fp16;
+    ckpt_fp32_bogus.act_dtype = kDiskFp32;
+
+    // Runtime match & auto-resume eligibility across same-BF16, same-FP16, and mixed-dtype
+    expect(kv_checkpoint_runtime_matches(ckpt_bf16, id_bf16), "runtime match same-BF16");
+    expect(kv_checkpoint_runtime_matches(ckpt_fp16, id_fp16), "runtime match same-FP16");
+    expect(!kv_checkpoint_runtime_matches(ckpt_fp16, id_bf16), "runtime reject BF16 engine vs FP16 ckpt");
+    expect(!kv_checkpoint_runtime_matches(ckpt_bf16, id_fp16), "runtime reject FP16 engine vs BF16 ckpt");
+    expect(!kv_checkpoint_runtime_matches(ckpt_fp32_bogus, id_fp16), "runtime reject FP16 engine vs FP32(1) ckpt");
+
+    expect(kv_checkpoint_auto_resume_eligible(ckpt_bf16, id_bf16, prod_bf16, 256, 2048, false),
+           "auto-resume eligible same-BF16 (different max_ctx_at_save=8192 vs runtime max_ctx=2048)");
+    expect(kv_checkpoint_auto_resume_eligible(ckpt_fp16, id_fp16, prod_fp16, 256, 2048, false),
+           "auto-resume eligible same-FP16");
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16, id_bf16, prod_bf16, 256, 2048, false),
+           "auto-resume declines BF16 engine vs FP16 ckpt");
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_bf16, id_fp16, prod_fp16, 256, 2048, false),
+           "auto-resume declines FP16 engine vs BF16 ckpt");
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp32_bogus, id_fp16, prod_fp16, 256, 2048, false),
+           "auto-resume declines FP16 engine vs raw FP32(1) ckpt");
+
+    // Legacy checkpoint without verified producer trailer MUST be declined for auto-resume
+    KvCheckpointInfo ckpt_fp16_legacy = ckpt_fp16;
+    ckpt_fp16_legacy.has_producer_identity = false;
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16_legacy, id_fp16, prod_fp16, 256, 2048, false),
+           "auto-resume declines legacy config.json-only checkpoint (no verified producer identity)");
+
+    // Verified checkpoint with mismatched producer (different weights/dense_fp8/prefill_chunk) MUST be declined
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16, id_fp16, compute_disk_producer_sha256(id_fp16_densebf),
+                                               256, 2048, false),
+           "auto-resume declines mismatched producer dense_fp8");
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16, id_fp16, compute_disk_producer_sha256(id_fp16_chunk),
+                                               256, 2048, false),
+           "auto-resume declines mismatched producer prefill_chunk");
+
+    // Additional eligibility guards on same-FP16
+    KvCheckpointInfo ckpt_fp16_q4 = ckpt_fp16;
+    ckpt_fp16_q4.kv_format = 2u;
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16_q4, id_fp16, prod_fp16, 256, 2048, false),
+           "same-FP16 declines mismatched kv_format");
+    KvCheckpointInfo ckpt_fp16_nologits = ckpt_fp16;
+    ckpt_fp16_nologits.has_logits = false;
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16_nologits, id_fp16, prod_fp16, 128, 2048, false),
+           "same-FP16 declines has_logits=false at exact prompt length");
+    expect(kv_checkpoint_auto_resume_eligible(ckpt_fp16_nologits, id_fp16, prod_fp16, 256, 2048, false),
+           "same-FP16 allows has_logits=false for strict prefix");
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16, id_fp16, prod_fp16, 256, 2048, true),
+           "same-FP16 declines prefix containing media");
+    StateIdentity id_fp16_spec = id_fp16;
+    id_fp16_spec.spec_enabled = true;
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16, id_fp16_spec, prod_fp16, 256, 2048, false),
+           "same-FP16 declines when spec_enabled");
+
+    // Model-package fingerprint distinguishes packages sharing identical config.json (e.g. native vs EXL3-9G)
+    const std::filesystem::path pkg_base =
+        std::filesystem::temp_directory_path() / "ingine_test_model_pkg_sha";
+    std::error_code ec;
+    std::filesystem::remove_all(pkg_base, ec);
+    const auto pkg_a = pkg_base / "native_pkg";
+    const auto pkg_b = pkg_base / "exl3_pkg";
+    std::filesystem::create_directories(pkg_a);
+    std::filesystem::create_directories(pkg_b);
+    auto write_str = [](const std::filesystem::path& p, const std::string& s) {
+      std::ofstream out(p, std::ios::binary | std::ios::trunc);
+      out.write(s.data(), std::streamsize(s.size()));
+    };
+    const std::string shared_cfg = R"({"architectures":["Inkling2ForCausalLM"],"hidden_size":2304})";
+    write_str(pkg_a / "config.json", shared_cfg);
+    write_str(pkg_b / "config.json", shared_cfg);
+    write_str(pkg_a / "model.safetensors.index.json", R"({"weight_map":{"embed":"model-00001-of-00001.safetensors"}})");
+    write_str(pkg_b / "model.safetensors.index.json", R"({"weight_map":{"embed":"model-00001-of-00002.safetensors"}})");
+    expect(sha256_file_or_zero(pkg_a / "config.json") == sha256_file_or_zero(pkg_b / "config.json"),
+           "synthetic packages share identical config.json SHA");
+    expect(compute_model_package_sha256(pkg_a) != compute_model_package_sha256(pkg_b),
+           "compute_model_package_sha256 distinguishes packages with identical config.json");
+    std::filesystem::remove_all(pkg_base, ec);
+
+    // If local native and EXL3 Inkling packages are both present, verify they get distinct package SHAs
+    const std::filesystem::path real_native = "/mnt/storage/models/Inkling-2-Mini-ingine";
+    const std::filesystem::path real_exl3 = "/mnt/storage/models/Inkling-2-Mini-atlas-exl3-9g";
+    if (std::filesystem::exists(real_native / "config.json") && std::filesystem::exists(real_exl3 / "config.json")) {
+      expect(compute_model_package_sha256(real_native) != compute_model_package_sha256(real_exl3),
+             "compute_model_package_sha256 distinguishes local Inkling native vs EXL3-9G packages");
+    }
   }
 
   std::printf("%s model_data constants\n", ok ? "PASS" : "FAIL");

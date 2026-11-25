@@ -57,10 +57,9 @@ const RuntimeOptions& without_spec(const RuntimeOptions& options) {
 
 std::array<std::uint8_t, 32> compute_model_identity_sha(const RuntimeOptions& opt) {
   std::array<std::uint8_t, 64> buf{};
-  const auto cfg_sha =
-      opt.model_dir.empty() ? std::array<std::uint8_t, 32>{} : sha256_file_or_zero(opt.model_dir / "config.json");
+  const auto pkg_sha = compute_model_package_sha256(opt.model_dir);
   const auto abl_sha = opt.ablation.empty() ? std::array<std::uint8_t, 32>{} : sha256_file_or_zero(opt.ablation);
-  std::memcpy(buf.data(), cfg_sha.data(), 32);
+  std::memcpy(buf.data(), pkg_sha.data(), 32);
   std::memcpy(buf.data() + 32, abl_sha.data(), 32);
   return sha256_bytes(buf.data(), buf.size());
 }
@@ -202,6 +201,7 @@ class EngineGenerator final : public Generator {
     base_identity_.max_ctx = options_.max_ctx;
     base_identity_.prefill_chunk = options_.prefill_chunk;
     base_identity_.spec_enabled = (drafter_ != nullptr);
+    disk_producer_sha_ = compute_disk_producer_sha256(base_identity_);
 
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options_.vision) vision_ = std::make_unique<VisionEncoder>(options_.model_dir, rt_.stream());
@@ -541,8 +541,13 @@ class EngineGenerator final : public Generator {
       stats.reuse = Reuse::None;
       stats.restored_bytes = 0u;
       stats.restore_seconds = 0.0;
-      // Optional disk KV checkpoint resume (explicit --kv-ckpt-resume fails loudly; --kv-ckpt-path auto-resumes
-      // only when exact runtime identity, text-only prefix, drafter compatibility, and boundary logits are proved).
+      // Optional disk KV checkpoint resume (single-fd atomic validation + load):
+      //   * Explicit --kv-ckpt-resume fails loudly on runtime/producer/media/missing-logits mismatches, while
+      //     preserving legacy checkpoints that lack the v1 producer trailer (legacy resumes are never promoted
+      //     to reusable root entries).
+      //   * Auto --kv-ckpt-path requires verified producer identity (weights package + ablation + act_dtype +
+      //     dense_fp8 + kv_format + prefill_chunk), text-only prefix, non-spec mode, and boundary logits when
+      //     pos == n; deliberate compatible case: max_ctx_at_save may differ as long as pos <= runtime.max_ctx.
       auto has_media_before = [&](int pos_limit) {
         for (const PromptImage& img : images) {
           if (img.pos < pos_limit) return true;
@@ -561,52 +566,70 @@ class EngineGenerator final : public Generator {
           throw std::invalid_argument(
               "--kv-ckpt-resume is incompatible with --spec (disk checkpoint stores no DSpark drafter state)");
         }
-        const KvCheckpointInfo info = inspect_kv_checkpoint(options_.kv_ckpt_resume);
-        if (info.act_dtype != req_identity.act_dtype || info.kv_format != req_identity.kv_format) {
-          throw std::runtime_error("--kv-ckpt-resume runtime dtype/kv_format mismatch");
-        }
-        if (info.pos > 0 && has_media_before(info.pos)) {
-          throw std::invalid_argument(
-              "--kv-ckpt-resume cannot resume a prefix containing images (disk checkpoint hashes token IDs only)");
-        }
-        if (info.pos == int(n) && !info.has_logits) {
-          throw std::runtime_error(
-              "--kv-ckpt-resume checkpoint omits boundary logits (has_logits=false) at full prompt length");
-        }
         const auto tr = std::chrono::steady_clock::now();
-        const int resumed = load_kv_checkpoint(st, options_.model_dir, ids, static_cast<float*>(logits_.p),
-                                               options_.kv_ckpt_resume, stream);
-        start = std::size_t(resumed);
-        resumed_has_full_state = info.has_logits && !drafter_;
+        const KvCheckpointLoadResult res = load_kv_checkpoint_checked(
+            st, options_.model_dir, ids, static_cast<float*>(logits_.p), options_.kv_ckpt_resume, stream,
+            [&](const KvCheckpointInfo& info) -> bool {
+              if (!kv_checkpoint_runtime_matches(info, req_identity)) {
+                throw std::runtime_error("--kv-ckpt-resume runtime dtype/kv_format mismatch");
+              }
+              if (info.has_producer_identity && info.producer_sha256 != disk_producer_sha_) {
+                throw std::runtime_error(
+                    "--kv-ckpt-resume producer identity mismatch (weights package, dense_fp8, or prefill_chunk)");
+              }
+              if (info.pos > 0 && has_media_before(info.pos)) {
+                throw std::invalid_argument(
+                    "--kv-ckpt-resume cannot resume a prefix containing images (disk checkpoint hashes token IDs only)");
+              }
+              if (info.pos == int(n) && !info.has_logits) {
+                throw std::runtime_error(
+                    "--kv-ckpt-resume checkpoint omits boundary logits (has_logits=false) at full prompt length");
+              }
+              return true;
+            });
+        start = std::size_t(res.info.pos);
+        const bool verified_producer = res.info.has_producer_identity && res.info.producer_sha256 == disk_producer_sha_;
+        resumed_has_full_state = res.info.has_logits && !drafter_ && verified_producer;
         stats.reuse = Reuse::Checkpoint;
         stats.restored_bytes = std::nullopt;  // disk payload transfer bytes not counted inside load_kv_checkpoint
         stats.restore_seconds = seconds_since(tr);
-        std::fprintf(stderr, "[kv-ckpt] resumed %d / %zu tokens from %s (has_logits=%s)\n", resumed, n,
-                     options_.kv_ckpt_resume.c_str(), info.has_logits ? "true" : "false");
+        std::fprintf(stderr, "[kv-ckpt] resumed %d / %zu tokens from %s (has_logits=%s, verified_producer=%s)\n",
+                     res.info.pos, n, options_.kv_ckpt_resume.c_str(), res.info.has_logits ? "true" : "false",
+                     verified_producer ? "true" : "false");
       } else if (baseline_disk_ok && !drafter_ && !options_.kv_ckpt_path.empty() &&
                  std::filesystem::exists(options_.kv_ckpt_path)) {
         try {
-          const KvCheckpointInfo info = inspect_kv_checkpoint(options_.kv_ckpt_path);
-          const bool compat = info.pos > 0 && std::size_t(info.pos) <= n &&
-                              info.act_dtype == req_identity.act_dtype && info.kv_format == req_identity.kv_format &&
-                              info.pos <= options_.max_ctx && !has_media_before(info.pos) &&
-                              !(info.pos == int(n) && !info.has_logits);
-          if (compat) {
-            const auto psha = sha256_bytes(ids.data(), std::size_t(info.pos) * sizeof(std::int32_t));
-            if (psha == info.prompt_sha256) {
-              const auto tr = std::chrono::steady_clock::now();
-              const int resumed = load_kv_checkpoint(st, options_.model_dir, ids, static_cast<float*>(logits_.p),
-                                                     options_.kv_ckpt_path, stream);
-              start = std::size_t(resumed);
-              resumed_has_full_state = info.has_logits && !drafter_;
-              stats.reuse = Reuse::Checkpoint;
-              stats.restored_bytes = std::nullopt;
-              stats.restore_seconds = seconds_since(tr);
-              std::fprintf(stderr, "[kv-ckpt] auto-resumed %d / %zu tokens from %s (has_logits=%s)\n", resumed, n,
-                           options_.kv_ckpt_path.c_str(), info.has_logits ? "true" : "false");
-            }
+          const auto tr = std::chrono::steady_clock::now();
+          const KvCheckpointLoadResult res = load_kv_checkpoint_checked(
+              st, options_.model_dir, ids, static_cast<float*>(logits_.p), options_.kv_ckpt_path, stream,
+              [&](const KvCheckpointInfo& info) -> bool {
+                if (!kv_checkpoint_auto_resume_eligible(info, req_identity, disk_producer_sha_, n, options_.max_ctx,
+                                                        has_media_before(info.pos))) {
+                  return false;
+                }
+                const auto psha = sha256_bytes(ids.data(), std::size_t(info.pos) * sizeof(std::int32_t));
+                return psha == info.prompt_sha256;
+              });
+          if (res.loaded) {
+            start = std::size_t(res.info.pos);
+            const bool verified_producer =
+                res.info.has_producer_identity && res.info.producer_sha256 == disk_producer_sha_;
+            resumed_has_full_state = res.info.has_logits && !drafter_ && verified_producer;
+            stats.reuse = Reuse::Checkpoint;
+            stats.restored_bytes = std::nullopt;
+            stats.restore_seconds = seconds_since(tr);
+            std::fprintf(stderr, "[kv-ckpt] auto-resumed %d / %zu tokens from %s (has_logits=%s)\n", res.info.pos, n,
+                         options_.kv_ckpt_path.c_str(), res.info.has_logits ? "true" : "false");
           }
         } catch (const std::exception& e) {
+          // Always reset live/paged/recurrent state before cold fallback in case copying started before failure.
+          reset_state(st, stream);
+          if (drafter_) drafter_->reset();
+          start = 0;
+          resumed_has_full_state = false;
+          stats.reuse = Reuse::None;
+          stats.restored_bytes = 0u;
+          stats.restore_seconds = 0.0;
           std::fprintf(stderr, "[kv-ckpt] ignoring incompatible existing checkpoint %s: %s\n",
                        options_.kv_ckpt_path.c_str(), e.what());
         }
@@ -696,8 +719,9 @@ class EngineGenerator final : public Generator {
         const bool sigterm = kv_checkpoint_sigterm_requested();
         const bool periodic = (options_.kv_ckpt_every > 0 && done >= next_ckpt && done < n);
         if (periodic || sigterm) {
+          const KvCheckpointProducer producer{true, options_.dense_fp8, options_.prefill_chunk, disk_producer_sha_};
           save_kv_checkpoint(st, options_.model_dir, ids.subspan(0, done), static_cast<const float*>(logits_.p),
-                             options_.kv_ckpt_path, stream);
+                             options_.kv_ckpt_path, stream, &producer);
           std::fprintf(stderr, "[kv-ckpt] %s saved atomic checkpoint at pos=%zu / %zu -> %s\n",
                        sigterm ? "SIGTERM" : "periodic", done, n, options_.kv_ckpt_path.c_str());
           if (options_.kv_ckpt_every > 0) {
@@ -1127,14 +1151,17 @@ class EngineGenerator final : public Generator {
   }
 
   // Captures the live state at an exact verified root-prefix boundary `root_ids` right after prefilling to it.
-  // Uses the pre-allocated fixed `checkpoint_` device staging buffer (zero dynamic device staging allocation).
+  // Uses the pre-allocated fixed `checkpoint_` device staging buffer (zero dynamic device staging allocation) and
+  // books the exact live-to-staging D2D bytes copied into `cache_stats_.d2d_park_bytes`.
   void capture_root_checkpoint(std::span<const std::int32_t> root_ids, const std::vector<VerifiedImageSpan>& root_imgs,
                                const StateIdentity& identity, int& req_evictions) {
     char* p = static_cast<char*>(checkpoint_.p);
-    rt_.save_checkpoint(p);
-    if (drafter_) drafter_->save_checkpoint(p + checkpoint_drafter_);
+    std::size_t staging_d2d = rt_.save_checkpoint(p);
+    if (drafter_) staging_d2d += drafter_->save_checkpoint(p + checkpoint_drafter_);
     CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
+    staging_d2d += logits_.bytes;
+    cache_stats_.d2d_park_bytes += staging_d2d;
     store_parked_from_checkpoint(root_ids, root_imgs, identity, /*is_root=*/true, nullptr, req_evictions);
   }
 
@@ -1232,6 +1259,7 @@ class EngineGenerator final : public Generator {
   };
 
   StateIdentity base_identity_;
+  std::array<std::uint8_t, 32> disk_producer_sha_{};
   StateIdentity live_identity_;
   StateIdentity checkpoint_identity_;
   std::vector<std::int32_t> checkpoint_ids_;
