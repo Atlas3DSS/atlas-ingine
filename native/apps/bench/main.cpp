@@ -26,6 +26,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -54,6 +55,19 @@ std::vector<int> parse_csv_ints(const std::string& s) {
     const std::size_t comma = s.find(',', start);
     const std::string tok = s.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
     if (!tok.empty()) out.push_back(std::stoi(tok));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return out;
+}
+
+std::vector<double> parse_csv_doubles(const std::string& s) {
+  std::vector<double> out;
+  std::size_t start = 0;
+  while (start < s.size()) {
+    const std::size_t comma = s.find(',', start);
+    const std::string tok = s.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    if (!tok.empty()) out.push_back(std::stod(tok));
     if (comma == std::string::npos) break;
     start = comma + 1;
   }
@@ -164,7 +178,7 @@ int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   std::string kv_cache_mode = "per_pass";
-  std::string concurrency_csv;
+  std::string concurrency_csv, arrival_trace_csv;
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
   int max_batch = 0, max_kv_tokens = 0, vram_limit_mb = 0, stagger_join_tokens = 0, park_mb = -1, park_host_mb = 0,
@@ -240,8 +254,11 @@ int main(int argc, char** argv) {
   ap.flag("--ignore-eos", "with --concurrency: decode full --tokens per request (steady-state peak throughput)", &ignore_eos);
   ap.flag("--staggered", "with --concurrency: also run a staggered mid-generation continuous-batching arrival pass", &staggered);
   ap.option("--stagger-join-tokens", "",
-            "with --staggered: per-request emitted-token milestone in cohort 1 that triggers cohort 2 arrival (default: tokens/4)",
+            "with --staggered: exact per-request emitted-token milestone in cohort 1 that triggers cohort 2 arrival (default: tokens/4)",
             &stagger_join_tokens);
+  ap.option("--arrival-trace", "",
+            "with --staggered: optional comma-separated external arrival timestamps in ms (one per request 0..C-1)",
+            &arrival_trace_csv);
   ap.parse(argc, argv);
 
   try {
@@ -487,13 +504,24 @@ int main(int argc, char** argv) {
                                      {"runs", agg_rates}});
       }
 
+      int staggered_aborted_zero = 0;
       if (staggered && gen->max_batch_size() > 1) {
-        // Staggered continuous-batching pass: offer cohort 1 (C/2) at t=0, and offer cohort 2 (remaining C/2)
-        // when cohort 1's cumulative emitted tokens reach an identical output-token milestone (default: half * tokens/4),
-        // keeping plain (1 tok/round) and spec (k tok/round) on the exact same mid-generation overlap point!
+        // Staggered continuous-batching pass:
+        // - Default exact emission-point mode: caps cohort-1 step widths before join so EVERY cohort-1 slot hits
+        //   EXACTLY `join_tokens_per_req` (zero overshoot between 1 tok/round plain and k tok/round spec!).
+        // - Optional external arrival-trace mode (--arrival-trace ms0,ms1,...): replays identical wall-clock arrivals.
         const int C = resolved_max_batch;
         ingine::model::StaggeredBenchmarkState stg;
-        stg.init(C, tokens, stagger_join_tokens);
+        if (!arrival_trace_csv.empty()) {
+          std::vector<double> trace_ms = parse_csv_doubles(arrival_trace_csv);
+          if (int(trace_ms.size()) != C) {
+            throw std::invalid_argument("--arrival-trace must provide exactly max_batch (" + std::to_string(C) +
+                                        ") timestamps");
+          }
+          stg.init_external_trace(std::move(trace_ms));
+        } else {
+          stg.init(C, tokens, stagger_join_tokens);
+        }
         struct Active {
           int req_idx = 0;
           int slot = -1;
@@ -506,12 +534,18 @@ int main(int argc, char** argv) {
         auto is_eos = [&](int32_t t) {
           return !ignore_eos && std::find(stop.begin(), stop.end(), t) != stop.end();
         };
-        auto cohort1_active_count = [&]() {
-          int n = 0;
-          for (const auto& a : live)
-            if (a.req_idx < stg.cohort1_size) ++n;
-          return n;
+        auto cohort1_counts = [&]() -> std::pair<int, int> {
+          int active = 0, below_join = 0;
+          for (const auto& a : live) {
+            if (a.req_idx < stg.cohort1_size) {
+              ++active;
+              if (a.generated < stg.join_tokens_per_req) ++below_join;
+            }
+          }
+          return {active, below_join};
         };
+        const auto ts0 = Clock::now();
+        auto elapsed_ms = [&]() { return std::chrono::duration<double, std::milli>(Clock::now() - ts0).count(); };
         auto try_admit_pending = [&]() {
           while (!stg.pending.empty()) {
             const int req_idx = stg.pending.front();
@@ -522,7 +556,6 @@ int main(int argc, char** argv) {
             if (!gen->can_admit_slot(pr, tokens, s)) {
               ++stg.deferred_attempts;
               if (live.empty()) {
-                // Unadmittable even on an empty engine: account explicitly as dropped.
                 stg.pending.pop_front();
                 ++stg.dropped;
                 continue;
@@ -563,25 +596,36 @@ int main(int argc, char** argv) {
           }
         };
 
-        const auto ts0 = Clock::now();
         try_admit_pending();
         std::vector<ingine::model::BatchSlotStep> steps;
         std::vector<ingine::model::BatchSlotResult> results;
-        while (!live.empty() || !stg.pending.empty() || !stg.cohort2_offered) {
-          stg.maybe_offer_cohort2(step_n, cohort1_active_count());
+        while (!live.empty() || !stg.pending.empty() || stg.has_unoffered()) {
+          const auto [c1_act, c1_below] = cohort1_counts();
+          stg.maybe_offer_cohort2(step_n, c1_act, c1_below, elapsed_ms());
           try_admit_pending();
           if (live.empty()) {
-            if (!stg.cohort2_offered) {
-              stg.maybe_offer_cohort2(step_n, 0);
+            if (stg.has_unoffered()) {
+              if (stg.use_external_trace) {
+                const double wait_ms = stg.next_arrival_ms() - elapsed_ms();
+                if (wait_ms > 0.0) {
+                  std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(wait_ms));
+                }
+                stg.maybe_offer_cohort2(step_n, 0, 0, elapsed_ms());
+              } else {
+                stg.maybe_offer_cohort2(step_n, 0, 0, elapsed_ms());
+              }
               try_admit_pending();
               if (!live.empty()) continue;
             }
-            if (stg.pending.empty()) break;
+            if (stg.pending.empty() && !stg.has_unoffered()) break;
             continue;
           }
           steps.resize(live.size());
           results.resize(live.size());
-          for (std::size_t i = 0; i < live.size(); ++i) steps[i] = {live[i].slot, live[i].last_tok};
+          for (std::size_t i = 0; i < live.size(); ++i) {
+            const int cap = stg.step_max_tokens_for(live[i].req_idx, live[i].generated);
+            steps[i] = {live[i].slot, live[i].last_tok, cap};
+          }
           gen->step_slots_multi(steps, results);
           vram.sample();
           ++step_n;
@@ -610,10 +654,14 @@ int main(int argc, char** argv) {
                 break;
               }
             }
-            if (done || res.count == 0) {
+            if (done) {
               if (hit_eos) ++stg.eos_stopped;
               else ++stg.max_token_stopped;
               ++stg.completed;
+              gen->release_slot(live[i].slot);
+            } else if (res.count == 0) {
+              // Zero-result step below token budget: classify separately from completed/max-token-stopped!
+              ++stg.aborted_zero_result;
               gen->release_slot(live[i].slot);
             } else {
               kept.push_back(live[i]);
@@ -627,22 +675,27 @@ int main(int argc, char** argv) {
         if (!stg.accounting_consistent()) {
           throw std::runtime_error("staggered benchmark accounting invariant failed");
         }
+        staggered_aborted_zero = stg.aborted_zero_result;
         std::printf(
-            "staggered (C=%d, join_milestone=%d tok, cohort1@join=%d tok/%d active, round=%d): "
-            "offered=%d admitted=%d completed=%d dropped=%d deferred=%d eos0=%d | %d tok in %.2fs = %.1f tok/s "
+            "staggered (C=%d, policy=%s, join_milestone=%d tok, cohort1@join=%d tok/%d active, round=%d): "
+            "offered=%d admitted=%d completed=%d aborted_zero=%d dropped=%d deferred=%d eos0=%d | %d tok in %.2fs = %.1f tok/s "
             "(spec_rounds=%d, spec_accepted=%d)\n",
-            C, stg.join_milestone_tokens, stg.cohort1_emitted_at_join, stg.cohort1_active_at_join, stg.join_round,
-            stg.offered, stg.admitted, stg.completed, stg.dropped, stg.deferred_attempts, stg.eos_first_token,
-            total_gen, wall_s, eff_tok_s, total_spec_rounds, total_spec_accepted);
+            C, stg.use_external_trace ? "external_arrival_trace" : "exact_cohort1_emission_point",
+            stg.join_milestone_tokens, stg.cohort1_emitted_at_join, stg.cohort1_active_at_join, stg.join_round,
+            stg.offered, stg.admitted, stg.completed, stg.aborted_zero_result, stg.dropped, stg.deferred_attempts,
+            stg.eos_first_token, total_gen, wall_s, eff_tok_s, total_spec_rounds, total_spec_accepted);
         report["staggered"] = {{"concurrency", C},
-                               {"join_policy", "cohort1_emitted_tokens"},
+                               {"join_policy",
+                                stg.use_external_trace ? "external_arrival_trace" : "exact_cohort1_emission_point"},
                                {"join_milestone_tokens", stg.join_milestone_tokens},
                                {"cohort1_emitted_at_join", stg.cohort1_emitted_at_join},
                                {"cohort1_active_at_join", stg.cohort1_active_at_join},
                                {"join_round", stg.join_round},
+                               {"join_elapsed_ms", stg.join_elapsed_ms},
                                {"offered", stg.offered},
                                {"admitted", stg.admitted},
                                {"completed", stg.completed},
+                               {"aborted_zero_result", stg.aborted_zero_result},
                                {"dropped", stg.dropped},
                                {"deferred_attempts", stg.deferred_attempts},
                                {"eos_first_token", stg.eos_first_token},
@@ -669,7 +722,7 @@ int main(int argc, char** argv) {
                   vram.load_delta_gb(), vram.peak_delta_gb(), vram.peak_delta_mib(), vram.peak_device_used_gb(),
                   vram_limit_mb > 0 ? (vram_ok ? " [WITHIN LIMIT]" : " [EXCEEDED LIMIT]") : "");
       std::printf("%s\n", report.dump().c_str());
-      return vram_ok ? 0 : 1;
+      return (vram_ok && staggered_aborted_zero == 0) ? 0 : 1;
     }
 
     std::string json = "{";

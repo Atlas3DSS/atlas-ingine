@@ -4,6 +4,7 @@
 // 3. KV-page backpressure, error isolation (bad prompt fails without breaking active slots), and clean shutdown.
 #include "engine/scheduler.h"
 #include "ingine/batch_spec_plan.h"
+#include "model/batch_spec_verify.h"
 
 #include <algorithm>
 #include <atomic>
@@ -604,26 +605,40 @@ void test_confidence_width_and_page_budget_plan() {
 
 void test_staggered_milestone_and_accounting() {
   using ingine::model::StaggeredBenchmarkState;
+  using ingine::model::check_vram_lease_fit;
 
-  // Compare 32-token cap under 1 tok/round (plain) vs 4 tok/round (spec):
-  // Cohort 2 MUST join at the same output-token milestone (while cohort 1 is mid-generation and still active),
-  // NEVER after cohort 1 already finished at 32 tokens!
-  auto run_sim = [](int tok_per_round, bool first_eos_on_req0, int max_active_cap) {
+  // 1. Fail-closed VRAM lease check: remaining=0 MUST NOT be treated as unlimited!
+  {
+    CHECK(!check_vram_lease_fit(std::optional<std::size_t>(0), 1024).ok);
+    CHECK(check_vram_lease_fit(std::optional<std::size_t>(0), 0).ok);
+    CHECK(!check_vram_lease_fit(std::optional<std::size_t>(4096), 8192).ok);
+    CHECK(check_vram_lease_fit(std::optional<std::size_t>(4096), 4096).ok);
+    CHECK(check_vram_lease_fit(std::nullopt, 1ull << 40).ok);
+  }
+
+  // 2. Compare 32-token cap under 1 tok/round (plain) vs 4 tok/round (spec):
+  //    Using step_max_tokens_for(), BOTH plain and spec MUST hit cohort1_emitted_at_join == 32 EXACTLY (ZERO overshoot!)
+  //    while ALL 4 cohort-1 requests remain active mid-generation!
+  auto run_sim = [](int tok_per_round, bool first_eos_on_req0, int max_active_cap, bool inject_zero_result_req1) {
     const int C = 8;
     const int tokens = 32;
     StaggeredBenchmarkState stg;
-    stg.init(C, tokens, /*join_tokens_per_req=*/8);  // 4 cohort-1 reqs * 8 = 32 emitted tokens
+    stg.init(C, tokens, /*join_per_req=*/8);  // 4 cohort-1 reqs * 8 = 32 emitted tokens EXACT!
     struct Active {
       int req = 0;
       int gen = 0;
     };
     std::vector<Active> live;
     int round = 0;
-    auto c1_active = [&]() {
-      int n = 0;
-      for (const auto& a : live)
-        if (a.req < stg.cohort1_size) ++n;
-      return n;
+    auto c1_counts = [&]() -> std::pair<int, int> {
+      int act = 0, below = 0;
+      for (const auto& a : live) {
+        if (a.req < stg.cohort1_size) {
+          ++act;
+          if (a.gen < stg.join_tokens_per_req) ++below;
+        }
+      }
+      return {act, below};
     };
     auto try_admit = [&]() {
       while (!stg.pending.empty()) {
@@ -645,20 +660,28 @@ void test_staggered_milestone_and_accounting() {
       }
     };
     try_admit();
-    while (!live.empty() || !stg.pending.empty() || !stg.cohort2_offered) {
-      stg.maybe_offer_cohort2(round, c1_active());
+    while (!live.empty() || !stg.pending.empty() || stg.has_unoffered()) {
+      const auto [act, below] = c1_counts();
+      stg.maybe_offer_cohort2(round, act, below);
       try_admit();
       if (live.empty()) continue;
       ++round;
       std::vector<Active> kept;
       for (auto& a : live) {
-        for (int k = 0; k < tok_per_round && a.gen < tokens; ++k) {
+        const int step_cap = stg.step_max_tokens_for(a.req, a.gen);
+        int emit = tok_per_round;
+        if (step_cap > 0) emit = std::min(emit, step_cap);
+        if (inject_zero_result_req1 && a.req == 1 && a.gen == 1) emit = 0;
+        for (int k = 0; k < emit && a.gen < tokens; ++k) {
           ++a.gen;
           stg.note_emitted(a.req, 1);
         }
         if (a.gen >= tokens) {
           ++stg.max_token_stopped;
           ++stg.completed;
+        } else if (emit == 0) {
+          // Zero-result step below budget MUST NOT be counted as completed or max_token_stopped!
+          ++stg.aborted_zero_result;
         } else {
           kept.push_back(a);
         }
@@ -668,26 +691,132 @@ void test_staggered_milestone_and_accounting() {
     return stg;
   };
 
-  const auto plain = run_sim(1, false, 8);
-  const auto spec = run_sim(4, false, 8);
+  const auto plain = run_sim(1, false, 8, false);
+  const auto spec = run_sim(4, false, 8, false);
   CHECK(plain.accounting_consistent());
   CHECK(spec.accounting_consistent());
-  CHECK(plain.offered == 8 && plain.admitted == 8 && plain.completed == 8 && plain.dropped == 0);
-  CHECK(spec.offered == 8 && spec.admitted == 8 && spec.completed == 8 && spec.dropped == 0);
-  // Both join mid-generation while ALL 4 cohort-1 requests are still active (~8-9 tokens/req, well below 32)!
+  CHECK(plain.offered == 8 && plain.admitted == 8 && plain.completed == 8 && plain.aborted_zero_result == 0 && plain.dropped == 0);
+  CHECK(spec.offered == 8 && spec.admitted == 8 && spec.completed == 8 && spec.aborted_zero_result == 0 && spec.dropped == 0);
+  // EXACT zero-overshoot match across plain and spec: 32 == 32, both with 4 active cohort-1 slots!
   CHECK(plain.cohort1_active_at_join == 4);
   CHECK(spec.cohort1_active_at_join == 4);
   CHECK(plain.cohort1_emitted_at_join == 32);
-  CHECK(spec.cohort1_emitted_at_join >= 32 && spec.cohort1_emitted_at_join <= 36);
+  CHECK(spec.cohort1_emitted_at_join == 32);
   CHECK(plain.join_round == 7);
   CHECK(spec.join_round == 2);
 
-  // First-token EOS on req 0 + tight capacity cap (4) forcing deferral of cohort 2 until slots free!
-  const auto constrained = run_sim(4, true, 4);
+  // First-token EOS on req 0 + tight capacity cap (4) forcing deferral
+  const auto constrained = run_sim(4, true, 4, false);
   CHECK(constrained.accounting_consistent());
   CHECK(constrained.offered == 8 && constrained.admitted == 8 && constrained.completed == 8 && constrained.dropped == 0);
   CHECK(constrained.eos_first_token == 1);
   CHECK(constrained.deferred_attempts > 0);
+
+  // Zero-result step below budget: MUST be classified as aborted_zero_result=1, completed=7, max_token_stopped=7!
+  const auto zero_step = run_sim(4, false, 8, true);
+  CHECK(zero_step.accounting_consistent());
+  CHECK(zero_step.offered == 8 && zero_step.admitted == 8);
+  CHECK(zero_step.completed == 7 && zero_step.max_token_stopped == 7);
+  CHECK(zero_step.aborted_zero_result == 1);
+
+  // External arrival trace mode: frozen timestamps replayed identically
+  {
+    StaggeredBenchmarkState tr;
+    tr.init_external_trace({0.0, 0.0, 50.0, 50.0});
+    CHECK(tr.offered == 2 && tr.pending.size() == 2 && tr.has_unoffered());
+    tr.maybe_offer_cohort2(1, 2, 2, 25.0);
+    CHECK(tr.offered == 2 && tr.has_unoffered());
+    tr.maybe_offer_cohort2(2, 2, 2, 50.0);
+    CHECK(tr.offered == 4 && !tr.has_unoffered() && tr.join_round == 2);
+  }
+}
+
+void test_philox_sampled_and_cross_gear_controls() {
+  namespace sv = ingine::model::spec_verify;
+  using ingine::model::BatchSpecSlotTrace;
+
+  // 1. Exact Philox wrong-member control (reproduces review control: seed=12345, draws=7, uniform shortlist -> col 420!):
+  //    Valid Philox token 420 MUST pass; substituting wrong shortlist member 421 MUST be rejected!
+  {
+    constexpr int V = 1024;
+    BatchSpecSlotTrace tr{};
+    tr.has_draft = true;
+    tr.has_sampled_details = true;
+    tr.temperature = 0.8f;
+    tr.draft_seed = 12345ull;
+    tr.draft_draws = 7ull;
+    tr.w_cap = 2;
+    tr.W_batch = 2;
+    tr.draft_cand_idx.resize(sv::kGamma * sv::kCandidates);
+    tr.draft_cand_logits.assign(sv::kGamma * sv::kCandidates, 0.0f);  // uniform shortlist!
+    for (int r = 0; r < sv::kGamma; ++r) {
+      for (int k = 0; k < sv::kCandidates; ++k) {
+        tr.draft_cand_idx[std::size_t(r) * sv::kCandidates + k] = k;
+      }
+      const int col = sv::reconstruct_draft_column(
+          std::span<const float>(tr.draft_cand_logits.data() + std::size_t(r) * sv::kCandidates, sv::kCandidates),
+          tr.temperature, tr.draft_seed, tr.draft_draws, r);
+      tr.draft_tokens[r] = tr.draft_cand_idx[std::size_t(r) * sv::kCandidates + col];
+      tr.draft_conf[r] = 1.0f / float(sv::kCandidates);
+      tr.draft_qstats[r][0] = 0.0f;
+      tr.draft_qstats[r][1] = float(sv::kCandidates);
+    }
+    CHECK(tr.draft_tokens[0] == 420);  // exact review control value!
+
+    tr.accept_rng_seed = 99999ull;
+    tr.accept_rng_counter_u = 3ull;
+    tr.accept_rng_counter_resid = 4ull;
+    tr.uniforms = {sv::head_uniform(tr.accept_rng_seed, tr.accept_rng_counter_u, 0u)};
+    tr.target_probs.assign(std::size_t(tr.w_cap) * V, 1.0f / float(V));
+    // Force accept at r=0 (p(420) = 1.0 > u * q(420))
+    tr.target_probs[420] = 1.0f;
+    for (int v = 0; v < V; ++v)
+      if (v != 420) tr.target_probs[std::size_t(v)] = 0.0f;
+    tr.accepted = 1;
+    tr.residual_probs.assign(tr.target_probs.begin() + V, tr.target_probs.begin() + 2 * V);
+    tr.next_token = sv::head_sample_from_probs(tr.residual_probs, tr.accept_rng_seed, tr.accept_rng_counter_resid);
+    tr.commit = tr.accepted + 1;
+
+    CHECK(sv::validate_sampled_trace(tr, V).ok);
+
+    // Inject wrong in-shortlist draft token 421 -> MUST FAIL!
+    BatchSpecSlotTrace bad_draft = tr;
+    bad_draft.draft_tokens[0] = 421;
+    const auto r_bad = sv::validate_sampled_trace(bad_draft, V);
+    CHECK(!r_bad.ok);
+    CHECK(r_bad.reason.find("Philox draft token mismatch") != std::string::npos);
+
+    // Inject wrong uniform draw -> MUST FAIL!
+    BatchSpecSlotTrace bad_u = tr;
+    bad_u.uniforms[0] = std::fmod(bad_u.uniforms[0] + 0.1f, 1.0f);
+    CHECK(!sv::validate_sampled_trace(bad_u, V).ok);
+
+    // Inject wrong next token -> MUST FAIL!
+    BatchSpecSlotTrace bad_next = tr;
+    bad_next.next_token = (bad_next.next_token + 1) % V;
+    CHECK(!sv::validate_sampled_trace(bad_next, V).ok);
+  }
+
+  // 2. Cross-gear divergence binding controls:
+  //    - Identical rows [0, 0, 3] with claimed differing tokens 0 vs 1 MUST FAIL (neither is argmax=2)!
+  //    - Empty capture MUST FAIL!
+  //    - Genuine tight near-tie where argmax(l_plain)==0 and argmax(l_spec)==1 MUST PASS!
+  {
+    const std::vector<float> identical = {0.f, 0.f, 3.f};
+    CHECK(!sv::validate_cross_gear_divergence(identical, identical, 0, 1, 3, 0.6f).ok);
+    CHECK(!sv::validate_cross_gear_divergence({}, {}, 0, 1, 3, 0.6f).ok);
+
+    const std::vector<float> lp = {2.01f, 2.00f, -1.f};
+    const std::vector<float> ls = {1.99f, 2.02f, -1.f};
+    const auto ok_tie = sv::validate_cross_gear_divergence(lp, ls, 0, 1, 3, 0.6f);
+    CHECK(ok_tie.ok);
+    CHECK(ok_tie.argmax_plain == 0 && ok_tie.argmax_spec == 1);
+    CHECK(ok_tie.margin_plain >= 0.f && ok_tie.margin_spec >= 0.f);
+
+    // Large logit divergence exceeding bound MUST FAIL!
+    const std::vector<float> ls_bug = {0.5f, 3.0f, -1.f};
+    CHECK(!sv::validate_cross_gear_divergence(lp, ls_bug, 0, 1, 3, 0.6f).ok);
+  }
 }
 
 }  // namespace
@@ -702,6 +831,7 @@ int main() {
   test_batched_spec_multi_token_stop_budget_cancel();
   test_confidence_width_and_page_budget_plan();
   test_staggered_milestone_and_accounting();
+  test_philox_sampled_and_cross_gear_controls();
   std::printf(g_failures ? "FAILED (%d checks)\n" : "batch_scheduler ok\n", g_failures);
   return g_failures ? 1 : 0;
 }

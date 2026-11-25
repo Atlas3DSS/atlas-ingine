@@ -31,6 +31,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -180,11 +181,70 @@ struct BatchStatePool {
   std::vector<bool> slot_in_use;
 
   void init(int max_b, int ctx, bool fp8, int max_kv_tokens, std::size_t extra_reserve_bytes = 0,
-            std::size_t vram_budget_bytes = 0) {
+            std::optional<std::size_t> vram_budget_bytes = std::nullopt) {
     max_batch = max_b;
     max_ctx = ctx;
     kv_fp8 = fp8;
     max_pages_per_slot = (ctx + bk::kPageSize - 1) / bk::kPageSize;
+
+    // Pre-compute ALL fixed pool buffer sizes BEFORE allocating a single byte so lease caps fail closed!
+    const std::size_t es = fp8 ? 1 : 2;
+    const std::size_t scratch_bytes = std::size_t(NUM_FULL_VISITS) * ctx * KV_DIM * es;
+    const std::size_t fixed_bytes =
+        2 * std::size_t(max_b) * ring_slot_stride * sizeof(ActT) +
+        std::size_t(max_b) * ring_pos_slot_stride * sizeof(std::int64_t) +
+        2 * std::size_t(max_b) * conv_kv_slot_stride * sizeof(float) +
+        2 * std::size_t(max_b) * conv_h_slot_stride * sizeof(float) +
+        std::size_t(max_b) * sizeof(std::int64_t) +
+        2 * scratch_bytes +
+        std::size_t(max_b) * max_pages_per_slot * sizeof(std::int32_t);
+
+    // Paged full-KV pool sizing (explicitly reserves extra_reserve_bytes for decoder/logits/rollback/graphs
+    // and enforces vram_budget_bytes on BOTH explicit max_kv_tokens and auto-sized branches!).
+    const std::size_t page_kv_bytes = std::size_t(NUM_FULL_VISITS) * bk::kPageSize * KV_DIM * es;
+    const std::size_t bytes_per_page = 2 * page_kv_bytes;  // K + V
+    const int max_possible_pages = max_b * max_pages_per_slot;
+    if (max_kv_tokens > 0) {
+      num_pages =
+          std::min(max_possible_pages, std::max(max_pages_per_slot, (max_kv_tokens + bk::kPageSize - 1) / bk::kPageSize));
+      const std::size_t total_planned = fixed_bytes + std::size_t(num_pages) * bytes_per_page + extra_reserve_bytes;
+      const VramLeaseCheck chk = check_vram_lease_fit(vram_budget_bytes, total_planned);
+      if (!chk.ok) {
+        throw std::runtime_error("BatchStatePool: VRAM lease cap exceeded for explicit max_kv_tokens=" +
+                                 std::to_string(max_kv_tokens) + " (need " + std::to_string(chk.planned_bytes >> 20) +
+                                 " MiB including decoder reserve, remaining " +
+                                 std::to_string(chk.remaining_bytes >> 20) + " MiB)");
+      }
+    } else {
+      std::size_t free_bytes = 0, total_bytes = 0;
+      CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+      if (vram_budget_bytes.has_value()) {
+        const std::size_t min_needed = fixed_bytes + extra_reserve_bytes;
+        if (*vram_budget_bytes <= min_needed) {
+          throw std::runtime_error("BatchStatePool: VRAM lease cap exhausted before paged KV pool allocation (need >= " +
+                                   std::to_string(min_needed >> 20) + " MiB, remaining " +
+                                   std::to_string(*vram_budget_bytes >> 20) + " MiB)");
+        }
+        const std::size_t cap_avail = std::min(free_bytes, *vram_budget_bytes) > min_needed
+                                          ? (std::min(free_bytes, *vram_budget_bytes) - min_needed)
+                                          : 0;
+        const int fit_pages = int(cap_avail / bytes_per_page);
+        if (fit_pages < max_pages_per_slot) {
+          throw std::runtime_error("BatchStatePool: VRAM lease cap cannot fit minimum 1-slot full-KV pool (" +
+                                   std::to_string(max_pages_per_slot) + " pages needed, only " +
+                                   std::to_string(fit_pages) + " fit in remaining " +
+                                   std::to_string(*vram_budget_bytes >> 20) + " MiB)");
+        }
+        num_pages = std::min(max_possible_pages, fit_pages);
+      } else {
+        const std::size_t base_reserve = std::min<std::size_t>(std::size_t(2560) << 20, free_bytes / 4);
+        const std::size_t reserve = base_reserve + extra_reserve_bytes + fixed_bytes;
+        const std::size_t avail = free_bytes > reserve ? free_bytes - reserve : 0;
+        const int fit_pages = int(avail / bytes_per_page);
+        num_pages = std::min(max_possible_pages, std::max(std::min(max_possible_pages, max_pages_per_slot), fit_pages));
+      }
+      if (num_pages < 1) throw std::runtime_error("BatchStatePool: insufficient VRAM for paged full-KV pool");
+    }
 
     // Allocate per-slot sliding rings & conv states
     k_ring = DeviceBuffer(std::size_t(max_b) * ring_slot_stride * sizeof(ActT));
@@ -206,36 +266,10 @@ struct BatchStatePool {
     slot_pos.fill(0);
 
     // Scratch full-KV buffer for single-sequence Prefiller
-    const std::size_t es = fp8 ? 1 : 2;
-    const std::size_t scratch_bytes = std::size_t(NUM_FULL_VISITS) * ctx * KV_DIM * es;
     scratch_k_full = DeviceBuffer(scratch_bytes);
     scratch_v_full = DeviceBuffer(scratch_bytes);
     scratch_k_full.fill(0);
     scratch_v_full.fill(0);
-
-    // Paged full-KV pool sizing (explicitly reserves extra_reserve_bytes for decoder/logits/rollback/graphs).
-    const std::size_t page_kv_bytes = std::size_t(NUM_FULL_VISITS) * bk::kPageSize * KV_DIM * es;
-    const std::size_t bytes_per_page = 2 * page_kv_bytes;  // K + V
-    const int max_possible_pages = max_b * max_pages_per_slot;
-    if (max_kv_tokens > 0) {
-      num_pages = std::min(max_possible_pages, std::max(max_pages_per_slot, (max_kv_tokens + bk::kPageSize - 1) / bk::kPageSize));
-    } else {
-      std::size_t free_bytes = 0, total_bytes = 0;
-      CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-      if (vram_budget_bytes > 0) {
-        const std::size_t fixed_used = k_ring.bytes + v_ring.bytes + ring_pos.bytes + conv_k.bytes + conv_v.bytes +
-                                       conv_attn.bytes + conv_mlp.bytes + slot_pos.bytes + scratch_k_full.bytes +
-                                       scratch_v_full.bytes;
-        const std::size_t rem_budget = vram_budget_bytes > fixed_used ? (vram_budget_bytes - fixed_used) : 0;
-        free_bytes = std::min(free_bytes, rem_budget);
-      }
-      const std::size_t base_reserve = std::min<std::size_t>(std::size_t(2560) << 20, free_bytes / 4);
-      const std::size_t reserve = base_reserve + extra_reserve_bytes;
-      const std::size_t avail = free_bytes > reserve ? free_bytes - reserve : 0;
-      const int fit_pages = int(avail / bytes_per_page);
-      num_pages = std::min(max_possible_pages, std::max(std::min(max_possible_pages, max_pages_per_slot), fit_pages));
-      if (num_pages < 1) throw std::runtime_error("BatchStatePool: insufficient VRAM for paged full-KV pool");
-    }
 
     k_full_pool = DeviceBuffer(std::size_t(num_pages) * page_kv_bytes);
     v_full_pool = DeviceBuffer(std::size_t(num_pages) * page_kv_bytes);
@@ -1765,7 +1799,8 @@ class BatchGenerator final : public Generator {
                                                          pos,
                                                          options_.max_ctx,
                                                          max_pos_res,
-                                                         int(pool_.slot_pages[s].size())};
+                                                         int(pool_.slot_pages[s].size()),
+                                                         inputs[b].max_tokens};
     }
 
     int other_reserved = 0;
@@ -2237,21 +2272,43 @@ class BatchGenerator final : public Generator {
     }
     model_sha256_ = sha256_bytes(id_buf.data(), id_buf.size());
 
-    auto remaining_lease_bytes = [&]() -> std::size_t {
+    const std::optional<std::size_t> vram_limit_bytes =
+        options_.vram_limit_mb > 0 ? std::optional<std::size_t>(std::size_t(options_.vram_limit_mb) << 20)
+                                   : std::nullopt;
+    auto remaining_lease_opt = [&]() -> std::optional<std::size_t> {
+      if (!vram_limit_bytes.has_value()) return std::nullopt;
       std::size_t free_b = 0, total_b = 0;
       CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-      if (options_.vram_limit_mb <= 0) return free_b;
-      const std::size_t limit_b = std::size_t(options_.vram_limit_mb) << 20;
       const std::size_t used_since_entry = free_at_entry_ > free_b ? (free_at_entry_ - free_b) : 0;
-      const std::size_t rem = limit_b > used_since_entry ? (limit_b - used_since_entry) : 0;
+      const std::size_t rem = *vram_limit_bytes > used_since_entry ? (*vram_limit_bytes - used_since_entry) : 0;
       return std::min(free_b, rem);
     };
+    auto effective_free_bytes = [&]() -> std::size_t {
+      const auto rem = remaining_lease_opt();
+      if (rem.has_value()) return *rem;
+      std::size_t free_b = 0, total_b = 0;
+      CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+      return free_b;
+    };
+    auto enforce_lease_now = [&](const char* phase) {
+      if (!vram_limit_bytes.has_value()) return;
+      std::size_t free_b = 0, total_b = 0;
+      CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+      const std::size_t used_since_entry = free_at_entry_ > free_b ? (free_at_entry_ - free_b) : 0;
+      if (used_since_entry > *vram_limit_bytes) {
+        throw std::runtime_error(std::string("BatchGenerator: VRAM lease cap exceeded after ") + phase + " (used " +
+                                 std::to_string(used_since_entry >> 20) + " MiB > cap " +
+                                 std::to_string(*vram_limit_bytes >> 20) + " MiB)");
+      }
+    };
+    enforce_lease_now("weights+prefiller");
 
     // Size and allocate BatchDrafter BEFORE BatchStatePool page reservation so VRAM headroom is exact.
     max_verify_width_ = 1;
-    std::size_t decoder_reserve_bytes = 0;
+    std::size_t decoder_reserve_bytes =
+        BatchDecoder::estimate_bytes(options_.max_batch, 1, options_.dense_fp8, false);
     if (options_.spec) {
-      const std::size_t free_b = remaining_lease_bytes();
+      const std::size_t free_b = effective_free_bytes();
       max_verify_width_ = 8;
       // Only step down from W=8 if dense verify activations + rollback + drafter would crowd out VRAM.
       const std::size_t min_kv_headroom = std::size_t(2048) << 20;
@@ -2265,32 +2322,47 @@ class BatchGenerator final : public Generator {
       }
       drafter_ = std::make_unique<BatchDrafter>(options_.model_dir, weights_, options_.max_batch, options_.max_ctx,
                                                 max_verify_width_, stream_, BatchDrafter::SHORTLIST_ROWS,
-                                                options_.vram_limit_mb > 0 ? remaining_lease_bytes() : 0);
+                                                remaining_lease_opt());
       prefill_taps_ = DeviceBuffer(std::size_t(prefill_chunk_) * NUM_TAPS * H * sizeof(ActT));
       decoder_reserve_bytes =
           BatchDecoder::estimate_bytes(options_.max_batch, max_verify_width_, options_.dense_fp8, true);
+      enforce_lease_now("BatchDrafter");
     }
 
     pool_.init(options_.max_batch, options_.max_ctx, options_.kv_fp8, options_.max_kv_tokens, decoder_reserve_bytes,
-               options_.vram_limit_mb > 0 ? remaining_lease_bytes() : 0);
+               remaining_lease_opt());
+    enforce_lease_now("BatchStatePool");
     slot_meta_.resize(options_.max_batch);
 
+    {
+      const VramLeaseCheck chk = check_vram_lease_fit(remaining_lease_opt(), decoder_reserve_bytes);
+      if (!chk.ok) {
+        throw std::runtime_error("BatchGenerator: VRAM lease cap exceeded before BatchDecoder allocation (need " +
+                                 std::to_string(chk.planned_bytes >> 20) + " MiB, remaining " +
+                                 std::to_string(chk.remaining_bytes >> 20) + " MiB)");
+      }
+    }
     decoder_ = std::make_unique<BatchDecoder>(weights_, ablation_, pool_, options_.max_batch, max_verify_width_,
                                               drafter_ != nullptr);
     decoder_->capture_buckets(stream_);
     CUDA_CHECK(cudaEventCreate(&restore_ev_start_));
     CUDA_CHECK(cudaEventCreate(&restore_ev_stop_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
+    enforce_lease_now("BatchDecoder+graphs");
 
-    // Size private recurrent/tail/logits VRAM budget for prefix checkpoints (never starves active pool).
+    // Size private recurrent/tail/logits VRAM budget for prefix checkpoints (never starves active pool or exceeds lease).
     if (!options_.prefix_cache || options_.park_mb == 0) {
       prefix_cache_.set_vram_budget(0);
     } else if (options_.park_mb > 0) {
-      std::size_t cap = std::size_t(options_.park_mb) << 20;
-      if (options_.vram_limit_mb > 0) cap = std::min(cap, remaining_lease_bytes() / 2);
+      const std::size_t cap = std::size_t(options_.park_mb) << 20;
+      const VramLeaseCheck chk = check_vram_lease_fit(remaining_lease_opt(), cap);
+      if (!chk.ok) {
+        throw std::runtime_error("BatchGenerator: explicit --park-mb=" + std::to_string(options_.park_mb) +
+                                 " exceeds remaining VRAM lease (" + std::to_string(chk.remaining_bytes >> 20) + " MiB)");
+      }
       prefix_cache_.set_vram_budget(cap);
     } else {
-      const std::size_t free_b = remaining_lease_bytes();
+      const std::size_t free_b = effective_free_bytes();
       const std::size_t reserve = std::min<std::size_t>(std::size_t(1024) << 20, free_b / 4);
       const std::size_t avail = free_b > reserve ? free_b - reserve : 0;
       const std::size_t auto_cap = std::min<std::size_t>(std::size_t(2048) << 20, avail / 2);

@@ -207,6 +207,8 @@ struct RuntimeOptions {
 struct BatchSlotStep {
   int slot = -1;
   int32_t token = 0;
+  // Optional per-step emission cap (0 = unconstrained; >0 clamps this slot's verify width w_cap <= max_tokens).
+  int max_tokens = 0;
 };
 
 // Output of one batched speculative (or plain 1-token) decode step for one slot.

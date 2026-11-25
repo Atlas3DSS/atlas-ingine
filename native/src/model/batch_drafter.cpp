@@ -41,16 +41,27 @@ std::vector<float> bf16_to_float(const std::vector<std::byte>& raw) {
   return out;
 }
 
-int choose_draft_ctx(int max_batch, int max_ctx, std::size_t vram_budget_bytes) {
+int choose_draft_ctx(int max_batch, int max_ctx, std::optional<std::size_t> vram_budget_bytes) {
   std::size_t free_b = 0, total_b = 0;
   CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-  if (vram_budget_bytes > 0) free_b = std::min(free_b, vram_budget_bytes);
+  if (vram_budget_bytes.has_value()) free_b = std::min(free_b, *vram_budget_bytes);
   int cap = 4096;
   if (max_batch <= 8 && free_b > (std::size_t(12) << 30)) cap = 65536;
   else if (free_b > (std::size_t(48) << 30)) cap = 16384;
   else if (free_b > (std::size_t(18) << 30)) cap = 8192;
   else if (free_b < (std::size_t(6) << 30)) cap = 2048;
   return std::max(std::min(max_ctx, 1024), std::min(max_ctx, cap));
+}
+
+std::size_t estimate_drafter_bytes(int max_batch, int draft_ctx, int vocab, int shortlist_rows) {
+  // Conservative lower-bound estimate before allocating: weights/folded head + per-slot KV rings + acceptance scratch.
+  const std::size_t folded_head = std::size_t(vocab) * (kd::RANK + 1) * sizeof(ActT);
+  const std::size_t shortlist_w = std::size_t(shortlist_rows + 256) * H;
+  const std::size_t local_kv = std::size_t(max_batch) * 4 * LOCAL_SLOTS * kd::KV_DIM * sizeof(ActT);
+  const std::size_t global_kv = std::size_t(max_batch) * 2 * std::size_t(draft_ctx) * GLOBAL_SLOT_BYTES;
+  const std::size_t accept_bufs = std::size_t(kd::BLOCK + kd::GAMMA + 1) * std::size_t(vocab) * sizeof(float);
+  const std::size_t base_buf = std::size_t(max_batch) * kd::GAMMA * std::size_t(shortlist_rows + kd::kMaxSlotExtra) * sizeof(float);
+  return folded_head + shortlist_w + local_kv + global_kv + accept_bufs + base_buf;
 }
 
 }  // namespace
@@ -61,7 +72,8 @@ void* BatchDrafter::alloc(std::size_t bytes) {
 }
 
 BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights& w, int max_batch, int max_ctx,
-                           int max_verify_width, cudaStream_t stream, int shortlist_rows, std::size_t vram_budget_bytes)
+                           int max_verify_width, cudaStream_t stream, int shortlist_rows,
+                           std::optional<std::size_t> vram_budget_bytes)
     : w_(w),
       stream_(stream),
       max_batch_(max_batch),
@@ -72,6 +84,14 @@ BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights
       commit_meta_host_(std::size_t(max_batch) * sizeof(kd::BatchSlotCommitMeta)) {
   if (max_batch < 1) throw std::invalid_argument("BatchDrafter: max_batch must be >= 1");
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("BatchDrafter: max_ctx must hold two blocks");
+  if (vram_budget_bytes.has_value()) {
+    const std::size_t est = estimate_drafter_bytes(max_batch, ctx_, w.unembed.rows(), shortlist_rows);
+    if (est > *vram_budget_bytes) {
+      throw std::runtime_error("BatchDrafter: VRAM lease cap exceeded before allocation (need >= " +
+                               std::to_string(est >> 20) + " MiB, remaining " +
+                               std::to_string(*vram_budget_bytes >> 20) + " MiB)");
+    }
+  }
   head_ = {w.unembed.w.data, w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
            w.unembed.rows()};
   V_ = w.unembed.rows();

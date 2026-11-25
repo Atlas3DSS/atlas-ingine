@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <unordered_set>
 #include <vector>
@@ -76,7 +77,7 @@ class BatchDrafter {
 
   BatchDrafter(const std::filesystem::path& model_dir, const Weights& w, int max_batch, int max_ctx,
                int max_verify_width, cudaStream_t stream, int shortlist_rows = SHORTLIST_ROWS,
-               std::size_t vram_budget_bytes = 0);
+               std::optional<std::size_t> vram_budget_bytes = std::nullopt);
   ~BatchDrafter();
   BatchDrafter(const BatchDrafter&) = delete;
   BatchDrafter& operator=(const BatchDrafter&) = delete;
