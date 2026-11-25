@@ -1,10 +1,10 @@
 # Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
 cmake_minimum_required(VERSION 3.28)
 
-set(INGINE_BACKEND "CUDA" CACHE STRING "Compute backend (CUDA, CPU)")
-set_property(CACHE INGINE_BACKEND PROPERTY STRINGS CUDA CPU)
-if(NOT INGINE_BACKEND STREQUAL "CUDA" AND NOT INGINE_BACKEND STREQUAL "CPU")
-  message(FATAL_ERROR "Unsupported INGINE_BACKEND='${INGINE_BACKEND}' (First Slice supports CUDA or CPU)")
+set(INGINE_BACKEND "CUDA" CACHE STRING "Compute backend (CUDA, CPU, HIP, MLX, SYCL)")
+set_property(CACHE INGINE_BACKEND PROPERTY STRINGS CUDA CPU HIP MLX SYCL)
+if(NOT INGINE_BACKEND MATCHES "^(CUDA|CPU|HIP|MLX|SYCL)$")
+  message(FATAL_ERROR "Unsupported INGINE_BACKEND='${INGINE_BACKEND}' (expected CUDA, CPU, HIP, MLX, or SYCL)")
 endif()
 
 if(INGINE_BACKEND STREQUAL "CUDA")
@@ -83,6 +83,13 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
 endif()
 
 include(cmake/Dependencies.cmake)
+if(INGINE_BACKEND STREQUAL "HIP")
+  include(cmake/hip_backend.cmake)
+elseif(INGINE_BACKEND STREQUAL "MLX")
+  include(cmake/mlx_backend.cmake)
+elseif(INGINE_BACKEND STREQUAL "SYCL")
+  include(cmake/sycl_backend.cmake)
+endif()
 
 add_subdirectory(third_party)
 add_subdirectory(src/core)

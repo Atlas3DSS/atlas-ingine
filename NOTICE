@@ -130,3 +130,13 @@ Modifications by Atlas3DSS:
     escha-mlx and Kintsugi-Inkling-2-Mini (Apache License 2.0).
 - Native OpenAI response_format (text, json_object, json_schema) and automatic
   tool-invocation token suppression when tools are omitted.
+- Phase 3 target vendor backend slices (pure native C++20 AMD ROCm/HIP, Apple
+  MLX/Metal, Intel SYCL/oneAPI HAL/Ops/policy primitives):
+  * HIP device intrinsic compatibility mappings (v_perm_b32, sudot4/sdot4, SWAR
+    vsub4, wave64 logical-32 half-wavefront ballot/sync, gfx11/gfx12 RDNA WMMA
+    row mapping, EXL3 scalar prompt tile policy) and Metal parallel pread
+    chunking patterns studied from Strata / Project Maya
+    (https://github.com/Atlas3DSS/project-maya, MIT License).
+  * HIP/SYCL CMake discovery patterns (oneAPI SYCL/icpx, Level Zero direct
+    device allocation, oneMKL/oneDNN vendor guard) studied from ggml-hip and
+    ggml-sycl in llama.cpp / atlas-engine (MIT License, Copyright (c) The ggml authors).

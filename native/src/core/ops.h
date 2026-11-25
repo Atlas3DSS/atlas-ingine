@@ -39,6 +39,8 @@ enum class DispatchPath : std::uint8_t {
 //     every execution/replay. Requires non-null args.invalid_token_flag (throws std::invalid_argument if null),
 //     clears it stream-ordered to 0 before every launch/replay, records 1 on OOB without fabricating zero rows,
 //     and is enforced after synchronization via ops::check_deferred_token_bounds(flag, desc.vocab_size).
+//     Caller contract: whenever *invalid_token_flag != 0, treat the entire output tensor as unusable
+//     (CUDA native still computes valid neighboring rows, whereas CPU native/portable leave output unchanged).
 //   * PreValidated: for model callers enforcing [0, vocab_size) at host admission before every launch/replay
 //     (EngineGenerator, BatchGenerator, Runtime::set_inputs). Preserves zero-sync capture/fast path while
 //     device kernels still guard OOB table reads and record invalid_token_flag (cleared stream-ordered).

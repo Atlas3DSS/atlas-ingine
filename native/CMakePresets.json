@@ -97,6 +97,43 @@
         "INGINE_BUILD_APPS": "ON",
         "INGINE_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "hip-dev",
+      "displayName": "AMD ROCm/HIP pure native C++ backend build (zero CUDA)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-hip",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "INGINE_BACKEND": "HIP",
+        "INGINE_HIP_ARCHITECTURES": "gfx1100;gfx1101;gfx1151;gfx1200;gfx1201;gfx942",
+        "INGINE_BUILD_APPS": "ON",
+        "INGINE_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "mlx-dev",
+      "displayName": "Apple MLX C++20 / Metal native backend build (macOS Apple Silicon)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-mlx",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "INGINE_BACKEND": "MLX",
+        "INGINE_BUILD_APPS": "ON",
+        "INGINE_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "sycl-dev",
+      "displayName": "Intel SYCL / oneAPI C++20 backend build (zero CUDA)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-sycl",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "INGINE_BACKEND": "SYCL",
+        "INGINE_BUILD_APPS": "ON",
+        "INGINE_BUILD_TESTS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -108,7 +145,10 @@
     { "name": "sm70-dev", "configurePreset": "sm70-dev" },
     { "name": "sm70-simt-dev", "configurePreset": "sm70-simt-dev" },
     { "name": "legacy-fp16", "configurePreset": "legacy-fp16" },
-    { "name": "cpu-dev", "configurePreset": "cpu-dev" }
+    { "name": "cpu-dev", "configurePreset": "cpu-dev" },
+    { "name": "hip-dev", "configurePreset": "hip-dev" },
+    { "name": "mlx-dev", "configurePreset": "mlx-dev" },
+    { "name": "sycl-dev", "configurePreset": "sycl-dev" }
   ],
   "testPresets": [
     {
@@ -134,6 +174,21 @@
     {
       "name": "cpu-dev",
       "configurePreset": "cpu-dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "hip-dev",
+      "configurePreset": "hip-dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "mlx-dev",
+      "configurePreset": "mlx-dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "sycl-dev",
+      "configurePreset": "sycl-dev",
       "output": { "outputOnFailure": true }
     }
   ]

@@ -561,6 +561,7 @@ DeviceCaps query_device_caps(int device_id) {
   caps.backend = BackendKind::Cpu;
   caps.primary_space = MemorySpace::Host;
   caps.name = "cpu-host";
+  caps.arch_name = "cpu";
   caps.device_id = 0;
   caps.arch_major = 0;
   caps.arch_minor = 0;
@@ -572,6 +573,8 @@ DeviceCaps query_device_caps(int device_id) {
   caps.supports_graph_capture = false;
   caps.supports_conditional_graph = false;
   caps.supports_pdl = false;
+  caps.supports_wmma_or_xmx = false;
+  caps.prefers_direct_device_alloc = false;
   caps.unified_memory = true;
   return caps;
 }

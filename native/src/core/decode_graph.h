@@ -5,13 +5,43 @@
 
 #pragma once
 
+#ifndef INGINE_BACKEND_CUDA
+#if defined(INGINE_BACKEND_CPU) || defined(INGINE_BACKEND_HIP) || defined(INGINE_BACKEND_MLX) || defined(INGINE_BACKEND_SYCL)
+#define INGINE_BACKEND_CUDA 0
+#else
+#define INGINE_BACKEND_CUDA 1
+#endif
+#endif
+
+#ifndef INGINE_BACKEND_HIP
+#define INGINE_BACKEND_HIP 0
+#endif
+
+#if INGINE_BACKEND_HIP
+#include <hip/hip_runtime.h>
+#elif INGINE_BACKEND_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <cstdint>
 #include <functional>
 #include <utility>
 
 namespace ingine {
+
+#if INGINE_BACKEND_HIP
+using GraphStreamT = hipStream_t;
+using BackendGraphT = hipGraph_t;
+using BackendGraphExecT = hipGraphExec_t;
+#elif INGINE_BACKEND_CUDA
+using GraphStreamT = cudaStream_t;
+using BackendGraphT = cudaGraph_t;
+using BackendGraphExecT = cudaGraphExec_t;
+#else
+using GraphStreamT = void*;
+using BackendGraphT = void*;
+using BackendGraphExecT = void*;
+#endif
 
 class DecodeGraphDefinition {
 public:
@@ -23,18 +53,18 @@ public:
     DecodeGraphDefinition(DecodeGraphDefinition&& other) noexcept;
     DecodeGraphDefinition& operator=(DecodeGraphDefinition&& other) noexcept;
 
-    void capture(cudaStream_t stream, const std::function<void()>& body);
+    void capture(GraphStreamT stream, const std::function<void()>& body);
     [[nodiscard]] bool ready() const noexcept;
     void reset() noexcept;
 
     // Node count and an order-sensitive hash of the captured node sequence. Profiles with different
-    // signatures capture different node topologies and must not share one executable: a CUDA graph
+    // signatures capture different node topologies and must not share one executable: a graph
     // executable can be updated across profiles only while the topology is unchanged.
     [[nodiscard]] std::pair<std::size_t, std::uint64_t> topology_signature() const;
 
 private:
     friend class DecodeGraphExecutable;
-    cudaGraph_t graph_ = nullptr;
+    BackendGraphT graph_ = nullptr;
 };
 
 class DecodeGraphExecutable {
@@ -49,13 +79,13 @@ public:
 
     void instantiate(const DecodeGraphDefinition& definition);
     void update(const DecodeGraphDefinition& definition);
-    void upload(cudaStream_t stream);
-    void launch(cudaStream_t stream);
+    void upload(GraphStreamT stream);
+    void launch(GraphStreamT stream);
     [[nodiscard]] bool ready() const noexcept;
     void reset() noexcept;
 
 private:
-    cudaGraphExec_t exec_ = nullptr;
+    BackendGraphExecT exec_ = nullptr;
 };
 
 } // namespace ingine

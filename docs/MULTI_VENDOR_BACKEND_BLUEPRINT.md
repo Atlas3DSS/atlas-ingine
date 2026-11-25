@@ -1,7 +1,7 @@
 # Multi-Vendor Backend Blueprint (#835): Apple MLX/Metal, AMD ROCm/HIP, Intel SYCL/XPU
 
-Status: Phase 2 First Slice RFC (worktree `feat/multi-vendor-backends` @ `b823de5`)  
-Scope: Hardware-backend abstraction, upstream ecosystem lift audit, phased execution plan, and qualification gates for `Atlas3DSS/atlas-ingine`.
+Status: Phase 2 First Slice signed off (`feat/multi-vendor-backends @ 15309801d308aced3c1b347a556e9b8f99b3ec8a`) + Phase 3 Native Target Backend Slices (`feat/multi-vendor-phase3`, compile/host-testable slices pending target vendor hardware qualification)  
+Scope: Hardware-backend abstraction, Project Maya / StrataEngine cheap-compute & bandwidth study, pure native C++ vendor backend slices (`HIP`, `MLX`, `SYCL`), and qualification gates for `Atlas3DSS/atlas-ingine`.
 
 ---
 
@@ -211,10 +211,40 @@ Every candidate is Apache-2.0 or MIT (compatible with `atlas-ingine`'s Apache-2.
 
 ### 5.3 Local Verification vs. Target Hardware Qualification Matrix
 
-Current local hosts (`devbox` RTX 3090 / RTX PRO 6000, `monkeypc` RTX 4090, `quincy` 7× V100) are NVIDIA-only without `hipcc`, Apple Metal/macOS, or `icpx`/oneAPI installed:
+Current local hosts (`devbox` RTX 3090 / RTX PRO 6000, `monkeypc` RTX 4090, `quincy` 7× V100) and Vast.ai RTX PRO 6000 Blackwell hosts are NVIDIA-only without `hipcc`, Apple Metal/macOS, or `icpx`/oneAPI installed:
 
-| Gate | Runs Locally (`devbox` / `quincy`) | Requires Target Hardware (AMD / Apple / Intel) |
+| Gate | Runs Locally / NVIDIA (`devbox` / `quincy` / Blackwell) | Requires Target Hardware (AMD / Apple / Intel) |
 |---|---|---|
-| Zero-CUDA CPU build, `hal_embed_q4_parity`, host CTests, `ingine-serve --fake` | **Yes** | — |
-| CUDA `multiarch-dev` zero-regression (`hal_embed_q4_parity`, `spec_conditional_fallback`, bitlock baseline vs candidate, FP64 oracles, `ingine-validate`) | **Yes (`sb run`)** | — |
-| HIP / SYCL / MLX `hal_embed_q4_parity`, kernel FP64 oracles, `ingine-validate`, `model_reuse`, `vision_model`, `batch_parity`, `ingine-bench` | — | **Yes** |
+| Zero-CUDA CPU build (`BF16` & `FP16`), `core_vendor_portability`, `hal_embed_q4_parity`, host CTests, `ingine-serve --fake` | **Yes** | — |
+| CUDA `multiarch-dev` zero-regression (`kernels_bitlock`, `hal_embed_q4_parity`, `hal_embed_q4_capture`, `spec_conditional_fallback`, `core_vendor_portability`, FP64 oracles, `ingine-validate`, 64K `ingine-bench`) | **Yes (`sb run` / Blackwell)** | — |
+| HIP / SYCL / MLX target compilation, `hal_embed_q4_parity`, kernel FP64 oracles, `ingine-validate`, `model_reuse`, `vision_model`, `batch_parity`, `ingine-bench` | — | **Yes (Target hardware qualification pending)** |
+
+---
+
+## 6. Phase 3 Target Vendor Implementation & Project Maya / StrataEngine Architecture Study
+
+All Phase 3 backend code stays **100% pure native `atlas-ingine` C++** (zero Python runtime fallbacks and zero `llama.cpp`/`vLLM`/`PyTorch` runtime shims). The local Devbox carries **compile/host-testable slices (`feat/multi-vendor-phase3`)**, while target hardware qualification on physical AMD, Apple Silicon, and Intel GPUs remains pending.
+
+### 6.1 Genuine Cheap-Compute & Bandwidth Savings Studied from Project Maya & StrataEngine
+
+Studying **Project Maya / StrataEngine** (`v1.1.73`/`v1.1.75`, MIT) alongside `ggml-{hip,metal,sycl}` (MIT) surfaces four concrete bandwidth and instruction-level optimizations incorporated into `core/vendor_policy.h`, `kernels/common/{arch_ops,warp}.cuh`, and the native backends:
+
+1. **Direct Compressed-to-LDS MoE Tile Streaming (RDNA3/4 Wave32):** Instead of materializing intermediate FP16 weight buffers before GEMM, wave32 RDNA kernels stream compressed NVFP4 / Q4_0 / Q8_0 blocks directly into 64 KiB LDS (`32 KiB` per `256x256` 4-bit tile) and execute `16x16x16` `wmma_f16` (`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32[_gfx12]`) with architecture-specific result row mapping (`wmma_result_row`, handling RDNA3 `2*i + hi` vs RDNA4 `8*hi + i`) and LDS-only barriers (`lds_sync` keeping next global tile loads in flight).
+2. **Packed Byte & Dot4 Instructions Without Scratch Spills:** HIP maps `__byte_perm` to single-instruction `v_perm_b32` (`__builtin_amdgcn_perm`, avoiding HIP's private-memory array fallback), maps signed dot4 to `v_dot4_i32_iu8` (`sudot4`, RDNA3/4) or `v_dot4_i32_i8` (`sdot4`, RDNA2/CDNA), and uses Hacker's Delight SWAR `vsub4` where `gfx11`/`gfx12` lack native packed 8-bit subtract.
+3. **CDNA Wave64 Half-Wavefront Determinism & `-ffp-contract=on`:** Wave64 GPUs (`gfx906`, `gfx908`, `gfx90a`, `gfx942`, `gfx950`) execute 32-lane algorithms inside logical half-wavefronts (`ballot >> (__lane_id() & 32)`), while CDNA3/4 (`gfx942`/`gfx950`) build with `-ffp-contract=on` so clang's SLP vectorizer does not alter `v_pk_fma_f32` contraction across multi-activation vs single-activation GEMVs. EXL3 scalar prompt tile policies (`select_exl3_scalar_rows`: `8`, `auto -> -1`, `12`, `16`, `24`) stay host-testable in `vendor::hip`.
+4. **Unified-Memory Zero-Copy vs Fixed 2.3–3.0 GiB Streaming Ring (Apple Silicon / Mobile):** High-RAM Apple Silicon (`>= 24 GiB` unified RAM) keeps our ~9 GiB EXL3 pack resident in `MTLResourceStorageModeShared`, whereas constrained `4–8 GB` Apple Silicon / iPhone / iPad targets enforce `StreamingBudgetPlan::BoundedStreamingRing` capped at `2.3 GiB` (phone class) or `3.0 GiB` (tablet / 8 GB class) fed by parallel `1 MiB` `pread` chunks (`ParallelReader` / `safetensors_upload_mlx.cpp`).
+5. **Intel Level Zero Direct Alloc & Subgroup `8`/`16`/`32`:** SYCL enables `ze_loader` / Level Zero direct device USM allocation (`INGINE_SYCL_LEVEL_ZERO`) to bypass TTM/DMA-buf system RAM staging on discrete Intel GPUs, selects workgroup sizes cleanly divisible by queried `SubgroupCaps` (`8`/`16`/`32`), and enforces `DNNL_GPU_VENDOR=INTEL`.
+
+### 6.2 Caller Contract Clarification (`TokenBoundsMode::DeferredFlag`)
+
+Consistent with `core/ops.h`, whenever a caller runs `TokenBoundsMode::DeferredFlag` and observes `*invalid_token_flag != 0` after synchronization, the caller **must treat the entire output tensor as unusable** (CUDA native skips out-of-range rows while still writing valid neighboring rows; CPU native and `PortableFallback` leave the entire output unchanged upon detecting an invalid token ID).
+
+### 6.3 Comparative Baseline Reference & Hardware Qualification Framing
+
+| Engine / Baseline | Hardware & Context | Status & Measured / Target Role |
+|---|---|---|
+| **`atlas-ingine` (`feat/multi-vendor-backends @ 15309801`)** | RTX PRO 6000 Blackwell WS (`sm_120`), `NVFP4+MXFP8`, `--dense-fp8 --kv-fp8 --spec`, 64K ctx | **HAL signed off (`att-20afe6df`, container `att-91d3b0b1`)**: **`506.8 tok/s`** chat, **`622.7 tok/s`** code, **`14,137 tok/s`** 64K prefill; 48/48 bitlock deterministic; 3/3 model-goldens PASS. *Baseline note:* reported standalone — the `README.md` `fa4ecb9` native row (`460.6 / 586.1`, `job-1124071206-ce294a`) used `--max-ctx 4096 --runs 3` without long prefill and the 64K README rows use Elastic weights (`atlas-12g`/`atlas-10g`), so a matched back-to-back pre-HAL (`b823de5`) vs `15309801` native 64K PRO 6000 comparison remains staged for one post-queue local PRO 6000 lease. |
+| **`atlas-ingine` Native (`feat/multi-vendor-phase3`)** | AMD HIP (`INGINE_BACKEND=HIP`), Apple MLX/Metal (`INGINE_BACKEND=MLX`), Intel SYCL (`INGINE_BACKEND=SYCL`) | **Compile/host-testable pure C++20 slices** (`core_vendor_portability` + CPU/CUDA zero-regression verified); target GPU hardware qualification pending |
+| **Project Maya (`v1.1.73`/`v1.1.75` MIT)** | RTX 3090 24 GB bare multi-turn Blender (6 seqs / 24 shots; different engine/workload) + AMD ROCm/HIP / Apple Metal ref | External baseline (`README.md` RTX 3090 bare showdown: `atlas-ingine` Native `220.15 tok/s` = `1.86×` Project Maya `118.26 tok/s`, different kernel stack) |
+| **StrataEngine** | Tesla P100 16 GB (thinking off, prompt length unstated; different hardware/workload) | External baseline (`README.md`: `35.0 tok/s`, not directly comparable to `--effort medium` thinking-on runs) |
+| **vLLM / SGLang / Kern / `llama.cpp`** | Single RTX PRO 5000 72 GB (`@SuJinYan123`) & RTX 3090 (`llama.cpp v7+DSpark`) | External baselines (`README.md`: PRO 5000 `c=1` `152`–`256`, `c=8` `478`–`693 tok/s`; 3090 `llama.cpp v7+DSpark` `104.16 tok/s` — different cards, quants, and serving setups) |

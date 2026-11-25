@@ -56,11 +56,14 @@ struct DeviceCaps {
   BackendKind backend = BackendKind::Cpu;
   MemorySpace primary_space = MemorySpace::Host;
   std::string name;
+  std::string arch_name;
   int device_id = 0;
   int arch_major = 0;
   int arch_minor = 0;
   SubgroupCaps subgroup{};
   std::size_t max_shared_mem_bytes = 0;
+  std::size_t recommended_working_set_bytes = 0;
+  std::size_t streaming_ring_budget_bytes = 0;
   bool supports_bf16 = false;
   bool supports_fp16 = false;
   bool supports_fp8_e4m3 = false;
@@ -68,6 +71,8 @@ struct DeviceCaps {
   // Conditional SWITCH graph node support (e.g. cudaGraphCondTypeSwitch on CUDA >= 12.8 driver/context).
   bool supports_conditional_graph = false;
   bool supports_pdl = false;
+  bool supports_wmma_or_xmx = false;
+  bool prefers_direct_device_alloc = true;
   bool unified_memory = false;
 };
 

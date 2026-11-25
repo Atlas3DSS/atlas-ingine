@@ -16,11 +16,27 @@
 #endif
 #endif
 
+#ifndef INGINE_BACKEND_HIP
+#define INGINE_BACKEND_HIP 0
+#endif
+
+#ifndef INGINE_BACKEND_MLX
+#define INGINE_BACKEND_MLX 0
+#endif
+
+#ifndef INGINE_BACKEND_SYCL
+#define INGINE_BACKEND_SYCL 0
+#endif
+
 #if INGINE_BACKEND_CUDA
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <library_types.h>
+#elif INGINE_BACKEND_HIP && defined(__HIPCC__)
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 #endif
 
 #include <algorithm>
@@ -46,6 +62,18 @@ using ActT = __nv_bfloat16;
 using Act2T = __nv_bfloat162;
 inline constexpr DType kActDType = DType::BF16;
 inline constexpr cudaDataType_t kCublasActType = CUDA_R_16BF;
+inline constexpr bool kActIsFP16 = false;
+#endif
+#elif INGINE_BACKEND_HIP && defined(__HIPCC__)
+#if INGINE_ACT_FP16
+using ActT = __half;
+using Act2T = __half2;
+inline constexpr DType kActDType = DType::FP16;
+inline constexpr bool kActIsFP16 = true;
+#else
+using ActT = __hip_bfloat16;
+using Act2T = __hip_bfloat162;
+inline constexpr DType kActDType = DType::BF16;
 inline constexpr bool kActIsFP16 = false;
 #endif
 #else
@@ -165,8 +193,8 @@ inline float host_bits_to_float(std::uint16_t b) {
 
 inline ActT host_from_float(float f) {
   const std::uint16_t b = host_float_to_bits(f);
-  ActT v;
-  std::memcpy(&v, &b, 2);
+  ActT v{};
+  std::memcpy(static_cast<void*>(&v), &b, 2);
   return v;
 }
 
@@ -178,9 +206,34 @@ inline float host_to_float(ActT v) {
 
 inline float host_round(float f) { return host_bits_to_float(host_float_to_bits(f)); }
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+__host__ __device__ __forceinline__
+#else
+inline
+#endif
+std::uint16_t e4m3_to_f16_bits_portable_host(std::uint32_t b) {
+  const std::uint32_t s = (b & 0x80u) << 8;
+  const std::uint32_t a = b & 0x7fu;
+  const std::uint32_t norm = (a + 64u) << 7;
+  const std::uint32_t sub = a ? (0x1800u + (((0xBA986400u >> (a * 4u)) & 0xfu) << 8)) : 0u;
+  return static_cast<std::uint16_t>(s | (a >= 8u ? norm : sub));
+}
+
 // ------------------------------------------------------------------------------------------- device helpers
 
-#if INGINE_BACKEND_CUDA && defined(__CUDACC__)
+#if (INGINE_BACKEND_CUDA && defined(__CUDACC__)) || (INGINE_BACKEND_HIP && defined(__HIPCC__))
+
+#if INGINE_BACKEND_HIP
+__device__ __forceinline__ std::uint16_t hip_float_to_bf16_bits(float f) noexcept {
+  const std::uint32_t w = __float_as_uint(f);
+  if ((w & 0x7fffffffu) > 0x7f800000u) return static_cast<std::uint16_t>((w >> 16) | 0x40u);
+  return static_cast<std::uint16_t>((w + 0x7fffu + ((w >> 16) & 1u)) >> 16);
+}
+
+__device__ __forceinline__ float hip_round_bf16(float f) noexcept {
+  return __uint_as_float(static_cast<std::uint32_t>(hip_float_to_bf16_bits(f)) << 16);
+}
+#endif
 
 __device__ __forceinline__ float clamp_fp16_finite(float x) {
   return isfinite(x) ? fminf(fmaxf(x, -kFp16Max), kFp16Max) : x;
@@ -189,6 +242,9 @@ __device__ __forceinline__ float clamp_fp16_finite(float x) {
 __device__ __forceinline__ ActT from_float(float x) {
 #if INGINE_ACT_FP16
   return __float2half_rn(clamp_fp16_finite(x));
+#elif INGINE_BACKEND_HIP
+  const std::uint16_t bits = hip_float_to_bf16_bits(x);
+  return *reinterpret_cast<const ActT*>(&bits);
 #else
   return __float2bfloat16_rn(x);
 #endif
@@ -197,6 +253,9 @@ __device__ __forceinline__ ActT from_float(float x) {
 __device__ __forceinline__ float to_float(ActT x) {
 #if INGINE_ACT_FP16
   return __half2float(x);
+#elif INGINE_BACKEND_HIP
+  const std::uint16_t bits = *reinterpret_cast<const std::uint16_t*>(&x);
+  return __uint_as_float(static_cast<std::uint32_t>(bits) << 16);
 #else
   return __bfloat162float(x);
 #endif
@@ -205,6 +264,8 @@ __device__ __forceinline__ float to_float(ActT x) {
 __device__ __forceinline__ float round_act(float x) {
 #if INGINE_ACT_FP16
   return __half2float(__float2half_rn(clamp_fp16_finite(x)));
+#elif INGINE_BACKEND_HIP
+  return hip_round_bf16(x);
 #else
   return __bfloat162float(__float2bfloat16_rn(x));
 #endif
@@ -213,6 +274,8 @@ __device__ __forceinline__ float round_act(float x) {
 __device__ __forceinline__ std::uint16_t float_to_bits(float x) {
 #if INGINE_ACT_FP16
   return __half_as_ushort(__float2half_rn(clamp_fp16_finite(x)));
+#elif INGINE_BACKEND_HIP
+  return hip_float_to_bf16_bits(x);
 #else
   return __bfloat16_as_ushort(__float2bfloat16_rn(x));
 #endif
@@ -230,6 +293,10 @@ __device__ __forceinline__ std::uint32_t pack2(float lo, float hi) {
 #if INGINE_ACT_FP16
   const __half2 h = __floats2half2_rn(clamp_fp16_finite(lo), clamp_fp16_finite(hi));
   return *reinterpret_cast<const std::uint32_t*>(&h);
+#elif INGINE_BACKEND_HIP
+  const std::uint32_t lo_b = static_cast<std::uint32_t>(hip_float_to_bf16_bits(lo));
+  const std::uint32_t hi_b = static_cast<std::uint32_t>(hip_float_to_bf16_bits(hi));
+  return lo_b | (hi_b << 16);
 #else
   const __nv_bfloat162 b = __floats2bfloat162_rn(lo, hi);
   return *reinterpret_cast<const std::uint32_t*>(&b);
@@ -273,16 +340,12 @@ __device__ __forceinline__ uint4 pack8(const float* f) {
 }
 
 __device__ __forceinline__ std::uint16_t e4m3_to_f16_bits_portable(std::uint32_t b) {
-  const std::uint32_t s = (b & 0x80u) << 8;
-  const std::uint32_t a = b & 0x7fu;
-  const std::uint32_t norm = (a + 64u) << 7;
-  const std::uint32_t sub = a ? (0x1800u + (((0xBA986400u >> (a * 4u)) & 0xfu) << 8)) : 0u;
-  return static_cast<std::uint16_t>(s | (a >= 8u ? norm : sub));
+  return e4m3_to_f16_bits_portable_host(b);
 }
 
-// 2 E4M3 codes (low 16 bits of u) -> packed FP16 pair (exact on all SM70+).
+// 2 E4M3 codes (low 16 bits of u) -> packed FP16 pair (exact on all SM70+ / HIP).
 __device__ __forceinline__ std::uint32_t e4m3x2_to_half2_bits(std::uint32_t u) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 890
   std::uint32_t r;
   asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
   return r;
@@ -296,19 +359,18 @@ __device__ __forceinline__ std::uint32_t e4m3x2_to_half2_bits(std::uint32_t u) {
 __device__ __forceinline__ std::uint32_t e4m3x2_to_act2_bits(std::uint32_t u) {
 #if INGINE_ACT_FP16
   return e4m3x2_to_half2_bits(u);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#elif defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 1200
   std::uint32_t r;
   asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
   return r;
 #else
   const std::uint32_t h2 = e4m3x2_to_half2_bits(u);
   const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
-  const __nv_bfloat162 b = __float22bfloat162_rn(f);
-  return *reinterpret_cast<const std::uint32_t*>(&b);
+  return pack2(f.x, f.y);
 #endif
 }
 
-#endif  // INGINE_BACKEND_CUDA && __CUDACC__
+#endif  // (INGINE_BACKEND_CUDA && __CUDACC__) || (INGINE_BACKEND_HIP && __HIPCC__)
 
 }  // namespace act
 }  // namespace ingine

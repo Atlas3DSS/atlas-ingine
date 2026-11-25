@@ -255,6 +255,7 @@ DeviceCaps query_device_caps(int device_id) {
   caps.backend = BackendKind::Cuda;
   caps.primary_space = MemorySpace::Device;
   caps.name = prop.name;
+  caps.arch_name = "sm_" + std::to_string(prop.major * 10 + prop.minor);
   caps.device_id = device_id;
   caps.arch_major = prop.major;
   caps.arch_minor = prop.minor;
@@ -267,6 +268,8 @@ DeviceCaps query_device_caps(int device_id) {
   caps.supports_graph_capture = true;
   caps.supports_conditional_graph = conditional_graphs_enabled(device_id);
   caps.supports_pdl = prop.major >= 9;
+  caps.supports_wmma_or_xmx = prop.major >= 7;
+  caps.prefers_direct_device_alloc = true;
   caps.unified_memory = prop.integrated != 0;
   return caps;
 }
