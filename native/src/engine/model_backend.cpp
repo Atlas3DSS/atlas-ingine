@@ -404,7 +404,7 @@ ModelFamily parse_model_family(std::string_view s) {
       lower == "qwen38" || lower == "qwen3.8") {
     return ModelFamily::Qwen3_5;
   }
-  if (lower == "deepseek_v41" || lower == "deepseek41") {
+  if (lower == "deepseek_v4" || lower == "deepseek_v41" || lower == "deepseek41") {
     return ModelFamily::DeepSeekV4;
   }
   if (lower == "glm_flash" || lower == "glm53" || lower == "glm_53_flash" || lower == "glm5-next" ||
@@ -863,6 +863,18 @@ GenerateStats ModelBackend::generate_request(const BackendRequest& req, int max_
   validate_request_against_capabilities(capabilities(), max_model_len(), req.prompt, max_new_tokens, sampling);
   if (!req.token_mask.empty() && req.token_mask.size() != req.prompt.ids.size()) {
     throw std::invalid_argument("BackendRequest token_mask length must equal prompt.ids length");
+  }
+  if (!req.token_mask.empty()) {
+    throw std::logic_error(
+        "ModelBackend::generate_request base fallback does not support non-empty token_mask; override generate_request()");
+  }
+  if (!req.use_prefix_cache) {
+    throw std::logic_error(
+        "ModelBackend::generate_request base fallback cannot honor use_prefix_cache=false; override generate_request()");
+  }
+  if (!req.cache_namespace.empty()) {
+    throw std::logic_error(
+        "ModelBackend::generate_request base fallback does not support cache_namespace isolation; override generate_request()");
   }
   return generate(req.prompt, max_new_tokens, sampling, stop_ids, on_tokens, on_prefill);
 }

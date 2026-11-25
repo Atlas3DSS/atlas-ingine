@@ -404,6 +404,11 @@ void test_family_enum_and_detection() {
   CHECK(parse_model_family("deepseek41") == ModelFamily::DeepSeekV4);
   CHECK(parse_model_family("glm53") == ModelFamily::GlmFlash);
   CHECK(parse_model_family("glm5-next") == ModelFamily::GlmFlash);
+  for (ModelFamily fam : {ModelFamily::Inkling2, ModelFamily::Qwen3_5, ModelFamily::DeepSeekV4, ModelFamily::GlmFlash}) {
+    CHECK(parse_model_family(to_string(fam)) == fam);
+  }
+  CHECK_THROWS(parse_model_family(to_string(ModelFamily::Unknown)), std::invalid_argument);
+  CHECK_THROWS(parse_model_family("deepseek_v3"), std::invalid_argument);
   CHECK_THROWS(parse_model_family("llama99"), std::invalid_argument);
   CHECK_THROWS(parse_model_family("dflash"), std::invalid_argument);
 
@@ -733,6 +738,107 @@ void test_session_lifecycle_reuse_and_registry() {
                                     return true;
                                   });
     CHECK(gst.generated_tokens == 2 && gen_ids.size() == 2);
+  }
+
+  // Base ModelBackend::generate_request() fallback: delegates plain requests and fails closed on
+  // non-empty token_mask, use_prefix_cache=false, or non-empty cache_namespace.
+  {
+    class FallbackOnlyBackend final : public ModelBackend {
+     public:
+      FallbackOnlyBackend() {
+        caps_.family = ModelFamily::Qwen3_5;
+        caps_.backend_name = "fallback-only";
+        caps_.architecture = "Qwen3_5ForConditionalGeneration";
+        caps_.supports_text = true;
+        caps_.vocab_size = 64;
+        caps_.max_position_embeddings = 128;
+
+        id_ = make_verified_sample_identity();
+        id_.max_ctx = 128;
+        profile_.family = ModelFamily::Qwen3_5;
+        profile_.model_id = "fallback-only";
+        profile_.gear = "dense";
+        profile_.kv_cache_mode = "dense_bf16";
+        profile_.max_ctx = 128;
+        profile_.max_batch = 1;
+        profile_.capabilities = caps_;
+        profile_.state_identity = id_;
+      }
+
+      std::string model_id() const override { return "fallback-only"; }
+      int max_model_len() const override { return 128; }
+      bool supports_images() const override { return false; }
+
+      const BackendCapabilities& capabilities() const override { return caps_; }
+      const WorkerProfile& worker_profile() const override { return profile_; }
+      const BackendStateIdentity& state_identity() const override { return id_; }
+      void reset_session() override {}
+
+      GenerateStats generate(std::span<const std::int32_t> prompt, int max_new_tokens, const Sampling& sampling,
+                             std::span<const std::int32_t> stop_ids,
+                             const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
+        Prompt p;
+        p.ids = prompt;
+        return generate(p, max_new_tokens, sampling, stop_ids, on_tokens, nullptr);
+      }
+
+      GenerateStats generate(const Prompt& prompt, int /*max_new_tokens*/, const Sampling& /*sampling*/,
+                             std::span<const std::int32_t> /*stop_ids*/,
+                             const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+                             const PrefillCallback& on_prefill) override {
+        GenerateStats st;
+        st.prompt_tokens = static_cast<int>(prompt.ids.size());
+        if (on_prefill) on_prefill(st);
+        const std::int32_t tok = 7;
+        st.generated_tokens = 1;
+        (void)on_tokens(std::span<const std::int32_t>(&tok, 1));
+        return st;
+      }
+
+     private:
+      BackendCapabilities caps_;
+      BackendStateIdentity id_;
+      WorkerProfile profile_;
+    };
+
+    FallbackOnlyBackend fb;
+    const std::array<std::int32_t, 2> fb_ids = {1, 2};
+    BackendRequest ok_req;
+    ok_req.prompt.ids = fb_ids;
+    ok_req.use_prefix_cache = true;
+    std::vector<std::int32_t> out_toks;
+    const auto fb_st = fb.generate_request(
+        ok_req, 1, Sampling{}, {}, [&](std::span<const std::int32_t> toks) {
+          out_toks.insert(out_toks.end(), toks.begin(), toks.end());
+          return true;
+        });
+    CHECK(fb_st.generated_tokens == 1 && out_toks == std::vector<std::int32_t>({7}));
+
+    const std::array<std::uint8_t, 1> short_mask = {1};
+    BackendRequest bad_len = ok_req;
+    bad_len.token_mask = short_mask;
+    CHECK_THROWS(
+        fb.generate_request(bad_len, 1, Sampling{}, {}, [](std::span<const std::int32_t>) { return true; }),
+        std::invalid_argument);
+
+    const std::array<std::uint8_t, 2> valid_mask = {1, 0};
+    BackendRequest with_mask = ok_req;
+    with_mask.token_mask = valid_mask;
+    CHECK_THROWS(
+        fb.generate_request(with_mask, 1, Sampling{}, {}, [](std::span<const std::int32_t>) { return true; }),
+        std::logic_error);
+
+    BackendRequest cold_req = ok_req;
+    cold_req.use_prefix_cache = false;
+    CHECK_THROWS(
+        fb.generate_request(cold_req, 1, Sampling{}, {}, [](std::span<const std::int32_t>) { return true; }),
+        std::logic_error);
+
+    BackendRequest ns_req = ok_req;
+    ns_req.cache_namespace = "isolated-ns";
+    CHECK_THROWS(
+        fb.generate_request(ns_req, 1, Sampling{}, {}, [](std::span<const std::int32_t>) { return true; }),
+        std::logic_error);
   }
 }
 
