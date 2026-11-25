@@ -47,6 +47,7 @@ struct ChatRequest {
   text::RenderStats render_stats;  // CPU tokenization cache stats (distinct from GPU prefix reuse)
   bool stream = false;
   bool include_usage = false;
+  bool has_user_or_cache_key = false;  // true if JSON body specifies non-empty `user` or `prompt_cache_key`
 };
 
 // Validates `body` (a JSON object) and renders the prompt. Throws BadRequest or text::ChatError. Sampling fields

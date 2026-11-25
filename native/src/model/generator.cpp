@@ -28,14 +28,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <list>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace ingine::model {
 namespace {
@@ -59,6 +63,56 @@ std::array<std::uint8_t, 32> compute_model_identity_sha(const RuntimeOptions& op
   std::memcpy(buf.data(), cfg_sha.data(), 32);
   std::memcpy(buf.data() + 32, abl_sha.data(), 32);
   return sha256_bytes(buf.data(), buf.size());
+}
+
+// Verified media identity bound to exact position, dimensions, and full SHA-256 over RGB pixels.
+struct VerifiedImageSpan {
+  int pos = 0;
+  int height = 0;
+  int width = 0;
+  int tokens = 0;
+  std::array<std::uint8_t, 32> rgb_sha256{};
+  bool operator==(const VerifiedImageSpan&) const = default;
+};
+
+std::vector<VerifiedImageSpan> build_verified_images(std::span<const PromptImage> images) {
+  std::vector<VerifiedImageSpan> out;
+  out.reserve(images.size());
+  for (const PromptImage& img : images) {
+    VerifiedImageSpan span;
+    span.pos = img.pos;
+    span.height = img.height;
+    span.width = img.width;
+    span.tokens = img.tokens();
+    if (img.rgb && !img.rgb->empty()) {
+      span.rgb_sha256 = sha256_bytes(img.rgb->data(), img.rgb->size());
+    }
+    out.push_back(span);
+  }
+  return out;
+}
+
+std::vector<VerifiedImageSpan> filter_images_in_prefix(const std::vector<VerifiedImageSpan>& imgs,
+                                                       std::size_t prefix_len) {
+  std::vector<VerifiedImageSpan> out;
+  for (const VerifiedImageSpan& img : imgs) {
+    if (std::size_t(img.pos) + std::size_t(img.tokens) <= prefix_len) out.push_back(img);
+  }
+  return out;
+}
+
+// True iff every image of `incoming` intersecting [0, prefix_len) lies wholly inside [0, prefix_len) and matches
+// `cached` (exact position, geometry, and full RGB SHA-256).
+bool images_match_prefix(const std::vector<VerifiedImageSpan>& cached, const std::vector<VerifiedImageSpan>& incoming,
+                         std::size_t prefix_len) {
+  std::size_t ci = 0;
+  for (const VerifiedImageSpan& img : incoming) {
+    if (std::size_t(img.pos) >= prefix_len) break;
+    if (std::size_t(img.pos) + std::size_t(img.tokens) > prefix_len) return false;  // straddles boundary
+    if (ci >= cached.size() || !(cached[ci] == img)) return false;
+    ++ci;
+  }
+  return ci == cached.size();
 }
 
 class EngineGenerator final : public Generator {
@@ -178,8 +232,16 @@ class EngineGenerator final : public Generator {
     cache_stats_.vram_budget_bytes = park_budget_;
     cache_stats_.host_budget_bytes = host_park_budget_;
 
-    // parked VRAM conversations are best-effort: a device allocation that fails releases them and retries
-    release_hook_ = add_release_hook([this] { return release_parked(); });
+    // parked VRAM conversations are best-effort: a device allocation that fails releases them and retries.
+    // HookControl prevents a copied ReleaseHook invoked outside arena.cu's registry lock from touching a
+    // destroyed EngineGenerator.
+    hook_ctrl_ = std::make_shared<HookControl>();
+    hook_ctrl_->gen = this;
+    auto ctrl = hook_ctrl_;
+    release_hook_ = add_release_hook([ctrl] {
+      std::lock_guard<std::mutex> hlk(ctrl->m);
+      return ctrl->gen ? ctrl->gen->release_parked() : false;
+    });
   }
 
  public:
@@ -223,10 +285,18 @@ class EngineGenerator final : public Generator {
       req_identity.persona_fingerprint = sampling.persona->fingerprint_sha256;
     }
     req_identity.cache_namespace = full_prompt.cache_namespace;
-    const bool bypass_reuse = !options_.prefix_cache || (sampling.persona && sampling.persona->bypasses_prefix_reuse());
+    const bool bypass_reuse = !options_.prefix_cache || full_prompt.bypass_prefix_cache ||
+                              (sampling.persona && sampling.persona->bypasses_prefix_reuse());
     const int root_prefix_tokens =
         validate_root_prefix_tokens(prompt, full_prompt.images, full_prompt.root_prefix_tokens);
     std::lock_guard<std::mutex> lock(mutex_);
+    struct OwnerGuard {
+      std::atomic<std::thread::id>& tid;
+      explicit OwnerGuard(std::atomic<std::thread::id>& t) : tid(t) {
+        tid.store(std::this_thread::get_id(), std::memory_order_release);
+      }
+      ~OwnerGuard() { tid.store(std::thread::id{}, std::memory_order_release); }
+    } owner_guard(active_owner_);
 
     auto t = std::chrono::steady_clock::now();
     bool restore_timed = false;
@@ -268,6 +338,10 @@ class EngineGenerator final : public Generator {
   }
 
   ~EngineGenerator() override {
+    if (hook_ctrl_) {
+      std::lock_guard<std::mutex> hlk(hook_ctrl_->m);
+      hook_ctrl_->gen = nullptr;
+    }
     remove_release_hook(release_hook_);
     // nothing queued may outlive the graphs and buffers of the members destroyed below
     if (rt_.stream()) cudaStreamSynchronize(rt_.stream());
@@ -311,9 +385,13 @@ class EngineGenerator final : public Generator {
     cudaStreamSynchronize(rt_.stream());
     tokens_in_state_.clear();
     checkpoint_ids_.clear();
+    live_images_.clear();
+    checkpoint_images_.clear();
     live_identity_ = StateIdentity{};
     checkpoint_identity_ = StateIdentity{};
     live_bypass_reuse_ = false;
+    active_keep_ = nullptr;
+    unparking_ = false;
     if (drafter_) drafter_->reset();  // stream-ordered; CUDA failures abort (CUDA_CHECK)
   }
 
@@ -390,31 +468,46 @@ class EngineGenerator final : public Generator {
                const StateIdentity& req_identity, bool bypass_reuse, GenerateStats& stats, bool& restore_timed) {
     const std::vector<std::int32_t>& prev = tokens_in_state_;
     const std::size_t n = ids.size();
+    const std::vector<VerifiedImageSpan> req_images = build_verified_images(images);
     const bool drafter_in_step = !drafter_ || drafter_->length() == int(prev.size());  // else a row is missing
     State& st = rt_.state();
     const cudaStream_t stream = rt_.stream();
     const bool extend = !bypass_reuse && !live_bypass_reuse_ && live_identity_ == req_identity && drafter_in_step &&
-                        !prev.empty() && prev.size() < n && std::equal(prev.begin(), prev.end(), ids.begin());
+                        !prev.empty() && prev.size() < n && std::equal(prev.begin(), prev.end(), ids.begin()) &&
+                        images_match_prefix(live_images_, req_images, prev.size());
     const bool checkpoint = !bypass_reuse && !extend && checkpoint_identity_ == req_identity &&
                             !checkpoint_ids_.empty() && checkpoint_ids_.size() <= n &&
-                            std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), ids.begin());
+                            std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), ids.begin()) &&
+                            images_match_prefix(checkpoint_images_, req_images, checkpoint_ids_.size());
     const std::size_t live_match = extend ? prev.size() : (checkpoint ? checkpoint_ids_.size() : 0u);
-    Parked* parked = bypass_reuse ? nullptr : find_parked(ids, live_match, req_identity);
+    Parked* parked = bypass_reuse ? nullptr : find_parked(ids, req_images, live_match, req_identity);
     std::size_t start = 0;
+    bool resumed_has_full_state = true;
     request_evictions_ = 0;
     if (parked) {
-      // parking the live conversation may modify parked_ (never evicting the entry we are restoring)
-      const std::vector<std::int32_t> keep = parked->ids;
-      const StateIdentity keep_id = parked->identity;
-      park_live(&keep, &keep_id, request_evictions_);
-      auto it = std::find_if(parked_.begin(), parked_.end(),
-                             [&](const Parked& p) { return p.ids == keep && p.identity == keep_id; });
-      const ParkTier restored_tier = it->tier;
-      const bool restored_root = it->is_root;
+      // Pin the selected parked node across park_live() and unpark() so neither LRU eviction nor a re-entrant
+      // release_parked() hook can drop the entry we are about to restore (std::list keeps node pointers stable).
+      struct RestorePinGuard {
+        const Parked*& keep_ref;
+        bool& unpark_ref;
+        RestorePinGuard(const Parked*& k, bool& u, const Parked* target) : keep_ref(k), unpark_ref(u) {
+          keep_ref = target;
+        }
+        ~RestorePinGuard() {
+          unpark_ref = false;
+          keep_ref = nullptr;
+        }
+      } pin_guard(active_keep_, unparking_, parked);
+
+      park_live(parked, request_evictions_);
+      const ParkTier restored_tier = parked->tier;
+      const bool restored_root = parked->is_root;
+      unparking_ = true;
       CUDA_CHECK(cudaEventRecord(restore_start_, stream));
-      const std::size_t unpark_bytes = unpark(*it);
+      const std::size_t unpark_bytes = unpark(*parked);
       const std::size_t ckpt_bytes = restore_checkpoint();
       CUDA_CHECK(cudaEventRecord(restore_end_, stream));
+      unparking_ = false;
       restore_timed = true;
       start = checkpoint_ids_.size();
       stats.restored_bytes = std::uint64_t(unpark_bytes + ckpt_bytes);
@@ -435,52 +528,82 @@ class EngineGenerator final : public Generator {
       stats.reuse = Reuse::Checkpoint;
       stats.restored_bytes = std::uint64_t(ckpt_bytes);
     } else {
-      if (!bypass_reuse) park_live(nullptr, nullptr, request_evictions_);
+      if (!bypass_reuse) park_live(nullptr, request_evictions_);
       reset_state(st, stream);
       if (drafter_) drafter_->reset();
       tokens_in_state_.clear();
       checkpoint_ids_.clear();
+      live_images_.clear();
+      checkpoint_images_.clear();
       live_identity_ = req_identity;
       checkpoint_identity_ = StateIdentity{};
       live_bypass_reuse_ = bypass_reuse;
+      stats.reuse = Reuse::None;
       stats.restored_bytes = 0u;
       stats.restore_seconds = 0.0;
-      stats.reuse = Reuse::None;
-      stats.restored_bytes = 0;
-      stats.restore_seconds = 0.0;
-      // Optional disk KV checkpoint resume (explicit --kv-ckpt-resume fails loudly; --kv-ckpt-path auto-resumes on exact prefix match).
-      // Disk KV checkpoints belong to the unhooked baseline (persona_key == 0, empty namespace); never cross-contaminate.
+      // Optional disk KV checkpoint resume (explicit --kv-ckpt-resume fails loudly; --kv-ckpt-path auto-resumes
+      // only when exact runtime identity, text-only prefix, drafter compatibility, and boundary logits are proved).
+      auto has_media_before = [&](int pos_limit) {
+        for (const PromptImage& img : images) {
+          if (img.pos < pos_limit) return true;
+        }
+        return false;
+      };
       const bool baseline_disk_ok =
-          req_identity.persona_key == 0 && req_identity.cache_namespace.empty() && !bypass_reuse;
+          req_identity.persona_key == 0 && req_identity.cache_namespace.empty() && !bypass_reuse &&
+          options_.ablation.empty();
       if (!options_.kv_ckpt_resume.empty()) {
-        if (req_identity.persona_key != 0 || !req_identity.cache_namespace.empty() || bypass_reuse) {
-          throw std::invalid_argument("--kv-ckpt-resume cannot be combined with a hooked persona, namespace, or --no-prefix-cache");
+        if (!baseline_disk_ok) {
+          throw std::invalid_argument(
+              "--kv-ckpt-resume cannot be combined with an ablation, hooked persona, namespace, or --no-prefix-cache");
+        }
+        if (drafter_) {
+          throw std::invalid_argument(
+              "--kv-ckpt-resume is incompatible with --spec (disk checkpoint stores no DSpark drafter state)");
+        }
+        const KvCheckpointInfo info = inspect_kv_checkpoint(options_.kv_ckpt_resume);
+        if (info.act_dtype != req_identity.act_dtype || info.kv_format != req_identity.kv_format) {
+          throw std::runtime_error("--kv-ckpt-resume runtime dtype/kv_format mismatch");
+        }
+        if (info.pos > 0 && has_media_before(info.pos)) {
+          throw std::invalid_argument(
+              "--kv-ckpt-resume cannot resume a prefix containing images (disk checkpoint hashes token IDs only)");
+        }
+        if (info.pos == int(n) && !info.has_logits) {
+          throw std::runtime_error(
+              "--kv-ckpt-resume checkpoint omits boundary logits (has_logits=false) at full prompt length");
         }
         const auto tr = std::chrono::steady_clock::now();
         const int resumed = load_kv_checkpoint(st, options_.model_dir, ids, static_cast<float*>(logits_.p),
                                                options_.kv_ckpt_resume, stream);
         start = std::size_t(resumed);
+        resumed_has_full_state = info.has_logits && !drafter_;
         stats.reuse = Reuse::Checkpoint;
-        stats.restored_bytes = std::nullopt;  // exact payload transfer bytes not yet counted inside load_kv_checkpoint
+        stats.restored_bytes = std::nullopt;  // disk payload transfer bytes not counted inside load_kv_checkpoint
         stats.restore_seconds = seconds_since(tr);
-        std::fprintf(stderr, "[kv-ckpt] resumed %d / %zu tokens from %s\n", resumed, n,
-                     options_.kv_ckpt_resume.c_str());
-      } else if (baseline_disk_ok && !options_.kv_ckpt_path.empty() &&
+        std::fprintf(stderr, "[kv-ckpt] resumed %d / %zu tokens from %s (has_logits=%s)\n", resumed, n,
+                     options_.kv_ckpt_resume.c_str(), info.has_logits ? "true" : "false");
+      } else if (baseline_disk_ok && !drafter_ && !options_.kv_ckpt_path.empty() &&
                  std::filesystem::exists(options_.kv_ckpt_path)) {
         try {
           const KvCheckpointInfo info = inspect_kv_checkpoint(options_.kv_ckpt_path);
-          if (info.pos > 0 && std::size_t(info.pos) <= n) {
+          const bool compat = info.pos > 0 && std::size_t(info.pos) <= n &&
+                              info.act_dtype == req_identity.act_dtype && info.kv_format == req_identity.kv_format &&
+                              info.pos <= options_.max_ctx && !has_media_before(info.pos) &&
+                              !(info.pos == int(n) && !info.has_logits);
+          if (compat) {
             const auto psha = sha256_bytes(ids.data(), std::size_t(info.pos) * sizeof(std::int32_t));
             if (psha == info.prompt_sha256) {
               const auto tr = std::chrono::steady_clock::now();
               const int resumed = load_kv_checkpoint(st, options_.model_dir, ids, static_cast<float*>(logits_.p),
                                                      options_.kv_ckpt_path, stream);
               start = std::size_t(resumed);
+              resumed_has_full_state = info.has_logits && !drafter_;
               stats.reuse = Reuse::Checkpoint;
               stats.restored_bytes = std::nullopt;
               stats.restore_seconds = seconds_since(tr);
-              std::fprintf(stderr, "[kv-ckpt] auto-resumed %d / %zu tokens from %s\n", resumed, n,
-                           options_.kv_ckpt_path.c_str());
+              std::fprintf(stderr, "[kv-ckpt] auto-resumed %d / %zu tokens from %s (has_logits=%s)\n", resumed, n,
+                           options_.kv_ckpt_path.c_str(), info.has_logits ? "true" : "false");
             }
           }
         } catch (const std::exception& e) {
@@ -491,16 +614,19 @@ class EngineGenerator final : public Generator {
     }
 
     // Verified root-prefix snapshot boundary: only capture if we have parking budget, a valid verified root
-    // boundary >= kMinRootTokens, and no exact parked copy already exists for (ids[0..root_len), req_identity).
+    // boundary >= kMinRootTokens, and no exact parked copy already exists for (ids[0..root_len), images, identity).
     const std::size_t root_len =
         (!bypass_reuse && can_park_any() && root_prefix_tokens >= int(kMinRootTokens))
             ? std::size_t(root_prefix_tokens)
             : 0u;
+    const std::vector<VerifiedImageSpan> root_images =
+        root_len > 0 ? filter_images_in_prefix(req_images, root_len) : std::vector<VerifiedImageSpan>{};
     bool need_root_capture =
-        root_len > 0 && !has_exact_parked(ids.subspan(0, root_len), req_identity, /*mark_root=*/true);
-    // If we restored an exact checkpoint at `root_len` (logits_ is exact for root_len - 1), promote it to root now.
-    if (need_root_capture && start == root_len && stats.reuse == Reuse::Checkpoint) {
-      capture_root_checkpoint(ids.subspan(0, root_len), req_identity, request_evictions_);
+        root_len > 0 && !has_exact_parked(ids.subspan(0, root_len), root_images, req_identity, /*mark_root=*/true);
+    // Only promote an exact-length restored checkpoint to a reusable root when full runtime/drafter state AND
+    // boundary logits at root_len - 1 are proved (never promote a logit-less or drafter-less disk resume).
+    if (need_root_capture && start == root_len && stats.reuse == Reuse::Checkpoint && resumed_has_full_state) {
+      capture_root_checkpoint(ids.subspan(0, root_len), root_images, req_identity, request_evictions_);
       need_root_capture = false;
     }
 
@@ -562,11 +688,11 @@ class EngineGenerator final : public Generator {
       }
       const std::size_t done = s + step;
       if (need_root_capture && done == root_len) {
-        capture_root_checkpoint(ids.subspan(0, root_len), req_identity, request_evictions_);
+        capture_root_checkpoint(ids.subspan(0, root_len), root_images, req_identity, request_evictions_);
         need_root_capture = false;
       }
-      if (req_identity.persona_key == 0 && req_identity.cache_namespace.empty() && !bypass_reuse &&
-          !options_.kv_ckpt_path.empty()) {
+      if (!drafter_ && options_.ablation.empty() && images.empty() && req_identity.persona_key == 0 &&
+          req_identity.cache_namespace.empty() && !bypass_reuse && !options_.kv_ckpt_path.empty()) {
         const bool sigterm = kv_checkpoint_sigterm_requested();
         const bool periodic = (options_.kv_ckpt_every > 0 && done >= next_ckpt && done < n);
         if (periodic || sigterm) {
@@ -586,10 +712,12 @@ class EngineGenerator final : public Generator {
     }
     if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream));  // queued chunks read the rows freed here
     tokens_in_state_.assign(ids.begin(), ids.end());
+    live_images_ = req_images;
     live_identity_ = req_identity;
     live_bypass_reuse_ = bypass_reuse;
     if (bypass_reuse) {
       checkpoint_ids_.clear();
+      checkpoint_images_.clear();
       checkpoint_identity_ = StateIdentity{};
     } else if (start < n) {
       save_checkpoint();
@@ -598,15 +726,22 @@ class EngineGenerator final : public Generator {
     stats.cache_evictions = request_evictions_;
   }
 
-  // Two-tier bounded conversation & root-prefix parking.
+  // Two-tier bounded conversation & root-prefix parking (stored in std::list for stable node addresses/iterators
+  // across concurrent-tier LRU evictions and demotions).
   // Tier 0 (VRAM): up to park_budget_ bytes, fast D2D copies, dropped on VRAM pressure.
   // Tier 1 (Pinned Host RAM): up to host_park_budget_ bytes, async PCIe D2H/H2D DMA, strict LRU eviction,
   //   graceful fallback under host memory pressure, survives GPU VRAM pressure (0 bytes of VRAM).
-  // Every entry is keyed by full StateIdentity + exact token IDs (hashes are index accelerators only).
+  // Every entry is keyed by full StateIdentity + exact token IDs + verified image SHA-256 spans.
+  // Eviction semantics:
+  //   - vram_evictions: Tier-0 VRAM entries dropped (capacity drop without demotion, VRAM OOM release, or disable).
+  //   - host_evictions: Tier-1 Host entries dropped (capacity LRU or host pinned OOM retry).
+  //   - host_demotions: Tier-0 -> Tier-1 moves (preserved in Tier 1, NOT counted as evictions).
+  //   - Superseded same-conversation prefix replacements are NOT counted as capacity evictions.
   enum class ParkTier : std::uint8_t { Vram = 0, Host = 1 };
 
   struct Parked {
     std::vector<std::int32_t> ids, context;
+    std::vector<VerifiedImageSpan> images;
     StateIdentity identity;
     std::uint64_t id_hash = 0;
     std::uint64_t prefix_hash = 0;
@@ -670,12 +805,13 @@ class EngineGenerator final : public Generator {
 
   PrefixCacheStats cache_stats_locked() const noexcept { return cache_stats_; }
 
-  bool has_exact_parked(std::span<const std::int32_t> prefix, const StateIdentity& identity, bool mark_root) {
+  bool has_exact_parked(std::span<const std::int32_t> prefix, const std::vector<VerifiedImageSpan>& imgs,
+                        const StateIdentity& identity, bool mark_root) {
     const std::uint64_t ih = hash_state_identity(identity);
     const std::uint64_t ph = hash_token_prefix(prefix);
     for (Parked& p : parked_) {
       if (p.id_hash == ih && p.prefix_hash == ph && p.ids.size() == prefix.size() && p.identity == identity &&
-          std::equal(p.ids.begin(), p.ids.end(), prefix.begin())) {
+          p.images == imgs && std::equal(p.ids.begin(), p.ids.end(), prefix.begin())) {
         if (mark_root) p.is_root = true;
         p.used = ++clock_;
         refresh_cache_usage_locked();
@@ -685,9 +821,10 @@ class EngineGenerator final : public Generator {
     return false;
   }
 
-  // Longest exact parked prefix of `ids` matching `identity` with length > `live`.
-  // Prefers Tier 0 (VRAM) over Tier 1 (Host) on equal length (dedup makes equal lengths distinct only in theory).
-  Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live, const StateIdentity& identity) {
+  // Longest exact parked prefix of `ids` matching `identity` and verified `req_images` with length > `live`.
+  // Prefers Tier 0 (VRAM) over Tier 1 (Host) on equal length.
+  Parked* find_parked(std::span<const std::int32_t> ids, const std::vector<VerifiedImageSpan>& req_images,
+                      std::size_t live, const StateIdentity& identity) {
     const std::uint64_t ih = hash_state_identity(identity);
     Parked* best = nullptr;
     for (Parked& p : parked_) {
@@ -695,20 +832,28 @@ class EngineGenerator final : public Generator {
       if (p.id_hash != ih || p.ids.size() < min_len || p.ids.size() <= live || p.ids.size() > ids.size()) continue;
       if (best && p.ids.size() < best->ids.size()) continue;
       if (best && p.ids.size() == best->ids.size() && best->tier == ParkTier::Vram) continue;
-      if (p.identity == identity && std::equal(p.ids.begin(), p.ids.end(), ids.begin())) {
+      if (p.identity == identity && std::equal(p.ids.begin(), p.ids.end(), ids.begin()) &&
+          images_match_prefix(p.images, req_images, p.ids.size())) {
         best = &p;
       }
     }
     return best;
   }
 
-  // The release hook (core/arena.h): a device allocation failed; drop Tier-0 VRAM parked entries so it can
-  // retry. Tier-1 pinned host entries hold 0 bytes of VRAM and stay intact.
+  // The release hook (core/arena.h): invoked outside arena.cu's registry lock by THIS generator (same thread,
+  // holding mutex_) or by ANOTHER generator on another thread. Never deadlocks or races with an active request,
+  // never drops a pinned pending restore (`active_keep_`), and preserves Tier-1 pinned host entries (0 VRAM).
   bool release_parked() {
-    if (parking_) return false;
+    const bool same_thread = (active_owner_.load(std::memory_order_acquire) == std::this_thread::get_id());
+    std::unique_lock<std::mutex> lk;
+    if (!same_thread) {
+      lk = std::unique_lock<std::mutex>(mutex_, std::try_to_lock);
+      if (!lk.owns_lock()) return false;  // another thread is mid-request on this generator; skip safely
+    }
+    if (parking_ || unparking_) return false;
     bool any_vram = false;
     for (const Parked& p : parked_) {
-      if (p.tier == ParkTier::Vram) {
+      if (p.tier == ParkTier::Vram && &p != active_keep_) {
         any_vram = true;
         break;
       }
@@ -716,41 +861,41 @@ class EngineGenerator final : public Generator {
     if (!any_vram) return false;
     cudaStreamSynchronize(rt_.stream());  // copies from or into parked buffers may be queued
     std::size_t dropped = 0;
-    std::erase_if(parked_, [&](const Parked& p) {
-      if (p.tier == ParkTier::Vram) {
+    for (auto it = parked_.begin(); it != parked_.end();) {
+      if (it->tier == ParkTier::Vram && &(*it) != active_keep_) {
+        it = parked_.erase(it);
         ++dropped;
-        return true;
+      } else {
+        ++it;
       }
-      return false;
-    });
-    request_evictions_ += int(dropped);
+    }
+    if (same_thread) request_evictions_ += int(dropped);
     cache_stats_.vram_evictions += dropped;
     ++cache_stats_.vram_pressure_releases;
     refresh_cache_usage_locked();
     std::fprintf(stderr, "device memory low: released %zu VRAM parked conversation(s)\n", dropped);
-    return true;
+    return dropped > 0;
   }
 
-  std::size_t tier_used_bytes(ParkTier tier, const std::vector<std::int32_t>* keep, const StateIdentity* keep_id,
-                              std::size_t* kept_out = nullptr) const noexcept {
+  std::size_t tier_used_bytes(ParkTier tier, const Parked* keep_entry, std::size_t* kept_out = nullptr) const noexcept {
     std::size_t total = 0, kept_bytes = 0;
     for (const Parked& p : parked_) {
       if (p.tier != tier) continue;
       total += p.bytes;
-      if (keep && keep_id && p.ids == *keep && p.identity == *keep_id) kept_bytes += p.bytes;
+      if (keep_entry && &p == keep_entry) kept_bytes += p.bytes;
     }
     if (kept_out) *kept_out = kept_bytes;
     return total;
   }
 
   // Attempt to allocate a PinnedHostBuffer of `bytes` within `host_park_budget_`, evicting Tier-1 LRU entries
-  // as needed and degrading gracefully under host memory pressure (never throws).
-  bool alloc_host_park_slot(std::size_t bytes, const std::vector<std::int32_t>* keep, const StateIdentity* keep_id,
-                            PinnedHostBuffer& out, int& req_evictions) {
+  // as needed and degrading gracefully under host memory pressure (never throws). Because `parked_` is a
+  // std::list, erasing any Tier-1 entry NEVER invalidates caller iterators or `keep_entry`.
+  bool alloc_host_park_slot(std::size_t bytes, const Parked* keep_entry, PinnedHostBuffer& out, int& req_evictions) {
     if (host_park_budget_ == 0 || bytes == 0) return false;
-    auto kept = [&](const Parked& p) { return keep && keep_id && p.ids == *keep && p.identity == *keep_id; };
+    auto kept = [&](const Parked& p) { return keep_entry && &p == keep_entry; };
     std::size_t kept_host = 0;
-    std::size_t host_used = tier_used_bytes(ParkTier::Host, keep, keep_id, &kept_host);
+    std::size_t host_used = tier_used_bytes(ParkTier::Host, keep_entry, &kept_host);
     if (kept_host + bytes > host_park_budget_) return false;
 
     auto evict_one_host_lru = [&]() -> bool {
@@ -810,55 +955,63 @@ class EngineGenerator final : public Generator {
     }
   }
 
-  // Demote a Tier-0 VRAM entry into Tier-1 pinned host RAM instead of dropping it, when budget allows.
-  bool try_demote_to_host(Parked& victim, const std::vector<std::int32_t>* keep, const StateIdentity* keep_id,
-                          int& req_evictions) {
-    if (host_park_budget_ == 0 || victim.tier != ParkTier::Vram) return false;
-    // Never evict `victim` itself while making room in Tier 1 (victim is still Tier 0 anyway).
+  // Demote a Tier-0 VRAM list node into Tier-1 pinned host RAM instead of dropping it, when budget allows.
+  // `victim` is a stable std::list iterator and remains valid even if alloc_host_park_slot evicts earlier nodes
+  // or fails allocation.
+  bool try_demote_to_host(std::list<Parked>::iterator victim, const Parked* keep_entry, int& req_evictions) {
+    if (host_park_budget_ == 0 || victim == parked_.end() || victim->tier != ParkTier::Vram ||
+        &(*victim) == keep_entry) {
+      return false;
+    }
     PinnedHostBuffer hbuf;
-    if (!alloc_host_park_slot(victim.bytes, keep, keep_id, hbuf, req_evictions)) return false;
+    if (!alloc_host_park_slot(victim->bytes, keep_entry, hbuf, req_evictions)) return false;
     const cudaStream_t s = rt_.stream();
-    CUDA_CHECK(cudaMemcpyAsync(hbuf.data(), victim.vram_data.p, victim.bytes, cudaMemcpyDeviceToHost, s));
-    CUDA_CHECK(cudaStreamSynchronize(s));  // D2H must finish before releasing victim.vram_data
-    victim.vram_data = DeviceBuffer();
-    victim.host_data = std::move(hbuf);
-    victim.tier = ParkTier::Host;
-    cache_stats_.d2h_park_bytes += victim.bytes;
+    CUDA_CHECK(cudaMemcpyAsync(hbuf.data(), victim->vram_data.p, victim->bytes, cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));  // D2H must finish before releasing victim->vram_data
+    cache_stats_.d2h_park_bytes += victim->bytes;  // exact cudaMemcpyAsync transfer size
+    victim->vram_data = DeviceBuffer();
+    victim->host_data = std::move(hbuf);
+    victim->tier = ParkTier::Host;
     ++cache_stats_.host_demotions;
     refresh_cache_usage_locked();
     return true;
   }
 
   // Copies the current packed checkpoint in `checkpoint_` plus full rows [0, n) from `rt_.state()` into a new
-  // Tier-0 VRAM or Tier-1 pinned host RAM entry. Never fails the request.
-  void store_parked_from_checkpoint(std::span<const std::int32_t> ids, const StateIdentity& identity, bool is_root,
-                                    const std::vector<std::int32_t>* keep, const StateIdentity* keep_id,
+  // Tier-0 VRAM or Tier-1 pinned host RAM entry. Never fails the request and never evicts `keep_entry`.
+  void store_parked_from_checkpoint(std::span<const std::int32_t> ids, const std::vector<VerifiedImageSpan>& imgs,
+                                    const StateIdentity& identity, bool is_root, const Parked* keep_entry,
                                     int& req_evictions) {
     const std::size_t n = ids.size();
     const std::size_t min_len = is_root ? kMinRootTokens : kMinParked;
     if (!can_park_any() || n < min_len) return;
-    if (has_exact_parked(ids, identity, is_root)) return;
+    if (has_exact_parked(ids, imgs, identity, is_root)) return;
 
-    auto kept = [&](const Parked& p) { return keep && keep_id && p.ids == *keep && p.identity == *keep_id; };
+    auto kept = [&](const Parked& p) { return keep_entry && &p == keep_entry; };
 
-    // A non-root parked prefix of this conversation (same StateIdentity) is superseded by it.
+    // A non-root parked prefix of this conversation (same StateIdentity & verified images) is superseded by it.
     // Root checkpoints (`p.is_root == true`) are NEVER erased as superseded so forks immediately after the
     // root boundary still hit the root checkpoint even after a sibling conversation grows longer.
     if (!is_root) {
       bool any_superseded = false;
       for (const Parked& p : parked_) {
         if (!kept(p) && !p.is_root && p.identity == identity && p.ids.size() < n &&
-            std::equal(p.ids.begin(), p.ids.end(), ids.begin())) {
+            std::equal(p.ids.begin(), p.ids.end(), ids.begin()) && images_match_prefix(p.images, imgs, p.ids.size())) {
           any_superseded = true;
           break;
         }
       }
       if (any_superseded) {
         CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
-        std::erase_if(parked_, [&](const Parked& p) {
-          return !kept(p) && !p.is_root && p.identity == identity && p.ids.size() < n &&
-                 std::equal(p.ids.begin(), p.ids.end(), ids.begin());
-        });
+        for (auto it = parked_.begin(); it != parked_.end();) {
+          if (!kept(*it) && !it->is_root && it->identity == identity && it->ids.size() < n &&
+              std::equal(it->ids.begin(), it->ids.end(), ids.begin()) &&
+              images_match_prefix(it->images, imgs, it->ids.size())) {
+            it = parked_.erase(it);
+          } else {
+            ++it;
+          }
+        }
         refresh_cache_usage_locked();
       }
     }
@@ -866,6 +1019,7 @@ class EngineGenerator final : public Generator {
     const ParkLayout l = park_layout(int(n));
     Parked entry;
     entry.ids.assign(ids.begin(), ids.end());
+    entry.images = imgs;
     entry.identity = identity;
     entry.id_hash = hash_state_identity(identity);
     entry.prefix_hash = hash_token_prefix(ids);
@@ -876,7 +1030,7 @@ class EngineGenerator final : public Generator {
     // Try Tier 0 (VRAM) first if budget fits.
     if (park_budget_ > 0) {
       std::size_t kept_vram = 0;
-      std::size_t vram_used = tier_used_bytes(ParkTier::Vram, keep, keep_id, &kept_vram);
+      std::size_t vram_used = tier_used_bytes(ParkTier::Vram, keep_entry, &kept_vram);
       if (kept_vram + l.bytes <= park_budget_) {
         while (vram_used + l.bytes > park_budget_) {
           auto lru = parked_.end();
@@ -885,9 +1039,10 @@ class EngineGenerator final : public Generator {
           }
           if (lru == parked_.end()) break;
           const std::size_t victim_bytes = lru->bytes;
-          if (try_demote_to_host(*lru, keep, keep_id, req_evictions)) {
+          if (try_demote_to_host(lru, keep_entry, req_evictions)) {
             vram_used -= victim_bytes;
           } else {
+            // `lru` remains valid in std::list even if alloc_host_park_slot evicted earlier Tier-1 nodes.
             CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
             vram_used -= victim_bytes;
             parked_.erase(lru);
@@ -908,8 +1063,15 @@ class EngineGenerator final : public Generator {
             cudaGetLastError();  // clear sticky error
             CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
             park_budget_ = 0;
-            const std::size_t dropped =
-                std::erase_if(parked_, [&](const Parked& q) { return q.tier == ParkTier::Vram && !kept(q); });
+            std::size_t dropped = 0;
+            for (auto it = parked_.begin(); it != parked_.end();) {
+              if (it->tier == ParkTier::Vram && !kept(*it)) {
+                it = parked_.erase(it);
+                ++dropped;
+              } else {
+                ++it;
+              }
+            }
             req_evictions += int(dropped);
             cache_stats_.vram_evictions += dropped;
             refresh_cache_usage_locked();
@@ -921,7 +1083,7 @@ class EngineGenerator final : public Generator {
     // Fall back to Tier 1 (Pinned Host RAM) if Tier 0 was disabled, too small, or failed allocation.
     if (!allocated && host_park_budget_ > 0) {
       PinnedHostBuffer hbuf;
-      if (alloc_host_park_slot(l.bytes, keep, keep_id, hbuf, req_evictions)) {
+      if (alloc_host_park_slot(l.bytes, keep_entry, hbuf, req_evictions)) {
         entry.host_data = std::move(hbuf);
         entry.tier = ParkTier::Host;
         allocated = true;
@@ -936,39 +1098,44 @@ class EngineGenerator final : public Generator {
     const char* c = static_cast<const char*>(checkpoint_.p);
     const cudaStream_t s = rt_.stream();
     const cudaMemcpyKind kind = (entry.tier == ParkTier::Vram) ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
+    std::size_t copied = 0;
     CUDA_CHECK(cudaMemcpyAsync(dst, c, checkpoint_drafter_, kind, s));
+    copied += checkpoint_drafter_;
     for (int i = 0; i < 3 && drafter_; ++i) {
       if (l.drafter[i].bytes > 0) {
         CUDA_CHECK(cudaMemcpyAsync(dst + l.drafter_off[i], c + checkpoint_drafter_ + l.drafter[i].offset,
                                    l.drafter[i].bytes, kind, s));
+        copied += l.drafter[i].bytes;
       }
     }
     CUDA_CHECK(cudaMemcpyAsync(dst + l.logits, c + checkpoint_logits_, logits_.bytes, kind, s));
-    rt_.save_full_rows(dst + l.rows, int(n));
+    copied += logits_.bytes;
+    copied += rt_.save_full_rows(dst + l.rows, int(n));
     if (drafter_) entry.context = drafter_->checkpoint_context();
     entry.used = ++clock_;
-    if (entry.tier == ParkTier::Vram) cache_stats_.d2d_park_bytes += l.bytes;
-    else cache_stats_.d2h_park_bytes += l.bytes;
+    if (entry.tier == ParkTier::Vram) cache_stats_.d2d_park_bytes += copied;
+    else cache_stats_.d2h_park_bytes += copied;
     parked_.push_back(std::move(entry));
     refresh_cache_usage_locked();
   }
 
   // Parks the live conversation's checkpoint (from checkpoint_ + live full rows [0, n)).
-  void park_live(const std::vector<std::int32_t>* keep, const StateIdentity* keep_id, int& req_evictions) {
+  void park_live(const Parked* keep_entry, int& req_evictions) {
     if (checkpoint_ids_.empty()) return;
-    store_parked_from_checkpoint(checkpoint_ids_, checkpoint_identity_, /*is_root=*/false, keep, keep_id, req_evictions);
+    store_parked_from_checkpoint(checkpoint_ids_, checkpoint_images_, checkpoint_identity_, /*is_root=*/false,
+                                 keep_entry, req_evictions);
   }
 
   // Captures the live state at an exact verified root-prefix boundary `root_ids` right after prefilling to it.
   // Uses the pre-allocated fixed `checkpoint_` device staging buffer (zero dynamic device staging allocation).
-  void capture_root_checkpoint(std::span<const std::int32_t> root_ids, const StateIdentity& identity,
-                               int& req_evictions) {
+  void capture_root_checkpoint(std::span<const std::int32_t> root_ids, const std::vector<VerifiedImageSpan>& root_imgs,
+                               const StateIdentity& identity, int& req_evictions) {
     char* p = static_cast<char*>(checkpoint_.p);
     rt_.save_checkpoint(p);
     if (drafter_) drafter_->save_checkpoint(p + checkpoint_drafter_);
     CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
-    store_parked_from_checkpoint(root_ids, identity, /*is_root=*/true, nullptr, nullptr, req_evictions);
+    store_parked_from_checkpoint(root_ids, root_imgs, identity, /*is_root=*/true, nullptr, req_evictions);
   }
 
   // Puts a parked conversation (VRAM or pinned host RAM) back into the fixed `checkpoint_` staging buffer and
@@ -995,6 +1162,7 @@ class EngineGenerator final : public Generator {
     copied += rt_.restore_full_rows(src + l.rows, n);
     if (drafter_) drafter_->adopt_checkpoint(c + checkpoint_drafter_, n, p.context);
     checkpoint_ids_ = p.ids;
+    checkpoint_images_ = p.images;
     checkpoint_identity_ = p.identity;
     p.used = ++clock_;
     if (p.tier == ParkTier::Vram) cache_stats_.d2d_restore_bytes += copied;
@@ -1011,6 +1179,7 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
     checkpoint_ids_ = tokens_in_state_;
+    checkpoint_images_ = live_images_;
     checkpoint_identity_ = live_identity_;
   }
 
@@ -1022,7 +1191,9 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
     copied += logits_.bytes;
+    cache_stats_.d2d_restore_bytes += copied;
     tokens_in_state_ = checkpoint_ids_;
+    live_images_ = checkpoint_images_;
     live_identity_ = checkpoint_identity_;
     live_bypass_reuse_ = false;
     return copied;
@@ -1055,21 +1226,32 @@ class EngineGenerator final : public Generator {
   DeviceBuffer checkpoint_;
   std::size_t checkpoint_drafter_ = 0, checkpoint_logits_ = 0;  // byte offsets in checkpoint_
   cudaEvent_t restore_start_ = nullptr, restore_end_ = nullptr;
+  struct HookControl {
+    std::mutex m;
+    EngineGenerator* gen = nullptr;
+  };
+
   StateIdentity base_identity_;
   StateIdentity live_identity_;
   StateIdentity checkpoint_identity_;
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;
+  std::vector<VerifiedImageSpan> checkpoint_images_;
+  std::vector<VerifiedImageSpan> live_images_;
   bool live_bypass_reuse_ = false;
   persona::RefusalMap refusal_map_;
-  std::vector<Parked> parked_;
+  std::list<Parked> parked_;
   std::size_t park_budget_ = 0;       // Tier-0 VRAM bytes
   std::size_t host_park_budget_ = 0;  // Tier-1 pinned host RAM bytes
   PrefixCacheStats cache_stats_;
   std::uint64_t clock_ = 0;           // monotonic LRU clock
   bool parking_ = false;              // park allocation guard against re-entrant release hook
+  bool unparking_ = false;            // restore guard against re-entrant release hook
+  const Parked* active_keep_ = nullptr;  // pinned entry currently being restored
   int request_evictions_ = 0;         // parked entries evicted/released during the active request
+  std::shared_ptr<HookControl> hook_ctrl_;
   int release_hook_ = -1;
+  std::atomic<std::thread::id> active_owner_{};
   mutable std::mutex mutex_;
 };
 

@@ -52,12 +52,13 @@ struct PromptImage {
 };
 
 // A prompt: token ids, images in position order (without overlap), optional verified root-prefix snapshot
-// boundary hint (0 = none; never a trust key), and optional cache isolation namespace.
+// boundary hint (0 = none; never a trust key), optional cache isolation namespace, and per-request bypass.
 struct Prompt {
   std::span<const std::int32_t> ids;
   std::span<const PromptImage> images;
   int root_prefix_tokens = 0;
   std::string cache_namespace;
+  bool bypass_prefix_cache = false;
 };
 
 // Validates that `root_prefix_tokens` lies inside [0, ids.size()] and does not straddle any PromptImage.
@@ -77,9 +78,9 @@ enum class Reuse {
   Extend,          // the prompt extends the tokens in the state (previous prompt + processed generated tokens)
   Checkpoint,      // restored the checkpoint taken after the previous prompt's prefill (a prefix of this prompt)
   Parked,          // restored a parked conversation's checkpoint in VRAM (a prefix of this prompt; RuntimeOptions::park_mb)
-  RootCheckpoint,  // restored a verified root-prefix (system+tools) checkpoint from VRAM (#826)
-  HostParked,      // restored a parked checkpoint (root or conversation) from pinned host RAM (#826)
-  PagedPrefix,     // restored a shared paged full-KV + recurrent prefix checkpoint (batched B>1, #825)
+  RootCheckpoint,  // restored a verified root-prefix (system+tools) checkpoint
+  HostParked,      // restored a parked conversation's checkpoint from pinned host RAM
+  PagedPrefix,     // restored a shared paged full-KV + recurrent prefix checkpoint (batched B>1)
 };
 inline const char* to_string(Reuse reuse) {
   switch (reuse) {
@@ -189,10 +190,6 @@ class Generator {
                                  std::span<const int32_t> stop_ids,
                                  const std::function<bool(std::span<const int32_t>)>& on_tokens) = 0;
   // The same for a prompt with images. Generators without image input take prompts without images only.
-  // Optional callback invoked right after prefill completes (strictly before the first on_tokens call),
-  // so callers see exact prompt/reuse stats even if generation stops early.
-  using PrefillCallback = model::PrefillCallback;
-
   virtual GenerateStats generate(const Prompt& prompt, int max_new_tokens, const Sampling& sampling,
                                  std::span<const int32_t> stop_ids,
                                  const std::function<bool(std::span<const int32_t>)>& on_tokens) {
@@ -217,6 +214,9 @@ class Generator {
   // ---- Optional continuous-batching interface (used by Scheduler and ingine-bench when max_batch_size() > 1)
   virtual int max_batch_size() const { return 1; }
   virtual bool can_admit_slot(int /*prompt_tokens*/, int /*max_new_tokens*/) const { return false; }
+  virtual bool can_admit_slot(const Prompt& prompt, int max_new_tokens, const Sampling& /*sampling*/) const {
+    return can_admit_slot(int(prompt.ids.size()), max_new_tokens);
+  }
   // Allocates a free slot, prefills `prompt`, samples `first_token` and fills `stats`. Returns slot id >= 0,
   // or -1 if no slot / KV pages are currently available. Throws std::invalid_argument on invalid prompt.
   virtual int start_slot(const Prompt& /*prompt*/, int /*max_new_tokens*/, const Sampling& /*sampling*/,

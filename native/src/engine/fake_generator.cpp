@@ -123,7 +123,8 @@ model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, i
     std::lock_guard lock(mutex_);
     index = calls_.size();
     calls_.push_back(Call{std::vector<int32_t>(prompt.begin(), prompt.end()), max_new_tokens, sampling,
-                          int(full_prompt.images.size()), image_tokens});
+                          int(full_prompt.images.size()), image_tokens, full_prompt.root_prefix_tokens,
+                          full_prompt.cache_namespace, full_prompt.bypass_prefix_cache});
     hook = prefill_stats_hook_;
   }
   model::GenerateStats stats;

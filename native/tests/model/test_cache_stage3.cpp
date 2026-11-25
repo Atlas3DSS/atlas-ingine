@@ -1,30 +1,38 @@
 // Stage 3 (#826) full-model verification & restore-vs-recompute latency crossover benchmark:
 //   1. Verified root-prefix checkpoint on real ChatFormat-rendered system+tools prompts:
-//      - Fork diverging immediately after the root boundary (Reuse::RootCheckpoint, exact greedy parity)
-//      - Exact-root request (n == R, 0 tokens prefilled, exact greedy parity, even with root hint=0)
-//      - Child conversation extension past R never erases the root checkpoint
-//      - Tenant/branch cache_namespace isolation (fail-closed miss)
-//      - Symmetric --no-prefix-cache toggle (cache-off parity baseline)
+//      - True immediate-divergence fork with asserted LCP(A, B) == R (Reuse::RootCheckpoint, exact greedy parity)
+//      - Sibling forks diverging after R, exact-root request (n == R, hint=0, 0 prefilled), child growth past R
+//      - Tenant/branch cache_namespace isolation (fail-closed miss) & Prompt::bypass_prefix_cache
+//      - Symmetric --no-prefix-cache baseline (counters + true cache-off continuation comparison vs matched-boundary Extend)
 //   2. Bounded pinned host-RAM parking tier (park_host_mb):
 //      - Direct host-only parking (park_mb=0, park_host_mb>0): Reuse::HostParked, 0 VRAM parked, exact parity
-//      - Strict byte cap + LRU eviction (host_used <= host_budget, host_peak <= host_budget, evictions > 0)
-//      - Tier-0 VRAM -> Tier-1 pinned host RAM demotion on VRAM LRU eviction
-//      - Graceful fallback under host pinned OOM (fail_next_pinned_allocations) and VRAM OOM (host entries survive)
-//      - DSpark --spec parity with host-parked root + fork
-//   3. Measured restore-vs-recompute latency crossover sweep across L in {256, 512, 1024, 2048, 4096, 8192, 16384}.
+//      - Strict byte cap + deterministic LRU eviction
+//      - Simultaneous Tier-0 VRAM + Tier-1 Host pressure (demotion evicts earlier Tier-1 entry, victim preserved intact)
+//      - Pin-failure rollback under simultaneous tier pressure (victim cleanly dropped, surviving state uncorrupted)
+//      - VRAM OOM releasing Tier-0 while preserving Tier-1 Host entries & exact demoted root parity
+//      - DSpark --spec root capture + HostParked fork parity
+//      - Disk checkpoint resume & promotion gating (has_logits=false exact-root & non-promotion; --spec rejection/decline)
+//      - Verified media SHA-256 identity binding (identical negative token IDs with different RGB pixels fail closed)
+//   3. Measured apples-to-apples wall TTFT crossover (kReps=3 medians) across L in {64, 128, 256..16384}, with
+//      separate CUDA transfer-event timing and separate prefix-cache vs device-wide VRAM reporting.
 #include "common/test_util.h"
 #include "core/arena.h"
 #include "ingine/generator.h"
+#include "model/kv_checkpoint.h"
+#include "model/model_data.h"
 #include "text/chat.h"
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,10 +67,43 @@ RunOut run_prompt(Generator& gen, const Prompt& p, int max_new, const Sampling& 
   return o;
 }
 
-std::size_t current_vram_used_bytes() {
+std::size_t common_prefix_len(std::span<const std::int32_t> a, std::span<const std::int32_t> b) {
+  const std::size_t m = std::min(a.size(), b.size());
+  std::size_t i = 0;
+  while (i < m && a[i] == b[i]) ++i;
+  return i;
+}
+
+double median_of(std::vector<double> vals) {
+  if (vals.empty()) return 0.0;
+  std::sort(vals.begin(), vals.end());
+  const std::size_t mid = vals.size() / 2;
+  return (vals.size() % 2 == 1) ? vals[mid] : 0.5 * (vals[mid - 1] + vals[mid]);
+}
+
+std::size_t device_wide_vram_used_bytes() {
   std::size_t free_b = 0, total_b = 0;
   cudaMemGetInfo(&free_b, &total_b);
   return total_b > free_b ? (total_b - free_b) : 0;
+}
+
+// Create a valid disk KV checkpoint copy with has_logits=0 (no logits payload), matching kv_checkpoint.cpp RawHeader.
+void strip_logits_from_kv_checkpoint(const std::filesystem::path& src, const std::filesystem::path& dst) {
+  std::ifstream in(src, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open source checkpoint: " + src.string());
+  std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const std::size_t logits_bytes = std::size_t(UNPADDED_VOCAB) * sizeof(float);
+  if (bytes.size() < 4096 + logits_bytes) {
+    throw std::runtime_error("source checkpoint too small to strip logits");
+  }
+  // RawHeader::has_logits sits at byte offset 52 (8-byte magic + 11 x 4-byte scalar fields).
+  std::uint32_t zero = 0;
+  std::memcpy(bytes.data() + 52, &zero, sizeof(zero));
+  bytes.resize(bytes.size() - logits_bytes);
+  std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+  if (!out) throw std::runtime_error("cannot write stripped checkpoint: " + dst.string());
+  out.write(bytes.data(), std::streamsize(bytes.size()));
+  out.close();
 }
 
 }  // namespace
@@ -89,7 +130,8 @@ int main(int argc, char** argv) {
   Sampling greedy;
   greedy.temperature = 0.f;
 
-  // Build a realistic system + tools root (~600-900 tokens) and two forks diverging immediately after root.
+  // Build a realistic system + tools root (~1600 tokens) and forks diverging both at exact index R (LCP == R)
+  // and after user role tokens.
   std::string sys_text =
       "You are an autonomous software engineering agent operating inside a verified build harness.\n"
       "Follow these immutable architectural rules strictly on every turn:\n";
@@ -127,24 +169,36 @@ int main(int argc, char** argv) {
   const auto rp_c = render_fork("Write a short C++ helper to verify token prefix equality without hash trust.");
   const auto rp_root = fmt.render(Json::array({{{"role", "system"}, {"content", sys_text}}}), tools,
                                   ingine::text::ChatOptions{});
+  // Fork diverging immediately at token index R itself: assistant-prefill (enable_thinking=false) begins with
+  // <|message_model|> at index R, whereas rp_a begins with <|message_user|> at index R -> LCP(rp_a, rp_fork_r) == R.
+  ingine::text::ChatOptions no_think_opts;
+  no_think_opts.enable_thinking = false;
+  const auto rp_fork_r =
+      fmt.render(Json::array({{{"role", "system"}, {"content", sys_text}}}), tools, no_think_opts);
+
   const int R = rp_a.root_prefix_tokens;
-  std::printf("[setup] rendered root_prefix_tokens=%d | fork_a=%zu fork_b=%zu fork_c=%zu exact_root=%zu\n", R,
-              rp_a.ids.size(), rp_b.ids.size(), rp_c.ids.size(), rp_root.ids.size());
+  const std::size_t lcp_ar = common_prefix_len(rp_a.ids, rp_fork_r.ids);
+  const std::size_t lcp_ab = common_prefix_len(rp_a.ids, rp_b.ids);
+  std::printf("[setup] rendered root_prefix_tokens=%d | fork_a=%zu fork_b=%zu fork_c=%zu fork_r=%zu exact_root=%zu | "
+              "LCP(A,fork_r)=%zu LCP(A,B)=%zu\n",
+              R, rp_a.ids.size(), rp_b.ids.size(), rp_c.ids.size(), rp_fork_r.ids.size(), rp_root.ids.size(), lcp_ar,
+              lcp_ab);
 
   bool ok = true;
   auto check = [&](bool cond, const char* label) {
     std::printf("%s %s\n", cond ? "PASS" : "FAIL", label);
     ok &= cond;
   };
-  check(R >= 256 && R == rp_b.root_prefix_tokens && R == rp_c.root_prefix_tokens && R == int(rp_root.ids.size()) &&
+  check(R >= 256 && R == rp_b.root_prefix_tokens && R == rp_c.root_prefix_tokens && R == rp_fork_r.root_prefix_tokens &&
+            R == int(rp_root.ids.size()) && lcp_ar == std::size_t(R) && rp_fork_r.ids.size() > std::size_t(R) &&
             std::equal(rp_root.ids.begin(), rp_root.ids.end(), rp_a.ids.begin()) &&
             std::equal(rp_root.ids.begin(), rp_root.ids.end(), rp_b.ids.begin()),
-        "rendered prompts share exact verified root boundary");
+        "rendered prompts share exact verified root boundary with LCP(A, fork_r) == R");
 
   RuntimeOptions base_opt;
   base_opt.model_dir = dir;
   base_opt.max_ctx = 20480;
-  base_opt.prefill_chunk = 512;  // R (~700-900) straddles chunk=512, exercising chunk-split root capture!
+  base_opt.prefill_chunk = 512;  // R (~1629) straddles chunk=512, exercising chunk-split root capture
   base_opt.dense_fp8 = true;
   base_opt.kv_fp8 = !use_kv_q4;
   base_opt.kv_q4 = use_kv_q4;
@@ -152,27 +206,30 @@ int main(int argc, char** argv) {
   base_opt.offload_vram_mb = offload_vram_mb;
 
   // ---- Reference outputs (strict exact-root -> Extend parity oracle, no parking) ----
-  RunOut ref_fork_b, ref_fork_c, ref_exact_root;
+  RunOut ref_fork_b, ref_fork_c, ref_fork_r, ref_exact_root;
   {
     RuntimeOptions opt = base_opt;
     opt.park_mb = 0;
     opt.park_host_mb = 0;
     auto gen = make_generator(opt);
+    const std::vector<std::int32_t> noise(64, 1234);
     ref_exact_root = run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 32, greedy);
-    // Strict Extend from exact-root prefill (0 generated tokens so state is at exact R) -> same chunk boundaries as root restore.
     run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 0, greedy);
     ref_fork_b = run_prompt(*gen, Prompt{rp_b.ids, {}, 0}, 32, greedy);
-    // Reset with unrelated prompt, then exact-root -> Extend for fork C.
-    const std::vector<std::int32_t> noise(64, 1234);
     run_prompt(*gen, Prompt{noise, {}, 0}, 1, greedy);
     run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 0, greedy);
     ref_fork_c = run_prompt(*gen, Prompt{rp_c.ids, {}, 0}, 32, greedy);
+    run_prompt(*gen, Prompt{noise, {}, 0}, 1, greedy);
+    run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 0, greedy);
+    ref_fork_r = run_prompt(*gen, Prompt{rp_fork_r.ids, {}, 0}, 32, greedy);
     check(ref_fork_b.stats.reuse == Reuse::Extend && ref_fork_b.stats.reused_tokens == R &&
-              ref_fork_c.stats.reuse == Reuse::Extend && ref_fork_c.stats.reused_tokens == R,
-          "reference oracle established strict Extend from exact root R");
+              ref_fork_c.stats.reuse == Reuse::Extend && ref_fork_c.stats.reused_tokens == R &&
+              ref_fork_r.stats.reuse == Reuse::Extend && ref_fork_r.stats.reused_tokens == R,
+          "reference oracle established strict Extend from exact root R (including LCP==R fork)");
   }
 
   // ---- Suite 1: B=1 Verified Root-Prefix Checkpoint (VRAM tier), forks, exact-root, child extension, namespace & --no-prefix-cache ----
+  RunOut s1_ob, s1_ofr;
   {
     RuntimeOptions opt = base_opt;
     opt.park_mb = 1024;
@@ -185,15 +242,25 @@ int main(int argc, char** argv) {
               oa.saw_prefill_cb && oa.prefill_cb_before_tokens && oa.prefill_cb_stats.reused_tokens == 0,
           "Suite 1a: cold fork A captures verified root checkpoint (root_entries=1, prefill_cb before tokens)");
 
-    // Fork B diverges immediately after R -> must hit RootCheckpoint with exact greedy parity!
-    const RunOut ob = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
-    check(ob.stats.reuse == Reuse::RootCheckpoint && ob.stats.reused_tokens == R &&
-              ob.stats.restored_bytes.value_or(0) > 0 && ob.tokens == ref_fork_b.tokens && ob.saw_prefill_cb &&
-              ob.prefill_cb_before_tokens && ob.prefill_cb_stats.reused_tokens == R &&
-              ob.prefill_cb_stats.reuse == Reuse::RootCheckpoint,
-          "Suite 1b: fork B diverging right after R hits Reuse::RootCheckpoint with exact greedy parity");
+    // Immediate-divergence fork (LCP(A, fork_r) == R) -> must hit RootCheckpoint with exact greedy parity!
+    const std::uint64_t d2d_before = gen->cache_stats().d2d_restore_bytes;
+    s1_ofr = run_prompt(*gen, Prompt{rp_fork_r.ids, {}, R}, 32, greedy);
+    const std::uint64_t d2d_after = gen->cache_stats().d2d_restore_bytes;
+    check(s1_ofr.stats.reuse == Reuse::RootCheckpoint && s1_ofr.stats.reused_tokens == R &&
+              s1_ofr.stats.restored_bytes.value_or(0) > 0 &&
+              (d2d_after - d2d_before) == s1_ofr.stats.restored_bytes.value_or(0) &&
+              s1_ofr.tokens == ref_fork_r.tokens,
+          "Suite 1b-exact-LCP: fork diverging at exact index R (LCP==R) hits RootCheckpoint with exact parity & D2D byte match");
 
-    // Extend fork A past R (simulating multi-turn child growth) -> root checkpoint MUST NOT be erased as superseded!
+    // Sibling user fork B -> must hit RootCheckpoint with exact greedy parity!
+    s1_ob = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
+    check(s1_ob.stats.reuse == Reuse::RootCheckpoint && s1_ob.stats.reused_tokens == R &&
+              s1_ob.stats.restored_bytes.value_or(0) > 0 && s1_ob.tokens == ref_fork_b.tokens && s1_ob.saw_prefill_cb &&
+              s1_ob.prefill_cb_before_tokens && s1_ob.prefill_cb_stats.reused_tokens == R &&
+              s1_ob.prefill_cb_stats.reuse == Reuse::RootCheckpoint,
+          "Suite 1b: fork B hits Reuse::RootCheckpoint with exact greedy parity");
+
+    // Extend fork A past R (multi-turn child growth) -> root checkpoint MUST NOT be erased as superseded!
     std::vector<std::int32_t> child_a = rp_a.ids;
     child_a.insert(child_a.end(), oa.tokens.begin(), oa.tokens.end());
     const std::vector<std::int32_t> turn2_tail(60, 4242);
@@ -204,64 +271,76 @@ int main(int argc, char** argv) {
               cs_child.root_entries == 1,
           "Suite 1c: child A resumes from parked A and extending past R preserves root checkpoint (root_entries=1)");
 
-    // Fork C diverging right after R STILL hits the preserved root checkpoint!
+    // Fork C STILL hits the preserved root checkpoint!
     const RunOut oc = run_prompt(*gen, Prompt{rp_c.ids, {}, R}, 32, greedy);
     check(oc.stats.reuse == Reuse::RootCheckpoint && oc.stats.reused_tokens == R && oc.tokens == ref_fork_c.tokens,
           "Suite 1d: fork C hits preserved root checkpoint after sibling child growth (exact greedy parity)");
 
-    // Exact-root request (n == R, even with root_prefix_tokens=0 so lookup uses exact token IDs, never trusting hint)
+    // Exact-root request (n == R, even with hint=0 so lookup verifies exact token IDs, never trusting hint)
     const RunOut oroot = run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 32, greedy);
     check(oroot.stats.reuse == Reuse::RootCheckpoint && oroot.stats.reused_tokens == R &&
               oroot.tokens == ref_exact_root.tokens,
           "Suite 1e: exact-root request (hint=0) hits RootCheckpoint with 0 tokens prefilled & exact parity");
 
-    // Namespace isolation: same tokens under a different cache_namespace MUST miss (fail-closed)
-    const RunOut ons = run_prompt(*gen, Prompt{rp_b.ids, {}, R, "tenant-isolated"}, 8, greedy);
-    check(ons.stats.reuse == Reuse::None && ons.stats.reused_tokens == 0,
-          "Suite 1f: different cache_namespace fails closed to Reuse::None");
+    // Namespace isolation + per-request bypass_prefix_cache: both MUST fail closed to Reuse::None
+    const RunOut ons = run_prompt(*gen, Prompt{rp_b.ids, {}, R, "tenant-isolated", false}, 8, greedy);
+    const RunOut obyp = run_prompt(*gen, Prompt{rp_b.ids, {}, R, "", true}, 8, greedy);
+    check(ons.stats.reuse == Reuse::None && ons.stats.reused_tokens == 0 && obyp.stats.reuse == Reuse::None &&
+              obyp.stats.reused_tokens == 0,
+          "Suite 1f: different cache_namespace and Prompt::bypass_prefix_cache fail closed to Reuse::None");
 
     std::printf("[Suite 1 stats] %s\n", gen->offload_summary().c_str());
   }
 
-  // ---- Suite 1g: Symmetric --no-prefix-cache toggle (cache-off parity baseline) ----
+  // ---- Suite 1g: True cache-off baseline (--no-prefix-cache) counters + continuation comparison ----
   {
     RuntimeOptions opt = base_opt;
     opt.prefix_cache = false;
     opt.park_mb = 1024;
     opt.park_host_mb = 1024;
     auto gen = make_generator(opt);
-    const RunOut r1 = run_prompt(*gen, Prompt{rp_root.ids, {}, R}, 16, greedy);
-    const RunOut r2 = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 16, greedy);
+    const RunOut off_root = run_prompt(*gen, Prompt{rp_root.ids, {}, R}, 32, greedy);
+    const RunOut off_b = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
+    const RunOut off_fr = run_prompt(*gen, Prompt{rp_fork_r.ids, {}, R}, 32, greedy);
     const PrefixCacheStats cs = gen->cache_stats();
-    check(r1.stats.reuse == Reuse::None && r2.stats.reuse == Reuse::None && r2.stats.reused_tokens == 0 &&
-              cs.vram_used_bytes == 0 && cs.host_used_bytes == 0 && cs.root_entries == 0,
-          "Suite 1g: prefix_cache=false disables all reuse & parking cleanly (cache-off baseline)");
+    const std::size_t b_match = common_prefix_len(off_b.tokens, s1_ob.tokens);
+    const std::size_t fr_match = common_prefix_len(off_fr.tokens, s1_ofr.tokens);
+    std::printf("[Suite 1g cache-off comparison] exact_root_match=%s | fork_b_unsplit_vs_split_root=%zu/32 | "
+                "fork_r_unsplit_vs_split_root=%zu/32 (matched-boundary Extend parity=32/32; unsplit cold may differ "
+                "only by BF16/FP8 chunk-shape rounding at R=%d vs chunk=%d)\n",
+                (off_root.tokens == ref_exact_root.tokens) ? "32/32" : "DIFF", b_match, fr_match, R,
+                base_opt.prefill_chunk);
+    check(off_root.stats.reuse == Reuse::None && off_b.stats.reuse == Reuse::None && off_b.stats.reused_tokens == 0 &&
+              off_root.tokens == ref_exact_root.tokens && cs.vram_used_bytes == 0 && cs.host_used_bytes == 0 &&
+              cs.root_entries == 0,
+          "Suite 1g: prefix_cache=false disables all reuse & parking and matches exact-root cold continuation");
   }
 
-  // ---- Suite 2: Bounded Pinned Host-RAM Parking (park_mb=0, LRU eviction, VRAM->Host demotion, OOM fallback) ----
+  // ---- Suite 2: Bounded Pinned Host-RAM Parking, Simultaneous Tier Pressure, Rollback, Spec, Disk, Media ----
   {
-    // 2a: Direct host-only parking (0 VRAM parked) + exact fork & exact-root parity + LRU eviction
     RuntimeOptions opt = base_opt;
     opt.park_mb = 0;
-    opt.park_host_mb = 450;  // fits ~2 checkpoints (~175-190 MiB each), forces LRU eviction on 3rd!
+    opt.park_host_mb = 450;  // fits ~2 checkpoints (~175-190 MiB each), forces LRU eviction on 3rd
     auto gen = make_generator(opt);
 
     const RunOut ha = run_prompt(*gen, Prompt{rp_a.ids, {}, R}, 8, greedy);
+    const std::uint64_t h2d_0 = gen->cache_stats().h2d_restore_bytes;
+    const std::uint64_t d2d_0 = gen->cache_stats().d2d_restore_bytes;
     const RunOut hb = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
     const PrefixCacheStats cs_h1 = gen->cache_stats();
+    const std::uint64_t dma_delta = (cs_h1.h2d_restore_bytes - h2d_0) + (cs_h1.d2d_restore_bytes - d2d_0);
     check(ha.stats.reuse == Reuse::None && hb.stats.reuse == Reuse::HostParked && hb.stats.reused_tokens == R &&
-              hb.stats.restored_bytes.value_or(0) > 0 && hb.stats.restore_seconds.value_or(0.0) > 0.0 &&
-              hb.tokens == ref_fork_b.tokens && cs_h1.vram_used_bytes == 0 && cs_h1.vram_peak_bytes == 0 &&
+              hb.stats.restored_bytes.value_or(0) > 0 && dma_delta == hb.stats.restored_bytes.value_or(0) &&
+              hb.stats.restore_seconds.value_or(0.0) > 0.0 && hb.tokens == ref_fork_b.tokens &&
+              cs_h1.vram_used_bytes == 0 && cs_h1.vram_peak_bytes == 0 &&
               cs_h1.host_used_bytes <= cs_h1.host_budget_bytes && cs_h1.host_peak_bytes <= cs_h1.host_budget_bytes,
-          "Suite 2a: direct host-only parking (park_mb=0) hits Reuse::HostParked with 0 VRAM parked & exact parity");
+          "Suite 2a: direct host-only parking (park_mb=0) hits Reuse::HostParked with exact parity & copy-site DMA match");
 
-    // Exact-root from pinned host RAM
     const RunOut hroot = run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 32, greedy);
     check(hroot.stats.reuse == Reuse::HostParked && hroot.stats.reused_tokens == R &&
               hroot.tokens == ref_exact_root.tokens,
           "Suite 2b: exact-root request hits Reuse::HostParked with exact greedy parity");
 
-    // Force host LRU eviction with 3 unrelated 400-token conversations (each ~170 MiB > 450 MiB for 3)
     ingine::test::Rng rng(77);
     auto make_conv = [&](int len) {
       std::vector<std::int32_t> v(static_cast<std::size_t>(len));
@@ -270,10 +349,9 @@ int main(int argc, char** argv) {
     };
     const auto u1 = make_conv(400), u2 = make_conv(400), u3 = make_conv(400), u4 = make_conv(400);
     run_prompt(*gen, Prompt{u1, {}, 0}, 4, greedy);
-    run_prompt(*gen, Prompt{u2, {}, 0}, 4, greedy);  // parks u1 in host
-    run_prompt(*gen, Prompt{u3, {}, 0}, 4, greedy);  // parks u2 in host (evicts older LRU)
-    run_prompt(*gen, Prompt{u4, {}, 0}, 4, greedy);  // parks u3 in host (evicts u1!)
-    // Follow-up on u3 (MRU) should HIT host; follow-up on u1 (LRU evicted) should MISS!
+    run_prompt(*gen, Prompt{u2, {}, 0}, 4, greedy);
+    run_prompt(*gen, Prompt{u3, {}, 0}, 4, greedy);
+    run_prompt(*gen, Prompt{u4, {}, 0}, 4, greedy);
     auto u3_follow = u3;
     u3_follow.push_back(5555);
     auto u1_follow = u1;
@@ -286,9 +364,9 @@ int main(int argc, char** argv) {
               cs_ev.host_used_bytes <= cs_ev.host_budget_bytes && cs_ev.host_peak_bytes <= cs_ev.host_budget_bytes,
           "Suite 2c: bounded host-RAM tier enforces byte cap with deterministic LRU eviction");
 
-    // Graceful fallback under injected host pinned allocation failure (request MUST succeed with exact output!)
     ingine::fail_next_pinned_allocations(2);
     const RunOut hfail = run_prompt(*gen, Prompt{rp_c.ids, {}, R}, 8, greedy);
+    ingine::fail_next_pinned_allocations(0);
     const PrefixCacheStats cs_fail = gen->cache_stats();
     check(hfail.tokens.size() == 8 && cs_fail.host_alloc_failures >= 1,
           "Suite 2d: host pinned OOM degrades gracefully (host_alloc_failures>=1, request succeeds)");
@@ -296,44 +374,137 @@ int main(int argc, char** argv) {
     std::printf("[Suite 2a-2d stats] %s\n", gen->offload_summary().c_str());
   }
 
-  // 2e: Tier-0 VRAM -> Tier-1 Host demotion + VRAM OOM pressure preserves Host entries
+  // 2e + 2e-rollback + 2f: Simultaneous Tier-0 VRAM + Tier-1 Host pressure, pin-failure rollback, and VRAM OOM
   {
     RuntimeOptions opt = base_opt;
-    opt.park_mb = 240;       // fits exactly 1 checkpoint in VRAM (~175-190 MiB)
-    opt.park_host_mb = 1024; // demoted entries land in pinned host RAM
+    opt.park_mb = 240;       // fits exactly 1 checkpoint in Tier-0 VRAM (~175-190 MiB)
+    opt.park_host_mb = 240;  // fits exactly 1 checkpoint in Tier-1 Host -> forces simultaneous tier eviction!
     auto gen = make_generator(opt);
 
-    run_prompt(*gen, Prompt{rp_a.ids, {}, R}, 4, greedy);  // captures root in VRAM (slot 1/1), live=A
-    // An unrelated prompt has no parked match (keep=nullptr), so parking live A into Tier-0 VRAM (240 MiB)
-    // evicts the LRU Tier-0 entry (root) and demotes it to Tier-1 pinned host RAM.
+    // 1. Capture root in Tier-0 VRAM (slot 1/1), live = A.
+    run_prompt(*gen, Prompt{rp_a.ids, {}, R}, 4, greedy);
+    // 2. Fork B restores pinned root from VRAM -> live A spills directly into Tier-1 Host (slot 1/1; Tier-1 FULL!).
+    run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 4, greedy);
+    // 3. Unrelated prompt (keep=nullptr) parks live B into Tier-0 VRAM -> demotes root from Tier-0 to Tier-1,
+    //    which MUST simultaneously evict earlier Tier-1 entry A while keeping root's iterator & data valid!
     std::vector<std::int32_t> unrelated(300, 9999);
     unrelated[0] = 8888;
     run_prompt(*gen, Prompt{unrelated, {}, 0}, 4, greedy);
     const PrefixCacheStats cs_dem = gen->cache_stats();
-    check(cs_dem.host_demotions >= 1 && cs_dem.vram_entries == 1 && cs_dem.host_entries >= 1 &&
-              cs_dem.root_entries >= 1 && cs_dem.vram_peak_bytes <= cs_dem.vram_budget_bytes &&
-              cs_dem.host_peak_bytes <= cs_dem.host_budget_bytes,
-          "Suite 2e: Tier-0 VRAM LRU eviction demotes checkpoint to Tier-1 pinned host RAM");
+    // Verify the demoted root survived simultaneous Tier-1 eviction intact with exact parity!
+    const RunOut dem_c = run_prompt(*gen, Prompt{rp_c.ids, {}, R}, 32, greedy);
+    check(cs_dem.host_demotions >= 1 && cs_dem.host_evictions >= 1 && cs_dem.vram_entries == 1 &&
+              cs_dem.host_entries == 1 && cs_dem.root_entries == 1 &&
+              cs_dem.vram_peak_bytes <= cs_dem.vram_budget_bytes &&
+              cs_dem.host_peak_bytes <= cs_dem.host_budget_bytes && dem_c.stats.reuse == Reuse::HostParked &&
+              dem_c.stats.reused_tokens == R && dem_c.tokens == ref_fork_c.tokens,
+          "Suite 2e: simultaneous Tier-0/Tier-1 pressure demotes victim cleanly while evicting earlier Tier-1 entry (exact parity)");
 
-    // Inject GPU VRAM allocation failure while both Tier-0 VRAM (A) and Tier-1 Host (demoted root) exist:
-    // VRAM entries release, Host entries SURVIVE (0 bytes of VRAM), and fork C still hits demoted root!
-    const std::uint64_t host_before = cs_dem.host_entries;
+    // 2f: VRAM OOM releases Tier-0 VRAM while preserving Tier-1 Host root intact
+    const std::uint64_t host_before = gen->cache_stats().host_entries;
     Sampling forced = greedy;
     const std::vector<std::int32_t> forced_toks = {100, 101, 102, 103};
     forced.forced = forced_toks;
     ingine::fail_next_allocations(1);
-    const RunOut opress = run_prompt(*gen, Prompt{unrelated, {}, 0}, 4, forced);
+    const RunOut opress = run_prompt(*gen, Prompt{rp_c.ids, {}, 0}, 4, forced);
     const PrefixCacheStats cs_press = gen->cache_stats();
-    const RunOut post_oom_c = run_prompt(*gen, Prompt{rp_c.ids, {}, R}, 32, greedy);
+    const RunOut post_oom_b = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
     check(opress.tokens == forced_toks && cs_press.vram_pressure_releases >= 1 && cs_press.vram_entries == 0 &&
-              cs_press.host_entries == host_before && post_oom_c.stats.reuse == Reuse::HostParked &&
-              post_oom_c.stats.reused_tokens == R && post_oom_c.tokens == ref_fork_c.tokens,
+              cs_press.host_entries == host_before && post_oom_b.stats.reuse == Reuse::HostParked &&
+              post_oom_b.stats.reused_tokens == R && post_oom_b.tokens == ref_fork_b.tokens,
           "Suite 2f: VRAM OOM releases Tier-0 VRAM parked entries while preserving Tier-1 Host entries & root parity");
+
+    // 2e-rollback: With BOTH Tier-0 VRAM (C) and Tier-1 Host (root) populated, inject pin failure during
+    // Tier-0 -> Tier-1 demotion: alloc_host_park_slot evicts earlier Tier-1 entry on retry AND pin still fails;
+    // verify the selected VRAM victim is cleanly dropped without list corruption and request completes.
+    std::vector<std::int32_t> unrelated2(300, 7777);
+    unrelated2[0] = 6666;
+    const std::uint64_t v_ev_before = gen->cache_stats().vram_evictions;
+    const std::uint64_t h_fail_before = gen->cache_stats().host_alloc_failures;
+    ingine::fail_next_pinned_allocations(2);
+    const RunOut oroll = run_prompt(*gen, Prompt{unrelated2, {}, 0}, 4, greedy);
+    ingine::fail_next_pinned_allocations(0);
+    const PrefixCacheStats cs_roll = gen->cache_stats();
+    check(oroll.tokens.size() == 4 && cs_roll.host_alloc_failures > h_fail_before &&
+              cs_roll.vram_evictions > v_ev_before && cs_roll.vram_used_bytes <= cs_roll.vram_budget_bytes &&
+              cs_roll.host_used_bytes <= cs_roll.host_budget_bytes,
+          "Suite 2e-rollback: pin failure after Tier-1 eviction rolls back demotion cleanly & drops exact VRAM victim");
 
     std::printf("[Suite 2e-2f stats] %s\n", gen->offload_summary().c_str());
   }
 
-  // ---- Suite 2g: DSpark --spec with host-parked root + fork parity ----
+  // ---- Suite 2h: Disk checkpoint gating (has_logits=false exact-root & non-promotion; save real ckpt at R) ----
+  const std::filesystem::path ckpt_with_logits =
+      std::filesystem::temp_directory_path() / ("s3_ckpt_logits_" + std::string(use_kv_q4 ? "q4" : "fp8") + ".bin");
+  const std::filesystem::path ckpt_no_logits =
+      std::filesystem::temp_directory_path() / ("s3_ckpt_nologits_" + std::string(use_kv_q4 ? "q4" : "fp8") + ".bin");
+  std::filesystem::remove(ckpt_with_logits);
+  std::filesystem::remove(ckpt_no_logits);
+  {
+    // Save a real disk checkpoint at exact pos = R (with logits) via periodic checkpoint on rp_b (root split hits R)
+    RuntimeOptions opt = base_opt;
+    opt.park_mb = 512;
+    opt.park_host_mb = 0;
+    opt.kv_ckpt_path = ckpt_with_logits;
+    opt.kv_ckpt_every = R;
+    {
+      auto gen = make_generator(opt);
+      run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 4, greedy);
+    }
+    const bool saved_ok = std::filesystem::exists(ckpt_with_logits) &&
+                          inspect_kv_checkpoint(ckpt_with_logits).pos == R &&
+                          inspect_kv_checkpoint(ckpt_with_logits).has_logits;
+    if (saved_ok) strip_logits_from_kv_checkpoint(ckpt_with_logits, ckpt_no_logits);
+    const bool stripped_ok = saved_ok && std::filesystem::exists(ckpt_no_logits) &&
+                             inspect_kv_checkpoint(ckpt_no_logits).pos == R &&
+                             !inspect_kv_checkpoint(ckpt_no_logits).has_logits;
+
+    // 2h-1: Explicit --kv-ckpt-resume on exact-root with has_logits=false MUST throw
+    bool explicit_nologits_threw = false;
+    if (stripped_ok) {
+      RuntimeOptions ropt = base_opt;
+      ropt.park_mb = 512;
+      ropt.park_host_mb = 0;
+      ropt.kv_ckpt_resume = ckpt_no_logits;
+      auto gen = make_generator(ropt);
+      try {
+        run_prompt(*gen, Prompt{rp_root.ids, {}, R}, 8, greedy);
+      } catch (const std::exception&) {
+        explicit_nologits_threw = true;
+      }
+    }
+
+    // 2h-2 & 2h-3: Auto --kv-ckpt-path with has_logits=false:
+    //   - On exact-root (n == R): declines disk resume (Reuse::None) and recomputes exact ref_exact_root
+    //   - On fork B (n > R, root_prefix_tokens = R): resumes R tokens (Reuse::Checkpoint), computes suffix logits
+    //     matching ref_fork_b, and MUST NOT promote the logit-less disk resume into a reusable root (root_entries==0)!
+    bool auto_exact_declined = false;
+    bool auto_fork_no_promote = false;
+    if (stripped_ok) {
+      RuntimeOptions aopt = base_opt;
+      aopt.park_mb = 512;
+      aopt.park_host_mb = 0;
+      aopt.kv_ckpt_path = ckpt_no_logits;
+      aopt.kv_ckpt_every = 0;
+      {
+        auto gen = make_generator(aopt);
+        const RunOut er = run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 32, greedy);
+        auto_exact_declined = (er.stats.reuse == Reuse::None && er.stats.reused_tokens == 0 &&
+                               er.tokens == ref_exact_root.tokens);
+      }
+      {
+        auto gen = make_generator(aopt);
+        const RunOut fb = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
+        const PrefixCacheStats cs = gen->cache_stats();
+        auto_fork_no_promote = (fb.stats.reuse == Reuse::Checkpoint && fb.stats.reused_tokens == R &&
+                                fb.tokens == ref_fork_b.tokens && cs.root_entries == 0);
+      }
+    }
+    check(saved_ok && stripped_ok && explicit_nologits_threw && auto_exact_declined && auto_fork_no_promote,
+          "Suite 2h: has_logits=false disk checkpoint rejected on exact-root & never promoted to reusable root");
+  }
+
+  // ---- Suite 2g: DSpark --spec host-parked root + fork parity & speculative disk-resume rejection/decline ----
   if (std::filesystem::exists(dir / "mtp.safetensors")) {
     RuntimeOptions opt = base_opt;
     opt.spec = true;
@@ -345,17 +516,72 @@ int main(int argc, char** argv) {
       run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 0, greedy);
       spec_ref_b = run_prompt(*gen, Prompt{rp_b.ids, {}, 0}, 32, greedy);
     }
-    opt.park_host_mb = 1024;
-    auto gen = make_generator(opt);
-    run_prompt(*gen, Prompt{rp_a.ids, {}, R}, 8, greedy);
-    const RunOut spec_hb = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
-    check(spec_hb.stats.reuse == Reuse::HostParked && spec_hb.stats.reused_tokens == R &&
-              spec_hb.tokens == spec_ref_b.tokens,
-          "Suite 2g: DSpark --spec root capture + HostParked fork restore exact greedy parity");
-    std::printf("[Suite 2g spec stats] %s\n", gen->offload_summary().c_str());
+    // Speculative explicit --kv-ckpt-resume MUST throw; auto --kv-ckpt-path MUST decline & match spec_ref_b
+    bool spec_explicit_threw = false;
+    bool spec_auto_declined = false;
+    if (std::filesystem::exists(ckpt_with_logits)) {
+      {
+        RuntimeOptions sopt = opt;
+        sopt.kv_ckpt_resume = ckpt_with_logits;
+        auto gen = make_generator(sopt);
+        try {
+          run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 8, greedy);
+        } catch (const std::exception&) {
+          spec_explicit_threw = true;
+        }
+      }
+      {
+        RuntimeOptions sopt = opt;
+        sopt.park_host_mb = 1024;
+        sopt.kv_ckpt_path = ckpt_with_logits;
+        sopt.kv_ckpt_every = 0;
+        auto gen = make_generator(sopt);
+        const RunOut sa = run_prompt(*gen, Prompt{rp_a.ids, {}, R}, 8, greedy);
+        const RunOut sb = run_prompt(*gen, Prompt{rp_b.ids, {}, R}, 32, greedy);
+        spec_auto_declined = (sa.stats.reuse == Reuse::None && sa.stats.reused_tokens == 0 &&
+                              sb.stats.reuse == Reuse::HostParked && sb.stats.reused_tokens == R &&
+                              sb.tokens == spec_ref_b.tokens);
+        std::printf("[Suite 2g spec stats] %s\n", gen->offload_summary().c_str());
+      }
+    }
+    check(spec_explicit_threw && spec_auto_declined,
+          "Suite 2g: DSpark --spec rejects/declines incompatible disk ckpt & passes HostParked fork exact parity");
+  }
+  std::filesystem::remove(ckpt_with_logits);
+  std::filesystem::remove(ckpt_no_logits);
+
+  // ---- Suite 2i: Verified media SHA-256 identity binding (same negative token ID, different RGB fails closed) ----
+  {
+    RuntimeOptions vopt = base_opt;
+    vopt.vision = true;
+    vopt.park_mb = 512;
+    vopt.park_host_mb = 0;
+    try {
+      auto gen = make_generator(vopt);
+      if (gen->supports_images()) {
+        std::vector<std::int32_t> img_ids(300, 1234);
+        img_ids[40] = -42;  // identical negative image token ID in both prompts!
+        auto red_rgb = std::make_shared<std::vector<std::uint8_t>>(40 * 40 * 3, 220);
+        auto blue_rgb = std::make_shared<std::vector<std::uint8_t>>(40 * 40 * 3, 25);
+        std::array<PromptImage, 1> img_red = {PromptImage{40, 40, 40, red_rgb}};
+        std::array<PromptImage, 1> img_blue = {PromptImage{40, 40, 40, blue_rgb}};
+        const RunOut m_red1 = run_prompt(*gen, Prompt{img_ids, img_red, 0}, 8, greedy);
+        const RunOut m_blue = run_prompt(*gen, Prompt{img_ids, img_blue, 0}, 8, greedy);
+        const RunOut m_red2 = run_prompt(*gen, Prompt{img_ids, img_red, 0}, 8, greedy);
+        check(m_red1.stats.reuse == Reuse::None && m_blue.stats.reuse == Reuse::None &&
+                  m_blue.stats.reused_tokens == 0 && m_red2.stats.reuse == Reuse::Parked &&
+                  m_red2.stats.reused_tokens == 300 && m_red2.tokens == m_red1.tokens,
+              "Suite 2i: verified media SHA-256 fails closed on different RGB with identical negative token IDs");
+      }
+    } catch (const std::exception& e) {
+      std::printf("skip Suite 2i (vision tower unavailable: %s)\n", e.what());
+    }
   }
 
-  // ---- Suite 3: Measured Restore-vs-Recompute Latency Crossover Sweep ----
+  // ---- Suite 3: Apples-to-Apples End-to-End Wall TTFT Crossover (kReps=3 medians) ----
+  // Brackets below kMinParked=256 using eligible verified root checkpoints (kMinRootTokens=64: L=64, 128).
+  // Compares the EXACT SAME wall TTFT boundary (stats.prefill_seconds: start of generate() -> first sampled token)
+  // across Cold, Tier-0 VRAM, and Tier-1 Host, while reporting CUDA transfer-event timing separately.
   if (run_crossover) {
     RuntimeOptions opt = base_opt;
     opt.max_ctx = 20480;
@@ -367,102 +593,134 @@ int main(int argc, char** argv) {
     opt_vram.park_mb = 2048;
     opt_vram.park_host_mb = 0;
 
-    std::printf("\n=== MEASURED RESTORE-VS-RECOMPUTE CROSSOVER (kv=%s, chunk=%d) ===\n",
-                use_kv_q4 ? "q4_0" : "fp8", opt.prefill_chunk);
-    std::printf("%-7s | %-10s | %-11s | %-11s | %-11s | %-11s | %-10s | %-9s\n",
-                "Len", "Ckpt_MiB", "Cold_ms", "VramRes_ms", "HostRes_ms", "HostEff_GBs", "Speedup_H", "Parity");
+    constexpr int kReps = 3;
+    std::printf("\n=== MEASURED WALL-TTFT RESTORE-VS-RECOMPUTE CROSSOVER (kv=%s, chunk=%d, reps=%d median) ===\n",
+                use_kv_q4 ? "q4_0" : "fp8", opt.prefill_chunk, kReps);
+    std::printf("%-6s | %-4s | %-8s | %-11s | %-11s | %-11s | %-10s | %-10s | %-11s | %-11s | %-10s | %-6s\n",
+                "Len", "Path", "CkptMiB", "ColdTTFTms", "VramTTFTms", "HostTTFTms", "TTFT_SpdV", "TTFT_SpdH",
+                "VramXferms", "HostXferms", "HostGB/s", "Parity");
 
     ingine::test::Rng rng(2026);
     std::vector<std::int32_t> master(16500);
     for (auto& x : master) x = std::int32_t(1000 + rng.next() % 50000);
     const std::vector<std::int32_t> flush_ids(128, 7777);
-    const std::vector<int> lengths = {256, 512, 1024, 2048, 4096, 8192, 16384};
+    const std::vector<int> lengths = {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384};
 
     struct Row {
       int L = 0;
-      std::uint64_t bytes = 0;
-      double cold_ms = 0;
-      double host_ms = 0;
-      double vram_ms = 0;
+      bool is_root_bracket = false;
+      std::uint64_t h2d_bytes = 0;
+      double cold_ttft_ms = 0;
+      double host_ttft_ms = 0;
+      double vram_ttft_ms = 0;
+      double host_xfer_ms = 0;
+      double vram_xfer_ms = 0;
       std::vector<std::int32_t> cold_tok;
-      bool host_ok = false;
-      bool vram_ok = false;
+      bool host_ok = true;
+      bool vram_ok = true;
     };
     std::vector<Row> rows(lengths.size());
     PrefixCacheStats ch, cv;
-    std::size_t vram_delta_host = 0, vram_delta_vram = 0;
+    std::size_t dev_vram_host_snap = 0, dev_vram_vram_snap = 0;
 
-    // Pass 1: Cold recompute + Tier-1 Pinned Host-RAM restore (one model resident at a time so 24 GB GPUs fit)
+    // Pass 1: Cold recompute + Tier-1 Pinned Host-RAM restore (single model resident)
     {
-      const std::size_t before = current_vram_used_bytes();
       auto gen_host = make_generator(opt);
-      const std::size_t after = current_vram_used_bytes();
-      vram_delta_host = after > before ? (after - before) : 0;
+      dev_vram_host_snap = device_wide_vram_used_bytes();
       run_prompt(*gen_host, Prompt{std::span(master).subspan(0, 256), {}, 0}, 1, greedy);  // warm up
       for (std::size_t i = 0; i < lengths.size(); ++i) {
         const int L = lengths[i];
+        const bool use_root = (L < 256);  // bracket below kMinParked=256 where root parking (kMinRootTokens=64) applies
+        const int root_hint = use_root ? L : 0;
         std::vector<std::int32_t> p(master.begin(), master.begin() + L);
         p[0] = 20000 + L;
-        run_prompt(*gen_host, Prompt{flush_ids, {}, 0}, 1, greedy);
-        const RunOut cold = run_prompt(*gen_host, Prompt{p, {}, 0}, 1, greedy);
-        run_prompt(*gen_host, Prompt{flush_ids, {}, 0}, 1, greedy);  // parks p in pinned host RAM
-        const std::uint64_t h2d_before = gen_host->cache_stats().h2d_restore_bytes;
-        const RunOut hres = run_prompt(*gen_host, Prompt{p, {}, 0}, 1, greedy);
-        const std::uint64_t h2d_after = gen_host->cache_stats().h2d_restore_bytes;
         rows[i].L = L;
-        rows[i].bytes = h2d_after - h2d_before;  // exact PCIe H2D bytes copied for this checkpoint
-        rows[i].cold_ms = cold.stats.prefill_seconds * 1e3;
-        rows[i].host_ms = hres.stats.restore_seconds.value_or(0.0) * 1e3;
-        rows[i].cold_tok = cold.tokens;
-        rows[i].host_ok = (hres.stats.reuse == Reuse::HostParked && hres.stats.reused_tokens == L &&
-                           hres.tokens == cold.tokens);
+        rows[i].is_root_bracket = use_root;
+
+        std::vector<double> cold_samples, host_ttft_samples, host_xfer_samples;
+        for (int rep = 0; rep < kReps; ++rep) {
+          // Use distinct token 0 per cold rep so cold never hits a previously parked entry
+          std::vector<std::int32_t> pc = p;
+          pc[0] = 30000 + L * 10 + rep;
+          run_prompt(*gen_host, Prompt{flush_ids, {}, 0}, 1, greedy);
+          const RunOut cold = run_prompt(*gen_host, Prompt{pc, {}, root_hint}, 1, greedy);
+          cold_samples.push_back(cold.stats.prefill_seconds * 1e3);
+          if (rep == 0) rows[i].cold_tok = cold.tokens;
+
+          run_prompt(*gen_host, Prompt{flush_ids, {}, 0}, 1, greedy);  // parks pc (non-root) or flushes live (root already parked)
+          const std::uint64_t h2d_before = gen_host->cache_stats().h2d_restore_bytes;
+          const RunOut hres = run_prompt(*gen_host, Prompt{pc, {}, 0}, 1, greedy);
+          const std::uint64_t h2d_after = gen_host->cache_stats().h2d_restore_bytes;
+          if (rep == 0) rows[i].h2d_bytes = h2d_after - h2d_before;
+          host_ttft_samples.push_back(hres.stats.prefill_seconds * 1e3);
+          host_xfer_samples.push_back(hres.stats.restore_seconds.value_or(0.0) * 1e3);
+          rows[i].host_ok &= (hres.stats.reuse == Reuse::HostParked && hres.stats.reused_tokens == L &&
+                              hres.tokens == cold.tokens);
+        }
+        rows[i].cold_ttft_ms = median_of(cold_samples);
+        rows[i].host_ttft_ms = median_of(host_ttft_samples);
+        rows[i].host_xfer_ms = median_of(host_xfer_samples);
       }
       ch = gen_host->cache_stats();
     }
 
-    // Pass 2: Tier-0 VRAM parked restore (separate model instance so peak VRAM stays single-instance)
+    // Pass 2: Tier-0 VRAM parked restore (separate single-model instance)
     {
-      const std::size_t before = current_vram_used_bytes();
       auto gen_vram = make_generator(opt_vram);
-      const std::size_t after = current_vram_used_bytes();
-      vram_delta_vram = after > before ? (after - before) : 0;
+      dev_vram_vram_snap = device_wide_vram_used_bytes();
       run_prompt(*gen_vram, Prompt{std::span(master).subspan(0, 256), {}, 0}, 1, greedy);  // warm up
       for (std::size_t i = 0; i < lengths.size(); ++i) {
         const int L = lengths[i];
+        const bool use_root = (L < 256);
+        const int root_hint = use_root ? L : 0;
         std::vector<std::int32_t> p(master.begin(), master.begin() + L);
-        p[0] = 20000 + L;
-        run_prompt(*gen_vram, Prompt{flush_ids, {}, 0}, 1, greedy);
-        run_prompt(*gen_vram, Prompt{p, {}, 0}, 1, greedy);
-        run_prompt(*gen_vram, Prompt{flush_ids, {}, 0}, 1, greedy);  // parks p in Tier-0 VRAM
-        const RunOut vres = run_prompt(*gen_vram, Prompt{p, {}, 0}, 1, greedy);
-        rows[i].vram_ms = vres.stats.restore_seconds.value_or(0.0) * 1e3;
-        rows[i].vram_ok = (vres.stats.reuse == Reuse::Parked && vres.stats.reused_tokens == L &&
-                           vres.tokens == rows[i].cold_tok);
+        std::vector<double> vram_ttft_samples, vram_xfer_samples;
+        for (int rep = 0; rep < kReps; ++rep) {
+          std::vector<std::int32_t> pc = p;
+          pc[0] = 30000 + L * 10 + rep;
+          run_prompt(*gen_vram, Prompt{flush_ids, {}, 0}, 1, greedy);
+          const RunOut cold = run_prompt(*gen_vram, Prompt{pc, {}, root_hint}, 1, greedy);
+          run_prompt(*gen_vram, Prompt{flush_ids, {}, 0}, 1, greedy);
+          const RunOut vres = run_prompt(*gen_vram, Prompt{pc, {}, 0}, 1, greedy);
+          vram_ttft_samples.push_back(vres.stats.prefill_seconds * 1e3);
+          vram_xfer_samples.push_back(vres.stats.restore_seconds.value_or(0.0) * 1e3);
+          const Reuse expected_vram = use_root ? Reuse::RootCheckpoint : Reuse::Parked;
+          rows[i].vram_ok &= (vres.stats.reuse == expected_vram && vres.stats.reused_tokens == L &&
+                              vres.tokens == cold.tokens);
+        }
+        rows[i].vram_ttft_ms = median_of(vram_ttft_samples);
+        rows[i].vram_xfer_ms = median_of(vram_xfer_samples);
       }
       cv = gen_vram->cache_stats();
     }
 
     for (const Row& r : rows) {
-      const double ckpt_mib = double(r.bytes) / (1024.0 * 1024.0);
-      const double host_gbs = r.host_ms > 0.0 ? (double(r.bytes) / (r.host_ms * 1e6)) : 0.0;
-      const double speedup = r.host_ms > 0.0 ? (r.cold_ms / r.host_ms) : 0.0;
+      const double ckpt_mib = double(r.h2d_bytes) / (1024.0 * 1024.0);
+      const double spd_v = r.vram_ttft_ms > 0.0 ? (r.cold_ttft_ms / r.vram_ttft_ms) : 0.0;
+      const double spd_h = r.host_ttft_ms > 0.0 ? (r.cold_ttft_ms / r.host_ttft_ms) : 0.0;
+      const double host_gbs = r.host_xfer_ms > 0.0 ? (double(r.h2d_bytes) / (r.host_xfer_ms * 1e6)) : 0.0;
       const bool par = r.host_ok && r.vram_ok;
-      std::printf("%-7d | %10.1f | %11.2f | %11.3f | %11.3f | %11.2f | %9.2fx | %s\n", r.L, ckpt_mib, r.cold_ms,
-                  r.vram_ms, r.host_ms, host_gbs, speedup, par ? "PASS" : "FAIL");
+      std::printf("%-6d | %-4s | %8.1f | %11.2f | %11.3f | %11.3f | %9.2fx | %9.2fx | %11.3f | %11.3f | %10.2f | %s\n",
+                  r.L, r.is_root_bracket ? "root" : "park", ckpt_mib, r.cold_ttft_ms, r.vram_ttft_ms, r.host_ttft_ms,
+                  spd_v, spd_h, r.vram_xfer_ms, r.host_xfer_ms, host_gbs, par ? "PASS" : "FAIL");
       ok &= par;
     }
-    std::printf("[crossover host-tier] device_staging=%.1f MiB, vram_park_peak=%.1f MiB, host_park_peak=%.1f MiB, "
-                "h2d=%.2f MB, d2h=%.2f MB, host_evictions=%llu, model_vram_delta=%.2f GiB\n",
+    std::printf("[crossover prefix-cache host-tier] staging=%.1f MiB, vram_park_peak=%.1f MiB, host_park_peak=%.1f MiB, "
+                "dma(h2d_r=%.2f MB, d2h_p=%.2f MB, d2d_r=%.2f MB, d2d_p=%.2f MB), host_evict=%llu, demote=%llu\n",
                 double(ch.device_staging_bytes) / (1024.0 * 1024.0), double(ch.vram_peak_bytes) / (1024.0 * 1024.0),
                 double(ch.host_peak_bytes) / (1024.0 * 1024.0), double(ch.h2d_restore_bytes) / 1e6,
-                double(ch.d2h_park_bytes) / 1e6, static_cast<unsigned long long>(ch.host_evictions),
-                double(vram_delta_host) / (1024.0 * 1024.0 * 1024.0));
-    std::printf("[crossover vram-tier] device_staging=%.1f MiB, vram_park_peak=%.1f MiB, host_park_peak=%.1f MiB, "
-                "d2d_r=%.2f MB, d2d_p=%.2f MB, vram_evictions=%llu, model_vram_delta=%.2f GiB\n",
+                double(ch.d2h_park_bytes) / 1e6, double(ch.d2d_restore_bytes) / 1e6, double(ch.d2d_park_bytes) / 1e6,
+                static_cast<unsigned long long>(ch.host_evictions), static_cast<unsigned long long>(ch.host_demotions));
+    std::printf("[crossover prefix-cache vram-tier] staging=%.1f MiB, vram_park_peak=%.1f MiB, host_park_peak=%.1f MiB, "
+                "dma(h2d_r=%.2f MB, d2h_p=%.2f MB, d2d_r=%.2f MB, d2d_p=%.2f MB), vram_evict=%llu\n",
                 double(cv.device_staging_bytes) / (1024.0 * 1024.0), double(cv.vram_peak_bytes) / (1024.0 * 1024.0),
-                double(cv.host_peak_bytes) / (1024.0 * 1024.0), double(cv.d2d_restore_bytes) / 1e6,
-                double(cv.d2d_park_bytes) / 1e6, static_cast<unsigned long long>(cv.vram_evictions),
-                double(vram_delta_vram) / (1024.0 * 1024.0 * 1024.0));
+                double(cv.host_peak_bytes) / (1024.0 * 1024.0), double(cv.h2d_restore_bytes) / 1e6,
+                double(cv.d2h_park_bytes) / 1e6, double(cv.d2d_restore_bytes) / 1e6, double(cv.d2d_park_bytes) / 1e6,
+                static_cast<unsigned long long>(cv.vram_evictions));
+    std::printf("[device-wide cudaMemGetInfo snapshot (non-exclusive GPU, not per-process peak)] "
+                "host_pass=%.2f GiB, vram_pass=%.2f GiB\n",
+                double(dev_vram_host_snap) / (1024.0 * 1024.0 * 1024.0),
+                double(dev_vram_vram_snap) / (1024.0 * 1024.0 * 1024.0));
   }
 
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

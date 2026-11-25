@@ -68,7 +68,7 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
-  std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1";
+  std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
   int max_batch = 1, max_kv_tokens = 0;
@@ -140,6 +140,9 @@ int main(int argc, char** argv) {
             &park_host_mb);
   ap.flag("--no-prefix-cache", "disable all prefix/root/parked checkpoint reuse (cache-off parity baseline)",
           &no_prefix_cache);
+  ap.option("--cache-namespace-header", "",
+            "trusted proxy HTTP header isolating prefix-cache namespaces (absent/empty fails closed to bypass)",
+            &cache_namespace_header);
   ap.flag("--no-vision", "text only: do not load the vision tower (saves 0.6 GB) and reject requests with images",
           &no_vision);
   ap.option("--image-max-tokens", "",
@@ -270,6 +273,7 @@ int main(int argc, char** argv) {
     server_options.images.max_images = max_images;
     server_options.images.max_total_tokens = max_image_tokens;
     server_options.personas = personas;
+    server_options.cache_namespace_header = cache_namespace_header;
     log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
              server_options.sampling.top_p, server_options.sampling.top_k);
     ingine::serve::ChatServer server(*generator, fmt, server_options);
