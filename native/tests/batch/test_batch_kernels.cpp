@@ -467,6 +467,40 @@ void test_head_softcap_and_scatter_gather() {
       CHECK(std::memcmp(src_k.data() + off, got_k.data() + off, len) == 0);
       CHECK(std::memcmp(src_v.data() + off, got_v.data() + off, len) == 0);
     }
+
+    // Verify partial (<64-token) tail copy helpers: scratch -> compact tail -> scratch & pool page.
+    const int tail_pos0 = 128;
+    const int tail_len = 37;
+    const std::size_t tail_bytes = std::size_t(NUM_FULL_VISITS) * std::size_t(tail_len) * KV_DIM * es;
+    DeviceBuffer d_tk(tail_bytes), d_tv(tail_bytes);
+    d_tk.fill(0);
+    d_tv.fill(0);
+    d_gk.fill(0);
+    d_gv.fill(0);
+    bk::copy_tail_kv_from_scratch(d_sk.p, d_sv.p, scratch_ctx, tail_pos0, tail_len, fp8, d_tk.p, d_tv.p, nullptr);
+    bk::copy_tail_kv_to_scratch(d_tk.p, d_tv.p, tail_len, fp8, d_gk.p, d_gv.p, scratch_ctx, tail_pos0, nullptr);
+    d_pk.fill(0);
+    d_pv.fill(0);
+    bk::copy_tail_kv_to_pool_page(d_tk.p, d_tv.p, tail_len, fp8, pt[2], d_pk.p, d_pv.p, nullptr);
+    DeviceBuffer d_gk2(scratch_bytes), d_gv2(scratch_bytes);
+    d_gk2.fill(0);
+    d_gv2.fill(0);
+    bk::gather_full_kv(d_pk.p, d_pv.p, 0, static_cast<const std::int32_t*>(d_pt.p), max_pages, tail_pos0 + tail_len, fp8,
+                       d_gk2.p, d_gv2.p, scratch_ctx, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    d_gk.copy_to_host(got_k.data(), scratch_bytes);
+    d_gv.copy_to_host(got_v.data(), scratch_bytes);
+    std::vector<std::uint8_t> got_k2(scratch_bytes), got_v2(scratch_bytes);
+    d_gk2.copy_to_host(got_k2.data(), scratch_bytes);
+    d_gv2.copy_to_host(got_v2.data(), scratch_bytes);
+    for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+      const std::size_t off = (std::size_t(fi) * scratch_ctx + tail_pos0) * KV_DIM * es;
+      const std::size_t len = std::size_t(tail_len) * KV_DIM * es;
+      CHECK(std::memcmp(src_k.data() + off, got_k.data() + off, len) == 0);
+      CHECK(std::memcmp(src_v.data() + off, got_v.data() + off, len) == 0);
+      CHECK(std::memcmp(src_k.data() + off, got_k2.data() + off, len) == 0);
+      CHECK(std::memcmp(src_v.data() + off, got_v2.data() + off, len) == 0);
+    }
   }
 }
 

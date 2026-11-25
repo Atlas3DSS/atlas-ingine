@@ -462,6 +462,14 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
     if (!p->is_string()) throw BadRequest("'persona' must be a string", "persona");
     req.persona_name = p->get<std::string>();
   }
+  if (const Json* u = get(body, "user")) {
+    if (!u->is_string()) throw BadRequest("'user' must be a string", "user");
+    if (!u->get_ref<const std::string&>().empty()) req.has_isolation_hint = true;
+  }
+  if (const Json* pk = get(body, "prompt_cache_key")) {
+    if (!pk->is_string()) throw BadRequest("'prompt_cache_key' must be a string", "prompt_cache_key");
+    if (!pk->get_ref<const std::string&>().empty()) req.has_isolation_hint = true;
+  }
   if (auto it = body.find("stream"); it != body.end()) {
     if (!it->is_boolean()) throw BadRequest("'stream' must be a boolean", "stream");
     req.stream = it->get<bool>();

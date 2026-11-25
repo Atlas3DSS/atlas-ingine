@@ -29,6 +29,11 @@ struct ServerOptions {
   model::Sampling sampling;  // temperature / top_p / top_k of requests that omit them
   ImageOptions images;       // image input; in effect only when the generator supports images
   std::shared_ptr<const persona::PersonaCatalog> personas;  // optional loaded persona spec catalog
+  // Optional trusted proxy HTTP header carrying tenant/scope isolation key for prefix caching.
+  // Empty (default): server operates as a single trusted scope, and fail-closed bypasses prefix reuse for requests
+  // carrying caller isolation hints (Authorization header, JSON "user", or JSON "prompt_cache_key").
+  // Non-empty: requests carrying the header are scoped to its value; requests omitting it fail-closed bypass reuse.
+  std::string cache_namespace_header;
 };
 
 class ChatServer {
@@ -66,6 +71,7 @@ class ChatServer {
   const model::Sampling sampling_defaults_;
   const ImageOptions image_options_;
   const std::shared_ptr<const persona::PersonaCatalog> personas_;
+  const std::string cache_namespace_header_;
   const int64_t created_;
   engine::Scheduler scheduler_;
   httplib::Server server_;

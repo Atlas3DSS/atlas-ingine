@@ -142,7 +142,9 @@ class EngineGenerator final : public Generator {
     if (sampling.persona) persona::validate_profile_safety(*sampling.persona, refusal_map_);
     const std::uint64_t req_persona_key =
         (sampling.persona && !sampling.persona->is_unhooked()) ? sampling.persona->cache_key : 0ull;
-    const bool bypass_reuse = (sampling.persona && sampling.persona->bypasses_prefix_reuse());
+    const bool bypass_reuse = !options_.prefix_cache || full_prompt.bypass_prefix_cache ||
+                              !full_prompt.cache_namespace.empty() ||
+                              (sampling.persona && sampling.persona->bypasses_prefix_reuse());
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto t = std::chrono::steady_clock::now();
@@ -346,7 +348,7 @@ class EngineGenerator final : public Generator {
       stats.restored_bytes = std::uint64_t(ckpt_bytes);
       stats.restore_seconds = std::nullopt;
     } else {
-      park_live();
+      if (options_.prefix_cache) park_live();
       reset_state(st, stream);
       if (drafter_) drafter_->reset();
       tokens_in_state_.clear();
