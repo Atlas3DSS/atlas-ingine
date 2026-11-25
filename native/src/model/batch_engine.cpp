@@ -452,6 +452,8 @@ class BatchDecoder {
     return logits_;
   }
 
+  const float* last_logits() const { return logits_; }
+
  private:
   const float* const* block_table(const std::vector<const float*>& blocks) {
     auto it = tables_.find(blocks);
@@ -1124,6 +1126,7 @@ class BatchGenerator final : public Generator {
       stats.cache_evictions = evictions;
       stats.image_tokens = image_tokens;
       stats.prefill_seconds = seconds_since(t0);
+      last_prefill_logits_valid_ = true;
       slot_committed = true;
       return s;
   }
@@ -1150,6 +1153,7 @@ class BatchGenerator final : public Generator {
     }
 
     const float* logits = decoder_->run_step(inputs, stream_);
+    last_step_batch_ = B;
     for (int i = 0; i < B; ++i) pool_.slot_pos_host[inputs[i].slot] += 1;
 
     // Fast path: all greedy with identical banned tokens -> single batched argmax launch.
@@ -1454,6 +1458,26 @@ class BatchGenerator final : public Generator {
     return int(tokens);
   }
 
+ public:
+  bool copy_last_prefill_logits(std::vector<float>& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!last_prefill_logits_valid_ || !prefill_logits_.p) return false;
+    out.resize(UNPADDED_VOCAB);
+    CUDA_CHECK(cudaMemcpy(out.data(), prefill_logits_.p, std::size_t(UNPADDED_VOCAB) * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    return true;
+  }
+
+  bool copy_last_step_logits(int lane_idx, std::vector<float>& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (lane_idx < 0 || lane_idx >= last_step_batch_ || !decoder_ || !decoder_->last_logits()) return false;
+    out.resize(UNPADDED_VOCAB);
+    CUDA_CHECK(cudaMemcpy(out.data(), decoder_->last_logits() + std::size_t(lane_idx) * UNPADDED_VOCAB,
+                          std::size_t(UNPADDED_VOCAB) * sizeof(float), cudaMemcpyDeviceToHost));
+    return true;
+  }
+
+ private:
   RuntimeOptions options_;
   cudaStream_t stream_ = nullptr;
   cudaEvent_t restore_ev_start_ = nullptr;
@@ -1470,6 +1494,8 @@ class BatchGenerator final : public Generator {
   DeviceBuffer chunk_tokens_, prefill_logits_, sampled_dev_;
   PinnedHostBuffer sampled_host_;
   std::vector<SlotMeta> slot_meta_;
+  bool last_prefill_logits_valid_ = false;
+  int last_step_batch_ = 0;
   mutable std::mutex mutex_;
 };
 
@@ -1478,6 +1504,16 @@ class BatchGenerator final : public Generator {
 void set_batch_prefill_splits_for_test(std::vector<int> splits) {
   std::lock_guard<std::mutex> lock(g_test_splits_mu);
   g_test_prefill_splits = std::move(splits);
+}
+
+bool copy_batch_prefill_logits_for_test(const Generator& gen, std::vector<float>& out) {
+  const auto* bg = dynamic_cast<const BatchGenerator*>(&gen);
+  return bg ? bg->copy_last_prefill_logits(out) : false;
+}
+
+bool copy_batch_step_logits_for_test(const Generator& gen, int lane_idx, std::vector<float>& out) {
+  const auto* bg = dynamic_cast<const BatchGenerator*>(&gen);
+  return bg ? bg->copy_last_step_logits(lane_idx, out) : false;
 }
 
 std::unique_ptr<Generator> make_batch_generator(const RuntimeOptions& options) {

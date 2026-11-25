@@ -25,9 +25,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -35,6 +37,8 @@
 
 namespace ingine::model {
 void set_batch_prefill_splits_for_test(std::vector<int> splits);
+bool copy_batch_prefill_logits_for_test(const Generator& gen, std::vector<float>& out);
+bool copy_batch_step_logits_for_test(const Generator& gen, int lane_idx, std::vector<float>& out);
 }  // namespace ingine::model
 
 namespace {
@@ -89,6 +93,142 @@ int count_matching(const std::vector<int32_t>& a, const std::vector<int32_t>& b)
   for (std::size_t i = 0; i < n; ++i)
     if (a[i] == b[i]) ++m;
   return m;
+}
+
+double kl_div_fp64(const std::vector<float>& ref, const std::vector<float>& tst) {
+  const std::size_t n = ref.size();
+  double max_r = -1e300, max_t = -1e300;
+  for (std::size_t i = 0; i < n; ++i) {
+    max_r = std::max(max_r, double(ref[i]));
+    max_t = std::max(max_t, double(tst[i]));
+  }
+  double sum_r = 0.0, sum_t = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    sum_r += std::exp(double(ref[i]) - max_r);
+    sum_t += std::exp(double(tst[i]) - max_t);
+  }
+  const double lse_r = max_r + std::log(sum_r);
+  const double lse_t = max_t + std::log(sum_t);
+  double kl = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const double lp_r = double(ref[i]) - lse_r;
+    const double lp_t = double(tst[i]) - lse_t;
+    kl += std::exp(lp_r) * (lp_r - lp_t);
+  }
+  return kl;
+}
+
+struct LockedBatchRun {
+  std::vector<int> slots;
+  std::vector<ingine::model::GenerateStats> stats;
+  std::vector<std::vector<int32_t>> tokens;                // [B][steps]
+  std::vector<std::vector<std::vector<float>>> logits;     // [B][steps][UNPADDED_VOCAB]
+};
+
+// Runs a locked B-lane batch directly through BatchGenerator::start_slot + step_slots so warm and cold-bypass
+// execute identical token histories, active batch size / CUDA graph gear, and prefill splits, capturing full
+// UNPADDED_VOCAB logits at the first resumed prediction (step 0) and every subsequent teacher-forced decode step.
+LockedBatchRun run_locked_batch_with_logits(
+    ingine::model::Generator& gen, const std::vector<std::vector<int32_t>>& prompts,
+    const std::vector<std::string>& namespaces, const std::vector<int>& root_toks, bool bypass_cache,
+    int gen_tokens, const ingine::model::Sampling& greedy,
+    const std::vector<std::vector<int32_t>>* teacher_forced = nullptr) {
+  const std::size_t B = prompts.size();
+  LockedBatchRun run;
+  run.slots.assign(B, -1);
+  run.stats.resize(B);
+  run.tokens.assign(B, {});
+  run.logits.assign(B, std::vector<std::vector<float>>(std::size_t(gen_tokens)));
+
+  auto release_all = [&]() {
+    for (int& s : run.slots) {
+      if (s >= 0) {
+        gen.release_slot(s);
+        s = -1;
+      }
+    }
+  };
+
+  try {
+    for (std::size_t i = 0; i < B; ++i) {
+      ingine::model::Prompt pr{prompts[i], {}, root_toks[i], namespaces[i], bypass_cache};
+      std::int32_t first_tok = -1;
+      const int s = gen.start_slot(pr, gen_tokens, greedy, first_tok, run.stats[i]);
+      CHECK(s >= 0);
+      run.slots[i] = s;
+      run.tokens[i].push_back(first_tok);
+      CHECK(ingine::model::copy_batch_prefill_logits_for_test(gen, run.logits[i][0]));
+    }
+    for (int step = 1; step < gen_tokens; ++step) {
+      std::vector<ingine::model::BatchSlotStep> inputs(B);
+      for (std::size_t i = 0; i < B; ++i) {
+        const std::int32_t feed =
+            teacher_forced ? (*teacher_forced)[i][std::size_t(step - 1)] : run.tokens[i].back();
+        inputs[i] = {run.slots[i], feed};
+      }
+      std::vector<std::int32_t> next_toks(B, -1);
+      gen.step_slots(inputs, next_toks);
+      for (std::size_t i = 0; i < B; ++i) {
+        run.tokens[i].push_back(next_toks[i]);
+        CHECK(ingine::model::copy_batch_step_logits_for_test(gen, int(i), run.logits[i][std::size_t(step)]));
+      }
+    }
+  } catch (...) {
+    release_all();
+    throw;
+  }
+  release_all();
+  return run;
+}
+
+void verify_matched_batch_bypass(const char* label, const LockedBatchRun& warm, const LockedBatchRun& cold,
+                                 const std::vector<ingine::model::Reuse>& expected_warm_reuse,
+                                 const std::vector<int>& expected_warm_reused, int gen_tokens) {
+  const std::size_t B = warm.tokens.size();
+  CHECK(cold.tokens.size() == B);
+  for (std::size_t i = 0; i < B; ++i) {
+    CHECK(warm.stats[i].reuse == expected_warm_reuse[i]);
+    CHECK(warm.stats[i].reused_tokens == expected_warm_reused[i]);
+    CHECK(cold.stats[i].reuse == ingine::model::Reuse::None);
+    CHECK(cold.stats[i].reused_tokens == 0);
+    CHECK(int(warm.tokens[i].size()) == gen_tokens);
+    CHECK(int(cold.tokens[i].size()) == gen_tokens);
+    CHECK(warm.tokens[i] == cold.tokens[i]);
+
+    bool all_finite = true;
+    int byte_exact_steps = 0;
+    double max_abs_all = 0.0;
+    double max_kl_all = 0.0;
+    std::size_t vocab_sz = 0;
+    for (int step = 0; step < gen_tokens; ++step) {
+      const auto& wl = warm.logits[i][std::size_t(step)];
+      const auto& cl = cold.logits[i][std::size_t(step)];
+      CHECK(!wl.empty() && wl.size() == cl.size());
+      vocab_sz = wl.size();
+      bool step_finite = true;
+      double step_max_abs = 0.0;
+      for (std::size_t v = 0; v < wl.size(); ++v) {
+        if (!std::isfinite(wl[v]) || !std::isfinite(cl[v])) {
+          step_finite = false;
+          break;
+        }
+        step_max_abs = std::max(step_max_abs, std::abs(double(wl[v]) - double(cl[v])));
+      }
+      if (!step_finite) all_finite = false;
+      const bool byte_eq =
+          step_finite && (std::memcmp(wl.data(), cl.data(), wl.size() * sizeof(float)) == 0);
+      if (byte_eq) ++byte_exact_steps;
+      max_abs_all = std::max(max_abs_all, step_max_abs);
+      if (step_finite) max_kl_all = std::max(max_kl_all, kl_div_fp64(cl, wl));
+      CHECK(step_finite);
+      CHECK(byte_eq);
+    }
+    std::printf("  [%s lane=%zu] warm_reused=%d cold_reused=%d tok=%d/%d vocab=%zu finite=%s logit_bytes_exact=%d/%d "
+                "max_abs=%.3e max_kl_fp64=%.3e\n",
+                label, i, warm.stats[i].reused_tokens, cold.stats[i].reused_tokens,
+                count_matching(warm.tokens[i], cold.tokens[i]), gen_tokens, vocab_sz, all_finite ? "YES" : "NO",
+                byte_exact_steps, gen_tokens, max_abs_all, max_kl_all);
+  }
 }
 
 }  // namespace
@@ -361,10 +501,34 @@ int main(int argc, char** argv) {
                 warm_1128_prefill_ms, cold_1128_prefill_ms / std::max(warm_1128_prefill_ms, 0.01), restore_gpu_ms);
     CHECK(out_wrap_hit == ref_wrap);
 
-    // 3c. Concurrent B=4 forks sharing committed pages + verified root64 via Scheduler::loop_batched()
-    ingine::engine::Scheduler sched(*gen, stop, 16);
+    // 3c. Concurrent B=4 forks sharing committed pages + verified root64:
+    //     First run an unconditional locked B=4 warm vs cold-bypass comparison directly through
+    //     BatchGenerator::start_slot + step_slots (identical token histories, active B=4 CUDA graph gear,
+    //     and prefill_chunk=64 splits), hard-checking admission, true warm hit, true cold bypass, equal
+    //     lengths, exact resumed IDs, and finite full-vocab logit bytes + FP64 KL across all 16 steps.
+    //     Then also exercise Scheduler::loop_batched() concurrently and retain B>1 vs B=1 as a diagnostic.
     std::vector<std::vector<int32_t>> fork_prompts = {p128_a, p128_b, p129_a, p64};
     std::vector<std::vector<int32_t>> fork_refs = {ref_p128_a, ref_p128_b, ref_p129, ref_p64};
+    {
+      const std::vector<std::string> warm_ns(4, "ns-root64");
+      const std::vector<std::string> cold_ns(4, "ns-cold-b4-ref");
+      const std::vector<int> warm_roots(4, 64);
+      const std::vector<int> cold_roots(4, 0);
+      const std::vector<ingine::model::Reuse> exp_reuse(4, ingine::model::Reuse::PagedPrefix);
+      const std::vector<int> exp_reused = {128, 64, 128, 64};
+
+      auto warm_b4 =
+          run_locked_batch_with_logits(*gen, fork_prompts, warm_ns, warm_roots, /*bypass_cache=*/false, gen_tokens, greedy);
+      auto cold_b4 = run_locked_batch_with_logits(*gen, fork_prompts, cold_ns, cold_roots, /*bypass_cache=*/true,
+                                                  gen_tokens, greedy, &warm_b4.tokens);
+      verify_matched_batch_bypass("3c_locked_B4", warm_b4, cold_b4, exp_reuse, exp_reused, gen_tokens);
+      for (std::size_t i = 0; i < fork_prompts.size(); ++i) {
+        std::printf("  [diag 3c lane=%zu B4_vs_B1] match=%d/%zu\n", i, count_matching(warm_b4.tokens[i], fork_refs[i]),
+                    fork_refs[i].size());
+      }
+    }
+
+    ingine::engine::Scheduler sched(*gen, stop, 16);
     std::vector<std::shared_ptr<ingine::engine::Job>> jobs;
     for (const auto& fp : fork_prompts) {
       auto j = std::make_shared<ingine::engine::Job>(fp, gen_tokens, greedy, std::vector<ingine::model::PromptImage>{},
@@ -372,28 +536,32 @@ int main(int argc, char** argv) {
       CHECK(sched.submit(j));
       jobs.push_back(std::move(j));
     }
+    std::vector<std::vector<int32_t>> sched_warm_outs(jobs.size());
+    const std::vector<int> exp_sched_reused = {128, 64, 128, 64};
     for (std::size_t i = 0; i < jobs.size(); ++i) {
-      const auto out = drain(*jobs[i]);
+      sched_warm_outs[i] = drain(*jobs[i]);
       const auto pst = jobs[i]->prefill_stats();
-      CHECK(pst.has_value() && pst->reuse == ingine::model::Reuse::PagedPrefix && pst->reused_tokens >= 64);
-      if (out != fork_refs[i]) {
-        std::printf("  [fork i=%zu] vs B=1 ref mismatch:\n", i);
-        print_vec_diff("fork", out, fork_refs[i]);
-        // Matched-batch B=4 cold bypass diagnostic (distinguishes B=1 vs B=4 FP8 GEMM drift from cache bugs).
-        std::vector<std::shared_ptr<ingine::engine::Job>> cold_jobs;
-        for (const auto& fp : fork_prompts) {
-          auto cj = std::make_shared<ingine::engine::Job>(fp, gen_tokens, greedy, std::vector<ingine::model::PromptImage>{},
-                                                          0, "ns-cold-diag", /*bypass_prefix_cache=*/true);
-          if (sched.submit(cj)) cold_jobs.push_back(std::move(cj));
-        }
-        std::vector<std::vector<int32_t>> cold_outs;
-        for (auto& cj : cold_jobs) cold_outs.push_back(drain(*cj));
-        if (i < cold_outs.size()) {
-          std::printf("  [fork i=%zu] cached_B4 vs cold_bypass_B4: %d/%zu tokens matched\n", i,
-                      count_matching(out, cold_outs[i]), cold_outs[i].size());
-        }
-      }
-      CHECK(out == fork_refs[i]);
+      CHECK(pst.has_value() && pst->reuse == ingine::model::Reuse::PagedPrefix &&
+            pst->reused_tokens == exp_sched_reused[i]);
+      CHECK(int(sched_warm_outs[i].size()) == gen_tokens);
+    }
+    // Unconditional matched Scheduler B=4 cold-bypass control.
+    std::vector<std::shared_ptr<ingine::engine::Job>> cold_jobs;
+    for (const auto& fp : fork_prompts) {
+      auto cj = std::make_shared<ingine::engine::Job>(fp, gen_tokens, greedy, std::vector<ingine::model::PromptImage>{},
+                                                      0, "ns-cold-sched-b4", /*bypass_prefix_cache=*/true);
+      CHECK(sched.submit(cj));
+      cold_jobs.push_back(std::move(cj));
+    }
+    for (std::size_t i = 0; i < cold_jobs.size(); ++i) {
+      const auto cold_out = drain(*cold_jobs[i]);
+      const auto cpst = cold_jobs[i]->prefill_stats();
+      CHECK(cpst.has_value() && cpst->reuse == ingine::model::Reuse::None && cpst->reused_tokens == 0);
+      CHECK(int(cold_out.size()) == gen_tokens);
+      CHECK(sched_warm_outs[i] == cold_out);
+      std::printf("  [3c_sched lane=%zu] warm_vs_cold_bypass=%d/%d (diag B4_vs_B1=%d/%zu)\n", i,
+                  count_matching(sched_warm_outs[i], cold_out), gen_tokens,
+                  count_matching(sched_warm_outs[i], fork_refs[i]), fork_refs[i].size());
     }
 
     // 3d. Early cancellation & slot recycle + recoverable failure cleanup (throwing on_prefill + OOM during snapshot).
@@ -552,45 +720,78 @@ int main(int argc, char** argv) {
                   (out1 == solo_96 && out2 == solo_96) ? "YES" : "NO");
     }
 
-    // 4b. Tight-pool live-sibling eviction under pressure.
+    // 4b. Tight-pool live-sibling eviction under pressure:
+    //     Unconditional locked B=2 warm vs cold-bypass comparison with finite full-vocab logit byte checks +
+    //     FP64 KL across both lanes, plus Scheduler::loop_batched() concurrency & eviction verification.
     auto p_alt_b = pad_to_len(render("Distinct topic about distributed consensus algorithms."), 128, filler);
     auto p_pressure = pad_to_len(render("Unrelated long prompt forcing KV page eviction under pressure."), 160, filler);
     (void)run_plain(p_alt_b, "tight-b");
     CHECK(run_plain(p128_a, "tight-a") == ref_p128_a);
 
+    {
+      const std::vector<std::vector<int32_t>> b2_prompts = {p128_a, p_pressure};
+      const std::vector<std::string> warm_ns = {"tight-a", "tight-c"};
+      const std::vector<std::string> cold_ns = {"tight-cold-a", "tight-cold-c"};
+      const std::vector<int> roots = {0, 0};
+      const std::vector<ingine::model::Reuse> exp_reuse = {ingine::model::Reuse::PagedPrefix,
+                                                           ingine::model::Reuse::None};
+      const std::vector<int> exp_reused = {128, 0};
+
+      auto warm_b2 =
+          run_locked_batch_with_logits(*gen, b2_prompts, warm_ns, roots, /*bypass_cache=*/false, gen_tokens, greedy);
+      const auto cstats_locked = gen->cache_stats();
+      CHECK(cstats_locked.vram_evictions > 0);
+      auto cold_b2 = run_locked_batch_with_logits(*gen, b2_prompts, cold_ns, roots, /*bypass_cache=*/true, gen_tokens,
+                                                  greedy, &warm_b2.tokens);
+      verify_matched_batch_bypass("4b_locked_B2", warm_b2, cold_b2, exp_reuse, exp_reused, gen_tokens);
+      std::printf("  [diag 4b lane=0 B2_vs_B1] match=%d/%zu\n", count_matching(warm_b2.tokens[0], ref_p128_a),
+                  ref_p128_a.size());
+    }
+
+    // Re-prime tight-b + tight-a so Scheduler live-sibling eviction is also exercised end-to-end.
+    (void)run_plain(p_alt_b, "tight-b");
+    CHECK(run_plain(p128_a, "tight-a") == ref_p128_a);
+    const auto evict_before_sched = gen->cache_stats().vram_evictions;
+
     ingine::engine::Scheduler sched(*gen, stop, 8);
     auto j_sib = std::make_shared<ingine::engine::Job>(p128_a, gen_tokens, greedy,
                                                        std::vector<ingine::model::PromptImage>{}, 0, "tight-a");
     auto j_press = std::make_shared<ingine::engine::Job>(p_pressure, gen_tokens, greedy,
-                                                         std::vector<ingine::model::PromptImage>{}, 0, "tight-c");
+                                                         std::vector<ingine::model::PromptImage>{}, 0, "tight-c-sched");
     CHECK(sched.submit(j_sib));
     CHECK(sched.submit(j_press));
     const auto out_sib = drain(*j_sib);
     const auto out_press = drain(*j_press);
-    if (out_sib != ref_p128_a) {
-      print_vec_diff("tight_evict_sib_vs_B1", out_sib, ref_p128_a);
-      auto cj_sib = std::make_shared<ingine::engine::Job>(p128_a, gen_tokens, greedy,
-                                                          std::vector<ingine::model::PromptImage>{}, 0, "tight-cold-a",
-                                                          /*bypass_prefix_cache=*/true);
-      auto cj_press = std::make_shared<ingine::engine::Job>(p_pressure, gen_tokens, greedy,
-                                                            std::vector<ingine::model::PromptImage>{}, 0,
-                                                            "tight-cold-c", /*bypass_prefix_cache=*/true);
-      if (sched.submit(cj_sib) && sched.submit(cj_press)) {
-        const auto cold_sib = drain(*cj_sib);
-        (void)drain(*cj_press);
-        std::printf("  [tight_evict] cached_B2 vs cold_bypass_B2: %d/%zu tokens matched\n",
-                    count_matching(out_sib, cold_sib), cold_sib.size());
-      }
-    }
-    CHECK(out_sib == ref_p128_a);
-    CHECK(!out_press.empty());
     const auto st_sib = j_sib->prefill_stats();
+    const auto st_press = j_press->prefill_stats();
     CHECK(st_sib.has_value() && st_sib->reuse == ingine::model::Reuse::PagedPrefix && st_sib->reused_tokens == 128);
+    CHECK(st_press.has_value() && st_press->reuse == ingine::model::Reuse::None && st_press->reused_tokens == 0);
+    CHECK(int(out_sib.size()) == gen_tokens && int(out_press.size()) == gen_tokens);
+
+    // Unconditional matched Scheduler B=2 cold-bypass control.
+    auto cj_sib = std::make_shared<ingine::engine::Job>(p128_a, gen_tokens, greedy,
+                                                        std::vector<ingine::model::PromptImage>{}, 0,
+                                                        "tight-cold-sched-a", /*bypass_prefix_cache=*/true);
+    auto cj_press = std::make_shared<ingine::engine::Job>(p_pressure, gen_tokens, greedy,
+                                                          std::vector<ingine::model::PromptImage>{}, 0,
+                                                          "tight-cold-sched-c", /*bypass_prefix_cache=*/true);
+    CHECK(sched.submit(cj_sib) && sched.submit(cj_press));
+    const auto cold_sib = drain(*cj_sib);
+    const auto cold_press = drain(*cj_press);
+    const auto cst_sib = cj_sib->prefill_stats();
+    const auto cst_press = cj_press->prefill_stats();
+    CHECK(cst_sib.has_value() && cst_sib->reuse == ingine::model::Reuse::None && cst_sib->reused_tokens == 0);
+    CHECK(cst_press.has_value() && cst_press->reuse == ingine::model::Reuse::None && cst_press->reused_tokens == 0);
+    CHECK(out_sib == cold_sib && out_press == cold_press);
+    std::printf("  [4b_sched] sib warm_vs_cold=%d/%d press warm_vs_cold=%d/%d (diag B2_vs_B1=%d/%zu)\n",
+                count_matching(out_sib, cold_sib), gen_tokens, count_matching(out_press, cold_press), gen_tokens,
+                count_matching(out_sib, ref_p128_a), ref_p128_a.size());
     const auto cstats = gen->cache_stats();
-    std::printf("tight-pool live-sibling eviction: vram_evictions=%llu entries=%llu\n",
+    std::printf("tight-pool live-sibling eviction: vram_evictions=%llu (delta=%llu) entries=%llu\n",
                 static_cast<unsigned long long>(cstats.vram_evictions),
+                static_cast<unsigned long long>(cstats.vram_evictions - evict_before_sched),
                 static_cast<unsigned long long>(cstats.vram_entries));
-    CHECK(cstats.vram_evictions > 0);
+    CHECK(cstats.vram_evictions > evict_before_sched);
   }
 
   std::printf(g_failures ? "FAILED (%d checks)\n" : "batch_prefix_parity ok\n", g_failures);
