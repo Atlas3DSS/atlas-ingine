@@ -145,7 +145,7 @@ bool check_decode_q4_bit_exact(hal::Stream& stream) {
         d_z_norm.copy_from_host(nw.data(), nw.size() * sizeof(float));
         const ops::EmbedQ4RmsNormArgs args{
             static_cast<const std::int64_t*>(d_z_tok.p), d_z_tbl.p,
-            static_cast<const float*>(d_z_norm.p), static_cast<float*>(d_z_out.p), ids.data(), nullptr};
+            static_cast<const float*>(d_z_norm.p), static_cast<float*>(d_z_out.p), nullptr};
         const ops::DispatchPath path =
             ops::run_embed_q4_rmsnorm(desc, args, stream.handle(), /*allow_fallback=*/true, fallback);
         std::vector<float> got(ids.size() * kInklingHidden, 0.f);
@@ -309,7 +309,6 @@ bool check_embed_q4_rmsnorm_case(int M, const std::vector<std::int64_t>& tok_ids
       d_table.p,
       static_cast<const float*>(d_norm.p),
       static_cast<float*>(d_out),
-      tok_ids.data(),
       nullptr,
   };
 
@@ -389,6 +388,18 @@ bool check_token_bounds_contract(int vocab_size, const std::vector<std::uint8_t>
     }
     return true;
   };
+  auto check_invalid_rows_untouched = [&](const std::vector<std::int64_t>& ids) {
+    std::vector<float> got(2 * kInklingHidden, 0.f);
+    d_out.copy_to_host(got.data(), got.size() * sizeof(float));
+    for (int m = 0; m < int(ids.size()); ++m) {
+      if (ids[std::size_t(m)] < 0 || ids[std::size_t(m)] >= vocab_size) {
+        for (int j = 0; j < kInklingHidden; ++j) {
+          if (got[std::size_t(m) * kInklingHidden + j] != kSentinel) return false;
+        }
+      }
+    }
+    return true;
+  };
 
   const std::vector<std::vector<std::int64_t>> bad_cases = {
       {0, -1},
@@ -397,24 +408,9 @@ bool check_token_bounds_contract(int vocab_size, const std::vector<std::uint8_t>
   };
 
   for (const auto& bad_ids : bad_cases) {
-    // 1. Validate with host_token_ids != nullptr (both Native and PortableFallback).
+    // 1. Validate synchronously inspects the actual args.token_ids buffer (both Native and PortableFallback),
+    // with and without invalid_token_flag.
     for (bool fallback : {false, true}) {
-      d_tok.copy_from_host(bad_ids.data(), bad_ids.size() * sizeof(std::int64_t));
-      d_out.copy_from_host(init_out.data(), init_out.size() * sizeof(float));
-      ops::EmbedQ4RmsNormArgs args{
-          static_cast<const std::int64_t*>(d_tok.p), d_tbl.p,
-          static_cast<const float*>(d_norm.p), static_cast<float*>(d_out.p), bad_ids.data(), nullptr};
-      bool threw = false;
-      try {
-        (void)ops::run_embed_q4_rmsnorm(base_desc, args, stream.handle(), /*allow_fallback=*/true, fallback);
-      } catch (const std::out_of_range&) {
-        threw = true;
-      }
-      ok &= threw && check_out_untouched();
-    }
-
-    // 2. Validate with host_token_ids == nullptr (device readback / host direct) + oob flag.
-    {
       d_tok.copy_from_host(bad_ids.data(), bad_ids.size() * sizeof(std::int64_t));
       d_out.copy_from_host(init_out.data(), init_out.size() * sizeof(float));
       const std::uint32_t zero_flag = 0u;
@@ -422,16 +418,99 @@ bool check_token_bounds_contract(int vocab_size, const std::vector<std::uint8_t>
       ops::EmbedQ4RmsNormArgs args{
           static_cast<const std::int64_t*>(d_tok.p), d_tbl.p,
           static_cast<const float*>(d_norm.p), static_cast<float*>(d_out.p),
-          nullptr, static_cast<std::uint32_t*>(d_oob.p)};
+          static_cast<std::uint32_t*>(d_oob.p)};
       bool threw = false;
       try {
-        (void)ops::run_embed_q4_rmsnorm(base_desc, args, stream.handle(), /*allow_fallback=*/true, false);
+        (void)ops::run_embed_q4_rmsnorm(base_desc, args, stream.handle(), /*allow_fallback=*/true, fallback);
       } catch (const std::out_of_range&) {
         threw = true;
       }
       std::uint32_t flag_val = 0u;
       d_oob.copy_to_host(&flag_val, sizeof(flag_val));
-      ok &= threw && (flag_val == 1u) && check_out_untouched();
+      const bool out_ok1 = check_out_untouched();
+      if (!threw || flag_val != 1u || !out_ok1) {
+        std::fprintf(stderr, "token-bounds Validate(with flag) failed fallback=%d ids=[%lld,%lld] threw=%d flag=%u out_ok=%d\n",
+                     int(fallback), static_cast<long long>(bad_ids[0]), static_cast<long long>(bad_ids[1]),
+                     int(threw), flag_val, int(out_ok1));
+      }
+      ok &= threw && (flag_val == 1u) && out_ok1;
+
+      ops::EmbedQ4RmsNormArgs args_no_flag{
+          static_cast<const std::int64_t*>(d_tok.p), d_tbl.p,
+          static_cast<const float*>(d_norm.p), static_cast<float*>(d_out.p), nullptr};
+      threw = false;
+      try {
+        (void)ops::run_embed_q4_rmsnorm(base_desc, args_no_flag, stream.handle(), /*allow_fallback=*/true, fallback);
+      } catch (const std::out_of_range&) {
+        threw = true;
+      }
+      const bool out_ok2 = check_out_untouched();
+      if (!threw || !out_ok2) {
+        std::fprintf(stderr, "token-bounds Validate(no flag) failed fallback=%d ids=[%lld,%lld] threw=%d out_ok=%d\n",
+                     int(fallback), static_cast<long long>(bad_ids[0]), static_cast<long long>(bad_ids[1]),
+                     int(threw), int(out_ok2));
+      }
+      ok &= threw && out_ok2;
+    }
+
+    // 2. DeferredFlag requires non-null flag, clears flag on valid, sets flag=1 on OOB without touching invalid rows,
+    // and enforces via check_deferred_token_bounds.
+    {
+      auto def_desc = base_desc;
+      def_desc.token_bounds = ops::TokenBoundsMode::DeferredFlag;
+      bool null_rejected = false;
+      try {
+        ops::EmbedQ4RmsNormArgs null_args{
+            static_cast<const std::int64_t*>(d_tok.p), d_tbl.p,
+            static_cast<const float*>(d_norm.p), static_cast<float*>(d_out.p), nullptr};
+        (void)ops::run_embed_q4_rmsnorm(def_desc, null_args, stream.handle(), /*allow_fallback=*/true, false);
+      } catch (const std::invalid_argument&) {
+        null_rejected = true;
+      }
+      if (!null_rejected) std::fprintf(stderr, "token-bounds DeferredFlag null flag check failed\n");
+      ok &= null_rejected;
+
+      for (bool fallback : {false, true}) {
+        d_tok.copy_from_host(bad_ids.data(), bad_ids.size() * sizeof(std::int64_t));
+        d_out.copy_from_host(init_out.data(), init_out.size() * sizeof(float));
+        const std::uint32_t zero_flag = 0u;
+        d_oob.copy_from_host(&zero_flag, sizeof(zero_flag));
+        ops::EmbedQ4RmsNormArgs args{
+            static_cast<const std::int64_t*>(d_tok.p), d_tbl.p,
+            static_cast<const float*>(d_norm.p), static_cast<float*>(d_out.p),
+            static_cast<std::uint32_t*>(d_oob.p)};
+        (void)ops::run_embed_q4_rmsnorm(def_desc, args, stream.handle(), /*allow_fallback=*/true, fallback);
+        hal::stream_synchronize(stream.handle());
+        std::uint32_t flag_val = 0u;
+        d_oob.copy_to_host(&flag_val, sizeof(flag_val));
+        bool deferred_threw = false;
+        try {
+          ops::check_deferred_token_bounds(flag_val, vocab_size);
+        } catch (const std::out_of_range&) {
+          deferred_threw = true;
+        }
+        const bool rows_ok = (fallback || hal::active_backend() == hal::BackendKind::Cpu)
+                                 ? check_out_untouched()
+                                 : check_invalid_rows_untouched(bad_ids);
+        if (flag_val != 1u || !deferred_threw || !rows_ok) {
+          std::fprintf(stderr, "token-bounds DeferredFlag OOB failed fallback=%d ids=[%lld,%lld] flag=%u threw=%d rows_ok=%d\n",
+                       int(fallback), static_cast<long long>(bad_ids[0]), static_cast<long long>(bad_ids[1]),
+                       flag_val, int(deferred_threw), int(rows_ok));
+        }
+        ok &= (flag_val == 1u) && deferred_threw && rows_ok;
+
+        // Subsequent valid call on the same flag must reset flag back to 0u.
+        const std::vector<std::int64_t> good_ids = {1, 2};
+        d_tok.copy_from_host(good_ids.data(), good_ids.size() * sizeof(std::int64_t));
+        (void)ops::run_embed_q4_rmsnorm(def_desc, args, stream.handle(), /*allow_fallback=*/true, fallback);
+        hal::stream_synchronize(stream.handle());
+        d_oob.copy_to_host(&flag_val, sizeof(flag_val));
+        ops::check_deferred_token_bounds(flag_val, vocab_size);
+        if (flag_val != 0u) {
+          std::fprintf(stderr, "token-bounds DeferredFlag reset failed fallback=%d flag=%u\n", int(fallback), flag_val);
+        }
+        ok &= (flag_val == 0u);
+      }
     }
 
     // 3. Scalar oracle rejects OOB instead of silently substituting zero.
@@ -445,6 +524,7 @@ bool check_token_bounds_contract(int vocab_size, const std::vector<std::uint8_t>
       } catch (const std::out_of_range&) {
         threw = true;
       }
+      if (!threw) std::fprintf(stderr, "token-bounds scalar oracle check failed\n");
       ok &= threw;
     }
   }
@@ -461,7 +541,7 @@ bool check_token_bounds_contract(int vocab_size, const std::vector<std::uint8_t>
     ops::EmbedQ4RmsNormArgs args{
         static_cast<const std::int64_t*>(d_tok.p), d_tbl.p,
         static_cast<const float*>(d_norm.p), static_cast<float*>(d_out.p),
-        nullptr, static_cast<std::uint32_t*>(d_oob.p)};
+        static_cast<std::uint32_t*>(d_oob.p)};
     const ops::DispatchPath path =
         ops::run_embed_q4_rmsnorm(pre_desc, args, stream.handle(), /*allow_fallback=*/false, false);
     hal::stream_synchronize(stream.handle());
@@ -473,10 +553,14 @@ bool check_token_bounds_contract(int vocab_size, const std::vector<std::uint8_t>
     for (int j = 0; j < kInklingHidden; ++j) {
       if (got[j] != kSentinel) row0_untouched = false;
     }
+    if (path != ops::DispatchPath::Native || flag_val != 1u || !row0_untouched) {
+      std::fprintf(stderr, "token-bounds cuda PreValidated check failed path=%d flag=%u row0_untouched=%d\n",
+                   int(path), flag_val, int(row0_untouched));
+    }
     ok &= (path == ops::DispatchPath::Native) && (flag_val == 1u) && row0_untouched;
   }
 
-  std::printf("%s unified token-bounds contract checks (host, device, fallback, oracle%s)\n",
+  std::printf("%s unified token-bounds contract checks (actual-buffer Validate, DeferredFlag, fallback, oracle%s)\n",
               ok ? "PASS" : "FAIL",
               hal::active_backend() == hal::BackendKind::Cuda ? ", cuda PreValidated kernel guard" : "");
   return ok;
@@ -553,7 +637,7 @@ int main() {
     d_norm.copy_from_host(norm_f32.data(), norm_f32.size() * sizeof(float));
     ops::EmbedQ4RmsNormArgs dummy{static_cast<const std::int64_t*>(d_tok.p), d_tbl.p,
                                  static_cast<const float*>(d_norm.p), static_cast<float*>(d_out.p),
-                                 &tok0, nullptr};
+                                 nullptr};
 
     bool disabled_fallback_rejected = false;
     try {

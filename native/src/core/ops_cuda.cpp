@@ -2,11 +2,25 @@
 
 #include "kernels/dense/dense.h"
 
+#include <cuda_runtime.h>
+
 #include <cmath>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ingine::ops {
+namespace {
+
+void clear_flag_async(std::uint32_t* flag, cudaStream_t cs) {
+  const cudaError_t err = cudaMemsetAsync(flag, 0, sizeof(std::uint32_t), cs);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("embed_q4_rmsnorm: cudaMemsetAsync(invalid_token_flag) failed: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
+}  // namespace
 
 OpResolution resolve_embed_q4_rmsnorm(const EmbedQ4RmsNormDesc& desc, bool allow_fallback) {
   validate_embed_q4_rmsnorm_desc(desc);
@@ -41,19 +55,20 @@ DispatchPath run_embed_q4_rmsnorm(const EmbedQ4RmsNormDesc& desc, const EmbedQ4R
     throw std::invalid_argument("embed_q4_rmsnorm: null buffer argument");
   }
   if (!force_fallback && res.path == DispatchPath::Native) {
-    if (desc.token_bounds == TokenBoundsMode::Validate) {
-      if (args.host_token_ids != nullptr) {
-        validate_token_ids(args.host_token_ids, desc.tokens, desc.vocab_size);
-      } else if (hal::is_stream_capturing(stream)) {
-        throw std::logic_error(
-            "embed_q4_rmsnorm: TokenBoundsMode::Validate during graph capture requires host_token_ids or "
-            "TokenBoundsMode::PreValidated");
-      } else {
+    const cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    switch (desc.token_bounds) {
+      case TokenBoundsMode::Validate: {
+        if (hal::is_stream_capturing(stream)) {
+          throw std::logic_error(
+              "embed_q4_rmsnorm: TokenBoundsMode::Validate cannot run inside graph capture; use "
+              "TokenBoundsMode::DeferredFlag or TokenBoundsMode::PreValidated");
+        }
         std::vector<std::int64_t> host_tokens(static_cast<std::size_t>(desc.tokens));
         hal::memcpy_d2h_async(host_tokens.data(), args.token_ids, host_tokens.size() * sizeof(std::int64_t), stream);
         hal::stream_synchronize(stream);
         try {
           validate_token_ids(host_tokens.data(), desc.tokens, desc.vocab_size);
+          if (args.invalid_token_flag != nullptr) clear_flag_async(args.invalid_token_flag, cs);
         } catch (const std::out_of_range&) {
           if (args.invalid_token_flag != nullptr) {
             const std::uint32_t one = 1u;
@@ -62,10 +77,20 @@ DispatchPath run_embed_q4_rmsnorm(const EmbedQ4RmsNormDesc& desc, const EmbedQ4R
           }
           throw;
         }
+        break;
       }
+      case TokenBoundsMode::DeferredFlag:
+        if (args.invalid_token_flag == nullptr) {
+          throw std::invalid_argument("embed_q4_rmsnorm: TokenBoundsMode::DeferredFlag requires invalid_token_flag");
+        }
+        clear_flag_async(args.invalid_token_flag, cs);
+        break;
+      case TokenBoundsMode::PreValidated:
+        if (args.invalid_token_flag != nullptr) clear_flag_async(args.invalid_token_flag, cs);
+        break;
     }
     kernels::dense::embed_q4(args.token_ids, desc.tokens, desc.vocab_size, args.table_q4, args.norm_weight, args.out,
-                             desc.allow_pdl, static_cast<cudaStream_t>(stream), args.invalid_token_flag);
+                             desc.allow_pdl, cs, args.invalid_token_flag);
     return DispatchPath::Native;
   }
   if (!allow_fallback) throw std::invalid_argument("embed_q4_rmsnorm: portable fallback disabled");

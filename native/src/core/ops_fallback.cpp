@@ -112,6 +112,13 @@ void validate_token_ids_i32(const std::int32_t* host_token_ids, int tokens, int 
   }
 }
 
+void check_deferred_token_bounds(std::uint32_t invalid_token_flag, int vocab_size) {
+  if (invalid_token_flag != 0u) {
+    throw std::out_of_range("embed_q4_rmsnorm: deferred token-bounds check failed for vocabulary range [0, " +
+                            std::to_string(vocab_size) + ")");
+  }
+}
+
 void decode_q4_0_row(const std::uint8_t* row_bytes, int hidden_size, float* out_f32) {
   if (!row_bytes || !out_f32) throw std::invalid_argument("decode_q4_0_row: null pointer");
   if (hidden_size <= 0 || (hidden_size % 32) != 0) {
@@ -157,8 +164,8 @@ DispatchPath run_embed_q4_rmsnorm_fallback(const EmbedQ4RmsNormDesc& desc, const
   if (hal::is_stream_capturing(stream)) {
     throw std::runtime_error("embed_q4_rmsnorm portable fallback cannot run inside graph capture");
   }
-  if (desc.token_bounds == TokenBoundsMode::Validate && args.host_token_ids != nullptr) {
-    validate_token_ids(args.host_token_ids, desc.tokens, desc.vocab_size);
+  if (desc.token_bounds == TokenBoundsMode::DeferredFlag && args.invalid_token_flag == nullptr) {
+    throw std::invalid_argument("embed_q4_rmsnorm: TokenBoundsMode::DeferredFlag requires invalid_token_flag");
   }
 
   const int M = desc.tokens;
@@ -169,14 +176,19 @@ DispatchPath run_embed_q4_rmsnorm_fallback(const EmbedQ4RmsNormDesc& desc, const
   hal::memcpy_d2h_async(host_norm.data(), args.norm_weight, host_norm.size() * sizeof(float), stream);
   hal::stream_synchronize(stream);
 
-  try {
-    validate_token_ids(host_tokens.data(), M, desc.vocab_size);
-  } catch (const std::out_of_range&) {
+  auto set_flag = [&](std::uint32_t value) {
     if (args.invalid_token_flag != nullptr) {
-      const std::uint32_t one = 1u;
-      hal::memcpy_h2d_async(args.invalid_token_flag, &one, sizeof(one), stream);
+      hal::memcpy_h2d_async(args.invalid_token_flag, &value, sizeof(value), stream);
       hal::stream_synchronize(stream);
     }
+  };
+
+  try {
+    validate_token_ids(host_tokens.data(), M, desc.vocab_size);
+    set_flag(0u);
+  } catch (const std::out_of_range&) {
+    set_flag(1u);
+    if (desc.token_bounds == TokenBoundsMode::DeferredFlag) return DispatchPath::PortableFallback;
     throw;
   }
 

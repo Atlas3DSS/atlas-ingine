@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <stdexcept>
 
 namespace ingine::model {
@@ -468,18 +469,21 @@ void Runtime::record_rollback(int m, const std::int32_t* accepted, cudaStream_t 
 
 namespace {
 
+std::atomic<int> g_fail_next_switch_capture{int(cudaSuccess)};
+std::atomic<std::uint64_t> g_switch_verify_launches{0};
+std::atomic<std::uint64_t> g_switch_accept_launches{0};
+std::atomic<std::uint64_t> g_eager_verify_launches{0};
+std::atomic<std::uint64_t> g_eager_accept_launches{0};
+std::atomic<std::uint64_t> g_switch_capture_fallbacks{0};
+
 bool is_conditional_unsupported(cudaError_t err) noexcept {
   switch (err) {
     case cudaErrorNotSupported:
     case cudaErrorNotPermitted:
     case cudaErrorInsufficientDriver:
-    case cudaErrorOperatingSystem:
-#ifdef cudaErrorCallRequiresNewerDriver
     case cudaErrorCallRequiresNewerDriver:
-#endif
-#ifdef cudaErrorUnsupportedPtxVersion
+    case cudaErrorOperatingSystem:
     case cudaErrorUnsupportedPtxVersion:
-#endif
       return true;
     default:
       return false;
@@ -498,7 +502,43 @@ void throw_if_switch_err(cudaError_t err, const char* what, bool from_switch_nod
 
 }  // namespace
 
-GraphExec Runtime::try_capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
+bool is_conditional_switch_unsupported_error(cudaError_t err) noexcept {
+  return is_conditional_unsupported(err);
+}
+
+void fail_next_switch_capture(cudaError_t err) noexcept {
+  g_fail_next_switch_capture.store(int(err), std::memory_order_relaxed);
+}
+
+SpecExecutionCounters spec_execution_counters() noexcept {
+  return SpecExecutionCounters{
+      g_switch_verify_launches.load(std::memory_order_relaxed),
+      g_switch_accept_launches.load(std::memory_order_relaxed),
+      g_eager_verify_launches.load(std::memory_order_relaxed),
+      g_eager_accept_launches.load(std::memory_order_relaxed),
+      g_switch_capture_fallbacks.load(std::memory_order_relaxed),
+  };
+}
+
+void reset_spec_execution_counters() noexcept {
+  g_switch_verify_launches.store(0, std::memory_order_relaxed);
+  g_switch_accept_launches.store(0, std::memory_order_relaxed);
+  g_eager_verify_launches.store(0, std::memory_order_relaxed);
+  g_eager_accept_launches.store(0, std::memory_order_relaxed);
+  g_switch_capture_fallbacks.store(0, std::memory_order_relaxed);
+}
+
+void record_spec_execution(bool is_verify, bool used_switch) noexcept {
+  if (is_verify) {
+    if (used_switch) g_switch_verify_launches.fetch_add(1, std::memory_order_relaxed);
+    else g_eager_verify_launches.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    if (used_switch) g_switch_accept_launches.fetch_add(1, std::memory_order_relaxed);
+    else g_eager_accept_launches.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+GraphExec Runtime::try_capture_switch(const std::function<cudaError_t(cudaStream_t, cudaGraphConditionalHandle)>& head,
                                       const std::function<void(cudaStream_t, int)>& branch) {
   if (!supports_conditional_graphs_) return GraphExec{};
   if (verify_widths_.empty()) throw std::logic_error("capture_switch needs the speculative widths (options.spec)");
@@ -506,6 +546,7 @@ GraphExec Runtime::try_capture_switch(const std::function<void(cudaStream_t, cud
   (void)head;
   (void)branch;
   supports_conditional_graphs_ = false;
+  g_switch_capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
   return GraphExec{};
 #else
   const cudaStream_t s = capture_stream_;
@@ -540,7 +581,12 @@ GraphExec Runtime::try_capture_switch(const std::function<void(cudaStream_t, cud
                         "cudaGraphConditionalHandleCreate", /*from_switch_node=*/true);
     cudaGraph_t* bodies = nullptr;
     captured(graph, [&] {
-      head(s, handle);
+      const cudaError_t head_err = head(s, handle);
+      throw_if_switch_err(head_err, "switch head selector", /*from_switch_node=*/true);
+      const cudaError_t injected = static_cast<cudaError_t>(g_fail_next_switch_capture.exchange(int(cudaSuccess)));
+      if (injected != cudaSuccess) {
+        throw_if_switch_err(injected, "injected switch capture error", /*from_switch_node=*/true);
+      }
       cudaStreamCaptureStatus status;
       cudaGraph_t g = nullptr;
       const cudaGraphNode_t* deps = nullptr;
@@ -587,6 +633,7 @@ GraphExec Runtime::try_capture_switch(const std::function<void(cudaStream_t, cud
     (void)cudaGetLastError();
     if (is_conditional_unsupported(e.err) || (e.from_switch_node && e.err == cudaErrorInvalidValue)) {
       supports_conditional_graphs_ = false;
+      g_switch_capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
       return GraphExec{};
     }
     throw std::runtime_error(std::string(e.what) + ": " + cudaGetErrorName(e.err) + ": " + cudaGetErrorString(e.err));
@@ -594,7 +641,7 @@ GraphExec Runtime::try_capture_switch(const std::function<void(cudaStream_t, cud
 #endif
 }
 
-GraphExec Runtime::capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
+GraphExec Runtime::capture_switch(const std::function<cudaError_t(cudaStream_t, cudaGraphConditionalHandle)>& head,
                                   const std::function<void(cudaStream_t, int)>& branch) {
   GraphExec result = try_capture_switch(head, branch);
   if (!result) {

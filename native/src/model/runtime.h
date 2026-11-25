@@ -39,6 +39,26 @@
 
 namespace ingine::model {
 
+struct SpecExecutionCounters {
+  std::uint64_t switch_verify_launches = 0;
+  std::uint64_t switch_accept_launches = 0;
+  std::uint64_t eager_verify_launches = 0;
+  std::uint64_t eager_accept_launches = 0;
+  std::uint64_t switch_capture_fallbacks = 0;
+};
+
+// Returns true when `err` represents an unsupported driver/runtime/conditional-SWITCH error suitable for
+// controlled eager fallback rather than aborting.
+bool is_conditional_switch_unsupported_error(cudaError_t err) noexcept;
+
+// Test/fault-injection hook: forces the next Runtime::try_capture_switch construction after the HAL probe to
+// behave as if CUDA returned `err` (automatically resets to cudaSuccess once consumed).
+void fail_next_switch_capture(cudaError_t err) noexcept;
+
+SpecExecutionCounters spec_execution_counters() noexcept;
+void reset_spec_execution_counters() noexcept;
+void record_spec_execution(bool is_verify, bool used_switch) noexcept;
+
 // ---- loading (weights.load + FastDecoder._concat_projections/_stack_layer_params/_fp8_dense,
 // model.Ablation.load/none, model.State)
 Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream,
@@ -182,9 +202,9 @@ class Runtime {
   // by a switch node whose branch i is `branch(verify_widths()[i])` (captured).
   // try_capture_switch returns an empty GraphExec and disables conditional graphs on controlled unsupported
   // driver/runtime/SWITCH failures; capture_switch throws if conditional SWITCH graphs are unavailable.
-  GraphExec try_capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
+  GraphExec try_capture_switch(const std::function<cudaError_t(cudaStream_t, cudaGraphConditionalHandle)>& head,
                                const std::function<void(cudaStream_t, int)>& branch);
-  GraphExec capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
+  GraphExec capture_switch(const std::function<cudaError_t(cudaStream_t, cudaGraphConditionalHandle)>& head,
                            const std::function<void(cudaStream_t, int)>& branch);
   // Mech-interp / persona runtime hooks: fixed-address device table + dual unhooked/hooked CUDA graphs.
   PersonaRuntime& persona_runtime() { return *persona_rt_; }

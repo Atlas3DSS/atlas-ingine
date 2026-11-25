@@ -7,6 +7,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/host_memory.h"
+#include "core/ops.h"
 #include "kernels/batch/batch.h"
 #include "kernels/dense/dense.h"
 #include "kernels/head/head.h"
@@ -467,7 +468,14 @@ class BatchDecoder {
       }
     };
 
-    dense::embed(tokens_dev_, B, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
+    if (w.embed_q4()) {
+      auto desc = ops::make_inkling_embed_q4_desc(B, VOCAB, /*allow_pdl=*/false);
+      desc.token_bounds = ops::TokenBoundsMode::PreValidated;
+      const ops::EmbedQ4RmsNormArgs args{tokens_dev_, w.embed.data, f32p(w.embed_norm), B0_};
+      ops::run_embed_q4_rmsnorm(desc, args, stream, /*allow_fallback=*/false, /*force_fallback=*/false);
+    } else {
+      dense::embed(tokens_dev_, B, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
+    }
 
     int prev_v = -1;
     for (int v = 0; v < NUM_VISITS; ++v) {
@@ -799,6 +807,15 @@ class BatchGenerator final : public Generator {
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     const int n = int(prompt.size());
     const int image_tokens = check_images(full_prompt);
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+      if (prompt[i] >= VOCAB) {
+        throw std::out_of_range("prompt token id " + std::to_string(prompt[i]) +
+                                " out of vocabulary range [0, " + std::to_string(VOCAB) + ")");
+      }
+    }
+    if (!sampling.forced.empty()) {
+      ops::validate_token_ids_i32(sampling.forced.data(), int(sampling.forced.size()), VOCAB);
+    }
     if (n >= options_.max_ctx) {
       throw std::invalid_argument("prompt of " + std::to_string(n) + " tokens does not fit max_ctx " +
                                   std::to_string(options_.max_ctx));
@@ -907,16 +924,35 @@ class BatchGenerator final : public Generator {
   void step_slots(std::span<const BatchSlotStep> inputs, std::span<std::int32_t> out_tokens) override {
     const int B = int(inputs.size());
     if (B == 0) return;
+    if (B > options_.max_batch) throw std::invalid_argument("step_slots: batch size exceeds max_batch");
     if (int(out_tokens.size()) < B) throw std::invalid_argument("step_slots: out_tokens too small");
 
     std::lock_guard<std::mutex> lock(mutex_);
-    // Ensure every active slot has a physical page for its current decode position `slot_pos_host[s]`.
+    // Pass 1 (read-only): validate every slot, token id, and KV page capacity before mutating any state.
+    std::vector<bool> seen(static_cast<std::size_t>(options_.max_batch), false);
+    int total_add_pages = 0;
     for (int i = 0; i < B; ++i) {
       const int s = inputs[i].slot;
       if (s < 0 || s >= options_.max_batch || !pool_.slot_in_use[s])
         throw std::invalid_argument("step_slots: invalid or inactive slot");
+      if (seen[static_cast<std::size_t>(s)])
+        throw std::invalid_argument("step_slots: duplicate slot in batch");
+      seen[static_cast<std::size_t>(s)] = true;
+      ops::validate_token_ids_i32(&inputs[i].token, 1, VOCAB);
       const int pos = pool_.slot_pos_host[s];
       if (pos >= options_.max_ctx) throw std::runtime_error("step_slots: slot reached max_ctx");
+      const int needed = (pos + 1 + bk::kPageSize - 1) / bk::kPageSize;
+      if (needed > pool_.max_pages_per_slot) throw std::runtime_error("step_slots: paged KV pool exhausted");
+      const int cur = int(pool_.slot_pages[s].size());
+      if (needed > cur) total_add_pages += (needed - cur);
+    }
+    if (int(pool_.free_pages.size()) < total_add_pages) {
+      throw std::runtime_error("step_slots: paged KV pool exhausted");
+    }
+    // Pass 2: ensure KV pages only after all inputs and capacity are verified.
+    for (int i = 0; i < B; ++i) {
+      const int s = inputs[i].slot;
+      const int pos = pool_.slot_pos_host[s];
       if (!pool_.ensure_pages(s, pos + 1, stream_))
         throw std::runtime_error("step_slots: paged KV pool exhausted");
     }

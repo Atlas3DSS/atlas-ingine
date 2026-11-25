@@ -117,10 +117,11 @@ Grep across `native/src/kernels/` and `native/src/model/` shows **103 non-commen
 2. **CUDA Graph Conditional Switch Nodes & DSpark Speculative Fallback (`SpecLoop`):**
    - `cudaGraphConditionalHandle` / `cudaGraphNodeTypeConditional` (`cudaGraphCondTypeSwitch`) is used in `Runtime::try_capture_switch` (`src/model/runtime.cpp`) for `SpecLoop` (`src/model/spec.cpp`).
    - Previously, `SpecLoop::prepare_accept` unconditionally called `capture_switch` and every speculative round unconditionally launched `accept_`, so `verify_select_eager` alone could not run acceptance, rollback, or `verify_publish` without conditional graphs.
-   - **Complete Fix:** Gate `try_capture_switch` behind `Runtime::supports_conditional_graphs()` (12.8+ driver/runtime/context probe, `INGINE_DISABLE_CONDITIONAL_GRAPHS=1` override, and controlled non-aborting fallback on unsupported `SWITCH` node errors). When conditional graphs are unavailable or disabled:
+   - **Complete Fix:** Gate `try_capture_switch` behind `Runtime::supports_conditional_graphs()` (12.8+ driver/runtime/context probe, `INGINE_DISABLE_CONDITIONAL_GRAPHS=1` override, non-aborting SWITCH selector return codes, and controlled non-aborting fallback on unsupported `SWITCH` node errors). When conditional graphs are unavailable or disabled:
      - `SpecLoop::prepare_accept` skips `capture_switch`.
      - Verify runs `verify_select_eager`, synchronizes the 4-byte `width_ready_` event, reads `selected_m`, calls `rt_.record_save_verify(selected_m, stream)`, and executes either `rt_.run_step_eager(selected_m)` (if `needs_eager_step()`) or the linear captured graph via `rt_.run_step(selected_m)` (including hooked graphs via `ensure_hooked_graphs()` when `hooked_active()`).
      - Acceptance, rollback (`record_rollback`), and publication (`verify_publish`) run directly on `stream` for the exact `selected_m` via a shared `SpecLoop::record_accept_for_width(selected_m, sampling, stream)` helper used by both conditional-graph capture and eager fallback.
+     - Single-generator (`EngineGenerator`) and continuous-batching (`BatchGenerator`, `max_batch > 1`) entry points validate prompt upper bounds (preserving verified image placeholders), `sampling.forced`, and per-slot decode tokens/pages before mutating state, while `BatchDecoder` dispatches packed Q4_0 embeddings via `ops::run_embed_q4_rmsnorm`.
 
 ---
 
@@ -198,7 +199,7 @@ Every candidate is Apache-2.0 or MIT (compatible with `atlas-ingine`'s Apache-2.
      - Device-emitted and host-decoded Q4_0 lanes match the independent scalar decoder (`fmaf(float(nibble), d, -8.0f * d)`, canonicalizing zeroes to `+0.0f`) bit-for-bit across every lane including signed scales and zero fixtures.
      - All normalized outputs are finite, match the specified activation rounding (`BF16` or `FP16`) bit-for-bit on every lane, pass the independent scalar FP64 reference (`scalar_embed_q4_rmsnorm_fp64` in `tests/common/scalar_oracle.h`, `ORACLE` `-fno-fast-math -ffp-contract=off`, `rel = 1/128`, `abs = 1e-6`, `frac = 0.01`), and match across two runs.
      - Dispatch fallback (`DispatchPath::PortableFallback`, both `force_fallback = true` on packed/padded strides and non-specialized descriptor stride) passes on the exact same inputs.
-     - Invalid descriptors and out-of-range token IDs (`TokenBoundsMode::Validate` on host/device/fallback/oracle; `TokenBoundsMode::PreValidated` kernel bounds guard + graph capture) obey the single token-bounds contract.
+     - Invalid descriptors and out-of-range token IDs (`TokenBoundsMode::Validate` on actual device/host buffers for CPU/fallback/CUDA/oracle; `TokenBoundsMode::DeferredFlag` replay-bound device flag checks during graph capture/replay; `TokenBoundsMode::PreValidated` kernel bounds guard after host admission) obey the single token-bounds contract.
 2. **Zero-CUDA CPU Proof (`INGINE_BACKEND=CPU`):**
    - Preprocessor check (`g++ -E` on `generator.h`, `arena.h`, `hal.h`, `ops.h`, `act.h`, `safetensors.h`, `scalar_oracle.h`) with CUDA headers excluded -> 0 errors, 0 CUDA includes.
    - Clean `cmake --preset cpu-dev` build in a CUDA-free `PATH` (`CMakeCache.txt` has zero CUDA discovery; `ldd` on `ingine-serve` and `hal_embed_q4_parity` shows zero `cuda`/`cublas` libraries).

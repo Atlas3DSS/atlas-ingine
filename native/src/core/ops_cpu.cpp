@@ -52,17 +52,19 @@ DispatchPath run_embed_q4_rmsnorm(const EmbedQ4RmsNormDesc& desc, const EmbedQ4R
   if (!args.token_ids || !args.table_q4 || !args.norm_weight || !args.out) {
     throw std::invalid_argument("embed_q4_rmsnorm: null buffer argument");
   }
-  if (desc.token_bounds == TokenBoundsMode::Validate && args.host_token_ids != nullptr) {
-    validate_token_ids(args.host_token_ids, desc.tokens, desc.vocab_size);
+  if (desc.token_bounds == TokenBoundsMode::DeferredFlag && args.invalid_token_flag == nullptr) {
+    throw std::invalid_argument("embed_q4_rmsnorm: TokenBoundsMode::DeferredFlag requires invalid_token_flag");
   }
 
   hal::stream_synchronize(stream);
   const int M = desc.tokens;
   const int H = desc.hidden_size;
+  if (args.invalid_token_flag != nullptr) *args.invalid_token_flag = 0u;
   try {
     validate_token_ids(args.token_ids, M, desc.vocab_size);
   } catch (const std::out_of_range&) {
     if (args.invalid_token_flag != nullptr) *args.invalid_token_flag = 1u;
+    if (desc.token_bounds == TokenBoundsMode::DeferredFlag) return DispatchPath::Native;
     throw;
   }
 
