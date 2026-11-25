@@ -168,6 +168,10 @@ class FakeCpuSession final : public BackendSession {
     acc_ = history_.back();
   }
 
+  std::size_t restorable_prefix_len(std::size_t max_prefix_len) const noexcept override {
+    return std::min(max_prefix_len, tokens_.size());
+  }
+
   void set_identity(BackendStateIdentity id) { id_ = std::move(id); }
 
   void advance(std::int32_t tok, std::uint8_t mask_bit) {
@@ -308,7 +312,7 @@ class FakeCpuModelBackend final : public ModelBackend {
     const std::span<const std::uint8_t> eff_mask =
         req.token_mask.empty() ? std::span<const std::uint8_t>(default_mask) : req.token_mask;
 
-    const SessionLookupResult lookup = lookup_session_prefix(
+    const SessionLookupResult lookup = restore_session_prefix(
         *sess, SessionLookupQuery{req_id, req.prompt.ids, eff_mask, req.prompt.images, req.use_prefix_cache});
 
     GenerateStats stats;
@@ -319,8 +323,8 @@ class FakeCpuModelBackend final : public ModelBackend {
     if (!lookup.hit) {
       sess->reset();
       sess->set_identity(req_id);
-    } else if (lookup.reused_tokens < sess->committed_tokens().size()) {
-      sess->truncate(lookup.reused_tokens);
+    } else {
+      CHECK(sess->committed_tokens().size() == lookup.reused_tokens);
     }
 
     for (std::size_t i = lookup.reused_tokens; i < req.prompt.ids.size(); ++i) {
@@ -357,14 +361,14 @@ class FakeCpuModelBackend final : public ModelBackend {
     const std::span<const std::uint8_t> eff_mask =
         req.token_mask.empty() ? std::span<const std::uint8_t>(default_mask) : req.token_mask;
 
-    const SessionLookupResult lookup = lookup_session_prefix(
+    const SessionLookupResult lookup = restore_session_prefix(
         *sess, SessionLookupQuery{req_id, req.prompt.ids, eff_mask, req.prompt.images, req.use_prefix_cache});
 
     if (!lookup.hit) {
       sess->reset();
       sess->set_identity(req_id);
-    } else if (lookup.reused_tokens < sess->committed_tokens().size()) {
-      sess->truncate(lookup.reused_tokens);
+    } else {
+      CHECK(sess->committed_tokens().size() == lookup.reused_tokens);
     }
     last_lookup_ = lookup;
 
@@ -559,6 +563,36 @@ void test_capabilities_and_fail_closed_validation() {
   Prompt p;
   p.ids = ds_media;
   CHECK_THROWS(validate_request_against_capabilities(caps_zero_vocab, 1024, p, 8, Sampling{}), std::invalid_argument);
+
+  // Qwen text-only capabilities MUST reject all vision media control IDs including 248055 (<|vision_pad|>).
+  Qwen38Config qwen_cfg;
+  qwen_cfg.model_type = "qwen3_5";
+  qwen_cfg.vocab_size = 248320;
+  qwen_cfg.hidden_size = 64;
+  qwen_cfg.intermediate_size = 128;
+  qwen_cfg.num_hidden_layers = 4;
+  qwen_cfg.max_position_embeddings = 1024;
+  qwen_cfg.rms_norm_eps = 1e-6f;
+  qwen_cfg.num_attention_heads = 2;
+  qwen_cfg.num_key_value_heads = 1;
+  qwen_cfg.head_dim = 8;
+  qwen_cfg.rope_theta = 1e7f;
+  qwen_cfg.partial_rotary_factor = 0.25f;
+  qwen_cfg.rotary_dim = 2;
+  qwen_cfg.linear_conv_kernel_dim = 4;
+  qwen_cfg.linear_key_head_dim = 4;
+  qwen_cfg.linear_value_head_dim = 4;
+  qwen_cfg.linear_num_key_heads = 1;
+  qwen_cfg.linear_num_value_heads = 2;
+  qwen_cfg.layer_types = {Qwen38LayerKind::LinearAttention, Qwen38LayerKind::LinearAttention,
+                          Qwen38LayerKind::LinearAttention, Qwen38LayerKind::FullAttention};
+  const BackendCapabilities qwen_caps = qwen38_dense_capabilities(qwen_cfg);
+  for (std::int32_t media_id : {248053, 248054, 248055, 248056, 248057}) {
+    std::vector<std::int32_t> q_toks = {10, media_id, 11};
+    Prompt qp;
+    qp.ids = q_toks;
+    CHECK_THROWS(validate_request_against_capabilities(qwen_caps, 1024, qp, 8, Sampling{}), std::invalid_argument);
+  }
 }
 
 void test_session_lifecycle_reuse_and_registry() {
@@ -839,6 +873,130 @@ void test_session_lifecycle_reuse_and_registry() {
     CHECK_THROWS(
         fb.generate_request(ns_req, 1, Sampling{}, {}, [](std::span<const std::int32_t>) { return true; }),
         std::logic_error);
+  }
+
+  // Restorable-prefix semantics (#821 / #833): tip-only misses forks and extends tips; sparse checkpoints
+  // only hit saved lengths; dishonest restorable claims fail closed when truncate() rejects.
+  {
+    const BackendStateIdentity sid = make_verified_sample_identity();
+
+    class TipOnlySession final : public BackendSession {
+     public:
+      explicit TipOnlySession(BackendStateIdentity id, std::vector<std::int32_t> toks)
+          : id_(std::move(id)), tokens_(std::move(toks)), mask_(tokens_.size(), 1u) {}
+      void reset() override {
+        tokens_.clear();
+        mask_.clear();
+      }
+      std::size_t state_bytes() const noexcept override { return tokens_.size() * sizeof(std::int32_t); }
+      std::span<const std::int32_t> committed_tokens() const noexcept override { return tokens_; }
+      std::span<const std::uint8_t> committed_token_mask() const noexcept override { return mask_; }
+      const BackendStateIdentity& identity() const noexcept override { return id_; }
+
+     private:
+      BackendStateIdentity id_;
+      std::vector<std::int32_t> tokens_;
+      std::vector<std::uint8_t> mask_;
+    };
+
+    TipOnlySession tip_only(sid, {4, 5, 6});
+    const std::vector<std::int32_t> fork_457 = {4, 5, 7};
+    const std::vector<std::uint8_t> mask_3 = {1, 1, 1};
+    const SessionLookupQuery fork_q{sid, fork_457, mask_3, {}, true};
+    const auto fork_lookup = lookup_session_prefix(tip_only, fork_q);
+    CHECK(!fork_lookup.hit && fork_lookup.reuse == Reuse::None && fork_lookup.reused_tokens == 0);
+    const auto fork_restore = restore_session_prefix(tip_only, fork_q);
+    CHECK(!fork_restore.hit && fork_restore.reuse == Reuse::None && fork_restore.reused_tokens == 0);
+    CHECK(tip_only.committed_tokens().size() == 3);
+
+    const std::vector<std::int32_t> ext_4567 = {4, 5, 6, 7};
+    const std::vector<std::uint8_t> mask_4 = {1, 1, 1, 1};
+    const auto ext_restore = restore_session_prefix(tip_only, SessionLookupQuery{sid, ext_4567, mask_4, {}, true});
+    CHECK(ext_restore.hit && ext_restore.reuse == Reuse::Extend && ext_restore.reused_tokens == 3);
+
+    class SparseCheckpointSession final : public BackendSession {
+     public:
+      SparseCheckpointSession(BackendStateIdentity id, std::size_t ckpt_len)
+          : id_(std::move(id)), ckpt_len_(ckpt_len) {
+        repopulate();
+      }
+      void repopulate() {
+        tokens_ = {4, 5, 6, 8, 9};
+        mask_.assign(tokens_.size(), 1u);
+      }
+      void reset() override {
+        tokens_.clear();
+        mask_.clear();
+      }
+      std::size_t state_bytes() const noexcept override { return tokens_.size() * sizeof(std::int32_t); }
+      std::span<const std::int32_t> committed_tokens() const noexcept override { return tokens_; }
+      std::span<const std::uint8_t> committed_token_mask() const noexcept override { return mask_; }
+      const BackendStateIdentity& identity() const noexcept override { return id_; }
+      std::size_t restorable_prefix_len(std::size_t max_prefix_len) const noexcept override {
+        if (max_prefix_len >= tokens_.size() && !tokens_.empty()) return tokens_.size();
+        if (ckpt_len_ > 0 && ckpt_len_ <= max_prefix_len && ckpt_len_ <= tokens_.size()) return ckpt_len_;
+        return 0;
+      }
+      void truncate(std::size_t new_token_count) override {
+        if (new_token_count != tokens_.size() && new_token_count != ckpt_len_) {
+          throw std::logic_error("no saved recurrent checkpoint at requested length");
+        }
+        tokens_.resize(new_token_count);
+        mask_.resize(new_token_count);
+      }
+
+     private:
+      BackendStateIdentity id_;
+      std::size_t ckpt_len_ = 0;
+      std::vector<std::int32_t> tokens_;
+      std::vector<std::uint8_t> mask_;
+    };
+
+    SparseCheckpointSession sparse(sid, 2);
+    const std::vector<std::int32_t> fork_at_4 = {4, 5, 6, 8, 99};
+    const std::vector<std::uint8_t> mask_5 = {1, 1, 1, 1, 1};
+    const auto ckpt_hit = restore_session_prefix(sparse, SessionLookupQuery{sid, fork_at_4, mask_5, {}, true});
+    CHECK(ckpt_hit.hit && ckpt_hit.reuse == Reuse::Checkpoint && ckpt_hit.reused_tokens == 2);
+    CHECK(sparse.committed_tokens().size() == 2);
+
+    sparse.repopulate();
+    const std::vector<std::int32_t> fork_at_1 = {4, 99};
+    const std::vector<std::uint8_t> mask_2 = {1, 1};
+    const auto ckpt_miss = restore_session_prefix(sparse, SessionLookupQuery{sid, fork_at_1, mask_2, {}, true});
+    CHECK(!ckpt_miss.hit && ckpt_miss.reuse == Reuse::None && ckpt_miss.reused_tokens == 0);
+    CHECK(sparse.committed_tokens().size() == 5);
+
+    const std::vector<std::int32_t> full_ext = {4, 5, 6, 8, 9, 10};
+    const std::vector<std::uint8_t> mask_6 = {1, 1, 1, 1, 1, 1};
+    const auto tip_hit = restore_session_prefix(sparse, SessionLookupQuery{sid, full_ext, mask_6, {}, true});
+    CHECK(tip_hit.hit && tip_hit.reuse == Reuse::Extend && tip_hit.reused_tokens == 5);
+
+    class DishonestTruncateSession final : public BackendSession {
+     public:
+      explicit DishonestTruncateSession(BackendStateIdentity id)
+          : id_(std::move(id)), tokens_{4, 5, 6}, mask_{1, 1, 1} {}
+      void reset() override {
+        tokens_.clear();
+        mask_.clear();
+      }
+      std::size_t state_bytes() const noexcept override { return tokens_.size() * sizeof(std::int32_t); }
+      std::span<const std::int32_t> committed_tokens() const noexcept override { return tokens_; }
+      std::span<const std::uint8_t> committed_token_mask() const noexcept override { return mask_; }
+      const BackendStateIdentity& identity() const noexcept override { return id_; }
+      std::size_t restorable_prefix_len(std::size_t max_prefix_len) const noexcept override {
+        return std::min(max_prefix_len, tokens_.size());
+      }
+      // Deliberately inherits throwing BackendSession::truncate().
+     private:
+      BackendStateIdentity id_;
+      std::vector<std::int32_t> tokens_;
+      std::vector<std::uint8_t> mask_;
+    };
+
+    DishonestTruncateSession dishonest(sid);
+    const auto fail_restore = restore_session_prefix(dishonest, fork_q);
+    CHECK(!fail_restore.hit && fail_restore.reuse == Reuse::None && fail_restore.reused_tokens == 0 &&
+          fail_restore.reason == "restore_failed");
   }
 }
 

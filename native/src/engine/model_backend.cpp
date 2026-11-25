@@ -727,18 +727,40 @@ SessionLookupResult lookup_session_prefix(const BackendSession& session, const S
     if (!cached_mask.empty() && cached_mask[reused] != query.prompt_mask[reused]) break;
     ++reused;
   }
-  for (const PromptImage& img : query.images) {
-    const std::size_t img_begin = img.pos > 0 ? static_cast<std::size_t>(img.pos) : 0;
-    const std::size_t img_end = img_begin + static_cast<std::size_t>(std::max(0, img.tokens()));
-    if (img_begin < reused && img_end > reused) {
-      reused = img_begin;
+  const std::size_t tip = cached_ids.size();
+  while (reused > 0) {
+    for (const PromptImage& img : query.images) {
+      const std::size_t img_begin = img.pos > 0 ? static_cast<std::size_t>(img.pos) : 0;
+      const std::size_t img_end = img_begin + static_cast<std::size_t>(std::max(0, img.tokens()));
+      if (img_begin < reused && img_end > reused) {
+        reused = img_begin;
+      }
     }
+    if (reused == 0) {
+      return SessionLookupResult{false, 0, Reuse::None, "empty_common_prefix"};
+    }
+    const std::size_t restorable = session.restorable_prefix_len(reused);
+    if (restorable == 0 || restorable > reused || restorable > tip) {
+      return SessionLookupResult{false, 0, Reuse::None, "no_restorable_checkpoint"};
+    }
+    if (restorable == reused) break;
+    reused = restorable;
   }
   if (reused == 0) {
     return SessionLookupResult{false, 0, Reuse::None, "empty_common_prefix"};
   }
-  const Reuse kind = (reused == cached_ids.size()) ? Reuse::Extend : Reuse::Checkpoint;
-  return SessionLookupResult{true, reused, kind, "exact_prefix_match"};
+  const Reuse kind = (reused == tip) ? Reuse::Extend : Reuse::Checkpoint;
+  return SessionLookupResult{true, reused, kind,
+                             kind == Reuse::Extend ? "exact_prefix_match" : "exact_checkpoint_match"};
+}
+
+SessionLookupResult restore_session_prefix(BackendSession& session, const SessionLookupQuery& query) {
+  SessionLookupResult res = lookup_session_prefix(session, query);
+  if (!res.hit) return res;
+  if (!session.try_restore_prefix(res.reused_tokens)) {
+    return SessionLookupResult{false, 0, Reuse::None, "restore_failed"};
+  }
+  return res;
 }
 
 bool prefix_matches_exact(std::span<const std::int32_t> cached_ids, std::span<const std::int32_t> prompt_ids,

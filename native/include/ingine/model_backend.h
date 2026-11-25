@@ -233,6 +233,31 @@ class BackendSession {
   virtual void truncate(std::size_t /*new_token_count*/) {
     throw std::logic_error("session does not support truncate");
   }
+
+  // Returns the largest prefix length <= max_prefix_len for which this session holds live
+  // or saved restorable state. Default is tip-only: only committed_tokens().size() is
+  // restorable (returning 0 for any strictly shorter fork prefix). Backends that save sparse
+  // checkpoints or support arbitrary truncation override this alongside truncate().
+  virtual std::size_t restorable_prefix_len(std::size_t max_prefix_len) const noexcept {
+    const std::size_t tip = committed_tokens().size();
+    return (tip > 0 && max_prefix_len >= tip) ? tip : 0;
+  }
+
+  // Restores session state to `prefix_len` (no-op at live tip; invokes truncate() for an
+  // earlier saved checkpoint). Returns true iff the session now sits at `prefix_len`;
+  // fails closed (false) if restoration is unsupported or throws std::logic_error.
+  virtual bool try_restore_prefix(std::size_t prefix_len) {
+    const std::size_t tip = committed_tokens().size();
+    if (prefix_len == 0 || prefix_len > tip) return false;
+    if (prefix_len == tip) return true;
+    if (restorable_prefix_len(prefix_len) != prefix_len) return false;
+    try {
+      truncate(prefix_len);
+    } catch (const std::logic_error&) {
+      return false;
+    }
+    return committed_tokens().size() == prefix_len;
+  }
 };
 
 struct LogitStep {
@@ -267,8 +292,12 @@ struct SessionLookupResult {
 };
 
 // Shared fail-closed prefix reuse gate: enforces identity reusability, media digest match,
-// token + per-token mask match, and image-boundary integrity (bypassing cleanly if !use_prefix_cache).
+// token + per-token mask match, image-boundary integrity, and session.restorable_prefix_len()
+// availability (bypassing cleanly if !use_prefix_cache).
 SessionLookupResult lookup_session_prefix(const BackendSession& session, const SessionLookupQuery& query) noexcept;
+// Runs lookup_session_prefix() and confirms restoration via session.try_restore_prefix()
+// before reporting a reuse hit. Fails closed to Reuse::None if restoration cannot succeed.
+SessionLookupResult restore_session_prefix(BackendSession& session, const SessionLookupQuery& query);
 
 // Fail-closed admission validators; MUST be invoked before allocating or mutating live model state.
 void validate_runtime_options_against_capabilities(const BackendCapabilities& caps, const RuntimeOptions& options);

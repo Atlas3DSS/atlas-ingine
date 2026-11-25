@@ -5,10 +5,15 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_set>
 
 namespace ingine::backends::qwen38 {
@@ -135,26 +140,189 @@ std::string to_hex(const std::array<std::uint8_t, 32>& d) {
   return out;
 }
 
+struct ScopedFd {
+  int fd = -1;
+  ScopedFd() = default;
+  explicit ScopedFd(int f) noexcept : fd(f) {}
+  ScopedFd(const ScopedFd&) = delete;
+  ScopedFd& operator=(const ScopedFd&) = delete;
+  ScopedFd(ScopedFd&& other) noexcept : fd(other.fd) { other.fd = -1; }
+  ScopedFd& operator=(ScopedFd&& other) noexcept {
+    if (this != &other) {
+      reset();
+      fd = other.fd;
+      other.fd = -1;
+    }
+    return *this;
+  }
+  ~ScopedFd() { reset(); }
+  void reset() noexcept {
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
+  [[nodiscard]] int get() const noexcept { return fd; }
+};
+
+int open_readonly_fd(const std::filesystem::path& path, const char* what) {
+  int fd = -1;
+  do {
+    fd = ::open(path.c_str(), O_RDONLY);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) {
+    throw std::invalid_argument(std::string("cannot open ") + what + ": " + path.string() + " (" +
+                                std::strerror(errno) + ")");
+  }
+  return fd;
+}
+
+std::optional<ScopedFd> try_open_readonly_fd(const std::filesystem::path& path, const char* what) {
+  int fd = -1;
+  do {
+    fd = ::open(path.c_str(), O_RDONLY);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) {
+    if (errno == ENOENT) return std::nullopt;
+    throw std::invalid_argument(std::string("cannot open ") + what + ": " + path.string() + " (" +
+                                std::strerror(errno) + ")");
+  }
+  return ScopedFd(fd);
+}
+
+struct stat fstat_regular(int fd, const std::filesystem::path& path) {
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    throw std::invalid_argument("fstat failed for " + path.string() + ": " + std::strerror(errno));
+  }
+  if (!S_ISREG(st.st_mode)) {
+    throw std::invalid_argument("expected regular file, got non-regular path: " + path.string());
+  }
+  if (st.st_size < 0) {
+    throw std::invalid_argument("negative file size reported for " + path.string());
+  }
+  return st;
+}
+
+void read_exact_fd(int fd, void* dst, std::size_t n, const std::filesystem::path& path) {
+  auto* out = static_cast<std::uint8_t*>(dst);
+  std::size_t off = 0;
+  while (off < n) {
+    const ssize_t got = ::read(fd, out + off, n - off);
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      throw std::invalid_argument("read error on " + path.string() + ": " + std::strerror(errno));
+    }
+    if (got == 0) {
+      throw std::invalid_argument("unexpected EOF (concurrent truncation) in " + path.string());
+    }
+    off += static_cast<std::size_t>(got);
+  }
+}
+
+struct VerifiedSmallFile {
+  std::string bytes;
+  Qwen38VerifiedFile identity;
+};
+
+VerifiedSmallFile consume_and_hash_small_fd(int fd, const std::filesystem::path& path, std::string_view filename) {
+  const struct stat st = fstat_regular(fd, path);
+  const std::uint64_t fsize = static_cast<std::uint64_t>(st.st_size);
+  constexpr std::uint64_t kMaxSmallFileBytes = 256ull * 1024ull * 1024ull;
+  if (fsize > kMaxSmallFileBytes) {
+    throw std::invalid_argument("metadata file exceeds 256 MiB limit: " + path.string());
+  }
+  VerifiedSmallFile out;
+  out.bytes.reserve(static_cast<std::size_t>(fsize));
+  Sha256 h;
+  std::array<char, 65536> buf{};
+  while (true) {
+    const ssize_t got = ::read(fd, buf.data(), buf.size());
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      throw std::invalid_argument("read error on " + path.string() + ": " + std::strerror(errno));
+    }
+    if (got == 0) break;
+    const std::size_t chunk = static_cast<std::size_t>(got);
+    if (out.bytes.size() + chunk > fsize) {
+      throw std::invalid_argument("concurrent file growth detected while reading " + path.string());
+    }
+    out.bytes.append(buf.data(), chunk);
+    h.update(buf.data(), chunk);
+  }
+  if (out.bytes.size() != fsize) {
+    throw std::invalid_argument("concurrent file truncation detected while reading " + path.string());
+  }
+  out.identity.filename = std::string(filename);
+  out.identity.dev = static_cast<std::uint64_t>(st.st_dev);
+  out.identity.ino = static_cast<std::uint64_t>(st.st_ino);
+  out.identity.byte_size = fsize;
+  out.identity.sha256 = h.finalize();
+  out.identity.payload_hashed = true;
+  return out;
+}
+
+std::optional<VerifiedSmallFile> read_and_hash_small_file_fd(const std::filesystem::path& path,
+                                                             std::string_view filename, bool optional) {
+  auto fd_opt = try_open_readonly_fd(path, filename.data());
+  if (!fd_opt.has_value()) {
+    if (optional) return std::nullopt;
+    throw std::invalid_argument("missing " + std::string(filename) + ": " + path.string());
+  }
+  return consume_and_hash_small_fd(fd_opt->get(), path, filename);
+}
+
+std::vector<std::int32_t> collect_media_token_ids_from_tokenizer(std::string_view json_text) {
+  nlohmann::json root;
+  try {
+    root = nlohmann::json::parse(json_text);
+  } catch (const nlohmann::json::exception& e) {
+    throw std::invalid_argument(std::string("invalid tokenizer.json: ") + e.what());
+  }
+  if (!root.is_object() || !root.contains("added_tokens") || !root.at("added_tokens").is_array()) {
+    return {};
+  }
+  static constexpr std::array<std::string_view, 8> kMediaTokens = {
+      "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>",
+      "<|video_pad|>",    "<|audio_start|>", "<|audio_end|>",  "<|audio_pad|>",
+  };
+  std::vector<std::int32_t> ids;
+  for (const auto& entry : root.at("added_tokens")) {
+    if (!entry.is_object() || !entry.contains("id") || !entry.at("id").is_number_integer() ||
+        !entry.contains("content") || !entry.at("content").is_string()) {
+      continue;
+    }
+    const std::string content = entry.at("content").get<std::string>();
+    if (std::find(kMediaTokens.begin(), kMediaTokens.end(), content) != kMediaTokens.end()) {
+      ids.push_back(entry.at("id").get<std::int32_t>());
+    }
+  }
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  return ids;
+}
+
 struct ParsedSafetensorHeader {
   std::uint64_t data_base_offset = 0;
   std::uint64_t file_size = 0;
   std::unordered_map<std::string, Qwen38TensorInfo> tensors;
+  Qwen38VerifiedFile file_info;
 };
 
-ParsedSafetensorHeader parse_safetensors_header(const std::filesystem::path& path, const std::string& shard_name) {
-  std::ifstream in(path, std::ios::binary | std::ios::ate);
-  if (!in) {
-    throw std::invalid_argument("cannot open safetensors shard: " + path.string());
-  }
-  const std::streamoff end_pos = in.tellg();
-  if (end_pos < 8) {
+ParsedSafetensorHeader inspect_safetensors_shard_fd(const std::filesystem::path& path, const std::string& shard_name,
+                                                    bool hash_payload) {
+  ScopedFd fd(open_readonly_fd(path, "safetensors shard"));
+  const struct stat st = fstat_regular(fd.get(), path);
+  const std::uint64_t file_size = static_cast<std::uint64_t>(st.st_size);
+  if (file_size < 8) {
     throw std::invalid_argument("safetensors shard truncated (< 8 bytes): " + path.string());
   }
-  const std::uint64_t file_size = static_cast<std::uint64_t>(end_pos);
-  in.seekg(0, std::ios::beg);
 
+  Sha256 hasher;
   std::array<std::uint8_t, 8> len_bytes{};
-  in.read(reinterpret_cast<char*>(len_bytes.data()), 8);
+  read_exact_fd(fd.get(), len_bytes.data(), 8, path);
+  if (hash_payload) hasher.update(len_bytes.data(), 8);
+
   std::uint64_t header_len = 0;
   for (int i = 0; i < 8; ++i) {
     header_len |= (static_cast<std::uint64_t>(len_bytes[i]) << (8 * i));
@@ -164,7 +332,9 @@ ParsedSafetensorHeader parse_safetensors_header(const std::filesystem::path& pat
   }
 
   std::string header_json(header_len, '\0');
-  in.read(header_json.data(), static_cast<std::streamsize>(header_len));
+  read_exact_fd(fd.get(), header_json.data(), static_cast<std::size_t>(header_len), path);
+  if (hash_payload) hasher.update(header_json.data(), header_json.size());
+
   nlohmann::json hdr;
   try {
     hdr = nlohmann::json::parse(header_json);
@@ -204,7 +374,57 @@ ParsedSafetensorHeader parse_safetensors_header(const std::filesystem::path& pat
     }
     parsed.tensors.emplace(info.name, std::move(info));
   }
+
+  parsed.file_info.filename = shard_name;
+  parsed.file_info.dev = static_cast<std::uint64_t>(st.st_dev);
+  parsed.file_info.ino = static_cast<std::uint64_t>(st.st_ino);
+  parsed.file_info.byte_size = file_size;
+  parsed.file_info.payload_hashed = hash_payload;
+
+  if (hash_payload) {
+    std::uint64_t total_read = parsed.data_base_offset;
+    std::array<char, 65536> buf{};
+    while (true) {
+      const ssize_t got = ::read(fd.get(), buf.data(), buf.size());
+      if (got < 0) {
+        if (errno == EINTR) continue;
+        throw std::invalid_argument("read error while hashing shard " + path.string() + ": " + std::strerror(errno));
+      }
+      if (got == 0) break;
+      const std::uint64_t chunk = static_cast<std::uint64_t>(got);
+      if (total_read + chunk > file_size) {
+        throw std::invalid_argument("concurrent shard growth detected while hashing " + path.string());
+      }
+      hasher.update(buf.data(), static_cast<std::size_t>(chunk));
+      total_read += chunk;
+    }
+    if (total_read != file_size) {
+      throw std::invalid_argument("concurrent shard truncation detected while hashing " + path.string());
+    }
+    parsed.file_info.sha256 = hasher.finalize();
+  }
   return parsed;
+}
+
+void hash_u32(Sha256& h, std::uint32_t v) {
+  std::array<std::uint8_t, 4> b{static_cast<std::uint8_t>(v & 0xffu), static_cast<std::uint8_t>((v >> 8) & 0xffu),
+                                static_cast<std::uint8_t>((v >> 16) & 0xffu),
+                                static_cast<std::uint8_t>((v >> 24) & 0xffu)};
+  h.update(b.data(), b.size());
+}
+
+void hash_i32(Sha256& h, std::int32_t v) { hash_u32(h, static_cast<std::uint32_t>(v)); }
+
+void hash_f32_bits(Sha256& h, float v) {
+  static_assert(sizeof(float) == sizeof(std::uint32_t));
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &v, sizeof(bits));
+  hash_u32(h, bits);
+}
+
+void hash_str(Sha256& h, std::string_view s) {
+  hash_u32(h, static_cast<std::uint32_t>(s.size()));
+  if (!s.empty()) h.update(s.data(), s.size());
 }
 
 bool is_excluded_tensor(std::string_view name, bool& is_visual, bool& is_mtp) {
@@ -274,25 +494,111 @@ std::array<std::uint8_t, 32> sha256_bytes_digest(const void* data, std::size_t s
 std::string sha256_bytes_hex(const void* data, std::size_t size) { return to_hex(sha256_bytes_digest(data, size)); }
 
 std::array<std::uint8_t, 32> sha256_file_digest(const std::filesystem::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    throw std::invalid_argument("cannot open file for sha256: " + path.string());
-  }
+  ScopedFd fd(open_readonly_fd(path, "file for sha256"));
+  const struct stat st = fstat_regular(fd.get(), path);
+  const std::uint64_t fsize = static_cast<std::uint64_t>(st.st_size);
   Sha256 h;
+  std::uint64_t total_read = 0;
   std::array<char, 65536> buf{};
-  while (in.good()) {
-    in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-    const std::streamsize got = in.gcount();
-    if (got > 0) h.update(buf.data(), static_cast<std::size_t>(got));
+  while (true) {
+    const ssize_t got = ::read(fd.get(), buf.data(), buf.size());
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      throw std::invalid_argument("read error while hashing file: " + path.string() + " (" + std::strerror(errno) + ")");
+    }
+    if (got == 0) break;
+    const std::uint64_t chunk = static_cast<std::uint64_t>(got);
+    if (total_read + chunk > fsize) {
+      throw std::invalid_argument("concurrent file growth detected while hashing " + path.string());
+    }
+    h.update(buf.data(), static_cast<std::size_t>(chunk));
+    total_read += chunk;
   }
-  if (in.bad()) {
-    throw std::invalid_argument("read error while hashing file: " + path.string());
+  if (total_read != fsize) {
+    throw std::invalid_argument("concurrent file truncation detected while hashing " + path.string());
   }
   return h.finalize();
 }
 
 std::string sha256_file_hex_streaming(const std::filesystem::path& path) {
   return to_hex(sha256_file_digest(path));
+}
+
+std::array<std::uint8_t, 32> qwen38_config_fingerprint(const Qwen38Config& c) {
+  c.validate();
+  Sha256 h;
+  static constexpr std::string_view kTag = "qwen38_cfg_v1";
+  hash_str(h, kTag);
+  hash_str(h, c.model_type);
+  hash_u32(h, static_cast<std::uint32_t>(c.architectures.size()));
+  for (const auto& arch : c.architectures) hash_str(h, arch);
+  hash_i32(h, c.vocab_size);
+  hash_i32(h, c.hidden_size);
+  hash_i32(h, c.intermediate_size);
+  hash_i32(h, c.num_hidden_layers);
+  hash_i32(h, c.max_position_embeddings);
+  hash_f32_bits(h, c.rms_norm_eps);
+  hash_u32(h, c.tie_word_embeddings ? 1u : 0u);
+  hash_i32(h, c.full_attention_interval);
+  hash_i32(h, c.num_attention_heads);
+  hash_i32(h, c.num_key_value_heads);
+  hash_i32(h, c.head_dim);
+  hash_u32(h, c.attention_bias ? 1u : 0u);
+  hash_u32(h, c.attn_output_gate ? 1u : 0u);
+  hash_f32_bits(h, c.rope_theta);
+  hash_f32_bits(h, c.partial_rotary_factor);
+  hash_i32(h, c.rotary_dim);
+  for (int m : c.mrope_section) hash_i32(h, m);
+  hash_u32(h, c.mrope_interleaved ? 1u : 0u);
+  hash_i32(h, c.linear_conv_kernel_dim);
+  hash_i32(h, c.linear_key_head_dim);
+  hash_i32(h, c.linear_value_head_dim);
+  hash_i32(h, c.linear_num_key_heads);
+  hash_i32(h, c.linear_num_value_heads);
+  hash_str(h, c.mamba_ssm_dtype);
+  hash_u32(h, static_cast<std::uint32_t>(c.layer_types.size()));
+  for (Qwen38LayerKind lk : c.layer_types) hash_u32(h, static_cast<std::uint32_t>(lk));
+  hash_u32(h, static_cast<std::uint32_t>(c.weight_precision));
+  hash_str(h, c.quant_method);
+  hash_str(h, c.quant_algo);
+  hash_i32(h, c.nvfp4_group_size);
+  return h.finalize();
+}
+
+std::string qwen38_config_fingerprint_hex(const Qwen38Config& config) {
+  return to_hex(qwen38_config_fingerprint(config));
+}
+
+void Qwen38Manifest::verify_open_fd(int fd, std::string_view filename) const {
+  const auto it = verified_files.find(std::string(filename));
+  if (it == verified_files.end()) {
+    throw std::invalid_argument("file not present in verified manifest inventory: " + std::string(filename));
+  }
+  const Qwen38VerifiedFile& v = it->second;
+  const struct stat st = fstat_regular(fd, filename);
+  if (static_cast<std::uint64_t>(st.st_dev) != v.dev || static_cast<std::uint64_t>(st.st_ino) != v.ino ||
+      static_cast<std::uint64_t>(st.st_size) != v.byte_size) {
+    throw std::invalid_argument("open FD identity mismatch (file replaced or modified since inspection) for '" +
+                                std::string(filename) + "'");
+  }
+}
+
+std::string Qwen38Manifest::read_verified_file_bytes(const std::filesystem::path& model_dir,
+                                                     std::string_view filename) const {
+  const auto it = verified_files.find(std::string(filename));
+  if (it == verified_files.end()) {
+    throw std::invalid_argument("file not present in verified manifest inventory: " + std::string(filename));
+  }
+  const Qwen38VerifiedFile& v = it->second;
+  const std::filesystem::path full_path = model_dir / std::string(filename);
+  ScopedFd fd(open_readonly_fd(full_path, filename.data()));
+  verify_open_fd(fd.get(), filename);
+
+  const VerifiedSmallFile consumed = consume_and_hash_small_fd(fd.get(), full_path, filename);
+  if (v.payload_hashed && consumed.identity.sha256 != v.sha256) {
+    throw std::invalid_argument("SHA-256 mismatch on verified file consumption for '" + std::string(filename) + "'");
+  }
+  return consumed.bytes;
 }
 
 Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, bool hash_shards,
@@ -304,15 +610,14 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
   const std::filesystem::path tok_path = model_dir / "tokenizer.json";
   const std::filesystem::path tmpl_path = model_dir / "chat_template.jinja";
 
-  if (!std::filesystem::is_regular_file(cfg_path)) {
-    throw std::invalid_argument("missing config.json in " + model_dir.string());
-  }
-  if (!std::filesystem::is_regular_file(tok_path)) {
-    throw std::invalid_argument("missing tokenizer.json in " + model_dir.string());
-  }
+  // Single-pass open-FD read+hash for metadata files (never parse one path and reopen to hash).
+  const VerifiedSmallFile cfg_file = *read_and_hash_small_file_fd(cfg_path, "config.json", false);
+  const VerifiedSmallFile tok_file = *read_and_hash_small_file_fd(tok_path, "tokenizer.json", false);
+  const auto tmpl_file = read_and_hash_small_file_fd(tmpl_path, "chat_template.jinja", true);
 
   Qwen38Manifest manifest;
-  manifest.config = Qwen38Config::load(cfg_path);
+  manifest.config = Qwen38Config::from_json_str(cfg_file.bytes);
+  manifest.parsed_config_fingerprint = qwen38_config_fingerprint(manifest.config);
   manifest.checkpoint.format = ingine::model::CheckpointFormat::Safetensors;
   manifest.checkpoint.verification_level =
       hash_shards ? ingine::model::VerificationLevel::SelfHashed : ingine::model::VerificationLevel::HeadersOnly;
@@ -321,22 +626,26 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
                                                                               : "qwen3_5_bf16";
   manifest.checkpoint.model_id = model_dir.filename().string();
   manifest.checkpoint.revision = revision;
-  manifest.checkpoint.config_sha256 = sha256_file_digest(cfg_path);
-  manifest.checkpoint.tokenizer_sha256 = sha256_file_digest(tok_path);
-  if (std::filesystem::is_regular_file(tmpl_path)) {
-    manifest.checkpoint.chat_template_sha256 = sha256_file_digest(tmpl_path);
+  manifest.checkpoint.config_sha256 = cfg_file.identity.sha256;
+  manifest.checkpoint.tokenizer_sha256 = tok_file.identity.sha256;
+  manifest.media_token_ids = collect_media_token_ids_from_tokenizer(tok_file.bytes);
+  manifest.verified_files.emplace("config.json", cfg_file.identity);
+  manifest.verified_files.emplace("tokenizer.json", tok_file.identity);
+  if (tmpl_file.has_value()) {
+    manifest.checkpoint.chat_template_sha256 = tmpl_file->identity.sha256;
+    manifest.verified_files.emplace("chat_template.jinja", tmpl_file->identity);
   }
 
   const std::filesystem::path index_path = model_dir / "model.safetensors.index.json";
-  const std::filesystem::path single_path = model_dir / "model.safetensors";
+  const auto idx_file = read_and_hash_small_file_fd(index_path, "model.safetensors.index.json", true);
 
   std::vector<std::pair<std::string, std::string>> index_entries;  // (tensor_name, shard_file)
   std::unordered_set<std::string> shard_set;
-  if (std::filesystem::is_regular_file(index_path)) {
-    std::ifstream in(index_path, std::ios::binary);
+  if (idx_file.has_value()) {
+    manifest.verified_files.emplace("model.safetensors.index.json", idx_file->identity);
     nlohmann::json idx;
     try {
-      in >> idx;
+      idx = nlohmann::json::parse(idx_file->bytes);
     } catch (const nlohmann::json::exception& e) {
       throw std::invalid_argument("invalid model.safetensors.index.json: " + std::string(e.what()));
     }
@@ -354,7 +663,7 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
     }
     manifest.shard_files.assign(shard_set.begin(), shard_set.end());
     std::sort(manifest.shard_files.begin(), manifest.shard_files.end());
-  } else if (std::filesystem::is_regular_file(single_path)) {
+  } else if (std::filesystem::is_regular_file(model_dir / "model.safetensors")) {
     manifest.shard_files.push_back("model.safetensors");
   } else {
     throw std::invalid_argument("neither model.safetensors.index.json nor model.safetensors found in " +
@@ -365,16 +674,14 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
   Sha256 shard_set_hash;
   for (const std::string& shard : manifest.shard_files) {
     const std::filesystem::path sp = model_dir / shard;
-    if (!std::filesystem::is_regular_file(sp)) {
-      throw std::invalid_argument("missing safetensors shard: " + sp.string());
-    }
-    auto hdr = parse_safetensors_header(sp, shard);
+    auto hdr = inspect_safetensors_shard_fd(sp, shard, hash_shards);
     manifest.shard_sizes.emplace(shard, hdr.file_size);
     std::string digest_note = "header_verified";
     if (hash_shards) {
-      digest_note = sha256_file_hex_streaming(sp);
+      digest_note = to_hex(hdr.file_info.sha256);
       manifest.shard_sha256.emplace(shard, digest_note);
     }
+    manifest.verified_files.emplace(shard, hdr.file_info);
     const std::string line = shard + '|' + std::to_string(hdr.file_size) + '|' + digest_note + '\n';
     shard_set_hash.update(line.data(), line.size());
     parsed_shards.emplace(shard, std::move(hdr));

@@ -283,6 +283,31 @@ void test_synthetic_manifest() {
   CHECK(prof.state_identity.act_dtype == ingine::model::ActivationDtype::Bf16);
   CHECK(prof.state_identity.is_reusable_with(prof.state_identity));
 
+  // Unadvertised gear or kv_cache_mode must reject fail-closed (never return reusable=true).
+  CHECK_THROWS(make_qwen38_state_identity(m_pinned, bf16_opts, "dense_bf16", "sparse"), std::invalid_argument);
+  CHECK_THROWS(make_qwen38_state_identity(m_pinned, bf16_opts, "paged_q4", "dense"), std::invalid_argument);
+  CHECK_THROWS(make_qwen38_worker_profile(m_pinned, bf16_opts, "dense_bf16", "sparse"), std::invalid_argument);
+  CHECK_THROWS(make_qwen38_worker_profile(m_pinned, bf16_opts, "paged_q4", "dense"), std::invalid_argument);
+
+  // Effective execution config (e.g. rms_norm_eps) MUST bind into BackendStateIdentity and fail reuse if altered.
+  {
+    Qwen38Manifest m_eps = m_pinned;
+    m_eps.config.rms_norm_eps = 2e-6f;
+    const auto id_eps = make_qwen38_state_identity(m_eps, bf16_opts);
+    CHECK(id_eps != prof.state_identity);
+    CHECK(!prof.state_identity.is_reusable_with(id_eps));
+    CHECK(!id_eps.is_reusable_with(prof.state_identity));
+    CHECK(!id_eps.is_reusable_with(id_eps));
+  }
+
+  // Verified FD/bytes tracking from single-pass inspect_pinned.
+  CHECK(m_pinned.verified_files.count("config.json") == 1 && m_pinned.verified_files.at("config.json").payload_hashed);
+  CHECK(m_pinned.verified_files.count("tokenizer.json") == 1 &&
+        m_pinned.verified_files.at("tokenizer.json").payload_hashed);
+  CHECK(m_pinned.verified_files.count("model.safetensors") == 1 &&
+        m_pinned.verified_files.at("model.safetensors").payload_hashed);
+  CHECK(!m_pinned.read_verified_file_bytes(ok.path, "config.json").empty());
+
   // Mutate 1 byte inside active embed_tokens.weight payload on disk (leaving headers untouched):
   //   - HeadersOnly inspect(false) has identical header metadata yet MUST NOT reuse.
   //   - SelfHashed inspect(true) changes shard_set_sha256 and MUST NOT reuse.
@@ -307,6 +332,14 @@ void test_synthetic_manifest() {
     CHECK(mut_self.checkpoint.shard_set_sha256 != m_pinned.checkpoint.shard_set_sha256);
     CHECK(!make_qwen38_state_identity(mut_self, bf16_opts).is_reusable_with(prof.state_identity));
     CHECK_THROWS(Qwen38Manifest::inspect_pinned(ok.path, pins, "synth-r1"), std::invalid_argument);
+  }
+
+  // Concurrent replacement with identical bytes at a new inode MUST fail open-FD identity verification.
+  {
+    const std::string cfg_bytes = m_pinned.read_verified_file_bytes(ok.path, "config.json");
+    write_str(ok.path / "config.json.new", cfg_bytes);
+    std::filesystem::rename(ok.path / "config.json.new", ok.path / "config.json");
+    CHECK_THROWS(m_pinned.read_verified_file_bytes(ok.path, "config.json"), std::invalid_argument);
   }
 
   // Verify pinned 27B spec carries 3 expected shards + config/tokenizer/chat_template digests.
@@ -355,6 +388,18 @@ void test_real_checkpoints() {
           "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3");
     CHECK(hex_digest(m.checkpoint.chat_template_sha256) ==
           "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041");
+    for (std::int32_t mid : {248053, 248054, 248055, 248056, 248057, 248070, 248071, 248076}) {
+      CHECK(std::find(m.media_token_ids.begin(), m.media_token_ids.end(), mid) != m.media_token_ids.end());
+    }
+    const auto real_prof = make_qwen38_worker_profile(m, ingine::model::RuntimeOptions{});
+    for (std::int32_t blocked_id : {248053, 248054, 248055, 248056, 248057, 248076}) {
+      ingine::model::Prompt p;
+      const std::array<std::int32_t, 3> ids = {10, blocked_id, 11};
+      p.ids = ids;
+      CHECK_THROWS(ingine::model::validate_request_against_capabilities(
+                       real_prof.capabilities, real_prof.max_ctx, p, 8, ingine::model::Sampling{}),
+                   std::invalid_argument);
+    }
     std::printf("  27B manifest verified: active=%zu text_bytes=%llu\n", m.active_text_tensor_count,
                 static_cast<unsigned long long>(m.memory_budget.text_weight_bytes));
   }

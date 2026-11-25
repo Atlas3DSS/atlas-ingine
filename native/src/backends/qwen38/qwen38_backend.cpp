@@ -1,8 +1,26 @@
 #include "backends/qwen38/qwen38_backend.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ingine::backends::qwen38 {
+namespace {
+
+bool contains_mode(const std::vector<std::string>& allowed, std::string_view value) noexcept {
+  return std::find(allowed.begin(), allowed.end(), value) != allowed.end();
+}
+
+void validate_qwen38_profile_selection(const ingine::model::BackendCapabilities& caps,
+                                       std::string_view kv_cache_mode, std::string_view gear) {
+  if (!contains_mode(caps.supported_kv_cache_modes, kv_cache_mode)) {
+    throw std::invalid_argument("qwen38-dense unsupported kv_cache_mode: '" + std::string(kv_cache_mode) + "'");
+  }
+  if (!contains_mode(caps.supported_gears, gear)) {
+    throw std::invalid_argument("qwen38-dense unsupported gear: '" + std::string(gear) + "'");
+  }
+}
+
+}  // namespace
 
 ingine::model::BackendCapabilities qwen38_dense_capabilities(const Qwen38Config& config, int max_supported_batch) {
   config.validate();
@@ -29,7 +47,7 @@ ingine::model::BackendCapabilities qwen38_dense_capabilities(const Qwen38Config&
     caps.supported_quant_layouts = {"bf16"};
   }
   if (config.vocab_size > 248057) {
-    caps.media_token_ids = {248053, 248054, 248056, 248057};
+    caps.media_token_ids = {248053, 248054, 248055, 248056, 248057};
   }
   caps.vocab_size = config.vocab_size;
   caps.max_position_embeddings = config.max_position_embeddings;
@@ -41,10 +59,22 @@ ingine::model::BackendStateIdentity make_qwen38_state_identity(const Qwen38Manif
                                                               std::string_view kv_cache_mode, std::string_view gear,
                                                               std::string_view cache_namespace) {
   validate_qwen38_runtime_options(manifest.config, options);
+  const auto caps = qwen38_dense_capabilities(manifest.config, options.max_batch);
+  validate_qwen38_profile_selection(caps, kv_cache_mode, gear);
+
+  const auto live_cfg_fp = qwen38_config_fingerprint(manifest.config);
+  const std::string live_cfg_hex = qwen38_config_fingerprint_hex(manifest.config);
+
   ingine::model::BackendStateIdentity id;
   id.family = ingine::model::ModelFamily::Qwen3_5;
   id.backend_name = "qwen38-dense";
   id.checkpoint = manifest.checkpoint;
+  // Bind the effective parsed execution config into verification status: if config fields were
+  // mutated in memory after inspection, revoke verification fail-closed.
+  if (manifest.parsed_config_fingerprint != live_cfg_fp) {
+    id.checkpoint.verification_level = ingine::model::VerificationLevel::Unverified;
+    id.checkpoint.shard_digests_verified = false;
+  }
   id.state_layout_id = "qwen3_5_gdn_kv_v1";
   id.act_dtype = ingine::model::ActivationDtype::Bf16;
   id.numeric_abi = manifest.config.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4
@@ -65,7 +95,7 @@ ingine::model::BackendStateIdentity make_qwen38_state_identity(const Qwen38Manif
   id.family_state_fingerprint = "gdn" + std::to_string(manifest.config.num_linear_layers) + "_full" +
                                 std::to_string(manifest.config.num_full_layers) + "_conv" +
                                 std::to_string(manifest.config.linear_conv_kernel_dim) + "_rope" +
-                                std::to_string(manifest.config.rotary_dim) + "_v1";
+                                std::to_string(manifest.config.rotary_dim) + "_v1_cfg_" + live_cfg_hex;
   return id;
 }
 
@@ -82,7 +112,16 @@ ingine::model::WorkerProfile make_qwen38_worker_profile(const Qwen38Manifest& ma
   prof.chat_template_family = "qwen3_5_chatml_xml";
   prof.max_ctx = options.max_ctx;
   prof.max_batch = options.max_batch;
-  prof.capabilities = qwen38_dense_capabilities(manifest.config);
+  prof.capabilities = qwen38_dense_capabilities(manifest.config, options.max_batch);
+  validate_qwen38_profile_selection(prof.capabilities, kv_cache_mode, gear);
+  if (!manifest.media_token_ids.empty()) {
+    prof.capabilities.media_token_ids.insert(prof.capabilities.media_token_ids.end(),
+                                             manifest.media_token_ids.begin(), manifest.media_token_ids.end());
+    std::sort(prof.capabilities.media_token_ids.begin(), prof.capabilities.media_token_ids.end());
+    prof.capabilities.media_token_ids.erase(
+        std::unique(prof.capabilities.media_token_ids.begin(), prof.capabilities.media_token_ids.end()),
+        prof.capabilities.media_token_ids.end());
+  }
   prof.state_identity = make_qwen38_state_identity(manifest, options, kv_cache_mode, gear);
   return prof;
 }
