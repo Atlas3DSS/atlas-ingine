@@ -502,15 +502,22 @@ int main(int argc, char** argv) {
     CHECK(out_wrap_hit == ref_wrap);
 
     // 3c. Concurrent B=4 forks sharing committed pages + verified root64:
-    //     First run an unconditional locked B=4 warm vs cold-bypass comparison directly through
+    //     Seed an isolated namespace ("ns-root64-locked") with only p128_a (root_prefix_tokens=64) so
+    //     the 4 fork lanes {p128_a, p128_b, p129_a, p64} have deterministic expected reuse {128, 64, 128, 64}.
+    //     Run an unconditional locked B=4 warm vs cold-bypass comparison directly through
     //     BatchGenerator::start_slot + step_slots (identical token histories, active B=4 CUDA graph gear,
     //     and prefill_chunk=64 splits), hard-checking admission, true warm hit, true cold bypass, equal
     //     lengths, exact resumed IDs, and finite full-vocab logit bytes + FP64 KL across all 16 steps.
-    //     Then also exercise Scheduler::loop_batched() concurrently and retain B>1 vs B=1 as a diagnostic.
+    //     Then seed a separate isolated namespace ("ns-root64-sched") with only p128_a (root=64) to
+    //     exercise Scheduler::loop_batched() concurrently with the exact same {128, 64, 128, 64} reuse
+    //     expectations, retaining B>1 vs B=1 as a separate numerical diagnostic.
     std::vector<std::vector<int32_t>> fork_prompts = {p128_a, p128_b, p129_a, p64};
     std::vector<std::vector<int32_t>> fork_refs = {ref_p128_a, ref_p128_b, ref_p129, ref_p64};
     {
-      const std::vector<std::string> warm_ns(4, "ns-root64");
+      CHECK(run_cached(p128_a, "ns-root64-locked", 64, st) == ref_p128_a);
+      CHECK(st.reuse == ingine::model::Reuse::None && st.reused_tokens == 0);
+
+      const std::vector<std::string> warm_ns(4, "ns-root64-locked");
       const std::vector<std::string> cold_ns(4, "ns-cold-b4-ref");
       const std::vector<int> warm_roots(4, 64);
       const std::vector<int> cold_roots(4, 0);
@@ -528,11 +535,14 @@ int main(int argc, char** argv) {
       }
     }
 
+    CHECK(run_cached(p128_a, "ns-root64-sched", 64, st) == ref_p128_a);
+    CHECK(st.reuse == ingine::model::Reuse::None && st.reused_tokens == 0);
+
     ingine::engine::Scheduler sched(*gen, stop, 16);
     std::vector<std::shared_ptr<ingine::engine::Job>> jobs;
     for (const auto& fp : fork_prompts) {
       auto j = std::make_shared<ingine::engine::Job>(fp, gen_tokens, greedy, std::vector<ingine::model::PromptImage>{},
-                                                     64, "ns-root64");
+                                                     64, "ns-root64-sched");
       CHECK(sched.submit(j));
       jobs.push_back(std::move(j));
     }
@@ -541,6 +551,9 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < jobs.size(); ++i) {
       sched_warm_outs[i] = drain(*jobs[i]);
       const auto pst = jobs[i]->prefill_stats();
+      std::printf("  [3c_sched_warm lane=%zu] reuse=%d reused=%d expected=%d out_len=%zu\n", i,
+                  pst ? int(pst->reuse) : -1, pst ? pst->reused_tokens : -1, exp_sched_reused[i],
+                  sched_warm_outs[i].size());
       CHECK(pst.has_value() && pst->reuse == ingine::model::Reuse::PagedPrefix &&
             pst->reused_tokens == exp_sched_reused[i]);
       CHECK(int(sched_warm_outs[i].size()) == gen_tokens);
