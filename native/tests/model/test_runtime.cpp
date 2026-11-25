@@ -1121,13 +1121,13 @@ bool run_disk_checkpoint_dtype() {
   };
 
   const std::array<std::uint8_t, 32> synth_verified_sha = sha256_bytes("SYNTH_VERIFIED_TEST_WEIGHTS_77", 30);
-  auto make_synth_gen = [&](const RuntimeOptions& opt, bool verified = true) {
+  auto make_synth_gen = [&](const RuntimeOptions& opt, bool set_sha = false, const std::filesystem::path& abl = {}) {
     cudaStream_t s;
     INGINE_TEST_CUDA(cudaStreamCreate(&s));
     Weights w = synthetic_weights(s);
     INGINE_TEST_CUDA(cudaStreamDestroy(s));
-    if (verified) w.content_sha256 = synth_verified_sha;
-    return make_generator(opt, std::move(w), load_ablation({}));
+    if (set_sha) w.content_sha256 = synth_verified_sha;
+    return make_generator(opt, std::move(w), load_ablation(abl));
   };
 
   Rng rng(91);
@@ -1155,23 +1155,25 @@ bool run_disk_checkpoint_dtype() {
   base.park_mb = 0;
   base.park_host_mb = 0;
 
-  // 0. Given weights with NO content_sha256 identity MUST stay unverified (save !has_producer_identity, decline auto)
-  {
+  // 0. Caller-supplied given-weights overload MUST stay unverified even if w.content_sha256 is set
+  //    (saves !has_producer_identity and declines auto-resume).
+  for (bool set_sha : {false, true}) {
+    std::filesystem::remove(ckpt_unverified);
     RuntimeOptions opt = base;
     opt.kv_ckpt_path = ckpt_unverified;
     opt.kv_ckpt_every = 64;
-    auto gen = make_synth_gen(opt, /*verified=*/false);
+    auto gen = make_synth_gen(opt, set_sha);
     (void)run_once(*gen, prompt100);
     const KvCheckpointInfo ui = inspect_kv_checkpoint(ckpt_unverified);
 
     RuntimeOptions aopt = base;
     aopt.kv_ckpt_path = ckpt_unverified;
     aopt.kv_ckpt_every = 0;
-    auto gen2 = make_synth_gen(aopt, /*verified=*/false);
+    auto gen2 = make_synth_gen(aopt, set_sha);
     const auto [toks2, st2] = run_once(*gen2, prompt100);
     ok &= report(ui.pos == 64 && !ui.has_producer_identity && st2.reuse == Reuse::None && st2.reused_tokens == 0 &&
                      toks2.size() == 16,
-                 "given weights with no content identity stay unverified (no producer stamp & auto-resume declined)" +
+                 std::string("given-weights overload stays unverified (set_sha=") + (set_sha ? "true" : "false") + ")" +
                      tag);
   }
 
@@ -1191,31 +1193,70 @@ bool run_disk_checkpoint_dtype() {
   }
   const KvCheckpointInfo saved_info = inspect_kv_checkpoint(ckpt_same);
   const std::uint32_t expected_disk_dtype = static_cast<std::uint32_t>(kActDType);
-  ok &= report(saved_info.pos == 64 && saved_info.has_logits && saved_info.has_producer_identity &&
+  ok &= report(saved_info.pos == 64 && saved_info.has_logits && !saved_info.has_producer_identity &&
                    saved_info.act_dtype == expected_disk_dtype,
-               "disk checkpoint writes raw kActDType (" + std::to_string(expected_disk_dtype) +
-                   ") + verified producer identity at pos=64" + tag);
+               "disk checkpoint writes raw kActDType (" + std::to_string(expected_disk_dtype) + ") at pos=64" + tag);
 
-  // 2. Same-dtype explicit --kv-ckpt-resume MUST succeed and reproduce exact greedy tokens
+  // 2. Same-dtype explicit --kv-ckpt-resume MUST succeed and reproduce exact greedy tokens (including deliberate max_ctx=4096)
   {
     RuntimeOptions opt = base;
+    opt.max_ctx = 4096;  // deliberate compatible case: pos=64 <= max_ctx
     opt.kv_ckpt_resume = ckpt_same;
     auto gen = make_synth_gen(opt);
     const auto [toks, st] = run_once(*gen, prompt);
     ok &= report(st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && toks == ref_tokens,
-                 "same-dtype explicit --kv-ckpt-resume succeeds with exact parity" + tag);
+                 "same-dtype explicit --kv-ckpt-resume succeeds with exact parity (deliberate max_ctx=4096)" + tag);
   }
 
-  // 3. Same-dtype auto --kv-ckpt-path MUST auto-resume (including deliberate max_ctx increase 2048 -> 4096)
+  // 3. Supplied active Ablation with empty options.ablation MUST block periodic save, throw on explicit, decline auto
   {
-    RuntimeOptions opt = base;
-    opt.max_ctx = 4096;  // deliberate compatible case: pos=64 <= max_ctx with matching producer identity
-    opt.kv_ckpt_path = ckpt_same;
-    opt.kv_ckpt_every = 0;
-    auto gen = make_synth_gen(opt);
-    const auto [toks, st] = run_once(*gen, prompt);
-    ok &= report(st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && toks == ref_tokens,
-                 "same-dtype auto --kv-ckpt-path resumes with exact parity (deliberate max_ctx=4096)" + tag);
+    const std::filesystem::path abl_file = tmp_dir / "supplied_abl.safetensors";
+    const std::filesystem::path ckpt_abl_out = tmp_dir / "abl_should_not_exist.bin";
+    std::filesystem::remove(ckpt_abl_out);
+    Rng arng(31);
+    auto fbytes = [](const std::vector<float>& v) {
+      std::vector<std::uint8_t> b(v.size() * 4);
+      std::memcpy(b.data(), v.data(), b.size());
+      return b;
+    };
+    std::vector<float> dirs(std::size_t(NUM_VISITS) * H);
+    for (auto& x : dirs) x = float(arng.normal());
+    std::vector<float> wt(NUM_VISITS, 1.5f);
+    ingine::test::write_safetensors(abl_file, {{"attn_dirs", "F32", {NUM_VISITS, H}, fbytes(dirs)},
+                                               {"mlp_dirs", "F32", {NUM_VISITS, H}, fbytes(dirs)},
+                                               {"attn_w", "F32", {NUM_VISITS}, fbytes(wt)},
+                                               {"mlp_w", "F32", {NUM_VISITS}, fbytes(wt)}});
+
+    RuntimeOptions opt = base;  // opt.ablation is EMPTY!
+    opt.kv_ckpt_path = ckpt_abl_out;
+    opt.kv_ckpt_every = 64;
+    auto gen_save = make_synth_gen(opt, /*set_sha=*/true, abl_file);
+    (void)run_once(*gen_save, prompt100);
+    const bool save_blocked = !std::filesystem::exists(ckpt_abl_out);
+
+    bool explicit_threw = false;
+    {
+      RuntimeOptions ropt = base;
+      ropt.kv_ckpt_resume = ckpt_same;
+      auto gen_exp = make_synth_gen(ropt, /*set_sha=*/true, abl_file);
+      try {
+        (void)run_once(*gen_exp, prompt);
+      } catch (const std::invalid_argument&) {
+        explicit_threw = true;
+      }
+    }
+    bool auto_declined = false;
+    {
+      RuntimeOptions aopt = base;
+      aopt.kv_ckpt_path = ckpt_same;
+      aopt.kv_ckpt_every = 0;
+      auto gen_auto = make_synth_gen(aopt, /*set_sha=*/true, abl_file);
+      const auto [toks, st] = run_once(*gen_auto, prompt);
+      auto_declined = (st.reuse == Reuse::None && st.reused_tokens == 0 && toks.size() == 16);
+    }
+    ok &= report(save_blocked && explicit_threw && auto_declined,
+                 "supplied active Ablation (empty options.ablation) blocks save, throws on explicit, declines auto" +
+                     tag);
   }
 
   // 4. Legacy checkpoint (zeroed producer trailer at pos=64):
@@ -1264,49 +1305,12 @@ bool run_disk_checkpoint_dtype() {
       const auto [toks, st] = run_once(*gen, prompt);
       desc_auto_declined = (st.reuse == Reuse::None && st.reused_tokens == 0 && toks.size() == 16);
     }
-    bool auto_declined = false;
-    {
-      RuntimeOptions opt = base;
-      opt.kv_ckpt_path = ckpt_legacy;
-      opt.kv_ckpt_every = 0;
-      auto gen = make_synth_gen(opt);
-      const auto [toks, st] = run_once(*gen, prompt);
-      auto_declined = (st.reuse == Reuse::None && st.reused_tokens == 0 && toks == ref_tokens);
-    }
-    ok &= report(!li.has_producer_identity && explicit_isolated && desc_auto_declined && auto_declined,
+    ok &= report(!li.has_producer_identity && explicit_isolated && desc_auto_declined,
                  "legacy disk checkpoint & pos-96 descendant isolated from root/parked/auto-resume & producer stamp" +
                      tag);
   }
 
-  // 5. Verified checkpoint with mismatched producer (prefill_chunk 64 -> 32): explicit throws, auto declines
-  {
-    bool explicit_threw = false;
-    {
-      RuntimeOptions opt = base;
-      opt.prefill_chunk = 32;
-      opt.kv_ckpt_resume = ckpt_same;
-      auto gen = make_synth_gen(opt);
-      try {
-        (void)run_once(*gen, prompt);
-      } catch (const std::exception&) {
-        explicit_threw = true;
-      }
-    }
-    bool auto_declined = false;
-    {
-      RuntimeOptions opt = base;
-      opt.prefill_chunk = 32;
-      opt.kv_ckpt_path = ckpt_same;
-      opt.kv_ckpt_every = 0;
-      auto gen = make_synth_gen(opt);
-      const auto [toks, st] = run_once(*gen, prompt);
-      auto_declined = (st.reuse == Reuse::None && st.reused_tokens == 0 && toks.size() == 16);
-    }
-    ok &= report(explicit_threw && auto_declined,
-                 "verified disk checkpoint with mismatched prefill_chunk throws on explicit & declines on auto" + tag);
-  }
-
-  // 6. Host-only root capture books live-to-staging D2D capture bytes into d2d_park_bytes (> 0) as well as d2h_park_bytes
+  // 5. Host-only root capture books live-to-staging D2D capture bytes into d2d_park_bytes (> 0) as well as d2h_park_bytes
   {
     RuntimeOptions opt = base;
     opt.park_mb = 0;
@@ -1323,7 +1327,7 @@ bool run_disk_checkpoint_dtype() {
                  "host-only root capture books live-to-staging d2d_park_bytes > 0 and d2h_park_bytes > 0" + tag);
   }
 
-  // 7. Mixed-dtype (opposite BF16/FP16) & bogus FP32(1) checkpoints: explicit MUST throw, auto MUST decline cleanly
+  // 6. Mixed-dtype (opposite BF16/FP16) & bogus FP32(1) checkpoints: explicit MUST throw, auto MUST decline cleanly
   const std::uint32_t other_disk_dtype =
       (kActDType == DType::FP16) ? static_cast<std::uint32_t>(DType::BF16) : static_cast<std::uint32_t>(DType::FP16);
   patch_act_dtype(ckpt_same, ckpt_mixed, other_disk_dtype);

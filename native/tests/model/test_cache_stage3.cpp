@@ -18,9 +18,11 @@
 #include "common/test_util.h"
 #include "core/act.h"
 #include "core/arena.h"
+#include "core/safetensors.h"
 #include "ingine/generator.h"
 #include "model/kv_checkpoint.h"
 #include "model/model_data.h"
+#include "model/runtime.h"
 #include "text/chat.h"
 
 #include <cuda_runtime.h>
@@ -626,6 +628,170 @@ int main(int argc, char** argv) {
     }
     check(saved_ok && stripped_ok && explicit_nologits_threw && auto_exact_declined && auto_fork_no_promote,
           "Suite 2h: has_logits=false disk checkpoint rejected on exact-root & never promoted to reusable root");
+
+    // 2h-supplied-ablation: given-weights overload with real load_weights + supplied active Ablation (options.ablation
+    // empty) MUST NOT write a checkpoint, MUST throw on explicit resume, and MUST decline auto-resume!
+    const std::filesystem::path abl_path = dir / "inkling-2-mini-abliterated.safetensors";
+    if (saved_ok && std::filesystem::exists(abl_path)) {
+      const std::filesystem::path ckpt_abl_out =
+          std::filesystem::temp_directory_path() / ("s3_ckpt_abl_out_" + std::string(use_kv_q4 ? "q4" : "fp8") + ".bin");
+      std::filesystem::remove(ckpt_abl_out);
+      auto make_supplied_abl_gen = [&](const RuntimeOptions& ropt) {
+        cudaStream_t s;
+        INGINE_TEST_CUDA(cudaStreamCreate(&s));
+        Weights w = load_weights(dir, ropt.dense_fp8, s);
+        Ablation abl = load_ablation(abl_path);
+        INGINE_TEST_CUDA(cudaStreamDestroy(s));
+        return make_generator(ropt, std::move(w), std::move(abl));
+      };
+      bool abl_save_blocked = false;
+      bool abl_explicit_threw = false;
+      bool abl_auto_declined = false;
+      {
+        RuntimeOptions aopt = base_opt;
+        aopt.ablation.clear();  // empty options.ablation, active supplied Ablation!
+        aopt.park_mb = 0;
+        aopt.park_host_mb = 0;
+        aopt.kv_ckpt_path = ckpt_abl_out;
+        aopt.kv_ckpt_every = R;
+        auto gen = make_supplied_abl_gen(aopt);
+        run_prompt(*gen, Prompt{rp_b.ids, {}, 0}, 4, greedy);
+        abl_save_blocked = !std::filesystem::exists(ckpt_abl_out);
+      }
+      {
+        RuntimeOptions ropt = base_opt;
+        ropt.ablation.clear();
+        ropt.park_mb = 0;
+        ropt.park_host_mb = 0;
+        ropt.kv_ckpt_resume = ckpt_with_logits;
+        auto gen = make_supplied_abl_gen(ropt);
+        try {
+          run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 4, greedy);
+        } catch (const std::invalid_argument&) {
+          abl_explicit_threw = true;
+        }
+      }
+      {
+        RuntimeOptions aopt = base_opt;
+        aopt.ablation.clear();
+        aopt.park_mb = 0;
+        aopt.park_host_mb = 0;
+        aopt.kv_ckpt_path = ckpt_with_logits;
+        aopt.kv_ckpt_every = 0;
+        auto gen = make_supplied_abl_gen(aopt);
+        const RunOut er = run_prompt(*gen, Prompt{rp_root.ids, {}, 0}, 16, greedy);
+        abl_auto_declined = (er.stats.reuse == Reuse::None && er.stats.reused_tokens == 0 && er.tokens.size() == 16);
+      }
+      std::filesystem::remove(ckpt_abl_out);
+      check(abl_save_blocked && abl_explicit_threw && abl_auto_declined,
+            "Suite 2h-supplied-ablation: active supplied Ablation (empty options.ablation) blocks save, throws on explicit, declines auto");
+    }
+
+    // 2h-consumed-weight-toctou: private 4608-byte embed_norm shard mutated on disk right after Load 1 loads weights
+    // (before Load 1 writes its checkpoint): Load 1's checkpoint MUST bind Load 1's consumed +embed_norm bytes so
+    // Load 2 (which consumes -embed_norm) declines auto-resume & throws on explicit resume!
+    if (std::filesystem::exists(dir / "model.safetensors.index.json")) {
+      const std::filesystem::path priv_dir =
+          std::filesystem::temp_directory_path() / ("s3_priv_toctou_" + std::string(use_kv_q4 ? "q4" : "fp8"));
+      const std::filesystem::path ckpt_toctou = priv_dir / "toctou_pos64.bin";
+      std::error_code ec;
+      std::filesystem::remove_all(priv_dir, ec);
+      std::filesystem::create_directories(priv_dir);
+      // Symlink large weight shard(s) and config/quant files; override ONLY embed_norm into a tiny private shard.
+      for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        const std::string fname = entry.path().filename().string();
+        if (fname == "model.safetensors.index.json") continue;
+        std::filesystem::create_symlink(entry.path(), priv_dir / fname, ec);
+      }
+      const std::string en_name = "model.llm.embed_norm.weight";
+      const std::filesystem::path priv_shard = priv_dir / "embed_norm_priv.safetensors";
+      std::vector<std::byte> en_raw;
+      std::string en_dtype;
+      std::vector<std::int64_t> en_shape;
+      {
+        const ingine::SafetensorsModel orig_m(dir);
+        const ingine::SafetensorsRef ref = orig_m.at(en_name);
+        en_dtype = ref->dtype;
+        en_shape = ref->shape;
+        en_raw = orig_m.read(en_name);
+      }
+      auto write_priv_embed_norm = [&](const std::vector<std::byte>& raw) {
+        Json sh = Json::array();
+        for (auto d : en_shape) sh.push_back(d);
+        Json hdr = {{en_name, {{"dtype", en_dtype}, {"shape", sh}, {"data_offsets", Json::array({0, raw.size()})}}}};
+        const std::string hdr_s = hdr.dump();
+        const std::uint64_t hlen = std::uint64_t(hdr_s.size());
+        std::ofstream out(priv_shard, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
+        out.write(hdr_s.data(), std::streamsize(hdr_s.size()));
+        out.write(reinterpret_cast<const char*>(raw.data()), std::streamsize(raw.size()));
+      };
+      write_priv_embed_norm(en_raw);
+      {
+        std::ifstream in(dir / "model.safetensors.index.json");
+        Json idx = Json::parse(in);
+        idx["weight_map"][en_name] = "embed_norm_priv.safetensors";
+        std::ofstream out(priv_dir / "model.safetensors.index.json", std::ios::trunc);
+        out << idx.dump();
+      }
+
+      // Build flipped -embed_norm bytes (flip sign bit of BF16 or FP32 elements)
+      std::vector<std::byte> en_neg = en_raw;
+      if (en_dtype == "BF16") {
+        for (std::size_t i = 1; i < en_neg.size(); i += 2) en_neg[i] ^= std::byte{0x80};
+      } else if (en_dtype == "F32") {
+        for (std::size_t i = 3; i < en_neg.size(); i += 4) en_neg[i] ^= std::byte{0x80};
+      }
+
+      const std::vector<std::int32_t> short_p(rp_root.ids.begin(), rp_root.ids.begin() + 100);
+      RunOut out1, out2_auto;
+      bool toctou_saved = false;
+      bool toctou_explicit_threw = false;
+      {
+        RuntimeOptions topt = base_opt;
+        topt.model_dir = priv_dir;
+        topt.prefill_chunk = 64;
+        topt.park_mb = 0;
+        topt.park_host_mb = 0;
+        topt.kv_ckpt_path = ckpt_toctou;
+        topt.kv_ckpt_every = 64;
+        auto gen1 = make_generator(topt);  // consumes +embed_norm into GPU and hashes those exact bytes
+        // Mutate private embed_norm shard on disk to -embed_norm AFTER load_weights, BEFORE saving checkpoint!
+        write_priv_embed_norm(en_neg);
+        out1 = run_prompt(*gen1, Prompt{short_p, {}, 0}, 8, greedy);
+        toctou_saved = std::filesystem::exists(ckpt_toctou) && inspect_kv_checkpoint(ckpt_toctou).pos == 64 &&
+                       inspect_kv_checkpoint(ckpt_toctou).has_producer_identity;
+      }
+      {
+        RuntimeOptions topt = base_opt;
+        topt.model_dir = priv_dir;
+        topt.prefill_chunk = 64;
+        topt.park_mb = 0;
+        topt.park_host_mb = 0;
+        topt.kv_ckpt_path = ckpt_toctou;
+        topt.kv_ckpt_every = 0;
+        auto gen2 = make_generator(topt);  // consumes -embed_norm -> different consumed producer digest!
+        out2_auto = run_prompt(*gen2, Prompt{short_p, {}, 0}, 8, greedy);
+      }
+      {
+        RuntimeOptions topt = base_opt;
+        topt.model_dir = priv_dir;
+        topt.prefill_chunk = 64;
+        topt.park_mb = 0;
+        topt.park_host_mb = 0;
+        topt.kv_ckpt_resume = ckpt_toctou;
+        auto gen3 = make_generator(topt);
+        try {
+          run_prompt(*gen3, Prompt{short_p, {}, 0}, 8, greedy);
+        } catch (const std::exception&) {
+          toctou_explicit_threw = true;
+        }
+      }
+      std::filesystem::remove_all(priv_dir, ec);
+      check(toctou_saved && out2_auto.stats.reuse == Reuse::None && out2_auto.stats.reused_tokens == 0 &&
+                out2_auto.tokens != out1.tokens && toctou_explicit_threw,
+            "Suite 2h-consumed-weight-toctou: mutated embed_norm after Load 1 yields distinct consumed producer SHA (auto declines & explicit throws)");
+    }
   }
 
   // ---- Suite 2g: DSpark --spec host-parked root + fork parity & speculative disk-resume rejection/decline ----

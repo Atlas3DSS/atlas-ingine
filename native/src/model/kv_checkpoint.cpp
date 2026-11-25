@@ -399,6 +399,23 @@ std::array<std::uint8_t, 32> compute_model_package_sha256_from_tensors(
   return ctx.finish();
 }
 
+std::array<std::uint8_t, 32> compute_consumed_weights_sha256(
+    const std::array<std::uint8_t, 32>& config_sha, const std::array<std::uint8_t, 32>& quant_config_sha,
+    const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas) noexcept {
+  Sha256 ctx;
+  static constexpr char kDomain[] = "INGINE_CONSUMED_WEIGHTS_V1";
+  ctx.update(kDomain, sizeof(kDomain) - 1);
+  hash_tagged_bytes(ctx, "config_sha256", config_sha.data(), config_sha.size());
+  hash_tagged_bytes(ctx, "quant_config_sha256", quant_config_sha.data(), quant_config_sha.size());
+  const std::uint64_t n_tensors = std::uint64_t(tensor_shas.size());
+  hash_tagged_bytes(ctx, "num_tensors", &n_tensors, sizeof(n_tensors));
+  for (const auto& [name, tsha] : tensor_shas) {
+    hash_tagged_bytes(ctx, "tensor_name", name.data(), name.size());
+    ctx.update(tsha.data(), tsha.size());
+  }
+  return ctx.finish();
+}
+
 std::optional<std::array<std::uint8_t, 32>> compute_model_package_sha256_opt(const std::filesystem::path& model_dir) {
   if (model_dir.empty()) return std::nullopt;
   std::error_code ec;

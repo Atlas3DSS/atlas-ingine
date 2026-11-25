@@ -104,6 +104,12 @@ std::array<std::uint8_t, 32> compute_model_package_sha256_from_tensors(
     const std::filesystem::path& model_dir,
     const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas);
 
+// Pure in-memory digest strictly over the exact bytes consumed during load_weights (config.json SHA,
+// consumed hf_quant_config.json SHA, and every consumed weight tensor's digest — zero post-load file re-reads).
+std::array<std::uint8_t, 32> compute_consumed_weights_sha256(
+    const std::array<std::uint8_t, 32>& config_sha, const std::array<std::uint8_t, 32>& quant_config_sha,
+    const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas) noexcept;
+
 // Verified cryptographic model-package fingerprint over config.json, hf_quant_config.json,
 // model.safetensors.index.json, and 100% of every weight tensor's actual bytes (32 MiB chunked SHA-256;
 // bit-identical to load_weights). Returns std::nullopt when model_dir is empty or has no readable weight tensors.

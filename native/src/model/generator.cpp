@@ -118,10 +118,11 @@ bool images_match_prefix(const std::vector<VerifiedImageSpan>& cached, const std
 class EngineGenerator final : public Generator {
  public:
   explicit EngineGenerator(const RuntimeOptions& options)
-      : EngineGenerator(options, std::make_unique<Runtime>(options)) {}
+      : EngineGenerator(options, std::make_unique<Runtime>(options), /*file_backed_runtime=*/true) {}
   EngineGenerator(const RuntimeOptions& options, Weights weights, Ablation ablation)
       : EngineGenerator(without_spec(options),
-                        std::make_unique<Runtime>(options, std::move(weights), std::move(ablation))) {}
+                        std::make_unique<Runtime>(options, std::move(weights), std::move(ablation)),
+                        /*file_backed_runtime=*/false) {}
 
   std::string model_id() const override {
     return options_.ablation.empty() ? "inkling-2-mini" : "inkling-2-mini-abliterated";
@@ -167,7 +168,7 @@ class EngineGenerator final : public Generator {
   }
 
  private:
-  EngineGenerator(const RuntimeOptions& options, std::unique_ptr<Runtime> runtime)
+  EngineGenerator(const RuntimeOptions& options, std::unique_ptr<Runtime> runtime, bool file_backed_runtime)
       : options_(runtime->options()),
         runtime_(std::move(runtime)),
         rt_(*runtime_),
@@ -195,9 +196,11 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaEventCreate(&restore_end_));
 
     // Build fail-closed runtime/model identity pinned for all prefix-cache lookups.
-    // File-backed models loaded via load_weights carry verified weight-content SHA-256; caller-supplied/synthetic
-    // Weights without content_sha256 remain unverified for disk checkpoint producer stamps and auto-resume.
-    has_verified_producer_ = rt_.weights().content_sha256.has_value();
+    // Verified disk producer identity is permitted ONLY for untouched file-backed models (make_generator(options))
+    // with consumed-byte weight SHA-256, non-tiered resident experts, and no active ablation (file OR supplied).
+    const bool ablation_active = rt_.ablation().active || !options_.ablation.empty();
+    has_verified_producer_ = file_backed_runtime && rt_.weights().content_sha256.has_value() && !ablation_active &&
+                             !rt_.weights().expert_cache;
     base_identity_.model_sha256 = compute_model_identity_sha(options_, rt_.weights());
     base_identity_.act_dtype = (kActDType == DType::FP16) ? 1u : 0u;
     base_identity_.dense_fp8 = options_.dense_fp8;
@@ -561,9 +564,9 @@ class EngineGenerator final : public Generator {
         }
         return false;
       };
+      const bool ablation_active = rt_.ablation().active || !options_.ablation.empty();
       const bool baseline_disk_ok =
-          req_identity.persona_key == 0 && req_identity.cache_namespace.empty() && !bypass_reuse &&
-          options_.ablation.empty();
+          req_identity.persona_key == 0 && req_identity.cache_namespace.empty() && !bypass_reuse && !ablation_active;
       if (!options_.kv_ckpt_resume.empty()) {
         if (!baseline_disk_ok) {
           throw std::invalid_argument(
@@ -726,8 +729,9 @@ class EngineGenerator final : public Generator {
         capture_root_checkpoint(ids.subspan(0, root_len), root_images, req_identity, request_evictions_);
         need_root_capture = false;
       }
-      if (!drafter_ && options_.ablation.empty() && images.empty() && req_identity.persona_key == 0 &&
-          req_identity.cache_namespace.empty() && !bypass_reuse && !options_.kv_ckpt_path.empty()) {
+      if (!drafter_ && options_.ablation.empty() && !rt_.ablation().active && images.empty() &&
+          req_identity.persona_key == 0 && req_identity.cache_namespace.empty() && !bypass_reuse &&
+          !options_.kv_ckpt_path.empty()) {
         const bool sigterm = kv_checkpoint_sigterm_requested();
         const bool periodic = (options_.kv_ckpt_every > 0 && done >= next_ckpt && done < n);
         if (periodic || sigterm) {

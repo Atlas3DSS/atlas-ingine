@@ -292,6 +292,17 @@ int main() {
     tmap["w"] = sha256_tensor_from_chunk_digests("w", "F32", sh1, sizeof(v1), cshas);
     expect(compute_model_package_sha256_from_tensors(pkg_rev1, tmap) == *sha_rev1,
            "in-flight tensor digest assembly matches standalone compute_model_package_sha256_opt bit-for-bit");
+
+    // Consumed-weights digest (used by load_weights with zero post-load file re-reads) distinguishes value changes
+    const float v2 = 2.0f;
+    const std::array<std::array<std::uint8_t, 32>, 1> cshas2 = {sha256_bytes(&v2, sizeof(v2))};
+    std::map<std::string, std::array<std::uint8_t, 32>> tmap2;
+    tmap2["w"] = sha256_tensor_from_chunk_digests("w", "F32", sh1, sizeof(v2), cshas2);
+    const auto cfg_sha = sha256_file_or_zero(pkg_rev1 / "config.json");
+    const auto q_sha = sha256_bytes("quant", 5);
+    expect(compute_consumed_weights_sha256(cfg_sha, q_sha, tmap) !=
+               compute_consumed_weights_sha256(cfg_sha, q_sha, tmap2),
+           "compute_consumed_weights_sha256 distinguishes consumed tensor byte changes");
     std::filesystem::remove_all(pkg_base, ec);
   }
 
