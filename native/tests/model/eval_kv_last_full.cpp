@@ -213,8 +213,12 @@ Json run_vram_table(bool kv_fp8, bool kv_q4, const std::vector<int>& contexts) {
   return rows;
 }
 
-Json run_ckpt_isolation_test(const std::string& model_dir, bool kv_fp8, bool kv_q4,
-                             std::span<const std::int32_t> prefix, cudaStream_t stream) {
+Json run_ckpt_isolation_test(const Weights& w, const Ablation& abl, const std::string& model_dir, bool kv_fp8,
+                             bool kv_q4, const std::vector<std::int32_t>& ids, const DeviceBuffer& d_ids,
+                             DeviceBuffer& d_logits, DeviceBuffer& d_pos, Buffers& buf1, cudaStream_t stream) {
+  const int ckpt_prefix = 128;
+  const int ckpt_steps = 16;
+  std::span<const std::int32_t> prefix(ids.data(), ckpt_prefix);
   const std::filesystem::path dir = std::filesystem::temp_directory_path();
   const std::filesystem::path p_pp = dir / ("eval_kv_lf_pp_" + std::to_string(int(getpid())) + ".ckpt");
   const std::filesystem::path p_lf = dir / ("eval_kv_lf_lf_" + std::to_string(int(getpid())) + ".ckpt");
@@ -222,13 +226,96 @@ Json run_ckpt_isolation_test(const std::string& model_dir, bool kv_fp8, bool kv_
   bool lf_into_pp_rejected = false;
   bool pp_roundtrip_ok = false;
   bool lf_roundtrip_ok = false;
+  bool pp_populated_exact = false;
+  bool lf_populated_exact = false;
+  int pp_tok_matches = 0, lf_tok_matches = 0;
+  int pp_logit_exact_steps = 0, lf_logit_exact_steps = 0;
+  double pp_max_abs = 0.0, lf_max_abs = 0.0;
+  double pp_max_kl = 0.0, lf_max_kl = 0.0;
   std::string pp_err, lf_err;
-  const int ctx = int(prefix.size()) + 32;
+  const int ctx = ckpt_prefix + ckpt_steps + 32;
+
+  auto run_populated_mode = [&](bool last_full, const std::filesystem::path& ckpt_path, bool& roundtrip_ok,
+                                bool& populated_exact, int& tok_matches, int& logit_exact_steps, double& max_abs_out,
+                                double& max_kl_out) -> State {
+    Prefiller pre(w, abl, ckpt_prefix, stream);
+    State st_orig = make_state(ctx, kv_fp8, kv_q4, {}, last_full);
+    reset_state(st_orig, stream);
+    pre.run(st_orig, static_cast<const std::int32_t*>(d_ids.p), ckpt_prefix, 0, static_cast<float*>(d_logits.p),
+            nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    save_kv_checkpoint(st_orig, model_dir, prefix, static_cast<const float*>(d_logits.p), ckpt_path, stream);
+
+    // Uninterrupted continuation (step 0 = prefill logits, steps 1..ckpt_steps = decode logits).
+    std::vector<std::vector<float>> orig_logits;
+    orig_logits.reserve(std::size_t(ckpt_steps + 1));
+    orig_logits.push_back(download_f32(static_cast<const float*>(d_logits.p), UNPADDED_VOCAB));
+    {
+      Decoder dec_orig(w, abl, st_orig, true);
+      for (int i = 0; i < ckpt_steps; ++i) {
+        const std::int64_t tok = ids[std::size_t(ckpt_prefix + i)];
+        const std::int64_t pos = ckpt_prefix + i;
+        CUDA_CHECK(cudaMemcpyAsync(buf1.token.data, &tok, sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos.p, &pos, sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+        dec_orig.decode(buf1, static_cast<const std::int64_t*>(d_pos.p), false, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        orig_logits.push_back(download_f32(static_cast<const float*>(buf1.logits.data), UNPADDED_VOCAB));
+      }
+    }
+
+    // Fresh same-mode state loaded from populated checkpoint.
+    State st_res = make_state(ctx, kv_fp8, kv_q4, {}, last_full);
+    reset_state(st_res, stream);
+    DeviceBuffer d_res_logits(std::size_t(UNPADDED_VOCAB) * sizeof(float));
+    CUDA_CHECK(cudaMemsetAsync(d_res_logits.p, 0, d_res_logits.bytes, stream));
+    const int loaded =
+        load_kv_checkpoint(st_res, model_dir, prefix, static_cast<float*>(d_res_logits.p), ckpt_path, stream);
+    roundtrip_ok = (loaded == ckpt_prefix);
+
+    std::vector<std::vector<float>> res_logits;
+    res_logits.reserve(std::size_t(ckpt_steps + 1));
+    res_logits.push_back(download_f32(static_cast<const float*>(d_res_logits.p), UNPADDED_VOCAB));
+    {
+      Decoder dec_res(w, abl, st_res, true);
+      for (int i = 0; i < ckpt_steps; ++i) {
+        const std::int64_t tok = ids[std::size_t(ckpt_prefix + i)];
+        const std::int64_t pos = ckpt_prefix + i;
+        CUDA_CHECK(cudaMemcpyAsync(buf1.token.data, &tok, sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos.p, &pos, sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+        dec_res.decode(buf1, static_cast<const std::int64_t*>(d_pos.p), false, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        res_logits.push_back(download_f32(static_cast<const float*>(buf1.logits.data), UNPADDED_VOCAB));
+      }
+    }
+
+    bool all_ok = roundtrip_ok;
+    tok_matches = 0;
+    logit_exact_steps = 0;
+    max_abs_out = 0.0;
+    max_kl_out = 0.0;
+    for (int s = 0; s <= ckpt_steps; ++s) {
+      const auto& a = orig_logits[std::size_t(s)];
+      const auto& b = res_logits[std::size_t(s)];
+      bool finite = (a.size() == b.size() && !a.empty());
+      for (std::size_t v = 0; finite && v < a.size(); ++v) {
+        if (!std::isfinite(a[v]) || !std::isfinite(b[v])) finite = false;
+        else max_abs_out = std::max(max_abs_out, std::abs(double(a[v]) - double(b[v])));
+      }
+      const bool bytes_eq = finite && (std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+      if (bytes_eq) ++logit_exact_steps;
+      if (finite && argmax(a) == argmax(b)) ++tok_matches;
+      if (finite) max_kl_out = std::max(max_kl_out, kl_div(a, b));
+      if (!finite || !bytes_eq || argmax(a) != argmax(b)) all_ok = false;
+    }
+    populated_exact = all_ok;
+    return st_res;
+  };
+
   try {
-    State st_pp = make_state(ctx, kv_fp8, kv_q4, {}, false);
-    State st_lf = make_state(ctx, kv_fp8, kv_q4, {}, true);
-    save_kv_checkpoint(st_pp, model_dir, prefix, nullptr, p_pp, stream);
-    save_kv_checkpoint(st_lf, model_dir, prefix, nullptr, p_lf, stream);
+    State st_pp = run_populated_mode(false, p_pp, pp_roundtrip_ok, pp_populated_exact, pp_tok_matches,
+                                     pp_logit_exact_steps, pp_max_abs, pp_max_kl);
+    State st_lf = run_populated_mode(true, p_lf, lf_roundtrip_ok, lf_populated_exact, lf_tok_matches,
+                                     lf_logit_exact_steps, lf_max_abs, lf_max_kl);
 
     const KvCheckpointInfo info_pp = inspect_kv_checkpoint(p_pp);
     const KvCheckpointInfo info_lf = inspect_kv_checkpoint(p_lf);
@@ -238,9 +325,6 @@ Json run_ckpt_isolation_test(const std::string& model_dir, bool kv_fp8, bool kv_
     if (info_lf.kv_cache_mode != KvCacheMode::LastFull || info_lf.num_full_slots != 4) {
       throw std::runtime_error("inspect_kv_checkpoint last_full mismatch");
     }
-
-    pp_roundtrip_ok = (load_kv_checkpoint(st_pp, model_dir, prefix, nullptr, p_pp, stream) == int(prefix.size()));
-    lf_roundtrip_ok = (load_kv_checkpoint(st_lf, model_dir, prefix, nullptr, p_lf, stream) == int(prefix.size()));
 
     try {
       (void)load_kv_checkpoint(st_lf, model_dir, prefix, nullptr, p_pp, stream);
@@ -263,13 +347,27 @@ Json run_ckpt_isolation_test(const std::string& model_dir, bool kv_fp8, bool kv_
   std::error_code ec;
   std::filesystem::remove(p_pp, ec);
   std::filesystem::remove(p_lf, ec);
-  return Json{{"passed", pp_roundtrip_ok && lf_roundtrip_ok && pp_into_lf_rejected && lf_into_pp_rejected},
-              {"per_pass_roundtrip_ok", pp_roundtrip_ok},
-              {"last_full_roundtrip_ok", lf_roundtrip_ok},
-              {"per_pass_into_last_full_rejected", pp_into_lf_rejected},
-              {"last_full_into_per_pass_rejected", lf_into_pp_rejected},
-              {"per_pass_into_last_full_error", pp_err},
-              {"last_full_into_per_pass_error", lf_err}};
+  return Json{
+      {"passed", pp_roundtrip_ok && lf_roundtrip_ok && pp_populated_exact && lf_populated_exact &&
+                     pp_into_lf_rejected && lf_into_pp_rejected},
+      {"ckpt_prefix_tokens", ckpt_prefix},
+      {"ckpt_verify_steps", ckpt_steps + 1},
+      {"per_pass_roundtrip_ok", pp_roundtrip_ok},
+      {"last_full_roundtrip_ok", lf_roundtrip_ok},
+      {"per_pass_populated_resume_exact", pp_populated_exact},
+      {"last_full_populated_resume_exact", lf_populated_exact},
+      {"per_pass_tok_matches", pp_tok_matches},
+      {"last_full_tok_matches", lf_tok_matches},
+      {"per_pass_logit_byte_exact_steps", pp_logit_exact_steps},
+      {"last_full_logit_byte_exact_steps", lf_logit_exact_steps},
+      {"per_pass_max_abs_logit_diff", pp_max_abs},
+      {"last_full_max_abs_logit_diff", lf_max_abs},
+      {"per_pass_max_kl_fp64", pp_max_kl},
+      {"last_full_max_kl_fp64", lf_max_kl},
+      {"per_pass_into_last_full_rejected", pp_into_lf_rejected},
+      {"last_full_into_per_pass_rejected", lf_into_pp_rejected},
+      {"per_pass_into_last_full_error", pp_err},
+      {"last_full_into_per_pass_error", lf_err}};
 }
 
 }  // namespace
@@ -355,18 +453,20 @@ int main(int argc, char** argv) {
     std::size_t free_after_w = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_after_w, &total_vram));
 
-    // 3. Checkpoint mode-isolation check.
-    Json ckpt_check =
-        run_ckpt_isolation_test(model_dir, kv_fp8, kv_q4, std::span<const std::int32_t>(ids.data(), 128), stream);
-    std::printf("[#829] checkpoint mode isolation: %s\n", ckpt_check["passed"].get<bool>() ? "PASS" : "FAIL");
-    std::fflush(stdout);
-
     DeviceBuffer d_ids(ids.size() * sizeof(std::int32_t));
     d_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
     DeviceBuffer d_logits(std::size_t(UNPADDED_VOCAB) * sizeof(float));
     DeviceBuffer d_pos(sizeof(std::int64_t));
     Buffers buf1 = make_buffers(1);
     const int max_ctx = prefix_len + decode_len + 64;
+
+    // 3. Checkpoint populated-prefix same-mode resume + cross-mode isolation check.
+    Json ckpt_check = run_ckpt_isolation_test(w, abl, model_dir, kv_fp8, kv_q4, ids, d_ids, d_logits, d_pos, buf1, stream);
+    std::printf("[#829] checkpoint populated-resume + mode isolation: %s (pp_exact=%d/%d lf_exact=%d/%d)\n",
+                ckpt_check["passed"].get<bool>() ? "PASS" : "FAIL",
+                ckpt_check["per_pass_logit_byte_exact_steps"].get<int>(), ckpt_check["ckpt_verify_steps"].get<int>(),
+                ckpt_check["last_full_logit_byte_exact_steps"].get<int>(), ckpt_check["ckpt_verify_steps"].get<int>());
+    std::fflush(stdout);
 
     auto run_arm = [&](KvCacheMode mode, int chunk_size) -> ArmOutput {
       using Clock = std::chrono::steady_clock;
