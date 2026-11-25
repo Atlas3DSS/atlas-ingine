@@ -121,10 +121,10 @@ __global__ void bf16_to_f32_kernel(const std::uint16_t* src, float* dst, std::si
   if (i < n) dst[i] = dev_bf16_to_f32(src[i]);
 }
 
-template <typename ActIO>
-__global__ void nvfp4_linear_kernel(const ActIO* __restrict__ x, const std::uint8_t* __restrict__ w_packed,
+template <typename InIO, typename OutIO>
+__global__ void nvfp4_linear_kernel(const InIO* __restrict__ x, const std::uint8_t* __restrict__ w_packed,
                                     const std::uint8_t* __restrict__ block_scales, float weight_scale_2, int m,
-                                    int out_features, int in_features, ActIO* __restrict__ out) {
+                                    int out_features, int in_features, OutIO* __restrict__ out) {
   const int warp_in_block = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.y;
@@ -183,9 +183,9 @@ __global__ void fp8_linear_kernel(const ActIO* __restrict__ x, const std::uint8_
   }
 }
 
-template <typename ActIO>
-__global__ void bf16_linear_kernel(const ActIO* __restrict__ x, const std::uint16_t* __restrict__ w_bf16, int m,
-                                   int out_features, int in_features, ActIO* __restrict__ out) {
+template <typename InIO, typename OutIO>
+__global__ void bf16_linear_kernel(const InIO* __restrict__ x, const std::uint16_t* __restrict__ w_bf16, int m,
+                                   int out_features, int in_features, OutIO* __restrict__ out) {
   const int warp_in_block = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.y;
@@ -928,6 +928,63 @@ void dispatch_full_attn_gated(const ActIO* q_with_gate, const ActIO* k_raw, cons
   CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void dequant_nvfp4_to_bf16_kernel(const std::uint8_t* __restrict__ w_packed,
+                                             const std::uint8_t* __restrict__ block_scales, int n_rows,
+                                             int in_features, std::uint16_t* __restrict__ out_bf16) {
+  const int blocks = in_features >> 4;
+  const int r = blockIdx.y;
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= n_rows || b >= blocks) return;
+  const float sc = dev_decode_e4m3fn(block_scales[static_cast<std::size_t>(r) * blocks + b]);
+  const std::size_t p_base = static_cast<std::size_t>(r) * static_cast<std::size_t>(in_features >> 1) +
+                             static_cast<std::size_t>(b * 8);
+  const std::size_t o_base = static_cast<std::size_t>(r) * static_cast<std::size_t>(in_features) +
+                             static_cast<std::size_t>(b * 16);
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const std::uint8_t pb = w_packed[p_base + i];
+    out_bf16[o_base + 2 * i] = dev_f32_to_bf16(dev_decode_e2m1(pb & 0x0fu) * sc);
+    out_bf16[o_base + 2 * i + 1] = dev_f32_to_bf16(dev_decode_e2m1((pb >> 4) & 0x0fu) * sc);
+  }
+}
+
+__global__ void dequant_fp8_to_bf16_kernel(const std::uint8_t* __restrict__ w_e4m3, std::size_t n,
+                                           std::uint16_t* __restrict__ out_bf16) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out_bf16[i] = dev_f32_to_bf16(dev_decode_e4m3fn(w_e4m3[i]));
+}
+
+__global__ void quant_fp8_act_to_bf16_kernel(const std::uint16_t* __restrict__ x_in, float inv_scale, std::size_t n,
+                                             std::uint16_t* __restrict__ x_out) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    const float xv = dev_bf16_to_f32(x_in[i]) * inv_scale;
+    x_out[i] = dev_f32_to_bf16(dev_decode_e4m3fn(dev_quantize_e4m3fn(xv)));
+  }
+}
+
+__global__ void embed_lookup_bf16_kernel(const std::uint16_t* __restrict__ embed_table,
+                                         const std::int32_t* __restrict__ token_ids, int seq_len, int hidden_size,
+                                         int vocab_size, std::uint16_t* __restrict__ out_hidden) {
+  const int row = blockIdx.y;
+  const int d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= seq_len || d >= hidden_size) return;
+  const std::int32_t tid = token_ids[row];
+  const std::uint16_t val =
+      (tid >= 0 && tid < vocab_size) ? embed_table[static_cast<std::size_t>(tid) * hidden_size + d] : 0u;
+  out_hidden[static_cast<std::size_t>(row) * hidden_size + d] = val;
+}
+
+__global__ void gather_rows_bf16_kernel(const std::uint16_t* __restrict__ src, const int* __restrict__ row_indices,
+                                        int num_rows, int hidden_size, std::uint16_t* __restrict__ dst) {
+  const int row = blockIdx.y;
+  const int d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows || d >= hidden_size) return;
+  const int src_row = row_indices[row];
+  dst[static_cast<std::size_t>(row) * hidden_size + d] =
+      src[static_cast<std::size_t>(src_row) * hidden_size + d];
+}
+
 }  // namespace
 
 void qwen38_cuda_f32_to_bf16(const float* src, __nv_bfloat16* dst, std::size_t n, cudaStream_t stream) {
@@ -946,7 +1003,7 @@ void qwen38_cuda_nvfp4_linear_f32(const float* x, const std::uint8_t* w_packed, 
                                   float weight_scale_2, int m, int out_features, int in_features, float* out,
                                   cudaStream_t stream) {
   if (m <= 0 || out_features <= 0 || in_features % 16 != 0) throw std::invalid_argument("nvfp4_linear bad shape");
-  nvfp4_linear_kernel<float><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
+  nvfp4_linear_kernel<float, float><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
       x, w_packed, block_scales_e4m3, weight_scale_2, m, out_features, in_features, out);
   CUDA_CHECK(cudaGetLastError());
 }
@@ -955,7 +1012,7 @@ void qwen38_cuda_nvfp4_linear_bf16(const __nv_bfloat16* x, const std::uint8_t* w
                                    const std::uint8_t* block_scales_e4m3, float weight_scale_2, int m, int out_features,
                                    int in_features, __nv_bfloat16* out, cudaStream_t stream) {
   if (m <= 0 || out_features <= 0 || in_features % 16 != 0) throw std::invalid_argument("nvfp4_linear bad shape");
-  nvfp4_linear_kernel<std::uint16_t><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
+  nvfp4_linear_kernel<std::uint16_t, std::uint16_t><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
       reinterpret_cast<const std::uint16_t*>(x), w_packed, block_scales_e4m3, weight_scale_2, m, out_features,
       in_features, reinterpret_cast<std::uint16_t*>(out));
   CUDA_CHECK(cudaGetLastError());
@@ -982,7 +1039,7 @@ void qwen38_cuda_fp8_linear_bf16(const __nv_bfloat16* x, const std::uint8_t* w_e
 void qwen38_cuda_bf16_linear_f32(const float* x, const __nv_bfloat16* w_bf16, int m, int out_features, int in_features,
                                  float* out, cudaStream_t stream) {
   if (m <= 0 || out_features <= 0 || in_features <= 0) throw std::invalid_argument("bf16_linear bad shape");
-  bf16_linear_kernel<float><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
+  bf16_linear_kernel<float, float><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
       x, reinterpret_cast<const std::uint16_t*>(w_bf16), m, out_features, in_features, out);
   CUDA_CHECK(cudaGetLastError());
 }
@@ -990,7 +1047,7 @@ void qwen38_cuda_bf16_linear_f32(const float* x, const __nv_bfloat16* w_bf16, in
 void qwen38_cuda_bf16_linear_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w_bf16, int m, int out_features,
                                   int in_features, __nv_bfloat16* out, cudaStream_t stream) {
   if (m <= 0 || out_features <= 0 || in_features <= 0) throw std::invalid_argument("bf16_linear bad shape");
-  bf16_linear_kernel<std::uint16_t><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
+  bf16_linear_kernel<std::uint16_t, std::uint16_t><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
       reinterpret_cast<const std::uint16_t*>(x), reinterpret_cast<const std::uint16_t*>(w_bf16), m, out_features,
       in_features, reinterpret_cast<std::uint16_t*>(out));
   CUDA_CHECK(cudaGetLastError());
@@ -1173,6 +1230,82 @@ void qwen38_cuda_add_residual_bf16(__nv_bfloat16* hidden, const __nv_bfloat16* r
   if (n == 0) return;
   add_residual_bf16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(reinterpret_cast<std::uint16_t*>(hidden),
                                                                  reinterpret_cast<const std::uint16_t*>(residual), n);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_split_qkv_sep_bf16(const __nv_bfloat16* mixed, __nv_bfloat16* q_sep, __nv_bfloat16* k_sep,
+                                    __nv_bfloat16* v_sep, int seq_len, int kd, int vd, cudaStream_t stream) {
+  if (seq_len <= 0 || kd <= 0 || vd <= 0) throw std::invalid_argument("split_qkv_sep bad shape");
+  const int cd = 2 * kd + vd;
+  split_qkv_sep_bf16_kernel<<<dim3((cd + 255) / 256, seq_len), 256, 0, stream>>>(
+      reinterpret_cast<const std::uint16_t*>(mixed), reinterpret_cast<std::uint16_t*>(q_sep),
+      reinterpret_cast<std::uint16_t*>(k_sep), reinterpret_cast<std::uint16_t*>(v_sep), seq_len, kd, vd);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_dequant_nvfp4_to_bf16(const std::uint8_t* w_packed, const std::uint8_t* block_scales_e4m3, int n_rows,
+                                       int in_features, __nv_bfloat16* out_bf16, cudaStream_t stream) {
+  if (n_rows <= 0 || in_features <= 0 || in_features % 16 != 0) {
+    throw std::invalid_argument("dequant_nvfp4_to_bf16 bad shape");
+  }
+  const int blocks = in_features >> 4;
+  dequant_nvfp4_to_bf16_kernel<<<dim3((blocks + 255) / 256, n_rows), 256, 0, stream>>>(
+      w_packed, block_scales_e4m3, n_rows, in_features, reinterpret_cast<std::uint16_t*>(out_bf16));
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_dequant_fp8_to_bf16(const std::uint8_t* w_e4m3, int n_rows, int in_features, __nv_bfloat16* out_bf16,
+                                     cudaStream_t stream) {
+  if (n_rows <= 0 || in_features <= 0) throw std::invalid_argument("dequant_fp8_to_bf16 bad shape");
+  const std::size_t n = static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(in_features);
+  dequant_fp8_to_bf16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+      w_e4m3, n, reinterpret_cast<std::uint16_t*>(out_bf16));
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_quant_fp8_act_to_bf16(const __nv_bfloat16* x_in, float input_scale, std::size_t n,
+                                       __nv_bfloat16* x_out, cudaStream_t stream) {
+  if (n == 0) return;
+  if (!(input_scale > 0.0f)) throw std::invalid_argument("quant_fp8_act_to_bf16 requires positive input_scale");
+  quant_fp8_act_to_bf16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+      reinterpret_cast<const std::uint16_t*>(x_in), 1.0f / input_scale, n, reinterpret_cast<std::uint16_t*>(x_out));
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_embed_lookup_bf16(const __nv_bfloat16* embed_table, const std::int32_t* token_ids, int seq_len,
+                                   int hidden_size, int vocab_size, __nv_bfloat16* out_hidden, cudaStream_t stream) {
+  if (seq_len <= 0 || hidden_size <= 0 || vocab_size <= 0) throw std::invalid_argument("embed_lookup bad shape");
+  embed_lookup_bf16_kernel<<<dim3((hidden_size + 255) / 256, seq_len), 256, 0, stream>>>(
+      reinterpret_cast<const std::uint16_t*>(embed_table), token_ids, seq_len, hidden_size, vocab_size,
+      reinterpret_cast<std::uint16_t*>(out_hidden));
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_gather_rows_bf16(const __nv_bfloat16* src, const int* row_indices, int num_rows, int hidden_size,
+                                  __nv_bfloat16* dst, cudaStream_t stream) {
+  if (num_rows <= 0 || hidden_size <= 0) return;
+  gather_rows_bf16_kernel<<<dim3((hidden_size + 255) / 256, num_rows), 256, 0, stream>>>(
+      reinterpret_cast<const std::uint16_t*>(src), row_indices, num_rows, hidden_size,
+      reinterpret_cast<std::uint16_t*>(dst));
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_nvfp4_linear_bf16_to_f32(const __nv_bfloat16* x, const std::uint8_t* w_packed,
+                                          const std::uint8_t* block_scales_e4m3, float weight_scale_2, int m,
+                                          int out_features, int in_features, float* out_f32, cudaStream_t stream) {
+  if (m <= 0 || out_features <= 0 || in_features % 16 != 0) throw std::invalid_argument("nvfp4_bf16_f32 bad shape");
+  nvfp4_linear_kernel<std::uint16_t, float><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
+      reinterpret_cast<const std::uint16_t*>(x), w_packed, block_scales_e4m3, weight_scale_2, m, out_features,
+      in_features, out_f32);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_bf16_linear_bf16_to_f32(const __nv_bfloat16* x, const __nv_bfloat16* w_bf16, int m, int out_features,
+                                         int in_features, float* out_f32, cudaStream_t stream) {
+  if (m <= 0 || out_features <= 0 || in_features <= 0) throw std::invalid_argument("bf16_bf16_f32 bad shape");
+  bf16_linear_kernel<std::uint16_t, float><<<dim3((out_features + 3) / 4, m), 128, 0, stream>>>(
+      reinterpret_cast<const std::uint16_t*>(x), reinterpret_cast<const std::uint16_t*>(w_bf16), m, out_features,
+      in_features, out_f32);
   CUDA_CHECK(cudaGetLastError());
 }
 
