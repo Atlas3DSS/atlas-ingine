@@ -521,6 +521,48 @@ void test_bounded_streaming_and_same_size_mutation() {
           [&]() { aborted = true; }, 1024);
       CHECK(admitted && !aborted && res.admitted && res.bytes_delivered == m_pin.shard_sizes.at("model.safetensors"));
     }
+    // Exception-rollback contract: both on_chunk and on_admit exceptions invoke on_abort once and propagate.
+    {
+      int admit_calls = 0;
+      int abort_calls = 0;
+      std::size_t staged = 0;
+      CHECK_THROWS(m_pin.stream_verified_file(
+                       same_sz.path, "model.safetensors",
+                       [&](std::uint64_t, std::span<const std::uint8_t> ch) {
+                         staged += ch.size();
+                         throw std::runtime_error("sink chunk error");
+                       },
+                       [&](const Qwen38StreamResult&) { ++admit_calls; },
+                       [&]() {
+                         staged = 0;
+                         ++abort_calls;
+                       },
+                       1024),
+                   std::runtime_error);
+      CHECK(admit_calls == 0 && abort_calls == 1 && staged == 0);
+    }
+    {
+      int admit_calls = 0;
+      int abort_calls = 0;
+      std::size_t staged = 0;
+      bool published = false;
+      CHECK_THROWS(m_pin.stream_verified_file(
+                       same_sz.path, "model.safetensors",
+                       [&](std::uint64_t, std::span<const std::uint8_t> ch) { staged += ch.size(); },
+                       [&](const Qwen38StreamResult&) {
+                         ++admit_calls;
+                         published = true;
+                         throw std::runtime_error("publication commit error");
+                       },
+                       [&]() {
+                         staged = 0;
+                         published = false;
+                         ++abort_calls;
+                       },
+                       1024),
+                   std::runtime_error);
+      CHECK(admit_calls == 1 && abort_calls == 1 && staged == 0 && !published);
+    }
 
     // Mutate 1 byte in-place keeping the exact same inode and byte size.
     const int rwfd = ::open(st_path.c_str(), O_RDWR);

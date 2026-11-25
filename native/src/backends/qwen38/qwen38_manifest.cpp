@@ -653,6 +653,10 @@ Qwen38StreamResult Qwen38Manifest::stream_verified_open_fd(
     res.bytes_delivered = offset;
     res.sha256 = digest;
     res.admitted = true;
+    if (on_admit) {
+      on_admit(res);
+    }
+    return res;
   } catch (...) {
     if (on_abort) {
       try {
@@ -662,10 +666,6 @@ Qwen38StreamResult Qwen38Manifest::stream_verified_open_fd(
     }
     throw;
   }
-  if (on_admit) {
-    on_admit(res);
-  }
-  return res;
 }
 
 Qwen38StreamResult Qwen38Manifest::stream_verified_file(

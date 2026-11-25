@@ -75,9 +75,9 @@ struct Qwen38Manifest {
   // Streams exact bytes from an open FD (starting at offset 0 via pread) in bounded chunks
   // (default 1 MiB, max 16 MiB), hashing the exact delivered bytes with SHA-256 in the same pass.
   // Calls `on_admit(res)` ONLY after all `byte_size` bytes are delivered, EOF has no trailing
-  // bytes, and computed SHA-256 matches the expected pin. On any mismatch/error (including
-  // unpinned manifests or same-size mutations), `on_admit` is never called, `on_abort` is
-  // invoked to discard staged state, and std::invalid_argument is thrown fail-closed.
+  // bytes, and computed SHA-256 matches the expected pin. On any failure (open/fstat/size/pin
+  // mismatch, `on_chunk` exception, or `on_admit` publication failure), `on_abort` is invoked
+  // once to discard/roll back staged state and the triggering exception is propagated.
   Qwen38StreamResult stream_verified_open_fd(
       int fd, std::string_view filename,
       const std::function<void(std::uint64_t offset, std::span<const std::uint8_t> chunk)>& on_chunk,
