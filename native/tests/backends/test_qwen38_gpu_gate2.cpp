@@ -19,6 +19,7 @@
 #include <exception>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <span>
@@ -141,6 +142,37 @@ nlohmann::ordered_json kld_summary_to_json(const Qwen38KldSummary& s) {
   };
 }
 
+struct SplitLogitTop2 {
+  bool valid = false;
+  Qwen38Top2Logits top2;
+  float logit_303 = 0.0f;
+  float logit_321 = 0.0f;
+};
+
+SplitLogitTop2 extract_split_top2(std::span<const float> logits) {
+  SplitLogitTop2 out;
+  out.top2 = compute_top2_logits(logits);
+  if (!out.top2.finite || logits.size() <= 321u) return out;
+  out.logit_303 = logits[303];
+  out.logit_321 = logits[321];
+  out.valid = std::isfinite(out.logit_303) && std::isfinite(out.logit_321);
+  return out;
+}
+
+nlohmann::ordered_json split_top2_to_json(const SplitLogitTop2& s) {
+  if (!s.valid) return {{"valid", false}};
+  return {
+      {"valid", true},
+      {"top1_id", s.top2.top1_id},
+      {"top1_logit", s.top2.top1_logit},
+      {"top2_id", s.top2.top2_id},
+      {"top2_logit", s.top2.top2_logit},
+      {"logit_303", s.logit_303},
+      {"logit_321", s.logit_321},
+      {"diff_303_minus_321", s.logit_303 - s.logit_321},
+  };
+}
+
 struct ShortPromptRecord {
   std::string name;
   std::size_t prompt_len = 0;
@@ -195,6 +227,7 @@ int main_impl(int argc, char** argv) {
 
   std::string q27_dir = "/home/orwel/dev_genius/models/Qwen3.8-27B-NVFP4-482ca0f";
   std::string ref_dir = "/mnt/storage/flare/release-references";
+  std::string alt_short_ref_dir = "/mnt/storage/flare/john-repro-b1";
   std::string q08_dir = "/mnt/storage/models/Qwen3.5-0.8B";
   std::string json_out;
   int prefill_chunk = 256;
@@ -216,6 +249,12 @@ int main_impl(int argc, char** argv) {
         return 2;
       }
       ref_dir = argv[++i];
+    } else if (a == "--alt-short-ref-dir") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "missing argument for --alt-short-ref-dir\n");
+        return 2;
+      }
+      alt_short_ref_dir = argv[++i];
     } else if (a == "--qwen08-dir") {
       if (i + 1 >= argc) {
         std::fprintf(stderr, "missing argument for --qwen08-dir\n");
@@ -292,9 +331,18 @@ int main_impl(int argc, char** argv) {
 
   bool q27_pins_verified_actual = false;
   bool short_ref_sha_verified = false;
+  bool short_ref_meta_sha_verified = false;
+  bool alt_short_ref_b1_sha_verified = false;
+  bool alt_short_ref_b1_meta_sha_verified = false;
+  bool alt_short_ref_b1_prompt0_ids_match = false;
   bool long_ref_sha_verified = false;
   std::string short_ref_sha_actual;
+  std::string short_ref_meta_sha_actual;
+  std::string alt_short_ref_b1_sha_actual;
+  std::string alt_short_ref_b1_meta_sha_actual;
   std::string long_ref_sha_actual;
+  nlohmann::ordered_json rel_b3_meta_summary;
+  nlohmann::ordered_json can_b1_meta_summary;
 
   std::vector<ShortPromptRecord> short_records;
   std::vector<ChunkVsStepRecord> chunk_step_records;
@@ -302,6 +350,14 @@ int main_impl(int argc, char** argv) {
   std::vector<Qwen38LogitParityPoint> short_points;
   std::vector<Qwen38LogitParityPoint> chunk_step_points;
   std::vector<Qwen38LogitParityPoint> long_points;
+
+  std::vector<std::int32_t> p0_alt_b1_ref_ids;
+  std::optional<Qwen38Prompt0TrajectoryEval> p0_traj_eval;
+  SplitLogitTop2 p0_cand_dec0_split_top2;
+  SplitLogitTop2 p0_rel_b3_dec0_split_top2;
+  SplitLogitTop2 p0_can_b1_dec0_split_top2;
+  bool p0_b1_eval_executed = false;
+  std::vector<Qwen38LogitParityPoint> p0_b1_points;
 
   bool prefix_lookup_hit = false;
   std::size_t prefix_lookup_reused_tokens = 0;
@@ -339,15 +395,39 @@ int main_impl(int argc, char** argv) {
     root["qwen27b_dir"] = q27_dir;
     root["qwen08b_dir"] = q08_dir;
     root["ref_dir"] = ref_dir;
+    root["alt_short_ref_dir"] = alt_short_ref_dir;
     root["prefill_chunk"] = prefill_chunk;
     root["verify_pins_requested"] = verify_pins;
     root["qwen27b_pins_verified"] = q27_pins_verified_actual;
     root["short_ref_sha256_expected"] = std::string(kGate2ShortRefSha256);
     root["short_ref_sha256_actual"] = short_ref_sha_actual;
     root["short_ref_sha_verified"] = short_ref_sha_verified;
+    root["short_ref_meta_sha_verified"] = short_ref_meta_sha_verified;
+    root["alt_short_ref_b1_sha_verified"] = alt_short_ref_b1_sha_verified;
+    root["alt_short_ref_b1_meta_sha_verified"] = alt_short_ref_b1_meta_sha_verified;
+    root["alt_short_ref_b1_prompt0_ids_match"] = alt_short_ref_b1_prompt0_ids_match;
     root["long_ref_sha256_expected"] = std::string(kGate2LongCodeRefSha256);
     root["long_ref_sha256_actual"] = long_ref_sha_actual;
     root["long_ref_sha_verified"] = long_ref_sha_verified;
+    root["reference_contract"] = {
+        {"version", std::string(kGate2ContractVersion)},
+        {"numeric_mode", std::string(kGate2ExpectedNumericMode)},
+        {"release_b3_sha256_expected", std::string(kGate2ShortRefSha256)},
+        {"release_b3_sha256_actual", short_ref_sha_actual},
+        {"release_b3_sha_verified", short_ref_sha_verified},
+        {"release_b3_meta_sha256_expected", std::string(kGate2ShortRefMetaSha256)},
+        {"release_b3_meta_sha256_actual", short_ref_meta_sha_actual},
+        {"release_b3_meta_sha_verified", short_ref_meta_sha_verified},
+        {"canonical_b1_sha256_expected", std::string(kGate2AltShortRefB1Sha256)},
+        {"canonical_b1_sha256_actual", alt_short_ref_b1_sha_actual},
+        {"canonical_b1_sha_verified", alt_short_ref_b1_sha_verified},
+        {"canonical_b1_meta_sha256_expected", std::string(kGate2AltShortRefB1MetaSha256)},
+        {"canonical_b1_meta_sha256_actual", alt_short_ref_b1_meta_sha_actual},
+        {"canonical_b1_meta_sha_verified", alt_short_ref_b1_meta_sha_verified},
+        {"prompt0_input_ids_identical", alt_short_ref_b1_prompt0_ids_match},
+        {"release_b3_meta", rel_b3_meta_summary},
+        {"canonical_b1_meta", can_b1_meta_summary},
+    };
 
     if (state_id.has_value()) {
       root["checkpoint_identity"] = {
@@ -370,6 +450,8 @@ int main_impl(int argc, char** argv) {
           {"fp8_cal_max_abs", gemm_report->fp8_cal_max_abs},
           {"bf16_max_abs", gemm_report->bf16_max_abs},
           {"batch_invariance_max_abs", gemm_report->batch_invariance_max_abs},
+          {"gdn_prefill_vs_step_max_abs", gemm_report->gdn_prefill_vs_step_max_abs},
+          {"gdn_batch_invariance_max_abs", gemm_report->gdn_batch_invariance_max_abs},
           {"passed", gemm_report->passed},
       };
     }
@@ -443,6 +525,7 @@ int main_impl(int argc, char** argv) {
     const Qwen38KldSummary short_sum = summarize_kld_metrics(short_points);
     const Qwen38KldSummary chunk_sum = summarize_kld_metrics(chunk_step_points);
     const Qwen38KldSummary long_sum = summarize_kld_metrics(long_points);
+    const Qwen38KldSummary p0_b1_sum = p0_b1_points.empty() ? Qwen38KldSummary{} : summarize_kld_metrics(p0_b1_points);
 
     std::size_t p0_matches = 0;
     std::size_t p0_total = 0;
@@ -462,10 +545,19 @@ int main_impl(int argc, char** argv) {
     gi.qwen27b_pins_verified = q27_pins_verified_actual;
     gi.short_ref_sha_verified = short_ref_sha_verified;
     gi.long_ref_sha_verified = long_ref_sha_verified;
+    gi.allow_canonical_b1_addendum = true;
+    gi.short_ref_meta_sha_verified = short_ref_meta_sha_verified;
+    gi.alt_short_ref_b1_sha_verified = alt_short_ref_b1_sha_verified;
+    gi.alt_short_ref_b1_meta_sha_verified = alt_short_ref_b1_meta_sha_verified;
+    gi.alt_short_ref_b1_prompt0_ids_match = alt_short_ref_b1_prompt0_ids_match;
     gi.short_prompt_count = short_records.size();
     gi.prompt0_greedy_matches = p0_matches;
     gi.prompt0_greedy_total = p0_total;
     gi.short_summary = short_sum;
+    gi.prompt0_b1_greedy_matches = p0_traj_eval.has_value() ? p0_traj_eval->canonical_b1_matches : 0u;
+    gi.prompt0_b1_greedy_total = p0_alt_b1_ref_ids.size();
+    gi.prompt0_b1_eval_executed = p0_b1_eval_executed;
+    gi.prompt0_b1_summary = p0_b1_sum;
     gi.long_prompt_count = long_records.size();
     gi.long_summary = long_sum;
     gi.chunk_vs_step_prompt_count = chunk_step_records.size();
@@ -478,11 +570,14 @@ int main_impl(int argc, char** argv) {
     if (!gemm_ok) {
       verdict.executed_checks_passed = false;
       verdict.qualification_passed = false;
+      verdict.release_only_qualification_passed = false;
       verdict.failures.push_back("self_check_gemm_parity failed or not executed");
+      verdict.release_only_failures.push_back("self_check_gemm_parity failed or not executed");
     }
     if (!error_message.empty() || terminated_early || in_progress) {
       verdict.executed_checks_passed = false;
       verdict.qualification_passed = false;
+      verdict.release_only_qualification_passed = false;
     }
     if (out_verdict) *out_verdict = verdict;
 
@@ -496,6 +591,12 @@ int main_impl(int argc, char** argv) {
                           : (diagnostic_mode && verdict.executed_checks_passed ? "diagnostic_executed_pass" : "failed")));
 
     root["coverage_status"] = cov_status;
+    root["gate2_contract_version"] = verdict.contract_version;
+    root["chosen_prompt0_realization"] = verdict.chosen_prompt0_realization;
+    root["canonical_b1_branch_passed"] = verdict.canonical_b1_branch_passed;
+    root["release_only_short_passed"] = verdict.release_only_short_passed;
+    root["release_only_qualification_passed"] = verdict.release_only_qualification_passed;
+    root["release_only_failures"] = verdict.release_only_failures;
     root["short_prompts_passed"] = verdict.short_prompts_passed;
     root["long_code_passed"] = verdict.long_code_passed;
     root["chunked_vs_stepwise_passed"] = verdict.chunked_vs_stepwise_passed;
@@ -513,6 +614,32 @@ int main_impl(int argc, char** argv) {
     root["short_summary"] = kld_summary_to_json(short_sum);
     root["short_summary"]["prompt0_greedy_matches"] = p0_matches;
     root["short_summary"]["prompt0_greedy_total"] = p0_total;
+    root["short_summary"]["prompt0_b1_greedy_matches"] =
+        p0_traj_eval.has_value() ? p0_traj_eval->canonical_b1_matches : 0u;
+    root["short_summary"]["prompt0_b1_greedy_total"] = p0_alt_b1_ref_ids.size();
+    root["prompt0_addendum"] = {
+        {"contract_version", verdict.contract_version},
+        {"chosen_realization", verdict.chosen_prompt0_realization},
+        {"release_b3_generated_ids",
+         short_records.empty() ? std::vector<std::int32_t>{} : short_records[0].ref_generated_ids},
+        {"canonical_b1_generated_ids", p0_alt_b1_ref_ids},
+        {"candidate_greedy_ids",
+         short_records.empty() ? std::vector<std::int32_t>{} : short_records[0].cand_greedy_ids},
+        {"release_b3_greedy_matches", p0_traj_eval.has_value() ? p0_traj_eval->release_b3_matches : 0u},
+        {"release_b3_greedy_total", p0_total},
+        {"release_b3_first_diff_idx", p0_traj_eval.has_value() ? p0_traj_eval->release_b3_first_diff_idx : -1},
+        {"canonical_b1_greedy_matches", p0_traj_eval.has_value() ? p0_traj_eval->canonical_b1_matches : 0u},
+        {"canonical_b1_greedy_total", p0_alt_b1_ref_ids.size()},
+        {"canonical_b1_first_diff_idx", p0_traj_eval.has_value() ? p0_traj_eval->canonical_b1_first_diff_idx : -1},
+        {"first_canonical_split_idx", 1},
+        {"dec0_split_top2",
+         {{"candidate", split_top2_to_json(p0_cand_dec0_split_top2)},
+          {"release_b3", split_top2_to_json(p0_rel_b3_dec0_split_top2)},
+          {"canonical_b1", split_top2_to_json(p0_can_b1_dec0_split_top2)}}},
+        {"canonical_b1_eval_executed", p0_b1_eval_executed},
+        {"canonical_b1_distribution_summary", kld_summary_to_json(p0_b1_sum)},
+        {"canonical_b1_branch_passed", verdict.canonical_b1_branch_passed},
+    };
     root["short_prompts"] = nlohmann::json::array();
     for (const auto& sr : short_records) {
       root["short_prompts"].push_back({
@@ -593,9 +720,10 @@ int main_impl(int argc, char** argv) {
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       std::printf(
           "  [gemm_parity_self_check] nvfp4_max_abs=%.6g fp8_cal_max_abs=%.6g bf16_max_abs=%.6g "
-          "batch_inv=%.6g elapsed_ms=%.1f -> %s\n",
+          "batch_inv=%.6g gdn_vs_step=%.6g gdn_batch_inv=%.6g elapsed_ms=%.1f -> %s\n",
           gemm_report->nvfp4_max_abs, gemm_report->fp8_cal_max_abs, gemm_report->bf16_max_abs,
-          gemm_report->batch_invariance_max_abs, timings.gemm_self_check_ms,
+          gemm_report->batch_invariance_max_abs, gemm_report->gdn_prefill_vs_step_max_abs,
+          gemm_report->gdn_batch_invariance_max_abs, timings.gemm_self_check_ms,
           gemm_report->passed ? "PASS" : "FAIL");
     }
     if (auto rc = check_early_stop("gemm_parity_self_check")) return *rc;
@@ -673,30 +801,114 @@ int main_impl(int argc, char** argv) {
       return ok_all ? 0 : 1;
     }
 
-    // Phase 2: Verify release-reference safetensors SHA-256 digests before loading 27B weights.
+    // Phase 2: Verify release-reference & canonical-b1 safetensors + metadata SHA-256 digests and contract bindings.
     std::printf("[phase] start=verify_references wall_ms=%.1f\n", wall_ms());
     checkpoint_json("verify_references");
     const std::filesystem::path ref_root(ref_dir);
     const std::filesystem::path short_path = ref_root / "reference.safetensors";
+    const std::filesystem::path short_meta_path = ref_root / "reference.json";
     const std::filesystem::path long_path = ref_root / "long-code-reference.safetensors";
-    if (!std::filesystem::is_regular_file(short_path) || !std::filesystem::is_regular_file(long_path)) {
-      throw std::runtime_error("missing reference safetensors files under: " + ref_dir);
+    const std::filesystem::path alt_b1_root(alt_short_ref_dir);
+    const std::filesystem::path alt_b1_path = alt_b1_root / "reference.safetensors";
+    const std::filesystem::path alt_b1_meta_path = alt_b1_root / "reference.json";
+    if (!std::filesystem::is_regular_file(short_path) || !std::filesystem::is_regular_file(short_meta_path) ||
+        !std::filesystem::is_regular_file(long_path) || !std::filesystem::is_regular_file(alt_b1_path) ||
+        !std::filesystem::is_regular_file(alt_b1_meta_path)) {
+      throw std::runtime_error("missing pinned reference or canonical-b1 files under ref-dir / alt-short-ref-dir");
     }
 
     const auto t_ref0 = std::chrono::steady_clock::now();
     Qwen38RefSafetensors short_ref(short_path);
+    Qwen38RefSafetensors alt_b1_ref(alt_b1_path);
     Qwen38RefSafetensors long_ref(long_path);
     short_ref_sha_actual = short_ref.sha256_hex();
     short_ref_sha_verified = (short_ref_sha_actual == kGate2ShortRefSha256);
+    short_ref_meta_sha_verified =
+        verify_file_sha256(short_meta_path, kGate2ShortRefMetaSha256, &short_ref_meta_sha_actual);
+    alt_short_ref_b1_sha_actual = alt_b1_ref.sha256_hex();
+    alt_short_ref_b1_sha_verified = (alt_short_ref_b1_sha_actual == kGate2AltShortRefB1Sha256);
+    alt_short_ref_b1_meta_sha_verified =
+        verify_file_sha256(alt_b1_meta_path, kGate2AltShortRefB1MetaSha256, &alt_short_ref_b1_meta_sha_actual);
     long_ref_sha_actual = long_ref.sha256_hex();
     long_ref_sha_verified = (long_ref_sha_actual == kGate2LongCodeRefSha256);
+
+    auto parse_and_bind_meta = [&](const std::filesystem::path& mp, int expected_bs, int expected_threads,
+                                   const Qwen38RefSafetensors& sf, nlohmann::ordered_json& summary_out) -> bool {
+      std::ifstream ifs(mp);
+      if (!ifs.is_open()) return false;
+      const auto j = nlohmann::json::parse(ifs, nullptr, false);
+      if (j.is_discarded() || !j.is_object()) return false;
+      if (j.value("model_id", "") != "nvidia/Qwen3.8-27B-NVFP4" ||
+          j.value("revision", "") != "482ca0f3832238542f8f5295dde86b5f22711d80" ||
+          j.value("status", "") != "complete" ||
+          j.value("config_sha256", "") != "71fa01bb64de20971045cd82a82c0ebb25a54e1b0a3f09ef23cf5479e9c54df8" ||
+          j.value("index_sha256", "") != "7aa103a2582b7d26631988de33dea19e8a308ee9c239e8e14feb374af30905e2") {
+        return false;
+      }
+      if (!j.contains("options") || !j["options"].is_object()) return false;
+      const int bs = j["options"].value("prompt_batch_size", -1);
+      const int th = j["options"].value("threads", -1);
+      if (bs != expected_bs || th != expected_threads) return false;
+      if (!j.contains("prompts") || !j["prompts"].is_array() || j["prompts"].size() != 3u) return false;
+      const auto& p0 = j["prompts"][0];
+      if (!p0.contains("prompt_ids") || !p0["prompt_ids"].is_array() || !p0.contains("generated_ids") ||
+          !p0["generated_ids"].is_array()) {
+        return false;
+      }
+      const auto sf_p0_ids = sf.read_i64("prompt_0.prompt_ids");
+      const auto sf_p0_gen = sf.read_i64("prompt_0.generated_ids");
+      const auto meta_p0_ids = p0["prompt_ids"].get<std::vector<std::int64_t>>();
+      const auto meta_p0_gen = p0["generated_ids"].get<std::vector<std::int64_t>>();
+      if (sf_p0_ids != meta_p0_ids || sf_p0_gen != meta_p0_gen) return false;
+      summary_out = {
+          {"prompt_batch_size", bs},
+          {"threads", th},
+          {"torch", j.value("torch", "")},
+          {"transformers", j.value("transformers", "")},
+          {"device_name", j.value("device_name", "")},
+          {"generated_ids", meta_p0_gen},
+      };
+      return true;
+    };
+
+    const bool rel_meta_bound = parse_and_bind_meta(short_meta_path, 3, 30, short_ref, rel_b3_meta_summary);
+    const bool b1_meta_bound = parse_and_bind_meta(alt_b1_meta_path, 1, 16, alt_b1_ref, can_b1_meta_summary);
+    const auto rel_p0_ids64 = short_ref.read_i64("prompt_0.prompt_ids");
+    const auto rel_p0_gen64 = short_ref.read_i64("prompt_0.generated_ids");
+    const auto b1_p0_ids64 = alt_b1_ref.read_i64("prompt_0.prompt_ids");
+    const auto b1_p0_gen64 = alt_b1_ref.read_i64("prompt_0.generated_ids");
+    const auto& rel_p0_pf = short_ref.at("prompt_0.prefill_logits");
+    const auto& rel_p0_dc = short_ref.at("prompt_0.decode_logits");
+    const auto& b1_p0_pf = alt_b1_ref.at("prompt_0.prefill_logits");
+    const auto& b1_p0_dc = alt_b1_ref.at("prompt_0.decode_logits");
+    const bool shapes_bound = (rel_p0_ids64.size() == 32u && rel_p0_gen64.size() == 16u &&
+                               b1_p0_ids64.size() == 32u && b1_p0_gen64.size() == 16u &&
+                               rel_p0_pf.shape.size() == 2 && rel_p0_pf.shape[0] == 32 &&
+                               rel_p0_dc.shape.size() == 2 && rel_p0_dc.shape[0] == 15 &&
+                               b1_p0_pf.shape == rel_p0_pf.shape && b1_p0_dc.shape == rel_p0_dc.shape);
+    if (shapes_bound) {
+      std::vector<float> tmp_row(static_cast<std::size_t>(rel_p0_dc.shape[1]));
+      short_ref.read_f32_row("prompt_0.decode_logits", 0, tmp_row);
+      p0_rel_b3_dec0_split_top2 = extract_split_top2(tmp_row);
+      alt_b1_ref.read_f32_row("prompt_0.decode_logits", 0, tmp_row);
+      p0_can_b1_dec0_split_top2 = extract_split_top2(tmp_row);
+    }
+    alt_short_ref_b1_prompt0_ids_match =
+        shapes_bound && rel_meta_bound && b1_meta_bound && (rel_p0_ids64 == b1_p0_ids64) &&
+        (rel_p0_gen64[0] == b1_p0_gen64[0]) && p0_rel_b3_dec0_split_top2.valid && p0_can_b1_dec0_split_top2.valid;
+
     timings.ref_sha_verify_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ref0).count();
-    std::printf("  [verify_references] short_sha=%s long_sha=%s elapsed_ms=%.1f wall_ms=%.1f\n",
-                short_ref_sha_verified ? "OK" : "MISMATCH", long_ref_sha_verified ? "OK" : "MISMATCH",
-                timings.ref_sha_verify_ms, wall_ms());
-    if (!short_ref_sha_verified || !long_ref_sha_verified) {
-      throw std::runtime_error("reference safetensors SHA-256 mismatch (fail closed)");
+    std::printf(
+        "  [verify_references] short_sha=%s short_meta=%s b1_sha=%s b1_meta=%s p0_bind=%s long_sha=%s elapsed_ms=%.1f "
+        "wall_ms=%.1f\n",
+        short_ref_sha_verified ? "OK" : "MISMATCH", short_ref_meta_sha_verified ? "OK" : "MISMATCH",
+        alt_short_ref_b1_sha_verified ? "OK" : "MISMATCH", alt_short_ref_b1_meta_sha_verified ? "OK" : "MISMATCH",
+        alt_short_ref_b1_prompt0_ids_match ? "OK" : "MISMATCH", long_ref_sha_verified ? "OK" : "MISMATCH",
+        timings.ref_sha_verify_ms, wall_ms());
+    if (!short_ref_sha_verified || !short_ref_meta_sha_verified || !alt_short_ref_b1_sha_verified ||
+        !alt_short_ref_b1_meta_sha_verified || !alt_short_ref_b1_prompt0_ids_match || !long_ref_sha_verified) {
+      throw std::runtime_error("reference safetensors or Option 1 addendum metadata/pin mismatch (fail closed)");
     }
     if (auto rc = check_early_stop("verify_references")) return *rc;
 
@@ -726,6 +938,7 @@ int main_impl(int argc, char** argv) {
     timings.cold_safetensors_load_ms = load_stats->cold_safetensors_load_ms;
 
     const int V = backend.config().vocab_size;
+    p0_alt_b1_ref_ids = i64_to_i32(b1_p0_gen64, V);
     std::printf(
         "  [load_qwen27b] pins=%s sha_ms=%.1f load_ms=%.1f weights=%.1f MiB state=%.1f MiB scratch=%.1f MiB "
         "peak_vram=%.1f MiB wall_ms=%.1f\n",
@@ -804,10 +1017,58 @@ int main_impl(int argc, char** argv) {
 
       double g_pf_ms = 0.0, g_dec_ms = 0.0;
       std::vector<std::int32_t> cand_greedy;
-      backend.generate_greedy_exact(p_ids, 16, true, false, cand_greedy, &g_pf_ms, &g_dec_ms);
+      backend.generate_greedy_exact(
+          p_ids, 16, true, false, cand_greedy, &g_pf_ms, &g_dec_ms, nullptr,
+          [&](const ingine::model::LogitStep& st) {
+            if (pi == 0 && st.position == static_cast<int>(p_ids.size())) {
+              p0_cand_dec0_split_top2 = extract_split_top2(st.logits);
+            }
+          });
       std::size_t matches = 0;
       for (std::size_t k = 0; k < 16 && k < cand_greedy.size(); ++k) {
         if (cand_greedy[k] == g_ids[k]) ++matches;
+      }
+
+      if (pi == 0) {
+        p0_traj_eval = evaluate_prompt0_canonical_trajectory(cand_greedy, g_ids, p0_alt_b1_ref_ids);
+        // Always evaluate canonical-b1's own 47-row teacher-forced distribution separately from short_points.
+        const auto alt_p_ids = i64_to_i32(b1_p0_ids64, V);
+        p0_b1_points.clear();
+        p0_b1_points.reserve(47);
+        backend.evaluate_teacher_forced_mode(
+            alt_p_ids, pf_caps, true,
+            [&](const ingine::model::LogitStep& st) {
+              alt_b1_ref.read_f32_row("prompt_0.prefill_logits", static_cast<std::size_t>(st.position), ref_row);
+              p0_b1_points.push_back(compute_logit_kld_and_top1(ref_row, st.logits, st.position));
+            },
+            nullptr, nullptr, true);
+        const std::span<const std::int32_t> b1_dec_ids(p0_alt_b1_ref_ids.data(), 15);
+        backend.evaluate_teacher_forced_mode(
+            b1_dec_ids, dec_caps, false,
+            [&](const ingine::model::LogitStep& st) {
+              const int local_dec = st.position - static_cast<int>(alt_p_ids.size());
+              if (local_dec < 0 || local_dec >= 15) {
+                throw std::runtime_error("unexpected decode position in canonical-b1 prompt_0 evaluation");
+              }
+              alt_b1_ref.read_f32_row("prompt_0.decode_logits", static_cast<std::size_t>(local_dec), ref_row);
+              p0_b1_points.push_back(compute_logit_kld_and_top1(ref_row, st.logits, st.position));
+            },
+            nullptr, nullptr, false);
+        backend.reset_session();
+        if (p0_b1_points.size() != 47u) {
+          throw std::runtime_error("incomplete canonical-b1 prompt_0 logit count");
+        }
+        p0_b1_eval_executed = true;
+        const auto b1_sum = summarize_kld_metrics(p0_b1_points);
+        std::printf(
+            "  [prompt_0:addendum] chosen=%s rel_b3=%zu/16(diff=%d) can_b1=%zu/16(diff=%d) "
+            "dec0_303_321 cand=(%.4f,%.4f) b3=(%.4f,%.4f) b1=(%.4f,%.4f) b1_dist(mean=%.6f,max=%.6f,top1=%.4f)\n",
+            p0_traj_eval->chosen_realization.c_str(), p0_traj_eval->release_b3_matches,
+            p0_traj_eval->release_b3_first_diff_idx, p0_traj_eval->canonical_b1_matches,
+            p0_traj_eval->canonical_b1_first_diff_idx, p0_cand_dec0_split_top2.logit_303,
+            p0_cand_dec0_split_top2.logit_321, p0_rel_b3_dec0_split_top2.logit_303,
+            p0_rel_b3_dec0_split_top2.logit_321, p0_can_b1_dec0_split_top2.logit_303,
+            p0_can_b1_dec0_split_top2.logit_321, b1_sum.kld_mean, b1_sum.kld_max, b1_sum.top1_agreement);
       }
 
       ShortPromptRecord rec;
@@ -999,12 +1260,16 @@ int main_impl(int argc, char** argv) {
   const auto short_sum = summarize_kld_metrics(short_points);
   const auto long_sum = summarize_kld_metrics(long_points);
   std::printf(
-      "qwen38_gpu_gate2: %s | short(mean=%.6f,max=%.6f,top1=%.4f,p0=%zu/%zu) "
+      "qwen38_gpu_gate2: %s | contract=%s chosen=%s rel_only=%s short(mean=%.6f,max=%.6f,top1=%.4f,p0_b3=%zu/%zu,p0_b1=%zu/%zu) "
       "long(mean=%.6f,p99=%.6f,top1=%.4f) chunk_vs_step=%s pins=%s peak_vram=%.1f MiB wall_ms=%.1f\n",
       verdict.qualification_passed ? "PASS" : (diagnostic_mode && verdict.executed_checks_passed ? "DIAGNOSTIC_PASS" : "FAIL"),
+      verdict.contract_version.c_str(), verdict.chosen_prompt0_realization.c_str(),
+      verdict.release_only_qualification_passed ? "PASS" : "FAIL",
       short_sum.kld_mean, short_sum.kld_max, short_sum.top1_agreement,
       short_records.empty() ? 0u : short_records[0].greedy_matches,
       short_records.empty() ? 0u : short_records[0].greedy_total,
+      p0_traj_eval.has_value() ? p0_traj_eval->canonical_b1_matches : 0u,
+      p0_alt_b1_ref_ids.size(),
       long_sum.kld_mean, long_sum.kld_p99, long_sum.top1_agreement,
       verdict.chunked_vs_stepwise_passed ? "PASS" : "FAIL",
       q27_pins_verified_actual ? "verified" : "UNVERIFIED",

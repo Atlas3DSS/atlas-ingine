@@ -168,6 +168,86 @@ Qwen38KldSummary summarize_kld_metrics(std::span<const Qwen38LogitParityPoint> p
   return s;
 }
 
+Qwen38Top2Logits compute_top2_logits(std::span<const float> logits) {
+  Qwen38Top2Logits out;
+  if (logits.empty()) return out;
+  double b1 = -std::numeric_limits<double>::infinity();
+  double b2 = -std::numeric_limits<double>::infinity();
+  std::int32_t i1 = -1;
+  std::int32_t i2 = -1;
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    const float v = logits[i];
+    if (!std::isfinite(v)) return Qwen38Top2Logits{};
+    const double dv = static_cast<double>(v);
+    if (dv > b1) {
+      b2 = b1;
+      i2 = i1;
+      b1 = dv;
+      i1 = static_cast<std::int32_t>(i);
+    } else if (dv > b2) {
+      b2 = dv;
+      i2 = static_cast<std::int32_t>(i);
+    }
+  }
+  out.top1_id = i1;
+  out.top1_logit = static_cast<float>(b1);
+  out.top2_id = i2;
+  out.top2_logit = static_cast<float>(i2 >= 0 ? b2 : 0.0);
+  out.finite = true;
+  return out;
+}
+
+bool verify_file_sha256(const std::filesystem::path& path, std::string_view expected_hex,
+                        std::string* actual_hex_out) {
+  if (actual_hex_out) actual_hex_out->clear();
+  try {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec) return false;
+    const std::string actual = sha256_file_hex_streaming(path);
+    if (actual_hex_out) *actual_hex_out = actual;
+    return lower_ascii(actual) == lower_ascii(expected_hex);
+  } catch (...) {
+    return false;
+  }
+}
+
+Qwen38Prompt0TrajectoryEval evaluate_prompt0_canonical_trajectory(std::span<const std::int32_t> cand_ids,
+                                                                 std::span<const std::int32_t> release_b3_ids,
+                                                                 std::span<const std::int32_t> canonical_b1_ids) {
+  Qwen38Prompt0TrajectoryEval ev;
+  auto cmp = [](std::span<const std::int32_t> a, std::span<const std::int32_t> b, std::size_t& matches_out,
+                int& first_diff_out, bool& intact_out) {
+    matches_out = 0;
+    first_diff_out = -1;
+    const std::size_t n = std::min(a.size(), b.size());
+    for (std::size_t i = 0; i < n; ++i) {
+      if (a[i] == b[i]) {
+        ++matches_out;
+      } else if (first_diff_out < 0) {
+        first_diff_out = static_cast<int>(i);
+      }
+    }
+    if (a.size() != b.size() && first_diff_out < 0) {
+      first_diff_out = static_cast<int>(n);
+    }
+    intact_out = (a.size() == 16u && b.size() == 16u && matches_out == 16u && first_diff_out == -1);
+  };
+  cmp(cand_ids, release_b3_ids, ev.release_b3_matches, ev.release_b3_first_diff_idx, ev.matches_release_b3_intact);
+  cmp(cand_ids, canonical_b1_ids, ev.canonical_b1_matches, ev.canonical_b1_first_diff_idx,
+      ev.matches_canonical_b1_intact);
+  if (ev.matches_release_b3_intact) {
+    ev.matched_intact_canonical = true;
+    ev.chosen_realization = "release_b3";
+  } else if (ev.matches_canonical_b1_intact) {
+    ev.matched_intact_canonical = true;
+    ev.chosen_realization = "canonical_b1";
+  } else {
+    ev.matched_intact_canonical = false;
+    ev.chosen_realization = "none";
+  }
+  return ev;
+}
+
 Qwen38Gate2Verdict evaluate_gate2_verdict(const Qwen38Gate2Input& in) {
   Qwen38Gate2Verdict v;
 
@@ -177,92 +257,188 @@ Qwen38Gate2Verdict evaluate_gate2_verdict(const Qwen38Gate2Input& in) {
            s.top1_agreement >= 0.0 && s.top1_agreement <= 1.0 && s.top1_matches <= s.positions;
   };
 
-  auto check_short = [&]() {
+  auto check_short_distribution = [&](std::vector<std::string>& errs) {
     if (in.short_prompt_count != 3 || in.short_summary.positions != 141) {
-      v.failures.push_back("short_prompts incomplete count/positions");
+      errs.push_back("short_prompts incomplete count/positions");
       return false;
     }
     if (!summary_scalars_valid(in.short_summary)) {
-      v.failures.push_back("short_prompts nonfinite or out-of-range summary");
-      return false;
-    }
-    if (in.prompt0_greedy_total != 16 || in.prompt0_greedy_matches != 16) {
-      v.failures.push_back("short prompt_0 greedy match < 16/16");
+      errs.push_back("short_prompts nonfinite or out-of-range summary");
       return false;
     }
     bool ok = true;
     if (in.short_summary.kld_mean > 0.005) {
-      v.failures.push_back("short_prompts kld_mean > 0.005");
+      errs.push_back("short_prompts kld_mean > 0.005");
       ok = false;
     }
     if (in.short_summary.kld_max > 0.05) {
-      v.failures.push_back("short_prompts kld_max > 0.05");
+      errs.push_back("short_prompts kld_max > 0.05");
       ok = false;
     }
     if (in.short_summary.top1_agreement < 0.90) {
-      v.failures.push_back("short_prompts top1_agreement < 0.90");
+      errs.push_back("short_prompts top1_agreement < 0.90");
       ok = false;
     }
     return ok;
   };
 
-  auto check_long = [&]() {
+  auto check_b1_distribution = [&](std::vector<std::string>& errs) {
+    if (!in.prompt0_b1_eval_executed || in.prompt0_b1_summary.positions != 47) {
+      errs.push_back("canonical-b1 prompt_0 teacher-forced evaluation incomplete/missing (expected 47 rows)");
+      return false;
+    }
+    if (!summary_scalars_valid(in.prompt0_b1_summary)) {
+      errs.push_back("canonical-b1 prompt_0 nonfinite or out-of-range summary");
+      return false;
+    }
+    bool ok = true;
+    if (in.prompt0_b1_summary.kld_mean > 0.005) {
+      errs.push_back("canonical-b1 prompt_0 kld_mean > 0.005");
+      ok = false;
+    }
+    if (in.prompt0_b1_summary.kld_max > 0.05) {
+      errs.push_back("canonical-b1 prompt_0 kld_max > 0.05");
+      ok = false;
+    }
+    if (in.prompt0_b1_summary.top1_agreement < 0.90) {
+      errs.push_back("canonical-b1 prompt_0 top1_agreement < 0.90");
+      ok = false;
+    }
+    return ok;
+  };
+
+  auto check_long = [&](std::vector<std::string>& errs) {
     if (in.long_prompt_count != 6 || in.long_summary.positions != 288) {
-      v.failures.push_back("long_code incomplete count/positions");
+      errs.push_back("long_code incomplete count/positions");
       return false;
     }
     if (!summary_scalars_valid(in.long_summary)) {
-      v.failures.push_back("long_code nonfinite or out-of-range summary");
+      errs.push_back("long_code nonfinite or out-of-range summary");
       return false;
     }
     bool ok = true;
     if (in.long_summary.kld_mean > 0.01) {
-      v.failures.push_back("long_code kld_mean > 0.01");
+      errs.push_back("long_code kld_mean > 0.01");
       ok = false;
     }
     if (in.long_summary.kld_p99 > 0.08) {
-      v.failures.push_back("long_code kld_p99 > 0.08");
+      errs.push_back("long_code kld_p99 > 0.08");
       ok = false;
     }
     if (in.long_summary.top1_agreement < 0.95) {
-      v.failures.push_back("long_code top1_agreement < 0.95");
+      errs.push_back("long_code top1_agreement < 0.95");
       ok = false;
     }
     return ok;
   };
 
-  auto check_chunk = [&]() {
+  auto check_chunk = [&](std::vector<std::string>& errs) {
     if (in.chunk_vs_step_prompt_count != 3 || in.chunk_vs_step_summary.positions != 3) {
-      v.failures.push_back("chunked_vs_stepwise incomplete count/positions");
+      errs.push_back("chunked_vs_stepwise incomplete count/positions");
       return false;
     }
     if (!summary_scalars_valid(in.chunk_vs_step_summary)) {
-      v.failures.push_back("chunked_vs_stepwise nonfinite or out-of-range summary");
+      errs.push_back("chunked_vs_stepwise nonfinite or out-of-range summary");
       return false;
     }
     bool ok = true;
     if (in.chunk_vs_step_summary.kld_max > 1e-4) {
-      v.failures.push_back("chunked_vs_stepwise kld_max > 1e-4");
+      errs.push_back("chunked_vs_stepwise kld_max > 1e-4");
       ok = false;
     }
     if (in.chunk_vs_step_greedy_total != 48 || in.chunk_vs_step_greedy_matches != 48) {
-      v.failures.push_back("chunked_vs_stepwise short greedy match < 48/48");
+      errs.push_back("chunked_vs_stepwise short greedy match < 48/48");
       ok = false;
     }
     return ok;
   };
 
-  v.short_prompts_passed = check_short();
-  v.long_code_passed = check_long();
-  v.chunked_vs_stepwise_passed = check_chunk();
+  const bool matched_b3 = (in.prompt0_greedy_total == 16 && in.prompt0_greedy_matches == 16);
+  const bool matched_b1 = (in.prompt0_b1_greedy_total == 16 && in.prompt0_b1_greedy_matches == 16);
+
+  // Strict release-only verdict (always computed and preserved).
+  {
+    bool rel_short_ok = check_short_distribution(v.release_only_failures);
+    if (!matched_b3) {
+      v.release_only_failures.push_back("short prompt_0 greedy match < 16/16");
+      rel_short_ok = false;
+    }
+    v.release_only_short_passed = rel_short_ok;
+    const bool rel_long_ok = check_long(v.release_only_failures);
+    const bool rel_chunk_ok = check_chunk(v.release_only_failures);
+    if (in.diagnostic_mode) v.release_only_failures.push_back("diagnostic_mode forbids Gate 2 qualification");
+    if (!in.qwen27b_pins_verified) v.release_only_failures.push_back("qwen27b_pins_verified is false");
+    if (!in.short_ref_sha_verified) v.release_only_failures.push_back("short reference SHA-256 mismatch");
+    if (!in.long_ref_sha_verified) v.release_only_failures.push_back("long-code reference SHA-256 mismatch");
+    v.release_only_qualification_passed = !in.diagnostic_mode && in.qwen27b_pins_verified &&
+                                          in.short_ref_sha_verified && in.long_ref_sha_verified && rel_short_ok &&
+                                          rel_long_ok && rel_chunk_ok;
+  }
+
+  v.long_code_passed = check_long(v.failures);
+  v.chunked_vs_stepwise_passed = check_chunk(v.failures);
+
+  const bool addendum_pins_ok = in.short_ref_sha_verified && in.short_ref_meta_sha_verified &&
+                                in.alt_short_ref_b1_sha_verified && in.alt_short_ref_b1_meta_sha_verified &&
+                                in.alt_short_ref_b1_prompt0_ids_match;
+
+  if (!in.allow_canonical_b1_addendum) {
+    v.contract_version = "v1.0-release-only";
+    v.chosen_prompt0_realization = matched_b3 ? "release_b3" : "none";
+    v.failures.clear();
+    bool short_ok = check_short_distribution(v.failures);
+    if (!matched_b3) {
+      v.failures.push_back("short prompt_0 greedy match < 16/16");
+      short_ok = false;
+    }
+    v.short_prompts_passed = short_ok;
+    v.long_code_passed = check_long(v.failures);
+    v.chunked_vs_stepwise_passed = check_chunk(v.failures);
+    v.executed_checks_passed = v.short_prompts_passed && v.long_code_passed && v.chunked_vs_stepwise_passed;
+    if (in.diagnostic_mode) v.failures.push_back("diagnostic_mode forbids Gate 2 qualification");
+    if (!in.qwen27b_pins_verified) v.failures.push_back("qwen27b_pins_verified is false");
+    if (!in.short_ref_sha_verified) v.failures.push_back("short reference SHA-256 mismatch");
+    if (!in.long_ref_sha_verified) v.failures.push_back("long-code reference SHA-256 mismatch");
+    v.qualification_passed = !in.diagnostic_mode && in.qwen27b_pins_verified && in.short_ref_sha_verified &&
+                             in.long_ref_sha_verified && v.executed_checks_passed;
+    return v;
+  }
+
+  v.contract_version = std::string(kGate2ContractVersion);
+  std::vector<std::string> b1_report_errs;
+  const bool b1_dist_ok = check_b1_distribution(b1_report_errs);
+  v.canonical_b1_branch_passed = addendum_pins_ok && matched_b1 && b1_dist_ok;
+
+  // Always retain the 141 release-b3 distribution rows and bounds unconditionally.
+  bool short_ok = check_short_distribution(v.failures);
+
+  if (matched_b3) {
+    v.chosen_prompt0_realization = "release_b3";
+  } else if (matched_b1) {
+    v.chosen_prompt0_realization = "canonical_b1";
+    if (!addendum_pins_ok) short_ok = false;
+    if (!check_b1_distribution(v.failures)) short_ok = false;
+  } else {
+    v.chosen_prompt0_realization = "none";
+    v.failures.push_back("short prompt_0 greedy did not match intact 16/16 trajectory of release-b3 or canonical-b1");
+    short_ok = false;
+  }
+
+  v.short_prompts_passed = short_ok;
   v.executed_checks_passed = v.short_prompts_passed && v.long_code_passed && v.chunked_vs_stepwise_passed;
 
   if (in.diagnostic_mode) v.failures.push_back("diagnostic_mode forbids Gate 2 qualification");
   if (!in.qwen27b_pins_verified) v.failures.push_back("qwen27b_pins_verified is false");
   if (!in.short_ref_sha_verified) v.failures.push_back("short reference SHA-256 mismatch");
+  if (!in.short_ref_meta_sha_verified) v.failures.push_back("short reference metadata SHA-256 mismatch");
+  if (!in.alt_short_ref_b1_sha_verified) v.failures.push_back("canonical-b1 short reference SHA-256 mismatch");
+  if (!in.alt_short_ref_b1_meta_sha_verified) {
+    v.failures.push_back("canonical-b1 short reference metadata SHA-256 mismatch");
+  }
+  if (!in.alt_short_ref_b1_prompt0_ids_match) v.failures.push_back("canonical-b1 prompt_0 input IDs mismatch");
   if (!in.long_ref_sha_verified) v.failures.push_back("long-code reference SHA-256 mismatch");
 
-  v.qualification_passed = !in.diagnostic_mode && in.qwen27b_pins_verified && in.short_ref_sha_verified &&
+  v.qualification_passed = !in.diagnostic_mode && in.qwen27b_pins_verified && addendum_pins_ok &&
                            in.long_ref_sha_verified && v.executed_checks_passed;
   return v;
 }

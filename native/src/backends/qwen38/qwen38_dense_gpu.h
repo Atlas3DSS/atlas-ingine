@@ -42,6 +42,8 @@ struct Qwen38GemmParityReport {
   float fp8_cal_max_abs = 0.0f;
   float bf16_max_abs = 0.0f;
   float batch_invariance_max_abs = 0.0f;
+  float gdn_prefill_vs_step_max_abs = 0.0f;
+  float gdn_batch_invariance_max_abs = 0.0f;
   bool passed = false;
 };
 
@@ -74,7 +76,7 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
   Qwen38DenseBackend(const Qwen38DenseBackend&) = delete;
   Qwen38DenseBackend& operator=(const Qwen38DenseBackend&) = delete;
 
-  // Lightweight unit check comparing tiled BF16 dequant + cuBLASLt (M=8) against Gate 1 warp kernels.
+  // Lightweight unit check comparing batched FP32 GEMM + GDN exact recurrent prefill against M=1 and Gate 1 kernels.
   static Qwen38GemmParityReport self_check_gemm_parity(int device_id = 0);
 
   [[nodiscard]] const Qwen38Manifest& manifest() const noexcept;
@@ -118,7 +120,8 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
   void generate_greedy_exact(std::span<const std::int32_t> prompt_ids, int max_new_tokens, bool use_chunk_prefill,
                              bool stop_on_eos, std::vector<std::int32_t>& out_tokens,
                              double* prefill_ms_out = nullptr, double* decode_ms_out = nullptr,
-                             Qwen38DenseSession* session = nullptr);
+                             Qwen38DenseSession* session = nullptr,
+                             const ingine::model::LogitCallback& on_step_logits = {});
 
  private:
   friend class Qwen38DenseSession;

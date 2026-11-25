@@ -1275,6 +1275,156 @@ __global__ void split_qkv_sep_f32_kernel(const float* __restrict__ mixed, float*
   }
 }
 
+__global__ void gdn_normalize_qk_packed_f32_kernel(const float* __restrict__ conv_out_packed, int seq_len,
+                                                   int num_k_heads, int num_v_heads, int k_dim, int v_dim,
+                                                   float* __restrict__ q_norm, float* __restrict__ k_norm) {
+  const int kh = blockIdx.x;
+  const int t = blockIdx.y;
+  if (t >= seq_len || kh >= num_k_heads) return;
+
+  const int kd_total = num_k_heads * k_dim;
+  const int vd_total = num_v_heads * v_dim;
+  const int cd = 2 * kd_total + vd_total;
+  const std::size_t q_src =
+      static_cast<std::size_t>(t) * static_cast<std::size_t>(cd) + static_cast<std::size_t>(kh * k_dim);
+  const std::size_t k_src = q_src + static_cast<std::size_t>(kd_total);
+  const std::size_t dst_base =
+      (static_cast<std::size_t>(t) * static_cast<std::size_t>(num_k_heads) + kh) * static_cast<std::size_t>(k_dim);
+
+  float qsq = 0.0f, ksq = 0.0f;
+  for (int d = threadIdx.x; d < k_dim; d += blockDim.x) {
+    const float qv = conv_out_packed[q_src + d];
+    const float kv = conv_out_packed[k_src + d];
+    qsq += qv * qv;
+    ksq += kv * kv;
+  }
+  qsq = warp_sum(qsq);
+  ksq = warp_sum(ksq);
+  __shared__ float rq[4], rk[4];
+  if ((threadIdx.x & 31) == 0) {
+    rq[threadIdx.x >> 5] = qsq;
+    rk[threadIdx.x >> 5] = ksq;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float qt = 0.0f, kt = 0.0f;
+    const int wcount = blockDim.x >> 5;
+    for (int i = 0; i < wcount; ++i) {
+      qt += rq[i];
+      kt += rk[i];
+    }
+    rq[0] = rsqrtf(qt + 1e-6f) * rsqrtf(static_cast<float>(k_dim));
+    rk[0] = rsqrtf(kt + 1e-6f);
+  }
+  __syncthreads();
+  const float q_inv = rq[0];
+  const float k_inv = rk[0];
+  for (int d = threadIdx.x; d < k_dim; d += blockDim.x) {
+    q_norm[dst_base + d] = conv_out_packed[q_src + d] * q_inv;
+    k_norm[dst_base + d] = conv_out_packed[k_src + d] * k_inv;
+  }
+}
+
+template <bool kUseSmemState>
+__global__ void gdn_recurrent_prefill_exact_f32_kernel(
+    const float* __restrict__ q_norm, const float* __restrict__ k_norm, const float* __restrict__ conv_out_packed,
+    const float* __restrict__ z_seq, const float* __restrict__ a_seq, const float* __restrict__ b_seq,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ norm_weight,
+    float rms_eps, int seq_len, int num_k_heads, int num_v_heads, int k_dim, int v_dim,
+    float* __restrict__ recurrent_state, float* __restrict__ out_seq) {
+  const int vh = blockIdx.x;
+  if (vh >= num_v_heads) return;
+  const int repeat_factor = num_v_heads / num_k_heads;
+  const int kh = vh / repeat_factor;
+  const int kd_total = num_k_heads * k_dim;
+  const int vd_total = num_v_heads * v_dim;
+  const int cd = 2 * kd_total + vd_total;
+
+  __shared__ float sqh[256];
+  __shared__ float skh[256];
+  __shared__ float s_core[512];
+  __shared__ float s_red[8];
+  extern __shared__ float s_state[];
+
+  const std::size_t state_elems = static_cast<std::size_t>(k_dim) * static_cast<std::size_t>(v_dim);
+  float* g_state = recurrent_state + static_cast<std::size_t>(vh) * state_elems;
+  float* state = kUseSmemState ? s_state : g_state;
+  if constexpr (kUseSmemState) {
+    for (std::size_t idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+      s_state[idx] = g_state[idx];
+    }
+    __syncthreads();
+  }
+
+  const float neg_exp_alog = -expf(a_log[vh]);
+  const float dt_b = dt_bias[vh];
+
+  for (int t = 0; t < seq_len; ++t) {
+    const std::size_t qk_off =
+        (static_cast<std::size_t>(t) * static_cast<std::size_t>(num_k_heads) + kh) * static_cast<std::size_t>(k_dim);
+    const float* qh_g = q_norm + qk_off;
+    const float* kh_g = k_norm + qk_off;
+    for (int d = threadIdx.x; d < k_dim; d += blockDim.x) {
+      sqh[d] = qh_g[d];
+      skh[d] = kh_g[d];
+    }
+    __syncthreads();
+
+    const float beta = 1.0f / (1.0f + expf(-b_seq[static_cast<std::size_t>(t) * static_cast<std::size_t>(num_v_heads) + vh]));
+    const float g =
+        neg_exp_alog * dev_softplus(a_seq[static_cast<std::size_t>(t) * static_cast<std::size_t>(num_v_heads) + vh] + dt_b);
+    const float decay = expf(g);
+
+    const std::size_t v_in_off =
+        static_cast<std::size_t>(t) * static_cast<std::size_t>(cd) + static_cast<std::size_t>(2 * kd_total + vh * v_dim);
+    const std::size_t zv_off =
+        static_cast<std::size_t>(t) * static_cast<std::size_t>(vd_total) + static_cast<std::size_t>(vh * v_dim);
+
+    float sq_sum = 0.0f;
+    for (int vd = threadIdx.x; vd < v_dim; vd += blockDim.x) {
+      float kv_mem = 0.0f;
+      for (int kd = 0; kd < k_dim; ++kd) {
+        kv_mem += (state[static_cast<std::size_t>(kd) * static_cast<std::size_t>(v_dim) + vd] * decay) * skh[kd];
+      }
+      const float delta = (conv_out_packed[v_in_off + vd] - kv_mem) * beta;
+      float core_vd = 0.0f;
+      for (int kd = 0; kd < k_dim; ++kd) {
+        const std::size_t idx = static_cast<std::size_t>(kd) * static_cast<std::size_t>(v_dim) + vd;
+        const float ns = state[idx] * decay + skh[kd] * delta;
+        state[idx] = ns;
+        core_vd += ns * sqh[kd];
+      }
+      s_core[vd] = core_vd;
+      sq_sum += core_vd * core_vd;
+    }
+
+    sq_sum = warp_sum(sq_sum);
+    if ((threadIdx.x & 31) == 0) s_red[threadIdx.x >> 5] = sq_sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float tot = 0.0f;
+      const int wcount = blockDim.x >> 5;
+      for (int i = 0; i < wcount; ++i) tot += s_red[i];
+      s_red[0] = rsqrtf(tot / static_cast<float>(v_dim) + rms_eps);
+    }
+    __syncthreads();
+
+    const float inv_rms = s_red[0];
+    for (int vd = threadIdx.x; vd < v_dim; vd += blockDim.x) {
+      const float zv = z_seq[zv_off + vd];
+      out_seq[zv_off + vd] = norm_weight[vd] * (s_core[vd] * inv_rms) * dev_silu(zv);
+    }
+    if (t + 1 < seq_len) __syncthreads();
+  }
+
+  if constexpr (kUseSmemState) {
+    __syncthreads();
+    for (std::size_t idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+      g_state[idx] = s_state[idx];
+    }
+  }
+}
+
 }  // namespace
 
 void qwen38_cuda_f32_to_bf16(const float* src, __nv_bfloat16* dst, std::size_t n, cudaStream_t stream) {
@@ -1792,6 +1942,52 @@ void qwen38_cuda_full_attn_gated_f32_kvbf16(const float* q_with_gate, float* k_r
       q_scratch, gate_scratch, reinterpret_cast<const std::uint16_t*>(k_cache),
       reinterpret_cast<const std::uint16_t*>(v_cache), seq_len, pos_offset, num_heads, num_kv_heads, head_dim,
       out_attn);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen38_cuda_gdn_recurrent_prefill_f32(const float* conv_out_packed, const float* z_seq, const float* a_seq,
+                                           const float* b_seq, const float* a_log, const float* dt_bias,
+                                           const float* norm_weight, float rms_eps, int seq_len, int num_k_heads,
+                                           int num_v_heads, int k_dim, int v_dim, float* recurrent_state,
+                                           float* qk_norm_scratch, float* out_seq, cudaStream_t stream,
+                                           bool force_global_fallback) {
+  if (seq_len == 0) return;
+  if (seq_len < 0 || num_k_heads <= 0 || num_v_heads <= 0 || num_v_heads % num_k_heads != 0 || k_dim <= 0 ||
+      k_dim > 256 || v_dim <= 0 || v_dim > 512) {
+    throw std::invalid_argument("qwen38_cuda_gdn_recurrent_prefill_f32 invalid dimensions");
+  }
+  const std::size_t qk_elems = static_cast<std::size_t>(seq_len) * static_cast<std::size_t>(num_k_heads * k_dim);
+  float* qn = qk_norm_scratch;
+  float* kn = qn + qk_elems;
+
+  gdn_normalize_qk_packed_f32_kernel<<<dim3(num_k_heads, seq_len), 128, 0, stream>>>(
+      conv_out_packed, seq_len, num_k_heads, num_v_heads, k_dim, v_dim, qn, kn);
+  CUDA_CHECK(cudaGetLastError());
+
+  int dev = 0;
+  CUDA_CHECK(cudaGetDevice(&dev));
+  int max_optin_smem = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+
+  cudaFuncAttributes attr{};
+  CUDA_CHECK(cudaFuncGetAttributes(&attr, gdn_recurrent_prefill_exact_f32_kernel<true>));
+  const std::size_t state_bytes = static_cast<std::size_t>(k_dim) * static_cast<std::size_t>(v_dim) * sizeof(float);
+  const bool use_smem = !force_global_fallback && (seq_len > 1) &&
+                        (static_cast<std::size_t>(attr.sharedSizeBytes) + state_bytes <=
+                         static_cast<std::size_t>(max_optin_smem));
+  const int block = ((std::max(32, std::min(256, v_dim)) + 31) / 32) * 32;
+
+  if (use_smem) {
+    CUDA_CHECK(cudaFuncSetAttribute(gdn_recurrent_prefill_exact_f32_kernel<true>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(state_bytes)));
+    gdn_recurrent_prefill_exact_f32_kernel<true><<<num_v_heads, block, state_bytes, stream>>>(
+        qn, kn, conv_out_packed, z_seq, a_seq, b_seq, a_log, dt_bias, norm_weight, rms_eps, seq_len, num_k_heads,
+        num_v_heads, k_dim, v_dim, recurrent_state, out_seq);
+  } else {
+    gdn_recurrent_prefill_exact_f32_kernel<false><<<num_v_heads, block, 0, stream>>>(
+        qn, kn, conv_out_packed, z_seq, a_seq, b_seq, a_log, dt_bias, norm_weight, rms_eps, seq_len, num_k_heads,
+        num_v_heads, k_dim, v_dim, recurrent_state, out_seq);
+  }
   CUDA_CHECK(cudaGetLastError());
 }
 

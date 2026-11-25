@@ -164,6 +164,16 @@ void qwen38_cuda_full_attn_gated_f32_kvbf16(const float* q_with_gate, float* k_r
                                             float* q_scratch, float* gate_scratch, float* out_attn,
                                             cudaStream_t stream = nullptr);
 
+// Batch-size-invariant exact recurrent GDN prefill over packed conv_out [seq_len, 2*kd + vd].
+// Executes identical FP32 recurrence order for seq_len == 1 and seq_len > 1 (0 ULP diff).
+// qk_norm_scratch must hold at least 2 * seq_len * num_k_heads * k_dim floats.
+void qwen38_cuda_gdn_recurrent_prefill_f32(const float* conv_out_packed, const float* z_seq, const float* a_seq,
+                                           const float* b_seq, const float* a_log, const float* dt_bias,
+                                           const float* norm_weight, float rms_eps, int seq_len, int num_k_heads,
+                                           int num_v_heads, int k_dim, int v_dim, float* recurrent_state,
+                                           float* qk_norm_scratch, float* out_seq, cudaStream_t stream = nullptr,
+                                           bool force_global_fallback = false);
+
 // Runs a 1-layer or 4-layer block bundle on the active CUDA device with BF16 activation boundaries
 // and F32 GDN recurrent state. Caller must ensure a valid CUDA device is active.
 Qwen38BlockRunOutput run_qwen38_blocks_gpu(const Qwen38BlockBundleHost& bundle, bool use_chunk_prefill,

@@ -270,9 +270,6 @@ struct Qwen38DenseBackend::Impl {
   DevBuf<float> residual;
   DevBuf<float> qkv;
   DevBuf<float> conv_out;
-  DevBuf<float> q_sep;
-  DevBuf<float> k_sep;
-  DevBuf<float> v_sep;
   DevBuf<float> z_buf;
   DevBuf<float> a_buf;
   DevBuf<float> b_buf;
@@ -358,8 +355,6 @@ struct Qwen38DenseBackend::Impl {
 
     const auto t0 = std::chrono::steady_clock::now();
     const int cd = c.linear_conv_dim();
-    const int kd = c.linear_key_dim();
-    const int vd = c.linear_value_dim();
     const int nhv = c.linear_num_value_heads;
     const int nkh = c.linear_num_key_heads;
     const int k_dim = c.linear_key_head_dim;
@@ -387,22 +382,11 @@ struct Qwen38DenseBackend::Impl {
 
           float* conv_st = sess.state_->conv_states[lin_idx].ptr;
           float* rec_st = sess.state_->rec_states[lin_idx].ptr;
-          if (M == 1) {
-            qwen38_cuda_causal_conv1d_silu_step_f32(qkv.ptr, l.conv1d_weight, cd, c.linear_conv_kernel_dim, conv_st,
-                                                     conv_out.ptr, ctx.stream);
-            qwen38_cuda_gdn_recurrent_step_f32(conv_out.ptr, conv_out.ptr + kd, conv_out.ptr + 2 * kd, z_buf.ptr,
-                                               a_buf.ptr, b_buf.ptr, l.a_log, l.dt_bias, l.linear_norm_weight,
-                                               c.rms_norm_eps, nkh, nhv, k_dim, v_dim, rec_st, gdn_scratch.ptr,
-                                               core_out.ptr, ctx.stream);
-          } else {
-            qwen38_cuda_causal_conv1d_silu_prefill_f32(qkv.ptr, l.conv1d_weight, M, cd, c.linear_conv_kernel_dim,
-                                                       conv_st, conv_out.ptr, ctx.stream);
-            qwen38_cuda_split_qkv_sep_f32(conv_out.ptr, q_sep.ptr, k_sep.ptr, v_sep.ptr, M, kd, vd, ctx.stream);
-            qwen38_cuda_gdn_chunk_prefill_f32(q_sep.ptr, k_sep.ptr, v_sep.ptr, z_buf.ptr, a_buf.ptr, b_buf.ptr,
-                                              l.a_log, l.dt_bias, l.linear_norm_weight, c.rms_norm_eps, M,
-                                              std::min(64, M), nkh, nhv, k_dim, v_dim, rec_st, gdn_scratch.ptr,
-                                              core_out.ptr, ctx.stream);
-          }
+          qwen38_cuda_causal_conv1d_silu_prefill_f32(qkv.ptr, l.conv1d_weight, M, cd, c.linear_conv_kernel_dim,
+                                                     conv_st, conv_out.ptr, ctx.stream);
+          qwen38_cuda_gdn_recurrent_prefill_f32(conv_out.ptr, z_buf.ptr, a_buf.ptr, b_buf.ptr, l.a_log, l.dt_bias,
+                                                l.linear_norm_weight, c.rms_norm_eps, M, nkh, nhv, k_dim, v_dim, rec_st,
+                                                gdn_scratch.ptr, core_out.ptr, ctx.stream);
           proj_forward_f32(l.out_proj, core_out.ptr, M, residual.ptr);
           ++lin_idx;
         } else {
@@ -610,9 +594,120 @@ Qwen38GemmParityReport Qwen38DenseBackend::self_check_gemm_parity(int device_id)
   max_batch_inv = std::max(max_batch_inv, dev_max_abs(d_out_m1_row0.ptr, d_out_batched.ptr, N));
   max_batch_inv = std::max(max_batch_inv, dev_max_abs(d_out_m1_row16.ptr, d_out_batched.ptr + 16 * N, N));
 
+  // 4. GDN exact recurrent prefill invariance from non-zero initial state:
+  // whole (273, 64 KiB/head smem across 64/256 boundaries), ragged+boundary splits {17,47,192,17},
+  // forced same-order global fallback {64,192,17}, 273x M=1 seq prefill, and 273x Gate 1 recurrent_step.
+  constexpr int kGdnSeq = 273, kGdnKh = 2, kGdnVh = 6, kGdnKd = 128, kGdnVd = 128;
+  constexpr int kGdnKdTot = kGdnKh * kGdnKd;
+  constexpr int kGdnVdTot = kGdnVh * kGdnVd;
+  constexpr int kGdnCd = 2 * kGdnKdTot + kGdnVdTot;
+  constexpr std::size_t kGdnStateElems =
+      static_cast<std::size_t>(kGdnVh) * static_cast<std::size_t>(kGdnKd) * static_cast<std::size_t>(kGdnVd);
+
+  std::vector<float> h_gdn_conv(static_cast<std::size_t>(kGdnSeq * kGdnCd));
+  std::vector<float> h_gdn_z(static_cast<std::size_t>(kGdnSeq * kGdnVdTot));
+  std::vector<float> h_gdn_a(static_cast<std::size_t>(kGdnSeq * kGdnVh));
+  std::vector<float> h_gdn_b(static_cast<std::size_t>(kGdnSeq * kGdnVh));
+  std::vector<float> h_gdn_alog(static_cast<std::size_t>(kGdnVh));
+  std::vector<float> h_gdn_dtb(static_cast<std::size_t>(kGdnVh));
+  std::vector<float> h_gdn_nw(static_cast<std::size_t>(kGdnVd));
+  std::vector<float> h_gdn_st_init(kGdnStateElems);
+  for (float& v : h_gdn_conv) v = dist(rng);
+  for (float& v : h_gdn_z) v = dist(rng);
+  for (float& v : h_gdn_a) v = dist(rng) * 4.0f;
+  for (float& v : h_gdn_b) v = dist(rng) * 4.0f;
+  for (int i = 0; i < kGdnVh; ++i) {
+    h_gdn_alog[static_cast<std::size_t>(i)] = -2.0f + 1.3f * static_cast<float>(i);
+    h_gdn_dtb[static_cast<std::size_t>(i)] = -3.0f + 2.6f * static_cast<float>(i);
+  }
+  for (float& v : h_gdn_nw) v = 1.0f + dist(rng) * 0.2f;
+  for (float& v : h_gdn_st_init) v = dist(rng) * 0.1f;
+
+  DevBuf<float> d_gdn_conv(h_gdn_conv.size()), d_gdn_z(h_gdn_z.size()), d_gdn_a(h_gdn_a.size()),
+      d_gdn_b(h_gdn_b.size()), d_gdn_alog(h_gdn_alog.size()), d_gdn_dtb(h_gdn_dtb.size()), d_gdn_nw(h_gdn_nw.size()),
+      d_gdn_st_whole(kGdnStateElems), d_gdn_st_split(kGdnStateElems), d_gdn_st_fb(kGdnStateElems),
+      d_gdn_st_seq1(kGdnStateElems), d_gdn_st_gate1(kGdnStateElems),
+      d_gdn_scratch(static_cast<std::size_t>(2 * kGdnSeq * kGdnKdTot)), d_gdn_out_whole(h_gdn_z.size()),
+      d_gdn_out_split(h_gdn_z.size()), d_gdn_out_fb(h_gdn_z.size()), d_gdn_out_seq1(h_gdn_z.size()),
+      d_gdn_out_gate1(h_gdn_z.size());
+
+  CUDA_CHECK(cudaMemcpy(d_gdn_conv.ptr, h_gdn_conv.data(), h_gdn_conv.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_gdn_z.ptr, h_gdn_z.data(), h_gdn_z.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_gdn_a.ptr, h_gdn_a.data(), h_gdn_a.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_gdn_b.ptr, h_gdn_b.data(), h_gdn_b.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_gdn_alog.ptr, h_gdn_alog.data(), h_gdn_alog.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_gdn_dtb.ptr, h_gdn_dtb.data(), h_gdn_dtb.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_gdn_nw.ptr, h_gdn_nw.data(), h_gdn_nw.size() * sizeof(float), cudaMemcpyHostToDevice));
+  for (float* st_dst :
+       {d_gdn_st_whole.ptr, d_gdn_st_split.ptr, d_gdn_st_fb.ptr, d_gdn_st_seq1.ptr, d_gdn_st_gate1.ptr}) {
+    CUDA_CHECK(cudaMemcpy(st_dst, h_gdn_st_init.data(), kGdnStateElems * sizeof(float), cudaMemcpyHostToDevice));
+  }
+
+  // Whole sequence across 64/256 boundaries.
+  qwen38_cuda_gdn_recurrent_prefill_f32(d_gdn_conv.ptr, d_gdn_z.ptr, d_gdn_a.ptr, d_gdn_b.ptr, d_gdn_alog.ptr,
+                                        d_gdn_dtb.ptr, d_gdn_nw.ptr, 1e-6f, kGdnSeq, kGdnKh, kGdnVh, kGdnKd, kGdnVd,
+                                        d_gdn_st_whole.ptr, d_gdn_scratch.ptr, d_gdn_out_whole.ptr, ctx.stream);
+
+  // Ragged + 64/256 boundary splits: {17, 47, 192, 17} -> cumulative [17, 64, 256, 273].
+  {
+    int off = 0;
+    for (int slen : {17, 47, 192, 17}) {
+      qwen38_cuda_gdn_recurrent_prefill_f32(
+          d_gdn_conv.ptr + static_cast<std::size_t>(off * kGdnCd),
+          d_gdn_z.ptr + static_cast<std::size_t>(off * kGdnVdTot),
+          d_gdn_a.ptr + static_cast<std::size_t>(off * kGdnVh),
+          d_gdn_b.ptr + static_cast<std::size_t>(off * kGdnVh), d_gdn_alog.ptr, d_gdn_dtb.ptr, d_gdn_nw.ptr, 1e-6f,
+          slen, kGdnKh, kGdnVh, kGdnKd, kGdnVd, d_gdn_st_split.ptr, d_gdn_scratch.ptr,
+          d_gdn_out_split.ptr + static_cast<std::size_t>(off * kGdnVdTot), ctx.stream);
+      off += slen;
+    }
+  }
+
+  // Forced same-order global fallback splits {64, 192, 17}.
+  {
+    int off = 0;
+    for (int slen : {64, 192, 17}) {
+      qwen38_cuda_gdn_recurrent_prefill_f32(
+          d_gdn_conv.ptr + static_cast<std::size_t>(off * kGdnCd),
+          d_gdn_z.ptr + static_cast<std::size_t>(off * kGdnVdTot),
+          d_gdn_a.ptr + static_cast<std::size_t>(off * kGdnVh),
+          d_gdn_b.ptr + static_cast<std::size_t>(off * kGdnVh), d_gdn_alog.ptr, d_gdn_dtb.ptr, d_gdn_nw.ptr, 1e-6f,
+          slen, kGdnKh, kGdnVh, kGdnKd, kGdnVd, d_gdn_st_fb.ptr, d_gdn_scratch.ptr,
+          d_gdn_out_fb.ptr + static_cast<std::size_t>(off * kGdnVdTot), ctx.stream, true);
+      off += slen;
+    }
+  }
+
+  // M=1 sequential prefill + Gate 1 recurrent_step reference.
+  for (int t = 0; t < kGdnSeq; ++t) {
+    const float* conv_t = d_gdn_conv.ptr + static_cast<std::size_t>(t * kGdnCd);
+    const float* z_t = d_gdn_z.ptr + static_cast<std::size_t>(t * kGdnVdTot);
+    const float* a_t = d_gdn_a.ptr + static_cast<std::size_t>(t * kGdnVh);
+    const float* b_t = d_gdn_b.ptr + static_cast<std::size_t>(t * kGdnVh);
+    qwen38_cuda_gdn_recurrent_prefill_f32(conv_t, z_t, a_t, b_t, d_gdn_alog.ptr, d_gdn_dtb.ptr, d_gdn_nw.ptr, 1e-6f, 1,
+                                          kGdnKh, kGdnVh, kGdnKd, kGdnVd, d_gdn_st_seq1.ptr, d_gdn_scratch.ptr,
+                                          d_gdn_out_seq1.ptr + static_cast<std::size_t>(t * kGdnVdTot), ctx.stream);
+    qwen38_cuda_gdn_recurrent_step_f32(conv_t, conv_t + kGdnKdTot, conv_t + 2 * kGdnKdTot, z_t, a_t, b_t,
+                                       d_gdn_alog.ptr, d_gdn_dtb.ptr, d_gdn_nw.ptr, 1e-6f, kGdnKh, kGdnVh, kGdnKd,
+                                       kGdnVd, d_gdn_st_gate1.ptr, d_gdn_scratch.ptr,
+                                       d_gdn_out_gate1.ptr + static_cast<std::size_t>(t * kGdnVdTot), ctx.stream);
+  }
+  ctx.synchronize();
+
   rep.batch_invariance_max_abs = max_batch_inv;
+  float gdn_bi = 0.0f;
+  gdn_bi = std::max(gdn_bi, dev_max_abs(d_gdn_out_whole.ptr, d_gdn_out_seq1.ptr, h_gdn_z.size()));
+  gdn_bi = std::max(gdn_bi, dev_max_abs(d_gdn_st_whole.ptr, d_gdn_st_seq1.ptr, kGdnStateElems));
+  gdn_bi = std::max(gdn_bi, dev_max_abs(d_gdn_out_split.ptr, d_gdn_out_seq1.ptr, h_gdn_z.size()));
+  gdn_bi = std::max(gdn_bi, dev_max_abs(d_gdn_st_split.ptr, d_gdn_st_seq1.ptr, kGdnStateElems));
+  gdn_bi = std::max(gdn_bi, dev_max_abs(d_gdn_out_fb.ptr, d_gdn_out_seq1.ptr, h_gdn_z.size()));
+  gdn_bi = std::max(gdn_bi, dev_max_abs(d_gdn_st_fb.ptr, d_gdn_st_seq1.ptr, kGdnStateElems));
+  rep.gdn_batch_invariance_max_abs = gdn_bi;
+  rep.gdn_prefill_vs_step_max_abs = std::max(dev_max_abs(d_gdn_out_whole.ptr, d_gdn_out_gate1.ptr, h_gdn_z.size()),
+                                             dev_max_abs(d_gdn_st_whole.ptr, d_gdn_st_gate1.ptr, kGdnStateElems));
   rep.passed = (rep.nvfp4_max_abs <= 1e-4f && rep.fp8_cal_max_abs <= 1e-4f && rep.bf16_max_abs <= 1e-4f &&
-                rep.batch_invariance_max_abs == 0.0f);
+                rep.batch_invariance_max_abs == 0.0f && rep.gdn_prefill_vs_step_max_abs <= 1e-6f &&
+                rep.gdn_batch_invariance_max_abs == 0.0f);
   return rep;
 }
 
@@ -921,16 +1016,11 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   impl_->residual.allocate(static_cast<std::size_t>(P * H));
   impl_->qkv.allocate(static_cast<std::size_t>(P * cd));
   impl_->conv_out.allocate(static_cast<std::size_t>(P * cd));
-  impl_->q_sep.allocate(static_cast<std::size_t>(P * kd));
-  impl_->k_sep.allocate(static_cast<std::size_t>(P * kd));
-  impl_->v_sep.allocate(static_cast<std::size_t>(P * vd));
   impl_->z_buf.allocate(static_cast<std::size_t>(P * vd));
   impl_->a_buf.allocate(static_cast<std::size_t>(P * nhv));
   impl_->b_buf.allocate(static_cast<std::size_t>(P * nhv));
   impl_->core_out.allocate(static_cast<std::size_t>(P * vd));
-  const std::size_t gdn_ws = qwen38_cuda_gdn_chunk_scratch_floats(
-      P, std::min(64, P), c.linear_num_key_heads, nhv, c.linear_key_head_dim, c.linear_value_head_dim);
-  impl_->gdn_scratch.allocate(std::max<std::size_t>(gdn_ws, static_cast<std::size_t>(2 * kd)));
+  impl_->gdn_scratch.allocate(static_cast<std::size_t>(P) * static_cast<std::size_t>(kd) * 2ull);
 
   impl_->q_gate.allocate(static_cast<std::size_t>(P * qg_dim));
   impl_->k_raw.allocate(static_cast<std::size_t>(P * kv_dim));
@@ -948,11 +1038,10 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
 
   impl_->scratch_bytes =
       (impl_->act_quant_scratch.count + impl_->hidden.count + impl_->normed.count + impl_->residual.count +
-       impl_->qkv.count + impl_->conv_out.count + impl_->q_sep.count + impl_->k_sep.count + impl_->v_sep.count +
-       impl_->z_buf.count + impl_->a_buf.count + impl_->b_buf.count + impl_->core_out.count + impl_->q_gate.count +
-       impl_->k_raw.count + impl_->v_raw.count + impl_->q_tmp.count + impl_->gate_tmp.count + impl_->attn_out.count +
-       impl_->mlp_gate.count + impl_->mlp_up.count + impl_->cap_hidden.count + impl_->cap_normed.count +
-       impl_->gdn_scratch.count + impl_->logits_f32.count) *
+       impl_->qkv.count + impl_->conv_out.count + impl_->z_buf.count + impl_->a_buf.count + impl_->b_buf.count +
+       impl_->core_out.count + impl_->q_gate.count + impl_->k_raw.count + impl_->v_raw.count + impl_->q_tmp.count +
+       impl_->gate_tmp.count + impl_->attn_out.count + impl_->mlp_gate.count + impl_->mlp_up.count +
+       impl_->cap_hidden.count + impl_->cap_normed.count + impl_->gdn_scratch.count + impl_->logits_f32.count) *
           sizeof(float) +
       (impl_->token_ids_dev.count + impl_->gather_rows_dev.count) * sizeof(std::int32_t);
 
@@ -1102,7 +1191,8 @@ void Qwen38DenseBackend::evaluate_teacher_forced(const ingine::model::BackendReq
 void Qwen38DenseBackend::generate_greedy_exact(std::span<const std::int32_t> prompt_ids, int max_new_tokens,
                                                bool use_chunk_prefill, bool stop_on_eos,
                                                std::vector<std::int32_t>& out_tokens, double* prefill_ms_out,
-                                               double* decode_ms_out, Qwen38DenseSession* session) {
+                                               double* decode_ms_out, Qwen38DenseSession* session,
+                                               const ingine::model::LogitCallback& on_step_logits) {
   out_tokens.clear();
   if (prompt_ids.empty() || max_new_tokens <= 0) return;
   const int V = manifest().config.vocab_size;
@@ -1125,6 +1215,7 @@ void Qwen38DenseBackend::generate_greedy_exact(std::span<const std::int32_t> pro
       }
     }
     next_tok = best_id;
+    if (on_step_logits) on_step_logits(step);
   };
 
   const std::array<int, 1> last_cap = {static_cast<int>(prompt_ids.size()) - 1};
