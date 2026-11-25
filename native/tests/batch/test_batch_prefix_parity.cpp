@@ -376,7 +376,23 @@ int main(int argc, char** argv) {
       const auto out = drain(*jobs[i]);
       const auto pst = jobs[i]->prefill_stats();
       CHECK(pst.has_value() && pst->reuse == ingine::model::Reuse::PagedPrefix && pst->reused_tokens >= 64);
-      if (out != fork_refs[i]) print_vec_diff("fork", out, fork_refs[i]);
+      if (out != fork_refs[i]) {
+        std::printf("  [fork i=%zu] vs B=1 ref mismatch:\n", i);
+        print_vec_diff("fork", out, fork_refs[i]);
+        // Matched-batch B=4 cold bypass diagnostic (distinguishes B=1 vs B=4 FP8 GEMM drift from cache bugs).
+        std::vector<std::shared_ptr<ingine::engine::Job>> cold_jobs;
+        for (const auto& fp : fork_prompts) {
+          auto cj = std::make_shared<ingine::engine::Job>(fp, gen_tokens, greedy, std::vector<ingine::model::PromptImage>{},
+                                                          0, "ns-cold-diag", /*bypass_prefix_cache=*/true);
+          if (sched.submit(cj)) cold_jobs.push_back(std::move(cj));
+        }
+        std::vector<std::vector<int32_t>> cold_outs;
+        for (auto& cj : cold_jobs) cold_outs.push_back(drain(*cj));
+        if (i < cold_outs.size()) {
+          std::printf("  [fork i=%zu] cached_B4 vs cold_bypass_B4: %d/%zu tokens matched\n", i,
+                      count_matching(out, cold_outs[i]), cold_outs[i].size());
+        }
+      }
       CHECK(out == fork_refs[i]);
     }
 
@@ -551,6 +567,21 @@ int main(int argc, char** argv) {
     CHECK(sched.submit(j_press));
     const auto out_sib = drain(*j_sib);
     const auto out_press = drain(*j_press);
+    if (out_sib != ref_p128_a) {
+      print_vec_diff("tight_evict_sib_vs_B1", out_sib, ref_p128_a);
+      auto cj_sib = std::make_shared<ingine::engine::Job>(p128_a, gen_tokens, greedy,
+                                                          std::vector<ingine::model::PromptImage>{}, 0, "tight-cold-a",
+                                                          /*bypass_prefix_cache=*/true);
+      auto cj_press = std::make_shared<ingine::engine::Job>(p_pressure, gen_tokens, greedy,
+                                                            std::vector<ingine::model::PromptImage>{}, 0,
+                                                            "tight-cold-c", /*bypass_prefix_cache=*/true);
+      if (sched.submit(cj_sib) && sched.submit(cj_press)) {
+        const auto cold_sib = drain(*cj_sib);
+        (void)drain(*cj_press);
+        std::printf("  [tight_evict] cached_B2 vs cold_bypass_B2: %d/%zu tokens matched\n",
+                    count_matching(out_sib, cold_sib), cold_sib.size());
+      }
+    }
     CHECK(out_sib == ref_p128_a);
     CHECK(!out_press.empty());
     const auto st_sib = j_sib->prefill_stats();

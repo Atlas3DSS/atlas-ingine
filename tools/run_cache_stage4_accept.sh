@@ -14,6 +14,7 @@ REPO="/home/orwel/dev_genius/engines/atlas-ingine-cache-827"
 BUILD="$REPO/native/build-sm120a"
 SERVE_BIN="$BUILD/apps/serve/ingine-serve"
 MODEL_DIR="/mnt/storage/models/Inkling-2-Mini-ingine"
+MODEL_10G_DIR="/mnt/storage/models/Inkling-2-Mini-atlas-10g"
 TRACES_DIR="$REPO/results/cache_stage1_traces"
 OUT_DIR="$REPO/results/stage4_accept"
 PORT=18497
@@ -43,8 +44,15 @@ EOF
 )
 echo "GPU=$GPU_NAME ($GPU_UUID)"
 
-echo "=== [1/5] GPU STAGE 2: batch_prefix_parity (full logits + KL + edge matrix) ==="
-INGINE_MODEL_DIR="$MODEL_DIR" "$BUILD/tests/batch/batch_prefix_parity"
+OVERALL_RC=0
+
+echo "=== [1/6] GPU STAGE 2: batch_prefix_parity on Inkling-2-Mini-atlas-10g (#825 regression) ==="
+if INGINE_MODEL_DIR="$MODEL_10G_DIR" "$BUILD/tests/batch/batch_prefix_parity" "$MODEL_10G_DIR"; then
+  echo "GATE_1_BATCH_PREFIX_PARITY_10G=PASS"
+else
+  echo "GATE_1_BATCH_PREFIX_PARITY_10G=FAIL"
+  OVERALL_RC=1
+fi
 
 run_arm() {
   local mode="$1"
@@ -109,13 +117,41 @@ PYTHONPATH="$REPO/tools" python3 "$REPO/tools/cache_stage4_accept.py" compare \
   --batch-warm "$OUT_DIR/stage4_batch_warm.json" \
   --output "$OUT_DIR/cache_stage4_accept_summary.json"
 
-echo "=== [3/5] GPU CORE REUSE: model_reuse ==="
-INGINE_MODEL_DIR="$MODEL_DIR" "$BUILD/tests/model/model_reuse"
+echo "=== [3/6] GPU CORE REUSE: model_reuse ==="
+if INGINE_MODEL_DIR="$MODEL_DIR" "$BUILD/tests/model/model_reuse"; then
+  echo "GATE_3_MODEL_REUSE=PASS"
+else
+  echo "GATE_3_MODEL_REUSE=FAIL"
+  OVERALL_RC=1
+fi
 
-echo "=== [4/5] GPU STAGE 3: model_cache_stage3 (FP8 KV) ==="
-INGINE_MODEL_DIR="$MODEL_DIR" "$BUILD/tests/model/model_cache_stage3" --model-dir "$MODEL_DIR"
+echo "=== [4/6] GPU STAGE 3: model_cache_stage3 (FP8 KV) ==="
+if INGINE_MODEL_DIR="$MODEL_DIR" "$BUILD/tests/model/model_cache_stage3" --model-dir "$MODEL_DIR"; then
+  echo "GATE_4_STAGE3_FP8=PASS"
+else
+  echo "GATE_4_STAGE3_FP8=FAIL"
+  OVERALL_RC=1
+fi
 
-echo "=== [5/5] GPU STAGE 3: model_cache_stage3 (--kv-q4) ==="
-INGINE_MODEL_DIR="$MODEL_DIR" "$BUILD/tests/model/model_cache_stage3" --model-dir "$MODEL_DIR" --kv-q4
+echo "=== [5/6] GPU STAGE 3: model_cache_stage3 (--kv-q4) ==="
+if INGINE_MODEL_DIR="$MODEL_DIR" "$BUILD/tests/model/model_cache_stage3" --model-dir "$MODEL_DIR" --kv-q4; then
+  echo "GATE_5_STAGE3_Q4=PASS"
+else
+  echo "GATE_5_STAGE3_Q4=FAIL"
+  OVERALL_RC=1
+fi
 
-echo "=== STAGE4_827_ALL_PASS ==="
+echo "=== [6/6] GPU STAGE 2: batch_prefix_parity on Inkling-2-Mini-ingine (dense_fp8 + B>1 matched-bypass diag) ==="
+if INGINE_MODEL_DIR="$MODEL_DIR" "$BUILD/tests/batch/batch_prefix_parity" "$MODEL_DIR"; then
+  echo "GATE_6_BATCH_PREFIX_PARITY_INGINE=PASS"
+else
+  echo "GATE_6_BATCH_PREFIX_PARITY_INGINE=FAIL"
+  OVERALL_RC=1
+fi
+
+if [ "$OVERALL_RC" -eq 0 ]; then
+  echo "=== STAGE4_827_ALL_PASS ==="
+else
+  echo "=== STAGE4_827_PARTIAL_OR_FAIL (rc=$OVERALL_RC) ==="
+fi
+exit "$OVERALL_RC"
