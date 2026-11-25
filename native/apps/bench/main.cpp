@@ -165,11 +165,11 @@ int main(int argc, char** argv) {
   std::string concurrency_csv;
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
-  int max_batch = 0, max_kv_tokens = 0;
+  int max_batch = 0, max_kv_tokens = 0, park_mb = -1, park_host_mb = 0;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
-       ignore_eos = false, staggered = false;
+       ignore_eos = false, staggered = false, no_prefix_cache = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -211,6 +211,11 @@ int main(int argc, char** argv) {
   ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
+  ap.option("--park-mb", "", "VRAM cap (MiB) for Tier-0 parked checkpoints (-1 = auto, 0 = off)", &park_mb);
+  ap.option("--park-host-mb", "", "pinned host RAM cap (MiB) for Tier-1 parked checkpoints (default 0 = off)",
+            &park_host_mb);
+  ap.flag("--no-prefix-cache", "disable all prefix/root/parked checkpoint reuse (cache-off parity baseline)",
+          &no_prefix_cache);
   ap.option("--temperature", "", "", &temperature);
   ap.option("--long-prompt", "", "also time prefill of a synthetic prompt of N tokens", &long_prompt);
   ap.option("--forced", "", "teacher-forced replay of the outputs in FILE (JSON lines {name, prompt, output})",
@@ -225,6 +230,7 @@ int main(int argc, char** argv) {
   ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity (0 = auto)", &max_kv_tokens);
   ap.flag("--ignore-eos", "with --concurrency: decode full --tokens per request (steady-state peak throughput)", &ignore_eos);
   ap.flag("--staggered", "with --concurrency: also run a staggered mid-generation continuous-batching arrival pass", &staggered);
+  ap.flag("--no-prefix-cache", "disable prefix checkpoint caching (cache-off parity baseline)", &no_prefix_cache);
   ap.parse(argc, argv);
 
   try {
@@ -269,6 +275,9 @@ int main(int argc, char** argv) {
     options.kv_ckpt_resume = kv_ckpt_resume;
     options.spec = (resolved_max_batch > 1) ? false : spec;
     options.spec_threshold = float(spec_threshold);
+    options.park_mb = park_mb;
+    options.park_host_mb = park_host_mb;
+    options.prefix_cache = !no_prefix_cache;
     options.vision = vision;
     options.offload_vram_mb = offload_vram_mb;
     options.offload_ram_mb = offload_ram_mb;
@@ -277,6 +286,7 @@ int main(int argc, char** argv) {
     options.dump_router_stats = dump_router_stats;
     options.max_batch = resolved_max_batch;
     options.max_kv_tokens = max_kv_tokens;
+    options.prefix_cache = !no_prefix_cache;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;

@@ -68,13 +68,14 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
-  std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1";
-  int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1;
+  std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
+  int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
+      park_host_mb = 0;
   int max_batch = 1, max_kv_tokens = 0;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
-       no_vision = false, atlas_6g = false, persona_probe_mode = false;
+       no_vision = false, atlas_6g = false, persona_probe_mode = false, no_prefix_cache = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -134,6 +135,14 @@ int main(int argc, char** argv) {
             "device memory (MiB) for conversations displaced by another one, released when memory runs short, "
             "0 = off (default: min(3072, free memory after start-up - 4096))",
             &park_mb);
+  ap.option("--park-host-mb", "",
+            "pinned host RAM cap (MiB) for Tier-1 parked checkpoints (LRU eviction, graceful fallback; default 0 = off)",
+            &park_host_mb);
+  ap.flag("--no-prefix-cache", "disable all prefix/root/parked checkpoint reuse (cache-off parity baseline)",
+          &no_prefix_cache);
+  ap.option("--cache-namespace-header", "",
+            "trusted proxy HTTP header isolating prefix-cache namespaces (absent/empty fails closed to bypass)",
+            &cache_namespace_header);
   ap.flag("--no-vision", "text only: do not load the vision tower (saves 0.6 GB) and reject requests with images",
           &no_vision);
   ap.option("--image-max-tokens", "",
@@ -146,6 +155,12 @@ int main(int argc, char** argv) {
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
   ap.option("--max-batch", "", "max concurrent sequences for continuous batching (1 = single-request mode)", &max_batch);
   ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity for --max-batch > 1 (0 = auto)", &max_kv_tokens);
+  ap.flag("--no-prefix-cache", "disable prefix checkpoint caching (cache-off parity baseline for B=1 and B>1)",
+          &no_prefix_cache);
+  ap.option("--cache-namespace-header", "",
+            "trusted proxy header scoping prefix cache per tenant (default: single trusted server scope; requests "
+            "with Authorization/user/prompt_cache_key fail-closed bypass reuse when unset)",
+            &cache_namespace_header);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
   ap.option("--log-level", "", "", &log_level);
@@ -232,6 +247,8 @@ int main(int argc, char** argv) {
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
+      options.park_host_mb = park_host_mb;
+      options.prefix_cache = !no_prefix_cache;
       options.vision = !no_vision;
       options.offload_vram_mb = offload_vram_mb;
       options.offload_ram_mb = offload_ram_mb;
@@ -262,6 +279,7 @@ int main(int argc, char** argv) {
     server_options.images.max_images = max_images;
     server_options.images.max_total_tokens = max_image_tokens;
     server_options.personas = personas;
+    server_options.cache_namespace_header = cache_namespace_header;
     log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
              server_options.sampling.top_p, server_options.sampling.top_k);
     ingine::serve::ChatServer server(*generator, fmt, server_options);

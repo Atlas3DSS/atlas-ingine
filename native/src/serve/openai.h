@@ -39,13 +39,16 @@ struct ChatRequest {
   std::vector<int32_t> prompt_ids;   // full prompt, prefill included; images expanded to their tokens
   std::vector<int32_t> prefill_ids;  // tail of prompt_ids the model would otherwise have generated
   std::vector<model::PromptImage> images;  // by position in prompt_ids
+  int root_prefix_tokens = 0;        // verified leading system+tools+effort boundary in prompt_ids
   int max_new_tokens = 0;
   model::Sampling sampling;
   std::vector<std::string> stop;
   std::string persona_name;  // optional per-request persona profile selector (empty = server default)
   text::RenderStats render_stats;  // CPU tokenization cache stats (distinct from GPU prefix reuse)
+  bool has_isolation_hint = false;  // true if request carries "user" or "prompt_cache_key" (signals tenant isolation)
   bool stream = false;
   bool include_usage = false;
+  bool has_user_or_cache_key = false;  // true if JSON body specifies non-empty `user` or `prompt_cache_key`
 };
 
 // Validates `body` (a JSON object) and renders the prompt. Throws BadRequest or text::ChatError. Sampling fields

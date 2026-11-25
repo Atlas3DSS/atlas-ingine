@@ -39,6 +39,8 @@ struct DeviceUploader::Impl {
         std::uint64_t offset;
         std::uint64_t bytes;
         void* dst;
+        std::size_t req_idx   = 0;
+        std::size_t chunk_idx = 0;
     };
     struct Slot {
         std::byte* host    = nullptr;
@@ -107,7 +109,8 @@ struct DeviceUploader::Impl {
         (void)cudaFreeHost(pinned_);
     }
 
-    UploadStats upload(std::span<const UploadRequest> requests, cudaStream_t stream) {
+    UploadStats upload(std::span<const UploadRequest> requests, cudaStream_t stream,
+                       UploadChunkObserver observer = {}) {
         nvtx::ScopedRange range(nvtx::Name::WeightUpload, nvtx::Category::Load);
         const auto start = std::chrono::steady_clock::now();
         int current      = 0;
@@ -120,7 +123,8 @@ struct DeviceUploader::Impl {
 
         std::vector<Chunk> chunks;
         UploadStats stats;
-        for (const UploadRequest& r : requests) {
+        for (std::size_t ri = 0; ri < requests.size(); ++ri) {
+            const UploadRequest& r = requests[ri];
             if (r.bytes == 0) { continue; }
             if (r.file == nullptr || r.dst == nullptr) {
                 throw std::invalid_argument(
@@ -130,11 +134,12 @@ struct DeviceUploader::Impl {
                 throw std::out_of_range("DeviceUploader::upload: range exceeds " +
                                         r.file->path().string());
             }
-            for (std::uint64_t done = 0; done < r.bytes;) {
+            std::size_t ci = 0;
+            for (std::uint64_t done = 0; done < r.bytes; ++ci) {
                 const std::uint64_t n =
                     std::min<std::uint64_t>(r.bytes - done, options_.chunk_bytes);
-                chunks.push_back(
-                    Chunk{r.file, r.offset + done, n, static_cast<std::byte*>(r.dst) + done});
+                chunks.push_back(Chunk{r.file, r.offset + done, n,
+                                       static_cast<std::byte*>(r.dst) + done, ri, ci});
                 done += n;
             }
             stats.bytes += r.bytes;
@@ -146,12 +151,14 @@ struct DeviceUploader::Impl {
             chunks_         = std::move(chunks);
             next_chunk_     = 0;
             stream_         = stream;
+            observer_       = std::move(observer);
             error_          = nullptr;
             active_workers_ = static_cast<int>(workers_.size());
             ++generation_;
             work_cv_.notify_all();
             done_cv_.wait(lock, [this] { return active_workers_ == 0; });
             chunks_.clear();
+            observer_ = {};
         }
 
         cudaError_t sync_err = cudaSuccess;
@@ -212,6 +219,10 @@ struct DeviceUploader::Impl {
                     nvtx::ScopedRange read_range(nvtx::Name::WeightRead, nvtx::Category::Load,
                                                  chunk.bytes);
                     chunk.file->read_range(chunk.offset, chunk.bytes, slot.host);
+                    if (observer_) {
+                        observer_(chunk.req_idx, chunk.chunk_idx, slot.host,
+                                  static_cast<std::size_t>(chunk.bytes));
+                    }
                 }
                 {
                     std::lock_guard lock(stream_mutex_);
@@ -266,6 +277,7 @@ struct DeviceUploader::Impl {
     std::vector<Chunk> chunks_;
     std::size_t next_chunk_ = 0;
     cudaStream_t stream_    = nullptr;
+    UploadChunkObserver observer_;
     int device_             = 0;
     std::exception_ptr error_;
 };
@@ -276,8 +288,8 @@ DeviceUploader::DeviceUploader(UploadOptions options)
 DeviceUploader::~DeviceUploader() = default;
 
 UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests,
-                                   hal::StreamHandle stream) {
-    return impl_->upload(requests, static_cast<cudaStream_t>(stream));
+                                   hal::StreamHandle stream, UploadChunkObserver observer) {
+    return impl_->upload(requests, static_cast<cudaStream_t>(stream), std::move(observer));
 }
 
 void fail_next_uploader_worker_start(int worker_index) noexcept {

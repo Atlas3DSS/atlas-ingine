@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -141,10 +142,13 @@ struct UploadRequest {
                                            const SafetensorsTensor& tensor, void* dst);
 [[nodiscard]] UploadRequest upload_request(SafetensorsRef ref, void* dst);
 
+// Canonical chunk size shared by DeviceUploader and chunked safetensors content digests.
+inline constexpr std::size_t kSafetensorsHashChunkBytes = std::size_t(32) << 20;
+
 struct UploadOptions {
-    std::size_t chunk_bytes = std::size_t(32) << 20; // staging buffer size and max bytes per copy
-    int staging_buffers     = 12;                    // pinned buffers in flight
-    int reader_threads      = 6;                     // threads reading file data into staging
+    std::size_t chunk_bytes = kSafetensorsHashChunkBytes; // staging buffer size and max bytes per copy
+    int staging_buffers     = 12;                         // pinned buffers in flight
+    int reader_threads      = 6;                          // threads reading file data into staging
 };
 
 struct UploadStats {
@@ -154,6 +158,11 @@ struct UploadStats {
         return seconds > 0 ? double(bytes) / double(1ull << 30) / seconds : 0.0;
     }
 };
+
+// Optional per-chunk host-buffer observer invoked from a reader thread right after pread, with
+// (request_index, chunk_index_within_request, host_data, chunk_bytes). Must be thread-safe.
+using UploadChunkObserver =
+    std::function<void(std::size_t req_idx, std::size_t chunk_idx, const void* data, std::size_t bytes)>;
 
 // Uploads file ranges to device memory. Reader threads pread chunks into pinned staging buffers and
 // enqueue each chunk's cudaMemcpyAsync as soon as it is read, so disk/page-cache reads, the copies of
@@ -170,7 +179,8 @@ public:
     // Copies every request (on `stream`, after the work already queued there) and returns once all
     // bytes have arrived on the device. Destinations must not overlap. On CUDA builds, the calling
     // thread's current device must match the device at construction. One upload() at a time per uploader.
-    UploadStats upload(std::span<const UploadRequest> requests, hal::StreamHandle stream);
+    UploadStats upload(std::span<const UploadRequest> requests, hal::StreamHandle stream,
+                       UploadChunkObserver observer = {});
 
     [[nodiscard]] const UploadOptions& options() const noexcept { return options_; }
 

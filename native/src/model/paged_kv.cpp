@@ -504,10 +504,10 @@ void PagedKvCache::export_page_to_host(int fi, int page, std::uint8_t* dst_k, st
                                        cudaStream_t compute_stream) {
   const PageMeta& pm = meta_[fi][page];
   if (pm.loc == Loc::Vram) {
-    CUDA_CHECK(cudaStreamSynchronize(compute_stream));
     const std::uint8_t* src = vram_slab_.slot_ptr(pm.slot);
-    if (dst_k) CUDA_CHECK(cudaMemcpy(dst_k, src, kKPageBytes, cudaMemcpyDeviceToHost));
-    if (dst_v) CUDA_CHECK(cudaMemcpy(dst_v, src + kKPageBytes, kVPageBytes, cudaMemcpyDeviceToHost));
+    if (dst_k) CUDA_CHECK(cudaMemcpyAsync(dst_k, src, kKPageBytes, cudaMemcpyDeviceToHost, compute_stream));
+    if (dst_v) CUDA_CHECK(cudaMemcpyAsync(dst_v, src + kKPageBytes, kVPageBytes, cudaMemcpyDeviceToHost, compute_stream));
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream));
   } else if (pm.loc == Loc::Ram) {
     const std::uint8_t* src = ram_host_ptr(pm.slot);
     if (dst_k) std::memcpy(dst_k, src, kKPageBytes);
@@ -539,10 +539,10 @@ void PagedKvCache::import_page_from_host(int fi, int page, const std::uint8_t* s
     }
   }
   ensure_write_pages(fi, page * kPageTokens, 1, compute_stream);
-  CUDA_CHECK(cudaStreamSynchronize(compute_stream));
   std::uint8_t* dst = vram_slab_.slot_ptr(meta_[fi][page].slot);
-  CUDA_CHECK(cudaMemcpy(dst, src_k, kKPageBytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dst + kKPageBytes, src_v, kVPageBytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(dst, src_k, kKPageBytes, cudaMemcpyHostToDevice, compute_stream));
+  CUDA_CHECK(cudaMemcpyAsync(dst + kKPageBytes, src_v, kVPageBytes, cudaMemcpyHostToDevice, compute_stream));
+  CUDA_CHECK(cudaStreamSynchronize(compute_stream));
 }
 
 void PagedKvCache::flush_all_tables(cudaStream_t stream) {

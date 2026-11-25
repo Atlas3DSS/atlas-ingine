@@ -37,10 +37,14 @@ std::string type_name(const std::exception& e) {
 }  // namespace
 
 Job::Job(std::vector<int32_t> prompt_ids_, int max_new_tokens_, model::Sampling sampling_,
-         std::vector<model::PromptImage> images_)
+         std::vector<model::PromptImage> images_, int root_prefix_tokens_, std::string cache_namespace_,
+         bool bypass_prefix_cache_)
     : id("chatcmpl-" + random_hex32()),
       prompt_ids(std::move(prompt_ids_)),
       images(std::move(images_)),
+      root_prefix_tokens(root_prefix_tokens_),
+      cache_namespace(std::move(cache_namespace_)),
+      bypass_prefix_cache(bypass_prefix_cache_),
       max_new_tokens(max_new_tokens_),
       sampling(sampling_),
       t_submit(Clock::now()) {}
@@ -192,6 +196,11 @@ void Scheduler::loop_batched() {
     int max_new_tokens = 0;
   };
   std::vector<SlotEntry> live;
+  live.reserve(std::size_t(max_batch_));
+  {
+    std::lock_guard lock(mutex_);
+    active_.reserve(std::size_t(max_batch_));
+  }
 
   auto remove_active_job = [&](const std::shared_ptr<Job>& job) {
     std::lock_guard lock(mutex_);
@@ -231,26 +240,82 @@ void Scheduler::loop_batched() {
 
     // 2. Admit newly arrived waiting jobs into free slots (new requests join mid-generation).
     while (int(live.size()) < max_batch_) {
-      std::shared_ptr<Job> job;
+      std::shared_ptr<Job> candidate;
+      bool need_admit_check = false;
       {
         std::lock_guard lock(mutex_);
         if (closed_ || waiting_.empty()) break;
         const auto& front = waiting_.front();
         if (front->cancelled()) {
-          job = front;
+          candidate = front;
           waiting_.pop_front();
-        } else if (!live.empty() && !generator_.can_admit_slot(int(front->prompt_ids.size()), front->max_new_tokens)) {
-          break;  // wait until an active slot frees KV pages
+        } else if (!live.empty()) {
+          candidate = front;
+          need_admit_check = true;
         } else {
-          job = front;
+          candidate = front;
+          active_.push_back(candidate);
           waiting_.pop_front();
-          active_.push_back(job);
         }
       }
-      if (job->cancelled()) {
-        job->finish();
+      if (!need_admit_check && candidate->cancelled()) {
+        candidate->finish();
         continue;
       }
+      if (need_admit_check) {
+        // Perform prompt-aware admission check OUTSIDE mutex_ and inside a per-job try/catch so any
+        // exception fails only `candidate` while active live slots and subsequent waiting jobs continue.
+        const int cn = int(candidate->prompt_ids.size());
+        int c_eff = candidate->max_new_tokens;
+        if (!candidate->sampling.forced.empty()) c_eff = std::min(c_eff, int(candidate->sampling.forced.size()));
+        const int max_len = generator_.max_model_len();
+        if (cn + c_eff > max_len) c_eff = std::max(0, max_len - cn);
+        bool admitted = false;
+        std::optional<std::string> admit_err;
+        try {
+          admitted = generator_.can_admit_slot(
+              model::Prompt{candidate->prompt_ids, candidate->images, candidate->root_prefix_tokens,
+                            candidate->cache_namespace, candidate->bypass_prefix_cache},
+              c_eff, candidate->sampling);
+        } catch (const std::exception& e) {
+          server_log().error("admission check failed: {}: {}", type_name(e), e.what());
+          admit_err = "generation failed: " + type_name(e) + ": " + e.what();
+        } catch (...) {
+          server_log().error("admission check failed: unknown exception");
+          admit_err = "generation failed: unknown exception";
+        }
+        if (admit_err) {
+          bool owned = false;
+          {
+            std::lock_guard lock(mutex_);
+            auto it = std::find(waiting_.begin(), waiting_.end(), candidate);
+            if (it != waiting_.end()) {
+              waiting_.erase(it);
+              owned = true;
+            }
+          }
+          // Only fail/finish `candidate` if we still owned it in waiting_; close() or withdraw()
+          // may already have finalized it while can_admit_slot() was running.
+          if (owned) {
+            candidate->fail(*admit_err);
+            candidate->finish();
+          }
+          continue;
+        }
+        if (!admitted) break;  // wait until an active slot frees KV pages
+        {
+          std::lock_guard lock(mutex_);
+          if (closed_ || waiting_.empty() || waiting_.front() != candidate) continue;
+          if (candidate->cancelled()) {
+            waiting_.pop_front();
+            candidate->finish();
+            continue;
+          }
+          active_.push_back(candidate);
+          waiting_.pop_front();
+        }
+      }
+      std::shared_ptr<Job> job = std::move(candidate);
       job->started();
       const int n = int(job->prompt_ids.size());
       int eff_max = job->max_new_tokens;
@@ -264,8 +329,10 @@ void Scheduler::loop_batched() {
         }
         int32_t first_tok = 0;
         model::GenerateStats st;
-        const int slot =
-            generator_.start_slot(model::Prompt{job->prompt_ids, job->images}, eff_max, job->sampling, first_tok, st);
+        const int slot = generator_.start_slot(
+            model::Prompt{job->prompt_ids, job->images, job->root_prefix_tokens, job->cache_namespace,
+                          job->bypass_prefix_cache},
+            eff_max, job->sampling, first_tok, st);
         if (slot < 0) {
           // Put back at front of queue; retry after next step frees resources.
           std::lock_guard lock(mutex_);
@@ -404,8 +471,10 @@ void Scheduler::run(Job& job) {
   };
   try {
     const auto on_prefill = [&](const model::GenerateStats& pst) { job.set_prefill_stats(pst); };
-    const model::GenerateStats st = generator_.generate(model::Prompt{job.prompt_ids, job.images}, job.max_new_tokens,
-                                                        job.sampling, stop_list_, on_tokens, on_prefill);
+    const model::GenerateStats st = generator_.generate(
+        model::Prompt{job.prompt_ids, job.images, job.root_prefix_tokens, job.cache_namespace,
+                      job.bypass_prefix_cache},
+        job.max_new_tokens, job.sampling, stop_list_, on_tokens, on_prefill);
     job.set_prefill_stats(st);
     // prefix reuse of the prompt: the path, the tokens reused and recomputed, restored bytes, prefill time
     const int recomputed = std::max(0, st.prompt_tokens - std::clamp(st.reused_tokens, 0, st.prompt_tokens));

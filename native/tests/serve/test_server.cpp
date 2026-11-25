@@ -1451,6 +1451,63 @@ void test_prompt_stability_and_render_stats() {
   CHECK(common_prefix_len(p_with_r.ids, p_without_r.ids) == p_base.ids.size() + 1);  // diverges right at <|content_thinking|> vs <|content_text|>
 }
 
+void test_cache_scope_isolation() {
+  // 1. Default single trusted scope (cache_namespace_header unset):
+  //    - Plain unauthenticated request shares default scope (bypass=false, namespace="").
+  //    - Request with Authorization header, JSON `user`, or JSON `prompt_cache_key` fails closed (bypass=true).
+  {
+    auto s = serve();
+    const Json msgs = Json::array({{{"role", "system"}, {"content", "Be concise."}}, {{"role", "user"}, {"content", "hi"}}});
+    Chat r = chat(s->port(), {{"messages", msgs}});
+    CHECK(r.status == 200);
+    const auto c0 = s->gen->calls().back();
+    CHECK(c0.root_prefix_tokens > 0 && c0.cache_namespace.empty() && !c0.bypass_prefix_cache);
+
+    // JSON `user` -> fail-closed bypass
+    r = chat(s->port(), {{"messages", msgs}, {"user", "alice"}});
+    CHECK(r.status == 200 && s->gen->calls().back().bypass_prefix_cache);
+
+    // JSON `prompt_cache_key` -> fail-closed bypass
+    r = chat(s->port(), {{"messages", msgs}, {"prompt_cache_key", "sess-42"}});
+    CHECK(r.status == 200 && s->gen->calls().back().bypass_prefix_cache);
+
+    // HTTP `Authorization` header -> fail-closed bypass
+    httplib::Client cli("127.0.0.1", s->port());
+    httplib::Headers hdrs{{"Authorization", "Bearer tok-xyz"}};
+    auto res = cli.Post("/v1/chat/completions", hdrs, ingine::serve::dump(Json{{"messages", msgs}}), "application/json");
+    CHECK(res && res->status == 200 && s->gen->calls().back().bypass_prefix_cache);
+  }
+
+  // 2. Trusted proxy header mode (cache_namespace_header = "X-Tenant-Scope"):
+  //    - Present header propagates exact namespace with bypass=false.
+  //    - Missing or empty header fails closed with bypass=true.
+  {
+    auto s = std::make_unique<Served>();
+    s->gen = std::make_unique<FakeGenerator>(
+        g_fmt->tokenizer(), "inkling-test", 1 << 20,
+        [](std::span<const int32_t>) { return FakeGenerator::Output(THINK_TEXT); }, 0.0);
+    ingine::serve::ServerOptions opt;
+    opt.cache_namespace_header = "X-Tenant-Scope";
+    s->srv = std::make_unique<ChatServer>(*s->gen, *g_fmt, opt);
+    if (!s->srv->bind("127.0.0.1", 0)) throw std::runtime_error("bind failed");
+    s->srv->start();
+    const Json msgs = Json::array({{{"role", "system"}, {"content", "Be concise."}}, {{"role", "user"}, {"content", "hi"}}});
+    httplib::Client cli("127.0.0.1", s->port());
+
+    auto res1 = cli.Post("/v1/chat/completions", httplib::Headers{{"X-Tenant-Scope", "tenant-a"}},
+                         ingine::serve::dump(Json{{"messages", msgs}}), "application/json");
+    CHECK(res1 && res1->status == 200);
+    const auto c1 = s->gen->calls().back();
+    CHECK(c1.cache_namespace == "tenant-a" && !c1.bypass_prefix_cache);
+
+    auto res2 = cli.Post("/v1/chat/completions", httplib::Headers{},
+                         ingine::serve::dump(Json{{"messages", msgs}}), "application/json");
+    CHECK(res2 && res2->status == 200);
+    const auto c2 = s->gen->calls().back();
+    CHECK(c2.cache_namespace.empty() && c2.bypass_prefix_cache);
+  }
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -1487,6 +1544,7 @@ int main() {
       {"cached_tokens_accounting", test_cached_tokens_accounting},
       {"legacy_generator_early_stop_cached_tokens", test_legacy_generator_early_stop_cached_tokens},
       {"prompt_stability_and_render_stats", test_prompt_stability_and_render_stats},
+      {"cache_scope_isolation", test_cache_scope_isolation},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {

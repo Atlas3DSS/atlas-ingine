@@ -26,6 +26,8 @@ struct DeviceUploader::Impl {
         std::uint64_t offset;
         std::uint64_t bytes;
         void* dst;
+        std::size_t req_idx   = 0;
+        std::size_t chunk_idx = 0;
     };
 
     explicit Impl(UploadOptions options) : options_(options) {
@@ -70,12 +72,14 @@ struct DeviceUploader::Impl {
         for (std::thread& w : workers_) { w.join(); }
     }
 
-    UploadStats upload(std::span<const UploadRequest> requests, hal::StreamHandle stream) {
+    UploadStats upload(std::span<const UploadRequest> requests, hal::StreamHandle stream,
+                       UploadChunkObserver observer = {}) {
         hal::stream_synchronize(stream);
         const auto start = std::chrono::steady_clock::now();
         std::vector<Chunk> chunks;
         UploadStats stats;
-        for (const UploadRequest& r : requests) {
+        for (std::size_t ri = 0; ri < requests.size(); ++ri) {
+            const UploadRequest& r = requests[ri];
             if (r.bytes == 0) { continue; }
             if (r.file == nullptr || r.dst == nullptr) {
                 throw std::invalid_argument(
@@ -85,11 +89,12 @@ struct DeviceUploader::Impl {
                 throw std::out_of_range("DeviceUploader::upload: range exceeds " +
                                         r.file->path().string());
             }
-            for (std::uint64_t done = 0; done < r.bytes;) {
+            std::size_t ci = 0;
+            for (std::uint64_t done = 0; done < r.bytes; ++ci) {
                 const std::uint64_t n =
                     std::min<std::uint64_t>(r.bytes - done, options_.chunk_bytes);
-                chunks.push_back(
-                    Chunk{r.file, r.offset + done, n, static_cast<std::byte*>(r.dst) + done});
+                chunks.push_back(Chunk{r.file, r.offset + done, n,
+                                       static_cast<std::byte*>(r.dst) + done, ri, ci});
                 done += n;
             }
             stats.bytes += r.bytes;
@@ -100,12 +105,14 @@ struct DeviceUploader::Impl {
             std::unique_lock lock(mutex_);
             chunks_         = std::move(chunks);
             next_chunk_     = 0;
+            observer_       = std::move(observer);
             error_          = nullptr;
             active_workers_ = static_cast<int>(workers_.size());
             ++generation_;
             work_cv_.notify_all();
             done_cv_.wait(lock, [this] { return active_workers_ == 0; });
             chunks_.clear();
+            observer_ = {};
         }
         if (error_) { std::rethrow_exception(std::exchange(error_, nullptr)); }
         stats.seconds =
@@ -131,6 +138,10 @@ struct DeviceUploader::Impl {
                         chunk = chunks_[next_chunk_++];
                     }
                     chunk.file->read_range(chunk.offset, chunk.bytes, chunk.dst);
+                    if (observer_) {
+                        observer_(chunk.req_idx, chunk.chunk_idx, chunk.dst,
+                                  static_cast<std::size_t>(chunk.bytes));
+                    }
                 }
             } catch (...) {
                 std::lock_guard lock(mutex_);
@@ -153,6 +164,7 @@ struct DeviceUploader::Impl {
     int active_workers_       = 0;
     std::vector<Chunk> chunks_;
     std::size_t next_chunk_ = 0;
+    UploadChunkObserver observer_;
     std::exception_ptr error_;
 };
 
@@ -162,8 +174,8 @@ DeviceUploader::DeviceUploader(UploadOptions options)
 DeviceUploader::~DeviceUploader() = default;
 
 UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests,
-                                   hal::StreamHandle stream) {
-    return impl_->upload(requests, stream);
+                                   hal::StreamHandle stream, UploadChunkObserver observer) {
+    return impl_->upload(requests, stream, std::move(observer));
 }
 
 void fail_next_uploader_worker_start(int worker_index) noexcept {
