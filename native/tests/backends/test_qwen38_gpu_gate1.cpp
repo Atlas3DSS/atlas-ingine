@@ -9,18 +9,21 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
-#include <fstream>
 #include <limits>
 #include <optional>
 #include <random>
 #include <string>
 #include <sys/resource.h>
+#include <unistd.h>
 #include <vector>
 
 #define CUDA_OK(expr)                                                                       \
@@ -36,6 +39,54 @@
 namespace {
 
 using namespace ingine::backends::qwen38;
+
+volatile std::sig_atomic_t g_stop_signal = 0;
+
+void handle_stop_signal(int sig) { g_stop_signal = sig; }
+
+void install_stop_signal_handlers() {
+  struct sigaction sa {};
+  sa.sa_handler = handle_stop_signal;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  ::sigaction(SIGTERM, &sa, nullptr);
+  ::sigaction(SIGINT, &sa, nullptr);
+}
+
+bool write_json_atomic(const std::string& path_str, const nlohmann::ordered_json& doc) {
+  if (path_str.empty()) return true;
+  const std::string payload = doc.dump(2) + "\n";
+  const std::filesystem::path target(path_str);
+  const std::filesystem::path parent = target.parent_path();
+  if (!parent.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+  }
+  const std::string tmp_str = path_str + ".tmp";
+  int fd = ::open(tmp_str.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return false;
+  std::size_t off = 0;
+  while (off < payload.size()) {
+    const ssize_t w = ::write(fd, payload.data() + off, payload.size() - off);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      ::close(fd);
+      std::error_code ec;
+      std::filesystem::remove(tmp_str, ec);
+      return false;
+    }
+    off += static_cast<std::size_t>(w);
+  }
+  (void)::fsync(fd);
+  ::close(fd);
+  std::error_code ec;
+  std::filesystem::rename(tmp_str, target, ec);
+  if (ec) {
+    std::filesystem::remove(tmp_str, ec);
+    return false;
+  }
+  return true;
+}
 
 template <typename T>
 struct DevVec {
@@ -101,8 +152,48 @@ float max_abs(std::span<const float> a, std::span<const float> b) {
   return m;
 }
 
+struct MatchedWarpMetrics {
+  float hidden_max_abs = 0.0f;
+  float hidden_rel_l2 = 0.0f;
+  double hidden_cosine = 1.0;
+  float layer0_gdn_max_abs = 0.0f;
+  float stacked_gdn_max_abs = 0.0f;
+  float conv_max_abs = 0.0f;
+  float conv_rel_l2 = 0.0f;
+  float k_cache_max_abs = 0.0f;
+  float k_cache_rel_l2 = 0.0f;
+  float v_cache_max_abs = 0.0f;
+  float v_cache_rel_l2 = 0.0f;
+  std::string criterion;
+  bool passed = false;
+};
+
+struct BlockStateMetrics {
+  bool state_shapes_valid = true;
+  bool conv_finite = true;
+  bool gdn_finite = true;
+  bool kv_finite = true;
+  float layer0_conv_max_abs = 0.0f;
+  float layer0_conv_rel_l2 = 0.0f;
+  float layer0_conv_rel_max_abs = 0.0f;
+  double layer0_conv_cosine = 1.0;
+  float stacked_conv_max_abs = 0.0f;
+  float stacked_conv_rel_l2 = 0.0f;
+  float stacked_conv_rel_max_abs = 0.0f;
+  double stacked_conv_cosine = 1.0;
+  float k_cache_max_abs = 0.0f;
+  float k_cache_rel_l2 = 0.0f;
+  float k_cache_rel_max_abs = 0.0f;
+  double k_cache_cosine = 1.0;
+  float v_cache_max_abs = 0.0f;
+  float v_cache_rel_l2 = 0.0f;
+  float v_cache_rel_max_abs = 0.0f;
+  double v_cache_cosine = 1.0;
+};
+
 struct Gate1Record {
   std::string name;
+  std::string category;  // "strict_operator", "strict_synthetic_block", "real_block_envelope"
   std::string status = "pass";
   std::string criterion;
   float max_abs_diff = 0.0f;
@@ -114,12 +205,35 @@ struct Gate1Record {
   std::optional<float> layer0_gdn_max_abs;
   std::optional<float> stacked_gdn_rel_l2;
   std::optional<std::uint32_t> max_bf16_ulp;
+  std::optional<std::uint32_t> max_bf16_ulp_above_floor;
+  std::optional<std::size_t> floor_exempt_count;
   std::optional<std::size_t> bf16_vs_gpu_f32_bit_mismatches;
+  std::optional<BlockStateMetrics> state_metrics;
+  std::optional<MatchedWarpMetrics> matched_warp_f32;
   double elapsed_ms = 0.0;
   bool passed = false;
 };
 
+struct PhaseTimingsMs {
+  double unit_operators_ms = 0.0;
+  double synthetic_blocks_ms = 0.0;
+  double qwen08b_inspect_ms = 0.0;
+  double qwen08b_load_ms = 0.0;
+  double qwen08b_cpu_fp64_ms = 0.0;
+  double qwen08b_cpu_warp_ms = 0.0;
+  double qwen08b_gpu_ms = 0.0;
+  double qwen27b_manifest_sha_ms = 0.0;
+  double qwen27b_stream_load_ms = 0.0;
+  double qwen27b_cpu_fp64_ms = 0.0;
+  double qwen27b_cpu_warp_ms = 0.0;
+  double qwen27b_gpu_ms = 0.0;
+  double total_wall_ms = 0.0;
+};
+
 int main_impl(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
+  std::setvbuf(stderr, nullptr, _IOLBF, 0);
+
   std::string q08_dir = "/mnt/storage/models/Qwen3.5-0.8B";
   std::string q27_dir = "/home/orwel/dev_genius/models/Qwen3.8-27B-NVFP4-482ca0f";
   std::string json_out;
@@ -177,6 +291,12 @@ int main_impl(int argc, char** argv) {
     return 77;
   }
 
+  install_stop_signal_handlers();
+  const auto t_program_start = std::chrono::steady_clock::now();
+  auto wall_ms = [&]() -> double {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_program_start).count();
+  };
+
   CUDA_OK(cudaSetDevice(0));
   cudaDeviceProp props{};
   CUDA_OK(cudaGetDeviceProperties(&props, 0));
@@ -186,27 +306,207 @@ int main_impl(int argc, char** argv) {
               verify_pins ? "true" : "false");
 
   std::vector<Gate1Record> records;
+  PhaseTimingsMs timings;
   std::uint64_t peak_vram_bytes = 0;
+  bool q27_pins_verified_actual = false;
 
-  auto record_exec = [&](const std::string& name, const std::string& criterion, float max_d, float aux_d,
-                         double ms, bool ok,
+  auto build_json = [&](bool in_progress, const std::string& current_phase, bool terminated_early, int stop_sig,
+                        Qwen38Gate1CoverageSummary* out_summary = nullptr) {
+    std::vector<Qwen38Gate1RowStatus> statuses;
+    statuses.reserve(records.size());
+    for (const auto& r : records) statuses.push_back({r.name, r.status, r.passed});
+    auto summary = evaluate_gate1_coverage(statuses, diagnostic_mode, q27_pins_verified_actual);
+    if (out_summary) *out_summary = summary;
+
+    struct rusage ru {};
+    std::uint64_t host_rss_bytes = 0;
+    if (::getrusage(RUSAGE_SELF, &ru) == 0 && ru.ru_maxrss > 0) {
+      host_rss_bytes = static_cast<std::uint64_t>(ru.ru_maxrss) * 1024ull;
+    }
+
+    auto category_all_passed = [&](std::string_view cat, std::size_t expected_count, bool require_warp = false) {
+      if (in_progress || terminated_early) return false;
+      std::size_t passed_count = 0;
+      for (const auto& r : records) {
+        if (r.category != cat) continue;
+        if (r.status != "pass" || !r.passed) return false;
+        if (require_warp && (!r.matched_warp_f32.has_value() || !r.matched_warp_f32->passed)) return false;
+        ++passed_count;
+      }
+      return passed_count == expected_count;
+    };
+
+    const bool strict_op_ok = category_all_passed("strict_operator", 13);
+    const bool strict_synth_ok = category_all_passed("strict_synthetic_block", 8);
+    const bool real_env_ok = category_all_passed("real_block_envelope", 8, false);
+    const bool real_warp_ok = category_all_passed("real_block_envelope", 8, true);
+
+    const std::string cov_status =
+        terminated_early ? "incomplete_terminated" : (in_progress ? "incomplete_partial" : summary.coverage_status);
+    const bool final_qual = (!in_progress && !terminated_early) ? summary.qualification_passed : false;
+    const bool final_complete = (!in_progress && !terminated_early) ? summary.complete_coverage : false;
+
+    timings.total_wall_ms = wall_ms();
+
+    nlohmann::ordered_json root;
+    root["device"] = props.name;
+    root["sm"] = std::to_string(props.major) + std::to_string(props.minor);
+    root["mode"] = summary.mode;
+    root["in_progress"] = in_progress;
+    root["current_phase"] = current_phase;
+    root["terminated_early"] = terminated_early;
+    if (stop_sig != 0) root["signal"] = stop_sig;
+    root["coverage_status"] = cov_status;
+    root["complete_coverage"] = final_complete;
+    root["executed_checks_passed"] = summary.executed_checks_passed;
+    root["qwen27b_pins_verified"] = summary.qwen27b_pins_verified;
+    root["qualification_passed"] = final_qual;
+    root["all_passed"] = final_qual;
+    root["strict_operator_all_passed"] = strict_op_ok;
+    root["strict_synthetic_all_passed"] = strict_synth_ok;
+    root["real_block_envelope_all_passed"] = real_env_ok;
+    root["real_block_matched_warp_all_passed"] = real_warp_ok;
+    root["required_row_count"] = summary.required_row_count;
+    root["passed_required_row_count"] = summary.passed_required_row_count;
+    root["missing_required_rows"] = summary.missing_required_rows;
+    root["failed_rows"] = summary.failed_rows;
+    root["qwen08b_dir"] = q08_dir;
+    root["qwen27b_dir"] = q27_dir;
+    root["cold_manifest_sha_ms"] = timings.qwen27b_manifest_sha_ms;
+    root["cold_safetensors_load_ms"] = timings.qwen27b_stream_load_ms;
+    root["phase_timings_ms"] = {
+        {"unit_operators_ms", timings.unit_operators_ms},
+        {"synthetic_blocks_ms", timings.synthetic_blocks_ms},
+        {"qwen08b_inspect_ms", timings.qwen08b_inspect_ms},
+        {"qwen08b_load_ms", timings.qwen08b_load_ms},
+        {"qwen08b_cpu_fp64_ms", timings.qwen08b_cpu_fp64_ms},
+        {"qwen08b_cpu_warp_ms", timings.qwen08b_cpu_warp_ms},
+        {"qwen08b_gpu_ms", timings.qwen08b_gpu_ms},
+        {"qwen27b_manifest_sha_ms", timings.qwen27b_manifest_sha_ms},
+        {"qwen27b_stream_load_ms", timings.qwen27b_stream_load_ms},
+        {"qwen27b_cpu_fp64_ms", timings.qwen27b_cpu_fp64_ms},
+        {"qwen27b_cpu_warp_ms", timings.qwen27b_cpu_warp_ms},
+        {"qwen27b_gpu_ms", timings.qwen27b_gpu_ms},
+        {"total_wall_ms", timings.total_wall_ms},
+    };
+    root["peak_vram_bytes"] = peak_vram_bytes;
+    root["host_rss_bytes"] = host_rss_bytes;
+    root["checks"] = nlohmann::json::array();
+    for (const auto& r : records) {
+      nlohmann::ordered_json j;
+      j["name"] = r.name;
+      j["category"] = r.category;
+      j["status"] = r.status;
+      j["criterion"] = r.criterion;
+      j["max_abs"] = r.max_abs_diff;
+      j["aux_max_abs"] = r.aux_max_abs;
+      if (r.ref_max_abs.has_value()) j["ref_max_abs"] = *r.ref_max_abs;
+      if (r.rel_max_abs.has_value()) j["rel_max_abs"] = *r.rel_max_abs;
+      if (r.rel_l2.has_value()) j["rel_l2"] = *r.rel_l2;
+      if (r.cosine_sim.has_value()) j["cosine_sim"] = *r.cosine_sim;
+      if (r.layer0_gdn_max_abs.has_value()) j["layer0_gdn_max_abs"] = *r.layer0_gdn_max_abs;
+      if (r.stacked_gdn_rel_l2.has_value()) j["stacked_gdn_rel_l2"] = *r.stacked_gdn_rel_l2;
+      if (r.max_bf16_ulp.has_value()) j["max_bf16_ulp"] = *r.max_bf16_ulp;
+      if (r.max_bf16_ulp_above_floor.has_value()) j["max_bf16_ulp_above_floor"] = *r.max_bf16_ulp_above_floor;
+      if (r.floor_exempt_count.has_value()) j["floor_exempt_count"] = *r.floor_exempt_count;
+      if (r.bf16_vs_gpu_f32_bit_mismatches.has_value()) {
+        j["bf16_vs_gpu_f32_bit_mismatches"] = *r.bf16_vs_gpu_f32_bit_mismatches;
+      }
+      if (r.state_metrics.has_value()) {
+        const auto& sm = *r.state_metrics;
+        j["state_metrics"] = {
+            {"state_shapes_valid", sm.state_shapes_valid},
+            {"conv_finite", sm.conv_finite},
+            {"gdn_finite", sm.gdn_finite},
+            {"kv_finite", sm.kv_finite},
+            {"layer0_conv_max_abs", sm.layer0_conv_max_abs},
+            {"layer0_conv_rel_l2", sm.layer0_conv_rel_l2},
+            {"layer0_conv_rel_max_abs", sm.layer0_conv_rel_max_abs},
+            {"layer0_conv_cosine", sm.layer0_conv_cosine},
+            {"stacked_conv_max_abs", sm.stacked_conv_max_abs},
+            {"stacked_conv_rel_l2", sm.stacked_conv_rel_l2},
+            {"stacked_conv_rel_max_abs", sm.stacked_conv_rel_max_abs},
+            {"stacked_conv_cosine", sm.stacked_conv_cosine},
+            {"k_cache_max_abs", sm.k_cache_max_abs},
+            {"k_cache_rel_l2", sm.k_cache_rel_l2},
+            {"k_cache_rel_max_abs", sm.k_cache_rel_max_abs},
+            {"k_cache_cosine", sm.k_cache_cosine},
+            {"v_cache_max_abs", sm.v_cache_max_abs},
+            {"v_cache_rel_l2", sm.v_cache_rel_l2},
+            {"v_cache_rel_max_abs", sm.v_cache_rel_max_abs},
+            {"v_cache_cosine", sm.v_cache_cosine},
+        };
+      }
+      if (r.matched_warp_f32.has_value()) {
+        const auto& mw = *r.matched_warp_f32;
+        j["matched_warp_f32"] = {
+            {"criterion", mw.criterion},
+            {"hidden_max_abs", mw.hidden_max_abs},
+            {"hidden_rel_l2", mw.hidden_rel_l2},
+            {"hidden_cosine", mw.hidden_cosine},
+            {"layer0_gdn_max_abs", mw.layer0_gdn_max_abs},
+            {"stacked_gdn_max_abs", mw.stacked_gdn_max_abs},
+            {"conv_max_abs", mw.conv_max_abs},
+            {"conv_rel_l2", mw.conv_rel_l2},
+            {"k_cache_max_abs", mw.k_cache_max_abs},
+            {"k_cache_rel_l2", mw.k_cache_rel_l2},
+            {"v_cache_max_abs", mw.v_cache_max_abs},
+            {"v_cache_rel_l2", mw.v_cache_rel_l2},
+            {"passed", mw.passed},
+        };
+      }
+      j["elapsed_ms"] = r.elapsed_ms;
+      j["passed"] = r.passed;
+      root["checks"].push_back(std::move(j));
+    }
+    return root;
+  };
+
+  auto checkpoint_json = [&](const std::string& phase) {
+    if (json_out.empty()) return;
+    (void)write_json_atomic(json_out, build_json(true, phase, false, 0));
+  };
+
+  auto check_early_stop = [&](const std::string& phase) -> std::optional<int> {
+    if (g_stop_signal == 0) return std::nullopt;
+    const int sig = static_cast<int>(g_stop_signal);
+    std::printf("qwen38_gpu_gate1: TERMINATED_EARLY signal=%d phase=%s wall_ms=%.1f (qualification=false)\n", sig,
+                phase.c_str(), wall_ms());
+    if (!json_out.empty()) {
+      (void)write_json_atomic(json_out, build_json(false, phase, true, sig));
+    }
+    return 128 + sig;
+  };
+
+  auto record_exec = [&](const std::string& name, const std::string& criterion, float max_d, float aux_d, double ms,
+                         bool ok, const std::string& phase_label,
                          std::optional<std::uint32_t> max_ulp = std::nullopt,
+                         std::optional<std::uint32_t> max_ulp_above = std::nullopt,
+                         std::optional<std::size_t> floor_exempt = std::nullopt,
                          std::optional<std::size_t> f32_bf16_mm = std::nullopt) {
     Gate1Record r;
     r.name = name;
+    r.category = "strict_operator";
     r.status = ok ? "pass" : "fail";
     r.criterion = criterion;
     r.max_abs_diff = max_d;
     r.aux_max_abs = aux_d;
     r.max_bf16_ulp = max_ulp;
+    r.max_bf16_ulp_above_floor = max_ulp_above;
+    r.floor_exempt_count = floor_exempt;
     r.bf16_vs_gpu_f32_bit_mismatches = f32_bf16_mm;
     r.elapsed_ms = ms;
     r.passed = ok;
     records.push_back(std::move(r));
-    std::printf("  [%s] max_abs=%.6g aux=%.6g %s\n", name.c_str(), max_d, aux_d, ok ? "PASS" : "FAIL");
+    std::printf("  [%s] max_abs=%.6g aux=%.6g wall_ms=%.1f -> %s\n", name.c_str(), max_d, aux_d, wall_ms(),
+                ok ? "PASS" : "FAIL");
+    checkpoint_json(phase_label);
   };
 
-  // Part 1.1 & 1.2: Shared Gate 1 NVFP4 + FP8 linear unit checks (both F32 oracle and rounded BF16 oracle).
+  // Phase 1: Strict unit operators.
+  const auto t_unit0 = std::chrono::steady_clock::now();
+  std::printf("[phase] start=unit_operators wall_ms=%.1f\n", wall_ms());
+  checkpoint_json("unit_operators");
   {
     const auto lin = make_gate1_linear_fixtures(20261125u);
     const std::size_t out_n = static_cast<std::size_t>(lin.m * lin.n);
@@ -236,11 +536,12 @@ int main_impl(int argc, char** argv) {
       const std::size_t mm = count_bit_mismatches(got_bits, got_f32);
       const auto cmp = compare_bf16_against_rounded_oracle(got_bits, lin.nvfp4_ref_f32, 1u, 1e-3f);
 
-      record_exec("unit_nvfp4_linear_f32", "raw_f32_max_abs <= 1e-3", d_f32, 0.0f, 0.0,
-                  d_f32 <= 1e-3f);
+      record_exec("unit_nvfp4_linear_f32", "raw_f32_max_abs <= 1e-3", d_f32, 0.0f, 0.0, d_f32 <= 1e-3f,
+                  "unit_operators");
       record_exec("unit_nvfp4_linear_bf16", "bf16_oracle_ulp <= 1 || abs <= 1e-3; exact_gpu_f32_to_bf16 == 0",
                   cmp.max_abs_vs_bf16_oracle, static_cast<float>(cmp.criterion_violations), 0.0,
-                  mm == 0 && cmp.passed, cmp.max_bf16_ulp, mm);
+                  mm == 0 && cmp.passed, "unit_operators", cmp.max_bf16_ulp, cmp.max_bf16_ulp_above_floor,
+                  cmp.floor_exempt_count, mm);
     }
 
     // 2A & 2B. fp8_linear weight-only (input_scale = 0) and calibrated (input_scale = 0.125), both F32 + BF16.
@@ -263,11 +564,12 @@ int main_impl(int argc, char** argv) {
       const std::size_t mm_wo = count_bit_mismatches(wo_bits, wo_f32);
       const auto cmp_wo = compare_bf16_against_rounded_oracle(wo_bits, lin.fp8_wo_ref_f32, 1u, 1e-3f);
       record_exec("unit_fp8_linear_weight_only_f32", "raw_f32_max_abs <= 1e-3", d_wo_f32, 0.0f, 0.0,
-                  d_wo_f32 <= 1e-3f);
+                  d_wo_f32 <= 1e-3f, "unit_operators");
       record_exec("unit_fp8_linear_weight_only_bf16",
                   "bf16_oracle_ulp <= 1 || abs <= 1e-3; exact_gpu_f32_to_bf16 == 0", cmp_wo.max_abs_vs_bf16_oracle,
                   static_cast<float>(cmp_wo.criterion_violations), 0.0, mm_wo == 0 && cmp_wo.passed,
-                  cmp_wo.max_bf16_ulp, mm_wo);
+                  "unit_operators", cmp_wo.max_bf16_ulp, cmp_wo.max_bf16_ulp_above_floor, cmp_wo.floor_exempt_count,
+                  mm_wo);
 
       const auto cal_f32 = d_out_cal_f32.download();
       const auto cal_bits = to_bf16_bits(d_out_cal_bf16.download());
@@ -275,11 +577,12 @@ int main_impl(int argc, char** argv) {
       const std::size_t mm_cal = count_bit_mismatches(cal_bits, cal_f32);
       const auto cmp_cal = compare_bf16_against_rounded_oracle(cal_bits, lin.fp8_cal_ref_f32, 1u, 1e-3f);
       record_exec("unit_fp8_linear_calibrated_f32", "raw_f32_max_abs <= 1e-3", d_cal_f32, 0.0f, 0.0,
-                  d_cal_f32 <= 1e-3f);
+                  d_cal_f32 <= 1e-3f, "unit_operators");
       record_exec("unit_fp8_linear_calibrated_bf16",
                   "bf16_oracle_ulp <= 1 || abs <= 1e-3; exact_gpu_f32_to_bf16 == 0", cmp_cal.max_abs_vs_bf16_oracle,
                   static_cast<float>(cmp_cal.criterion_violations), 0.0, mm_cal == 0 && cmp_cal.passed,
-                  cmp_cal.max_bf16_ulp, mm_cal);
+                  "unit_operators", cmp_cal.max_bf16_ulp, cmp_cal.max_bf16_ulp_above_floor,
+                  cmp_cal.floor_exempt_count, mm_cal);
     }
   }
 
@@ -307,7 +610,8 @@ int main_impl(int argc, char** argv) {
     qwen38_cuda_rmsnorm_zero_centered_f32(d_x.ptr, d_w.ptr, 1e-6f, M, D, d_out.ptr);
     CUDA_OK(cudaDeviceSynchronize());
     const float d_rms = max_abs(d_out.download(), ref);
-    record_exec("unit_rmsnorm_zero_centered", "raw_f32_max_abs <= 1e-5", d_rms, 0.0f, 0.0, d_rms <= 1e-5f);
+    record_exec("unit_rmsnorm_zero_centered", "raw_f32_max_abs <= 1e-5", d_rms, 0.0f, 0.0, d_rms <= 1e-5f,
+                "unit_operators");
   }
 
   // 4. rmsnorm_gated_silu (27B v_dim=128, M=48).
@@ -326,7 +630,8 @@ int main_impl(int argc, char** argv) {
     qwen38_cuda_rmsnorm_gated_silu_f32(d_x.ptr, d_z.ptr, d_w.ptr, 1e-6f, M, D, d_out.ptr);
     CUDA_OK(cudaDeviceSynchronize());
     const float d_gr = max_abs(d_out.download(), ref);
-    record_exec("unit_rmsnorm_gated_silu", "raw_f32_max_abs <= 1e-5", d_gr, 0.0f, 0.0, d_gr <= 1e-5f);
+    record_exec("unit_rmsnorm_gated_silu", "raw_f32_max_abs <= 1e-5", d_gr, 0.0f, 0.0, d_gr <= 1e-5f,
+                "unit_operators");
   }
 
   // 5. partial_rope_neox (27B H=24, head_dim=256, rotary_dim=64, pos_offset=37).
@@ -355,7 +660,7 @@ int main_impl(int argc, char** argv) {
       }
     }
     record_exec("unit_partial_rope_neox", "raw_f32_max_abs <= 1e-5 && passthrough_exact", d_rope,
-                slice_exact ? 0.0f : 1.0f, 0.0, d_rope <= 1e-5f && slice_exact);
+                slice_exact ? 0.0f : 1.0f, 0.0, d_rope <= 1e-5f && slice_exact, "unit_operators");
   }
 
   // 6. causal_conv1d_silu (step & prefill, 27B conv_dim=10240, kernel=4, seq=8, non-zero init state).
@@ -376,7 +681,7 @@ int main_impl(int argc, char** argv) {
     const float d_out_v = max_abs(d_out.download(), out_cpu);
     const float d_st_v = max_abs(d_st.download(), st_cpu);
     record_exec("unit_causal_conv1d_silu", "raw_f32_out <= 1e-5 && state <= 1e-6", d_out_v, d_st_v, 0.0,
-                d_out_v <= 1e-5f && d_st_v <= 1e-6f);
+                d_out_v <= 1e-5f && d_st_v <= 1e-6f, "unit_operators");
   }
 
   // 7 & 8. gdn_recurrent_step & gdn_chunk_prefill (27B 16K/48V heads, 128x128, seq=70 across 2 chunks 64+6).
@@ -409,7 +714,7 @@ int main_impl(int argc, char** argv) {
     const float d_step_o = max_abs(d_out_step.download(), out_cpu_step);
     const float d_step_s = max_abs(d_st_step.download(), st_cpu_step);
     record_exec("unit_gdn_recurrent_step", "raw_f32_out <= 1e-4 && state <= 2e-4", d_step_o, d_step_s, 0.0,
-                d_step_o <= 1e-4f && d_step_s <= 2e-4f);
+                d_step_o <= 1e-4f && d_step_s <= 2e-4f, "unit_operators");
 
     auto st_cpu_ch = st_init;
     std::vector<float> out_cpu_ch(S * NVH * VD);
@@ -423,7 +728,7 @@ int main_impl(int argc, char** argv) {
     const float d_ch_o = max_abs(d_out_ch.download(), out_cpu_ch);
     const float d_ch_s = max_abs(d_st_ch.download(), st_cpu_ch);
     record_exec("unit_gdn_chunk_prefill", "raw_f32_out <= 1e-4 && state <= 2e-4", d_ch_o, d_ch_s, 0.0,
-                d_ch_o <= 1e-4f && d_ch_s <= 2e-4f);
+                d_ch_o <= 1e-4f && d_ch_s <= 2e-4f, "unit_operators");
   }
 
   // 9. full_attn_gated (27B 24H / 4KVH, head_dim=256, rotary=64, prefill 8 + decode step 1 at pos=8).
@@ -457,19 +762,88 @@ int main_impl(int argc, char** argv) {
                                     d_out.ptr + S_PF * NH * HD);
     CUDA_OK(cudaDeviceSynchronize());
     const float d_fa = max_abs(d_out.download(), out_cpu);
-    record_exec("unit_full_attn_gated", "raw_f32_max_abs <= 1e-4", d_fa, 0.0f, 0.0, d_fa <= 1e-4f);
+    record_exec("unit_full_attn_gated", "raw_f32_max_abs <= 1e-4", d_fa, 0.0f, 0.0, d_fa <= 1e-4f, "unit_operators");
   }
+  timings.unit_operators_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_unit0).count();
+  std::printf("[phase] done=unit_operators elapsed_ms=%.1f wall_ms=%.1f\n", timings.unit_operators_ms, wall_ms());
+  if (auto rc = check_early_stop("unit_operators")) return *rc;
 
-  auto run_block_check = [&](const std::string& tag, const Qwen38BlockBundleHost& bundle, bool chunk_prefill,
-                             bool calibrated_fp8, Qwen38BlockParityTier tier) {
-    const auto cpu_bf16 = run_qwen38_blocks_cpu(bundle, true, chunk_prefill, 64, calibrated_fp8);
+  auto run_block_check = [&](const std::string& tag, const std::string& category, const Qwen38BlockBundleHost& bundle,
+                             bool chunk_prefill, bool calibrated_fp8, Qwen38BlockParityTier tier,
+                             bool run_matched_warp, double* fp64_ms_acc, double* warp_ms_acc, double* gpu_ms_acc,
+                             const std::string& phase_label) {
+    const auto cpu_bf16 = run_qwen38_blocks_cpu(bundle, true, chunk_prefill, 64, calibrated_fp8, 0, false);
+    if (fp64_ms_acc) *fp64_ms_acc += cpu_bf16.elapsed_ms;
     const auto gpu = run_qwen38_blocks_gpu(bundle, chunk_prefill, 64, calibrated_fp8);
+    if (gpu_ms_acc) *gpu_ms_acc += gpu.elapsed_ms;
     peak_vram_bytes = std::max(peak_vram_bytes, gpu.peak_vram_bytes);
     const auto p = evaluate_block_parity(bundle, gpu, cpu_bf16, tier);
 
+    std::optional<MatchedWarpMetrics> mw_opt;
+    bool warp_ok = true;
+    if (run_matched_warp) {
+      const auto cpu_warp = run_qwen38_blocks_cpu(bundle, true, chunk_prefill, 64, calibrated_fp8, 0, true);
+      if (warp_ms_acc) *warp_ms_acc += cpu_warp.elapsed_ms;
+      const auto pw = evaluate_block_parity(bundle, gpu, cpu_warp, tier);
+      MatchedWarpMetrics mw;
+      mw.hidden_max_abs = pw.hidden.max_abs;
+      mw.hidden_rel_l2 = pw.hidden.rel_l2;
+      mw.hidden_cosine = pw.hidden.cosine_sim;
+      mw.layer0_gdn_max_abs = pw.layer0_gdn_max_abs;
+      mw.stacked_gdn_max_abs = pw.stacked_gdn_max_abs;
+      mw.conv_max_abs = std::max(pw.layer0_conv_max_abs, pw.stacked_conv_max_abs);
+      mw.conv_rel_l2 = std::max(pw.layer0_conv_rel_l2, pw.stacked_conv_rel_l2);
+      mw.k_cache_max_abs = pw.k_cache_max_abs;
+      mw.k_cache_rel_l2 = pw.k_cache_rel_l2;
+      mw.v_cache_max_abs = pw.v_cache_max_abs;
+      mw.v_cache_rel_l2 = pw.v_cache_rel_l2;
+      if (tier == Qwen38BlockParityTier::RealSingleLayer) {
+        mw.criterion =
+            "matched_warp_1L: triangle-safe 2x real_1L (l0_gdn <= 4e-4 && hidden/conv/k/v rel_l2 <= 4e-3, cos >= "
+            "0.99998, rel_max <= 2e-2)";
+        mw.passed = pw.state_shapes_valid && pw.hidden.finite && pw.conv_finite && pw.gdn_finite && pw.kv_finite &&
+                    pw.layer0_gdn_max_abs <= 4e-4f &&
+                    pw.hidden.rel_l2 <= 4e-3f && pw.hidden.cosine_sim >= 0.99998 && pw.hidden.rel_max_abs <= 2e-2f &&
+                    pw.layer0_conv_rel_l2 <= 4e-3f && pw.layer0_conv_cosine >= 0.99998 &&
+                    pw.layer0_conv_rel_max_abs <= 2e-2f &&
+                    pw.k_cache_rel_l2 <= 4e-3f && pw.k_cache_cosine >= 0.99998 && pw.k_cache_rel_max_abs <= 2e-2f &&
+                    pw.v_cache_rel_l2 <= 4e-3f && pw.v_cache_cosine >= 0.99998 && pw.v_cache_rel_max_abs <= 2e-2f;
+      } else {
+        mw.criterion = pw.criterion;
+        mw.passed = pw.passed;
+      }
+      warp_ok = mw.passed;
+      mw_opt = std::move(mw);
+    }
+
+    BlockStateMetrics sm;
+    sm.state_shapes_valid = p.state_shapes_valid;
+    sm.conv_finite = p.conv_finite;
+    sm.gdn_finite = p.gdn_finite;
+    sm.kv_finite = p.kv_finite;
+    sm.layer0_conv_max_abs = p.layer0_conv_max_abs;
+    sm.layer0_conv_rel_l2 = p.layer0_conv_rel_l2;
+    sm.layer0_conv_rel_max_abs = p.layer0_conv_rel_max_abs;
+    sm.layer0_conv_cosine = p.layer0_conv_cosine;
+    sm.stacked_conv_max_abs = p.stacked_conv_max_abs;
+    sm.stacked_conv_rel_l2 = p.stacked_conv_rel_l2;
+    sm.stacked_conv_rel_max_abs = p.stacked_conv_rel_max_abs;
+    sm.stacked_conv_cosine = p.stacked_conv_cosine;
+    sm.k_cache_max_abs = p.k_cache_max_abs;
+    sm.k_cache_rel_l2 = p.k_cache_rel_l2;
+    sm.k_cache_rel_max_abs = p.k_cache_rel_max_abs;
+    sm.k_cache_cosine = p.k_cache_cosine;
+    sm.v_cache_max_abs = p.v_cache_max_abs;
+    sm.v_cache_rel_l2 = p.v_cache_rel_l2;
+    sm.v_cache_rel_max_abs = p.v_cache_rel_max_abs;
+    sm.v_cache_cosine = p.v_cache_cosine;
+
+    const bool ok = p.passed && warp_ok;
     Gate1Record r;
     r.name = tag;
-    r.status = p.passed ? "pass" : "fail";
+    r.category = category;
+    r.status = ok ? "pass" : "fail";
     r.criterion = p.criterion;
     r.max_abs_diff = p.hidden.max_abs;
     r.aux_max_abs = std::max(p.layer0_gdn_max_abs, p.stacked_gdn_max_abs);
@@ -480,178 +854,219 @@ int main_impl(int argc, char** argv) {
     r.layer0_gdn_max_abs = p.layer0_gdn_max_abs;
     r.stacked_gdn_rel_l2 = p.stacked_gdn_rel_l2;
     r.max_bf16_ulp = p.hidden_bf16.max_bf16_ulp;
+    r.max_bf16_ulp_above_floor = p.hidden_bf16.max_bf16_ulp_above_floor;
+    r.floor_exempt_count = p.hidden_bf16.floor_exempt_count;
+    r.state_metrics = sm;
+    r.matched_warp_f32 = mw_opt;
     r.elapsed_ms = gpu.elapsed_ms;
-    r.passed = p.passed;
+    r.passed = ok;
     records.push_back(std::move(r));
 
-    std::printf(
-        "  [%s] max_abs=%.6f ref_max=%.6f rel_l2=%.6g cos=%.8f l0_gdn=%.6f stacked_gdn=%.6f gpu_ms=%.2f cpu_ms=%.1f "
-        "vram=%.1f MiB -> %s\n",
-        tag.c_str(), p.hidden.max_abs, p.hidden.ref_max_abs, p.hidden.rel_l2, p.hidden.cosine_sim, p.layer0_gdn_max_abs,
-        p.stacked_gdn_max_abs, gpu.elapsed_ms, cpu_bf16.elapsed_ms,
-        static_cast<double>(gpu.peak_vram_bytes) / (1024.0 * 1024.0), p.passed ? "PASS" : "FAIL");
+    if (mw_opt.has_value()) {
+      std::printf(
+          "  [%s] rel_l2=%.6g cos=%.8f l0_gdn=%.6f conv_rel_l2=%.6g k_rel_l2=%.6g v_rel_l2=%.6g "
+          "warp_rel_l2=%.6g warp_v_rel_l2=%.6g raw_ulp=%u exempt=%zu gpu_ms=%.2f cpu_ms=%.1f vram=%.1f MiB "
+          "wall_ms=%.1f -> %s\n",
+          tag.c_str(), p.hidden.rel_l2, p.hidden.cosine_sim, p.layer0_gdn_max_abs,
+          std::max(p.layer0_conv_rel_l2, p.stacked_conv_rel_l2), p.k_cache_rel_l2, p.v_cache_rel_l2,
+          mw_opt->hidden_rel_l2, mw_opt->v_cache_rel_l2, p.hidden_bf16.max_bf16_ulp,
+          p.hidden_bf16.floor_exempt_count, gpu.elapsed_ms, cpu_bf16.elapsed_ms,
+          static_cast<double>(gpu.peak_vram_bytes) / (1024.0 * 1024.0), wall_ms(), ok ? "PASS" : "FAIL");
+    } else {
+      std::printf(
+          "  [%s] rel_l2=%.6g cos=%.8f l0_gdn=%.6f conv_rel_l2=%.6g k_rel_l2=%.6g v_rel_l2=%.6g "
+          "raw_ulp=%u exempt=%zu gpu_ms=%.2f cpu_ms=%.1f vram=%.1f MiB wall_ms=%.1f -> %s\n",
+          tag.c_str(), p.hidden.rel_l2, p.hidden.cosine_sim, p.layer0_gdn_max_abs,
+          std::max(p.layer0_conv_rel_l2, p.stacked_conv_rel_l2), p.k_cache_rel_l2, p.v_cache_rel_l2,
+          p.hidden_bf16.max_bf16_ulp, p.hidden_bf16.floor_exempt_count, gpu.elapsed_ms, cpu_bf16.elapsed_ms,
+          static_cast<double>(gpu.peak_vram_bytes) / (1024.0 * 1024.0), wall_ms(), ok ? "PASS" : "FAIL");
+    }
+    checkpoint_json(phase_label);
   };
 
-  auto record_non_executed_group = [&](std::initializer_list<const char*> names, const std::string& status,
-                                       const std::string& reason) {
+  auto record_non_executed_group = [&](std::initializer_list<const char*> names, const std::string& category,
+                                       const std::string& status, const std::string& reason,
+                                       const std::string& phase_label) {
     for (const char* nm : names) {
       Gate1Record r;
       r.name = nm;
+      r.category = category;
       r.status = status;
       r.criterion = reason;
       r.passed = false;
       records.push_back(std::move(r));
       std::printf("  [%s] status=%s (%s)\n", nm, status.c_str(), reason.c_str());
     }
+    checkpoint_json(phase_label);
   };
 
-  // Part 2A: Synthetic 1-layer and 4-layer blocks (BF16 & MixedFp8Nvfp4).
+  // Phase 2A: Synthetic 1-layer and 4-layer blocks (strict tolerance category).
+  const auto t_synth0 = std::chrono::steady_clock::now();
+  std::printf("[phase] start=synthetic_blocks wall_ms=%.1f\n", wall_ms());
+  checkpoint_json("synthetic_blocks");
   {
     const std::array<int, 4> l4 = {0, 1, 2, 3};
     const std::array<std::int32_t, 6> toks = {5, 11, 23, 37, 2, 49};
     for (Qwen38WeightPrecision prec : {Qwen38WeightPrecision::Bf16, Qwen38WeightPrecision::MixedFp8Nvfp4}) {
       const auto b4 = make_synthetic_qwen38_block_bundle(prec, l4, toks, 777u);
       const std::string ptag = prec == Qwen38WeightPrecision::Bf16 ? "synth_bf16" : "synth_nvfp4_fp8";
-      run_block_check(ptag + "_1L_gdn", slice_qwen38_block_layer(b4, 0), true, true,
-                      Qwen38BlockParityTier::SyntheticStrict);
-      run_block_check(ptag + "_1L_full", slice_qwen38_block_layer(b4, 3), false, true,
-                      Qwen38BlockParityTier::SyntheticStrict);
-      run_block_check(ptag + "_4L_stepwise", b4, false, true, Qwen38BlockParityTier::SyntheticStrict);
-      run_block_check(ptag + "_4L_chunk", b4, true, true, Qwen38BlockParityTier::SyntheticStrict);
+      run_block_check(ptag + "_1L_gdn", "strict_synthetic_block", slice_qwen38_block_layer(b4, 0), true, true,
+                      Qwen38BlockParityTier::SyntheticStrict, false, nullptr, nullptr, nullptr, "synthetic_blocks");
+      run_block_check(ptag + "_1L_full", "strict_synthetic_block", slice_qwen38_block_layer(b4, 3), false, true,
+                      Qwen38BlockParityTier::SyntheticStrict, false, nullptr, nullptr, nullptr, "synthetic_blocks");
+      run_block_check(ptag + "_4L_stepwise", "strict_synthetic_block", b4, false, true,
+                      Qwen38BlockParityTier::SyntheticStrict, false, nullptr, nullptr, nullptr, "synthetic_blocks");
+      run_block_check(ptag + "_4L_chunk", "strict_synthetic_block", b4, true, true,
+                      Qwen38BlockParityTier::SyntheticStrict, false, nullptr, nullptr, nullptr, "synthetic_blocks");
     }
   }
+  timings.synthetic_blocks_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_synth0).count();
+  std::printf("[phase] done=synthetic_blocks elapsed_ms=%.1f wall_ms=%.1f\n", timings.synthetic_blocks_ms, wall_ms());
+  if (auto rc = check_early_stop("synthetic_blocks")) return *rc;
 
-  // Part 2B: Real Qwen3.5-0.8B (BF16) 1-layer & 4-layer blocks (single 4L stream load + 1L slices).
+  // Phase 2B: Real Qwen3.5-0.8B (BF16) 1L & 4L blocks (single 4L stream load + 1L slices).
   if (skip_08b) {
     record_non_executed_group({"qwen08b_1L_gdn", "qwen08b_1L_full", "qwen08b_4L_stepwise", "qwen08b_4L_chunk"},
-                              "skipped_diagnostic", "--skip-08b specified in diagnostic mode");
+                              "real_block_envelope", "skipped_diagnostic", "--skip-08b specified in diagnostic mode",
+                              "qwen08b_blocks");
   } else if (!std::filesystem::is_directory(q08_dir)) {
     record_non_executed_group({"qwen08b_1L_gdn", "qwen08b_1L_full", "qwen08b_4L_stepwise", "qwen08b_4L_chunk"},
-                              "missing_checkpoint", "missing qwen08b directory: " + q08_dir);
+                              "real_block_envelope", "missing_checkpoint", "missing qwen08b directory: " + q08_dir,
+                              "qwen08b_blocks");
   } else {
+    std::printf("[phase] start=qwen08b_inspect wall_ms=%.1f\n", wall_ms());
+    checkpoint_json("qwen08b_inspect");
+    const auto t_i08_0 = std::chrono::steady_clock::now();
     const auto m08 = Qwen38Manifest::inspect(q08_dir, false, "local");
+    timings.qwen08b_inspect_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_i08_0).count();
+    std::printf("[phase] done=qwen08b_inspect elapsed_ms=%.1f wall_ms=%.1f\n", timings.qwen08b_inspect_ms, wall_ms());
+    if (auto rc = check_early_stop("qwen08b_inspect")) return *rc;
+
     const std::array<std::int32_t, 6> toks = {9707, 15, 220, 16, 17, 198};
     const std::array<int, 4> l4 = {0, 1, 2, 3};
+    std::printf("[phase] start=qwen08b_load wall_ms=%.1f\n", wall_ms());
+    checkpoint_json("qwen08b_load");
+    const auto t_l08_0 = std::chrono::steady_clock::now();
     const auto b08_4l = load_qwen38_block_bundle(q08_dir, m08, l4, toks);
-    run_block_check("qwen08b_1L_gdn", slice_qwen38_block_layer(b08_4l, 0), true, false,
-                    Qwen38BlockParityTier::RealSingleLayer);
-    run_block_check("qwen08b_1L_full", slice_qwen38_block_layer(b08_4l, 3), false, false,
-                    Qwen38BlockParityTier::RealSingleLayer);
-    run_block_check("qwen08b_4L_stepwise", b08_4l, false, false, Qwen38BlockParityTier::RealStacked4Layer);
-    run_block_check("qwen08b_4L_chunk", b08_4l, true, false, Qwen38BlockParityTier::RealStacked4Layer);
-  }
+    timings.qwen08b_load_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_l08_0).count();
+    std::printf("[phase] done=qwen08b_load elapsed_ms=%.1f wall_ms=%.1f\n", timings.qwen08b_load_ms, wall_ms());
+    if (auto rc = check_early_stop("qwen08b_load")) return *rc;
 
-  // Part 2C: Real Qwen3.8-27B-NVFP4 (MixedFp8Nvfp4) 1-layer & 4-layer blocks (single pinned 4L stream load + slices).
-  double cold_manifest_sha_ms = 0.0;
-  double cold_safetensors_load_ms = 0.0;
-  bool q27_pins_verified_actual = false;
+    std::printf("[phase] start=qwen08b_blocks wall_ms=%.1f\n", wall_ms());
+    checkpoint_json("qwen08b_blocks");
+    const auto b08_l0 = slice_qwen38_block_layer(b08_4l, 0);
+    const auto b08_l3 = slice_qwen38_block_layer(b08_4l, 3);
+    struct Job08 {
+      const char* name;
+      const Qwen38BlockBundleHost* bundle;
+      bool chunk;
+      Qwen38BlockParityTier tier;
+    };
+    const std::array<Job08, 4> jobs08 = {{
+        {"qwen08b_1L_gdn", &b08_l0, true, Qwen38BlockParityTier::RealSingleLayer},
+        {"qwen08b_1L_full", &b08_l3, false, Qwen38BlockParityTier::RealSingleLayer},
+        {"qwen08b_4L_stepwise", &b08_4l, false, Qwen38BlockParityTier::RealStacked4Layer},
+        {"qwen08b_4L_chunk", &b08_4l, true, Qwen38BlockParityTier::RealStacked4Layer},
+    }};
+    for (const auto& job : jobs08) {
+      if (auto rc = check_early_stop("qwen08b_blocks")) return *rc;
+      run_block_check(job.name, "real_block_envelope", *job.bundle, job.chunk, false, job.tier, true,
+                      &timings.qwen08b_cpu_fp64_ms, &timings.qwen08b_cpu_warp_ms, &timings.qwen08b_gpu_ms,
+                      "qwen08b_blocks");
+    }
+    std::printf("[phase] done=qwen08b_blocks cpu_fp64_ms=%.1f cpu_warp_ms=%.1f gpu_ms=%.1f wall_ms=%.1f\n",
+                timings.qwen08b_cpu_fp64_ms, timings.qwen08b_cpu_warp_ms, timings.qwen08b_gpu_ms, wall_ms());
+  }
+  if (auto rc = check_early_stop("qwen08b_blocks")) return *rc;
+
+  // Phase 2C: Real Qwen3.8-27B-NVFP4 (MixedFp8Nvfp4) 1L & 4L blocks (single pinned 4L stream load + slices).
   if (skip_27b) {
     record_non_executed_group({"qwen27b_1L_gdn", "qwen27b_1L_full", "qwen27b_4L_stepwise", "qwen27b_4L_chunk"},
-                              "skipped_diagnostic", "--skip-27b specified in diagnostic mode");
+                              "real_block_envelope", "skipped_diagnostic", "--skip-27b specified in diagnostic mode",
+                              "qwen27b_blocks");
   } else if (!std::filesystem::is_directory(q27_dir)) {
     record_non_executed_group({"qwen27b_1L_gdn", "qwen27b_1L_full", "qwen27b_4L_stepwise", "qwen27b_4L_chunk"},
-                              "missing_checkpoint", "missing qwen27b directory: " + q27_dir);
+                              "real_block_envelope", "missing_checkpoint", "missing qwen27b directory: " + q27_dir,
+                              "qwen27b_blocks");
   } else {
+    std::printf("[phase] start=qwen27b_manifest_sha wall_ms=%.1f\n", wall_ms());
+    checkpoint_json("qwen27b_manifest_sha");
     const auto t_sha0 = std::chrono::steady_clock::now();
     const auto m27 = verify_pins ? Qwen38Manifest::inspect_pinned(q27_dir, qwen38_27b_nvfp4_pin_spec(), "482ca0f")
                                  : Qwen38Manifest::inspect(q27_dir, false, "482ca0f");
-    const auto t_sha1 = std::chrono::steady_clock::now();
-    cold_manifest_sha_ms = std::chrono::duration<double, std::milli>(t_sha1 - t_sha0).count();
+    timings.qwen27b_manifest_sha_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sha0).count();
+    std::printf("[phase] done=qwen27b_manifest_sha elapsed_ms=%.1f wall_ms=%.1f\n",
+                timings.qwen27b_manifest_sha_ms, wall_ms());
+    if (auto rc = check_early_stop("qwen27b_manifest_sha")) return *rc;
+
     q27_pins_verified_actual =
         verify_pins && m27.checkpoint.verification_level == ingine::model::VerificationLevel::PinnedVerified &&
         m27.checkpoint.shard_digests_verified;
 
     const std::array<std::int32_t, 4> toks = {9707, 15, 220, 16};
     const std::array<int, 4> l4 = {0, 1, 2, 3};
+    std::printf("[phase] start=qwen27b_stream_load wall_ms=%.1f\n", wall_ms());
+    checkpoint_json("qwen27b_stream_load");
     const auto t_ld0 = std::chrono::steady_clock::now();
     const auto b27_4l = load_qwen38_block_bundle(q27_dir, m27, l4, toks);
-    const auto t_ld1 = std::chrono::steady_clock::now();
-    cold_safetensors_load_ms = std::chrono::duration<double, std::milli>(t_ld1 - t_ld0).count();
+    timings.qwen27b_stream_load_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ld0).count();
+    std::printf("[phase] done=qwen27b_stream_load elapsed_ms=%.1f wall_ms=%.1f\n",
+                timings.qwen27b_stream_load_ms, wall_ms());
+    if (auto rc = check_early_stop("qwen27b_stream_load")) return *rc;
 
-    run_block_check("qwen27b_1L_gdn", slice_qwen38_block_layer(b27_4l, 0), true, true,
-                    Qwen38BlockParityTier::RealSingleLayer);
-    run_block_check("qwen27b_1L_full", slice_qwen38_block_layer(b27_4l, 3), false, true,
-                    Qwen38BlockParityTier::RealSingleLayer);
-    run_block_check("qwen27b_4L_stepwise", b27_4l, false, true, Qwen38BlockParityTier::RealStacked4Layer);
-    run_block_check("qwen27b_4L_chunk", b27_4l, true, true, Qwen38BlockParityTier::RealStacked4Layer);
+    std::printf("[phase] start=qwen27b_blocks wall_ms=%.1f\n", wall_ms());
+    checkpoint_json("qwen27b_blocks");
+    const auto b27_l0 = slice_qwen38_block_layer(b27_4l, 0);
+    const auto b27_l3 = slice_qwen38_block_layer(b27_4l, 3);
+    struct Job27 {
+      const char* name;
+      const Qwen38BlockBundleHost* bundle;
+      bool chunk;
+      Qwen38BlockParityTier tier;
+    };
+    const std::array<Job27, 4> jobs27 = {{
+        {"qwen27b_1L_gdn", &b27_l0, true, Qwen38BlockParityTier::RealSingleLayer},
+        {"qwen27b_1L_full", &b27_l3, false, Qwen38BlockParityTier::RealSingleLayer},
+        {"qwen27b_4L_stepwise", &b27_4l, false, Qwen38BlockParityTier::RealStacked4Layer},
+        {"qwen27b_4L_chunk", &b27_4l, true, Qwen38BlockParityTier::RealStacked4Layer},
+    }};
+    for (const auto& job : jobs27) {
+      if (auto rc = check_early_stop("qwen27b_blocks")) return *rc;
+      run_block_check(job.name, "real_block_envelope", *job.bundle, job.chunk, true, job.tier, true,
+                      &timings.qwen27b_cpu_fp64_ms, &timings.qwen27b_cpu_warp_ms, &timings.qwen27b_gpu_ms,
+                      "qwen27b_blocks");
+    }
+    std::printf("[phase] done=qwen27b_blocks cpu_fp64_ms=%.1f cpu_warp_ms=%.1f gpu_ms=%.1f wall_ms=%.1f\n",
+                timings.qwen27b_cpu_fp64_ms, timings.qwen27b_cpu_warp_ms, timings.qwen27b_gpu_ms, wall_ms());
   }
 
-  std::vector<Qwen38Gate1RowStatus> statuses;
-  statuses.reserve(records.size());
-  for (const auto& r : records) statuses.push_back({r.name, r.status, r.passed});
-  const auto summary = evaluate_gate1_coverage(statuses, diagnostic_mode, q27_pins_verified_actual);
-
-  struct rusage ru {};
-  std::uint64_t host_rss_bytes = 0;
-  if (::getrusage(RUSAGE_SELF, &ru) == 0 && ru.ru_maxrss > 0) {
-    host_rss_bytes = static_cast<std::uint64_t>(ru.ru_maxrss) * 1024ull;
-  }
-
-  if (!json_out.empty()) {
-    nlohmann::ordered_json root;
-    root["device"] = props.name;
-    root["sm"] = std::to_string(props.major) + std::to_string(props.minor);
-    root["mode"] = summary.mode;
-    root["coverage_status"] = summary.coverage_status;
-    root["complete_coverage"] = summary.complete_coverage;
-    root["executed_checks_passed"] = summary.executed_checks_passed;
-    root["qwen27b_pins_verified"] = summary.qwen27b_pins_verified;
-    root["qualification_passed"] = summary.qualification_passed;
-    root["all_passed"] = summary.all_passed;
-    root["required_row_count"] = summary.required_row_count;
-    root["passed_required_row_count"] = summary.passed_required_row_count;
-    root["missing_required_rows"] = summary.missing_required_rows;
-    root["failed_rows"] = summary.failed_rows;
-    root["qwen08b_dir"] = q08_dir;
-    root["qwen27b_dir"] = q27_dir;
-    root["cold_manifest_sha_ms"] = cold_manifest_sha_ms;
-    root["cold_safetensors_load_ms"] = cold_safetensors_load_ms;
-    root["peak_vram_bytes"] = peak_vram_bytes;
-    root["host_rss_bytes"] = host_rss_bytes;
-    root["checks"] = nlohmann::json::array();
-    for (const auto& r : records) {
-      nlohmann::ordered_json j;
-      j["name"] = r.name;
-      j["status"] = r.status;
-      j["criterion"] = r.criterion;
-      j["max_abs"] = r.max_abs_diff;
-      j["aux_max_abs"] = r.aux_max_abs;
-      if (r.ref_max_abs.has_value()) j["ref_max_abs"] = *r.ref_max_abs;
-      if (r.rel_max_abs.has_value()) j["rel_max_abs"] = *r.rel_max_abs;
-      if (r.rel_l2.has_value()) j["rel_l2"] = *r.rel_l2;
-      if (r.cosine_sim.has_value()) j["cosine_sim"] = *r.cosine_sim;
-      if (r.layer0_gdn_max_abs.has_value()) j["layer0_gdn_max_abs"] = *r.layer0_gdn_max_abs;
-      if (r.stacked_gdn_rel_l2.has_value()) j["stacked_gdn_rel_l2"] = *r.stacked_gdn_rel_l2;
-      if (r.max_bf16_ulp.has_value()) j["max_bf16_ulp"] = *r.max_bf16_ulp;
-      if (r.bf16_vs_gpu_f32_bit_mismatches.has_value()) {
-        j["bf16_vs_gpu_f32_bit_mismatches"] = *r.bf16_vs_gpu_f32_bit_mismatches;
-      }
-      j["elapsed_ms"] = r.elapsed_ms;
-      j["passed"] = r.passed;
-      root["checks"].push_back(std::move(j));
-    }
-    std::ofstream out(json_out, std::ios::binary);
-    if (!out.good()) {
-      std::fprintf(stderr, "failed to open json output path: %s\n", json_out.c_str());
-      return 1;
-    }
-    out << root.dump(2) << '\n';
+  Qwen38Gate1CoverageSummary summary;
+  const auto final_doc = build_json(false, "complete", false, 0, &summary);
+  if (!json_out.empty() && !write_json_atomic(json_out, final_doc)) {
+    std::fprintf(stderr, "failed to write final atomic json output path: %s\n", json_out.c_str());
+    return 1;
   }
 
   if (diagnostic_mode) {
     std::printf("qwen38_gpu_gate1: DIAGNOSTIC (INCOMPLETE - NOT GATE 1 QUALIFIED) "
-                "status=%s (%zu/%zu required passed, missing=%zu, failed=%zu, peak_vram=%.1f MiB)\n",
+                "status=%s (%zu/%zu required passed, missing=%zu, failed=%zu, peak_vram=%.1f MiB, wall_ms=%.1f)\n",
                 summary.coverage_status.c_str(), summary.passed_required_row_count, summary.required_row_count,
                 summary.missing_required_rows.size(), summary.failed_rows.size(),
-                static_cast<double>(peak_vram_bytes) / (1024.0 * 1024.0));
+                static_cast<double>(peak_vram_bytes) / (1024.0 * 1024.0), timings.total_wall_ms);
     return summary.executed_checks_passed ? 0 : 1;
   }
 
-  std::printf("qwen38_gpu_gate1: %s (%zu/%zu required passed, missing=%zu, failed=%zu, pins=%s, peak_vram=%.1f MiB)\n",
+  std::printf("qwen38_gpu_gate1: %s (%zu/%zu required passed, missing=%zu, failed=%zu, pins=%s, peak_vram=%.1f MiB, "
+              "wall_ms=%.1f)\n",
               summary.qualification_passed ? "PASS" : "FAIL", summary.passed_required_row_count,
               summary.required_row_count, summary.missing_required_rows.size(), summary.failed_rows.size(),
               summary.qwen27b_pins_verified ? "verified" : "UNVERIFIED",
-              static_cast<double>(peak_vram_bytes) / (1024.0 * 1024.0));
+              static_cast<double>(peak_vram_bytes) / (1024.0 * 1024.0), timings.total_wall_ms);
   return summary.qualification_passed ? 0 : 1;
 }
 

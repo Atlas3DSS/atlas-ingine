@@ -1070,21 +1070,27 @@ Qwen38Bf16CompareStats compare_bf16_against_rounded_oracle(std::span<const std::
       ++stats.criterion_violations;
       ++stats.non_exact_bf16_count;
       stats.max_bf16_ulp = std::numeric_limits<std::uint32_t>::max();
+      stats.max_bf16_ulp_above_floor = std::numeric_limits<std::uint32_t>::max();
       continue;
     }
     const float abs_d = std::fabs(got_b - ref_b);
     const std::uint32_t ulp = bf16_ulp_distance(got_bf16_bits[i], ref_bits);
     stats.max_abs_vs_bf16_oracle = std::max(stats.max_abs_vs_bf16_oracle, abs_d);
+    stats.max_bf16_ulp = std::max(stats.max_bf16_ulp, ulp);
     if (ulp == 0) {
       ++stats.exact_bf16_matches;
     } else {
       ++stats.non_exact_bf16_count;
     }
-    if (abs_d > abs_floor || ulp <= max_ulp) {
-      stats.max_bf16_ulp = std::max(stats.max_bf16_ulp, ulp);
+    if (abs_d > abs_floor) {
+      stats.max_bf16_ulp_above_floor = std::max(stats.max_bf16_ulp_above_floor, ulp);
     }
-    if (ulp > max_ulp && abs_d > abs_floor) {
-      ++stats.criterion_violations;
+    if (ulp > max_ulp) {
+      if (abs_d > abs_floor) {
+        ++stats.criterion_violations;
+      } else {
+        ++stats.floor_exempt_count;
+      }
     }
   }
   stats.passed = (stats.criterion_violations == 0);
@@ -1373,47 +1379,171 @@ Qwen38VectorCompareStats compare_f32_vectors(std::span<const float> got, std::sp
 Qwen38BlockParityResult evaluate_block_parity(const Qwen38BlockBundleHost& bundle, const Qwen38BlockRunOutput& got,
                                               const Qwen38BlockRunOutput& ref, Qwen38BlockParityTier tier) {
   Qwen38BlockParityResult res;
+  const Qwen38Config& c = bundle.cfg;
+  const std::size_t S = bundle.token_ids.size();
+  const std::size_t L = bundle.layers.size();
+  const std::size_t expected_hidden = S * static_cast<std::size_t>(c.hidden_size);
+  if (S == 0 || L == 0 || got.hidden_seq.size() != expected_hidden || ref.hidden_seq.size() != expected_hidden) {
+    res.state_shapes_valid = false;
+  }
+
+  auto vec_all_finite = [](std::span<const float> v) noexcept {
+    for (float x : v) {
+      if (!std::isfinite(x)) return false;
+    }
+    return true;
+  };
+
   res.hidden = compare_f32_vectors(got.hidden_seq, ref.hidden_seq);
-  if (got.hidden_seq.size() == ref.hidden_seq.size()) {
+  if (got.hidden_seq.size() == ref.hidden_seq.size() && !got.hidden_seq.empty()) {
     std::vector<std::uint16_t> got_bits(got.hidden_seq.size());
     for (std::size_t i = 0; i < got.hidden_seq.size(); ++i) got_bits[i] = f32_to_bf16(got.hidden_seq[i]);
     res.hidden_bf16 = compare_bf16_against_rounded_oracle(got_bits, ref.hidden_seq, 1u, 1e-3f);
   }
-  if (got.recurrent_states.size() != bundle.layers.size() || ref.recurrent_states.size() != bundle.layers.size()) {
-    res.gdn_finite = false;
+
+  if (got.conv_states.size() != L || ref.conv_states.size() != L || got.recurrent_states.size() != L ||
+      ref.recurrent_states.size() != L || got.k_caches.size() != L || ref.k_caches.size() != L ||
+      got.v_caches.size() != L || ref.v_caches.size() != L) {
+    res.state_shapes_valid = false;
+    for (const auto& v : got.conv_states)
+      if (!vec_all_finite(v)) res.conv_finite = false;
+    for (const auto& v : ref.conv_states)
+      if (!vec_all_finite(v)) res.conv_finite = false;
+    for (const auto& v : got.recurrent_states)
+      if (!vec_all_finite(v)) res.gdn_finite = false;
+    for (const auto& v : ref.recurrent_states)
+      if (!vec_all_finite(v)) res.gdn_finite = false;
+    for (const auto& v : got.k_caches)
+      if (!vec_all_finite(v)) res.kv_finite = false;
+    for (const auto& v : ref.k_caches)
+      if (!vec_all_finite(v)) res.kv_finite = false;
+    for (const auto& v : got.v_caches)
+      if (!vec_all_finite(v)) res.kv_finite = false;
+    for (const auto& v : ref.v_caches)
+      if (!vec_all_finite(v)) res.kv_finite = false;
   } else {
-    for (std::size_t li = 0; li < bundle.layers.size(); ++li) {
-      if (bundle.layers[li].kind != Qwen38LayerKind::LinearAttention) continue;
-      const auto st = compare_f32_vectors(got.recurrent_states[li], ref.recurrent_states[li]);
-      if (!st.finite) {
-        res.gdn_finite = false;
-        continue;
-      }
-      if (li == 0) {
-        res.layer0_gdn_max_abs = std::max(res.layer0_gdn_max_abs, st.max_abs);
+    const std::size_t expected_conv =
+        static_cast<std::size_t>(c.linear_conv_dim()) * static_cast<std::size_t>(c.linear_conv_kernel_dim);
+    const std::size_t expected_gdn = static_cast<std::size_t>(c.linear_num_value_heads) *
+                                     static_cast<std::size_t>(c.linear_key_head_dim) *
+                                     static_cast<std::size_t>(c.linear_value_head_dim);
+    const std::size_t expected_kv = S * static_cast<std::size_t>(c.full_kv_proj_out_dim());
+
+    for (std::size_t li = 0; li < L; ++li) {
+      if (bundle.layers[li].kind == Qwen38LayerKind::LinearAttention) {
+        if (got.conv_states[li].size() != expected_conv || ref.conv_states[li].size() != expected_conv ||
+            got.recurrent_states[li].size() != expected_gdn || ref.recurrent_states[li].size() != expected_gdn ||
+            !got.k_caches[li].empty() || !ref.k_caches[li].empty() || !got.v_caches[li].empty() ||
+            !ref.v_caches[li].empty()) {
+          res.state_shapes_valid = false;
+        }
+        if (!vec_all_finite(got.conv_states[li]) || !vec_all_finite(ref.conv_states[li])) res.conv_finite = false;
+        if (!vec_all_finite(got.recurrent_states[li]) || !vec_all_finite(ref.recurrent_states[li])) {
+          res.gdn_finite = false;
+        }
+        if (!vec_all_finite(got.k_caches[li]) || !vec_all_finite(got.v_caches[li])) res.kv_finite = false;
+
+        if (got.conv_states[li].size() == ref.conv_states[li].size()) {
+          const auto cs = compare_f32_vectors(got.conv_states[li], ref.conv_states[li]);
+          if (!cs.finite) {
+            res.conv_finite = false;
+          } else if (li == 0) {
+            res.layer0_conv_max_abs = std::max(res.layer0_conv_max_abs, cs.max_abs);
+            res.layer0_conv_rel_l2 = std::max(res.layer0_conv_rel_l2, cs.rel_l2);
+            res.layer0_conv_rel_max_abs = std::max(res.layer0_conv_rel_max_abs, cs.rel_max_abs);
+            res.layer0_conv_cosine = std::min(res.layer0_conv_cosine, cs.cosine_sim);
+          } else {
+            res.stacked_conv_max_abs = std::max(res.stacked_conv_max_abs, cs.max_abs);
+            res.stacked_conv_rel_l2 = std::max(res.stacked_conv_rel_l2, cs.rel_l2);
+            res.stacked_conv_rel_max_abs = std::max(res.stacked_conv_rel_max_abs, cs.rel_max_abs);
+            res.stacked_conv_cosine = std::min(res.stacked_conv_cosine, cs.cosine_sim);
+          }
+        }
+        if (got.recurrent_states[li].size() == ref.recurrent_states[li].size()) {
+          const auto st = compare_f32_vectors(got.recurrent_states[li], ref.recurrent_states[li]);
+          if (!st.finite) {
+            res.gdn_finite = false;
+          } else if (li == 0) {
+            res.layer0_gdn_max_abs = std::max(res.layer0_gdn_max_abs, st.max_abs);
+          } else {
+            res.stacked_gdn_max_abs = std::max(res.stacked_gdn_max_abs, st.max_abs);
+            res.stacked_gdn_rel_l2 = std::max(res.stacked_gdn_rel_l2, st.rel_l2);
+          }
+        }
       } else {
-        res.stacked_gdn_max_abs = std::max(res.stacked_gdn_max_abs, st.max_abs);
-        res.stacked_gdn_rel_l2 = std::max(res.stacked_gdn_rel_l2, st.rel_l2);
+        if (got.k_caches[li].size() != expected_kv || ref.k_caches[li].size() != expected_kv ||
+            got.v_caches[li].size() != expected_kv || ref.v_caches[li].size() != expected_kv ||
+            !got.conv_states[li].empty() || !ref.conv_states[li].empty() || !got.recurrent_states[li].empty() ||
+            !ref.recurrent_states[li].empty()) {
+          res.state_shapes_valid = false;
+        }
+        if (!vec_all_finite(got.k_caches[li]) || !vec_all_finite(ref.k_caches[li]) ||
+            !vec_all_finite(got.v_caches[li]) || !vec_all_finite(ref.v_caches[li])) {
+          res.kv_finite = false;
+        }
+        if (!vec_all_finite(got.conv_states[li])) res.conv_finite = false;
+        if (!vec_all_finite(got.recurrent_states[li])) res.gdn_finite = false;
+
+        if (got.k_caches[li].size() == ref.k_caches[li].size()) {
+          const auto ks = compare_f32_vectors(got.k_caches[li], ref.k_caches[li]);
+          if (!ks.finite) {
+            res.kv_finite = false;
+          } else {
+            res.k_cache_max_abs = std::max(res.k_cache_max_abs, ks.max_abs);
+            res.k_cache_rel_l2 = std::max(res.k_cache_rel_l2, ks.rel_l2);
+            res.k_cache_rel_max_abs = std::max(res.k_cache_rel_max_abs, ks.rel_max_abs);
+            res.k_cache_cosine = std::min(res.k_cache_cosine, ks.cosine_sim);
+          }
+        }
+        if (got.v_caches[li].size() == ref.v_caches[li].size()) {
+          const auto vs = compare_f32_vectors(got.v_caches[li], ref.v_caches[li]);
+          if (!vs.finite) {
+            res.kv_finite = false;
+          } else {
+            res.v_cache_max_abs = std::max(res.v_cache_max_abs, vs.max_abs);
+            res.v_cache_rel_l2 = std::max(res.v_cache_rel_l2, vs.rel_l2);
+            res.v_cache_rel_max_abs = std::max(res.v_cache_rel_max_abs, vs.rel_max_abs);
+            res.v_cache_cosine = std::min(res.v_cache_cosine, vs.cosine_sim);
+          }
+        }
       }
     }
   }
+
+  const bool base_ok = res.state_shapes_valid && res.hidden.finite && res.conv_finite && res.gdn_finite && res.kv_finite;
   if (tier == Qwen38BlockParityTier::SyntheticStrict) {
-    res.criterion = "synth_strict: hidden_max_abs <= 1e-3 && gdn_max_abs <= 2e-4 && bf16_ulp <= 1 || abs <= 1e-3";
-    res.passed = res.hidden.finite && res.gdn_finite && res.hidden.max_abs <= 1e-3f &&
-                 res.layer0_gdn_max_abs <= 2e-4f && res.stacked_gdn_max_abs <= 2e-4f && res.hidden_bf16.passed;
+    res.criterion =
+        "synth_strict: hidden_max_abs <= 1e-3 && bf16_ulp <= 1 || abs <= 1e-3 && gdn <= 2e-4 && "
+        "conv <= 1e-3 && k_cache <= 1e-3 && v_cache <= 1e-3";
+    res.passed = base_ok && res.hidden.max_abs <= 1e-3f && res.hidden_bf16.passed &&
+                 res.layer0_gdn_max_abs <= 2e-4f && res.stacked_gdn_max_abs <= 2e-4f &&
+                 res.layer0_conv_max_abs <= 1e-3f && res.stacked_conv_max_abs <= 1e-3f &&
+                 res.k_cache_max_abs <= 1e-3f && res.v_cache_max_abs <= 1e-3f;
   } else if (tier == Qwen38BlockParityTier::RealSingleLayer) {
     res.criterion =
-        "real_1L_bf16: layer0_gdn_max_abs <= 2e-4 && hidden_rel_l2 <= 2e-3 && hidden_cosine >= 0.99999 && "
-        "hidden_rel_max_abs <= 1e-2";
-    res.passed = res.hidden.finite && res.gdn_finite && res.layer0_gdn_max_abs <= 2e-4f &&
-                 res.hidden.rel_l2 <= 2e-3f && res.hidden.cosine_sim >= 0.99999 && res.hidden.rel_max_abs <= 1e-2f;
+        "real_1L_bf16: layer0_gdn <= 2e-4 && hidden/conv/k/v (rel_l2 <= 2e-3 && cos >= 0.99999 && rel_max <= 1e-2)";
+    res.passed = base_ok && res.layer0_gdn_max_abs <= 2e-4f &&
+                 res.hidden.rel_l2 <= 2e-3f && res.hidden.cosine_sim >= 0.99999 && res.hidden.rel_max_abs <= 1e-2f &&
+                 res.layer0_conv_rel_l2 <= 2e-3f && res.layer0_conv_cosine >= 0.99999 &&
+                 res.layer0_conv_rel_max_abs <= 1e-2f &&
+                 res.k_cache_rel_l2 <= 2e-3f && res.k_cache_cosine >= 0.99999 && res.k_cache_rel_max_abs <= 1e-2f &&
+                 res.v_cache_rel_l2 <= 2e-3f && res.v_cache_cosine >= 0.99999 && res.v_cache_rel_max_abs <= 1e-2f;
   } else {
     res.criterion =
-        "real_4L_bf16: layer0_gdn_max_abs <= 2e-4 && stacked_gdn_max_abs <= 1e-2 && stacked_gdn_rel_l2 <= 2.5e-2 && "
-        "hidden_rel_l2 <= 1.5e-2 && hidden_cosine >= 0.99985 && hidden_rel_max_abs <= 2.5e-2";
-    res.passed = res.hidden.finite && res.gdn_finite && res.layer0_gdn_max_abs <= 2e-4f &&
-                 res.stacked_gdn_max_abs <= 1e-2f && res.stacked_gdn_rel_l2 <= 2.5e-2f &&
-                 res.hidden.rel_l2 <= 1.5e-2f && res.hidden.cosine_sim >= 0.99985 && res.hidden.rel_max_abs <= 2.5e-2f;
+        "real_4L_bf16: l0_gdn <= 2e-4 && stacked_gdn <= 1e-2 (rel_l2 <= 2.5e-2) && "
+        "l0_conv (rel_l2 <= 2e-3, cos >= 0.99999, rel_max <= 1e-2) && "
+        "hidden (rel_l2 <= 1.5e-2, cos >= 0.99985, rel_max <= 2.5e-2) && "
+        "stacked_conv (rel_l2 <= 2e-2, cos >= 0.99975, rel_max <= 5e-2) && "
+        "k/v_cache (rel_l2 <= 3.5e-2, cos >= 0.9994, rel_max <= 6e-2)";
+    res.passed = base_ok && res.layer0_gdn_max_abs <= 2e-4f && res.stacked_gdn_max_abs <= 1e-2f &&
+                 res.stacked_gdn_rel_l2 <= 2.5e-2f &&
+                 res.hidden.rel_l2 <= 1.5e-2f && res.hidden.cosine_sim >= 0.99985 && res.hidden.rel_max_abs <= 2.5e-2f &&
+                 res.layer0_conv_rel_l2 <= 2e-3f && res.layer0_conv_cosine >= 0.99999 &&
+                 res.layer0_conv_rel_max_abs <= 1e-2f &&
+                 res.stacked_conv_rel_l2 <= 2.0e-2f && res.stacked_conv_cosine >= 0.99975 &&
+                 res.stacked_conv_rel_max_abs <= 5.0e-2f &&
+                 res.k_cache_rel_l2 <= 3.5e-2f && res.k_cache_cosine >= 0.9994 && res.k_cache_rel_max_abs <= 6.0e-2f &&
+                 res.v_cache_rel_l2 <= 3.5e-2f && res.v_cache_cosine >= 0.9994 && res.v_cache_rel_max_abs <= 6.0e-2f;
   }
   return res;
 }

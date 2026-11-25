@@ -18,6 +18,7 @@
 #include <random>
 #include <stdexcept>
 #include <string_view>
+#include <sys/resource.h>
 #include <vector>
 
 #define CHECK(cond)                                                                         \
@@ -183,7 +184,20 @@ void test_gate1_linear_fixtures_cpu() {
   const std::uint16_t mag = static_cast<std::uint16_t>(oracle_bits & 0x7fffu);
   bad_bits[large_idx] = static_cast<std::uint16_t>((oracle_bits & 0x8000u) | (mag > 4u ? (mag - 3u) : (mag + 3u)));
   const auto bad_cmp = compare_bf16_against_rounded_oracle(bad_bits, fx.nvfp4_ref_f32, 1u, 1e-3f);
-  CHECK(!bad_cmp.passed && bad_cmp.criterion_violations == 1u);
+  CHECK(!bad_cmp.passed && bad_cmp.criterion_violations == 1u && bad_cmp.max_bf16_ulp >= 2u);
+
+  // Floor-exempt case regression (review.log: actual ULP=14851 within abs_floor=1e-3 vs 0.0f):
+  // MUST retain true raw maximum (14851), report 0 above-floor max, and count floor_exempt_count=1.
+  {
+    const std::array<std::uint16_t, 1> got_floor = {14851u};
+    const std::array<float, 1> ref_zero = {0.0f};
+    const auto fl_cmp = compare_bf16_against_rounded_oracle(got_floor, ref_zero, 1u, 1e-3f);
+    CHECK(fl_cmp.passed);
+    CHECK(fl_cmp.max_bf16_ulp == 14851u);
+    CHECK(fl_cmp.max_bf16_ulp_above_floor == 0u);
+    CHECK(fl_cmp.floor_exempt_count == 1u);
+    CHECK(fl_cmp.criterion_violations == 0u);
+  }
 }
 
 void test_gate1_coverage_enforcement() {
@@ -296,70 +310,219 @@ void test_block_parity_evaluator() {
     for (float& x : bad_rel.hidden_seq) x *= 1.03f;
     CHECK(!evaluate_block_parity(b4, bad_rel, r4_ref, Qwen38BlockParityTier::RealStacked4Layer).passed);
   }
+
+  // Regression for review.log line 2: valid 4-layer hidden & GDN output MUST FAIL when conv_states / K / V
+  // caches are damaged (nonfinite, missing/truncated, finite drift, or stray KV on linear layers).
+  {
+    auto damaged_combo = r4_ref;
+    damaged_combo.conv_states[0][0] = std::numeric_limits<float>::quiet_NaN();
+    damaged_combo.k_caches[3][0] = std::numeric_limits<float>::infinity();
+    damaged_combo.v_caches[3].clear();
+    const auto p = evaluate_block_parity(b4, damaged_combo, r4_ref, Qwen38BlockParityTier::RealStacked4Layer);
+    CHECK(!p.passed && !p.state_shapes_valid && !p.conv_finite && !p.kv_finite);
+  }
+  {
+    auto bad_conv_nan = r4_ref;
+    bad_conv_nan.conv_states[0][0] = std::numeric_limits<float>::quiet_NaN();
+    const auto p = evaluate_block_parity(b4, bad_conv_nan, r4_ref, Qwen38BlockParityTier::RealStacked4Layer);
+    CHECK(!p.passed && !p.conv_finite && p.state_shapes_valid);
+  }
+  {
+    auto bad_conv_trunc = r4_ref;
+    bad_conv_trunc.conv_states[0].pop_back();
+    const auto p = evaluate_block_parity(b4, bad_conv_trunc, r4_ref, Qwen38BlockParityTier::RealStacked4Layer);
+    CHECK(!p.passed && !p.state_shapes_valid);
+  }
+  {
+    auto bad_k_inf = r4_ref;
+    bad_k_inf.k_caches[3][0] = -std::numeric_limits<float>::infinity();
+    const auto p = evaluate_block_parity(b4, bad_k_inf, r4_ref, Qwen38BlockParityTier::RealStacked4Layer);
+    CHECK(!p.passed && !p.kv_finite && p.state_shapes_valid);
+  }
+  {
+    auto bad_v_missing = r4_ref;
+    bad_v_missing.v_caches[3].clear();
+    const auto p = evaluate_block_parity(b4, bad_v_missing, r4_ref, Qwen38BlockParityTier::RealStacked4Layer);
+    CHECK(!p.passed && !p.state_shapes_valid);
+  }
+  {
+    auto bad_conv_val = r4_ref;
+    bad_conv_val.conv_states[0][0] += 0.1f;
+    CHECK(!evaluate_block_parity(b4, bad_conv_val, r4_ref, Qwen38BlockParityTier::RealStacked4Layer).passed);
+  }
+  {
+    auto bad_stacked_conv = r4_ref;
+    bad_stacked_conv.conv_states[1][0] += 0.2f;
+    CHECK(!evaluate_block_parity(b4, bad_stacked_conv, r4_ref, Qwen38BlockParityTier::RealStacked4Layer).passed);
+  }
+  {
+    auto bad_k_val = r4_ref;
+    bad_k_val.k_caches[3][0] += 0.5f;
+    CHECK(!evaluate_block_parity(b4, bad_k_val, r4_ref, Qwen38BlockParityTier::RealStacked4Layer).passed);
+  }
+  {
+    auto bad_v_val = r4_ref;
+    bad_v_val.v_caches[3][0] += 0.5f;
+    CHECK(!evaluate_block_parity(b4, bad_v_val, r4_ref, Qwen38BlockParityTier::RealStacked4Layer).passed);
+  }
+  {
+    auto stray_kv = r4_ref;
+    stray_kv.k_caches[0].push_back(0.0f);
+    const auto p = evaluate_block_parity(b4, stray_kv, r4_ref, Qwen38BlockParityTier::RealStacked4Layer);
+    CHECK(!p.passed && !p.state_shapes_valid);
+  }
+}
+
+Qwen38BlockBundleHost slice_qwen38_block_tokens(const Qwen38BlockBundleHost& bundle, std::size_t tok_begin,
+                                               std::size_t tok_count) {
+  CHECK(tok_count > 0 && tok_begin + tok_count <= bundle.token_ids.size());
+  const std::size_t H = static_cast<std::size_t>(bundle.cfg.hidden_size);
+  Qwen38BlockBundleHost out;
+  out.cfg = bundle.cfg;
+  out.token_ids.assign(bundle.token_ids.begin() + static_cast<std::ptrdiff_t>(tok_begin),
+                       bundle.token_ids.begin() + static_cast<std::ptrdiff_t>(tok_begin + tok_count));
+  out.prompt_embeddings_bf16.assign(
+      bundle.prompt_embeddings_bf16.begin() + static_cast<std::ptrdiff_t>(tok_begin * H),
+      bundle.prompt_embeddings_bf16.begin() + static_cast<std::ptrdiff_t>((tok_begin + tok_count) * H));
+  out.layers = bundle.layers;
+  return out;
 }
 
 void bench_27b_pinned_cpu_dry_run(bool verify_pins_27b) {
   const auto t_start = std::chrono::steady_clock::now();
+  auto wall_ms = [&]() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+  };
   const std::filesystem::path q08_dir("/mnt/storage/models/Qwen3.5-0.8B");
   const std::filesystem::path q27_dir("/home/orwel/dev_genius/models/Qwen3.8-27B-NVFP4-482ca0f");
   CHECK(std::filesystem::is_directory(q08_dir));
   CHECK(std::filesystem::is_directory(q27_dir));
 
+  std::printf("[phase] start=qwen08b_inspect wall_ms=%.1f\n", wall_ms());
+  const auto t_i08_0 = std::chrono::steady_clock::now();
   const auto m08 = Qwen38Manifest::inspect(q08_dir, false, "local");
+  const double qwen08b_inspect_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_i08_0).count();
+  std::printf("[phase] done=qwen08b_inspect elapsed_ms=%.1f wall_ms=%.1f\n", qwen08b_inspect_ms, wall_ms());
+
   const std::array<int, 4> l4 = {0, 1, 2, 3};
   const std::array<std::int32_t, 6> toks08 = {9707, 15, 220, 16, 17, 198};
+  const std::array<std::int32_t, 6> toks_holdout = {785, 279, 1493, 311, 458, 19};
+
+  std::printf("[phase] start=qwen08b_load wall_ms=%.1f\n", wall_ms());
   const auto t_l08_0 = std::chrono::steady_clock::now();
   const auto b08_4l = load_qwen38_block_bundle(q08_dir, m08, l4, toks08);
-  const auto t_l08_1 = std::chrono::steady_clock::now();
-  const double load08_ms = std::chrono::duration<double, std::milli>(t_l08_1 - t_l08_0).count();
+  const auto b08_holdout_4l = load_qwen38_block_bundle(q08_dir, m08, l4, toks_holdout);
+  const double qwen08b_load_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_l08_0).count();
+  std::printf("[phase] done=qwen08b_load elapsed_ms=%.1f wall_ms=%.1f\n", qwen08b_load_ms, wall_ms());
 
+  std::printf("[phase] start=qwen27b_manifest_sha wall_ms=%.1f\n", wall_ms());
   const auto t_sha0 = std::chrono::steady_clock::now();
   const auto m27 = verify_pins_27b ? Qwen38Manifest::inspect_pinned(q27_dir, qwen38_27b_nvfp4_pin_spec(), "482ca0f")
                                    : Qwen38Manifest::inspect(q27_dir, false, "482ca0f");
-  const auto t_sha1 = std::chrono::steady_clock::now();
-  const double cold_manifest_sha_ms = std::chrono::duration<double, std::milli>(t_sha1 - t_sha0).count();
+  const double qwen27b_manifest_sha_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sha0).count();
+  std::printf("[phase] done=qwen27b_manifest_sha elapsed_ms=%.1f wall_ms=%.1f\n", qwen27b_manifest_sha_ms, wall_ms());
 
-  const std::array<std::int32_t, 4> toks27 = {9707, 15, 220, 16};
+  // Extract primary (first 4) + disjoint holdout (last 6) token embeddings in a single pinned 4L stream pass.
+  const std::array<std::int32_t, 10> toks27_both = {9707, 15, 220, 16, 785, 279, 1493, 311, 458, 19};
+  std::printf("[phase] start=qwen27b_stream_load wall_ms=%.1f\n", wall_ms());
   const auto t_l27_0 = std::chrono::steady_clock::now();
-  const auto b27_4l = load_qwen38_block_bundle(q27_dir, m27, l4, toks27);
-  const auto t_l27_1 = std::chrono::steady_clock::now();
-  const double cold_safetensors_load_ms = std::chrono::duration<double, std::milli>(t_l27_1 - t_l27_0).count();
+  const auto b27_both = load_qwen38_block_bundle(q27_dir, m27, l4, toks27_both);
+  const double qwen27b_stream_load_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_l27_0).count();
+  std::printf("[phase] done=qwen27b_stream_load elapsed_ms=%.1f wall_ms=%.1f\n", qwen27b_stream_load_ms, wall_ms());
 
-  std::printf("bench_27b_%s: load08_ms=%.1f cold_manifest_sha_ms=%.1f cold_safetensors_load_ms=%.1f\n",
-              verify_pins_27b ? "pinned" : "fast", load08_ms, cold_manifest_sha_ms, cold_safetensors_load_ms);
+  const auto b27_4l = slice_qwen38_block_tokens(b27_both, 0, 4);
+  const auto b27_holdout_4l = slice_qwen38_block_tokens(b27_both, 4, 6);
 
+  double qwen08b_cpu_fp64_ms = 0.0, qwen08b_cpu_warp_ms = 0.0;
+  double qwen27b_cpu_fp64_ms = 0.0, qwen27b_cpu_warp_ms = 0.0;
+  double holdout_cpu_ms = 0.0;
   bool all_ok = true;
+
   auto check_sim_pair = [&](const char* label, const Qwen38BlockBundleHost& b, bool chunk, bool cal_fp8,
-                            Qwen38BlockParityTier tier) {
+                            Qwen38BlockParityTier tier, double* fp64_acc_ms, double* warp_acc_ms) {
     const auto r_fp64 = run_qwen38_blocks_cpu(b, true, chunk, 64, cal_fp8, 8, false);
     const auto r_fp32 = run_qwen38_blocks_cpu(b, true, chunk, 64, cal_fp8, 8, true);
+    if (fp64_acc_ms) *fp64_acc_ms += r_fp64.elapsed_ms;
+    if (warp_acc_ms) *warp_acc_ms += r_fp32.elapsed_ms;
     const auto p = evaluate_block_parity(b, r_fp32, r_fp64, tier);
-    std::printf("  [%s] max_abs=%.6f ref_max=%.6f rel_max=%.6g rel_l2=%.6g cos=%.8f "
-                "l0_gdn=%.6f stacked_gdn=%.6f stacked_rel_l2=%.6g cpu_fp64_ms=%.1f cpu_fp32_ms=%.1f -> %s\n",
-                label, p.hidden.max_abs, p.hidden.ref_max_abs, p.hidden.rel_max_abs, p.hidden.rel_l2,
-                p.hidden.cosine_sim, p.layer0_gdn_max_abs, p.stacked_gdn_max_abs, p.stacked_gdn_rel_l2,
-                r_fp64.elapsed_ms, r_fp32.elapsed_ms, p.passed ? "PASS" : "FAIL");
-    std::fflush(stdout);
+    const float conv_rel_l2 = std::max(p.layer0_conv_rel_l2, p.stacked_conv_rel_l2);
+    const float conv_rel_max = std::max(p.layer0_conv_rel_max_abs, p.stacked_conv_rel_max_abs);
+    std::printf(
+        "  [%s] rel_l2=%.6g cos=%.8f rel_max=%.6g l0_gdn=%.6f stacked_gdn=%.6f "
+        "conv_rel_l2=%.6g conv_rel_max=%.6g k_rel_l2=%.6g k_rel_max=%.6g k_cos=%.8f "
+        "v_rel_l2=%.6g v_rel_max=%.6g v_cos=%.8f raw_ulp=%u above_floor_ulp=%u "
+        "exempt=%zu fp64_ms=%.1f warp_ms=%.1f -> %s\n",
+        label, p.hidden.rel_l2, p.hidden.cosine_sim, p.hidden.rel_max_abs, p.layer0_gdn_max_abs,
+        p.stacked_gdn_max_abs, conv_rel_l2, conv_rel_max, p.k_cache_rel_l2, p.k_cache_rel_max_abs, p.k_cache_cosine,
+        p.v_cache_rel_l2, p.v_cache_rel_max_abs, p.v_cache_cosine, p.hidden_bf16.max_bf16_ulp,
+        p.hidden_bf16.max_bf16_ulp_above_floor, p.hidden_bf16.floor_exempt_count, r_fp64.elapsed_ms, r_fp32.elapsed_ms,
+        p.passed ? "PASS" : "FAIL");
     all_ok = all_ok && p.passed;
   };
 
+  std::printf("[phase] start=qwen08b_blocks wall_ms=%.1f\n", wall_ms());
   check_sim_pair("qwen08b_1L_gdn", slice_qwen38_block_layer(b08_4l, 0), true, false,
-                 Qwen38BlockParityTier::RealSingleLayer);
+                 Qwen38BlockParityTier::RealSingleLayer, &qwen08b_cpu_fp64_ms, &qwen08b_cpu_warp_ms);
   check_sim_pair("qwen08b_1L_full", slice_qwen38_block_layer(b08_4l, 3), false, false,
-                 Qwen38BlockParityTier::RealSingleLayer);
-  check_sim_pair("qwen08b_4L_stepwise", b08_4l, false, false, Qwen38BlockParityTier::RealStacked4Layer);
-  check_sim_pair("qwen08b_4L_chunk", b08_4l, true, false, Qwen38BlockParityTier::RealStacked4Layer);
+                 Qwen38BlockParityTier::RealSingleLayer, &qwen08b_cpu_fp64_ms, &qwen08b_cpu_warp_ms);
+  check_sim_pair("qwen08b_4L_stepwise", b08_4l, false, false, Qwen38BlockParityTier::RealStacked4Layer,
+                 &qwen08b_cpu_fp64_ms, &qwen08b_cpu_warp_ms);
+  check_sim_pair("qwen08b_4L_chunk", b08_4l, true, false, Qwen38BlockParityTier::RealStacked4Layer,
+                 &qwen08b_cpu_fp64_ms, &qwen08b_cpu_warp_ms);
+  std::printf("[phase] done=qwen08b_blocks fp64_ms=%.1f warp_ms=%.1f wall_ms=%.1f\n",
+              qwen08b_cpu_fp64_ms, qwen08b_cpu_warp_ms, wall_ms());
 
+  std::printf("[phase] start=qwen27b_blocks wall_ms=%.1f\n", wall_ms());
   check_sim_pair("qwen27b_1L_gdn", slice_qwen38_block_layer(b27_4l, 0), true, true,
-                 Qwen38BlockParityTier::RealSingleLayer);
+                 Qwen38BlockParityTier::RealSingleLayer, &qwen27b_cpu_fp64_ms, &qwen27b_cpu_warp_ms);
   check_sim_pair("qwen27b_1L_full", slice_qwen38_block_layer(b27_4l, 3), false, true,
-                 Qwen38BlockParityTier::RealSingleLayer);
-  check_sim_pair("qwen27b_4L_stepwise", b27_4l, false, true, Qwen38BlockParityTier::RealStacked4Layer);
-  check_sim_pair("qwen27b_4L_chunk", b27_4l, true, true, Qwen38BlockParityTier::RealStacked4Layer);
+                 Qwen38BlockParityTier::RealSingleLayer, &qwen27b_cpu_fp64_ms, &qwen27b_cpu_warp_ms);
+  check_sim_pair("qwen27b_4L_stepwise", b27_4l, false, true, Qwen38BlockParityTier::RealStacked4Layer,
+                 &qwen27b_cpu_fp64_ms, &qwen27b_cpu_warp_ms);
+  check_sim_pair("qwen27b_4L_chunk", b27_4l, true, true, Qwen38BlockParityTier::RealStacked4Layer,
+                 &qwen27b_cpu_fp64_ms, &qwen27b_cpu_warp_ms);
+  std::printf("[phase] done=qwen27b_blocks fp64_ms=%.1f warp_ms=%.1f wall_ms=%.1f\n",
+              qwen27b_cpu_fp64_ms, qwen27b_cpu_warp_ms, wall_ms());
 
-  const auto t_end = std::chrono::steady_clock::now();
-  std::printf("bench_27b_%s total_ms=%.1f\n", verify_pins_27b ? "pinned" : "fast",
-              std::chrono::duration<double, std::milli>(t_end - t_start).count());
+  // Independent completely disjoint holdout sequence {785, 279, 1493, 311, 458, 19}.
+  std::printf("[phase] start=holdout_disjoint_blocks wall_ms=%.1f\n", wall_ms());
+  const auto t_ho0 = std::chrono::steady_clock::now();
+  check_sim_pair("holdout_08b_1L_gdn", slice_qwen38_block_layer(b08_holdout_4l, 0), true, false,
+                 Qwen38BlockParityTier::RealSingleLayer, &holdout_cpu_ms, nullptr);
+  check_sim_pair("holdout_08b_1L_full", slice_qwen38_block_layer(b08_holdout_4l, 3), false, false,
+                 Qwen38BlockParityTier::RealSingleLayer, &holdout_cpu_ms, nullptr);
+  check_sim_pair("holdout_08b_4L_stepwise", b08_holdout_4l, false, false, Qwen38BlockParityTier::RealStacked4Layer,
+                 &holdout_cpu_ms, nullptr);
+  check_sim_pair("holdout_08b_4L_chunk", b08_holdout_4l, true, false, Qwen38BlockParityTier::RealStacked4Layer,
+                 &holdout_cpu_ms, nullptr);
+
+  check_sim_pair("holdout_27b_1L_gdn", slice_qwen38_block_layer(b27_holdout_4l, 0), true, true,
+                 Qwen38BlockParityTier::RealSingleLayer, &holdout_cpu_ms, nullptr);
+  check_sim_pair("holdout_27b_1L_full", slice_qwen38_block_layer(b27_holdout_4l, 3), false, true,
+                 Qwen38BlockParityTier::RealSingleLayer, &holdout_cpu_ms, nullptr);
+  check_sim_pair("holdout_27b_4L_stepwise", b27_holdout_4l, false, true, Qwen38BlockParityTier::RealStacked4Layer,
+                 &holdout_cpu_ms, nullptr);
+  check_sim_pair("holdout_27b_4L_chunk", b27_holdout_4l, true, true, Qwen38BlockParityTier::RealStacked4Layer,
+                 &holdout_cpu_ms, nullptr);
+  const double holdout_total_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ho0).count();
+  std::printf("[phase] done=holdout_disjoint_blocks elapsed_ms=%.1f wall_ms=%.1f\n", holdout_total_ms, wall_ms());
+
+  struct rusage ru {};
+  std::uint64_t rss_kib = (::getrusage(RUSAGE_SELF, &ru) == 0 && ru.ru_maxrss > 0)
+                               ? static_cast<std::uint64_t>(ru.ru_maxrss)
+                               : 0ull;
+  std::printf(
+      "bench_27b_%s summary: q08_inspect_ms=%.1f q08_load_ms=%.1f q08_fp64_ms=%.1f q08_warp_ms=%.1f "
+      "q27_manifest_sha_ms=%.1f q27_stream_load_ms=%.1f q27_fp64_ms=%.1f q27_warp_ms=%.1f "
+      "holdout_total_ms=%.1f vmhwm_kib=%llu total_wall_ms=%.1f all_16_passed=%s\n",
+      verify_pins_27b ? "pinned" : "fast", qwen08b_inspect_ms, qwen08b_load_ms, qwen08b_cpu_fp64_ms,
+      qwen08b_cpu_warp_ms, qwen27b_manifest_sha_ms, qwen27b_stream_load_ms, qwen27b_cpu_fp64_ms, qwen27b_cpu_warp_ms,
+      holdout_total_ms, static_cast<unsigned long long>(rss_kib), wall_ms(), all_ok ? "true" : "false");
   CHECK(all_ok);
 }
 
@@ -505,6 +668,8 @@ void test_pinned_safetensors_block_extract() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
+  std::setvbuf(stderr, nullptr, _IOLBF, 0);
   bool bench_27b_pinned = false;
   bool bench_27b_fast = false;
   for (int i = 1; i < argc; ++i) {

@@ -108,9 +108,11 @@ std::uint32_t bf16_ulp_distance(std::uint16_t a, std::uint16_t b) noexcept;
 
 struct Qwen38Bf16CompareStats {
   float max_abs_vs_bf16_oracle = 0.0f;
-  std::uint32_t max_bf16_ulp = 0;
+  std::uint32_t max_bf16_ulp = 0;              // true raw maximum ULP across all elements
+  std::uint32_t max_bf16_ulp_above_floor = 0;  // max ULP among elements with abs diff > abs_floor
   std::size_t exact_bf16_matches = 0;
   std::size_t non_exact_bf16_count = 0;
+  std::size_t floor_exempt_count = 0;          // finite elements with ulp > max_ulp and abs diff <= abs_floor
   std::size_t criterion_violations = 0;
   bool passed = false;
 };
@@ -197,10 +199,29 @@ enum class Qwen38BlockParityTier { SyntheticStrict, RealSingleLayer, RealStacked
 struct Qwen38BlockParityResult {
   Qwen38VectorCompareStats hidden;
   Qwen38Bf16CompareStats hidden_bf16;
+  bool state_shapes_valid = true;
+  bool conv_finite = true;
+  bool gdn_finite = true;
+  bool kv_finite = true;
   float layer0_gdn_max_abs = 0.0f;
   float stacked_gdn_max_abs = 0.0f;
   float stacked_gdn_rel_l2 = 0.0f;
-  bool gdn_finite = true;
+  float layer0_conv_max_abs = 0.0f;
+  float layer0_conv_rel_l2 = 0.0f;
+  float layer0_conv_rel_max_abs = 0.0f;
+  double layer0_conv_cosine = 1.0;
+  float stacked_conv_max_abs = 0.0f;
+  float stacked_conv_rel_l2 = 0.0f;
+  float stacked_conv_rel_max_abs = 0.0f;
+  double stacked_conv_cosine = 1.0;
+  float k_cache_max_abs = 0.0f;
+  float k_cache_rel_l2 = 0.0f;
+  float k_cache_rel_max_abs = 0.0f;
+  double k_cache_cosine = 1.0;
+  float v_cache_max_abs = 0.0f;
+  float v_cache_rel_l2 = 0.0f;
+  float v_cache_rel_max_abs = 0.0f;
+  double v_cache_cosine = 1.0;
   std::string criterion;
   bool passed = false;
 };
