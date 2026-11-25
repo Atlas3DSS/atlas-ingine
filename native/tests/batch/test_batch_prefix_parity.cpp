@@ -33,6 +33,10 @@
 #include <string>
 #include <vector>
 
+namespace ingine::model {
+void set_batch_prefill_splits_for_test(std::vector<int> splits);
+}  // namespace ingine::model
+
 namespace {
 
 int g_failures = 0;
@@ -247,9 +251,23 @@ int main(int argc, char** argv) {
       print_vec_diff("orig_64->65_vs_split64", orig_65_from_64, ref_orig_p65_s64);
     CHECK(orig_65_from_64 == ref_orig_p65_s64);
     auto orig_65_chain_63_64_65 = run_cached(orig_p65, "orig-tail63", 0, st);
-    std::printf("orig 512-chunk diagnostic (alpha beta gamma): 64->65 vs matched-split64=%d/16, "
-                "64->65 vs unsplit512=%d/16, 63->64->65 vs unsplit512=%d/16, "
+    CHECK(st.reuse == ingine::model::Reuse::PagedPrefix && st.reused_tokens == 64);
+    // Matched-split fresh zero-restore control (63+1+1): MUST match chained 63->64->65 bit-for-bit (16/16)!
+    ingine::model::set_batch_prefill_splits_for_test({63, 1, 1});
+    auto orig_65_fresh_63_1_1 = run_cached(orig_p65, "orig-tail63", 0, st, /*bypass=*/true);
+    ingine::model::set_batch_prefill_splits_for_test({});
+    CHECK(st.reuse == ingine::model::Reuse::None && st.reused_tokens == 0);
+    if (orig_65_chain_63_64_65 != orig_65_fresh_63_1_1)
+      print_vec_diff("orig_63->64->65_vs_fresh_63+1+1", orig_65_chain_63_64_65, orig_65_fresh_63_1_1);
+    CHECK(orig_65_chain_63_64_65 == orig_65_fresh_63_1_1);
+    // Re-running orig_p65 as an exact warm hit must reproduce the chained 63->64->65 continuation bit-for-bit.
+    auto orig_65_chain_exact = run_cached(orig_p65, "orig-tail63", 0, st);
+    CHECK(st.reuse == ingine::model::Reuse::PagedPrefix && st.reused_tokens == 65);
+    CHECK(orig_65_chain_exact == orig_65_chain_63_64_65);
+    std::printf("orig 512-chunk diagnostic (alpha beta gamma): 63->64->65 vs fresh_63+1+1=%d/16, "
+                "64->65 vs matched-split64=%d/16, 64->65 vs unsplit512=%d/16, 63->64->65 vs unsplit512=%d/16, "
                 "split64 vs unsplit512 (both cold!)=%d/16\n",
+                count_matching(orig_65_chain_63_64_65, orig_65_fresh_63_1_1),
                 count_matching(orig_65_from_64, ref_orig_p65_s64), count_matching(orig_65_from_64, ref_unsplit512[1]),
                 count_matching(orig_65_chain_63_64_65, ref_unsplit512[1]),
                 count_matching(ref_orig_p65_s64, ref_unsplit512[1]));
@@ -479,9 +497,43 @@ int main(int argc, char** argv) {
       CHECK(std::equal(ref_p192.begin(), ref_p192.end(), out1.begin()));
       // Verify j2 started BEFORE j1 finished (i.e. prompt-aware admission admitted both concurrently on 6 pages!).
       CHECK(j2->t_start().has_value() && *j2->t_start() < t_j1_done);
-      std::printf("tight 6-page overlapping 192-tok siblings: overlapped=%s reused=%d/%d\n",
+      std::printf("tight 6-page overlapping 192-tok siblings (24 tok): overlapped=%s reused=%d/%d\n",
                   (j2->t_start().has_value() && *j2->t_start() < t_j1_done) ? "YES" : "NO", st1->reused_tokens,
                   st2->reused_tokens);
+    }
+
+    // 4a-long. Long-decode sibling commitment on the same 6-page pool (96 tokens, stopless):
+    // Each 192-tok request needs 3 shared + 2 private pages = 5 pages -> two concurrent 96-tok siblings would
+    // need 3 + 2 + 2 = 7 > 6 pages! Admission MUST safely defer the 2nd sibling until the 1st finishes so BOTH
+    // complete all 96/96 tokens matching solo output with reused=192 and zero "paged KV pool exhausted" errors!
+    {
+      std::vector<int32_t> solo_96;
+      {
+        ingine::model::Prompt pr{p192, {}, 0, "overlap-192-96"};
+        (void)gen->generate(pr, 96, greedy, {}, [&](std::span<const int32_t> t) {
+          solo_96.insert(solo_96.end(), t.begin(), t.end());
+          return true;
+        });
+      }
+      CHECK(solo_96.size() == 96);
+
+      ingine::engine::Scheduler sched(*gen, {}, 8);  // stopless so all 96 tokens are generated
+      auto j1 = std::make_shared<ingine::engine::Job>(p192, 96, greedy, std::vector<ingine::model::PromptImage>{}, 0,
+                                                      "overlap-192-96");
+      auto j2 = std::make_shared<ingine::engine::Job>(p192, 96, greedy, std::vector<ingine::model::PromptImage>{}, 0,
+                                                      "overlap-192-96");
+      CHECK(sched.submit(j1));
+      CHECK(sched.submit(j2));
+      const auto out1 = drain(*j1);
+      const auto out2 = drain(*j2);
+      const auto st1 = j1->prefill_stats();
+      const auto st2 = j2->prefill_stats();
+      CHECK(st1.has_value() && st1->reuse == ingine::model::Reuse::PagedPrefix && st1->reused_tokens == 192);
+      CHECK(st2.has_value() && st2->reuse == ingine::model::Reuse::PagedPrefix && st2->reused_tokens == 192);
+      CHECK(out1 == solo_96 && out2 == solo_96);
+      std::printf("tight 6-page 96-tok siblings (safe deferral): emitted=%zu/%zu reused=%d/%d exact_vs_solo=%s\n",
+                  out1.size(), out2.size(), st1 ? st1->reused_tokens : -1, st2 ? st2->reused_tokens : -1,
+                  (out1 == solo_96 && out2 == solo_96) ? "YES" : "NO");
     }
 
     // 4b. Tight-pool live-sibling eviction under pressure.

@@ -52,6 +52,12 @@ class FakeBatchGenerator final : public ingine::model::Generator {
     const int need = (prompt_tokens + 63) / 64 + 1;
     return free_s > 0 && free_pages_ >= need;
   }
+  bool can_admit_slot(const Prompt& prompt, int max_new_tokens, const Sampling&) const override {
+    if (prompt.cache_namespace == "throw-admit") {
+      throw std::runtime_error("injected admission fault");
+    }
+    return can_admit_slot(int(prompt.ids.size()), max_new_tokens);
+  }
 
   int start_slot(const Prompt& prompt, int, const Sampling&, int32_t& first_token, GenerateStats& stats) override {
     if (prompt.ids.empty() || prompt.ids[0] < 0) throw std::invalid_argument("bad prompt");
@@ -291,6 +297,34 @@ void test_on_prefill_exception_releases_slot_for_reuse() {
   CHECK(gen.free_pages() == 2);
 }
 
+void test_admission_exception_isolated_from_active_work() {
+  // Regression for review item #3: an exception thrown by can_admit_slot() while another job is live
+  // must fail only the faulting job and NEVER terminate the worker or fail healthy active/queued jobs.
+  FakeBatchGenerator gen(/*max_batch=*/4, /*max_pages=*/16, std::chrono::milliseconds(3));
+  Scheduler sched(gen, {}, 8);
+
+  auto j_live = std::make_shared<Job>(std::vector<int32_t>{1}, 20, Sampling{});
+  CHECK(sched.submit(j_live));
+  while (sched.stats().active < 1) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+  auto j_fault = std::make_shared<Job>(std::vector<int32_t>{2}, 6, Sampling{}, std::vector<ingine::model::PromptImage>{},
+                                       0, "throw-admit");
+  auto j_after = std::make_shared<Job>(std::vector<int32_t>{3}, 6, Sampling{});
+  CHECK(sched.submit(j_fault));
+  CHECK(sched.submit(j_after));
+
+  std::optional<std::string> err_live, err_fault, err_after;
+  const auto out_fault = drain(*j_fault, &err_fault);
+  const auto out_live = drain(*j_live, &err_live);
+  const auto out_after = drain(*j_after, &err_after);
+
+  CHECK(out_fault.empty() && err_fault && err_fault->find("injected admission fault") != std::string::npos);
+  CHECK(!err_live.has_value() && out_live.size() == 20 && out_live.front() == 1000 && out_live.back() == 1019);
+  CHECK(!err_after.has_value() && (out_after == std::vector<int32_t>{3000, 3001, 3002, 3003, 3004, 3005}));
+  CHECK(gen.active_now() == 0);
+  CHECK(gen.free_pages() == 16);
+}
+
 }  // namespace
 
 int main() {
@@ -298,6 +332,7 @@ int main() {
   test_continuous_join_leave_and_cancel();
   test_error_isolation_and_backpressure();
   test_on_prefill_exception_releases_slot_for_reuse();
+  test_admission_exception_isolated_from_active_work();
   std::printf(g_failures ? "FAILED (%d checks)\n" : "batch_scheduler ok\n", g_failures);
   return g_failures ? 1 : 0;
 }

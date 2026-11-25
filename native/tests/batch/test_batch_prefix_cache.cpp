@@ -281,22 +281,29 @@ void test_private_vram_budget_and_root_validation() {
 }
 
 struct ThrowingMovePayload {
-  bool fail_on_move = false;
+  // >= 0: decrements on each move constructor and throws std::bad_alloc when it hits 0.
+  // Setting throws_after_moves = 1 lets move #1 (constructing publish's by-value parameter) succeed
+  // while move #2 (inside publish at list-node construction) throws — discriminating transactional publish
+  // from pinning pages/counters before list insertion.
+  int throws_after_moves = -1;
   ThrowingMovePayload() = default;
-  explicit ThrowingMovePayload(bool fail) : fail_on_move(fail) {}
   ThrowingMovePayload(ThrowingMovePayload&& other) {
-    if (other.fail_on_move) throw std::bad_alloc();
-    fail_on_move = false;
+    if (other.throws_after_moves == 0) throw std::bad_alloc();
+    throws_after_moves = other.throws_after_moves > 0 ? (other.throws_after_moves - 1) : -1;
+    other.throws_after_moves = -1;
   }
   ThrowingMovePayload& operator=(ThrowingMovePayload&& other) {
-    if (other.fail_on_move) throw std::bad_alloc();
-    fail_on_move = false;
+    if (other.throws_after_moves == 0) throw std::bad_alloc();
+    throws_after_moves = other.throws_after_moves > 0 ? (other.throws_after_moves - 1) : -1;
+    other.throws_after_moves = -1;
     return *this;
   }
 };
 
 void test_transactional_publish_and_prompt_aware_admission() {
-  // 1. Transactional publish(): throwing during node move must leave zero leaked cache_refs or stats.
+  // 1. Discriminating transactional publish(): move #1 enters publish() by value; move #2 inside list-node
+  //    construction throws std::bad_alloc. Old non-transactional publish leaked cache_refs=1 & stats=1;
+  //    transactional publish leaves zero leaked cache_refs or stats.
   {
     PagedKvPagePool pool;
     pool.init(4);
@@ -309,7 +316,7 @@ void test_transactional_publish_and_prompt_aware_admission() {
     bad.tokens = make_tokens(64, 10);
     bad.committed_pages = {p0};
     bad.private_vram_bytes = 256;
-    bad.payload.fail_on_move = true;
+    bad.payload.throws_after_moves = 1;  // succeeds into param, throws inside node.push_front!
 
     bool threw = false;
     try {
@@ -329,7 +336,7 @@ void test_transactional_publish_and_prompt_aware_admission() {
     good.tokens = make_tokens(64, 10);
     good.committed_pages = {p0};
     good.private_vram_bytes = 256;
-    good.payload.fail_on_move = false;
+    good.payload.throws_after_moves = -1;
     auto [ok, ev] = cache.publish(pool, std::move(good));
     CHECK(ok && ev == 0);
     CHECK(pool.cache_refs(p0) == 1);

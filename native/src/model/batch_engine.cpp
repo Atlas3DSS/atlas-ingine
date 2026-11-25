@@ -34,6 +34,16 @@
 namespace ingine::model {
 namespace {
 
+// Test-only seam allowing matched-chunk-boundary verification (e.g. cold 63+1+1 vs cached 63->64->65)
+// without linker symbol wrapping. Empty in production (zero overhead).
+std::mutex g_test_splits_mu;
+std::vector<int> g_test_prefill_splits;
+
+std::vector<int> snapshot_test_prefill_splits() {
+  std::lock_guard<std::mutex> lock(g_test_splits_mu);
+  return g_test_prefill_splits;
+}
+
 namespace bk = kernels::batch;
 namespace dense = kernels::dense;
 namespace head = kernels::head;
@@ -188,6 +198,7 @@ struct BatchStatePool {
 
     pages.init(num_pages);
     slot_pages.assign(max_b, {});
+    for (auto& sp : slot_pages) sp.reserve(std::size_t(max_pages_per_slot));
     slot_pos_host.assign(max_b, 0);
     slot_in_use.assign(max_b, false);
   }
@@ -225,6 +236,8 @@ struct BatchStatePool {
     return n;
   }
 
+  int active_slot_count() const { return max_batch - free_slot_count(); }
+
   int alloc_slot() {
     for (int s = 0; s < max_batch; ++s) {
       if (!slot_in_use[s]) {
@@ -242,9 +255,16 @@ struct BatchStatePool {
     auto& sp = slot_pages[s];
     const int cur = int(sp.size());
     if (cur + int(committed.size()) > max_pages_per_slot) return false;
+    // Reserve capacity BEFORE retaining any page ref so a host std::bad_alloc never leaks active_refs.
+    sp.reserve(std::size_t(cur) + committed.size());
     for (int p : committed) {
       pages.retain_committed_page(p);
-      sp.push_back(p);
+      try {
+        sp.push_back(p);
+      } catch (...) {
+        pages.release_active_page(p);
+        throw;
+      }
     }
     std::int32_t* dev_row = static_cast<std::int32_t*>(page_table.p) + std::size_t(s) * max_pages_per_slot;
     CUDA_CHECK(cudaMemcpyAsync(dev_row + cur, sp.data() + cur, committed.size() * sizeof(std::int32_t),
@@ -266,10 +286,17 @@ struct BatchStatePool {
     if (needed <= cur) return true;
     const int add = needed - cur;
     if (pages.free_count() < add) return false;
+    // Reserve capacity BEFORE allocating any page so a host std::bad_alloc never leaks active_refs.
+    sp.reserve(std::size_t(needed));
     for (int i = 0; i < add; ++i) {
       const int p = pages.alloc_private_page();
       if (p < 0) return false;
-      sp.push_back(p);
+      try {
+        sp.push_back(p);
+      } catch (...) {
+        pages.release_active_page(p);
+        throw;
+      }
     }
     std::int32_t* dev_row = static_cast<std::int32_t*>(page_table.p) + std::size_t(s) * max_pages_per_slot;
     CUDA_CHECK(cudaMemcpyAsync(dev_row + cur, sp.data() + cur, std::size_t(add) * sizeof(std::int32_t),
@@ -823,18 +850,23 @@ class BatchGenerator final : public Generator {
     return prefix_cache_.stats();
   }
 
-  bool can_admit_slot(int prompt_tokens, int /*max_new_tokens*/) const override {
+  bool can_admit_slot(int prompt_tokens, int max_new_tokens) const override {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pool_.free_slot_count() <= 0) return false;
-    const int need_pages = (prompt_tokens + 1 + bk::kPageSize - 1) / bk::kPageSize;
-    return pool_.pages.available_for_admission() >= need_pages;
+    const int eff_max = std::max(0, std::min(max_new_tokens, options_.max_ctx - prompt_tokens));
+    const int worst_tokens = std::min(options_.max_ctx, prompt_tokens + std::max(1, eff_max - 1));
+    const int lifetime_pages = (worst_tokens + bk::kPageSize - 1) / bk::kPageSize;
+    const int reserved = active_reserved_growth_pages();
+    return pool_.pages.available_for_admission() >= lifetime_pages + reserved;
   }
 
-  bool can_admit_slot(const Prompt& full_prompt, int /*max_new_tokens*/, const Sampling& sampling) const override {
+  bool can_admit_slot(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling) const override {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pool_.free_slot_count() <= 0) return false;
     const int n = int(full_prompt.ids.size());
-    const int total_pages = (n + 1 + bk::kPageSize - 1) / bk::kPageSize;
+    const int eff_max = effective_max_new(n, max_new_tokens, sampling);
+    const int worst_tokens = std::min(options_.max_ctx, n + std::max(1, eff_max - 1));
+    const int lifetime_pages = (worst_tokens + bk::kPageSize - 1) / bk::kPageSize;
     const bool cache_eligible = options_.prefix_cache && !full_prompt.bypass_prefix_cache && !options_.spec &&
                                 !options_.enable_persona_hooks && sampling.persona == nullptr &&
                                 full_prompt.images.empty() && prefix_cache_.vram_budget_bytes() > 0;
@@ -847,9 +879,10 @@ class BatchGenerator final : public Generator {
         hit_id = hit->id;
       }
     }
-    const int fresh_needed = std::max(0, total_pages - F);
+    const int fresh_lifetime = std::max(0, lifetime_pages - F);
+    const int reserved = active_reserved_growth_pages();
     const int avail = pool_.pages.free_count() + prefix_cache_.reclaimable_pages_excluding(pool_.pages, hit_id);
-    return avail >= fresh_needed;
+    return avail >= fresh_lifetime + reserved;
   }
 
   int start_slot(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
@@ -878,8 +911,21 @@ class BatchGenerator final : public Generator {
     const int tail = L % bk::kPageSize;
     const std::uint64_t hit_id = hit ? hit->id : 0;
 
-    const int total_pages = (n + 1 + bk::kPageSize - 1) / bk::kPageSize;
-    const int fresh_needed = std::max(0, total_pages - F);
+    const int eff_max = effective_max_new(n, max_new_tokens, sampling);
+    const int worst_tokens = std::min(options_.max_ctx, n + std::max(1, eff_max - 1));
+    const int lifetime_pages = (worst_tokens + bk::kPageSize - 1) / bk::kPageSize;
+    const int fresh_lifetime = std::max(0, lifetime_pages - F);
+    const int initial_pages = (n + 1 + bk::kPageSize - 1) / bk::kPageSize;
+    const int fresh_needed = std::max(0, initial_pages - F);
+
+    // When other slots are already live, enforce lifetime decode budget + active slots' reserved future growth
+    // so admitting a concurrent slot can never exhaust the paged KV pool mid-decode.
+    if (pool_.active_slot_count() > 0) {
+      const int reserved = active_reserved_growth_pages();
+      const int avail = pool_.pages.free_count() + prefix_cache_.reclaimable_pages_excluding(pool_.pages, hit_id);
+      if (avail < fresh_lifetime + reserved) return -1;
+    }
+
     int evictions = 0;
     if (pool_.pages.free_count() < fresh_needed) {
       evictions += prefix_cache_.ensure_free_pages(pool_.pages, fresh_needed, hit_id);
@@ -888,6 +934,7 @@ class BatchGenerator final : public Generator {
 
     const int s = pool_.alloc_slot();
     if (s < 0) return -1;
+    slot_meta_[s].max_pos = worst_tokens;
 
     // Exception-safe slot guard: covers attach_committed_pages, ensure_pages, restore, prefill, scatter, and sample.
     bool slot_committed = false;
@@ -969,9 +1016,15 @@ class BatchGenerator final : public Generator {
         std::size_t next_image = 0;
         std::vector<EmbedRows> rows;
 
+        const std::vector<int> forced_splits = (L == 0) ? snapshot_test_prefill_splits() : std::vector<int>{};
+        std::size_t split_idx = 0;
         std::size_t start = std::size_t(L);
         while (start < std::size_t(n)) {
           std::size_t target_end = std::min(start + chunk, std::size_t(n));
+          if (split_idx < forced_splits.size() && forced_splits[split_idx] > 0) {
+            target_end = std::min(target_end, start + std::size_t(forced_splits[split_idx]));
+            ++split_idx;
+          }
           if (root_boundary > L && root_boundary < n && start < std::size_t(root_boundary) &&
               target_end > std::size_t(root_boundary)) {
             target_end = std::size_t(root_boundary);
@@ -1040,7 +1093,7 @@ class BatchGenerator final : public Generator {
       meta.rng.counter = 0;
       meta.forced.assign(sampling.forced.begin(), sampling.forced.end());
       meta.forced_idx = 0;
-      meta.max_pos = std::min(options_.max_ctx, n + std::max(0, max_new_tokens));
+      meta.max_pos = worst_tokens;
 
       auto* sampled = static_cast<std::int32_t*>(sampled_dev_.p);
       head::sample(static_cast<const float*>(prefill_logits_.p), 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params,
@@ -1166,6 +1219,24 @@ class BatchGenerator final : public Generator {
     std::size_t forced_idx = 0;
     int max_pos = 0;
   };
+
+  int effective_max_new(int prompt_tokens, int max_new_tokens, const Sampling& sampling) const {
+    int eff = std::max(0, max_new_tokens);
+    if (!sampling.forced.empty()) eff = std::min(eff, int(sampling.forced.size()));
+    const int room = std::max(0, options_.max_ctx - prompt_tokens);
+    return std::min(eff, room);
+  }
+
+  int active_reserved_growth_pages() const {
+    int reserved = 0;
+    for (int s = 0; s < options_.max_batch; ++s) {
+      if (!pool_.slot_in_use[s]) continue;
+      const int max_pages = (slot_meta_[s].max_pos + bk::kPageSize - 1) / bk::kPageSize;
+      const int cur_pages = int(pool_.slot_pages[s].size());
+      if (max_pages > cur_pages) reserved += (max_pages - cur_pages);
+    }
+    return reserved;
+  }
 
   StateIdentity build_identity(const Prompt& prompt) const {
     StateIdentity id{};
@@ -1403,6 +1474,11 @@ class BatchGenerator final : public Generator {
 };
 
 }  // namespace
+
+void set_batch_prefill_splits_for_test(std::vector<int> splits) {
+  std::lock_guard<std::mutex> lock(g_test_splits_mu);
+  g_test_prefill_splits = std::move(splits);
+}
 
 std::unique_ptr<Generator> make_batch_generator(const RuntimeOptions& options) {
   return std::make_unique<BatchGenerator>(options);
