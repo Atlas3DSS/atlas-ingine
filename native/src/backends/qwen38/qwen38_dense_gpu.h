@@ -2,6 +2,7 @@
 
 #include "backends/qwen38/qwen38_backend.h"
 #include "backends/qwen38/qwen38_config.h"
+#include "backends/qwen38/qwen38_gate3_metrics.h"
 #include "backends/qwen38/qwen38_manifest.h"
 #include "ingine/model_backend.h"
 
@@ -55,16 +56,27 @@ class Qwen38DenseSession final : public ingine::model::BackendSession {
 
   void reset() override;
   std::size_t state_bytes() const noexcept override;
-  std::span<const std::int32_t> committed_tokens() const noexcept override { return committed_tokens_; }
+  std::span<const std::int32_t> committed_tokens() const noexcept override;
+  std::span<const std::uint8_t> committed_token_mask() const noexcept override;
   const ingine::model::BackendStateIdentity& identity() const noexcept override;
+  void truncate(std::size_t new_token_count) override;
+  std::size_t restorable_prefix_len(std::size_t max_prefix_len) const noexcept override;
+
+  // Test/telemetry helpers for Gate 3 checkpoint inspection and capacity control.
+  [[nodiscard]] const Qwen38CheckpointIndex& checkpoint_index() const noexcept;
+  [[nodiscard]] std::uint64_t saved_checkpoint_bytes() const noexcept;
+  [[nodiscard]] std::uint64_t last_restore_bytes() const noexcept;
+  [[nodiscard]] double last_restore_seconds() const noexcept;
+  [[nodiscard]] double last_reset_ms() const noexcept;
+  int save_checkpoint();
+  std::uint64_t evict_checkpoints();
 
  private:
   friend class Qwen38DenseBackend;
-  explicit Qwen38DenseSession(Qwen38DenseBackend& owner);
+  explicit Qwen38DenseSession(Qwen38DenseBackend& owner, std::size_t max_checkpoints = 4);
 
   struct StateImpl;
   Qwen38DenseBackend& owner_;
-  std::vector<std::int32_t> committed_tokens_;
   std::unique_ptr<StateImpl> state_;
 };
 
@@ -91,6 +103,11 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
                                         const ingine::model::Sampling& sampling,
                                         std::span<const std::int32_t> stop_ids,
                                         const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override;
+  ingine::model::GenerateStats generate(const ingine::model::Prompt& prompt, int max_new_tokens,
+                                        const ingine::model::Sampling& sampling,
+                                        std::span<const std::int32_t> stop_ids,
+                                        const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+                                        const ingine::model::PrefillCallback& on_prefill = {}) override;
 
   // ingine::model::ModelBackend
   const ingine::model::BackendCapabilities& capabilities() const override { return profile_.capabilities; }
@@ -102,14 +119,37 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
   ingine::model::BackendSession* acquire_session(int slot = 0) override;
   void release_session(int slot = 0) override;
 
+  ingine::model::GenerateStats generate_request(const ingine::model::BackendRequest& req, int max_new_tokens,
+                                                const ingine::model::Sampling& sampling,
+                                                std::span<const std::int32_t> stop_ids,
+                                                const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+                                                const ingine::model::PrefillCallback& on_prefill = {}) override;
+
   ingine::model::ResidencyReport residency_report() const override;
   ingine::model::AdmissionEstimate admission_estimate(int max_ctx, int max_batch) const override;
+  std::uint64_t evict_caches(std::uint64_t target_free_bytes) override;
 
   void evaluate_teacher_forced(std::span<const std::int32_t> token_ids, std::span<const int> capture_positions,
                                bool use_prefix_cache, const ingine::model::LogitCallback& on_logits,
                                std::span<const std::uint8_t> token_mask = {}) override;
   void evaluate_teacher_forced(const ingine::model::BackendRequest& req, std::span<const int> capture_positions,
                                const ingine::model::LogitCallback& on_logits) override;
+
+  // Session-targeted helpers and reuse telemetry for Gate 3 verification.
+  ingine::model::GenerateStats generate_request_on_session(
+      Qwen38DenseSession& sess, const ingine::model::BackendRequest& req, int max_new_tokens,
+      const ingine::model::Sampling& sampling, std::span<const std::int32_t> stop_ids,
+      const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+      const ingine::model::PrefillCallback& on_prefill = {},
+      const ingine::model::LogitCallback& on_step_logits = {});
+  void evaluate_teacher_forced_on_session(Qwen38DenseSession& sess, const ingine::model::BackendRequest& req,
+                                          std::span<const int> capture_positions,
+                                          const ingine::model::LogitCallback& on_logits,
+                                          double* prefill_ms_out = nullptr);
+
+  [[nodiscard]] const ingine::model::SessionLookupResult& last_lookup() const noexcept;
+  [[nodiscard]] double last_lookup_ms() const noexcept;
+  [[nodiscard]] double last_reset_ms() const noexcept;
 
   // Explicit mode entry points for Gate 2 chunked-vs-stepwise parity & telemetry.
   void evaluate_teacher_forced_mode(std::span<const std::int32_t> token_ids, std::span<const int> capture_positions,

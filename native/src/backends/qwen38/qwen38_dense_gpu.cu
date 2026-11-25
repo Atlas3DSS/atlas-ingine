@@ -238,6 +238,15 @@ struct HostF32VecEntry {
   std::vector<std::uint8_t> raw;
 };
 
+struct SavedCheckpoint {
+  std::size_t token_count = 0;
+  std::vector<float> conv_host;
+  std::vector<float> rec_host;
+  std::vector<float> last_logits;
+  bool has_last_logits = false;
+  int last_logits_pos = -1;
+};
+
 }  // namespace
 
 struct Qwen38DenseSession::StateImpl {
@@ -246,6 +255,16 @@ struct Qwen38DenseSession::StateImpl {
   std::vector<DevBuf<__nv_bfloat16>> k_caches;
   std::vector<DevBuf<__nv_bfloat16>> v_caches;
   std::size_t total_state_bytes = 0;
+  std::size_t gdn_conv_total_floats = 0;
+  std::size_t gdn_rec_total_floats = 0;
+  std::size_t kv_stride_elems = 0;
+
+  Qwen38CheckpointIndex index{4};
+  std::vector<SavedCheckpoint> checkpoints;
+  std::vector<float> tip_logits;
+  std::uint64_t last_restore_bytes = 0;
+  double last_restore_seconds = 0.0;
+  double last_reset_ms = 0.0;
 };
 
 struct Qwen38DenseBackend::Impl {
@@ -296,6 +315,9 @@ struct Qwen38DenseBackend::Impl {
   std::unique_ptr<Qwen38DenseSession> default_session;
   std::uint64_t scratch_bytes = 0;
   std::uint64_t max_state_bytes = 0;
+  ingine::model::SessionLookupResult last_lookup;
+  double last_lookup_ms = 0.0;
+  double last_reset_ms = 0.0;
 
   explicit Impl(int dev_id) : ctx(dev_id) { ctx.bind_to_current_thread(); }
 
@@ -334,18 +356,24 @@ struct Qwen38DenseBackend::Impl {
 
   void forward_range(Qwen38DenseSession& sess, std::span<const std::int32_t> token_ids,
                      std::span<const int> sorted_capture_positions, bool use_chunk_prefill,
-                     const ingine::model::LogitCallback& on_logits, double* prefill_ms_out) {
+                     const ingine::model::LogitCallback& on_logits, double* prefill_ms_out,
+                     std::span<const std::uint8_t> token_mask = {}) {
     ctx.bind_to_current_thread();
     const auto& c = manifest.config;
     const int S = static_cast<int>(token_ids.size());
     const int H = c.hidden_size;
     const int I = c.intermediate_size;
     const int V = c.vocab_size;
-    const int pos_start = static_cast<int>(sess.committed_tokens_.size());
+    const int pos_start = static_cast<int>(sess.committed_tokens().size());
+    if (!token_mask.empty() && token_mask.size() != token_ids.size()) {
+      throw std::invalid_argument("forward_range token_mask length mismatch");
+    }
     if (S == 0) return;
     if (pos_start + S > opts.max_ctx) {
       throw std::invalid_argument("Qwen38DenseBackend sequence exceeds max_ctx");
     }
+    sess.state_->index.clear_tip_logits();
+    sess.state_->tip_logits.clear();
 
     const int step_cap = use_chunk_prefill ? opts.prefill_chunk : 1;
     std::size_t cap_idx = 0;
@@ -441,16 +469,21 @@ struct Qwen38DenseBackend::Impl {
                                      cudaMemcpyDeviceToHost, ctx.stream));
           ctx.synchronize();
           for (int r = 0; r < bc; ++r) {
-            on_logits(ingine::model::LogitStep{
-                global_rows[b0 + static_cast<std::size_t>(r)],
-                std::span<const float>(host_logits_stage.data() + static_cast<std::size_t>(r) * V,
-                                       static_cast<std::size_t>(V))});
+            const int gp = global_rows[b0 + static_cast<std::size_t>(r)];
+            const std::span<const float> row_logits(
+                host_logits_stage.data() + static_cast<std::size_t>(r) * V, static_cast<std::size_t>(V));
+            if (gp == pos_start + S - 1) {
+              sess.state_->tip_logits.assign(row_logits.begin(), row_logits.end());
+              sess.state_->index.set_tip_logits(gp);
+            }
+            on_logits(ingine::model::LogitStep{gp, row_logits});
           }
         }
       }
 
-      sess.committed_tokens_.insert(sess.committed_tokens_.end(), token_ids.begin() + off,
-                                    token_ids.begin() + off + M);
+      const std::span<const std::uint8_t> mask_slice =
+          token_mask.empty() ? std::span<const std::uint8_t>{} : token_mask.subspan(off, static_cast<std::size_t>(M));
+      sess.state_->index.append_committed(token_ids.subspan(off, static_cast<std::size_t>(M)), mask_slice);
     }
 
     ctx.synchronize();
@@ -460,8 +493,9 @@ struct Qwen38DenseBackend::Impl {
   }
 };
 
-Qwen38DenseSession::Qwen38DenseSession(Qwen38DenseBackend& owner)
+Qwen38DenseSession::Qwen38DenseSession(Qwen38DenseBackend& owner, std::size_t max_checkpoints)
     : owner_(owner), state_(std::make_unique<StateImpl>()) {
+  state_->index = Qwen38CheckpointIndex(max_checkpoints);
   const auto& c = owner_.config();
   const int max_ctx = owner_.impl_->opts.max_ctx;
   const int cd = c.linear_conv_dim();
@@ -469,7 +503,9 @@ Qwen38DenseSession::Qwen38DenseSession(Qwen38DenseBackend& owner)
   const std::size_t rec_elems = static_cast<std::size_t>(c.linear_num_value_heads) *
                                 static_cast<std::size_t>(c.linear_key_head_dim) *
                                 static_cast<std::size_t>(c.linear_value_head_dim);
-  const std::size_t kv_elems = static_cast<std::size_t>(max_ctx) * static_cast<std::size_t>(c.full_kv_proj_out_dim());
+  const std::size_t kv_stride = static_cast<std::size_t>(c.full_kv_proj_out_dim());
+  const std::size_t kv_elems = static_cast<std::size_t>(max_ctx) * kv_stride;
+  state_->kv_stride_elems = kv_stride;
 
   owner_.impl_->ctx.bind_to_current_thread();
   state_->conv_states.resize(static_cast<std::size_t>(c.num_linear_layers));
@@ -477,6 +513,8 @@ Qwen38DenseSession::Qwen38DenseSession(Qwen38DenseBackend& owner)
   for (int i = 0; i < c.num_linear_layers; ++i) {
     state_->conv_states[static_cast<std::size_t>(i)].allocate(conv_elems);
     state_->rec_states[static_cast<std::size_t>(i)].allocate(rec_elems);
+    state_->gdn_conv_total_floats += conv_elems;
+    state_->gdn_rec_total_floats += rec_elems;
     state_->total_state_bytes += (conv_elems + rec_elems) * sizeof(float);
   }
   state_->k_caches.resize(static_cast<std::size_t>(c.num_full_layers));
@@ -492,6 +530,7 @@ Qwen38DenseSession::Qwen38DenseSession(Qwen38DenseBackend& owner)
 Qwen38DenseSession::~Qwen38DenseSession() = default;
 
 void Qwen38DenseSession::reset() {
+  const auto t0 = std::chrono::steady_clock::now();
   owner_.impl_->ctx.bind_to_current_thread();
   for (auto& b : state_->conv_states) {
     if (b.count > 0) CUDA_CHECK(cudaMemsetAsync(b.ptr, 0, b.count * sizeof(float), owner_.impl_->ctx.stream));
@@ -499,14 +538,198 @@ void Qwen38DenseSession::reset() {
   for (auto& b : state_->rec_states) {
     if (b.count > 0) CUDA_CHECK(cudaMemsetAsync(b.ptr, 0, b.count * sizeof(float), owner_.impl_->ctx.stream));
   }
+  for (auto& b : state_->k_caches) {
+    if (b.count > 0) CUDA_CHECK(cudaMemsetAsync(b.ptr, 0, b.count * sizeof(__nv_bfloat16), owner_.impl_->ctx.stream));
+  }
+  for (auto& b : state_->v_caches) {
+    if (b.count > 0) CUDA_CHECK(cudaMemsetAsync(b.ptr, 0, b.count * sizeof(__nv_bfloat16), owner_.impl_->ctx.stream));
+  }
   owner_.impl_->ctx.synchronize();
-  committed_tokens_.clear();
+  state_->last_reset_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  owner_.impl_->last_reset_ms = state_->last_reset_ms;
+  std::vector<SavedCheckpoint>().swap(state_->checkpoints);
+  state_->tip_logits.clear();
+  state_->last_restore_bytes = 0;
+  state_->last_restore_seconds = 0.0;
+  state_->index.reset(owner_.state_identity());
 }
 
 std::size_t Qwen38DenseSession::state_bytes() const noexcept { return state_->total_state_bytes; }
 
+std::span<const std::int32_t> Qwen38DenseSession::committed_tokens() const noexcept {
+  return state_->index.committed_tokens();
+}
+
+std::span<const std::uint8_t> Qwen38DenseSession::committed_token_mask() const noexcept {
+  return state_->index.committed_token_mask();
+}
+
 const ingine::model::BackendStateIdentity& Qwen38DenseSession::identity() const noexcept {
-  return owner_.state_identity();
+  return state_->index.identity();
+}
+
+std::size_t Qwen38DenseSession::restorable_prefix_len(std::size_t max_prefix_len) const noexcept {
+  return state_->index.restorable_prefix_len(max_prefix_len);
+}
+
+void Qwen38DenseSession::truncate(std::size_t new_token_count) {
+  const std::size_t old_tc = state_->index.committed_tokens().size();
+  if (new_token_count > old_tc) {
+    throw std::out_of_range("Qwen38DenseSession::truncate exceeds committed token count");
+  }
+  if (new_token_count == 0) {
+    reset();
+    return;
+  }
+  if (new_token_count == old_tc) {
+    state_->last_restore_bytes = 0;
+    state_->last_restore_seconds = 0.0;
+    return;
+  }
+
+  auto it = std::find_if(state_->checkpoints.begin(), state_->checkpoints.end(),
+                         [&](const SavedCheckpoint& ck) { return ck.token_count == new_token_count; });
+  if (it == state_->checkpoints.end()) {
+    throw std::logic_error("no saved GDN checkpoint at requested token_count");
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  owner_.impl_->ctx.bind_to_current_thread();
+
+  std::size_t conv_off = 0;
+  for (auto& b : state_->conv_states) {
+    if (b.count > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(b.ptr, it->conv_host.data() + conv_off, b.count * sizeof(float),
+                                 cudaMemcpyHostToDevice, owner_.impl_->ctx.stream));
+      conv_off += b.count;
+    }
+  }
+  std::size_t rec_off = 0;
+  for (auto& b : state_->rec_states) {
+    if (b.count > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(b.ptr, it->rec_host.data() + rec_off, b.count * sizeof(float),
+                                 cudaMemcpyHostToDevice, owner_.impl_->ctx.stream));
+      rec_off += b.count;
+    }
+  }
+
+  const std::size_t tail_tokens = old_tc - new_token_count;
+  const std::size_t kv_off_elems = new_token_count * state_->kv_stride_elems;
+  const std::size_t kv_clr_bytes = tail_tokens * state_->kv_stride_elems * sizeof(__nv_bfloat16);
+  if (kv_clr_bytes > 0) {
+    for (auto& b : state_->k_caches) {
+      CUDA_CHECK(cudaMemsetAsync(b.ptr + kv_off_elems, 0, kv_clr_bytes, owner_.impl_->ctx.stream));
+    }
+    for (auto& b : state_->v_caches) {
+      CUDA_CHECK(cudaMemsetAsync(b.ptr + kv_off_elems, 0, kv_clr_bytes, owner_.impl_->ctx.stream));
+    }
+  }
+  owner_.impl_->ctx.synchronize();
+
+  state_->last_restore_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  state_->last_restore_bytes =
+      static_cast<std::uint64_t>(state_->gdn_conv_total_floats + state_->gdn_rec_total_floats) * sizeof(float);
+
+  SavedCheckpoint kept = *it;
+  state_->index.truncate_committed(new_token_count);
+  (void)state_->index.prune_above(new_token_count);
+  state_->checkpoints.erase(
+      std::remove_if(state_->checkpoints.begin(), state_->checkpoints.end(),
+                     [&](const SavedCheckpoint& ck) { return ck.token_count > new_token_count; }),
+      state_->checkpoints.end());
+
+  if (kept.has_last_logits && kept.last_logits_pos == static_cast<int>(new_token_count) - 1) {
+    state_->tip_logits = std::move(kept.last_logits);
+    state_->index.set_tip_logits(kept.last_logits_pos);
+  } else {
+    state_->tip_logits.clear();
+  }
+}
+
+const Qwen38CheckpointIndex& Qwen38DenseSession::checkpoint_index() const noexcept { return state_->index; }
+
+std::uint64_t Qwen38DenseSession::saved_checkpoint_bytes() const noexcept {
+  std::uint64_t total = 0;
+  for (const auto& ck : state_->checkpoints) {
+    total += static_cast<std::uint64_t>(ck.conv_host.size() + ck.rec_host.size() + ck.last_logits.size()) *
+             sizeof(float);
+  }
+  return total;
+}
+
+std::uint64_t Qwen38DenseSession::last_restore_bytes() const noexcept { return state_->last_restore_bytes; }
+
+double Qwen38DenseSession::last_restore_seconds() const noexcept { return state_->last_restore_seconds; }
+
+double Qwen38DenseSession::last_reset_ms() const noexcept { return state_->last_reset_ms; }
+
+int Qwen38DenseSession::save_checkpoint() {
+  const std::size_t tc = state_->index.committed_tokens().size();
+  if (tc == 0) return 0;
+
+  auto existing = std::find_if(state_->checkpoints.begin(), state_->checkpoints.end(),
+                               [&](const SavedCheckpoint& ck) { return ck.token_count == tc; });
+  if (existing != state_->checkpoints.end()) {
+    if (!existing->has_last_logits && state_->index.has_tip_logits() &&
+        state_->index.tip_logits_pos() == static_cast<int>(tc) - 1) {
+      existing->last_logits = state_->tip_logits;
+      existing->has_last_logits = true;
+      existing->last_logits_pos = state_->index.tip_logits_pos();
+    }
+    return 0;
+  }
+
+  int evicted_cnt = 0;
+  if (const auto evicted = state_->index.record_checkpoint(tc); evicted.has_value()) {
+    state_->checkpoints.erase(
+        std::remove_if(state_->checkpoints.begin(), state_->checkpoints.end(),
+                       [&](const SavedCheckpoint& ck) { return ck.token_count == *evicted; }),
+        state_->checkpoints.end());
+    evicted_cnt = 1;
+  }
+
+  SavedCheckpoint ck;
+  ck.token_count = tc;
+  ck.conv_host.resize(state_->gdn_conv_total_floats);
+  ck.rec_host.resize(state_->gdn_rec_total_floats);
+
+  owner_.impl_->ctx.bind_to_current_thread();
+  std::size_t conv_off = 0;
+  for (const auto& b : state_->conv_states) {
+    if (b.count > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(ck.conv_host.data() + conv_off, b.ptr, b.count * sizeof(float),
+                                 cudaMemcpyDeviceToHost, owner_.impl_->ctx.stream));
+      conv_off += b.count;
+    }
+  }
+  std::size_t rec_off = 0;
+  for (const auto& b : state_->rec_states) {
+    if (b.count > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(ck.rec_host.data() + rec_off, b.ptr, b.count * sizeof(float),
+                                 cudaMemcpyDeviceToHost, owner_.impl_->ctx.stream));
+      rec_off += b.count;
+    }
+  }
+  owner_.impl_->ctx.synchronize();
+
+  if (state_->index.has_tip_logits() && state_->index.tip_logits_pos() == static_cast<int>(tc) - 1 &&
+      !state_->tip_logits.empty()) {
+    ck.last_logits = state_->tip_logits;
+    ck.has_last_logits = true;
+    ck.last_logits_pos = state_->index.tip_logits_pos();
+  }
+  state_->checkpoints.push_back(std::move(ck));
+  std::sort(state_->checkpoints.begin(), state_->checkpoints.end(),
+            [](const SavedCheckpoint& a, const SavedCheckpoint& b) { return a.token_count < b.token_count; });
+  return evicted_cnt;
+}
+
+std::uint64_t Qwen38DenseSession::evict_checkpoints() {
+  const std::uint64_t freed = saved_checkpoint_bytes();
+  (void)state_->index.evict_all_checkpoints();
+  std::vector<SavedCheckpoint>().swap(state_->checkpoints);
+  return freed;
 }
 
 Qwen38GemmParityReport Qwen38DenseBackend::self_check_gemm_parity(int device_id) {
@@ -1089,13 +1312,26 @@ ingine::model::ResidencyReport Qwen38DenseBackend::residency_report() const {
   r.weights_device_bytes = load_stats_.weights_device_bytes;
   r.state_device_bytes = impl_->default_session ? impl_->default_session->state_bytes() : impl_->max_state_bytes;
   r.device_bytes = r.weights_device_bytes + r.state_device_bytes + load_stats_.scratch_device_bytes;
+  const std::uint64_t ckpt_bytes = impl_->default_session ? impl_->default_session->saved_checkpoint_bytes() : 0ull;
   struct rusage ru {};
   if (::getrusage(RUSAGE_SELF, &ru) == 0 && ru.ru_maxrss > 0) {
     r.process_rss_bytes = static_cast<std::uint64_t>(ru.ru_maxrss) * 1024ull;
-    r.host_ram_bytes = r.process_rss_bytes;
   }
+  r.host_ram_bytes = std::max(r.process_rss_bytes, ckpt_bytes);
   return r;
 }
+
+std::uint64_t Qwen38DenseBackend::evict_caches(std::uint64_t /*target_free_bytes*/) {
+  return impl_->default_session ? impl_->default_session->evict_checkpoints() : 0ull;
+}
+
+const ingine::model::SessionLookupResult& Qwen38DenseBackend::last_lookup() const noexcept {
+  return impl_->last_lookup;
+}
+
+double Qwen38DenseBackend::last_lookup_ms() const noexcept { return impl_->last_lookup_ms; }
+
+double Qwen38DenseBackend::last_reset_ms() const noexcept { return impl_->last_reset_ms; }
 
 ingine::model::AdmissionEstimate Qwen38DenseBackend::admission_estimate(int max_ctx, int max_batch) const {
   ingine::model::AdmissionEstimate est;
@@ -1138,9 +1374,89 @@ void Qwen38DenseBackend::evaluate_teacher_forced_mode(std::span<const std::int32
   if (reset_before) {
     impl_->forward_range(sess, token_ids, caps, use_chunk_prefill, on_logits, prefill_ms_out);
   } else {
-    const int base = static_cast<int>(sess.committed_tokens_.size());
+    const int base = static_cast<int>(sess.committed_tokens().size());
     for (int& p : caps) p += base;
     impl_->forward_range(sess, token_ids, caps, use_chunk_prefill, on_logits, prefill_ms_out);
+  }
+}
+
+void Qwen38DenseBackend::evaluate_teacher_forced_on_session(Qwen38DenseSession& sess,
+                                                            const ingine::model::BackendRequest& req,
+                                                            std::span<const int> capture_positions,
+                                                            const ingine::model::LogitCallback& on_logits,
+                                                            double* prefill_ms_out) {
+  ingine::model::validate_request_against_capabilities(profile_.capabilities, profile_.max_ctx, req.prompt, 1,
+                                                       ingine::model::Sampling{});
+  if (!req.token_mask.empty() && req.token_mask.size() != req.prompt.ids.size()) {
+    throw std::invalid_argument("token_mask size mismatch");
+  }
+
+  std::vector<int> caps(capture_positions.begin(), capture_positions.end());
+  std::sort(caps.begin(), caps.end());
+  caps.erase(std::unique(caps.begin(), caps.end()), caps.end());
+  for (int pos : caps) {
+    if (pos < 0 || pos >= static_cast<int>(req.prompt.ids.size())) {
+      throw std::invalid_argument("evaluate_teacher_forced capture position out of bounds");
+    }
+  }
+
+  ingine::model::BackendStateIdentity req_id = profile_.state_identity;
+  if (!req.cache_namespace.empty()) req_id.cache_namespace = req.cache_namespace;
+  req_id.media_sha256 = ingine::model::hash_prompt_media(req.prompt.images);
+
+  const auto tl0 = std::chrono::steady_clock::now();
+  ingine::model::SessionLookupResult lk = ingine::model::restore_session_prefix(
+      sess, ingine::model::SessionLookupQuery{req_id, req.prompt.ids, req.token_mask, req.prompt.images,
+                                              req.use_prefix_cache});
+  impl_->last_lookup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl0).count();
+
+  const int V = manifest().config.vocab_size;
+  if (lk.hit && !caps.empty() && caps.front() < static_cast<int>(lk.reused_tokens)) {
+    const bool tip_covers_only_last =
+        (caps.size() == 1 || caps[1] >= static_cast<int>(lk.reused_tokens)) &&
+        caps.front() == static_cast<int>(lk.reused_tokens) - 1 && sess.state_->index.has_tip_logits() &&
+        sess.state_->index.tip_logits_pos() == caps.front() &&
+        sess.state_->tip_logits.size() == static_cast<std::size_t>(V);
+    if (!tip_covers_only_last) {
+      const std::size_t prev = sess.restorable_prefix_len(static_cast<std::size_t>(caps.front()));
+      if (prev > 0 && sess.try_restore_prefix(prev)) {
+        lk.reused_tokens = prev;
+        lk.reuse = (prev == sess.committed_tokens().size()) ? ingine::model::Reuse::Extend
+                                                           : ingine::model::Reuse::Checkpoint;
+      } else {
+        lk = ingine::model::SessionLookupResult{false, 0, ingine::model::Reuse::None,
+                                                "capture_before_reused_prefix"};
+      }
+    }
+  }
+
+  impl_->last_lookup = lk;
+  if (!lk.hit) {
+    sess.reset();
+    sess.state_->index.set_identity(req_id);
+  }
+
+  std::vector<int> rem_caps;
+  rem_caps.reserve(caps.size());
+  for (int pos : caps) {
+    if (lk.hit && pos == static_cast<int>(lk.reused_tokens) - 1 && sess.state_->index.has_tip_logits() &&
+        sess.state_->index.tip_logits_pos() == pos && sess.state_->tip_logits.size() == static_cast<std::size_t>(V)) {
+      if (on_logits) {
+        on_logits(ingine::model::LogitStep{pos, sess.state_->tip_logits});
+      }
+    } else {
+      rem_caps.push_back(pos);
+    }
+  }
+
+  if (lk.reused_tokens < req.prompt.ids.size()) {
+    const std::span<const std::int32_t> suffix_ids = req.prompt.ids.subspan(lk.reused_tokens);
+    const std::span<const std::uint8_t> suffix_mask =
+        req.token_mask.empty() ? std::span<const std::uint8_t>{} : req.token_mask.subspan(lk.reused_tokens);
+    impl_->forward_range(sess, suffix_ids, rem_caps, true, on_logits, prefill_ms_out, suffix_mask);
+  }
+  if (req_id.is_reusable_with(req_id)) {
+    (void)sess.save_checkpoint();
   }
 }
 
@@ -1148,44 +1464,17 @@ void Qwen38DenseBackend::evaluate_teacher_forced(std::span<const std::int32_t> t
                                                  std::span<const int> capture_positions, bool use_prefix_cache,
                                                  const ingine::model::LogitCallback& on_logits,
                                                  std::span<const std::uint8_t> token_mask) {
-  if (!token_mask.empty() && token_mask.size() != token_ids.size()) {
-    throw std::invalid_argument("token_mask size mismatch");
-  }
-  Qwen38DenseSession& sess = *impl_->default_session;
-  std::size_t start_pos = 0;
-  if (use_prefix_cache && token_mask.empty()) {
-    ingine::model::SessionLookupQuery q;
-    q.identity = profile_.state_identity;
-    q.prompt_ids = token_ids;
-    q.use_prefix_cache = true;
-    const auto lk = ingine::model::restore_session_prefix(sess, q);
-    if (lk.hit && lk.reused_tokens > 0 && lk.reused_tokens < token_ids.size()) {
-      bool need_earlier_cap = false;
-      for (int p : capture_positions) {
-        if (p < static_cast<int>(lk.reused_tokens)) {
-          need_earlier_cap = true;
-          break;
-        }
-      }
-      if (!need_earlier_cap) start_pos = lk.reused_tokens;
-    }
-  }
-  if (start_pos == 0) {
-    evaluate_teacher_forced_mode(token_ids, capture_positions, true, on_logits, nullptr, &sess, true);
-  } else {
-    std::vector<int> caps(capture_positions.begin(), capture_positions.end());
-    std::sort(caps.begin(), caps.end());
-    caps.erase(std::unique(caps.begin(), caps.end()), caps.end());
-    impl_->forward_range(sess, token_ids.subspan(start_pos), caps, true, on_logits, nullptr);
-  }
+  ingine::model::BackendRequest req;
+  req.prompt.ids = token_ids;
+  req.token_mask = token_mask;
+  req.use_prefix_cache = use_prefix_cache;
+  evaluate_teacher_forced_on_session(*impl_->default_session, req, capture_positions, on_logits, nullptr);
 }
 
 void Qwen38DenseBackend::evaluate_teacher_forced(const ingine::model::BackendRequest& req,
                                                  std::span<const int> capture_positions,
                                                  const ingine::model::LogitCallback& on_logits) {
-  ingine::model::validate_request_against_capabilities(profile_.capabilities, profile_.max_ctx, req.prompt, 0,
-                                                       ingine::model::Sampling{});
-  evaluate_teacher_forced(req.prompt.ids, capture_positions, req.use_prefix_cache, on_logits, req.token_mask);
+  evaluate_teacher_forced_on_session(*impl_->default_session, req, capture_positions, on_logits, nullptr);
 }
 
 void Qwen38DenseBackend::generate_greedy_exact(std::span<const std::int32_t> prompt_ids, int max_new_tokens,
@@ -1227,7 +1516,7 @@ void Qwen38DenseBackend::generate_greedy_exact(std::span<const std::int32_t> pro
     if (stop_on_eos && (next_tok == 248044 || next_tok == 248046)) break;
     if (step + 1 == max_new_tokens) break;
     impl_->decode_single_tok[0] = next_tok;
-    const std::array<int, 1> cap_cur = {static_cast<int>(sess.committed_tokens_.size())};
+    const std::array<int, 1> cap_cur = {static_cast<int>(sess.committed_tokens().size())};
     impl_->forward_range(sess, impl_->decode_single_tok, cap_cur, false, pick_argmax, nullptr);
   }
   if (decode_ms_out) {
@@ -1235,23 +1524,22 @@ void Qwen38DenseBackend::generate_greedy_exact(std::span<const std::int32_t> pro
   }
 }
 
-ingine::model::GenerateStats Qwen38DenseBackend::generate(
-    std::span<const std::int32_t> prompt, int max_new_tokens, const ingine::model::Sampling& sampling,
-    std::span<const std::int32_t> stop_ids, const std::function<bool(std::span<const std::int32_t>)>& on_tokens) {
-  ingine::model::Prompt p;
-  p.ids = prompt;
-  ingine::model::validate_request_against_capabilities(profile_.capabilities, profile_.max_ctx, p, max_new_tokens,
-                                                       sampling);
-  if (prompt.empty()) throw std::invalid_argument("Qwen38DenseBackend::generate empty prompt");
+ingine::model::GenerateStats Qwen38DenseBackend::generate_request_on_session(
+    Qwen38DenseSession& sess, const ingine::model::BackendRequest& req, int max_new_tokens,
+    const ingine::model::Sampling& sampling, std::span<const std::int32_t> stop_ids,
+    const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+    const ingine::model::PrefillCallback& on_prefill, const ingine::model::LogitCallback& on_step_logits) {
+  ingine::model::validate_request_against_capabilities(profile_.capabilities, profile_.max_ctx, req.prompt,
+                                                       max_new_tokens, sampling);
+  if (!req.token_mask.empty() && req.token_mask.size() != req.prompt.ids.size()) {
+    throw std::invalid_argument("BackendRequest token_mask length must equal prompt.ids length");
+  }
 
   const int eff_max_new =
       sampling.forced.empty() ? max_new_tokens : std::min<int>(max_new_tokens, static_cast<int>(sampling.forced.size()));
   ingine::model::GenerateStats stats;
-  stats.prompt_tokens = static_cast<int>(prompt.size());
+  stats.prompt_tokens = static_cast<int>(req.prompt.ids.size());
   if (eff_max_new <= 0) return stats;
-
-  Qwen38DenseSession& sess = *impl_->default_session;
-  sess.reset();
 
   const int V = manifest().config.vocab_size;
   std::mt19937_64 rng(sampling.seed.value_or(0x9e3779b97f4a7c15ull));
@@ -1321,12 +1609,74 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate(
     return cand[keep - 1].second;
   };
 
+  ingine::model::BackendStateIdentity req_id = profile_.state_identity;
+  if (!req.cache_namespace.empty()) req_id.cache_namespace = req.cache_namespace;
+  req_id.media_sha256 = ingine::model::hash_prompt_media(req.prompt.images);
+
+  const auto tl0 = std::chrono::steady_clock::now();
+  ingine::model::SessionLookupResult lookup = ingine::model::restore_session_prefix(
+      sess, ingine::model::SessionLookupQuery{req_id, req.prompt.ids, req.token_mask, req.prompt.images,
+                                              req.use_prefix_cache});
+  impl_->last_lookup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl0).count();
+
+  const std::size_t S = req.prompt.ids.size();
+  if (lookup.hit && lookup.reused_tokens == S) {
+    const bool tip_ok = sess.state_->index.has_tip_logits() &&
+                        sess.state_->index.tip_logits_pos() == static_cast<int>(S) - 1 &&
+                        sess.state_->tip_logits.size() == static_cast<std::size_t>(V);
+    if (!tip_ok) {
+      const std::size_t prev = (S > 1) ? sess.restorable_prefix_len(S - 1) : 0;
+      if (prev > 0 && sess.try_restore_prefix(prev)) {
+        lookup.reused_tokens = prev;
+        lookup.reuse = ingine::model::Reuse::Checkpoint;
+      } else {
+        lookup = ingine::model::SessionLookupResult{false, 0, ingine::model::Reuse::None, "tip_logits_unavailable"};
+      }
+    }
+  }
+
+  impl_->last_lookup = lookup;
+  if (!lookup.hit) {
+    sess.reset();
+    sess.state_->index.set_identity(req_id);
+    stats.restored_bytes = 0ull;
+    stats.restore_seconds = 0.0;
+  } else if (lookup.reuse == ingine::model::Reuse::Checkpoint) {
+    stats.restored_bytes = sess.last_restore_bytes();
+    stats.restore_seconds = sess.last_restore_seconds();
+  } else {
+    stats.restored_bytes = 0ull;
+    stats.restore_seconds = 0.0;
+  }
+
+  stats.reuse = lookup.reuse;
+  stats.reused_tokens = static_cast<int>(lookup.reused_tokens);
+
   std::int32_t next_tok = 0;
   double pf_ms = 0.0;
-  const std::array<int, 1> last_cap = {static_cast<int>(prompt.size()) - 1};
-  impl_->forward_range(sess, prompt, last_cap, true,
-                       [&](const ingine::model::LogitStep& st) { next_tok = select_token(st.logits); }, &pf_ms);
+  if (lookup.reused_tokens == S) {
+    next_tok = select_token(sess.state_->tip_logits);
+  } else {
+    const std::span<const std::int32_t> suffix_ids = req.prompt.ids.subspan(lookup.reused_tokens);
+    const std::span<const std::uint8_t> suffix_mask =
+        req.token_mask.empty() ? std::span<const std::uint8_t>{} : req.token_mask.subspan(lookup.reused_tokens);
+    const std::array<int, 1> last_cap = {static_cast<int>(S) - 1};
+    impl_->forward_range(sess, suffix_ids, last_cap, true,
+                         [&](const ingine::model::LogitStep& st) { next_tok = select_token(st.logits); }, &pf_ms,
+                         suffix_mask);
+  }
+
+  int evictions = 0;
+  if (req_id.is_reusable_with(req_id)) {
+    evictions += sess.save_checkpoint();
+  }
+  stats.cache_evictions = evictions;
   stats.prefill_seconds = pf_ms / 1000.0;
+  if (on_prefill) on_prefill(stats);
+
+  if (on_step_logits) {
+    on_step_logits(ingine::model::LogitStep{static_cast<int>(S) - 1, sess.state_->tip_logits});
+  }
 
   const auto td0 = std::chrono::steady_clock::now();
   for (int i = 0; i < eff_max_new; ++i) {
@@ -1337,12 +1687,47 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate(
     const bool stopped = std::find(stop_ids.begin(), stop_ids.end(), emit) != stop_ids.end();
     if (i + 1 == eff_max_new || stopped || !cont) break;
     impl_->decode_single_tok[0] = emit;
-    const std::array<int, 1> cur_cap = {static_cast<int>(sess.committed_tokens_.size())};
+    const std::array<std::uint8_t, 1> decode_mask_arr = {1u};
+    const std::span<const std::uint8_t> decode_mask = sess.committed_token_mask().empty()
+                                                          ? std::span<const std::uint8_t>{}
+                                                          : std::span<const std::uint8_t>(decode_mask_arr);
+    const std::array<int, 1> cur_cap = {static_cast<int>(sess.committed_tokens().size())};
     impl_->forward_range(sess, impl_->decode_single_tok, cur_cap, false,
-                         [&](const ingine::model::LogitStep& st) { next_tok = select_token(st.logits); }, nullptr);
+                         [&](const ingine::model::LogitStep& st) {
+                           next_tok = select_token(st.logits);
+                           if (on_step_logits) on_step_logits(st);
+                         },
+                         nullptr, decode_mask);
   }
   stats.decode_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();
   return stats;
+}
+
+ingine::model::GenerateStats Qwen38DenseBackend::generate_request(
+    const ingine::model::BackendRequest& req, int max_new_tokens, const ingine::model::Sampling& sampling,
+    std::span<const std::int32_t> stop_ids, const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+    const ingine::model::PrefillCallback& on_prefill) {
+  return generate_request_on_session(*impl_->default_session, req, max_new_tokens, sampling, stop_ids, on_tokens,
+                                     on_prefill);
+}
+
+ingine::model::GenerateStats Qwen38DenseBackend::generate(
+    const ingine::model::Prompt& prompt, int max_new_tokens, const ingine::model::Sampling& sampling,
+    std::span<const std::int32_t> stop_ids, const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+    const ingine::model::PrefillCallback& on_prefill) {
+  ingine::model::BackendRequest req;
+  req.prompt = prompt;
+  req.use_prefix_cache = true;
+  return generate_request_on_session(*impl_->default_session, req, max_new_tokens, sampling, stop_ids, on_tokens,
+                                     on_prefill);
+}
+
+ingine::model::GenerateStats Qwen38DenseBackend::generate(
+    std::span<const std::int32_t> prompt, int max_new_tokens, const ingine::model::Sampling& sampling,
+    std::span<const std::int32_t> stop_ids, const std::function<bool(std::span<const std::int32_t>)>& on_tokens) {
+  ingine::model::Prompt p;
+  p.ids = prompt;
+  return generate(p, max_new_tokens, sampling, stop_ids, on_tokens, nullptr);
 }
 
 }  // namespace ingine::backends::qwen38

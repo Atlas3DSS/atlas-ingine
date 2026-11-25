@@ -5,6 +5,7 @@ add_library(ingine_qwen38_cpu STATIC
   qwen38_block_cpu.cpp
   qwen38_backend.cpp
   qwen38_gate2_metrics.cpp
+  qwen38_gate3_metrics.cpp
 )
 
 target_link_libraries(ingine_qwen38_cpu PUBLIC

@@ -68,3 +68,20 @@ ingine_add_test(
   ORACLE
   TIMEOUT 900
 )
+
+ingine_add_test(
+  NAME qwen38_phase1c_cpu_prep
+  SOURCES test_qwen38_phase1c_cpu_prep.cpp
+  LIBS ingine_qwen38_cpu ingine_engine nlohmann_json::nlohmann_json
+  LABELS backend qwen38 cpu
+)
+
+ingine_add_test(
+  NAME qwen38_gpu_gate3
+  SOURCES test_qwen38_gpu_gate3.cpp
+  LIBS ingine_qwen38_cuda ingine_qwen38_cpu ingine_core nlohmann_json::nlohmann_json
+  LABELS backend qwen38 phase1c
+  GPU
+  ORACLE
+  TIMEOUT 600
+)
