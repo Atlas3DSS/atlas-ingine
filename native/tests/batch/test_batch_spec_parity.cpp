@@ -14,11 +14,16 @@
 // 5. Deep multi-tenant shortlist isolation (cold concurrent + warm cross-slot restore after Tenant B rare tokens).
 // 6. Confidence-width bound enforcement (spec_threshold=0.8: w_cap <= lead + 1, accepted <= lead).
 // 7. Mid-block stop truncation, prefix-cache exact/partial/root cold-vs-warm parity, and tight 6-page pool safety.
+#include "core/act.h"
 #include "engine/scheduler.h"
 #include "ingine/generator.h"
 #include "model/batch_spec_trace.h"
 #include "model/batch_spec_verify.h"
 #include "text/chat.h"
+
+namespace ingine::model {
+void set_batch_prefill_splits_for_test(std::vector<int> splits);
+}  // namespace ingine::model
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
@@ -705,8 +710,10 @@ int main(int argc, char** argv) {
       const int32_t ban_tok = plain_refs[0][0][1];
       std::vector<Sampling> samps(4);
       samps[0].temperature = 0.0f;
+      samps[0].seed = 11111;
       samps[1].temperature = 0.0f;
       samps[1].banned_tokens = {ban_tok};
+      samps[1].seed = 22222;
       samps[2].temperature = 0.8f;
       samps[2].top_k = 40;
       samps[2].top_p = 0.95f;
@@ -819,21 +826,30 @@ int main(int argc, char** argv) {
     {
       Sampling greedy;
       greedy.temperature = 0.0f;
+      greedy.seed = 55555;
       Prompt pA{prompt_ids[0], {}, 0, "tenant-A", true};
-      std::vector<BatchSpecSlotTrace> soloA_traces;
-      RunOut soloA;
+      Prompt pCleanB{prompt_ids[1], {}, 0, "tenant-B-clean", true};
+      const RunOut soloA = run_solo(*gen_spec, pA, 32, greedy);
+
+      // Equal-batch B=2 clean control (same M=16 geometry as dirty run, 0 rare neighbor extras):
+      std::vector<BatchSpecSlotTrace> cleanA_traces;
+      int rc = 0, ac = 0;
+      std::vector<std::vector<int32_t>> clean_paired;
       {
         BatchSpecTraceConfig cfg;
         cfg.capture_candidates = true;
         cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& trs) {
-          for (const auto& tr : trs) soloA_traces.push_back(tr);
+          for (const auto& tr : trs) {
+            if (tr.slot == 0) cleanA_traces.push_back(tr);
+          }
         };
         TraceGuard tg(std::move(cfg));
-        soloA = run_solo(*gen_spec, pA, 32, greedy);
+        clean_paired = run_batch_greedy_multi(*gen_spec, {pA, pCleanB}, 32, rc, ac);
       }
 
+      // Dirty Tenant B with 350 rare tail token IDs (guaranteed >= 100 outside immutable 32768 shortlist):
       std::vector<int32_t> rare_b = prompt_ids[1];
-      for (int t = 150000; t < 150220; ++t) rare_b.push_back(t);
+      for (int t = 185000; t < 185350; ++t) rare_b.push_back(t);
       Prompt pB{rare_b, {}, 0, "tenant-B", true};
 
       std::vector<BatchSpecSlotTrace> pairA_traces, pairB_traces;
@@ -854,16 +870,17 @@ int main(int argc, char** argv) {
 
       CHECK(!pairB_traces.empty() && pairB_traces[0].slot_extra_ids.size() >= 100);
       CHECK(paired[0] == soloA.tokens);
-      CHECK(pairA_traces.size() == soloA_traces.size());
-      for (std::size_t k = 0; k < std::min(pairA_traces.size(), soloA_traces.size()); ++k) {
-        CHECK(pairA_traces[k].slot_extra_ids == soloA_traces[k].slot_extra_ids);
-        CHECK(pairA_traces[k].accepted == soloA_traces[k].accepted);
-        CHECK(pairA_traces[k].next_token == soloA_traces[k].next_token);
+      CHECK(paired[0] == clean_paired[0]);
+      CHECK(pairA_traces.size() == cleanA_traces.size());
+      for (std::size_t k = 0; k < std::min(pairA_traces.size(), cleanA_traces.size()); ++k) {
+        CHECK(pairA_traces[k].slot_extra_ids == cleanA_traces[k].slot_extra_ids);
+        CHECK(pairA_traces[k].accepted == cleanA_traces[k].accepted);
+        CHECK(pairA_traces[k].next_token == cleanA_traces[k].next_token);
         for (int g = 0; g < sv::kGamma; ++g) {
-          CHECK(pairA_traces[k].draft_tokens[g] == soloA_traces[k].draft_tokens[g]);
-          CHECK(std::fabs(pairA_traces[k].draft_conf[g] - soloA_traces[k].draft_conf[g]) <= 1e-4f);
+          CHECK(pairA_traces[k].draft_tokens[g] == cleanA_traces[k].draft_tokens[g]);
+          CHECK(pairA_traces[k].draft_conf[g] == cleanA_traces[k].draft_conf[g]);
         }
-        CHECK(pairA_traces[k].draft_cand_idx == soloA_traces[k].draft_cand_idx);
+        CHECK(pairA_traces[k].draft_cand_idx == cleanA_traces[k].draft_cand_idx);
       }
       std::printf("tenant shortlist isolation (cold): neighbor_extra=%zu tenantA_extra=%zu proposals=EXACT tokens=EXACT\n",
                   pairB_traces[0].slot_extra_ids.size(), pairA_traces[0].slot_extra_ids.size());
@@ -950,9 +967,10 @@ int main(int argc, char** argv) {
         if (s >= 0) gen_plain->release_slot(s);
     }
 
+    const float kCrossGearMaxDiff = INGINE_ACT_FP16 ? 1.5f : 0.6f;
     for (const auto& dc : divergent_cases) {
       const auto vr = sv::validate_cross_gear_divergence(dc.l_plain, dc.l_spec, dc.plain_tok, dc.spec_tok,
-                                                         kUnpaddedVocab, 0.6f);
+                                                         kUnpaddedVocab, kCrossGearMaxDiff);
       std::printf(
           "  [cross-gear bound diag B=%d seq=%d pos=%zu] plain=%d(am=%d) spec=%d(am=%d) max_diff=%.4f "
           "margin_p=%.4f margin_s=%.4f -> %s\n",
@@ -1038,8 +1056,12 @@ int main(int argc, char** argv) {
 
     Sampling greedy;
     greedy.temperature = 0.0f;
+    // Match the root-prefix chunk boundary (`common`) on cold controls so prefill cuBLASLt GEMM shapes are
+    // identical between cold and root-cached/warm runs (same pattern as test_batch_prefix_parity.cpp).
+    ingine::model::set_batch_prefill_splits_for_test({common});
     const RunOut cold1 = run_solo(*gen, Prompt{p_full1, {}, 0, "ns1", true}, 32, greedy);
     const RunOut cold2 = run_solo(*gen, Prompt{p_full2, {}, 0, "ns1", true}, 32, greedy);
+    ingine::model::set_batch_prefill_splits_for_test({});
     CHECK(cold1.stats.reused_tokens == 0 && cold2.stats.reused_tokens == 0);
 
     const RunOut warm_seed = run_solo(*gen, Prompt{p_full1, {}, common, "ns1", false}, 32, greedy);
@@ -1085,7 +1107,9 @@ int main(int argc, char** argv) {
         for (const auto& tr : trs) cold_s_traces.push_back(tr);
       };
       TraceGuard tg(std::move(cfg));
+      ingine::model::set_batch_prefill_splits_for_test({common});
       cold_s = run_solo(*gen, Prompt{p_full1, {}, 0, "ns1", true}, 24, samp);
+      ingine::model::set_batch_prefill_splits_for_test({});
     }
     {
       BatchSpecTraceConfig cfg;

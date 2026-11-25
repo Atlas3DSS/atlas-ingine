@@ -926,8 +926,9 @@ class BatchDecoder {
         }
       }
 
-      // ---- Batched per-slot attention (1-tok fast path vs multi-token verify path)
-      if (!verify_mode) {
+      // ---- Batched per-slot attention (1-tok fast path when !verify_mode or W==1 vs multi-token verify path)
+      const bool use_verify_kernels = (verify_mode && W > 1);
+      if (!use_verify_kernels) {
         bk::BatchedAttnArgs a;
         a.proj = proj_gemv ? static_cast<const void*>(proj_fp32_) : static_cast<const void*>(proj_act_);
         a.proj_fp32 = proj_gemv;
@@ -1027,7 +1028,7 @@ class BatchDecoder {
           dense::gemv(attn_out_ + std::size_t(m0) * HEADS * HEAD_DIM, cm, HEADS * HEAD_DIM, matrix(layer.wo),
                       wo_fp32_ + std::size_t(m0) * H, false, stream);
         }
-        if (!verify_mode) {
+        if (!use_verify_kernels) {
           bk::batched_static_conv_step(wo_fp32_, true, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
                                        pool_.conv_h_slot_stride, y_, stream);
         } else {
@@ -1038,7 +1039,7 @@ class BatchDecoder {
       } else {
         const ActT* wo = bf16_rows(layer.wo);
         gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_act_, H, false, M, H, HEADS * HEAD_DIM, stream);
-        if (!verify_mode) {
+        if (!use_verify_kernels) {
           bk::batched_static_conv_step(wo_act_, false, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
                                        pool_.conv_h_slot_stride, y_, stream);
         } else {
@@ -1084,7 +1085,7 @@ class BatchDecoder {
       pk::moe_combine(down_, wts_, M, moe_sum_, stream);
       float* conv_mlp_v = static_cast<float*>(pool_.conv_mlp.p) + std::size_t(v) * (CONV_K - 1) * H;
       float* hist_mlp_v = save_hist ? (hist_mlp_ + std::size_t(v) * hist_h_visit_stride_) : nullptr;
-      if (!verify_mode) {
+      if (!use_verify_kernels) {
         bk::batched_static_conv_step(moe_sum_, false, H, B, H, slot_ids_dev_, f32p(layer.mlp_conv), conv_mlp_v,
                                      pool_.conv_h_slot_stride, y2_, stream);
       } else {

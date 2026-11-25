@@ -478,31 +478,8 @@ void BatchDrafter::commit_batch(std::span<const kd::BatchSlotCommitMeta> commits
 
   const int M = B * W;
   const std::size_t slab = std::size_t(M) * H;
-  if (M <= 32) {
-    for (int m0 = 0; m0 < M; m0 += 8) {
-      const int cm = std::min(8, M - m0);
-      // Pack 3 slabs of cm rows for kdense::proj when M > 8, else read directly.
-      if (M <= 8) {
-        kdense::proj(commit_xin_, cm, wkv_all_, seg_kv_, 3, commit_kv_f32_, false, stream_);
-      } else {
-        // Use per-layer BF16 GEMM fallback or tiny copy into ctx_c_
-        for (int l = 0; l < 3; ++l) {
-          gemm_->run(commit_xin_ + std::size_t(l) * slab + std::size_t(m0) * H, H, layers_[l].wkv_ctx, H,
-                     ctx_kv_, 2 * kd::KV_DIM, false, cm, 2 * kd::KV_DIM, H, stream_);
-          // Copy into commit_kv_act_ not needed if we run the whole M below; simplify: always use gemm for M > 8!
-        }
-        break;
-      }
-    }
-    if (M <= 8) {
-      for (int l = 0; l < 3; ++l) {
-        kd::batch_commit_store(commit_kv_f32_, true, 3 * 2 * kd::KV_DIM, l * 2 * kd::KV_DIM, l, commit_meta_dev_, B, W,
-                               ctx_layers_, stream_);
-      }
-      return;
-    }
-  }
-  // M > 8: 3 cuBLASLt BF16 GEMMs using resident layers_[l].wkv_ctx (1x weight read across all B*W rows!).
+  // Always use resident full-precision layers_[l].wkv_ctx (matching commit_slot_prefill) so drafter KV
+  // precision is consistent across all batch sizes M (eliminates FP8-vs-ActT drift between B=1 and B>1).
   ActT* dst_kv = (M <= COMMIT_PIECE) ? ctx_kv_ : commit_kv_act_;
   for (int l = 0; l < 3; ++l) {
     gemm_->run(commit_xin_ + std::size_t(l) * slab, H, layers_[l].wkv_ctx, H, dst_kv, 2 * kd::KV_DIM, false, M,

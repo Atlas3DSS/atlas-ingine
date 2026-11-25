@@ -360,32 +360,41 @@ inline ValidationResult validate_cross_gear_divergence(std::span<const float> l_
 
   const std::int32_t am_plain = head_argmax(l_plain);
   const std::int32_t am_spec = head_argmax(l_spec);
-  if (am_plain != plain_tok) {
-    return fail_res("plain logit capture argmax (" + std::to_string(am_plain) +
-                    ") does not match observed plain_tok (" + std::to_string(plain_tok) + ")");
-  }
-  if (am_spec != spec_tok) {
-    return fail_res("spec logit capture argmax (" + std::to_string(am_spec) +
-                    ") does not match observed spec_tok (" + std::to_string(spec_tok) + ")");
-  }
-
   const float mp = l_plain[std::size_t(plain_tok)] - l_plain[std::size_t(spec_tok)];
   const float ms = l_spec[std::size_t(spec_tok)] - l_spec[std::size_t(plain_tok)];
-  if (!(mp >= 0.f) || !(ms >= 0.f)) return fail_res("negative winner margin");
-  if (max_diff > max_allowed_diff) {
-    return fail_res("cross-gear max_logit_diff exceeds bound: " + std::to_string(max_diff));
-  }
-  if (mp + ms > 2.f * max_diff + 1e-4f) {
-    return fail_res("inconsistent margins relative to max_logit_diff");
-  }
 
   ValidationResult r;
-  r.ok = true;
+  r.ok = false;
   r.max_diff = max_diff;
   r.margin_plain = mp;
   r.margin_spec = ms;
   r.argmax_plain = am_plain;
   r.argmax_spec = am_spec;
+
+  if (am_plain != plain_tok) {
+    r.reason = "plain logit capture argmax (" + std::to_string(am_plain) +
+               ") does not match observed plain_tok (" + std::to_string(plain_tok) + ")";
+    return r;
+  }
+  if (am_spec != spec_tok) {
+    r.reason = "spec logit capture argmax (" + std::to_string(am_spec) +
+               ") does not match observed spec_tok (" + std::to_string(spec_tok) + ")";
+    return r;
+  }
+  if (!(mp >= 0.f) || !(ms >= 0.f)) {
+    r.reason = "negative winner margin";
+    return r;
+  }
+  if (max_diff > max_allowed_diff) {
+    r.reason = "cross-gear max_logit_diff exceeds bound: " + std::to_string(max_diff);
+    return r;
+  }
+  if (mp + ms > 2.f * max_diff + 1e-4f) {
+    r.reason = "inconsistent margins relative to max_logit_diff";
+    return r;
+  }
+
+  r.ok = true;
   return r;
 }
 
