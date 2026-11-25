@@ -106,4 +106,113 @@ void batched_head_softcap(const ActT* in, int B, int chunk_V, int v_offset, int 
 // Advances slot_pos[slot_ids[b]] += 1 on device for every b in [0, B) with slot_ids[b] >= 0.
 void batched_advance_pos(const std::int32_t* slot_ids, int B, std::int64_t* slot_pos, cudaStream_t stream);
 
+// ---- Batched multi-token speculative verification & rollback (W in {1, 2, 4, 8}) ---------------------------
+
+struct BatchedVerifyAttnArgs {
+  const void* proj = nullptr;  // [B * W, R] fp32 (proj_fp32=true) or ActT (proj_fp32=false), row r = b * W + w
+  bool proj_fp32 = false;
+  int B = 1;
+  int W = 1;                                    // 1, 2, 4, or 8
+  const std::int32_t* slot_ids = nullptr;       // device int32 [B], < 0 = padded inactive slot
+  const std::int32_t* slot_w_limit = nullptr;   // optional device int32 [B], active trial width per slot in [1, W]
+  const std::int64_t* slot_pos = nullptr;       // device int64 [max_slots], starting pos p0 (NOT modified here)
+
+  const float* q_scale = nullptr;   // fp32 [24, 128]
+  const float* r_scale = nullptr;   // fp32 [24, 16]
+  const float* rel_proj = nullptr;  // fp32 [16, 1024]
+  const float* k_conv = nullptr;    // sliding: fp32 [1024, 4]; full: k_static [4, 1024]
+  const float* v_conv = nullptr;
+
+  float* conv_k_visit = nullptr;
+  float* conv_v_visit = nullptr;
+  std::size_t conv_slot_stride = 0;
+
+  // Optional conv input history [B * W, 1024] for speculative rollback (nullptr when W == 1).
+  float* hist_k_visit = nullptr;
+  float* hist_v_visit = nullptr;
+
+  ActT* k_ring_visit = nullptr;
+  ActT* v_ring_visit = nullptr;
+  std::int64_t* ring_pos_visit = nullptr;
+  std::size_t ring_slot_stride = 0;
+  std::size_t ring_pos_slot_stride = 0;
+
+  void* k_full_pool = nullptr;
+  void* v_full_pool = nullptr;
+  const std::int32_t* page_table = nullptr;
+  int max_pages_per_slot = 0;
+  int full_visit_idx = 0;
+  int max_ctx = 0;
+  bool cache_fp8 = false;
+
+  int window = 0;  // 1024 (sliding) or 0 (full)
+  bool log_scaling = false;
+
+  void* workspace = nullptr;
+  std::size_t workspace_size = 0;
+  ActT* out = nullptr;  // [B * W, 3072]
+};
+
+// Workspace bytes required for batched_attn_verify up to (max_b, max_w).
+std::size_t attn_verify_workspace_bytes(int max_b, int max_w);
+
+// Launches race-free batched multi-token causal verify attention for B slots x W trial tokens.
+// Does NOT modify slot_pos; caller commits slot_pos[s] += commit[b] once via batched_verify_rollback.
+void batched_attn_verify(const BatchedVerifyAttnArgs& a, cudaStream_t stream);
+
+// Multi-token per-slot 4-tap static conv for B slots x W trial rows (row r = b * W + w).
+// Optionally records BF16-rounded inputs into hist [B * W, C] for rollback.
+void batched_static_conv_verify(const void* x, bool x_fp32, int ld, int B, int W, int C,
+                                const std::int32_t* slot_ids, const std::int32_t* slot_w_limit,
+                                const float* conv_w, float* conv_state_visit, std::size_t conv_slot_stride,
+                                float* out, float* hist, cudaStream_t stream);
+
+// Pre-verify state snapshots for up to max_B batch items, width up to max_W (<= 8).
+struct BatchedVerifyBackup {
+  float* conv_k = nullptr;     // [max_B, 48, 2, 1024]
+  float* conv_v = nullptr;     // [max_B, 48, 2, 1024]
+  float* conv_attn = nullptr;  // [max_B, 48, 2, 2304]
+  float* conv_mlp = nullptr;   // [max_B, 48, 2, 2304]
+  ActT* ring_k = nullptr;      // [max_B, 40, max_W, 1024]
+  ActT* ring_v = nullptr;      // [max_B, 40, max_W, 1024]
+  std::int64_t* ring_pos = nullptr;  // [max_B, 40, max_W]
+  int max_W = 8;
+};
+
+struct BatchedVerifyStatePtrs {
+  float* conv_k = nullptr;
+  float* conv_v = nullptr;
+  float* conv_attn = nullptr;
+  float* conv_mlp = nullptr;
+  std::size_t conv_kv_slot_stride = 0;
+  std::size_t conv_h_slot_stride = 0;
+  ActT* k_ring = nullptr;
+  ActT* v_ring = nullptr;
+  std::int64_t* ring_pos = nullptr;
+  std::size_t ring_slot_stride = 0;
+  std::size_t ring_pos_slot_stride = 0;
+  std::int64_t* slot_pos = nullptr;
+};
+
+struct BatchedVerifyHistory {
+  const float* hist_k = nullptr;     // [48, visit_kv_stride] (row b * W + w at offset (b * W + w) * 1024)
+  const float* hist_v = nullptr;
+  const float* hist_attn = nullptr;  // [48, visit_h_stride] (row b * W + w at offset (b * W + w) * 2304)
+  const float* hist_mlp = nullptr;
+  std::size_t kv_visit_stride = 0;
+  std::size_t h_visit_stride = 0;
+};
+
+// Snapshots conv rows [1, 2] and sliding-ring entries [(p0 + w) % 1024] for w < slot_w_limit[b] before verify.
+void batched_verify_save(const BatchedVerifyStatePtrs& st, const BatchedVerifyBackup& bk,
+                         const std::int32_t* slot_ids, const std::int32_t* slot_w_limit, int B, int W,
+                         cudaStream_t stream);
+
+// Rolls back conv states & sliding-ring rows for w in [commit[b], slot_w_limit[b]) and advances
+// slot_pos[slot_ids[b]] += commit[b] exactly once per active slot.
+void batched_verify_rollback(const BatchedVerifyStatePtrs& st, const BatchedVerifyBackup& bk,
+                             const BatchedVerifyHistory& hist, const std::int32_t* slot_ids,
+                             const std::int32_t* slot_w_limit, const std::int32_t* commit_counts, int B, int W,
+                             cudaStream_t stream);
+
 }  // namespace ingine::kernels::batch

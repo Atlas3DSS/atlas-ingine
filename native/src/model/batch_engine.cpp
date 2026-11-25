@@ -10,8 +10,11 @@
 #include "core/ops.h"
 #include "kernels/batch/batch.h"
 #include "kernels/dense/dense.h"
+#include "kernels/draft/batch_draft.h"
+#include "kernels/draft/draft.h"
 #include "kernels/head/head.h"
 #include "kernels/prefill/prefill.h"
+#include "model/batch_drafter.h"
 #include "model/batch_prefix_cache.h"
 #include "model/kv_checkpoint.h"
 #include "model/prefill.h"
@@ -47,8 +50,35 @@ std::vector<int> snapshot_test_prefill_splits() {
 
 namespace bk = kernels::batch;
 namespace dense = kernels::dense;
+namespace kd = kernels::draft;
 namespace head = kernels::head;
 namespace pk = kernels::prefill;
+
+std::uint64_t splitmix64(std::uint64_t x) {
+  x += 0x9E3779B97F4A7C15ull;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+  return x ^ (x >> 31);
+}
+
+std::vector<int> build_batch_buckets(int max_batch) {
+  static constexpr int kCanonical[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64};
+  std::vector<int> out;
+  for (int b : kCanonical) {
+    if (b < max_batch) out.push_back(b);
+  }
+  for (int b = 128; b < max_batch; b <<= 1) out.push_back(b);
+  out.push_back(max_batch);
+  return out;
+}
+
+int bucket_for_batch(int active, int max_batch) {
+  static constexpr int kCanonical[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64};
+  for (int b : kCanonical) {
+    if (b >= active && b <= max_batch) return b;
+  }
+  return max_batch;
+}
 
 constexpr int H = HIDDEN;
 constexpr int kHeadChunk = 32768;  // tiled FP8/BF16 unembed chunk for B > 8 (32768 * 2304 * 2 = 150.9 MB)
@@ -139,7 +169,7 @@ struct BatchStatePool {
   std::vector<int> slot_pos_host;
   std::vector<bool> slot_in_use;
 
-  void init(int max_b, int ctx, bool fp8, int max_kv_tokens) {
+  void init(int max_b, int ctx, bool fp8, int max_kv_tokens, std::size_t extra_reserve_bytes = 0) {
     max_batch = max_b;
     max_ctx = ctx;
     kv_fp8 = fp8;
@@ -172,7 +202,7 @@ struct BatchStatePool {
     scratch_k_full.fill(0);
     scratch_v_full.fill(0);
 
-    // Paged full-KV pool sizing
+    // Paged full-KV pool sizing (explicitly reserves extra_reserve_bytes for decoder/logits/rollback/graphs).
     const std::size_t page_kv_bytes = std::size_t(NUM_FULL_VISITS) * bk::kPageSize * KV_DIM * es;
     const std::size_t bytes_per_page = 2 * page_kv_bytes;  // K + V
     const int max_possible_pages = max_b * max_pages_per_slot;
@@ -181,8 +211,8 @@ struct BatchStatePool {
     } else {
       std::size_t free_bytes = 0, total_bytes = 0;
       CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-      // Leave headroom for CUDA graphs, cuBLASLt, activation buffers, and workspace (~2.5 GiB or 20% of free).
-      const std::size_t reserve = std::min<std::size_t>(std::size_t(2560) << 20, free_bytes / 4);
+      const std::size_t base_reserve = std::min<std::size_t>(std::size_t(2560) << 20, free_bytes / 4);
+      const std::size_t reserve = base_reserve + extra_reserve_bytes;
       const std::size_t avail = free_bytes > reserve ? free_bytes - reserve : 0;
       const int fit_pages = int(avail / bytes_per_page);
       num_pages = std::min(max_possible_pages, std::max(std::min(max_possible_pages, max_pages_per_slot), fit_pages));
@@ -320,61 +350,128 @@ struct BatchStatePool {
   }
 };
 
-// ----------------------------------------------------------------------------- BatchDecoder (B = 1..max_batch)
+// ----------------------------------------------------------------------------- BatchDecoder (B = 1..max_batch, W = 1..8)
 
 class BatchDecoder {
  public:
-  BatchDecoder(const Weights& w, const Ablation& abl, BatchStatePool& pool, int max_batch)
+  struct VerifyOutput {
+    const float* logits = nullptr;  // [B * W, UNPADDED_VOCAB]
+    const ActT* taps = nullptr;     // [B * W, NUM_TAPS, H]
+  };
+
+  static std::size_t estimate_bytes(int max_batch, int max_verify_width, bool dense_fp8, bool spec_enabled) {
+    const std::size_t B = std::size_t(max_batch);
+    const std::size_t W = std::size_t(spec_enabled ? std::max(1, max_verify_width) : 1);
+    const std::size_t M = B * W;
+    std::size_t bytes = 0;
+    // Per-row activations + logits + taps + MoE scratch (~1.26 MB/row)
+    bytes += M * (20 * H * sizeof(float) + 5 * H * sizeof(ActT));
+    bytes += M * std::size_t(UNPADDED_VOCAB) * sizeof(float);
+    bytes += M * (HEADS * HEAD_DIM + TOP_K * (INTER + H) + H) * sizeof(ActT);
+    if (M > 8) {
+      bytes += M * (PROJ_ROWS_FULL + H + 6 * H + GATE_RANK + kHeadChunk) * sizeof(ActT);
+      bytes += M * 2 * H * sizeof(float);
+    }
+    if (dense_fp8 && M > 32) bytes += std::size_t(kHeadChunk) * H * sizeof(ActT);
+    if (spec_enabled) {
+      bytes += M * std::size_t(NUM_TAPS) * H * sizeof(ActT);
+      bytes += bk::attn_verify_workspace_bytes(max_batch, int(W));
+      if (W > 1) {
+        // Backup conv (2 rows) + backup sliding rings (W rows) + 48-visit conv histories (M rows)
+        bytes += B * NUM_VISITS * 2 * (2 * KV_DIM + 2 * H) * sizeof(float);
+        bytes += B * NUM_SLIDING_VISITS * W * (2 * KV_DIM * sizeof(ActT) + sizeof(std::int64_t));
+        bytes += NUM_VISITS * M * (2 * KV_DIM + 2 * H) * sizeof(float);
+      }
+    } else {
+      bytes += bk::attn_workspace_bytes(max_batch);
+    }
+    // Headroom for CUDA graph instantiation
+    bytes += std::size_t(spec_enabled ? 384 : 128) << 20;
+    return bytes;
+  }
+
+  BatchDecoder(const Weights& w, const Ablation& abl, BatchStatePool& pool, int max_batch, int max_verify_width = 1,
+               bool spec_enabled = false)
       : w_(w),
         abl_(abl),
         pool_(pool),
         max_batch_(max_batch),
+        max_verify_width_(spec_enabled ? std::max(1, max_verify_width) : 1),
+        max_rows_(max_batch * max_verify_width_),
+        spec_enabled_(spec_enabled),
         gemm_(std::make_unique<pk::Gemm>()),
-        tokens_host_(std::size_t(max_batch) * sizeof(std::int64_t)),
-        slots_host_(std::size_t(max_batch) * sizeof(std::int32_t)) {
+        tokens_host_(std::size_t(max_rows_) * sizeof(std::int64_t)),
+        slots_host_(std::size_t(max_batch_) * sizeof(std::int32_t)),
+        wlim_host_(std::size_t(max_batch_) * sizeof(std::int32_t)) {
     auto alloc = [&](std::size_t bytes) {
       storage_.emplace_back(bytes);
       storage_.back().fill(0);
       return storage_.back().p;
     };
-    const std::size_t B = std::size_t(max_batch);
+    const std::size_t B = std::size_t(max_batch_);
+    const std::size_t M = std::size_t(max_rows_);
     auto f32 = [&](std::size_t n) { return static_cast<float*>(alloc(n * sizeof(float))); };
     auto bf16 = [&](std::size_t n) { return static_cast<ActT*>(alloc(n * sizeof(ActT))); };
     auto i32 = [&](std::size_t n) { return static_cast<int*>(alloc(n * sizeof(int))); };
 
-    tokens_dev_ = static_cast<std::int64_t*>(alloc(B * sizeof(std::int64_t)));
+    tokens_dev_ = static_cast<std::int64_t*>(alloc(M * sizeof(std::int64_t)));
     slot_ids_dev_ = static_cast<std::int32_t*>(alloc(B * sizeof(std::int32_t)));
-    B0_ = f32(B * H), B1_ = f32(B * H);
-    for (int p = 0; p < PASSES; ++p) B2_[p] = f32(B * H), E_[p] = f32(B * H);
-    hid_ = f32(B * H), part_ = f32(B * H), y_ = f32(B * H), y2_ = f32(B * H);
-    xin_ = bf16(3 * B * H), xm_ = bf16(B * H), xf_ = bf16(B * H);
-    xin_chunk_ = (w.dense_fp8 && B > 8) ? bf16(3 * 8 * H) : nullptr;
-    mixf_ = f32(3 * B * H), msgs_ = f32(4 * B * H), mixm_ = f32(B * H);
-    proj_fp32_ = f32(std::min<std::size_t>(B, w.dense_fp8 ? 32 : 8) * PROJ_ROWS_FULL);
-    proj_act_ = B > 8 ? bf16(B * PROJ_ROWS_FULL) : nullptr;
-    attn_out_ = bf16(B * HEADS * HEAD_DIM);
-    wo_fp32_ = f32(std::min<std::size_t>(B, w.dense_fp8 ? 32 : 8) * H);
-    wo_act_ = B > 8 ? bf16(B * H) : nullptr;
-    gin_ = B > 8 ? bf16(3 * B * 2 * H) : nullptr;
-    g16_ = B > 8 ? bf16(B * GATE_RANK) : nullptr;
-    fpre_ = B > 8 ? f32(B * H) : nullptr;
-    gpre_ = B > 8 ? f32(B * H) : nullptr;
-    router_logits_ = f32(B * EXPERTS);
-    idx_ = i32(B * TOP_K);
-    wts_ = f32(B * TOP_K);
+    slot_w_limit_dev_ = static_cast<std::int32_t*>(alloc(B * sizeof(std::int32_t)));
+    B0_ = f32(M * H), B1_ = f32(M * H);
+    for (int p = 0; p < PASSES; ++p) B2_[p] = f32(M * H), E_[p] = f32(M * H);
+    hid_ = f32(M * H), part_ = f32(M * H), y_ = f32(M * H), y2_ = f32(M * H);
+    xin_ = bf16(3 * M * H), xm_ = bf16(M * H), xf_ = bf16(M * H);
+    xin_chunk_ = (w.dense_fp8 && M > 8) ? bf16(3 * 8 * H) : nullptr;
+    mixf_ = f32(3 * M * H), msgs_ = f32(4 * M * H), mixm_ = f32(M * H);
+    proj_fp32_ = f32(std::min<std::size_t>(M, w.dense_fp8 ? 32 : 8) * PROJ_ROWS_FULL);
+    proj_act_ = M > 8 ? bf16(M * PROJ_ROWS_FULL) : nullptr;
+    attn_out_ = bf16(M * HEADS * HEAD_DIM);
+    wo_fp32_ = f32(std::min<std::size_t>(M, w.dense_fp8 ? 32 : 8) * H);
+    wo_act_ = M > 8 ? bf16(M * H) : nullptr;
+    gin_ = M > 8 ? bf16(3 * M * 2 * H) : nullptr;
+    g16_ = M > 8 ? bf16(M * GATE_RANK) : nullptr;
+    fpre_ = M > 8 ? f32(M * H) : nullptr;
+    gpre_ = M > 8 ? f32(M * H) : nullptr;
+    router_logits_ = f32(M * EXPERTS);
+    idx_ = i32(M * TOP_K);
+    wts_ = f32(M * TOP_K);
     counts_ = i32(EXPERTS);
     tiles_n_ = i32(1);
-    pair_token_ = i32(B * TOP_K);
-    pair_dst_ = i32(B * TOP_K);
-    tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_batch)) * sizeof(int4)));
-    act_ = bf16(B * TOP_K * INTER);
-    down_ = bf16(B * TOP_K * H);
-    moe_sum_ = bf16(B * H);
-    logits_ = f32(B * UNPADDED_VOCAB);
-    head_act_ = B > 8 ? bf16(B * kHeadChunk) : nullptr;
-    wscratch_ = (w.dense_fp8 && B > 32) ? bf16(std::size_t(kHeadChunk) * H) : nullptr;
-    attn_ws_ = DeviceBuffer(bk::attn_workspace_bytes(max_batch));
+    pair_token_ = i32(M * TOP_K);
+    pair_dst_ = i32(M * TOP_K);
+    tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_rows_)) * sizeof(int4)));
+    act_ = bf16(M * TOP_K * INTER);
+    down_ = bf16(M * TOP_K * H);
+    moe_sum_ = bf16(M * H);
+    logits_ = f32(M * UNPADDED_VOCAB);
+    head_act_ = M > 8 ? bf16(M * kHeadChunk) : nullptr;
+    wscratch_ = (w.dense_fp8 && M > 32) ? bf16(std::size_t(kHeadChunk) * H) : nullptr;
+    attn_ws_ = DeviceBuffer(spec_enabled_ ? std::max(bk::attn_workspace_bytes(max_batch_),
+                                                     bk::attn_verify_workspace_bytes(max_batch_, max_verify_width_))
+                                          : bk::attn_workspace_bytes(max_batch_));
     attn_ws_.fill(0);
+
+    if (spec_enabled_) {
+      taps_ = bf16(M * NUM_TAPS * H);
+      if (max_verify_width_ > 1) {
+        const std::size_t W = std::size_t(max_verify_width_);
+        bk_buf_.max_W = max_verify_width_;
+        bk_buf_.conv_k = f32(B * NUM_VISITS * 2 * KV_DIM);
+        bk_buf_.conv_v = f32(B * NUM_VISITS * 2 * KV_DIM);
+        bk_buf_.conv_attn = f32(B * NUM_VISITS * 2 * H);
+        bk_buf_.conv_mlp = f32(B * NUM_VISITS * 2 * H);
+        bk_buf_.ring_k = bf16(B * NUM_SLIDING_VISITS * W * KV_DIM);
+        bk_buf_.ring_v = bf16(B * NUM_SLIDING_VISITS * W * KV_DIM);
+        bk_buf_.ring_pos = static_cast<std::int64_t*>(alloc(B * NUM_SLIDING_VISITS * W * sizeof(std::int64_t)));
+
+        hist_kv_visit_stride_ = M * KV_DIM;
+        hist_h_visit_stride_ = M * H;
+        hist_k_ = f32(std::size_t(NUM_VISITS) * hist_kv_visit_stride_);
+        hist_v_ = f32(std::size_t(NUM_VISITS) * hist_kv_visit_stride_);
+        hist_attn_ = f32(std::size_t(NUM_VISITS) * hist_h_visit_stride_);
+        hist_mlp_ = f32(std::size_t(NUM_VISITS) * hist_h_visit_stride_);
+      }
+    }
 
     segments_[0] = upload_ints(proj_layout(false, true));
     segments_[1] = upload_ints(proj_layout(false, false));
@@ -384,21 +481,18 @@ class BatchDecoder {
   ~BatchDecoder() {
     for (auto& [b, exec] : graphs_)
       if (exec) cudaGraphExecDestroy(exec);
+    for (auto& [k, exec] : verify_graphs_)
+      if (exec) cudaGraphExecDestroy(exec);
   }
 
   void capture_buckets(cudaStream_t stream) {
-    // Capture power-of-2 + intermediate (24, 48, 96) buckets up to max_batch_.
-    std::vector<int> buckets;
-    for (int b = 1; b < max_batch_; b <<= 1) buckets.push_back(b);
-    for (int mid : {24, 48, 96})
-      if (mid < max_batch_) buckets.push_back(mid);
-    buckets.push_back(max_batch_);
-    std::sort(buckets.begin(), buckets.end());
-    buckets.erase(std::unique(buckets.begin(), buckets.end()), buckets.end());
+    // Capture power-of-2 + intermediate buckets (1,2,3,4,6,8,12,16,24,32,48,64) up to max_batch_
+    // to eliminate non-power-of-two padding cliffs at c=12, c=24, c=48.
+    const std::vector<int> buckets = build_batch_buckets(max_batch_);
 
     // Warmup & capture with all slot_ids = -1 so ZERO state is modified.
-    std::vector<std::int64_t> ztok(max_batch_, 0);
-    std::vector<std::int32_t> nslot(max_batch_, -1);
+    std::vector<std::int64_t> ztok(std::size_t(max_rows_), 0);
+    std::vector<std::int32_t> nslot(std::size_t(max_batch_), -1);
     CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ztok.data(), ztok.size() * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev_, nslot.data(), nslot.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -427,12 +521,11 @@ class BatchDecoder {
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  // Runs one batched decode step for `inputs` (1..max_batch_). Returns device logits [B_active, UNPADDED_VOCAB].
+  // Runs one plain 1-token batched decode step for `inputs` (1..max_batch_). Returns logits [B_active, UNPADDED_VOCAB].
   const float* run_step(std::span<const BatchSlotStep> inputs, cudaStream_t stream) {
     const int B_active = int(inputs.size());
     if (B_active < 1 || B_active > max_batch_) throw std::invalid_argument("BatchDecoder::run_step: bad batch size");
 
-    // Pick smallest captured bucket >= B_active.
     auto it = graphs_.lower_bound(B_active);
     const int B_cap = (it != graphs_.end()) ? it->first : B_active;
 
@@ -459,7 +552,120 @@ class BatchDecoder {
 
   const float* last_logits() const { return logits_; }
 
+  // Runs one batched speculative verify pass for B_active slots x W trial rows (W in {1, 2, 4, 8}).
+  // Captures target taps [B_cap * W, NUM_TAPS, H] and pre-verify backup + conv histories (when W > 1).
+  // Does NOT advance slot_pos; caller MUST call rollback_verify() with commit_counts [B_cap].
+  VerifyOutput run_verify(int B_active, int W, const std::int64_t* tokens_host_bw, const std::int32_t* slot_ids_host,
+                          const std::int32_t* slot_w_limit_host, int& B_cap_out, cudaStream_t stream) {
+    if (!spec_enabled_) throw std::logic_error("BatchDecoder::run_verify called with spec disabled");
+    if (B_active < 1 || B_active > max_batch_ || W < 1 || W > max_verify_width_)
+      throw std::invalid_argument("BatchDecoder::run_verify: bad B or W");
+
+    const int B_cap = bucket_for_batch(B_active, max_batch_);
+    B_cap_out = B_cap;
+
+    // Lazily capture CUDA graph for (B_cap, W) using padded slot_ids=-1 (ZERO mutation of live slots).
+    const std::pair<int, int> key{B_cap, W};
+    auto it = verify_graphs_.find(key);
+    if (it == verify_graphs_.end() && verify_graphs_.size() < 24) {
+      ensure_verify_graph(B_cap, W, stream);
+      it = verify_graphs_.find(key);
+    }
+
+    auto* ht = static_cast<std::int64_t*>(tokens_host_.data());
+    auto* hs = static_cast<std::int32_t*>(slots_host_.data());
+    auto* hw = static_cast<std::int32_t*>(wlim_host_.data());
+    for (int b = 0; b < B_active; ++b) {
+      hs[b] = slot_ids_host[b];
+      hw[b] = slot_w_limit_host[b];
+      for (int w = 0; w < W; ++w) ht[b * W + w] = tokens_host_bw[b * W + w];
+    }
+    for (int b = B_active; b < B_cap; ++b) {
+      hs[b] = -1;
+      hw[b] = 1;
+      for (int w = 0; w < W; ++w) ht[b * W + w] = 0;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(B_cap) * W * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev_, hs, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(slot_w_limit_dev_, hw, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+
+    if (it != verify_graphs_.end() && it->second != nullptr) {
+      CUDA_CHECK(cudaGraphLaunch(it->second, stream));
+    } else {
+      decode_verify_eager(B_cap, W, stream);
+    }
+    return {logits_, taps_};
+  }
+
+  void rollback_verify(int B_cap, int W, const std::int32_t* commit_counts_dev, cudaStream_t stream) {
+    bk::BatchedVerifyStatePtrs st = state_ptrs();
+    bk::BatchedVerifyHistory hist{};
+    hist.hist_k = hist_k_;
+    hist.hist_v = hist_v_;
+    hist.hist_attn = hist_attn_;
+    hist.hist_mlp = hist_mlp_;
+    hist.kv_visit_stride = hist_kv_visit_stride_;
+    hist.h_visit_stride = hist_h_visit_stride_;
+    bk::batched_verify_rollback(st, bk_buf_, hist, slot_ids_dev_, slot_w_limit_dev_, commit_counts_dev, B_cap, W, stream);
+  }
+
+  const std::int32_t* slot_w_limit_dev() const { return slot_w_limit_dev_; }
+
  private:
+  bk::BatchedVerifyStatePtrs state_ptrs() const {
+    bk::BatchedVerifyStatePtrs st{};
+    st.conv_k = static_cast<float*>(pool_.conv_k.p);
+    st.conv_v = static_cast<float*>(pool_.conv_v.p);
+    st.conv_attn = static_cast<float*>(pool_.conv_attn.p);
+    st.conv_mlp = static_cast<float*>(pool_.conv_mlp.p);
+    st.conv_kv_slot_stride = pool_.conv_kv_slot_stride;
+    st.conv_h_slot_stride = pool_.conv_h_slot_stride;
+    st.k_ring = static_cast<ActT*>(pool_.k_ring.p);
+    st.v_ring = static_cast<ActT*>(pool_.v_ring.p);
+    st.ring_pos = static_cast<std::int64_t*>(pool_.ring_pos.p);
+    st.ring_slot_stride = pool_.ring_slot_stride;
+    st.ring_pos_slot_stride = pool_.ring_pos_slot_stride;
+    st.slot_pos = static_cast<std::int64_t*>(pool_.slot_pos.p);
+    return st;
+  }
+
+  void ensure_verify_graph(int B_cap, int W, cudaStream_t stream) {
+    auto* ht = static_cast<std::int64_t*>(tokens_host_.data());
+    auto* hs = static_cast<std::int32_t*>(slots_host_.data());
+    auto* hw = static_cast<std::int32_t*>(wlim_host_.data());
+    std::memset(ht, 0, std::size_t(B_cap) * W * sizeof(std::int64_t));
+    for (int b = 0; b < B_cap; ++b) {
+      hs[b] = -1;
+      hw[b] = W;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(B_cap) * W * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev_, hs, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(slot_w_limit_dev_, hw, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+    decode_verify_eager(B_cap, W, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    try {
+      decode_verify_eager(B_cap, W, stream);
+    } catch (...) {
+      cudaStreamEndCapture(stream, &graph);
+      if (graph) cudaGraphDestroy(graph);
+      verify_graphs_[{B_cap, W}] = nullptr;
+      return;
+    }
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    cudaGraphExec_t exec = nullptr;
+    const cudaError_t err = cudaGraphInstantiate(&exec, graph, 0);
+    cudaGraphDestroy(graph);
+    if (err != cudaSuccess) {
+      verify_graphs_[{B_cap, W}] = nullptr;
+      return;
+    }
+    CUDA_CHECK(cudaGraphUpload(exec, stream));
+    verify_graphs_[{B_cap, W}] = exec;
+  }
+
   const float* const* block_table(const std::vector<const float*>& blocks) {
     auto it = tables_.find(blocks);
     if (it == tables_.end()) {
@@ -470,11 +676,17 @@ class BatchDecoder {
     return static_cast<const float* const*>(it->second.p);
   }
 
-  void decode_eager(int B, cudaStream_t stream) {
+  void decode_core_eager(int B, int W, bool verify_mode, cudaStream_t stream) {
+    const int M = B * W;
     const Weights& w = w_;
     const Ablation& abl = abl_;
-    const std::size_t slab = std::size_t(B) * H;
-    const bool use_gemv = (B <= 8);
+    const std::size_t slab = std::size_t(M) * H;
+    const bool use_gemv = (M <= 8);
+    const bool save_hist = (verify_mode && W > 1);
+
+    if (save_hist) {
+      bk::batched_verify_save(state_ptrs(), bk_buf_, slot_ids_dev_, slot_w_limit_dev_, B, W, stream);
+    }
 
     const float* attn_dirs = f32p(abl.attn_dirs);
     const float* attn_w = f32p(abl.attn_w);
@@ -483,7 +695,8 @@ class BatchDecoder {
 
     auto run_mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write,
                        const float* abl_r, const float* abl_w, float* partial_out, const float* queries, int Q,
-                       const float* norm_w, ActT* out_bf16, float* out_f32) {
+                       const float* norm_w, ActT* out_bf16, float* out_f32, ActT* tap_new_bf16 = nullptr,
+                       ActT* tap_out_copy = nullptr) {
       dense::MixParams p;
       p.blocks = blocks.empty() ? nullptr : block_table(blocks);
       p.nblocks = int(blocks.size());
@@ -498,7 +711,15 @@ class BatchDecoder {
       p.norm_w = norm_w;
       p.out_bf16 = out_bf16;
       p.out_f32 = out_f32;
-      p.M = B;
+      if (tap_new_bf16) {
+        p.new_bf16 = tap_new_bf16;
+        p.new_bf16_stride = std::int64_t(NUM_TAPS) * H;
+      }
+      if (tap_out_copy) {
+        p.out_copy = tap_out_copy;
+        p.out_copy_stride = std::int64_t(NUM_TAPS) * H;
+      }
+      p.M = M;
       dense::mix(p, false, stream);
     };
 
@@ -510,30 +731,31 @@ class BatchDecoder {
 
     auto run_gates_gemm = [&](const pk::GateRows& rows, int G, const Tensor& down, const Tensor& forget16,
                               const Tensor& gain16, const float* norm_w, ActT* out) {
-      pk::gate_inputs(rows, G, B, gin_, stream);
+      pk::gate_inputs(rows, G, M, gin_, stream);
       for (int g = 0; g < G; ++g) {
         const ActT* gd = bf16p(down) + std::size_t(g) * GATE_RANK * 2 * H;
-        gemm_->run(gin_ + std::size_t(g) * B * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, B, GATE_RANK, 2 * H,
+        gemm_->run(gin_ + std::size_t(g) * M * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, M, GATE_RANK, 2 * H,
                    stream);
-        gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, B, H,
+        gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, M, H,
                    GATE_RANK, stream);
-        gemm_->run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gpre_, H, true, B, H,
+        gemm_->run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gpre_, H, true, M, H,
                    GATE_RANK, stream);
-        pk::gate_apply(rows.h[g], rows.msg[g], fpre_, gpre_, norm_w + std::size_t(g) * H, B,
+        pk::gate_apply(rows.h[g], rows.msg[g], fpre_, gpre_, norm_w + std::size_t(g) * H, M,
                        out + std::size_t(g) * slab, stream);
       }
     };
 
     if (w.embed_q4()) {
-      auto desc = ops::make_inkling_embed_q4_desc(B, VOCAB, /*allow_pdl=*/false);
+      auto desc = ops::make_inkling_embed_q4_desc(M, VOCAB, /*allow_pdl=*/false);
       desc.token_bounds = ops::TokenBoundsMode::PreValidated;
       const ops::EmbedQ4RmsNormArgs args{tokens_dev_, w.embed.data, f32p(w.embed_norm), B0_};
       ops::run_embed_q4_rmsnorm(desc, args, stream, /*allow_fallback=*/false, /*force_fallback=*/false);
     } else {
-      dense::embed(tokens_dev_, B, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
+      dense::embed(tokens_dev_, M, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
     }
 
     int prev_v = -1;
+    int tap = 0;
     for (int v = 0; v < NUM_VISITS; ++v) {
       const int l = VISITS[v].layer, p = VISITS[v].pass;
       const Layer& layer = w.layers[l];
@@ -565,14 +787,19 @@ class BatchDecoder {
         if (i == 0) write = nullptr;
       }
 
-      // ---- Attention read + message gates
+      // ---- Attention read + message gates + optional target tap capture (visits 5, 23, 41)
+      ActT* tap_dst = nullptr;
+      if (verify_mode && taps_ && tap < 3 && v == TAP_VISITS[tap]) {
+        tap_dst = taps_ + std::size_t(tap) * H;
+        ++tap;
+      }
       const float* queries = layer.attn_query.data ? f32p(layer.attn_query) : nullptr;
       const int nq = layer.attn_query.data ? layer.attn_query.ne[1] : 1;
       float* partial_out = hid != base ? hid : nullptr;
       if (msgs) {
-        run_mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_);
+        run_mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_, tap_dst);
         if (use_gemv) {
-          dense::message_gates(mixf_, !layer.full, msgs_, 3, B, bf16p(layer.qkv_gate_down),
+          dense::message_gates(mixf_, !layer.full, msgs_, 3, M, bf16p(layer.qkv_gate_down),
                                layer.qkv_gate_forget16.data, layer.qkv_gate_gain16.data, false, f32p(layer.attn_norm3),
                                xin_, nullptr, false, stream);
         } else {
@@ -583,39 +810,38 @@ class BatchDecoder {
         }
       } else {
         run_mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
-                f32p(layer.attn_norm_mix), xin_, nullptr);
+                f32p(layer.attn_norm_mix), xin_, nullptr, tap_dst);
       }
 
-      // ---- Attention projections
-      // For FP8 dense weights at B <= 32, fused chunk-8 GEMV moves ceil(B/8)x W_fp8 vs 5x W_fp8 for dequant+cuBLASLt.
+      // ---- Attention projections over M = B * W rows
       const int R = proj_rows(layer.full);
       const bool single = !layer.full && !msgs;
-      const bool proj_gemv = use_gemv || (layer.wproj.fp8() && B <= 32);
+      const bool proj_gemv = use_gemv || (layer.wproj.fp8() && M <= 32);
       if (proj_gemv) {
         const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
-        if (B <= 8) {
-          dense::proj(xin_, B, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_,
+        if (M <= 8) {
+          dense::proj(xin_, M, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_,
                       false, stream);
         } else {
-          for (int b0 = 0; b0 < B; b0 += 8) {
-            const int cb = std::min(8, B - b0);
-            const ActT* xptr = xin_ + std::size_t(b0) * H;
+          for (int m0 = 0; m0 < M; m0 += 8) {
+            const int cm = std::min(8, M - m0);
+            const ActT* xptr = xin_ + std::size_t(m0) * H;
             if (!single) {
               for (int g = 0; g < 3; ++g) {
-                CUDA_CHECK(cudaMemcpyAsync(xin_chunk_ + std::size_t(g) * cb * H,
-                                           xin_ + std::size_t(g) * slab + std::size_t(b0) * H,
-                                           std::size_t(cb) * H * sizeof(ActT), cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(xin_chunk_ + std::size_t(g) * cm * H,
+                                           xin_ + std::size_t(g) * slab + std::size_t(m0) * H,
+                                           std::size_t(cm) * H * sizeof(ActT), cudaMemcpyDeviceToDevice, stream));
               }
               xptr = xin_chunk_;
             }
-            dense::proj(xptr, cb, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full),
-                        proj_fp32_ + std::size_t(b0) * R, false, stream);
+            dense::proj(xptr, cm, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full),
+                        proj_fp32_ + std::size_t(m0) * R, false, stream);
           }
         }
       } else {
         const ActT* wp = bf16_rows(layer.wproj);
         if (single) {
-          gemm_->run(xin_, H, wp, H, proj_act_, R, false, B, R, H, stream);
+          gemm_->run(xin_, H, wp, H, proj_act_, R, false, M, R, H, stream);
         } else {
           struct Part {
             int begin, end, input;
@@ -628,70 +854,131 @@ class BatchDecoder {
           for (const Part& part : parts) {
             if (part.begin >= R) break;
             gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H,
-                       proj_act_ + part.begin, R, false, B, part.end - part.begin, H, stream);
+                       proj_act_ + part.begin, R, false, M, part.end - part.begin, H, stream);
           }
         }
       }
 
-      // ---- Batched per-slot attention (sliding ring or paged full KV)
-      bk::BatchedAttnArgs a;
-      a.proj = proj_gemv ? static_cast<const void*>(proj_fp32_) : static_cast<const void*>(proj_act_);
-      a.proj_fp32 = proj_gemv;
-      a.B = B;
-      a.slot_ids = slot_ids_dev_;
-      a.slot_pos = static_cast<const std::int64_t*>(pool_.slot_pos.p);
-      a.q_scale = f32p(layer.q_scale);
-      a.r_scale = f32p(layer.r_scale);
-      a.rel_proj = f32p(layer.rel_proj);
-      a.conv_k_visit = static_cast<float*>(pool_.conv_k.p) + std::size_t(v) * (CONV_K - 1) * KV_DIM;
-      a.conv_v_visit = static_cast<float*>(pool_.conv_v.p) + std::size_t(v) * (CONV_K - 1) * KV_DIM;
-      a.conv_slot_stride = pool_.conv_kv_slot_stride;
-      a.workspace = attn_ws_.p;
-      a.workspace_size = attn_ws_.bytes;
-      a.out = attn_out_;
-      if (layer.full) {
-        a.k_conv = f32p(layer.k_static);
-        a.v_conv = f32p(layer.v_static);
-        a.k_full_pool = pool_.k_full_pool.p;
-        a.v_full_pool = pool_.v_full_pool.p;
-        a.page_table = static_cast<const std::int32_t*>(pool_.page_table.p);
-        a.max_pages_per_slot = pool_.max_pages_per_slot;
-        a.full_visit_idx = FULL_INDEX[v];
-        a.max_ctx = pool_.max_ctx;
-        a.cache_fp8 = pool_.kv_fp8;
-        a.window = 0;
-        a.log_scaling = true;
+      // ---- Batched per-slot attention (1-tok fast path vs multi-token verify path)
+      if (!verify_mode) {
+        bk::BatchedAttnArgs a;
+        a.proj = proj_gemv ? static_cast<const void*>(proj_fp32_) : static_cast<const void*>(proj_act_);
+        a.proj_fp32 = proj_gemv;
+        a.B = B;
+        a.slot_ids = slot_ids_dev_;
+        a.slot_pos = static_cast<const std::int64_t*>(pool_.slot_pos.p);
+        a.q_scale = f32p(layer.q_scale);
+        a.r_scale = f32p(layer.r_scale);
+        a.rel_proj = f32p(layer.rel_proj);
+        a.conv_k_visit = static_cast<float*>(pool_.conv_k.p) + std::size_t(v) * (CONV_K - 1) * KV_DIM;
+        a.conv_v_visit = static_cast<float*>(pool_.conv_v.p) + std::size_t(v) * (CONV_K - 1) * KV_DIM;
+        a.conv_slot_stride = pool_.conv_kv_slot_stride;
+        a.workspace = attn_ws_.p;
+        a.workspace_size = attn_ws_.bytes;
+        a.out = attn_out_;
+        if (layer.full) {
+          a.k_conv = f32p(layer.k_static);
+          a.v_conv = f32p(layer.v_static);
+          a.k_full_pool = pool_.k_full_pool.p;
+          a.v_full_pool = pool_.v_full_pool.p;
+          a.page_table = static_cast<const std::int32_t*>(pool_.page_table.p);
+          a.max_pages_per_slot = pool_.max_pages_per_slot;
+          a.full_visit_idx = FULL_INDEX[v];
+          a.max_ctx = pool_.max_ctx;
+          a.cache_fp8 = pool_.kv_fp8;
+          a.window = 0;
+          a.log_scaling = true;
+        } else {
+          const int ri = RING_INDEX[v];
+          a.k_conv = f32p(layer.k_conv);
+          a.v_conv = f32p(layer.v_conv);
+          a.k_ring_visit = static_cast<ActT*>(pool_.k_ring.p) + std::size_t(ri) * WINDOW * KV_DIM;
+          a.v_ring_visit = static_cast<ActT*>(pool_.v_ring.p) + std::size_t(ri) * WINDOW * KV_DIM;
+          a.ring_pos_visit = static_cast<std::int64_t*>(pool_.ring_pos.p) + std::size_t(ri) * WINDOW;
+          a.ring_slot_stride = pool_.ring_slot_stride;
+          a.ring_pos_slot_stride = pool_.ring_pos_slot_stride;
+          a.cache_fp8 = false;
+          a.window = WINDOW;
+          a.log_scaling = false;
+        }
+        bk::batched_attn_decode(a, stream);
       } else {
-        const int ri = RING_INDEX[v];
-        a.k_conv = f32p(layer.k_conv);
-        a.v_conv = f32p(layer.v_conv);
-        a.k_ring_visit = static_cast<ActT*>(pool_.k_ring.p) + std::size_t(ri) * WINDOW * KV_DIM;
-        a.v_ring_visit = static_cast<ActT*>(pool_.v_ring.p) + std::size_t(ri) * WINDOW * KV_DIM;
-        a.ring_pos_visit = static_cast<std::int64_t*>(pool_.ring_pos.p) + std::size_t(ri) * WINDOW;
-        a.ring_slot_stride = pool_.ring_slot_stride;
-        a.ring_pos_slot_stride = pool_.ring_pos_slot_stride;
-        a.cache_fp8 = false;
-        a.window = WINDOW;
-        a.log_scaling = false;
+        bk::BatchedVerifyAttnArgs va;
+        va.proj = proj_gemv ? static_cast<const void*>(proj_fp32_) : static_cast<const void*>(proj_act_);
+        va.proj_fp32 = proj_gemv;
+        va.B = B;
+        va.W = W;
+        va.slot_ids = slot_ids_dev_;
+        va.slot_w_limit = slot_w_limit_dev_;
+        va.slot_pos = static_cast<const std::int64_t*>(pool_.slot_pos.p);
+        va.q_scale = f32p(layer.q_scale);
+        va.r_scale = f32p(layer.r_scale);
+        va.rel_proj = f32p(layer.rel_proj);
+        va.conv_k_visit = static_cast<float*>(pool_.conv_k.p) + std::size_t(v) * (CONV_K - 1) * KV_DIM;
+        va.conv_v_visit = static_cast<float*>(pool_.conv_v.p) + std::size_t(v) * (CONV_K - 1) * KV_DIM;
+        va.conv_slot_stride = pool_.conv_kv_slot_stride;
+        va.hist_k_visit = save_hist ? (hist_k_ + std::size_t(v) * hist_kv_visit_stride_) : nullptr;
+        va.hist_v_visit = save_hist ? (hist_v_ + std::size_t(v) * hist_kv_visit_stride_) : nullptr;
+        va.workspace = attn_ws_.p;
+        va.workspace_size = attn_ws_.bytes;
+        va.out = attn_out_;
+        if (layer.full) {
+          va.k_conv = f32p(layer.k_static);
+          va.v_conv = f32p(layer.v_static);
+          va.k_full_pool = pool_.k_full_pool.p;
+          va.v_full_pool = pool_.v_full_pool.p;
+          va.page_table = static_cast<const std::int32_t*>(pool_.page_table.p);
+          va.max_pages_per_slot = pool_.max_pages_per_slot;
+          va.full_visit_idx = FULL_INDEX[v];
+          va.max_ctx = pool_.max_ctx;
+          va.cache_fp8 = pool_.kv_fp8;
+          va.window = 0;
+          va.log_scaling = true;
+        } else {
+          const int ri = RING_INDEX[v];
+          va.k_conv = f32p(layer.k_conv);
+          va.v_conv = f32p(layer.v_conv);
+          va.k_ring_visit = static_cast<ActT*>(pool_.k_ring.p) + std::size_t(ri) * WINDOW * KV_DIM;
+          va.v_ring_visit = static_cast<ActT*>(pool_.v_ring.p) + std::size_t(ri) * WINDOW * KV_DIM;
+          va.ring_pos_visit = static_cast<std::int64_t*>(pool_.ring_pos.p) + std::size_t(ri) * WINDOW;
+          va.ring_slot_stride = pool_.ring_slot_stride;
+          va.ring_pos_slot_stride = pool_.ring_pos_slot_stride;
+          va.cache_fp8 = false;
+          va.window = WINDOW;
+          va.log_scaling = false;
+        }
+        bk::batched_attn_verify(va, stream);
       }
-      bk::batched_attn_decode(a, stream);
 
       // ---- Output projection + per-slot post-attention 4-tap conv
       float* conv_attn_v = static_cast<float*>(pool_.conv_attn.p) + std::size_t(v) * (CONV_K - 1) * H;
-      const bool wo_gemv = use_gemv || (layer.wo.fp8() && B <= 32);
+      float* hist_attn_v = save_hist ? (hist_attn_ + std::size_t(v) * hist_h_visit_stride_) : nullptr;
+      const bool wo_gemv = use_gemv || (layer.wo.fp8() && M <= 32);
       if (wo_gemv) {
-        for (int b0 = 0; b0 < B; b0 += 8) {
-          const int cb = std::min(8, B - b0);
-          dense::gemv(attn_out_ + std::size_t(b0) * HEADS * HEAD_DIM, cb, HEADS * HEAD_DIM, matrix(layer.wo),
-                      wo_fp32_ + std::size_t(b0) * H, false, stream);
+        for (int m0 = 0; m0 < M; m0 += 8) {
+          const int cm = std::min(8, M - m0);
+          dense::gemv(attn_out_ + std::size_t(m0) * HEADS * HEAD_DIM, cm, HEADS * HEAD_DIM, matrix(layer.wo),
+                      wo_fp32_ + std::size_t(m0) * H, false, stream);
         }
-        bk::batched_static_conv_step(wo_fp32_, true, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
-                                     pool_.conv_h_slot_stride, y_, stream);
+        if (!verify_mode) {
+          bk::batched_static_conv_step(wo_fp32_, true, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
+                                       pool_.conv_h_slot_stride, y_, stream);
+        } else {
+          bk::batched_static_conv_verify(wo_fp32_, true, H, B, W, H, slot_ids_dev_, slot_w_limit_dev_,
+                                         f32p(layer.attn_conv), conv_attn_v, pool_.conv_h_slot_stride, y_, hist_attn_v,
+                                         stream);
+        }
       } else {
         const ActT* wo = bf16_rows(layer.wo);
-        gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_act_, H, false, B, H, HEADS * HEAD_DIM, stream);
-        bk::batched_static_conv_step(wo_act_, false, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
-                                     pool_.conv_h_slot_stride, y_, stream);
+        gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_act_, H, false, M, H, HEADS * HEAD_DIM, stream);
+        if (!verify_mode) {
+          bk::batched_static_conv_step(wo_act_, false, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
+                                       pool_.conv_h_slot_stride, y_, stream);
+        } else {
+          bk::batched_static_conv_verify(wo_act_, false, H, B, W, H, slot_ids_dev_, slot_w_limit_dev_,
+                                         f32p(layer.attn_conv), conv_attn_v, pool_.conv_h_slot_stride, y_, hist_attn_v,
+                                         stream);
+        }
       }
 
       // ---- MLP read + message gate
@@ -702,7 +989,7 @@ class BatchDecoder {
         run_mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
                 f32p(layer.mlp_query), 1, nullptr, nullptr, mixm_);
         if (use_gemv) {
-          dense::message_gates(mixm_, false, msgs_ + 3 * slab, 1, B, bf16p(layer.mlp1_gate_down),
+          dense::message_gates(mixm_, false, msgs_ + 3 * slab, 1, M, bf16p(layer.mlp1_gate_down),
                                layer.mlp1_gate_forget16.data, layer.mlp1_gate_gain16.data, false,
                                f32p(layer.mlp_norm1), xm_, nullptr, false, stream);
         } else {
@@ -717,31 +1004,40 @@ class BatchDecoder {
       }
 
       // ---- Router + grouped tensor-core MoE + per-slot post-MLP 4-tap conv
-      gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, B, EXPERTS, H, stream);
+      gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, M, EXPERTS, H, stream);
       CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), stream));
-      pk::moe_topk(router_logits_, f32p(layer.router_bias), B, idx_, wts_, counts_, stream);
+      pk::moe_topk(router_logits_, f32p(layer.router_bias), M, idx_, wts_, counts_, stream);
       const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
-      pk::moe_route(idx_, B, work, stream);
+      pk::moe_route(idx_, M, work, stream);
       const Experts& ex = layer.experts;
       const pk::MoeExperts me{static_cast<int>(ex.fmt), ex.w13.data, ex.w13_scale.data, f32p(ex.w13_factor),
                               ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
-      pk::moe_gate_up(me, xm_, B, work, act_, stream);
-      pk::moe_down(me, act_, B, work, down_, stream);
-      pk::moe_combine(down_, wts_, B, moe_sum_, stream);
+      pk::moe_gate_up(me, xm_, M, work, act_, stream);
+      pk::moe_down(me, act_, M, work, down_, stream);
+      pk::moe_combine(down_, wts_, M, moe_sum_, stream);
       float* conv_mlp_v = static_cast<float*>(pool_.conv_mlp.p) + std::size_t(v) * (CONV_K - 1) * H;
-      bk::batched_static_conv_step(moe_sum_, false, H, B, H, slot_ids_dev_, f32p(layer.mlp_conv), conv_mlp_v,
-                                   pool_.conv_h_slot_stride, y2_, stream);
+      float* hist_mlp_v = save_hist ? (hist_mlp_ + std::size_t(v) * hist_h_visit_stride_) : nullptr;
+      if (!verify_mode) {
+        bk::batched_static_conv_step(moe_sum_, false, H, B, H, slot_ids_dev_, f32p(layer.mlp_conv), conv_mlp_v,
+                                     pool_.conv_h_slot_stride, y2_, stream);
+      } else {
+        bk::batched_static_conv_verify(moe_sum_, false, H, B, W, H, slot_ids_dev_, slot_w_limit_dev_,
+                                       f32p(layer.mlp_conv), conv_mlp_v, pool_.conv_h_slot_stride, y2_, hist_mlp_v,
+                                       stream);
+      }
       prev_v = v;
     }
 
-    // ---- Final read + LM head
+    // ---- Final read (capturing tap 3 = xf_ in verify mode) + LM head
+    ActT* final_tap = (verify_mode && taps_) ? (taps_ + std::size_t(NUM_TAPS - 1) * H) : nullptr;
     run_mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H,
-            mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
-    const bool head_gemv = use_gemv || (w.unembed.fp8() && B <= 32);
+            mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr,
+            nullptr, final_tap);
+    const bool head_gemv = use_gemv || (w.unembed.fp8() && M <= 32);
     if (head_gemv) {
-      for (int b0 = 0; b0 < B; b0 += 8) {
-        const int cb = std::min(8, B - b0);
-        dense::head(xf_ + std::size_t(b0) * H, cb, matrix(w.unembed), logits_ + std::size_t(b0) * UNPADDED_VOCAB,
+      for (int m0 = 0; m0 < M; m0 += 8) {
+        const int cm = std::min(8, M - m0);
+        dense::head(xf_ + std::size_t(m0) * H, cm, matrix(w.unembed), logits_ + std::size_t(m0) * UNPADDED_VOCAB,
                     false, stream);
       }
     } else {
@@ -755,19 +1051,27 @@ class BatchDecoder {
         } else {
           wchunk = bf16p(w.unembed.w) + std::size_t(v0) * H;
         }
-        gemm_->run(xf_, H, wchunk, H, head_act_, cv, false, B, cv, H, stream);
-        bk::batched_head_softcap(head_act_, B, cv, v0, UNPADDED_VOCAB, logits_, stream);
+        gemm_->run(xf_, H, wchunk, H, head_act_, cv, false, M, cv, H, stream);
+        bk::batched_head_softcap(head_act_, M, cv, v0, UNPADDED_VOCAB, logits_, stream);
       }
     }
 
-    // Advance per-slot position on device for active slots
-    bk::batched_advance_pos(slot_ids_dev_, B, static_cast<std::int64_t*>(pool_.slot_pos.p), stream);
+    // Plain 1-token path advances slot_pos directly; verify path advances ONCE per slot inside rollback_verify!
+    if (!verify_mode) {
+      bk::batched_advance_pos(slot_ids_dev_, B, static_cast<std::int64_t*>(pool_.slot_pos.p), stream);
+    }
   }
+
+  void decode_eager(int B, cudaStream_t stream) { decode_core_eager(B, 1, false, stream); }
+  void decode_verify_eager(int B, int W, cudaStream_t stream) { decode_core_eager(B, W, true, stream); }
 
   const Weights& w_;
   const Ablation& abl_;
   BatchStatePool& pool_;
   int max_batch_;
+  int max_verify_width_;
+  int max_rows_;
+  bool spec_enabled_;
   std::unique_ptr<pk::Gemm> gemm_;
 
   std::vector<DeviceBuffer> storage_;
@@ -776,10 +1080,12 @@ class BatchDecoder {
   DeviceBuffer full_segments_;
   DeviceBuffer attn_ws_;
   std::map<int, cudaGraphExec_t> graphs_;
-  PinnedHostBuffer tokens_host_, slots_host_;
+  std::map<std::pair<int, int>, cudaGraphExec_t> verify_graphs_;
+  PinnedHostBuffer tokens_host_, slots_host_, wlim_host_;
 
   std::int64_t* tokens_dev_ = nullptr;
   std::int32_t* slot_ids_dev_ = nullptr;
+  std::int32_t* slot_w_limit_dev_ = nullptr;
   float *B0_ = nullptr, *B1_ = nullptr, *B2_[PASSES] = {}, *E_[PASSES] = {};
   float *hid_ = nullptr, *part_ = nullptr, *y_ = nullptr, *y2_ = nullptr;
   ActT *xin_ = nullptr, *xin_chunk_ = nullptr, *xm_ = nullptr, *xf_ = nullptr;
@@ -798,6 +1104,10 @@ class BatchDecoder {
   ActT *act_ = nullptr, *down_ = nullptr, *moe_sum_ = nullptr;
   float* logits_ = nullptr;
   ActT *head_act_ = nullptr, *wscratch_ = nullptr;
+  ActT* taps_ = nullptr;
+  bk::BatchedVerifyBackup bk_buf_{};
+  float *hist_k_ = nullptr, *hist_v_ = nullptr, *hist_attn_ = nullptr, *hist_mlp_ = nullptr;
+  std::size_t hist_kv_visit_stride_ = 0, hist_h_visit_stride_ = 0;
 };
 
 // ----------------------------------------------------------------------------- BatchGenerator (implements Generator)
@@ -808,6 +1118,8 @@ struct PrefixCheckpointGpu {
   DeviceBuffer conv_k, conv_v, conv_attn, conv_mlp;
   DeviceBuffer tail_k, tail_v;  // [NUM_FULL_VISITS, tail_tokens, KV_DIM] when tail_tokens > 0
   DeviceBuffer logits;          // [UNPADDED_VOCAB] fp32
+  bool has_draft = false;
+  DraftCheckpointGpu draft;     // populated when RuntimeOptions::spec is enabled
 };
 
 class BatchGenerator final : public Generator {
@@ -845,6 +1157,7 @@ class BatchGenerator final : public Generator {
     if (stream_) cudaStreamSynchronize(stream_);
     prefix_cache_.clear(pool_.pages);
     decoder_.reset();
+    drafter_.reset();
     prefiller_.reset();
     vision_.reset();
     if (restore_ev_stop_) cudaEventDestroy(restore_ev_stop_);
@@ -859,6 +1172,7 @@ class BatchGenerator final : public Generator {
   int max_model_len() const override { return options_.max_ctx; }
   bool supports_images() const override { return vision_ != nullptr; }
   int max_batch_size() const override { return options_.max_batch; }
+  bool supports_batched_spec() const override { return drafter_ != nullptr; }
   PrefixCacheStats cache_stats() const override {
     std::lock_guard<std::mutex> lock(mutex_);
     return prefix_cache_.stats();
@@ -881,7 +1195,7 @@ class BatchGenerator final : public Generator {
     const int eff_max = effective_max_new(n, max_new_tokens, sampling);
     const int worst_tokens = std::min(options_.max_ctx, n + std::max(1, eff_max - 1));
     const int lifetime_pages = (worst_tokens + bk::kPageSize - 1) / bk::kPageSize;
-    const bool cache_eligible = options_.prefix_cache && !full_prompt.bypass_prefix_cache && !options_.spec &&
+    const bool cache_eligible = options_.prefix_cache && !full_prompt.bypass_prefix_cache &&
                                 !options_.enable_persona_hooks && sampling.persona == nullptr &&
                                 full_prompt.images.empty() && prefix_cache_.vram_budget_bytes() > 0;
     int F = 0;
@@ -922,12 +1236,13 @@ class BatchGenerator final : public Generator {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pool_.free_slot_count() <= 0) return -1;
 
-    // Stage 2 fail-closed eligibility: text + supported resident KV modes, speculation off, unhooked, not bypassed.
-    const bool cache_eligible = options_.prefix_cache && !full_prompt.bypass_prefix_cache && !options_.spec &&
+    // Prefix-cache eligibility: text + supported resident KV modes (with or without batched spec), unhooked, not bypassed.
+    const bool cache_eligible = options_.prefix_cache && !full_prompt.bypass_prefix_cache &&
                                 !options_.enable_persona_hooks && sampling.persona == nullptr &&
                                 full_prompt.images.empty() && prefix_cache_.vram_budget_bytes() > 0;
     const StateIdentity identity = build_identity(full_prompt);
     const auto* hit = cache_eligible ? prefix_cache_.find_longest_prefix(identity, prompt) : nullptr;
+    if (hit && drafter_ && !hit->payload.has_draft) hit = nullptr;
 
     const int L = hit ? int(hit->tokens.size()) : 0;
     const int F = L / bk::kPageSize;
@@ -941,8 +1256,6 @@ class BatchGenerator final : public Generator {
     const int initial_pages = (n + 1 + bk::kPageSize - 1) / bk::kPageSize;
     const int fresh_needed = std::max(0, initial_pages - F);
 
-    // When other slots are already live, enforce lifetime decode budget + active slots' reserved future growth
-    // so admitting a concurrent slot can never exhaust the paged KV pool mid-decode.
     if (pool_.active_slot_count() > 0) {
       const int reserved = active_reserved_growth_pages();
       const int avail = pool_.pages.free_count() + prefix_cache_.reclaimable_pages_excluding(pool_.pages, hit_id);
@@ -959,7 +1272,6 @@ class BatchGenerator final : public Generator {
     if (s < 0) return -1;
     slot_meta_[s].max_pos = worst_tokens;
 
-    // Exception-safe slot guard: covers attach_committed_pages, ensure_pages, restore, prefill, scatter, and sample.
     bool slot_committed = false;
     struct SlotGuard {
       BatchStatePool& pool;
@@ -997,6 +1309,9 @@ class BatchGenerator final : public Generator {
       CUDA_CHECK(cudaMemcpyAsync(prefill_logits_.p, hit->payload.logits.p, prefill_logits_.bytes,
                                  cudaMemcpyDeviceToDevice, stream_));
       restored_bytes += prefill_logits_.bytes;
+      if (drafter_) {
+        restored_bytes += drafter_->restore_slot_checkpoint(s, hit->payload.draft);
+      }
       CUDA_CHECK(cudaEventRecord(restore_ev_stop_, stream_));
       recorded_restore_events = true;
       pool_.set_slot_pos(s, n, stream_);
@@ -1006,6 +1321,7 @@ class BatchGenerator final : public Generator {
       int scatter_from = 0;
       if (L == 0) {
         reset_state(st, stream_);
+        if (drafter_) drafter_->reset_slot(s);
       } else {
         CUDA_CHECK(cudaEventRecord(restore_ev_start_, stream_));
         restored_bytes += restore_recurrent_state(s, hit->payload);
@@ -1023,135 +1339,152 @@ class BatchGenerator final : public Generator {
                                       stream_);
           restored_bytes += hit->payload.tail_k.bytes + hit->payload.tail_v.bytes;
         }
+        if (drafter_) {
+          restored_bytes += drafter_->restore_slot_checkpoint(s, hit->payload.draft);
+        }
         CUDA_CHECK(cudaEventRecord(restore_ev_stop_, stream_));
         recorded_restore_events = true;
         st.length = L;
-        scatter_from = F * bk::kPageSize;  // never overwrite shared committed pages [0..F-1]
+        scatter_from = F * bk::kPageSize;
         prefix_cache_.record_d2d_restore(restored_bytes);
       }
 
-        const std::size_t chunk = std::size_t(prefill_chunk_);
-        struct Encoded {
-          const PromptImage* image;
-          DeviceBuffer rows;
-        };
-        std::deque<Encoded> encoded;
-        std::size_t next_image = 0;
-        std::vector<EmbedRows> rows;
+      const std::size_t chunk = std::size_t(prefill_chunk_);
+      struct Encoded {
+        const PromptImage* image;
+        DeviceBuffer rows;
+      };
+      std::deque<Encoded> encoded;
+      std::size_t next_image = 0;
+      std::vector<EmbedRows> rows;
 
-        const std::vector<int> forced_splits = (L == 0) ? snapshot_test_prefill_splits() : std::vector<int>{};
-        std::size_t split_idx = 0;
-        std::size_t start = std::size_t(L);
-        while (start < std::size_t(n)) {
-          std::size_t target_end = std::min(start + chunk, std::size_t(n));
-          if (split_idx < forced_splits.size() && forced_splits[split_idx] > 0) {
-            target_end = std::min(target_end, start + std::size_t(forced_splits[split_idx]));
-            ++split_idx;
+      const std::vector<int> forced_splits = (L == 0) ? snapshot_test_prefill_splits() : std::vector<int>{};
+      std::size_t split_idx = 0;
+      std::size_t start = std::size_t(L);
+      while (start < std::size_t(n)) {
+        std::size_t target_end = std::min(start + chunk, std::size_t(n));
+        if (split_idx < forced_splits.size() && forced_splits[split_idx] > 0) {
+          target_end = std::min(target_end, start + std::size_t(forced_splits[split_idx]));
+          ++split_idx;
+        }
+        if (root_boundary > L && root_boundary < n && start < std::size_t(root_boundary) &&
+            target_end > std::size_t(root_boundary)) {
+          target_end = std::size_t(root_boundary);
+        }
+        const int T = int(target_end - start);
+        for (; next_image < full_prompt.images.size() &&
+               std::size_t(full_prompt.images[next_image].pos) < start + std::size_t(T);
+             ++next_image) {
+          const PromptImage& image = full_prompt.images[next_image];
+          const auto tv = std::chrono::steady_clock::now();
+          DeviceBuffer out = vision_->encode(image.rgb->data(), image.height, image.width);
+          while (!encoded.empty() &&
+                 std::size_t(encoded.front().image->pos + encoded.front().image->tokens()) <= start) {
+            encoded.pop_front();
           }
-          if (root_boundary > L && root_boundary < n && start < std::size_t(root_boundary) &&
-              target_end > std::size_t(root_boundary)) {
-            target_end = std::size_t(root_boundary);
-          }
-          const int T = int(target_end - start);
-          for (; next_image < full_prompt.images.size() &&
-                 std::size_t(full_prompt.images[next_image].pos) < start + std::size_t(T);
-               ++next_image) {
-            const PromptImage& image = full_prompt.images[next_image];
-            const auto tv = std::chrono::steady_clock::now();
-            DeviceBuffer out = vision_->encode(image.rgb->data(), image.height, image.width);
-            while (!encoded.empty() &&
-                   std::size_t(encoded.front().image->pos + encoded.front().image->tokens()) <= start) {
-              encoded.pop_front();
-            }
-            encoded.push_back(Encoded{&image, std::move(out)});
-            stats.vision_seconds += seconds_since(tv);
-            ++stats.images_encoded;
-          }
-          rows.clear();
-          for (const Encoded& e : encoded) {
-            const std::int64_t first = std::max<std::int64_t>(e.image->pos, std::int64_t(start));
-            const std::int64_t last =
-                std::min<std::int64_t>(std::int64_t(e.image->pos) + e.image->tokens(), std::int64_t(start) + T);
-            if (first < last) {
-              rows.push_back(EmbedRows{int(first - std::int64_t(start)), int(last - first),
-                                       static_cast<const ActT*>(e.rows.p) + std::size_t(first - e.image->pos) * H});
-            }
-          }
-          CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, prompt.data() + start, std::size_t(T) * sizeof(std::int32_t),
-                                     cudaMemcpyHostToDevice, stream_));
-          prefiller_->run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(start),
-                          static_cast<float*>(prefill_logits_.p), nullptr, rows);
-          start = target_end;
-
-          // Snapshot verified root-prefix boundary cleanly after stream sync without extra prefill compute.
-          if (cache_eligible && root_boundary > L && root_boundary < n && start == std::size_t(root_boundary)) {
-            if (root_boundary > scatter_from) {
-              bk::scatter_full_kv(pool_.scratch_k_full.p, pool_.scratch_v_full.p, pool_.max_ctx, scatter_from,
-                                  root_boundary - scatter_from, pool_.kv_fp8, s,
-                                  static_cast<const std::int32_t*>(pool_.page_table.p), pool_.max_pages_per_slot,
-                                  pool_.k_full_pool.p, pool_.v_full_pool.p, stream_);
-              scatter_from = root_boundary;
-            }
-            CUDA_CHECK(cudaStreamSynchronize(stream_));
-            evictions += snapshot_and_publish(s, identity, prompt.subspan(0, std::size_t(root_boundary)), true);
+          encoded.push_back(Encoded{&image, std::move(out)});
+          stats.vision_seconds += seconds_since(tv);
+          ++stats.images_encoded;
+        }
+        rows.clear();
+        for (const Encoded& e : encoded) {
+          const std::int64_t first = std::max<std::int64_t>(e.image->pos, std::int64_t(start));
+          const std::int64_t last =
+              std::min<std::int64_t>(std::int64_t(e.image->pos) + e.image->tokens(), std::int64_t(start) + T);
+          if (first < last) {
+            rows.push_back(EmbedRows{int(first - std::int64_t(start)), int(last - first),
+                                     static_cast<const ActT*>(e.rows.p) + std::size_t(first - e.image->pos) * H});
           }
         }
-        if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream_));
-
-        // Scatter newly prefilled full-attention KV rows [scatter_from, n) into slot s's private pages.
-        if (n > scatter_from) {
-          bk::scatter_full_kv(pool_.scratch_k_full.p, pool_.scratch_v_full.p, pool_.max_ctx, scatter_from,
-                              n - scatter_from, pool_.kv_fp8, s,
-                              static_cast<const std::int32_t*>(pool_.page_table.p), pool_.max_pages_per_slot,
-                              pool_.k_full_pool.p, pool_.v_full_pool.p, stream_);
+        CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, prompt.data() + start, std::size_t(T) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream_));
+        Tensor taps_view;
+        Tensor* taps_ptr = nullptr;
+        if (drafter_) {
+          taps_view = rm(prefill_taps_.p, kActDType, {T, NUM_TAPS, H});
+          taps_ptr = &taps_view;
         }
-        pool_.set_slot_pos(s, n, stream_);
-      }
+        prefiller_->run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(start),
+                        static_cast<float*>(prefill_logits_.p), taps_ptr, rows);
+        if (drafter_) {
+          drafter_->commit_slot_prefill(s, static_cast<const ActT*>(prefill_taps_.p), T, int(start));
+          drafter_->note_tokens_slot(s, prompt.subspan(start, std::size_t(T)));
+        }
+        start = target_end;
 
-      // Initialize per-slot sampling state and sample first_token.
-      SlotMeta& meta = slot_meta_[s];
-      meta.params = to_head_params(sampling);
-      meta.rng.seed =
-          sampling.seed ? *sampling.seed : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
-      meta.rng.counter = 0;
-      meta.forced.assign(sampling.forced.begin(), sampling.forced.end());
-      meta.forced_idx = 0;
-      meta.max_pos = worst_tokens;
-      meta.logit_masker = sampling.logit_masker;
-
-      auto* sampled = static_cast<std::int32_t*>(sampled_dev_.p);
-      const float* first_logits = apply_slot_mask(static_cast<const float*>(prefill_logits_.p), meta.logit_masker);
-      head::sample(first_logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params, meta.rng, sampled, stream_);
-      CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled, sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream_));
-      CUDA_CHECK(cudaStreamSynchronize(stream_));
-      if (recorded_restore_events) {
-        float restore_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&restore_ms, restore_ev_start_, restore_ev_stop_));
-        restore_seconds = double(restore_ms) * 1e-3;
+        if (cache_eligible && root_boundary > L && root_boundary < n && start == std::size_t(root_boundary)) {
+          if (root_boundary > scatter_from) {
+            bk::scatter_full_kv(pool_.scratch_k_full.p, pool_.scratch_v_full.p, pool_.max_ctx, scatter_from,
+                                root_boundary - scatter_from, pool_.kv_fp8, s,
+                                static_cast<const std::int32_t*>(pool_.page_table.p), pool_.max_pages_per_slot,
+                                pool_.k_full_pool.p, pool_.v_full_pool.p, stream_);
+            scatter_from = root_boundary;
+          }
+          CUDA_CHECK(cudaStreamSynchronize(stream_));
+          evictions += snapshot_and_publish(s, identity, prompt.subspan(0, std::size_t(root_boundary)), true);
+        }
       }
-      first_token = static_cast<const std::int32_t*>(sampled_host_.data())[0];
-      if (!meta.forced.empty()) {
-        first_token = meta.forced[0];
-        meta.forced_idx = 1;
-      }
-      if (meta.logit_masker) meta.logit_masker->advance(first_token);
+      if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream_));
 
-      // Stream is now synchronized: safely publish end-of-prefill checkpoint for future prefix/exact hits.
-      if (cache_eligible && L < n) {
-        evictions += snapshot_and_publish(s, identity, prompt, root_boundary == n);
+      if (n > scatter_from) {
+        bk::scatter_full_kv(pool_.scratch_k_full.p, pool_.scratch_v_full.p, pool_.max_ctx, scatter_from,
+                            n - scatter_from, pool_.kv_fp8, s,
+                            static_cast<const std::int32_t*>(pool_.page_table.p), pool_.max_pages_per_slot,
+                            pool_.k_full_pool.p, pool_.v_full_pool.p, stream_);
       }
+      pool_.set_slot_pos(s, n, stream_);
+    }
 
-      stats.prompt_tokens = n;
-      stats.reused_tokens = L;
-      stats.reuse = (L > 0) ? Reuse::PagedPrefix : Reuse::None;
-      stats.restored_bytes = restored_bytes;
-      stats.restore_seconds = restore_seconds;
-      stats.cache_evictions = evictions;
-      stats.image_tokens = image_tokens;
-      stats.prefill_seconds = seconds_since(t0);
-      last_prefill_logits_valid_ = true;
-      slot_committed = true;
-      return s;
+    // Initialize per-slot sampling state and sample first_token.
+    SlotMeta& meta = slot_meta_[s];
+    meta.params = to_head_params(sampling);
+    meta.rng.seed =
+        sampling.seed ? *sampling.seed : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
+    meta.rng.counter = 0;
+    meta.forced.assign(sampling.forced.begin(), sampling.forced.end());
+    meta.forced_idx = 0;
+    meta.max_pos = worst_tokens;
+    meta.remaining_emissions = std::max(0, eff_max - 1);
+    meta.logit_masker = sampling.logit_masker;
+
+    auto* sampled = static_cast<std::int32_t*>(sampled_dev_.p);
+    const float* first_logits = apply_slot_mask(static_cast<const float*>(prefill_logits_.p), meta.logit_masker);
+    head::sample(first_logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params, meta.rng, sampled, stream_);
+    CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled, sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    if (recorded_restore_events) {
+      float restore_ms = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&restore_ms, restore_ev_start_, restore_ev_stop_));
+      restore_seconds = double(restore_ms) * 1e-3;
+    }
+    first_token = static_cast<const std::int32_t*>(sampled_host_.data())[0];
+    if (!meta.forced.empty()) {
+      first_token = meta.forced[0];
+      meta.forced_idx = 1;
+    }
+    if (meta.logit_masker) meta.logit_masker->advance(first_token);
+
+    // Stream is synchronized: publish end-of-prefill checkpoint BEFORE any decode/speculation occurs!
+    if (cache_eligible && L < n) {
+      evictions += snapshot_and_publish(s, identity, prompt, root_boundary == n);
+    }
+
+    if (drafter_) {
+      drafter_->set_slot_seed(s, splitmix64(meta.rng.seed ^ splitmix64(meta.rng.counter++)));
+      drafter_->note_tokens_slot(s, std::span<const std::int32_t>(&first_token, 1));
+    }
+
+    stats.prompt_tokens = n;
+    stats.reused_tokens = L;
+    stats.reuse = (L > 0) ? Reuse::PagedPrefix : Reuse::None;
+    stats.restored_bytes = restored_bytes;
+    stats.restore_seconds = restore_seconds;
+    stats.cache_evictions = evictions;
+    stats.image_tokens = image_tokens;
+    stats.prefill_seconds = seconds_since(t0);
+    last_prefill_logits_valid_ = true;
+    slot_committed = true;
+    return s;
   }
 
   void step_slots(std::span<const BatchSlotStep> inputs, std::span<std::int32_t> out_tokens) override {
@@ -1192,7 +1525,30 @@ class BatchGenerator final : public Generator {
         throw std::runtime_error("step_slots: paged KV pool exhausted");
     }
 
-    const float* logits = decoder_->run_step(inputs, stream_);
+    const float* logits = nullptr;
+    const ActT* taps = nullptr;
+    int B_cap = B;
+    std::vector<int> old_pos;
+    if (drafter_) {
+      // Keep drafter taps & position synchronized even when legacy 1-token step_slots() is called!
+      old_pos.resize(static_cast<std::size_t>(B));
+      std::vector<std::int64_t> toks(static_cast<std::size_t>(B), 0);
+      std::vector<std::int32_t> sids(static_cast<std::size_t>(B), -1), wlims(static_cast<std::size_t>(B), 1);
+      for (int i = 0; i < B; ++i) {
+        old_pos[std::size_t(i)] = pool_.slot_pos_host[inputs[i].slot];
+        toks[std::size_t(i)] = inputs[i].token;
+        sids[std::size_t(i)] = inputs[i].slot;
+      }
+      auto vout = decoder_->run_verify(B, 1, toks.data(), sids.data(), wlims.data(), B_cap, stream_);
+      logits = vout.logits;
+      taps = vout.taps;
+      std::vector<std::int32_t> ones(std::size_t(B_cap), 1);
+      CUDA_CHECK(cudaMemcpyAsync(drafter_->accept_scratch().commit, ones.data(), std::size_t(B_cap) * sizeof(std::int32_t),
+                                 cudaMemcpyHostToDevice, stream_));
+      decoder_->rollback_verify(B_cap, 1, drafter_->accept_scratch().commit, stream_);
+    } else {
+      logits = decoder_->run_step(inputs, stream_);
+    }
     last_step_batch_ = B;
     for (int i = 0; i < B; ++i) pool_.slot_pos_host[inputs[i].slot] += 1;
 
@@ -1219,6 +1575,14 @@ class BatchGenerator final : public Generator {
       }
     }
 
+    if (drafter_) {
+      std::vector<kd::BatchSlotCommitMeta> cmetas(static_cast<std::size_t>(B));
+      for (int i = 0; i < B; ++i) {
+        cmetas[std::size_t(i)] = {inputs[i].slot, old_pos[std::size_t(i)], 1, 0};
+      }
+      drafter_->commit_batch(cmetas, taps, 1);
+    }
+
     CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled, std::size_t(B) * sizeof(std::int32_t),
                                cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -1228,7 +1592,289 @@ class BatchGenerator final : public Generator {
       std::int32_t tok = host_out[i];
       if (meta.forced_idx < meta.forced.size()) tok = meta.forced[meta.forced_idx++];
       if (meta.logit_masker) meta.logit_masker->advance(tok);
+      if (meta.remaining_emissions > 0) --meta.remaining_emissions;
       out_tokens[i] = tok;
+      if (drafter_) drafter_->note_tokens_slot(inputs[i].slot, std::span<const std::int32_t>(&tok, 1));
+    }
+  }
+
+  void step_slots_multi(std::span<const BatchSlotStep> inputs, std::span<BatchSlotResult> out) override {
+    const int B = int(inputs.size());
+    if (B == 0) return;
+    if (int(out.size()) < B) throw std::invalid_argument("step_slots_multi: out too small");
+    if (!drafter_) {
+      Generator::step_slots_multi(inputs, out);
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // 1. Validate slots and guarantee mandatory 1-token progress page for EVERY active slot first.
+    std::vector<bool> in_batch(std::size_t(options_.max_batch), false);
+    for (int b = 0; b < B; ++b) {
+      const int s = inputs[b].slot;
+      if (s < 0 || s >= options_.max_batch || !pool_.slot_in_use[s])
+        throw std::invalid_argument("step_slots_multi: invalid or inactive slot");
+      if (in_batch[std::size_t(s)]) throw std::invalid_argument("step_slots_multi: duplicate slot in batch");
+      in_batch[std::size_t(s)] = true;
+      const int pos = pool_.slot_pos_host[s];
+      if (pos >= options_.max_ctx) throw std::runtime_error("step_slots_multi: slot reached max_ctx");
+      const int add = pool_.additional_pages_needed(s, pos + 1);
+      if (add > 0 && pool_.pages.free_count() < add) {
+        prefix_cache_.ensure_free_pages(pool_.pages, add);
+      }
+      if (!pool_.ensure_pages(s, pos + 1, stream_))
+        throw std::runtime_error("step_slots_multi: paged KV pool exhausted");
+    }
+
+    // 2. Run batched drafter across all B active slots simultaneously.
+    std::vector<BatchDrafter::DraftRequest> dreqs(static_cast<std::size_t>(B));
+    for (int b = 0; b < B; ++b) {
+      const int s = inputs[b].slot;
+      dreqs[std::size_t(b)] = {s, inputs[b].token, slot_meta_[s].params.temperature};
+    }
+    const BatchDrafter::BatchDraftOutput dout = drafter_->draft_batch(dreqs);
+    std::vector<std::int32_t> h_drafts(std::size_t(B) * kd::GAMMA);
+    std::vector<float> h_conf(std::size_t(B) * kd::GAMMA);
+    CUDA_CHECK(cudaMemcpyAsync(h_drafts.data(), dout.tokens, h_drafts.size() * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(h_conf.data(), dout.conf, h_conf.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+
+    // 3. Choose per-slot verify width w_cap[b] respecting confidence, remaining emissions, max_ctx,
+    //    and each slot's reserved lifetime page ceiling (prevents stealing pages from siblings!).
+    std::vector<std::int32_t> w_cap(std::size_t(B), 1);
+    std::vector<std::int32_t> slot_ids(std::size_t(B), -1);
+    std::vector<int> old_pos(std::size_t(B), 0);
+    for (int b = 0; b < B; ++b) {
+      const int s = inputs[b].slot;
+      slot_ids[std::size_t(b)] = s;
+      const int pos = pool_.slot_pos_host[s];
+      old_pos[std::size_t(b)] = pos;
+      const SlotMeta& meta = slot_meta_[s];
+
+      int w_lim = max_verify_width_;
+      if (meta.forced_idx >= meta.forced.size()) {
+        int lead = 0;
+        while (lead < kd::GAMMA && h_conf[std::size_t(b) * kd::GAMMA + lead] > options_.spec_threshold) ++lead;
+        // Pick smallest canonical verify width >= lead + 1 (clamped to max_verify_width_).
+        int w_conf = max_verify_width_;
+        for (int cw : {8, 4, 2, 1}) {
+          if (cw <= max_verify_width_ && cw >= lead + 1) w_conf = cw;
+        }
+        w_lim = std::min(w_lim, w_conf);
+      }
+      if (meta.remaining_emissions > 0) {
+        w_lim = std::min(w_lim, meta.remaining_emissions);
+      } else {
+        w_lim = 1;
+      }
+      w_lim = std::min(w_lim, std::max(1, options_.max_ctx - pos));
+      const int max_pages_res = (meta.max_pos + bk::kPageSize - 1) / bk::kPageSize;
+      const int max_pos_res = max_pages_res * bk::kPageSize;
+      w_lim = std::min(w_lim, std::max(1, max_pos_res - pos));
+      w_cap[std::size_t(b)] = std::clamp(w_lim, 1, max_verify_width_);
+    }
+
+    // 4. Plan total speculative page demand across ALL live slots BEFORE allocating a single page!
+    int other_reserved = 0;
+    for (int s = 0; s < options_.max_batch; ++s) {
+      if (!pool_.slot_in_use[s] || in_batch[std::size_t(s)]) continue;
+      const int mp = (slot_meta_[s].max_pos + bk::kPageSize - 1) / bk::kPageSize;
+      const int cp = int(pool_.slot_pages[s].size());
+      if (mp > cp) other_reserved += (mp - cp);
+    }
+    const int avail_pages = pool_.pages.free_count() + prefix_cache_.reclaimable_pages_excluding(pool_.pages, 0);
+    const int spec_page_budget = std::max(0, avail_pages - other_reserved);
+
+    auto calc_total_extra = [&]() {
+      int sum = 0;
+      for (int b = 0; b < B; ++b) {
+        sum += pool_.additional_pages_needed(slot_ids[std::size_t(b)], old_pos[std::size_t(b)] + w_cap[std::size_t(b)]);
+      }
+      return sum;
+    };
+    int total_extra = calc_total_extra();
+    while (total_extra > spec_page_budget) {
+      int best_b = -1;
+      int best_w = 1;
+      for (int b = 0; b < B; ++b) {
+        const int need =
+            pool_.additional_pages_needed(slot_ids[std::size_t(b)], old_pos[std::size_t(b)] + w_cap[std::size_t(b)]);
+        if (need > 0 && w_cap[std::size_t(b)] > best_w) {
+          best_w = w_cap[std::size_t(b)];
+          best_b = b;
+        }
+      }
+      if (best_b < 0) break;
+      const int s = slot_ids[std::size_t(best_b)];
+      const int fit_in_cur_pages = int(pool_.slot_pages[s].size()) * bk::kPageSize - old_pos[std::size_t(best_b)];
+      w_cap[std::size_t(best_b)] = std::max(1, std::min(w_cap[std::size_t(best_b)] - 1, fit_in_cur_pages));
+      total_extra = calc_total_extra();
+    }
+    if (total_extra > 0) {
+      if (pool_.pages.free_count() < total_extra) {
+        prefix_cache_.ensure_free_pages(pool_.pages, total_extra);
+      }
+      for (int b = 0; b < B; ++b) {
+        if (!pool_.ensure_pages(slot_ids[std::size_t(b)], old_pos[std::size_t(b)] + w_cap[std::size_t(b)], stream_)) {
+          throw std::runtime_error("step_slots_multi: planned page allocation failed");
+        }
+      }
+    }
+
+    // 5. Pick batch verify width W_batch in {1, 2, 4, 8} >= max(w_cap).
+    int max_w_active = 1;
+    for (int b = 0; b < B; ++b) max_w_active = std::max(max_w_active, int(w_cap[std::size_t(b)]));
+    int W_batch = max_verify_width_;
+    for (int cw : {8, 4, 2, 1}) {
+      if (cw <= max_verify_width_ && cw >= max_w_active) W_batch = cw;
+    }
+
+    // 6. Populate verify input tokens [B * W_batch] and execute batched target verification.
+    std::vector<std::int64_t> v_tokens(std::size_t(B) * W_batch, 0);
+    for (int b = 0; b < B; ++b) {
+      v_tokens[std::size_t(b) * W_batch + 0] = inputs[b].token;
+      for (int k = 0; k < w_cap[std::size_t(b)] - 1; ++k) {
+        v_tokens[std::size_t(b) * W_batch + 1 + k] = h_drafts[std::size_t(b) * kd::GAMMA + k];
+      }
+    }
+
+    int B_cap = B;
+    const BatchDecoder::VerifyOutput vout =
+        decoder_->run_verify(B, W_batch, v_tokens.data(), slot_ids.data(), w_cap.data(), B_cap, stream_);
+
+    // 7. Heterogeneous acceptance (fast batched greedy path, or general mixed greedy / forced / exact sampled path).
+    const BatchDrafter::AcceptScratch& ascr = drafter_->accept_scratch();
+    bool all_greedy_uniform = true;
+    const head::BannedTokens& b0 = slot_meta_[slot_ids[0]].params.banned;
+    for (int b = 0; b < B; ++b) {
+      const SlotMeta& meta = slot_meta_[slot_ids[std::size_t(b)]];
+      if (meta.params.temperature > 0.f || !same_banned(meta.params.banned, b0) || meta.forced_idx < meta.forced.size()) {
+        all_greedy_uniform = false;
+        break;
+      }
+    }
+
+    std::vector<std::int32_t> h_acc(std::size_t(B), 0);
+    std::vector<std::int32_t> h_next(std::size_t(B), 0);
+    std::vector<std::int32_t> h_commit(std::size_t(B_cap), 1);
+
+    if (all_greedy_uniform) {
+      head::argmax(vout.logits, B * W_batch, UNPADDED_VOCAB, UNPADDED_VOCAB, ascr.target_argmax, stream_, b0);
+      kd::batch_greedy_accept(ascr.target_argmax, dout.tokens, decoder_->slot_w_limit_dev(), B, W_batch, ascr.accepted,
+                              ascr.next, ascr.commit, stream_);
+      // Pad commit_counts for [B, B_cap) with 1 (ignored since slot_ids == -1) and run rollback on device.
+      decoder_->rollback_verify(B_cap, W_batch, ascr.commit, stream_);
+      CUDA_CHECK(cudaMemcpyAsync(h_acc.data(), ascr.accepted, std::size_t(B) * sizeof(std::int32_t),
+                                 cudaMemcpyDeviceToHost, stream_));
+      CUDA_CHECK(cudaMemcpyAsync(h_next.data(), ascr.next, std::size_t(B) * sizeof(std::int32_t),
+                                 cudaMemcpyDeviceToHost, stream_));
+      CUDA_CHECK(cudaStreamSynchronize(stream_));
+      for (int b = 0; b < B; ++b) h_commit[std::size_t(b)] = h_acc[std::size_t(b)] + 1;
+    } else {
+      for (int b = 0; b < B; ++b) {
+        const int s = slot_ids[std::size_t(b)];
+        SlotMeta& meta = slot_meta_[s];
+        const int wl = w_cap[std::size_t(b)];
+        const float* slot_logits = vout.logits + std::size_t(b) * W_batch * UNPADDED_VOCAB;
+
+        if (meta.forced_idx < meta.forced.size()) {
+          // Teacher-forced replay: accept drafts matching forced sequence, next = forced[forced_idx + acc].
+          int acc = 0;
+          while (acc < wl - 1 && meta.forced_idx + std::size_t(acc) < meta.forced.size() &&
+                 h_drafts[std::size_t(b) * kd::GAMMA + acc] == meta.forced[meta.forced_idx + std::size_t(acc)]) {
+            ++acc;
+          }
+          std::int32_t next_tok = 0;
+          if (meta.forced_idx + std::size_t(acc) < meta.forced.size()) {
+            next_tok = meta.forced[meta.forced_idx + std::size_t(acc)];
+          } else {
+            head::argmax(slot_logits + std::size_t(acc) * UNPADDED_VOCAB, 1, UNPADDED_VOCAB, UNPADDED_VOCAB,
+                         ascr.target_argmax, stream_, meta.params.banned);
+            CUDA_CHECK(cudaMemcpyAsync(&next_tok, ascr.target_argmax, sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                       stream_));
+            CUDA_CHECK(cudaStreamSynchronize(stream_));
+          }
+          h_acc[std::size_t(b)] = acc;
+          h_next[std::size_t(b)] = next_tok;
+          h_commit[std::size_t(b)] = acc + 1;
+          meta.forced_idx = std::min(meta.forced.size(), meta.forced_idx + std::size_t(acc + 1));
+        } else if (meta.params.temperature <= 0.f) {
+          head::argmax(slot_logits, wl, UNPADDED_VOCAB, UNPADDED_VOCAB, ascr.target_argmax, stream_, meta.params.banned);
+          std::int32_t h_targ[kd::BLOCK] = {};
+          CUDA_CHECK(cudaMemcpyAsync(h_targ, ascr.target_argmax, std::size_t(wl) * sizeof(std::int32_t),
+                                     cudaMemcpyDeviceToHost, stream_));
+          CUDA_CHECK(cudaStreamSynchronize(stream_));
+          int acc = 0;
+          while (acc < wl - 1 && h_drafts[std::size_t(b) * kd::GAMMA + acc] == h_targ[acc]) ++acc;
+          h_acc[std::size_t(b)] = acc;
+          h_next[std::size_t(b)] = h_targ[acc];
+          h_commit[std::size_t(b)] = acc + 1;
+        } else {
+          // Exact speculative rejection sampling against slot's own temperature, top-k, top-p, bans, RNG, and proposal q!
+          if (wl == 1) {
+            std::int32_t next_tok = 0;
+            head::sample(slot_logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params, meta.rng, ascr.target_argmax,
+                         stream_);
+            CUDA_CHECK(cudaMemcpyAsync(&next_tok, ascr.target_argmax, sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                       stream_));
+            CUDA_CHECK(cudaStreamSynchronize(stream_));
+            h_acc[std::size_t(b)] = 0;
+            h_next[std::size_t(b)] = next_tok;
+            h_commit[std::size_t(b)] = 1;
+          } else {
+            const std::int32_t* slot_cidx = dout.cand_idx + std::size_t(b) * kd::GAMMA * kd::CANDIDATES;
+            const float* slot_clog = dout.cand_logits + std::size_t(b) * kd::GAMMA * kd::CANDIDATES;
+            kd::scatter_slot_draft_logits(slot_cidx, slot_clog, UNPADDED_VOCAB, ascr.draft_logits, stream_);
+            head::sampling_probs(slot_logits, wl, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params, ascr.probs, stream_);
+            head::uniform(wl - 1, meta.rng, ascr.uniforms, stream_);
+            kd::sampled_accept(ascr.probs, ascr.draft_logits, UNPADDED_VOCAB, dout.tokens + std::size_t(b) * kd::GAMMA,
+                               wl - 1, meta.params.temperature, dout.qstats + std::size_t(b) * kd::GAMMA * 2,
+                               ascr.uniforms, ascr.ws, ascr.resid, ascr.one_res, stream_);
+            head::sample_from_probs(ascr.resid, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.rng, &ascr.one_res->next,
+                                    stream_);
+            kd::clear_slot_draft_logits(slot_cidx, UNPADDED_VOCAB, ascr.draft_logits, stream_);
+            kd::AcceptResult res_h{};
+            CUDA_CHECK(cudaMemcpyAsync(&res_h, ascr.one_res, sizeof(res_h), cudaMemcpyDeviceToHost, stream_));
+            CUDA_CHECK(cudaStreamSynchronize(stream_));
+            h_acc[std::size_t(b)] = res_h.accepted;
+            h_next[std::size_t(b)] = res_h.next;
+            h_commit[std::size_t(b)] = res_h.accepted + 1;
+          }
+        }
+      }
+      CUDA_CHECK(cudaMemcpyAsync(ascr.commit, h_commit.data(), std::size_t(B_cap) * sizeof(std::int32_t),
+                                 cudaMemcpyHostToDevice, stream_));
+      decoder_->rollback_verify(B_cap, W_batch, ascr.commit, stream_);
+    }
+
+    // 8. Commit exact accepted tap rows (including W=1 single-row commits!) into BatchDrafter.
+    std::vector<kd::BatchSlotCommitMeta> cmetas(static_cast<std::size_t>(B));
+    for (int b = 0; b < B; ++b) {
+      cmetas[std::size_t(b)] = {slot_ids[std::size_t(b)], old_pos[std::size_t(b)], h_commit[std::size_t(b)], 0};
+    }
+    drafter_->commit_batch(cmetas, vout.taps, W_batch);
+
+    // 9. Update host state, slot-local dynamic shortlists, and output results.
+    for (int b = 0; b < B; ++b) {
+      const int s = slot_ids[std::size_t(b)];
+      const int acc = h_acc[std::size_t(b)];
+      const int commit = h_commit[std::size_t(b)];
+      pool_.slot_pos_host[s] += commit;
+      SlotMeta& meta = slot_meta_[s];
+      meta.remaining_emissions = std::max(0, meta.remaining_emissions - commit);
+
+      BatchSlotResult res{};
+      for (int k = 0; k < acc; ++k) res.tokens[k] = h_drafts[std::size_t(b) * kd::GAMMA + k];
+      res.tokens[acc] = h_next[std::size_t(b)];
+      res.count = commit;
+      res.spec_rounds = (w_cap[std::size_t(b)] > 1) ? 1 : 0;
+      res.spec_accepted = acc;
+      out[b] = res;
+
+      drafter_->note_tokens_slot(s, std::span<const std::int32_t>(res.tokens, std::size_t(res.count)));
     }
   }
 
@@ -1237,6 +1883,7 @@ class BatchGenerator final : public Generator {
     if (stream_) CUDA_CHECK(cudaStreamSynchronize(stream_));
     if (slot >= 0 && slot < int(slot_meta_.size())) slot_meta_[slot].logit_masker.reset();
     pool_.free_slot(slot);
+    if (drafter_ && slot >= 0 && slot < options_.max_batch) drafter_->reset_slot(slot);
   }
 
   GenerateStats generate(std::span<const std::int32_t> prompt, int max_new_tokens, const Sampling& sampling,
@@ -1266,6 +1913,7 @@ class BatchGenerator final : public Generator {
     std::size_t forced_idx = 0;
     int max_pos = 0;
     std::shared_ptr<TokenMasker> logit_masker;
+    int remaining_emissions = 0;
   };
 
   const float* apply_slot_mask(const float* row_logits, const std::shared_ptr<TokenMasker>& masker) {
@@ -1372,8 +2020,9 @@ class BatchGenerator final : public Generator {
     const std::size_t conv_h_bytes = pool_.conv_h_slot_stride * sizeof(float);
     const std::size_t tail_bytes = tail > 0 ? (std::size_t(NUM_FULL_VISITS) * std::size_t(tail) * KV_DIM * es) : 0;
     const std::size_t logits_bytes = prefill_logits_.bytes;
+    const std::size_t draft_bytes = drafter_ ? drafter_->estimate_checkpoint_bytes(L) : 0;
     const std::size_t total_private_bytes =
-        2 * ring_bytes + rp_bytes + 2 * conv_kv_bytes + 2 * conv_h_bytes + 2 * tail_bytes + logits_bytes;
+        2 * ring_bytes + rp_bytes + 2 * conv_kv_bytes + 2 * conv_h_bytes + 2 * tail_bytes + logits_bytes + draft_bytes;
     if (total_private_bytes > prefix_cache_.vram_budget_bytes()) return 0;
 
     int evicted = prefix_cache_.ensure_private_vram(pool_.pages, total_private_bytes);
@@ -1436,6 +2085,10 @@ class BatchGenerator final : public Generator {
                                       tail, pool_.kv_fp8, gpu.tail_k.p, gpu.tail_v.p, stream_);
       }
       CUDA_CHECK(cudaMemcpyAsync(gpu.logits.p, prefill_logits_.p, logits_bytes, cudaMemcpyDeviceToDevice, stream_));
+      if (drafter_) {
+        gpu.has_draft = true;
+        (void)drafter_->save_slot_checkpoint(s, L, gpu.draft);
+      }
       // Synchronize stream before publishing committed pages & snapshot buffers into shared cache.
       CUDA_CHECK(cudaStreamSynchronize(stream_));
 
@@ -1470,10 +2123,35 @@ class BatchGenerator final : public Generator {
     }
     model_sha256_ = sha256_bytes(id_buf.data(), id_buf.size());
 
-    pool_.init(options_.max_batch, options_.max_ctx, options_.kv_fp8, options_.max_kv_tokens);
+    // Size and allocate BatchDrafter BEFORE BatchStatePool page reservation so VRAM headroom is exact.
+    max_verify_width_ = 1;
+    std::size_t decoder_reserve_bytes = 0;
+    if (options_.spec) {
+      std::size_t free_b = 0, total_b = 0;
+      CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+      max_verify_width_ = 8;
+      // Only step down from W=8 if dense verify activations + rollback + drafter would crowd out VRAM.
+      const std::size_t min_kv_headroom = std::size_t(2048) << 20;
+      for (int cand_w : {8, 4, 2}) {
+        const std::size_t est = BatchDecoder::estimate_bytes(options_.max_batch, cand_w, options_.dense_fp8, true);
+        if (free_b > est + min_kv_headroom) {
+          max_verify_width_ = cand_w;
+          break;
+        }
+        max_verify_width_ = cand_w;
+      }
+      drafter_ = std::make_unique<BatchDrafter>(options_.model_dir, weights_, options_.max_batch, options_.max_ctx,
+                                                max_verify_width_, stream_);
+      prefill_taps_ = DeviceBuffer(std::size_t(prefill_chunk_) * NUM_TAPS * H * sizeof(ActT));
+      decoder_reserve_bytes =
+          BatchDecoder::estimate_bytes(options_.max_batch, max_verify_width_, options_.dense_fp8, true);
+    }
+
+    pool_.init(options_.max_batch, options_.max_ctx, options_.kv_fp8, options_.max_kv_tokens, decoder_reserve_bytes);
     slot_meta_.resize(options_.max_batch);
 
-    decoder_ = std::make_unique<BatchDecoder>(weights_, ablation_, pool_, options_.max_batch);
+    decoder_ = std::make_unique<BatchDecoder>(weights_, ablation_, pool_, options_.max_batch, max_verify_width_,
+                                              drafter_ != nullptr);
     decoder_->capture_buckets(stream_);
     CUDA_CHECK(cudaEventCreate(&restore_ev_start_));
     CUDA_CHECK(cudaEventCreate(&restore_ev_stop_));
@@ -1549,12 +2227,14 @@ class BatchGenerator final : public Generator {
   Ablation ablation_;
   std::array<std::uint8_t, 32> model_sha256_{};
   int prefill_chunk_ = 3072;
+  int max_verify_width_ = 1;
   std::unique_ptr<VisionEncoder> vision_;
   std::unique_ptr<Prefiller> prefiller_;
+  std::unique_ptr<BatchDrafter> drafter_;
   BatchStatePool pool_;
   BatchPrefixCache<PrefixCheckpointGpu> prefix_cache_;
   std::unique_ptr<BatchDecoder> decoder_;
-  DeviceBuffer chunk_tokens_, prefill_logits_, sampled_dev_;
+  DeviceBuffer chunk_tokens_, prefill_logits_, prefill_taps_, sampled_dev_;
   DeviceBuffer masked_logits_, mask_dev_;
   std::vector<std::uint32_t> mask_host_;
   PinnedHostBuffer sampled_host_;

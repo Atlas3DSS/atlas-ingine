@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
     options.kv_ckpt_path = kv_ckpt_path;
     options.kv_ckpt_every = kv_ckpt_every;
     options.kv_ckpt_resume = kv_ckpt_resume;
-    options.spec = (resolved_max_batch > 1) ? false : spec;
+    options.spec = spec;
     options.spec_threshold = float(spec_threshold);
     options.park_mb = park_mb;
     options.park_host_mb = park_host_mb;
@@ -327,6 +327,9 @@ int main(int argc, char** argv) {
       nlohmann::ordered_json report;
       report["vram_gb"] = vram_gb;
       report["max_batch"] = gen->max_batch_size();
+      report["spec"] = spec;
+      report["batched_spec"] = gen->supports_batched_spec();
+      report["prefix_cache"] = !no_prefix_cache;
       report["tokens_per_req"] = tokens;
       report["ignore_eos"] = ignore_eos;
       report["results"] = nlohmann::ordered_json::array();
@@ -334,7 +337,7 @@ int main(int argc, char** argv) {
       for (int C : concurrencies) {
         std::vector<double> agg_rates;
         double last_prefill_s = 0.0, last_decode_s = 0.0;
-        int last_prompt_toks = 0, last_gen_toks = 0;
+        int last_prompt_toks = 0, last_gen_toks = 0, last_spec_rounds = 0, last_spec_accepted = 0;
         for (int r = 0; r < runs; ++r) {
           if (C == 1 && gen->max_batch_size() == 1) {
             ingine::model::Sampling sampling;
@@ -347,6 +350,8 @@ int main(int argc, char** argv) {
             last_gen_toks = st.generated_tokens;
             last_prefill_s = st.prefill_seconds;
             last_decode_s = st.decode_seconds;
+            last_spec_rounds = st.spec_rounds;
+            last_spec_accepted = st.spec_accepted;
             agg_rates.push_back(double(std::max(1, st.generated_tokens - 1)) / std::max(st.decode_seconds, 1e-9));
             continue;
           }
@@ -359,6 +364,8 @@ int main(int argc, char** argv) {
           live.reserve(std::size_t(C));
           int total_prompt = 0;
           int total_gen = 0;
+          int total_spec_rounds = 0;
+          int total_spec_accepted = 0;
           const auto tp0 = Clock::now();
           for (int i = 0; i < C; ++i) {
             ingine::model::Sampling sampling;
@@ -383,22 +390,32 @@ int main(int argc, char** argv) {
           const auto td0 = Clock::now();
           int decode_tokens = 0;
           std::vector<ingine::model::BatchSlotStep> steps;
-          std::vector<int32_t> next_toks;
+          std::vector<ingine::model::BatchSlotResult> results;
           while (!live.empty()) {
             steps.resize(live.size());
-            next_toks.resize(live.size());
+            results.resize(live.size());
             for (std::size_t i = 0; i < live.size(); ++i) steps[i] = {live[i].slot, live[i].last_tok};
-            gen->step_slots(steps, next_toks);
+            gen->step_slots_multi(steps, results);
             std::vector<Active> kept;
             kept.reserve(live.size());
             for (std::size_t i = 0; i < live.size(); ++i) {
-              live[i].last_tok = next_toks[i];
-              ++live[i].generated;
-              ++total_gen;
-              ++decode_tokens;
-              const bool done = (live[i].generated >= tokens) ||
-                                (!ignore_eos && std::find(stop.begin(), stop.end(), next_toks[i]) != stop.end());
-              if (done) gen->release_slot(live[i].slot);
+              const auto& res = results[i];
+              total_spec_rounds += res.spec_rounds;
+              total_spec_accepted += res.spec_accepted;
+              bool done = false;
+              for (int k = 0; k < res.count; ++k) {
+                const int32_t tok_k = res.tokens[k];
+                live[i].last_tok = tok_k;
+                ++live[i].generated;
+                ++total_gen;
+                ++decode_tokens;
+                if (live[i].generated >= tokens ||
+                    (!ignore_eos && std::find(stop.begin(), stop.end(), tok_k) != stop.end())) {
+                  done = true;
+                  break;
+                }
+              }
+              if (done || res.count == 0) gen->release_slot(live[i].slot);
               else kept.push_back(live[i]);
             }
             live = std::move(kept);
@@ -408,14 +425,21 @@ int main(int argc, char** argv) {
           last_gen_toks = total_gen;
           last_prefill_s = prefill_s;
           last_decode_s = decode_s;
+          last_spec_rounds = total_spec_rounds;
+          last_spec_accepted = total_spec_accepted;
           agg_rates.push_back(double(decode_tokens) / std::max(decode_s, 1e-9));
         }
 
         const double med_agg = median(agg_rates);
         const double per_req = med_agg / double(C);
         const double prefill_tok_s = double(last_prompt_toks) / std::max(last_prefill_s, 1e-9);
-        std::printf("B=%-2d: aggregate decode %7.1f tok/s (%6.1f tok/s/req) | prefill %6.0f tok/s (%d prompt, %d gen, %.2fs decode)\n",
-                    C, med_agg, per_req, prefill_tok_s, last_prompt_toks, last_gen_toks, last_decode_s);
+        const double mean_toks_per_round =
+            last_spec_rounds > 0 ? double(last_spec_accepted + last_spec_rounds) / double(last_spec_rounds) : 1.0;
+        std::printf("B=%-2d: aggregate decode %7.1f tok/s (%6.1f tok/s/req) | prefill %6.0f tok/s (%d prompt, %d gen, %.2fs decode%s)\n",
+                    C, med_agg, per_req, prefill_tok_s, last_prompt_toks, last_gen_toks, last_decode_s,
+                    last_spec_rounds > 0
+                        ? (", " + std::to_string(mean_toks_per_round).substr(0, 4) + " tok/round").c_str()
+                        : "");
         std::fflush(stdout);
         report["results"].push_back({{"concurrency", C},
                                      {"aggregate_decode_tok_s", med_agg},
@@ -425,6 +449,9 @@ int main(int argc, char** argv) {
                                      {"generated_tokens", last_gen_toks},
                                      {"prefill_seconds", last_prefill_s},
                                      {"decode_seconds", last_decode_s},
+                                     {"spec_rounds", last_spec_rounds},
+                                     {"spec_accepted", last_spec_accepted},
+                                     {"mean_tokens_per_round", mean_toks_per_round},
                                      {"runs", agg_rates}});
       }
 
@@ -439,7 +466,7 @@ int main(int argc, char** argv) {
           int generated = 0;
         };
         std::vector<Active> live;
-        int next_idx = 0, total_gen = 0, step_n = 0;
+        int next_idx = 0, total_gen = 0, step_n = 0, total_spec_rounds = 0, total_spec_accepted = 0;
         auto admit = [&](int count) {
           for (int k = 0; k < count && next_idx < C; ++k, ++next_idx) {
             ingine::model::Sampling s;
@@ -457,7 +484,7 @@ int main(int argc, char** argv) {
         const auto ts0 = Clock::now();
         admit(half);
         std::vector<ingine::model::BatchSlotStep> steps;
-        std::vector<int32_t> next_toks;
+        std::vector<ingine::model::BatchSlotResult> results;
         while (!live.empty() || next_idx < C) {
           if (step_n == join_step && next_idx < C) admit(C - next_idx);
           if (live.empty()) {
@@ -465,28 +492,43 @@ int main(int argc, char** argv) {
             continue;
           }
           steps.resize(live.size());
-          next_toks.resize(live.size());
+          results.resize(live.size());
           for (std::size_t i = 0; i < live.size(); ++i) steps[i] = {live[i].slot, live[i].last_tok};
-          gen->step_slots(steps, next_toks);
+          gen->step_slots_multi(steps, results);
           ++step_n;
           std::vector<Active> kept;
           for (std::size_t i = 0; i < live.size(); ++i) {
-            live[i].last_tok = next_toks[i];
-            ++live[i].generated;
-            ++total_gen;
-            const bool done = (live[i].generated >= tokens) ||
-                              (!ignore_eos && std::find(stop.begin(), stop.end(), next_toks[i]) != stop.end());
-            if (done) gen->release_slot(live[i].slot);
+            const auto& res = results[i];
+            total_spec_rounds += res.spec_rounds;
+            total_spec_accepted += res.spec_accepted;
+            bool done = false;
+            for (int k = 0; k < res.count; ++k) {
+              const int32_t tok_k = res.tokens[k];
+              live[i].last_tok = tok_k;
+              ++live[i].generated;
+              ++total_gen;
+              if (live[i].generated >= tokens ||
+                  (!ignore_eos && std::find(stop.begin(), stop.end(), tok_k) != stop.end())) {
+                done = true;
+                break;
+              }
+            }
+            if (done || res.count == 0) gen->release_slot(live[i].slot);
             else kept.push_back(live[i]);
           }
           live = std::move(kept);
         }
         const double wall_s = std::chrono::duration<double>(Clock::now() - ts0).count();
         const double eff_tok_s = double(total_gen) / std::max(wall_s, 1e-9);
-        std::printf("staggered (C=%d, join@%d): %d tokens in %.2fs = %.1f tok/s effective\n", C, join_step, total_gen,
-                    wall_s, eff_tok_s);
-        report["staggered"] = {{"concurrency", C}, {"join_step", join_step}, {"generated_tokens", total_gen},
-                               {"wall_seconds", wall_s}, {"effective_tok_s", eff_tok_s}};
+        std::printf("staggered (C=%d, join@%d): %d tokens in %.2fs = %.1f tok/s effective (spec_rounds=%d, spec_accepted=%d)\n",
+                    C, join_step, total_gen, wall_s, eff_tok_s, total_spec_rounds, total_spec_accepted);
+        report["staggered"] = {{"concurrency", C},
+                               {"join_step", join_step},
+                               {"generated_tokens", total_gen},
+                               {"wall_seconds", wall_s},
+                               {"effective_tok_s", eff_tok_s},
+                               {"spec_rounds", total_spec_rounds},
+                               {"spec_accepted", total_spec_accepted}};
       }
 
       std::printf("%s\n", report.dump().c_str());

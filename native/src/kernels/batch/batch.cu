@@ -22,8 +22,9 @@ namespace {
 #define INGINE_TP_SIZE 1
 #endif
 constexpr int HQ = 24 / INGINE_TP_SIZE, HKV = 8 / INGINE_TP_SIZE, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA = 3, CONV_C = HKV * D;
+constexpr int H_DIM = 2304;
 constexpr int SINK_PAD = (HQ + 7) & ~7;
-constexpr int NUM_FULL_VISITS = 8;
+constexpr int NUM_VISITS = 48, NUM_SLIDING_VISITS = 40, NUM_FULL_VISITS = 8;
 constexpr int OFF_GATE = HQ * D, OFF_REL = 2 * HQ * D, OFF_SINK = OFF_REL + HQ * DREL,
               OFF_K = OFF_SINK + SINK_PAD, OFF_V = OFF_K + CONV_C, OFF_KDYN = OFF_V + CONV_C,
               OFF_VDYN = OFF_KDYN + HKV * 4;
@@ -1081,6 +1082,1032 @@ void batched_advance_pos(const std::int32_t* slot_ids, int B, std::int64_t* slot
   if (B <= 0) return;
   require(slot_ids && slot_pos, "batched_advance_pos: null arg");
   batched_advance_pos_kernel<<<(B + 63) / 64, 64, 0, stream>>>(slot_ids, B, slot_pos);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// ==========================================================================================================
+// Batched multi-token speculative verification & rollback (W in {1, 2, 4, 8})
+// ==========================================================================================================
+
+namespace {
+
+int choose_verify_splits(int B) {
+  if (B >= 16) return 1;
+  int s = 16 / B;
+  if (s < 1) s = 1;
+  if (s > 16) s = 16;
+  return s;
+}
+
+std::size_t verify_ws_nkv_off(int /*max_b*/, int max_w) {
+  return align256(std::size_t(16) * HKV * std::size_t(max_w) * GQA * PSTR * sizeof(float));
+}
+std::size_t verify_ws_nst_off(int max_b, int max_w) {
+  return verify_ws_nkv_off(max_b, max_w) +
+         align256(std::size_t(max_b) * HKV * 2 * std::size_t(max_w) * D * sizeof(ActT));
+}
+std::size_t verify_ws_total_bytes(int max_b, int max_w) {
+  return verify_ws_nst_off(max_b, max_w) + align256(std::size_t(max_b) * HKV * 3 * 2 * D * sizeof(float));
+}
+
+struct BatchedVerifyAttnKernelParams {
+  const void* proj;
+  int R;
+  int B;
+  int W;
+  int splits;
+  const std::int32_t* slot_ids;
+  const std::int32_t* slot_w_limit;
+  const std::int64_t* slot_pos;
+  const float* q_scale;
+  const float* r_scale;
+  const float* rel_proj;
+  const float* k_conv;
+  const float* v_conv;
+  float* conv_k_visit;
+  float* conv_v_visit;
+  std::size_t conv_slot_stride;
+  float* hist_k_visit;
+  float* hist_v_visit;
+  ActT* k_ring_visit;
+  ActT* v_ring_visit;
+  std::int64_t* ring_pos_visit;
+  std::size_t ring_slot_stride;
+  std::size_t ring_pos_slot_stride;
+  void* k_full_pool;
+  void* v_full_pool;
+  const std::int32_t* page_table;
+  int max_pages_per_slot;
+  int full_visit_idx;
+  int max_ctx;
+  int log_scaling;
+  float* part;
+  ActT* saved_nkv;
+  float* saved_nst;
+  ActT* out;
+};
+
+constexpr int V_KT = 16;  // cached keys per shared-memory tile (amortized Wx across all W tokens of slot b)
+
+template <int W, bool F8>
+struct VerifyAttnSmem {
+  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
+  __align__(16) ActT q[W][GQA][D];
+  float rel[W][GQA][DREL];
+  float sink[W][GQA];
+  __align__(16) ActT nkv[2][W][D];
+  float nst[3 * 2 * D];
+  float relp0[DREL][8];
+  union {
+    struct {
+      float qs[GQA * D];
+      float rs[GQA * DREL];
+      float st[3 * 2 * D];
+      float w[2 * D * 4];
+      float dyn[W * 2 * 4];
+      float nkf[2 * D];
+    } stage;
+    struct {
+      __align__(16) CT k[V_KT][D];
+      __align__(16) CT v[V_KT][D];
+      int kp[V_KT];
+    } tile;
+    struct {
+      float o[KW * GQA * D];
+      float ml[KW * GQA * 2];
+    } red;
+  } u;
+};
+
+static_assert(sizeof(VerifyAttnSmem<8, false>) <= 48 * 1024, "VerifyAttnSmem<8, BF16> must fit 48 KiB SMEM");
+static_assert(sizeof(VerifyAttnSmem<8, true>) <= 48 * 1024, "VerifyAttnSmem<8, FP8> must fit 48 KiB SMEM");
+
+template <int W, bool FULL, bool F8, bool PROJ_FP32, bool SPLIT>
+__global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const BatchedVerifyAttnKernelParams p) {
+  static_assert(W == 1 || W == 2 || W == 4 || W == 8, "W must be 1, 2, 4, or 8");
+  static_assert(FULL || !F8, "FP8 caches are full-layer only");
+  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
+  using KV = std::conditional_t<F8, uint2, uint4>;
+
+  const int rank = blockIdx.x;
+  const int g = blockIdx.y;
+  const int b = blockIdx.z;
+  const int slot = p.slot_ids[b];
+  if (slot < 0) return;
+
+  const int w_lim = p.slot_w_limit ? min(W, max(1, int(p.slot_w_limit[b]))) : W;
+  const int p0 = int(p.slot_pos[slot]);
+  if (FULL && p0 + w_lim > p.max_ctx) return;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int half = lane >> 4;
+  const int c = lane & 15;
+  const bool owner = (rank == 0);
+  const int R = p.R;
+
+  constexpr int KW_PER_TOK = KW / W;  // 8, 4, 2, 1 warps per trial token
+  const int tok = warp / KW_PER_TOK;  // 0..W-1
+  const int kw = warp % KW_PER_TOK;   // 0..KW_PER_TOK-1
+
+  __shared__ VerifyAttnSmem<W, F8> sm;
+
+  float* const conv_k_slot = p.conv_k_visit + std::size_t(slot) * p.conv_slot_stride;
+  float* const conv_v_slot = p.conv_v_visit + std::size_t(slot) * p.conv_slot_stride;
+  ActT* const k_ring_slot = FULL ? nullptr : (p.k_ring_visit + std::size_t(slot) * p.ring_slot_stride);
+  ActT* const v_ring_slot = FULL ? nullptr : (p.v_ring_visit + std::size_t(slot) * p.ring_slot_stride);
+  std::int64_t* const kpos_slot = FULL ? nullptr : (p.ring_pos_visit + std::size_t(slot) * p.ring_pos_slot_stride);
+  const std::int32_t* const pt_slot = FULL ? (p.page_table + std::size_t(slot) * p.max_pages_per_slot) : nullptr;
+  CT* const k_pool = FULL ? static_cast<CT*>(p.k_full_pool) : reinterpret_cast<CT*>(k_ring_slot);
+  CT* const v_pool = FULL ? static_cast<CT*>(p.v_full_pool) : reinterpret_cast<CT*>(v_ring_slot);
+
+  // ---- Stage shared scales, sink, and owner conv weights/state/relp0.
+  for (int i = tid; i < GQA * D; i += NT) sm.u.stage.qs[i] = p.q_scale[g * GQA * D + i];
+  for (int i = tid; i < GQA * DREL; i += NT) sm.u.stage.rs[i] = p.r_scale[g * GQA * DREL + i];
+  for (int i = tid; i < W * GQA; i += NT) {
+    const int w = i / GQA, row = i % GQA;
+    sm.sink[w][row] = (w < w_lim) ? load_proj_val<PROJ_FP32>(p.proj, std::size_t(b * W + w) * R + OFF_SINK + g * GQA + row)
+                                  : 0.f;
+  }
+  if (owner) {
+    for (int i = tid; i < 3 * 2 * D; i += NT) {
+      const int j = i / (2 * D), kv = (i / D) & 1, ch = i % D;
+      sm.u.stage.st[i] = (kv ? conv_v_slot : conv_k_slot)[j * CONV_C + g * D + ch];
+    }
+    for (int i = tid; i < 2 * D * 4; i += NT) {
+      const int kv = i / (D * 4), q = i % (D * 4);
+      const float* wptr = kv ? p.v_conv : p.k_conv;
+      if constexpr (FULL) {
+        const int lag = q / D, ch = q % D;
+        sm.u.stage.w[i] = wptr[lag * CONV_C + g * D + ch];
+      } else {
+        const int ch = q / 4, tap = q & 3;
+        sm.u.stage.w[i] = wptr[(g * D + ch) * 4 + tap];
+      }
+    }
+    if constexpr (FULL) {
+      for (int i = tid; i < W * 8; i += NT) {
+        const int w = i / 8, rem = i & 7, kv = rem >> 2, lag = rem & 3;
+        sm.u.stage.dyn[i] = (w < w_lim)
+                                ? load_proj_val<PROJ_FP32>(
+                                      p.proj, std::size_t(b * W + w) * R + (kv ? OFF_VDYN : OFF_KDYN) + g * 4 + lag)
+                                : 0.f;
+      }
+    }
+    for (int i = tid; i < DREL * 8; i += NT) {
+      const int c2 = i >> 3, d0 = i & 7;
+      sm.relp0[c2][d0] = p.rel_proj[c2 * EXT + d0];
+    }
+  }
+  __syncthreads();
+
+  // ---- Q and rel post-processing for all w < w_lim (bit-exact with batched_attn_decode).
+  // One warp processes one (w, head) pair at a time across (W * GQA) total rows.
+  for (int row_id = warp; row_id < W * GQA; row_id += KW) {
+    const int w = row_id / GQA;
+    const int h = row_id % GQA;
+    if (w < w_lim) {
+      const std::size_t pb = std::size_t(b * W + w) * R;
+      const float tau = p.log_scaling ? 1.f + 0.1f * logf(fmaxf(float(p0 + w + 1) * (1.f / 8192.f), 1.f)) : 1.f;
+      const float4 s = reinterpret_cast<const float4*>(sm.u.stage.qs + h * D)[lane];
+      float x[4];
+      x[0] = load_proj_val<PROJ_FP32>(p.proj, pb + (g * GQA + h) * D + 4 * lane + 0) * s.x;
+      x[1] = load_proj_val<PROJ_FP32>(p.proj, pb + (g * GQA + h) * D + 4 * lane + 1) * s.y;
+      x[2] = load_proj_val<PROJ_FP32>(p.proj, pb + (g * GQA + h) * D + 4 * lane + 2) * s.z;
+      x[3] = load_proj_val<PROJ_FP32>(p.proj, pb + (g * GQA + h) * D + 4 * lane + 3) * s.w;
+      const float f = clip_factor(wsum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]), CLIP_QK);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        x[e] = bf16r(x[e] * f);
+        if (p.log_scaling) x[e] = bf16r(x[e] * tau);
+      }
+      reinterpret_cast<uint2*>(&sm.q[w][h][0])[lane] = make_uint2(act::pack2(x[0], x[1]), act::pack2(x[2], x[3]));
+    }
+  }
+  // Rel: one half-warp per (w, h) row. Loop trip count MUST be warp-uniform so hsum16(0xffffffffu) never diverges!
+  constexpr int REL_ITERS = (W * GQA + KW * 2 - 1) / (KW * 2);
+  for (int iter = 0; iter < REL_ITERS; ++iter) {
+    const int row_id = iter * (KW * 2) + warp * 2 + half;
+    const int w = row_id / GQA;
+    const int h = row_id % GQA;
+    const bool ok = (row_id < W * GQA) && (w < w_lim);
+    float r = 0.f;
+    float tau = 1.f;
+    if (ok) {
+      const std::size_t pb = std::size_t(b * W + w) * R;
+      tau = p.log_scaling ? 1.f + 0.1f * logf(fmaxf(float(p0 + w + 1) * (1.f / 8192.f), 1.f)) : 1.f;
+      r = load_proj_val<PROJ_FP32>(p.proj, pb + OFF_REL + (g * GQA + h) * DREL + c) * sm.u.stage.rs[h * DREL + c];
+    }
+    const float ss = hsum16(r * r);
+    if (ok) {
+      float y = bf16r(r * clip_factor(ss, CLIP_REL));
+      if (p.log_scaling) y = bf16r(y * tau);
+      sm.rel[w][h][c] = y;
+    }
+  }
+
+  // ---- Owner: sequential w_lim-step K/V conv + key clip / value RMS norm + optional E4M3 round + hist_k/v.
+  if (owner) {
+    for (int w = 0; w < w_lim; ++w) {
+      const std::size_t pb = std::size_t(b * W + w) * R;
+      for (int idx = tid; idx < 2 * D; idx += NT) {
+        const int kv = idx / D, ch = idx % D;
+        const float e0 = sm.u.stage.st[(0 * 2 + kv) * D + ch];
+        const float e1 = sm.u.stage.st[(1 * 2 + kv) * D + ch];
+        const float e2 = sm.u.stage.st[(2 * 2 + kv) * D + ch];
+        const float e3 = bf16r(load_proj_val<PROJ_FP32>(p.proj, pb + (kv ? OFF_V : OFF_K) + g * D + ch));
+        if (kv == 0 && p.hist_k_visit) {
+          p.hist_k_visit[std::size_t(b * W + w) * CONV_C + g * D + ch] = e3;
+        } else if (kv == 1 && p.hist_v_visit) {
+          p.hist_v_visit[std::size_t(b * W + w) * CONV_C + g * D + ch] = e3;
+        }
+        float y;
+        if constexpr (FULL) {
+          float o = 0.f;
+          const float e_arr[4] = {e0, e1, e2, e3};
+#pragma unroll
+          for (int lag = 0; lag < 4; ++lag) {
+            const float wval = __fadd_rn(sm.u.stage.w[(kv * 4 + lag) * D + ch], sm.u.stage.dyn[w * 8 + kv * 4 + lag]);
+            o = __fadd_rn(o, __fmul_rn(wval, e_arr[3 - lag]));
+          }
+          y = __fmul_rn(__fadd_rn(o, e3), INV_3);
+        } else {
+          const float* wptr = sm.u.stage.w + (kv * D + ch) * 4;
+          float o = __fmul_rn(wptr[0], e0);
+          o = __fadd_rn(o, __fmul_rn(wptr[1], e1));
+          o = __fadd_rn(o, __fmul_rn(wptr[2], e2));
+          o = __fadd_rn(o, __fmul_rn(wptr[3], e3));
+          y = __fmul_rn(__fadd_rn(o, e3), INV_SQRT5);
+        }
+        sm.u.stage.nkf[kv * D + ch] = bf16r(y);
+        sm.u.stage.st[(0 * 2 + kv) * D + ch] = e1;
+        sm.u.stage.st[(1 * 2 + kv) * D + ch] = e2;
+        sm.u.stage.st[(2 * 2 + kv) * D + ch] = e3;
+      }
+      __syncthreads();
+      if (warp < 2) {
+        const int kv = warp;
+        const float4 x = reinterpret_cast<const float4*>(sm.u.stage.nkf + kv * D)[lane];
+        const float ss = wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
+        const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
+        float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
+        if constexpr (F8) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
+        }
+        reinterpret_cast<uint2*>(&sm.nkv[kv][w][0])[lane] = make_uint2(act::pack2(y[0], y[1]), act::pack2(y[2], y[3]));
+      }
+      __syncthreads();
+    }
+    for (int i = tid; i < 3 * 2 * D; i += NT) sm.nst[i] = sm.u.stage.st[i];
+  }
+  __syncthreads();  // stage inputs dead; sm.u.tile may now be used
+
+  // ---- Load this warp's token `tok` queries into registers (30 floats total -> zero spills!).
+  float qv[GQA][8], relv[GQA];
+  if (tok < w_lim) {
+#pragma unroll
+    for (int i = 0; i < GQA; ++i) {
+      float qf[8];
+      unpack8(*reinterpret_cast<const uint4*>(&sm.q[tok][i][c * 8]), qf);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) qv[i][e] = qf[e] * QSCALE;
+      relv[i] = sm.rel[tok][i][c];
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < GQA; ++i) {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) qv[i][e] = 0.f;
+      relv[i] = 0.f;
+    }
+  }
+
+  float mrun[GQA], lrun[GQA], acc[GQA][8];
+#pragma unroll
+  for (int i = 0; i < GQA; ++i) {
+    mrun[i] = NEG_INIT;
+    lrun[i] = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) acc[i][e] = 0.f;
+  }
+
+  const int P_tok = p0 + tok;
+
+  // ---- Owner attends causal self-keys j in [0..tok] from sm.nkv (warp-uniform trip count).
+  if (owner && kw == 0 && tok < w_lim) {
+    constexpr int SELF_STEPS = (W + 1) / 2;
+#pragma unroll
+    for (int step = 0; step < SELF_STEPS; ++step) {
+      const int j = 2 * step + half;
+      const bool ok = (j <= tok);
+      const int d = tok - j;
+      float kf[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      float vf[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      if (ok) {
+        unpack8(*reinterpret_cast<const uint4*>(&sm.nkv[0][j][c * 8]), kf);
+        unpack8(*reinterpret_cast<const uint4*>(&sm.nkv[1][j][c * 8]), vf);
+      }
+      const float rp = ok ? sm.relp0[c][d] : 0.f;
+#pragma unroll
+      for (int i = 0; i < GQA; ++i) {
+        float t = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) t = fmaf(qv[i][e], kf[e], t);
+        float s = hsum16(t);
+        const float bias = hsum16(relv[i] * rp);
+        if (ok) s = fmaf(bf16r(bias), LOG2E, s);
+        else s = -INFINITY;
+        const float mx = fmaxf(mrun[i], s);
+        const float sc = exp2f(mrun[i] - mx);
+        mrun[i] = mx;
+        lrun[i] *= sc;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[i][e] *= sc;
+        const float pu = exp2f(s - mrun[i]);
+        lrun[i] += pu;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[i][e] = fmaf(pu, vf[e], acc[i][e]);
+      }
+    }
+  }
+
+  // ---- Stream cached keys [0, old_end) in V_KT=16-key SMEM tiles, 1x global load shared across all W tokens!
+  const int old_end = FULL ? p0 : (p0 < WIN ? p0 : WIN);
+  const int stride = p.splits * V_KT;
+  const int c0 = rank * V_KT;
+  const std::uint64_t kvpol = l2::policy<KV_L2>();
+
+  constexpr int KEYS_PER_WARP = V_KT / KW_PER_TOK;  // 2, 4, 8, 16
+
+  for (int base = c0; base < old_end; base += stride) {
+    // Cooperative tile load: 512 vector loads (2 per thread for NT=256).
+    for (int idx = tid; idx < V_KT * 2 * (D / 8); idx += NT) {
+      const int k_idx = idx / (2 * (D / 8));
+      const int kv = (idx / (D / 8)) & 1;
+      const int c8 = idx & ((D / 8) - 1);
+      const int j = base + k_idx;
+      if (j < old_end) {
+        std::size_t off;
+        if constexpr (FULL) {
+          const int phys = pt_slot[j >> kPageShift];
+          off = ((((std::size_t(phys) * NUM_FULL_VISITS + p.full_visit_idx) * kPageSize + (j & kPageMask)) * HKV + g) * D) +
+                c8 * 8;
+        } else {
+          off = (std::size_t(j) * HKV + g) * D + c8 * 8;
+        }
+        const CT* src = (kv ? v_pool : k_pool) + off;
+        if constexpr (F8) {
+          const uint2 val = ld_kv8(src, kvpol);
+          reinterpret_cast<uint2*>((kv ? &sm.u.tile.v[k_idx][0] : &sm.u.tile.k[k_idx][0]))[c8] = val;
+        } else {
+          const uint4 val = ld_kv(src, kvpol);
+          reinterpret_cast<uint4*>((kv ? &sm.u.tile.v[k_idx][0] : &sm.u.tile.k[k_idx][0]))[c8] = val;
+        }
+      } else {
+        if constexpr (F8) {
+          reinterpret_cast<uint2*>((kv ? &sm.u.tile.v[k_idx][0] : &sm.u.tile.k[k_idx][0]))[c8] = make_uint2(0u, 0u);
+        } else {
+          reinterpret_cast<uint4*>((kv ? &sm.u.tile.v[k_idx][0] : &sm.u.tile.k[k_idx][0]))[c8] =
+              make_uint4(0u, 0u, 0u, 0u);
+        }
+      }
+    }
+    if (tid < V_KT) {
+      const int j = base + tid;
+      sm.u.tile.kp[tid] = (j < old_end) ? (FULL ? j : int(kpos_slot[j])) : -1;
+    }
+    __syncthreads();
+
+    if (tok < w_lim) {
+#pragma unroll
+      for (int step = 0; step < KEYS_PER_WARP / 2; ++step) {
+        const int k_idx = kw * KEYS_PER_WARP + 2 * step + half;
+        const int kp = sm.u.tile.kp[k_idx];
+        const int d = P_tok - kp;
+        const bool ok = (kp >= 0 && kp < p0 && d >= 0 && (FULL || d < WIN));
+        const bool need = (ok && d < EXT);
+        float kf[8], vf[8];
+        if constexpr (F8) {
+          unpack8(reinterpret_cast<const uint2*>(&sm.u.tile.k[k_idx][0])[c], kf);
+        } else {
+          unpack8(reinterpret_cast<const uint4*>(&sm.u.tile.k[k_idx][0])[c], kf);
+        }
+        float s[GQA];
+#pragma unroll
+        for (int i = 0; i < GQA; ++i) {
+          float t = 0.f;
+#pragma unroll
+          for (int e = 0; e < 8; ++e) t = fmaf(qv[i][e], kf[e], t);
+          s[i] = hsum16(t);
+        }
+        if (__any_sync(0xffffffffu, need)) {
+          const float rp = need ? __ldg(p.rel_proj + c * EXT + d) : 0.f;
+#pragma unroll
+          for (int i = 0; i < GQA; ++i) {
+            const float bias = hsum16(relv[i] * rp);
+            if (need) s[i] = fmaf(bf16r(bias), LOG2E, s[i]);
+          }
+        }
+        if (ok) {
+          if constexpr (F8) {
+            unpack8(reinterpret_cast<const uint2*>(&sm.u.tile.v[k_idx][0])[c], vf);
+          } else {
+            unpack8(reinterpret_cast<const uint4*>(&sm.u.tile.v[k_idx][0])[c], vf);
+          }
+        } else {
+#pragma unroll
+          for (int e = 0; e < 8; ++e) vf[e] = 0.f;
+        }
+#pragma unroll
+        for (int i = 0; i < GQA; ++i) {
+          const float sv = ok ? s[i] : -INFINITY;
+          const float mx = fmaxf(mrun[i], sv);
+          const float sc = exp2f(mrun[i] - mx);
+          mrun[i] = mx;
+          lrun[i] *= sc;
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[i][e] *= sc;
+          const float pu = exp2f(sv - mrun[i]);
+          lrun[i] += pu;
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[i][e] = fmaf(pu, vf[e], acc[i][e]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // ---- Merge the two half-warps in registers, then write per-warp partials to sm.u.red.
+#pragma unroll
+  for (int i = 0; i < GQA; ++i) {
+    const float mo = __shfl_xor_sync(0xffffffffu, mrun[i], 16);
+    const float lo = __shfl_xor_sync(0xffffffffu, lrun[i], 16);
+    const float mx = fmaxf(mrun[i], mo);
+    const float f1 = exp2f(mrun[i] - mx), f2 = exp2f(mo - mx);
+    lrun[i] = lrun[i] * f1 + lo * f2;
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+      acc[i][e] = acc[i][e] * f1 + __shfl_xor_sync(0xffffffffu, acc[i][e], 16) * f2;
+    mrun[i] = mx;
+  }
+  __syncthreads();  // tile dead; alias sm.u.red
+  if (half == 0) {
+#pragma unroll
+    for (int i = 0; i < GQA; ++i) {
+      float4* dst = reinterpret_cast<float4*>(sm.u.red.o + (warp * GQA + i) * D + c * 8);
+      dst[0] = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+      dst[1] = make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]);
+      if (c == 0) {
+        sm.u.red.ml[(warp * GQA + i) * 2] = mrun[i];
+        sm.u.red.ml[(warp * GQA + i) * 2 + 1] = lrun[i];
+      }
+    }
+  }
+  __syncthreads();
+
+  if constexpr (SPLIT) {
+    // Stage 1 (READ-ONLY on KV/ring_pos/conv): write split partials + owner saves nkv/nst.
+    float* part_base = p.part + std::size_t(((b * p.splits + rank) * HKV + g) * W) * GQA * PSTR;
+    for (int idx = tid; idx < w_lim * GQA * (D / 4); idx += NT) {
+      const int w = idx / (GQA * (D / 4));
+      const int rem = idx % (GQA * (D / 4));
+      const int row = rem / (D / 4), d4 = rem % (D / 4);
+      const int w0 = w * KW_PER_TOK;
+      float mx = NEG_INIT;
+#pragma unroll
+      for (int k = 0; k < KW_PER_TOK; ++k) mx = fmaxf(mx, sm.u.red.ml[((w0 + k) * GQA + row) * 2]);
+      float l = 0.f;
+      float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+      for (int k = 0; k < KW_PER_TOK; ++k) {
+        const int wi = (w0 + k) * GQA + row;
+        const float f = exp2f(sm.u.red.ml[wi * 2] - mx);
+        l += sm.u.red.ml[wi * 2 + 1] * f;
+        const float4 a = reinterpret_cast<const float4*>(sm.u.red.o + wi * D)[d4];
+        o.x += a.x * f, o.y += a.y * f, o.z += a.z * f, o.w += a.w * f;
+      }
+      float* pr = part_base + std::size_t(w * GQA + row) * PSTR;
+      reinterpret_cast<float4*>(pr)[d4] = o;
+      if (d4 == 0) *reinterpret_cast<float2*>(pr + D) = make_float2(mx, l);
+    }
+    if (owner) {
+      ActT* dst_nkv = p.saved_nkv + std::size_t(b * HKV + g) * 2 * W * D;
+      for (int idx = tid; idx < 2 * w_lim * 16; idx += NT) {
+        const int kv = idx / (w_lim * 16);
+        const int rem = idx % (w_lim * 16);
+        const int w = rem / 16, c8 = rem & 15;
+        reinterpret_cast<uint4*>(dst_nkv + (kv * W + w) * D)[c8] =
+            reinterpret_cast<const uint4*>(&sm.nkv[kv][w][0])[c8];
+      }
+      float* dst_nst = p.saved_nst + std::size_t(b * HKV + g) * 3 * 2 * D;
+      for (int idx = tid; idx < 3 * 2 * D; idx += NT) dst_nst[idx] = sm.nst[idx];
+    }
+  } else {
+    // Non-split finish: write out, commit per-head K/V and conv state.
+    // Note: for !FULL (sliding), ring_pos is committed in a separate post-grid kernel so no head can race on kpos!
+    for (int idx = tid; idx < w_lim * GQA * D; idx += NT) {
+      const int w = idx / (GQA * D);
+      const int rem = idx % (GQA * D);
+      const int row = rem / D, dim = rem % D;
+      const int w0 = w * KW_PER_TOK;
+      const float sink = sm.sink[w][row] * LOG2E;
+      float mx = sink;
+#pragma unroll
+      for (int k = 0; k < KW_PER_TOK; ++k) mx = fmaxf(mx, sm.u.red.ml[((w0 + k) * GQA + row) * 2]);
+      float l = exp2f(sink - mx), a = 0.f;
+#pragma unroll
+      for (int k = 0; k < KW_PER_TOK; ++k) {
+        const int wi = (w0 + k) * GQA + row;
+        const float f = exp2f(sm.u.red.ml[wi * 2] - mx);
+        l += sm.u.red.ml[wi * 2 + 1] * f;
+        a += sm.u.red.o[wi * D + dim] * f;
+      }
+      const std::size_t pb = std::size_t(b * W + w) * R;
+      const float gate_in = load_proj_val<PROJ_FP32>(p.proj, pb + OFF_GATE + (g * GQA + row) * D + dim);
+      const float gate = 1.f / (1.f + expf(-gate_in));
+      p.out[std::size_t(b * W + w) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
+    }
+
+    // Commit per-head new K/V rows (safe: this CTA is the sole reader & writer of head g for slot `slot`).
+    for (int idx = tid; idx < 2 * w_lim * 16; idx += NT) {
+      const int kv = idx / (w_lim * 16);
+      const int rem = idx % (w_lim * 16);
+      const int w = rem / 16, c8 = rem & 15;
+      const uint4 u = reinterpret_cast<const uint4*>(&sm.nkv[kv][w][0])[c8];
+      const int pw = p0 + w;
+      std::size_t dst_off;
+      if constexpr (FULL) {
+        const int phys = pt_slot[pw >> kPageShift];
+        dst_off = ((((std::size_t(phys) * NUM_FULL_VISITS + p.full_visit_idx) * kPageSize + (pw & kPageMask)) * HKV + g) * D);
+      } else {
+        dst_off = (std::size_t(pw & (WIN - 1)) * HKV + g) * D;
+      }
+      CT* const dst = (kv ? v_pool : k_pool) + dst_off;
+      if constexpr (F8) {
+        float f[8];
+        unpack8(u, f);
+        reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
+                                                       pack_e4m3x2(f[4], f[5]) | (pack_e4m3x2(f[6], f[7]) << 16));
+      } else {
+        reinterpret_cast<uint4*>(dst)[c8] = u;
+      }
+    }
+    for (int idx = tid; idx < 3 * 2 * D; idx += NT) {
+      const int i = idx / (2 * D), kv = (idx / D) & 1, ch = idx % D;
+      (kv ? conv_v_slot : conv_k_slot)[i * CONV_C + g * D + ch] = sm.nst[idx];
+    }
+  }
+}
+
+template <int W, bool FULL, bool F8, bool PROJ_FP32>
+__global__ void __launch_bounds__(NT) batched_attn_verify_reduce_kernel(const BatchedVerifyAttnKernelParams p) {
+  static_assert(FULL || !F8, "FP8 caches are full-layer only");
+  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
+
+  const int g = blockIdx.y;
+  const int b = blockIdx.z;
+  const int slot = p.slot_ids[b];
+  if (slot < 0) return;
+
+  const int w_lim = p.slot_w_limit ? min(W, max(1, int(p.slot_w_limit[b]))) : W;
+  const int p0 = int(p.slot_pos[slot]);
+  if (FULL && p0 + w_lim > p.max_ctx) return;
+
+  const int tid = threadIdx.x;
+  const int R = p.R;
+
+  for (int idx = tid; idx < w_lim * GQA * D; idx += NT) {
+    const int w = idx / (GQA * D);
+    const int rem = idx % (GQA * D);
+    const int row = rem / D, dim = rem % D;
+    const std::size_t pb = std::size_t(b * W + w) * R;
+    const float sink = load_proj_val<PROJ_FP32>(p.proj, pb + OFF_SINK + g * GQA + row) * LOG2E;
+    float mx = sink;
+    for (int q = 0; q < p.splits; ++q) {
+      const float* pr = p.part + std::size_t((((b * p.splits + q) * HKV + g) * W + w) * GQA + row) * PSTR;
+      const float2 ml = *reinterpret_cast<const float2*>(pr + D);
+      mx = fmaxf(mx, ml.x);
+    }
+    float l = exp2f(sink - mx), a = 0.f;
+    for (int q = 0; q < p.splits; ++q) {
+      const float* pr = p.part + std::size_t((((b * p.splits + q) * HKV + g) * W + w) * GQA + row) * PSTR;
+      const float2 ml = *reinterpret_cast<const float2*>(pr + D);
+      const float f = exp2f(ml.x - mx);
+      l += ml.y * f;
+      a += pr[dim] * f;
+    }
+    const float gate_in = load_proj_val<PROJ_FP32>(p.proj, pb + OFF_GATE + (g * GQA + row) * D + dim);
+    const float gate = 1.f / (1.f + expf(-gate_in));
+    p.out[std::size_t(b * W + w) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
+  }
+
+  float* const conv_k_slot = p.conv_k_visit + std::size_t(slot) * p.conv_slot_stride;
+  float* const conv_v_slot = p.conv_v_visit + std::size_t(slot) * p.conv_slot_stride;
+  ActT* const k_ring_slot = FULL ? nullptr : (p.k_ring_visit + std::size_t(slot) * p.ring_slot_stride);
+  ActT* const v_ring_slot = FULL ? nullptr : (p.v_ring_visit + std::size_t(slot) * p.ring_slot_stride);
+  std::int64_t* const kpos_slot = FULL ? nullptr : (p.ring_pos_visit + std::size_t(slot) * p.ring_pos_slot_stride);
+  const std::int32_t* const pt_slot = FULL ? (p.page_table + std::size_t(slot) * p.max_pages_per_slot) : nullptr;
+  CT* const k_pool = FULL ? static_cast<CT*>(p.k_full_pool) : reinterpret_cast<CT*>(k_ring_slot);
+  CT* const v_pool = FULL ? static_cast<CT*>(p.v_full_pool) : reinterpret_cast<CT*>(v_ring_slot);
+
+  const ActT* src_nkv = p.saved_nkv + std::size_t(b * HKV + g) * 2 * W * D;
+  for (int idx = tid; idx < 2 * w_lim * 16; idx += NT) {
+    const int kv = idx / (w_lim * 16);
+    const int rem = idx % (w_lim * 16);
+    const int w = rem / 16, c8 = rem & 15;
+    const uint4 u = reinterpret_cast<const uint4*>(src_nkv + (kv * W + w) * D)[c8];
+    const int pw = p0 + w;
+    std::size_t dst_off;
+    if constexpr (FULL) {
+      const int phys = pt_slot[pw >> kPageShift];
+      dst_off = ((((std::size_t(phys) * NUM_FULL_VISITS + p.full_visit_idx) * kPageSize + (pw & kPageMask)) * HKV + g) * D);
+    } else {
+      dst_off = (std::size_t(pw & (WIN - 1)) * HKV + g) * D;
+    }
+    CT* const dst = (kv ? v_pool : k_pool) + dst_off;
+    if constexpr (F8) {
+      float f[8];
+      unpack8(u, f);
+      reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
+                                                     pack_e4m3x2(f[4], f[5]) | (pack_e4m3x2(f[6], f[7]) << 16));
+    } else {
+      reinterpret_cast<uint4*>(dst)[c8] = u;
+    }
+  }
+  const float* src_nst = p.saved_nst + std::size_t(b * HKV + g) * 3 * 2 * D;
+  for (int idx = tid; idx < 3 * 2 * D; idx += NT) {
+    const int i = idx / (2 * D), kv = (idx / D) & 1, ch = idx % D;
+    (kv ? conv_v_slot : conv_k_slot)[i * CONV_C + g * D + ch] = src_nst[idx];
+  }
+  if (!FULL && g == 0 && tid < w_lim) {
+    kpos_slot[(p0 + tid) & (WIN - 1)] = p0 + tid;
+  }
+}
+
+__global__ void batched_ring_pos_write_kernel(const std::int32_t* __restrict__ slot_ids,
+                                              const std::int32_t* __restrict__ slot_w_limit,
+                                              const std::int64_t* __restrict__ slot_pos, int W,
+                                              std::int64_t* __restrict__ ring_pos_visit,
+                                              std::size_t ring_pos_slot_stride) {
+  const int b = blockIdx.x;
+  const int w = threadIdx.x;
+  const int slot = slot_ids[b];
+  if (slot < 0) return;
+  const int w_lim = slot_w_limit ? min(W, max(1, int(slot_w_limit[b]))) : W;
+  if (w >= w_lim) return;
+  const int p0 = int(slot_pos[slot]);
+  ring_pos_visit[std::size_t(slot) * ring_pos_slot_stride + ((p0 + w) & (WIN - 1))] = p0 + w;
+}
+
+template <int W, bool FULL, bool F8, bool PROJ_FP32>
+void dispatch_verify_attn_w(const BatchedVerifyAttnKernelParams& kp, cudaStream_t stream) {
+  if (kp.splits == 1) {
+    const dim3 grid(1, HKV, kp.B);
+    batched_attn_verify_kernel<W, FULL, F8, PROJ_FP32, false><<<grid, NT, 0, stream>>>(kp);
+    if constexpr (!FULL) {
+      batched_ring_pos_write_kernel<<<kp.B, 32, 0, stream>>>(kp.slot_ids, kp.slot_w_limit, kp.slot_pos, W,
+                                                             kp.ring_pos_visit, kp.ring_pos_slot_stride);
+    }
+  } else {
+    const dim3 grid1(kp.splits, HKV, kp.B);
+    batched_attn_verify_kernel<W, FULL, F8, PROJ_FP32, true><<<grid1, NT, 0, stream>>>(kp);
+    const dim3 grid2(1, HKV, kp.B);
+    batched_attn_verify_reduce_kernel<W, FULL, F8, PROJ_FP32><<<grid2, NT, 0, stream>>>(kp);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+template <bool FULL, bool F8, bool PROJ_FP32>
+void dispatch_verify_attn(const BatchedVerifyAttnKernelParams& kp, cudaStream_t stream) {
+  switch (kp.W) {
+    case 1: dispatch_verify_attn_w<1, FULL, F8, PROJ_FP32>(kp, stream); break;
+    case 2: dispatch_verify_attn_w<2, FULL, F8, PROJ_FP32>(kp, stream); break;
+    case 4: dispatch_verify_attn_w<4, FULL, F8, PROJ_FP32>(kp, stream); break;
+    case 8: dispatch_verify_attn_w<8, FULL, F8, PROJ_FP32>(kp, stream); break;
+    default: require(false, "batched_attn_verify: W must be 1, 2, 4, or 8");
+  }
+}
+
+template <bool X_FP32>
+__global__ void batched_static_conv_verify_kernel(const void* __restrict__ x, int ld, int W, int C,
+                                                  const std::int32_t* __restrict__ slot_ids,
+                                                  const std::int32_t* __restrict__ slot_w_limit,
+                                                  const float* __restrict__ conv_w,
+                                                  float* __restrict__ conv_state_visit, std::size_t conv_slot_stride,
+                                                  float* __restrict__ out, float* __restrict__ hist) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int b = blockIdx.y;
+  if (c >= C) return;
+  const int slot = slot_ids[b];
+  if (slot < 0) return;
+
+  const int w_lim = slot_w_limit ? min(W, max(1, int(slot_w_limit[b]))) : W;
+  float* const st = conv_state_visit + std::size_t(slot) * conv_slot_stride;
+  float e0 = st[0 * C + c];
+  float e1 = st[1 * C + c];
+  float e2 = st[2 * C + c];
+  const float4 w4 = reinterpret_cast<const float4*>(conv_w)[c];
+
+  for (int w = 0; w < w_lim; ++w) {
+    const std::size_t r = std::size_t(b) * W + w;
+    float e3;
+    if constexpr (X_FP32) {
+      e3 = bf16r(static_cast<const float*>(x)[r * ld + c]);
+    } else {
+      e3 = act::to_float(static_cast<const ActT*>(x)[r * ld + c]);
+    }
+    if (hist) hist[r * C + c] = e3;
+    float acc = __fmul_rn(w4.x, e0);
+    acc = __fadd_rn(acc, __fmul_rn(w4.y, e1));
+    acc = __fadd_rn(acc, __fmul_rn(w4.z, e2));
+    acc = __fadd_rn(acc, __fmul_rn(w4.w, e3));
+    out[r * C + c] = __fmul_rn(__fadd_rn(acc, e3), INV_SQRT5);
+    e0 = e1;
+    e1 = e2;
+    e2 = e3;
+  }
+  st[0 * C + c] = e0;
+  st[1 * C + c] = e1;
+  st[2 * C + c] = e2;
+}
+
+constexpr int kRbThreads = 256;
+constexpr int kRowVec = (2 * CONV_C + 2 * H_DIM) / 4;   // 1664 float4 per visit across k|v|attn|mlp
+constexpr int kConvVecs = NUM_VISITS * kRowVec;          // 79872 float4 per conv row across 48 visits
+constexpr int kRingVec = CONV_C * sizeof(ActT) / 16;     // 128 uint4 per ring slot row
+
+struct RbConvAt {
+  int t, v, c, cols;
+};
+
+__device__ __forceinline__ RbConvAt rb_conv_at(int q) {
+  const int v = q / kRowVec, c = q % kRowVec;
+  constexpr int k4 = CONV_C / 4, h4 = H_DIM / 4;
+  if (c < k4) return {0, v, c, k4};
+  if (c < 2 * k4) return {1, v, c - k4, k4};
+  if (c < 2 * k4 + h4) return {2, v, c - 2 * k4, h4};
+  return {3, v, c - 2 * k4 - h4, h4};
+}
+
+__device__ __forceinline__ float4* rb_state_conv_ptr(const BatchedVerifyStatePtrs& st, int slot, const RbConvAt& a,
+                                                     int row) {
+  float* base = (a.t == 0) ? (st.conv_k + std::size_t(slot) * st.conv_kv_slot_stride)
+                           : (a.t == 1) ? (st.conv_v + std::size_t(slot) * st.conv_kv_slot_stride)
+                                        : (a.t == 2) ? (st.conv_attn + std::size_t(slot) * st.conv_h_slot_stride)
+                                                     : (st.conv_mlp + std::size_t(slot) * st.conv_h_slot_stride);
+  return reinterpret_cast<float4*>(base) + (std::size_t(a.v) * 3 + row) * a.cols + a.c;
+}
+
+__device__ __forceinline__ float4* rb_bk_conv_ptr(const BatchedVerifyBackup& bk, int b, const RbConvAt& a,
+                                                  int row_idx01) {
+  // bk.conv_* is [max_B, NUM_VISITS, 2, cols*4], row_idx01 = 0 for conv row 1, 1 for conv row 2.
+  float* base = (a.t == 0) ? bk.conv_k : (a.t == 1) ? bk.conv_v : (a.t == 2) ? bk.conv_attn : bk.conv_mlp;
+  const std::size_t per_b = std::size_t(NUM_VISITS) * 2 * a.cols;
+  return reinterpret_cast<float4*>(base) + std::size_t(b) * per_b + (std::size_t(a.v) * 2 + row_idx01) * a.cols + a.c;
+}
+
+__device__ __forceinline__ const float4* rb_hist_ptr(const BatchedVerifyHistory& h, int b, int W, const RbConvAt& a,
+                                                     int w_row) {
+  const float* base = (a.t == 0) ? h.hist_k : (a.t == 1) ? h.hist_v : (a.t == 2) ? h.hist_attn : h.hist_mlp;
+  const std::size_t v_stride = (a.t < 2) ? (h.kv_visit_stride / 4) : (h.h_visit_stride / 4);
+  return reinterpret_cast<const float4*>(base) + std::size_t(a.v) * v_stride +
+         std::size_t(b * W + w_row) * a.cols + a.c;
+}
+
+__global__ void batched_verify_save_kernel(BatchedVerifyStatePtrs st, BatchedVerifyBackup bk,
+                                           const std::int32_t* __restrict__ slot_ids,
+                                           const std::int32_t* __restrict__ slot_w_limit, int W) {
+  const int b = blockIdx.y;
+  const int slot = slot_ids[b];
+  if (slot < 0) return;
+
+  const int w_lim = slot_w_limit ? min(W, max(1, int(slot_w_limit[b]))) : W;
+  const int i = blockIdx.x * kRbThreads + threadIdx.x;
+  if (i < 2 * kConvVecs) {
+    const int row01 = i / kConvVecs;  // 0 -> state row 1, 1 -> state row 2
+    const RbConvAt a = rb_conv_at(i % kConvVecs);
+    *rb_bk_conv_ptr(bk, b, a, row01) = *rb_state_conv_ptr(st, slot, a, row01 + 1);
+    return;
+  }
+
+  const int p0 = int(st.slot_pos[slot]);
+  int j = i - 2 * kConvVecs;
+  const int per_ring = W * 2 * kRingVec;
+  if (j < NUM_SLIDING_VISITS * per_ring) {
+    const int r = j / per_ring, k = j % per_ring;
+    const int row = k / (2 * kRingVec), c = k % (2 * kRingVec);
+    if (row >= w_lim) return;
+    const int ring_slot = (p0 + row) & (WIN - 1);
+    const std::size_t bk_off = ((std::size_t(b) * NUM_SLIDING_VISITS + r) * bk.max_W + row) * kRingVec;
+    if (c < kRingVec) {
+      const ActT* src = st.k_ring + std::size_t(slot) * st.ring_slot_stride + (std::size_t(r) * WIN + ring_slot) * CONV_C;
+      reinterpret_cast<uint4*>(bk.ring_k)[bk_off + c] = reinterpret_cast<const uint4*>(src)[c];
+    } else {
+      const ActT* src = st.v_ring + std::size_t(slot) * st.ring_slot_stride + (std::size_t(r) * WIN + ring_slot) * CONV_C;
+      reinterpret_cast<uint4*>(bk.ring_v)[bk_off + c - kRingVec] = reinterpret_cast<const uint4*>(src)[c - kRingVec];
+    }
+    return;
+  }
+  j -= NUM_SLIDING_VISITS * per_ring;
+  if (j < NUM_SLIDING_VISITS * W) {
+    const int r = j / W, row = j % W;
+    if (row >= w_lim) return;
+    const int ring_slot = (p0 + row) & (WIN - 1);
+    const std::int64_t* src_rp = st.ring_pos + std::size_t(slot) * st.ring_pos_slot_stride;
+    bk.ring_pos[(std::size_t(b) * NUM_SLIDING_VISITS + r) * bk.max_W + row] = src_rp[std::size_t(r) * WIN + ring_slot];
+  }
+}
+
+__global__ void batched_verify_rollback_kernel(BatchedVerifyStatePtrs st, BatchedVerifyBackup bk,
+                                               BatchedVerifyHistory hist, const std::int32_t* __restrict__ slot_ids,
+                                               const std::int32_t* __restrict__ slot_w_limit,
+                                               const std::int32_t* __restrict__ commit_counts, int W) {
+  const int b = blockIdx.y;
+  const int slot = slot_ids[b];
+  if (slot < 0) return;
+
+  const int w_lim = slot_w_limit ? min(W, max(1, int(slot_w_limit[b]))) : W;
+  const int commit = commit_counts[b];
+  if (commit >= w_lim) return;
+
+  const int i = blockIdx.x * kRbThreads + threadIdx.x;
+  if (i < 3 * kConvVecs) {
+    const int row_j = i / kConvVecs;
+    const int src = commit + row_j;
+    const RbConvAt a = rb_conv_at(i % kConvVecs);
+    const float4 val = (src < 3) ? *rb_bk_conv_ptr(bk, b, a, src - 1) : *rb_hist_ptr(hist, b, W, a, src - 3);
+    *rb_state_conv_ptr(st, slot, a, row_j) = val;
+    return;
+  }
+
+  const int p0 = int(st.slot_pos[slot]);
+  int j = i - 3 * kConvVecs;
+  const int per_ring = W * 2 * kRingVec;
+  if (j < NUM_SLIDING_VISITS * per_ring) {
+    const int r = j / per_ring, k = j % per_ring;
+    const int row = k / (2 * kRingVec), c = k % (2 * kRingVec);
+    if (row < commit || row >= w_lim) return;
+    const int ring_slot = (p0 + row) & (WIN - 1);
+    const std::size_t bk_off = ((std::size_t(b) * NUM_SLIDING_VISITS + r) * bk.max_W + row) * kRingVec;
+    if (c < kRingVec) {
+      ActT* dst = st.k_ring + std::size_t(slot) * st.ring_slot_stride + (std::size_t(r) * WIN + ring_slot) * CONV_C;
+      reinterpret_cast<uint4*>(dst)[c] = reinterpret_cast<const uint4*>(bk.ring_k)[bk_off + c];
+    } else {
+      ActT* dst = st.v_ring + std::size_t(slot) * st.ring_slot_stride + (std::size_t(r) * WIN + ring_slot) * CONV_C;
+      reinterpret_cast<uint4*>(dst)[c - kRingVec] = reinterpret_cast<const uint4*>(bk.ring_v)[bk_off + c - kRingVec];
+    }
+    return;
+  }
+  j -= NUM_SLIDING_VISITS * per_ring;
+  if (j < NUM_SLIDING_VISITS * W) {
+    const int r = j / W, row = j % W;
+    if (row < commit || row >= w_lim) return;
+    const int ring_slot = (p0 + row) & (WIN - 1);
+    std::int64_t* dst_rp = st.ring_pos + std::size_t(slot) * st.ring_pos_slot_stride;
+    dst_rp[std::size_t(r) * WIN + ring_slot] = bk.ring_pos[(std::size_t(b) * NUM_SLIDING_VISITS + r) * bk.max_W + row];
+  }
+}
+
+__global__ void batched_advance_pos_by_kernel(const std::int32_t* __restrict__ slot_ids,
+                                              const std::int32_t* __restrict__ commit_counts, int B,
+                                              std::int64_t* __restrict__ slot_pos) {
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= B) return;
+  const int slot = slot_ids[b];
+  if (slot >= 0) slot_pos[slot] += commit_counts[b];
+}
+
+}  // namespace
+
+std::size_t attn_verify_workspace_bytes(int max_b, int max_w) {
+  require(max_b >= 1 && (max_w == 1 || max_w == 2 || max_w == 4 || max_w == 8), "attn_verify_workspace_bytes: bad args");
+  return verify_ws_total_bytes(max_b, max_w);
+}
+
+void batched_attn_verify(const BatchedVerifyAttnArgs& a, cudaStream_t stream) {
+  require(a.B >= 1 && (a.W == 1 || a.W == 2 || a.W == 4 || a.W == 8), "batched_attn_verify: bad B/W");
+  require(a.window == 0 || a.window == WIN, "batched_attn_verify: window must be 0 or 1024");
+  const bool full = (a.window == 0);
+  require(full || !a.cache_fp8, "batched_attn_verify: FP8 caches are full-layer only");
+  require(a.proj && a.slot_ids && a.slot_pos && a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv &&
+              a.conv_k_visit && a.conv_v_visit && a.out,
+          "batched_attn_verify: null argument");
+  if (full) {
+    require(a.k_full_pool && a.v_full_pool && a.page_table && a.max_pages_per_slot > 0 && a.max_ctx > 0,
+            "batched_attn_verify: full layer needs paged pool and page_table");
+  } else {
+    require(a.k_ring_visit && a.v_ring_visit && a.ring_pos_visit, "batched_attn_verify: sliding layer needs rings");
+  }
+  const int splits = choose_verify_splits(a.B);
+  if (splits > 1) {
+    require(a.workspace && a.workspace_size >= verify_ws_total_bytes(a.B, a.W),
+            "batched_attn_verify: workspace too small");
+  }
+
+  BatchedVerifyAttnKernelParams kp{};
+  kp.proj = a.proj;
+  kp.R = full ? R_FULL : R_SLIDING;
+  kp.B = a.B;
+  kp.W = a.W;
+  kp.splits = splits;
+  kp.slot_ids = a.slot_ids;
+  kp.slot_w_limit = a.slot_w_limit;
+  kp.slot_pos = a.slot_pos;
+  kp.q_scale = a.q_scale;
+  kp.r_scale = a.r_scale;
+  kp.rel_proj = a.rel_proj;
+  kp.k_conv = a.k_conv;
+  kp.v_conv = a.v_conv;
+  kp.conv_k_visit = a.conv_k_visit;
+  kp.conv_v_visit = a.conv_v_visit;
+  kp.conv_slot_stride = a.conv_slot_stride;
+  kp.hist_k_visit = a.hist_k_visit;
+  kp.hist_v_visit = a.hist_v_visit;
+  kp.k_ring_visit = a.k_ring_visit;
+  kp.v_ring_visit = a.v_ring_visit;
+  kp.ring_pos_visit = a.ring_pos_visit;
+  kp.ring_slot_stride = a.ring_slot_stride;
+  kp.ring_pos_slot_stride = a.ring_pos_slot_stride;
+  kp.k_full_pool = a.k_full_pool;
+  kp.v_full_pool = a.v_full_pool;
+  kp.page_table = a.page_table;
+  kp.max_pages_per_slot = a.max_pages_per_slot;
+  kp.full_visit_idx = a.full_visit_idx;
+  kp.max_ctx = a.max_ctx;
+  kp.log_scaling = a.log_scaling ? 1 : 0;
+  if (a.workspace) {
+    char* ws = static_cast<char*>(a.workspace);
+    kp.part = reinterpret_cast<float*>(ws);
+    kp.saved_nkv = reinterpret_cast<ActT*>(ws + verify_ws_nkv_off(a.B, a.W));
+    kp.saved_nst = reinterpret_cast<float*>(ws + verify_ws_nst_off(a.B, a.W));
+  }
+  kp.out = a.out;
+
+  if (full) {
+    if (a.cache_fp8) {
+      if (a.proj_fp32) dispatch_verify_attn<true, true, true>(kp, stream);
+      else dispatch_verify_attn<true, true, false>(kp, stream);
+    } else {
+      if (a.proj_fp32) dispatch_verify_attn<true, false, true>(kp, stream);
+      else dispatch_verify_attn<true, false, false>(kp, stream);
+    }
+  } else {
+    if (a.proj_fp32) dispatch_verify_attn<false, false, true>(kp, stream);
+    else dispatch_verify_attn<false, false, false>(kp, stream);
+  }
+}
+
+void batched_static_conv_verify(const void* x, bool x_fp32, int ld, int B, int W, int C,
+                                const std::int32_t* slot_ids, const std::int32_t* slot_w_limit,
+                                const float* conv_w, float* conv_state_visit, std::size_t conv_slot_stride,
+                                float* out, float* hist, cudaStream_t stream) {
+  require(x && slot_ids && conv_w && conv_state_visit && out && B >= 1 && W >= 1 && W <= 8 && C >= 1 && ld >= C,
+          "batched_static_conv_verify: bad args");
+  const dim3 grid((C + 255) / 256, B);
+  if (x_fp32) {
+    batched_static_conv_verify_kernel<true><<<grid, 256, 0, stream>>>(
+        x, ld, W, C, slot_ids, slot_w_limit, conv_w, conv_state_visit, conv_slot_stride, out, hist);
+  } else {
+    batched_static_conv_verify_kernel<false><<<grid, 256, 0, stream>>>(
+        x, ld, W, C, slot_ids, slot_w_limit, conv_w, conv_state_visit, conv_slot_stride, out, hist);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void batched_verify_save(const BatchedVerifyStatePtrs& st, const BatchedVerifyBackup& bk,
+                         const std::int32_t* slot_ids, const std::int32_t* slot_w_limit, int B, int W,
+                         cudaStream_t stream) {
+  if (B <= 0) return;
+  require(slot_ids && st.conv_k && st.conv_v && st.conv_attn && st.conv_mlp && st.k_ring && st.v_ring && st.ring_pos &&
+              st.slot_pos && bk.conv_k && bk.conv_v && bk.conv_attn && bk.conv_mlp && bk.ring_k && bk.ring_v &&
+              bk.ring_pos && W >= 1 && W <= bk.max_W,
+          "batched_verify_save: bad args");
+  const int items = 2 * kConvVecs + NUM_SLIDING_VISITS * W * (2 * kRingVec + 1);
+  const dim3 grid((items + kRbThreads - 1) / kRbThreads, B);
+  batched_verify_save_kernel<<<grid, kRbThreads, 0, stream>>>(st, bk, slot_ids, slot_w_limit, W);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void batched_verify_rollback(const BatchedVerifyStatePtrs& st, const BatchedVerifyBackup& bk,
+                             const BatchedVerifyHistory& hist, const std::int32_t* slot_ids,
+                             const std::int32_t* slot_w_limit, const std::int32_t* commit_counts, int B, int W,
+                             cudaStream_t stream) {
+  if (B <= 0) return;
+  require(slot_ids && commit_counts && st.slot_pos && W >= 1, "batched_verify_rollback: bad args");
+  if (W > 1) {
+    require(st.conv_k && st.conv_v && st.conv_attn && st.conv_mlp && st.k_ring && st.v_ring && st.ring_pos &&
+                bk.conv_k && bk.conv_v && bk.conv_attn && bk.conv_mlp && bk.ring_k && bk.ring_v && bk.ring_pos &&
+                hist.hist_k && hist.hist_v && hist.hist_attn && hist.hist_mlp && W <= bk.max_W,
+            "batched_verify_rollback: null rollback buffers");
+    const int items = 3 * kConvVecs + NUM_SLIDING_VISITS * W * (2 * kRingVec + 1);
+    const dim3 grid((items + kRbThreads - 1) / kRbThreads, B);
+    batched_verify_rollback_kernel<<<grid, kRbThreads, 0, stream>>>(st, bk, hist, slot_ids, slot_w_limit, commit_counts,
+                                                                    W);
+  }
+  // Separate post-grid launch guarantees every rollback block finished reading old slot_pos[s] before advancing!
+  batched_advance_pos_by_kernel<<<(B + 63) / 64, 64, 0, stream>>>(slot_ids, commit_counts, B, st.slot_pos);
   CUDA_CHECK(cudaGetLastError());
 }
 

@@ -207,6 +207,15 @@ struct BatchSlotStep {
   int32_t token = 0;
 };
 
+// Output of one batched speculative (or plain 1-token) decode step for one slot.
+struct BatchSlotResult {
+  static constexpr int kMaxTokens = 8;
+  int32_t tokens[kMaxTokens] = {};
+  int count = 0;          // number of emitted tokens in tokens[0..count-1] (1..kMaxTokens)
+  int spec_rounds = 0;    // 1 if speculative verification ran on this slot, else 0
+  int spec_accepted = 0;  // accepted draft count (0..count-1)
+};
+
 class Generator {
  public:
   virtual ~Generator() = default;
@@ -264,6 +273,20 @@ class Generator {
   virtual void step_slots(std::span<const BatchSlotStep> /*inputs*/, std::span<int32_t> /*out_tokens*/) {
     throw std::logic_error("this generator does not support batched decoding");
   }
+  // True when batched multi-token speculative decoding (step_slots_multi) is active.
+  virtual bool supports_batched_spec() const { return false; }
+  // Runs one batched speculative (or plain 1-token) step across `inputs`, emitting 1..8 tokens per slot.
+  // Default wraps step_slots() so non-spec generators and CPU fakes require zero changes.
+  virtual void step_slots_multi(std::span<const BatchSlotStep> inputs, std::span<BatchSlotResult> out) {
+    if (out.size() < inputs.size()) throw std::invalid_argument("step_slots_multi: out too small");
+    std::vector<int32_t> toks(inputs.size(), 0);
+    step_slots(inputs, toks);
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      out[i] = BatchSlotResult{};
+      out[i].tokens[0] = toks[i];
+      out[i].count = 1;
+    }
+  }
   // Releases `slot` and returns its KV pages immediately. Safe to call on any active slot.
   virtual void release_slot(int /*slot*/) {}
 
@@ -292,15 +315,43 @@ class Generator {
     const auto t0 = std::chrono::steady_clock::now();
     try {
       if (on_prefill) on_prefill(stats);
-      for (int i = 0; i < max_new_tokens; ++i) {
-        stats.generated_tokens = i + 1;
-        const std::int32_t out[1] = {token};
-        const bool go_on = on_tokens(out);
-        if (i + 1 == max_new_tokens || is_stop(token) || !go_on) break;
+      int emitted = 1;
+      stats.generated_tokens = 1;
+      const std::int32_t first_out[1] = {token};
+      bool go_on = on_tokens(first_out);
+      const bool use_multi = supports_batched_spec();
+      while (go_on && emitted < max_new_tokens && !is_stop(token)) {
         const BatchSlotStep step[1] = {{s, token}};
-        std::int32_t next[1] = {0};
-        step_slots(step, next);
-        token = next[0];
+        if (use_multi) {
+          BatchSlotResult res[1] = {};
+          step_slots_multi(step, res);
+          stats.spec_rounds += res[0].spec_rounds;
+          stats.spec_accepted += res[0].spec_accepted;
+          int take = 0;
+          bool hit_stop = false;
+          for (int k = 0; k < res[0].count && emitted < max_new_tokens; ++k) {
+            ++emitted;
+            ++take;
+            if (is_stop(res[0].tokens[k])) {
+              hit_stop = true;
+              break;
+            }
+          }
+          stats.generated_tokens = emitted;
+          if (take > 0) {
+            go_on = on_tokens(std::span<const std::int32_t>(res[0].tokens, std::size_t(take)));
+            token = res[0].tokens[take - 1];
+          }
+          if (hit_stop || take == 0) break;
+        } else {
+          std::int32_t next[1] = {0};
+          step_slots(step, next);
+          token = next[0];
+          ++emitted;
+          stats.generated_tokens = emitted;
+          const std::int32_t out[1] = {token};
+          go_on = on_tokens(out);
+        }
       }
     } catch (...) {
       release_slot(s);

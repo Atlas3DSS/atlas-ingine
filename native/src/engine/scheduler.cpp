@@ -398,13 +398,21 @@ void Scheduler::loop_batched() {
       continue;
     }
 
-    // 4. Execute ONE batched decode step across all live slots and stream tokens immediately.
+    // 4. Execute ONE batched decode (or batched speculative verify) step across all live slots and stream immediately.
     std::vector<model::BatchSlotStep> inputs(live.size());
-    std::vector<int32_t> next_tokens(live.size(), 0);
     for (std::size_t i = 0; i < live.size(); ++i) inputs[i] = {live[i].slot, live[i].last_token};
+    const bool use_multi = generator_.supports_batched_spec();
+    std::vector<model::BatchSlotResult> multi_out;
+    std::vector<int32_t> next_tokens;
 
     try {
-      generator_.step_slots(inputs, next_tokens);
+      if (use_multi) {
+        multi_out.resize(live.size());
+        generator_.step_slots_multi(inputs, multi_out);
+      } else {
+        next_tokens.assign(live.size(), 0);
+        generator_.step_slots(inputs, next_tokens);
+      }
     } catch (const std::exception& e) {
       server_log().error("batched step failed: {}: {}", type_name(e), e.what());
       const std::string msg = "generation failed: " + type_name(e) + ": " + e.what();
@@ -426,20 +434,50 @@ void Scheduler::loop_batched() {
 
     std::vector<SlotEntry> kept;
     kept.reserve(live.size());
+    std::vector<int32_t> emit_buf;
+    emit_buf.reserve(model::BatchSlotResult::kMaxTokens);
     for (std::size_t i = 0; i < live.size(); ++i) {
       SlotEntry& e = live[i];
       if (e.job->cancelled()) {
         retire(e);
         continue;
       }
-      const int32_t tok = next_tokens[i];
-      e.job->push({tok});
-      e.last_token = tok;
-      ++e.generated;
-      if (stop_ids_.contains(tok) || e.generated >= e.max_new_tokens || e.job->cancelled()) {
-        retire(e);
+      if (use_multi) {
+        const model::BatchSlotResult& res = multi_out[i];
+        emit_buf.clear();
+        bool done = false;
+        for (int k = 0; k < res.count; ++k) {
+          if (e.job->cancelled()) {
+            done = true;
+            break;
+          }
+          const int32_t tok = res.tokens[k];
+          emit_buf.push_back(tok);
+          ++e.generated;
+          if (stop_ids_.contains(tok) || e.generated >= e.max_new_tokens || e.job->cancelled()) {
+            done = true;
+            break;
+          }
+        }
+        if (!emit_buf.empty()) {
+          e.job->push(emit_buf);
+          e.last_token = emit_buf.back();
+        }
+        if (done || emit_buf.empty() || e.job->cancelled()) {
+          retire(e);
+        } else {
+          kept.push_back(std::move(e));
+        }
       } else {
-        kept.push_back(std::move(e));
+        const int32_t tok = next_tokens[i];
+        e.job->push({tok});
+        e.last_token = tok;
+        ++e.generated;
+        if (stop_ids_.contains(tok) || e.generated >= e.max_new_tokens || e.job->cancelled()) {
+          retire(e);
+        } else {
+          kept.push_back(std::move(e));
+        }
       }
     }
     live = std::move(kept);

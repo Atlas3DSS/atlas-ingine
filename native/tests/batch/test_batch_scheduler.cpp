@@ -390,6 +390,168 @@ void test_admission_throw_during_shutdown_single_end() {
   CHECK(gen.releases.load() == 1);
 }
 
+void test_batched_spec_multi_token_stop_budget_cancel() {
+  // Deterministic CPU regression for step_slots_multi() in Scheduler::loop_batched() and generate_from_slots():
+  // - Mid-block stop token (token #2 of a 5-token speculative block) truncates cleanly and retires immediately.
+  // - Mid-block max_new_tokens cap truncates cleanly without emitting extra tokens.
+  // - Mid-block cancel retires cleanly without leaking slots or pages.
+  // - Concurrent heterogeneous multi-token bursts complete with exact token sequences and spec_rounds/spec_accepted stats.
+  class FakeMultiSpecGenerator final : public ingine::model::Generator {
+   public:
+    FakeMultiSpecGenerator(int max_batch, int tokens_per_step)
+        : max_batch_(max_batch), tokens_per_step_(tokens_per_step), slots_(std::size_t(max_batch)) {}
+
+    std::string model_id() const override { return "fake-multi-spec"; }
+    int max_model_len() const override { return 4096; }
+    int max_batch_size() const override { return max_batch_; }
+    bool supports_batched_spec() const override { return true; }
+    bool can_admit_slot(int, int) const override {
+      std::lock_guard lock(mu_);
+      return active_now_ < max_batch_;
+    }
+
+    int start_slot(const Prompt& prompt, int, const Sampling&, int32_t& first_token, GenerateStats& stats) override {
+      std::lock_guard lock(mu_);
+      for (int i = 0; i < max_batch_; ++i) {
+        if (!slots_[std::size_t(i)].used) {
+          slots_[std::size_t(i)] = {true, prompt.ids[0] * 1000, 1};
+          first_token = prompt.ids[0] * 1000;
+          stats.prompt_tokens = int(prompt.ids.size());
+          ++active_now_;
+          return i;
+        }
+      }
+      return -1;
+    }
+
+    void step_slots(std::span<const BatchSlotStep>, std::span<int32_t>) override {
+      throw std::logic_error("expected step_slots_multi when supports_batched_spec() is true");
+    }
+
+    void step_slots_multi(std::span<const BatchSlotStep> inputs,
+                          std::span<ingine::model::BatchSlotResult> out) override {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::lock_guard lock(mu_);
+      ++multi_calls_;
+      for (std::size_t i = 0; i < inputs.size(); ++i) {
+        auto& s = slots_[std::size_t(inputs[i].slot)];
+        if (!s.used) throw std::logic_error("step_slots_multi on inactive slot");
+        if (inputs[i].token != s.base + s.step - 1) throw std::logic_error("wrong anchor token");
+        ingine::model::BatchSlotResult r{};
+        r.count = tokens_per_step_;
+        r.spec_rounds = 1;
+        r.spec_accepted = tokens_per_step_ - 1;
+        for (int k = 0; k < tokens_per_step_; ++k) {
+          r.tokens[k] = s.base + s.step;
+          ++s.step;
+        }
+        out[i] = r;
+      }
+    }
+
+    void release_slot(int slot) override {
+      std::lock_guard lock(mu_);
+      if (slots_[std::size_t(slot)].used) {
+        slots_[std::size_t(slot)].used = false;
+        --active_now_;
+      }
+    }
+
+    GenerateStats generate(std::span<const int32_t>, int, const Sampling&, std::span<const int32_t>,
+                           const std::function<bool(std::span<const int32_t>)>&) override {
+      throw std::logic_error("unexpected generate");
+    }
+    GenerateStats generate(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
+                           std::span<const int32_t> stop_ids,
+                           const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                           const ingine::model::PrefillCallback& on_prefill) override {
+      return generate_from_slots(full_prompt, max_new_tokens, sampling, stop_ids, on_tokens, on_prefill);
+    }
+
+    int active_now() const {
+      std::lock_guard lock(mu_);
+      return active_now_;
+    }
+    int multi_calls() const {
+      std::lock_guard lock(mu_);
+      return multi_calls_;
+    }
+
+   private:
+    struct Slot {
+      bool used = false;
+      int32_t base = 0;
+      int32_t step = 0;
+    };
+    int max_batch_, tokens_per_step_;
+    mutable std::mutex mu_;
+    std::vector<Slot> slots_;
+    int active_now_ = 0;
+    int multi_calls_ = 0;
+  };
+
+  // 1. Direct generate_from_slots() mid-block stop & budget truncation + spec accounting
+  {
+    FakeMultiSpecGenerator gen(4, 5);
+    std::vector<int32_t> prompt = {2};
+    std::vector<int32_t> emitted;
+    const std::vector<int32_t> stops = {2003};  // token #3 (inside first 5-token block 2001..2005)
+    const GenerateStats st = gen.generate(
+        Prompt{prompt, {}}, 20, Sampling{}, stops,
+        [&](std::span<const int32_t> toks) {
+          emitted.insert(emitted.end(), toks.begin(), toks.end());
+          return true;
+        },
+        [](const GenerateStats&) {});
+    CHECK((emitted == std::vector<int32_t>{2000, 2001, 2002, 2003}));
+    CHECK(st.generated_tokens == 4);
+    CHECK(st.spec_rounds == 1);
+    CHECK(st.spec_accepted == 4);
+    CHECK(gen.active_now() == 0);
+
+    // Budget cap inside a 5-token block (max_new_tokens=8 -> 1 + 5 + 2)
+    emitted.clear();
+    const GenerateStats st2 = gen.generate(
+        Prompt{prompt, {}}, 8, Sampling{}, {},
+        [&](std::span<const int32_t> toks) {
+          emitted.insert(emitted.end(), toks.begin(), toks.end());
+          return true;
+        },
+        [](const GenerateStats&) {});
+    CHECK((emitted == std::vector<int32_t>{2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007}));
+    CHECK(st2.generated_tokens == 8);
+    CHECK(st2.spec_rounds == 2);
+    CHECK(gen.active_now() == 0);
+  }
+
+  // 2. Scheduler::loop_batched() concurrent multi-token streaming with mid-block stop, budget, and cancel
+  {
+    FakeMultiSpecGenerator gen(4, 5);
+    Scheduler sched(gen, {1003}, 8);  // 1003 stops j1 mid-block
+    auto j1 = std::make_shared<Job>(std::vector<int32_t>{1}, 50, Sampling{});
+    auto j2 = std::make_shared<Job>(std::vector<int32_t>{2}, 8, Sampling{});   // budget mid-block
+    auto j3 = std::make_shared<Job>(std::vector<int32_t>{3}, 16, Sampling{});  // exact multi-block (1+5+5+5)
+    auto j4 = std::make_shared<Job>(std::vector<int32_t>{4}, 200, Sampling{}); // cancelled mid-flight
+    CHECK(sched.submit(j1));
+    CHECK(sched.submit(j2));
+    CHECK(sched.submit(j3));
+    CHECK(sched.submit(j4));
+    while (sched.stats().active < 1) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    j4->cancel();
+
+    const auto o1 = drain(*j1);
+    const auto o2 = drain(*j2);
+    const auto o3 = drain(*j3);
+    const auto o4 = drain(*j4);
+    CHECK((o1 == std::vector<int32_t>{1000, 1001, 1002, 1003}));
+    CHECK((o2 == std::vector<int32_t>{2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007}));
+    CHECK(o3.size() == 16 && o3.front() == 3000 && o3.back() == 3015);
+    CHECK(o4.size() < 50);
+    CHECK(gen.active_now() == 0);
+    CHECK(gen.multi_calls() >= 1);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -399,6 +561,7 @@ int main() {
   test_on_prefill_exception_releases_slot_for_reuse();
   test_admission_exception_isolated_from_active_work();
   test_admission_throw_during_shutdown_single_end();
+  test_batched_spec_multi_token_stop_budget_cancel();
   std::printf(g_failures ? "FAILED (%d checks)\n" : "batch_scheduler ok\n", g_failures);
   return g_failures ? 1 : 0;
 }

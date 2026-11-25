@@ -10,5 +10,7 @@ if(INGINE_BACKEND STREQUAL "CUDA")
                     LABELS batch GPU MODEL TIMEOUT 900)
     ingine_add_test(NAME batch_prefix_parity SOURCES test_batch_prefix_parity.cpp LIBS ingine_model ingine_engine ingine_text
                     LABELS batch GPU MODEL TIMEOUT 900)
+    ingine_add_test(NAME batch_spec_parity SOURCES test_batch_spec_parity.cpp LIBS ingine_model ingine_engine ingine_text
+                    LABELS batch GPU MODEL TIMEOUT 1200)
   endif()
 endif()
