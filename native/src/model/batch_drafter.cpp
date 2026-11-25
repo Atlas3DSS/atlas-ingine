@@ -69,28 +69,42 @@ BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights
       max_batch_(max_batch),
       max_verify_width_(max_verify_width),
       ctx_(choose_draft_ctx(max_batch, max_ctx, vram_budget_bytes)),
-      gemm_(std::make_unique<pk::Gemm>()),
       draft_meta_host_(std::size_t(max_batch) * sizeof(kd::BatchSlotDraftMeta)),
       commit_meta_host_(std::size_t(max_batch) * sizeof(kd::BatchSlotCommitMeta)) {
   if (max_batch < 1) throw std::invalid_argument("BatchDrafter: max_batch must be >= 1");
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("BatchDrafter: max_ctx must hold two blocks");
   if (vram_budget_bytes.has_value()) {
-    // Header-only inspection (0 GPU bytes) to account for BOTH the transient raw mtp.safetensors upload buffer
-    // (635.8 MiB) + cat + persistent MTP weights + fold_head peak AND steady-state KV/scratch/accept buffers!
+    // Header-only inspection (0 GPU bytes — BEFORE pk::Gemm 32 MiB workspace or raw mtp.safetensors upload buffer!)
+    // using the exact compile-time production geometry of this build.
     SafetensorsFile mtp_hdr(model_dir / "mtp.safetensors");
     const std::size_t mtp_raw_bytes = std::size_t(mtp_hdr.file_size() - mtp_hdr.data_offset());
     const int inter_hdr = int(mtp_hdr.at("layers.0.mlp.gate_proj.weight").shape.at(0));
+    DrafterGeometry geom;
+    geom.H = std::size_t(kd::H);
+    geom.rank = std::size_t(kd::RANK);
+    geom.gamma = std::size_t(kd::GAMMA);
+    geom.block = std::size_t(kd::BLOCK);
+    geom.q_dim = std::size_t(kd::Q_DIM);
+    geom.kv_dim = std::size_t(kd::KV_DIM);
+    geom.local_slots = std::size_t(LOCAL_SLOTS);
+    geom.global_slot_bytes = GLOBAL_SLOT_BYTES;
+    geom.max_slot_extra = std::size_t(kd::kMaxSlotExtra);
+    geom.short_chunk = std::size_t(kShortChunk);
+    geom.commit_piece = std::size_t(COMMIT_PIECE);
     const DrafterVramPeakEstimate est = estimate_drafter_peak_bytes(
-        mtp_raw_bytes, inter_hdr, max_batch, ctx_, w.unembed.rows(), shortlist_rows, max_verify_width, w.unembed.fp8());
+        mtp_raw_bytes, inter_hdr, max_batch, ctx_, w.unembed.rows(), shortlist_rows, max_verify_width, w.unembed.fp8(),
+        geom);
     const VramLeaseCheck chk = check_vram_lease_fit(vram_budget_bytes, est.peak_bytes);
     if (!chk.ok) {
       throw std::runtime_error(
           "BatchDrafter: VRAM lease cap exceeded before allocation (peak_need=" +
           std::to_string(est.peak_bytes >> 20) + " MiB [load_peak=" + std::to_string(est.load_peak_bytes >> 20) +
-          " MiB, steady=" + std::to_string(est.steady_bytes >> 20) + " MiB], remaining=" +
+          " MiB, cat=" + std::to_string(est.cat_bytes >> 20) + " MiB, steady=" +
+          std::to_string(est.steady_bytes >> 20) + " MiB], remaining=" +
           std::to_string(chk.remaining_bytes >> 20) + " MiB)");
     }
   }
+  gemm_ = std::make_unique<pk::Gemm>();
   head_ = {w.unembed.w.data, w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
            w.unembed.rows()};
   V_ = w.unembed.rows();

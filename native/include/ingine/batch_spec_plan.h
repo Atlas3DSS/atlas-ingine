@@ -77,28 +77,36 @@ inline std::size_t estimate_prefiller_peak_bytes(int prefill_chunk, int vocab, i
   return arena_and_persist + aux + cublas_slack;
 }
 
+struct DrafterGeometry {
+  // Exact production geometry from kernels/draft/draft.h, batch_draft.h, and model/batch_drafter.cpp.
+  std::size_t H = 2304;
+  std::size_t rank = 256;
+  std::size_t gamma = 7;
+  std::size_t block = 8;
+  std::size_t q_dim = 3072;
+  std::size_t kv_dim = 1024;
+  std::size_t local_slots = 1024 + 8;  // kd::WINDOW + kd::BLOCK
+  std::size_t global_slot_bytes = 1024;
+  std::size_t max_slot_extra = 2048;   // kd::kMaxSlotExtra
+  std::size_t short_chunk = 16384;     // kShortChunk
+  std::size_t commit_piece = 1024;     // COMMIT_PIECE
+  std::size_t gemm_workspace_bytes = std::size_t(32) << 20;  // pk::Gemm workspace
+};
+
 struct DrafterVramPeakEstimate {
-  std::size_t load_peak_bytes = 0;   // peak while raw mtp.safetensors + cat + persistent MTP weights + fold_head coexist
-  std::size_t steady_bytes = 0;      // steady-state resident MTP weights + shortlist + KV rings + scratch + accept bufs
+  std::size_t cat_bytes = 0;         // transient concat buffer 2 * inter * H * 2 (81 MiB for [9216, 2304])
+  std::size_t load_peak_bytes = 0;   // peak while pk::Gemm + raw mtp.safetensors + cat + persistent MTP weights + fold_head coexist
+  std::size_t steady_bytes = 0;      // steady-state pk::Gemm + resident MTP weights + shortlist + KV rings + scratch + accept bufs
   std::size_t peak_bytes = 0;        // max(load_peak_bytes, steady_bytes)
 };
 
-// Conservative preflight peak VRAM bound for BatchDrafter BEFORE allocating the raw mtp.safetensors buffer.
-// Matches BatchDrafter::load() and BatchDrafter::BatchDrafter() exact buffer geometry.
+// Conservative preflight peak VRAM bound for BatchDrafter BEFORE allocating pk::Gemm or the raw mtp.safetensors buffer.
+// Matches BatchDrafter::load() and BatchDrafter::BatchDrafter() exact production buffer geometry.
 inline DrafterVramPeakEstimate estimate_drafter_peak_bytes(std::size_t mtp_raw_bytes, int inter, int max_batch,
                                                            int draft_ctx, int vocab, int shortlist_rows,
-                                                           int max_verify_width, bool fp8_head) {
-  constexpr std::size_t kH = 2048;
-  constexpr std::size_t kRank = 256;
-  constexpr std::size_t kGamma = 7;
-  constexpr std::size_t kBlock = 8;
-  constexpr std::size_t kKvDim = 512;
-  constexpr std::size_t kQDim = 2048;
-  constexpr std::size_t kQkvRows = kQDim + 2 * kKvDim;
-  constexpr std::size_t kLocalSlots = 2048;
-  constexpr std::size_t kGlobalSlotBytes = 1024;  // FP8 KV_DIM + scale/metadata
-  constexpr std::size_t kMaxSlotExtra = 1024;
-  constexpr std::size_t kShortChunk = 2048;
+                                                           int max_verify_width, bool fp8_head,
+                                                           const DrafterGeometry& g = DrafterGeometry{}) {
+  const std::size_t kQkvRows = g.q_dim + 2 * g.kv_dim;
   const std::size_t B = std::size_t(std::max(1, max_batch));
   const std::size_t I = std::size_t(std::max(1, inter));
   const std::size_t V = std::size_t(std::max(1, vocab));
@@ -106,34 +114,37 @@ inline DrafterVramPeakEstimate estimate_drafter_peak_bytes(std::size_t mtp_raw_b
   const std::size_t ctx = std::size_t(std::max(16, draft_ctx));
   const std::size_t short_K = std::size_t(std::max(0, shortlist_rows)) + 256;
 
-  // During BatchDrafter::load(), `raw` (mtp_raw_bytes) and `cat` (2 * I * H * 2) coexist with all persisted
-  // MTP weights (<= mtp_raw_bytes + 16 MiB for wkv_all FP8) plus fold_w_ and fold_b_.
-  const std::size_t cat_bytes = 2 * I * kH * 2;
+  // During BatchDrafter::load(), pk::Gemm (32 MiB), `raw` (mtp_raw_bytes), and `cat` (2 * I * H * 2 = 81 MiB for
+  // [9216, 2304]) coexist with all persisted MTP weights (<= mtp_raw_bytes + 16 MiB for wkv_all FP8) + fold_w_/fold_b_.
+  const std::size_t cat_bytes = 2 * I * g.H * 2;
   const std::size_t persistent_mtp_upper = mtp_raw_bytes + (std::size_t(16) << 20);
-  const std::size_t fold_head_bytes = V * (kRank + 1) * 2;
+  const std::size_t fold_head_bytes = V * (g.rank + 1) * 2;
   const std::size_t slack = std::size_t(64) << 20;
-  const std::size_t load_peak = mtp_raw_bytes + cat_bytes + persistent_mtp_upper + fold_head_bytes + slack;
+  const std::size_t load_peak =
+      g.gemm_workspace_bytes + mtp_raw_bytes + cat_bytes + persistent_mtp_upper + fold_head_bytes + slack;
 
   // Steady-state after `raw` and `cat` are freed:
-  const std::size_t shortlist_bytes = short_K * (fp8_head ? (kH + 4) : (2 * kH)) + short_K * 8;
-  const std::size_t local_kv = B * 4 * kLocalSlots * kKvDim * 2 + B * 2 * kLocalSlots * 4;
-  const std::size_t global_kv = B * 2 * ctx * kGlobalSlotBytes;
-  const std::size_t max_rows = B * kBlock;
-  const std::size_t max_gamma = B * kGamma;
+  const std::size_t shortlist_bytes = short_K * (fp8_head ? (g.H + 4) : (2 * g.H)) + short_K * 8;
+  const std::size_t local_kv = B * 4 * g.local_slots * g.kv_dim * 2 + B * 2 * (g.local_slots - g.block) * 4;
+  const std::size_t global_kv = B * 2 * ctx * g.global_slot_bytes;
+  const std::size_t max_rows = B * g.block;
+  const std::size_t max_gamma = B * g.gamma;
   const std::size_t max_commit = B * W;
+  const std::size_t wscratch_elems = std::max({kQkvRows * g.H, 2 * I * g.H, g.H * g.q_dim, g.H * I, g.short_chunk * g.H});
   const std::size_t act_scratch =
-      max_rows * (2 * kH + 2 * kQDim + I + kQkvRows + kH + 2 * I) * 2 +
-      max_gamma * (kH + kShortChunk) * 2 +
-      max_gamma * (short_K + kMaxSlotExtra) * 4 +
-      std::max({kQkvRows * kH, 2 * I * kH, kH * kQDim, kH * I, kShortChunk * kH}) * 2 +
-      max_commit * (3 * kH + 2 * kKvDim) * 2 +
-      (std::size_t(32) << 20);  // attn_ws + topk_ws + commit_piece + candidates
-  const std::size_t accept_bufs = (kBlock + kGamma + 1) * V * 4 + (std::size_t(16) << 20);
+      max_rows * (2 * g.H + 2 * g.q_dim + I + kQkvRows + g.H + 2 * I) * 2 +
+      max_gamma * (g.H + g.short_chunk) * 2 +
+      max_gamma * (short_K + g.max_slot_extra) * 4 +
+      wscratch_elems * 2 +
+      g.commit_piece * (g.H + 2 * g.kv_dim) * 2 +
+      max_commit * (3 * g.H + 2 * g.kv_dim) * 2 +
+      (std::size_t(32) << 20);  // attn_ws + topk_ws + candidates + f32 small-batch buffers
+  const std::size_t accept_bufs = (g.block + g.gamma + 1) * V * 4 + (std::size_t(16) << 20);
   const std::size_t steady =
-      persistent_mtp_upper + fold_head_bytes + shortlist_bytes + local_kv + global_kv + act_scratch + accept_bufs +
-      slack;
+      g.gemm_workspace_bytes + persistent_mtp_upper + fold_head_bytes + shortlist_bytes + local_kv + global_kv +
+      act_scratch + accept_bufs + slack;
 
-  return {load_peak, steady, std::max(load_peak, steady)};
+  return {cat_bytes, load_peak, steady, std::max(load_peak, steady)};
 }
 
 // Plans per-slot active verify widths w_cap[b] and shared launch bucket W_batch.

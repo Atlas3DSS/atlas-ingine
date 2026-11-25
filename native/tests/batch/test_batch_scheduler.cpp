@@ -762,26 +762,35 @@ void test_staggered_milestone_and_accounting() {
     CHECK(threw_neg && threw_dec && threw_nan);
   }
 
-  // Peak VRAM preflight checks (accounts for raw 635,795,744 B mtp.safetensors transient + persistent weights + fold_head!)
+  // Peak VRAM preflight checks using EXACT production geometry (H=2304, KV_DIM=1024, Q_DIM=3072, short_chunk=16384,
+  // MTP gate/up [9216, 2304] -> cat=81 MiB, raw mtp.safetensors=635,795,744 B, pk::Gemm=32 MiB, vocab=200058)!
   {
     constexpr std::size_t kMtpRawBytes = 635795744ull;
+    constexpr int kMtpInter = 9216;
+    constexpr int kProdVocab = 200058;
+    constexpr int kProdHidden = 2304;
+    const ingine::model::DrafterGeometry prod_g{};
+    CHECK(prod_g.H == 2304 && prod_g.kv_dim == 1024 && prod_g.q_dim == 3072 && prod_g.short_chunk == 16384);
     const auto d_est = ingine::model::estimate_drafter_peak_bytes(
-        kMtpRawBytes, 8192, 12, 2048, 200064, 16384, 8, true);
-    CHECK(d_est.load_peak_bytes > kMtpRawBytes);
+        kMtpRawBytes, kMtpInter, 12, 2048, kProdVocab, 16384, 8, true, prod_g);
+    CHECK(d_est.cat_bytes == std::size_t(2) * 9216 * 2304 * 2);  // exact 81 MiB (84,934,656 B)!
+    CHECK(d_est.load_peak_bytes > kMtpRawBytes + d_est.cat_bytes + prod_g.gemm_workspace_bytes);
     CHECK(d_est.peak_bytes >= d_est.load_peak_bytes && d_est.peak_bytes >= d_est.steady_bytes);
-    // 400 MiB remaining MUST fail closed BEFORE allocating the 606.34 MiB raw buffer!
+    // 0 B and 400 MiB remaining MUST fail closed BEFORE allocating pk::Gemm (32 MiB) or raw (606.34 MiB)!
+    CHECK(!ingine::model::check_vram_lease_fit(std::size_t(0), d_est.peak_bytes).ok);
     CHECK(!ingine::model::check_vram_lease_fit(std::size_t(400) << 20, d_est.peak_bytes).ok);
     // Near-cap rejection: 1 byte below peak_bytes fails, exact peak_bytes passes!
     CHECK(!ingine::model::check_vram_lease_fit(d_est.peak_bytes - 1, d_est.peak_bytes).ok);
     CHECK(ingine::model::check_vram_lease_fit(d_est.peak_bytes, d_est.peak_bytes).ok);
 
     // Weights & Prefiller preflight peak checks (near-cap rejection before load_weights / Prefiller!)
-    const std::size_t w_est = ingine::model::estimate_weights_peak_bytes(19526019168ull, true, 200064, 2048);
+    const std::size_t w_est =
+        ingine::model::estimate_weights_peak_bytes(19526019168ull, true, kProdVocab, kProdHidden);
     CHECK(w_est > 19526019168ull);
     CHECK(!ingine::model::check_vram_lease_fit(w_est - 1, w_est).ok);
     CHECK(ingine::model::check_vram_lease_fit(std::size_t(28) << 30, w_est).ok);
 
-    const std::size_t p_est = ingine::model::estimate_prefiller_peak_bytes(512, 200064, 12);
+    const std::size_t p_est = ingine::model::estimate_prefiller_peak_bytes(512, kProdVocab, 12);
     CHECK(p_est > (std::size_t(200) << 20));
     CHECK(!ingine::model::check_vram_lease_fit(p_est - 1, p_est).ok);
   }
