@@ -280,16 +280,73 @@ Json build_schema_skeleton(const Json& node, const Json& root, std::vector<std::
     }
     return obj;
   }
+  const std::string field = path.empty() ? std::string("root") : path;
   if (type == "array") {
+    int min_items = -1;
+    int max_items = -1;
+    if (const auto it = node.find("minItems"); it != node.end() && it->is_number_integer()) {
+      min_items = std::max(0, it->get<int>());
+    }
+    if (const auto it = node.find("maxItems"); it != node.end() && it->is_number_integer()) {
+      max_items = std::max(0, it->get<int>());
+    }
+    if (min_items >= 0 && max_items >= 0) {
+      if (min_items == max_items) {
+        constraints.push_back(field + ": array with exactly " + std::to_string(min_items) + " items");
+      } else {
+        constraints.push_back(field + ": array length between " + std::to_string(min_items) + " and " +
+                              std::to_string(max_items) + " items (inclusive)");
+      }
+    } else if (min_items >= 0) {
+      constraints.push_back(field + ": array with at least " + std::to_string(min_items) + " items");
+    } else if (max_items >= 0) {
+      constraints.push_back(field + ": array with at most " + std::to_string(max_items) + " items");
+    }
+    if (const auto it = node.find("uniqueItems"); it != node.end() && it->is_boolean() && it->get<bool>()) {
+      constraints.push_back(field + ": unique items");
+    }
     Json arr = Json::array();
     if (const auto items = node.find("items"); items != node.end() && items->is_object()) {
-      arr.push_back(build_schema_skeleton(*items, root, constraints, path + "[]", depth + 1));
+      const Json elem = build_schema_skeleton(*items, root, constraints, path + "[]", depth + 1);
+      int count = (min_items > 0) ? std::min(min_items, 4) : 1;
+      if (max_items >= 0) count = std::min(count, max_items);
+      for (int i = 0; i < count; ++i) arr.push_back(elem);
     }
     return arr;
   }
-  if (type == "string") return "<string>";
-  if (type == "integer") return 0;
-  if (type == "number") return 0.0;
+  if (type == "string") {
+    if (const auto it = node.find("minLength"); it != node.end() && it->is_number_integer()) {
+      constraints.push_back(field + ": minLength " + std::to_string(it->get<int>()));
+    }
+    if (const auto it = node.find("maxLength"); it != node.end() && it->is_number_integer()) {
+      constraints.push_back(field + ": maxLength " + std::to_string(it->get<int>()));
+    }
+    if (const std::string* pat = string_at(node, "pattern")) {
+      constraints.push_back(field + ": matches regex " + *pat);
+    }
+    if (const std::string* fmt = string_at(node, "format")) {
+      constraints.push_back(field + ": format " + *fmt);
+    }
+    return "<string>";
+  }
+  if (type == "integer" || type == "number") {
+    if (const auto it = node.find("minimum"); it != node.end() && it->is_number()) {
+      constraints.push_back(field + ": >= " + it->dump());
+    }
+    if (const auto it = node.find("exclusiveMinimum"); it != node.end() && it->is_number()) {
+      constraints.push_back(field + ": > " + it->dump());
+    }
+    if (const auto it = node.find("maximum"); it != node.end() && it->is_number()) {
+      constraints.push_back(field + ": <= " + it->dump());
+    }
+    if (const auto it = node.find("exclusiveMaximum"); it != node.end() && it->is_number()) {
+      constraints.push_back(field + ": < " + it->dump());
+    }
+    if (const auto it = node.find("multipleOf"); it != node.end() && it->is_number()) {
+      constraints.push_back(field + ": multiple of " + it->dump());
+    }
+    return (type == "integer") ? Json(0) : Json(0.0);
+  }
   if (type == "boolean") return false;
   return nullptr;
 }

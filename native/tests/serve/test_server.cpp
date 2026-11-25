@@ -880,6 +880,24 @@ void test_response_format_and_tool_ban() {
   CHECK(decoded_schema.find("\"$defs\"") == std::string::npos);
   CHECK(decoded_schema.find("\"additionalProperties\":false") == std::string::npos);
 
+  // Array length bounds (minItems/maxItems), numeric bounds, and string pattern/maxLength are preserved in constraints.
+  const Json bounded_schema = {
+      {"type", "object"},
+      {"additionalProperties", false},
+      {"properties",
+       {{"city", {{"type", "string"}, {"maxLength", 40}}},
+        {"population_millions", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 50.0}}},
+        {"landmarks", {{"type", "array"}, {"items", {{"type", "string"}}}, {"minItems", 2}, {"maxItems", 4}}}}},
+      {"required", Json::array({"city", "population_millions", "landmarks"})}};
+  r = chat(s->port(), {{"response_format", {{"type", "json_schema"}, {"json_schema", {{"name", "city"}, {"schema", bounded_schema}}}}}});
+  CHECK(r.status == 200);
+  const std::string decoded_bounded = g_fmt->decode(s->gen->calls().back().prompt_ids);
+  CHECK(decoded_bounded.find("\"landmarks\":[\"<string>\",\"<string>\"]") != std::string::npos);
+  CHECK(decoded_bounded.find("landmarks: array length between 2 and 4 items (inclusive)") != std::string::npos);
+  CHECK(decoded_bounded.find("population_millions: >= 0.0") != std::string::npos);
+  CHECK(decoded_bounded.find("population_millions: <= 50.0") != std::string::npos);
+  CHECK(decoded_bounded.find("city: maxLength 40") != std::string::npos);
+
   // Issue #2: enable_thinking=false without reasoning_effort clamps template effort to 0 and bans <|content_thinking|>.
   const int32_t think_tok = g_fmt->content_thinking_id();
   r = chat(s->port(), {{"enable_thinking", false}});
