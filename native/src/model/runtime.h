@@ -120,8 +120,9 @@ class Runtime {
   // Call widths available: {1}, or {1, 2, 4, 8} with options.spec.
   bool has_width(int m) const;
   std::span<const int> verify_widths() const;  // {2, 4, 8} with spec, else empty
-  bool needs_eager_step() const noexcept;      // true when host dispatch or streamed paged KV is active
-  bool has_verify_graph() const noexcept;      // false only when expert offload requires host dispatch
+  bool needs_eager_step() const noexcept;           // true when host dispatch or streamed paged KV is active
+  bool supports_conditional_graphs() const noexcept; // false if runtime/env disables conditional graph nodes
+  bool has_verify_graph() const noexcept;           // false when conditional graphs are disabled or host dispatch is needed
   Buffers& buffers(int m);
   std::int64_t* pos() { return static_cast<std::int64_t*>(pos_.p); }
 
@@ -217,6 +218,7 @@ class Runtime {
   std::map<int, cudaGraphExec_t> graphs_;
   std::map<int, cudaGraphExec_t> hooked_graphs_;
   std::vector<int> verify_widths_;
+  bool supports_conditional_graphs_ = false;
   // rollback scratch (VerifyBackup) and the width-1 undo records (StepUndo by position parity)
   DeviceBuffer backup_storage_;
   VerifyBackup backup_{};

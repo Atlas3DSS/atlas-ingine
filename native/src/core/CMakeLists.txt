@@ -1,15 +1,50 @@
 # Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
-add_library(ingine_core STATIC
-  arena.cu
-  decode_graph.cpp
-  device.cu
-  dtype.cpp
-  host_memory.cpp
-  paged_tier.cpp
-  safetensors.cpp
-  tensor.cpp
-)
-ingine_cuda_target(ingine_core)
+if(INGINE_BACKEND STREQUAL "CUDA")
+  add_library(ingine_core STATIC
+    arena.cu
+    decode_graph.cpp
+    device.cu
+    dtype.cpp
+    hal_cuda.cpp
+    host_memory.cpp
+    paged_tier.cpp
+    safetensors_io.cpp
+    safetensors_upload_cuda.cpp
+    tensor.cpp
+  )
+  ingine_cuda_target(ingine_core)
+  target_compile_definitions(ingine_core PUBLIC INGINE_BACKEND_CUDA=1 INGINE_BACKEND_CPU=0)
+  target_link_libraries(ingine_core PUBLIC
+    CUDA::cudart CUDA::nvtx3 Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)
+
+  add_library(ingine_ops STATIC
+    ops_fallback.cpp
+    ops_cuda.cpp
+  )
+  ingine_internal_includes(ingine_ops)
+  target_include_directories(ingine_ops PUBLIC ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(ingine_ops PUBLIC ingine_core)
+else()
+  add_library(ingine_core STATIC
+    dtype.cpp
+    hal_cpu.cpp
+    safetensors_io.cpp
+    safetensors_upload_cpu.cpp
+    tensor.cpp
+  )
+  target_compile_definitions(ingine_core PUBLIC INGINE_BACKEND_CUDA=0 INGINE_BACKEND_CPU=1)
+  target_link_libraries(ingine_core PUBLIC
+    Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)
+
+  add_library(ingine_ops STATIC
+    ops_fallback.cpp
+    ops_cpu.cpp
+  )
+  ingine_internal_includes(ingine_ops)
+  target_include_directories(ingine_ops PUBLIC ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(ingine_ops PUBLIC ingine_core Threads::Threads)
+endif()
+
 ingine_internal_includes(ingine_core)
 target_include_directories(ingine_core PUBLIC ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
 if(INGINE_ACT_FP16)
@@ -20,5 +55,3 @@ endif()
 if(INGINE_FORCE_SIMT_MMA)
   target_compile_definitions(ingine_core PUBLIC INGINE_FORCE_SIMT_MMA=1)
 endif()
-target_link_libraries(ingine_core PUBLIC
-  CUDA::cudart CUDA::nvtx3 Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)

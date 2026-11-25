@@ -4,6 +4,7 @@
 #include "model/runtime.h"
 
 #include "core/device.h"
+#include "core/hal.h"
 
 #include <algorithm>
 #include <array>
@@ -149,6 +150,7 @@ void Runtime::init() {
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
+  supports_conditional_graphs_ = hal::conditional_graphs_enabled();
   const bool eager_offload = weights_.expert_cache && weights_.expert_cache->needs_host_dispatch();
   if (!eager_offload) {
     for (const auto& [m, history] : history_) capture(m, history);
@@ -183,8 +185,10 @@ bool Runtime::needs_eager_step() const noexcept {
          (state_.paged_kv && state_.paged_kv->needs_streamed_decode());
 }
 
+bool Runtime::supports_conditional_graphs() const noexcept { return supports_conditional_graphs_; }
+
 bool Runtime::has_verify_graph() const noexcept {
-  return !(weights_.expert_cache && weights_.expert_cache->needs_host_dispatch());
+  return supports_conditional_graphs_ && !needs_eager_step();
 }
 
 Buffers& Runtime::buffers(int m) {
@@ -460,6 +464,9 @@ void Runtime::record_rollback(int m, const std::int32_t* accepted, cudaStream_t 
 
 GraphExec Runtime::capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
                                   const std::function<void(cudaStream_t, int)>& branch) {
+  if (!supports_conditional_graphs_) {
+    throw std::logic_error("capture_switch: conditional CUDA graphs are disabled or unsupported");
+  }
   if (verify_widths_.empty()) throw std::logic_error("capture_switch needs the speculative widths (options.spec)");
   const cudaStream_t s = capture_stream_;
   cudaGraph_t graph = nullptr;
