@@ -552,9 +552,10 @@ class EngineGenerator final : public Generator {
       stats.restored_bytes = 0u;
       stats.restore_seconds = 0.0;
       // Optional disk KV checkpoint resume (single-fd atomic validation + load):
-      //   * Explicit --kv-ckpt-resume fails loudly on runtime/producer/media/missing-logits mismatches, while
-      //     preserving legacy checkpoints that lack the v1 producer trailer (legacy resumes are never promoted
-      //     to reusable root entries).
+      //   * Explicit --kv-ckpt-resume fails loudly on runtime/producer/media/missing-logits mismatches — requiring a
+      //     verified matching reader whenever the file carries a v1 producer stamp — while preserving unstamped legacy
+      //     checkpoints that lack the v1 producer trailer (legacy resumes remain isolated and are never promoted to
+      //     reusable root entries).
       //   * Auto --kv-ckpt-path requires verified producer identity (weights package + ablation + act_dtype +
       //     dense_fp8 + kv_format + prefill_chunk), text-only prefix, non-spec mode, and boundary logits when
       //     pos == n; deliberate compatible case: max_ctx_at_save may differ as long as pos <= runtime.max_ctx.
@@ -583,9 +584,16 @@ class EngineGenerator final : public Generator {
               if (!kv_checkpoint_runtime_matches(info, req_identity)) {
                 throw std::runtime_error("--kv-ckpt-resume runtime dtype/kv_format mismatch");
               }
-              if (has_verified_producer_ && info.has_producer_identity && info.producer_sha256 != disk_producer_sha_) {
-                throw std::runtime_error(
-                    "--kv-ckpt-resume producer identity mismatch (weights package, dense_fp8, or prefill_chunk)");
+              if (info.has_producer_identity) {
+                if (!has_verified_producer_) {
+                  throw std::runtime_error(
+                      "--kv-ckpt-resume cannot verify stamped checkpoint producer against an unverified runtime "
+                      "(tiered offload or caller-supplied weights)");
+                }
+                if (info.producer_sha256 != disk_producer_sha_) {
+                  throw std::runtime_error(
+                      "--kv-ckpt-resume producer identity mismatch (weights package, dense_fp8, or prefill_chunk)");
+                }
               }
               if (info.pos > 0 && has_media_before(info.pos)) {
                 throw std::invalid_argument(

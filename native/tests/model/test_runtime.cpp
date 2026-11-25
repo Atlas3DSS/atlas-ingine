@@ -1086,12 +1086,16 @@ bool run_disk_checkpoint_dtype() {
   const std::filesystem::path ckpt_legacy = tmp_dir / "legacy.bin";
   const std::filesystem::path ckpt_legacy_desc = tmp_dir / "legacy_desc_96.bin";
   const std::filesystem::path ckpt_unverified = tmp_dir / "unverified_given.bin";
+  const std::filesystem::path ckpt_stamped = tmp_dir / "stamped_verified.bin";
+  const std::filesystem::path ckpt_stamped_bad_prompt = tmp_dir / "stamped_bad_prompt.bin";
   std::filesystem::remove(ckpt_same);
   std::filesystem::remove(ckpt_mixed);
   std::filesystem::remove(ckpt_fp32);
   std::filesystem::remove(ckpt_legacy);
   std::filesystem::remove(ckpt_legacy_desc);
   std::filesystem::remove(ckpt_unverified);
+  std::filesystem::remove(ckpt_stamped);
+  std::filesystem::remove(ckpt_stamped_bad_prompt);
 
   auto patch_act_dtype = [](const std::filesystem::path& src, const std::filesystem::path& dst,
                             std::uint32_t new_act_dtype) {
@@ -1197,7 +1201,8 @@ bool run_disk_checkpoint_dtype() {
                    saved_info.act_dtype == expected_disk_dtype,
                "disk checkpoint writes raw kActDType (" + std::to_string(expected_disk_dtype) + ") at pos=64" + tag);
 
-  // 2. Same-dtype explicit --kv-ckpt-resume MUST succeed and reproduce exact greedy tokens (including deliberate max_ctx=4096)
+  // 2. Same-dtype explicit --kv-ckpt-resume on unstamped checkpoint MUST succeed and reproduce exact greedy tokens
+  //    (including deliberate max_ctx=4096).
   {
     RuntimeOptions opt = base;
     opt.max_ctx = 4096;  // deliberate compatible case: pos=64 <= max_ctx
@@ -1206,6 +1211,80 @@ bool run_disk_checkpoint_dtype() {
     const auto [toks, st] = run_once(*gen, prompt);
     ok &= report(st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && toks == ref_tokens,
                  "same-dtype explicit --kv-ckpt-resume succeeds with exact parity (deliberate max_ctx=4096)" + tag);
+  }
+
+  // 2b. Stamped checkpoint on unknown caller-supplied given-weights reader MUST throw BEFORE import (both set_sha=false
+  //     and set_sha=true), even when prompt_sha256 is zeroed, leaving live state clean for cold fallback.
+  {
+    auto stamp_producer = [&](const std::filesystem::path& src, const std::filesystem::path& dst, bool zero_prompt_sha) {
+      std::ifstream in(src, std::ios::binary);
+      if (!in) throw std::runtime_error("cannot open checkpoint: " + src.string());
+      std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      if (bytes.size() < 4096) throw std::runtime_error("checkpoint smaller than 4096-byte header");
+      if (zero_prompt_sha) std::memset(bytes.data() + 80, 0, 32);  // RawHeader::prompt_sha256
+      const std::uint32_t flags = 1u;
+      const std::uint32_t dfp8 = 1u;
+      const std::int32_t chunk = 64;
+      const std::uint32_t resv = 0u;
+      std::memcpy(bytes.data() + 144, &flags, 4);
+      std::memcpy(bytes.data() + 148, &dfp8, 4);
+      std::memcpy(bytes.data() + 152, &chunk, 4);
+      std::memcpy(bytes.data() + 156, &resv, 4);
+      std::memcpy(bytes.data() + 160, synth_verified_sha.data(), 32);
+      std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+      if (!out) throw std::runtime_error("cannot write stamped checkpoint: " + dst.string());
+      out.write(bytes.data(), std::streamsize(bytes.size()));
+    };
+    stamp_producer(ckpt_same, ckpt_stamped, false);
+    stamp_producer(ckpt_same, ckpt_stamped_bad_prompt, true);
+    const KvCheckpointInfo si = inspect_kv_checkpoint(ckpt_stamped);
+    bool all_rejected_pre_import = si.has_producer_identity;
+    for (bool set_sha : {false, true}) {
+      for (const auto& spath : {ckpt_stamped, ckpt_stamped_bad_prompt}) {
+        RuntimeOptions ropt = base;
+        ropt.kv_ckpt_resume = spath;
+        auto gen = make_synth_gen(ropt, set_sha);
+        bool threw_producer = false;
+        try {
+          (void)run_once(*gen, prompt);
+        } catch (const std::runtime_error& e) {
+          threw_producer = std::string(e.what()).find("cannot verify stamped checkpoint producer") != std::string::npos;
+        }
+        const PrefixCacheStats cs = gen->cache_stats();
+        all_rejected_pre_import &=
+            (threw_producer && cs.root_entries == 0 && cs.vram_entries == 0 && cs.host_entries == 0);
+      }
+    }
+    // Direct pre-import proof: throwing inside load_kv_checkpoint_checked's eligibility callback leaves State untouched
+    // (st.length stays at its pre-call value 0 and zero payload/logits bytes are imported).
+    {
+      cudaStream_t s;
+      INGINE_TEST_CUDA(cudaStreamCreate(&s));
+      State st = make_state(base.max_ctx, true, false);
+      DeviceBuffer d_logits(std::size_t(UNPADDED_VOCAB) * sizeof(float));
+      d_logits.fill(0);
+      bool threw_pre = false;
+      try {
+        (void)load_kv_checkpoint_checked(st, {}, prompt, static_cast<float*>(d_logits.p), ckpt_stamped_bad_prompt, s,
+                                         [](const KvCheckpointInfo& info) -> bool {
+                                           if (info.has_producer_identity) {
+                                             throw std::runtime_error("pre-import reject");
+                                           }
+                                           return true;
+                                         });
+      } catch (const std::runtime_error& e) {
+        threw_pre = std::string(e.what()) == "pre-import reject";
+      }
+      std::vector<float> h_logits(64, 1.f);
+      INGINE_TEST_CUDA(cudaMemcpy(h_logits.data(), d_logits.p, h_logits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      bool logits_untouched = true;
+      for (float v : h_logits) logits_untouched &= (v == 0.f);
+      INGINE_TEST_CUDA(cudaStreamDestroy(s));
+      all_rejected_pre_import &= (threw_pre && st.length == 0 && logits_untouched);
+    }
+    ok &= report(all_rejected_pre_import,
+                 "stamped disk checkpoint rejected pre-import on given-weights unknown reader (set_sha=false/true)" +
+                     tag);
   }
 
   // 3. Supplied active Ablation with empty options.ablation MUST block periodic save, throw on explicit, decline auto

@@ -27,9 +27,13 @@
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
+#include <poll.h>
+#include <sys/inotify.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -37,6 +41,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace ingine::model;
@@ -687,50 +692,66 @@ int main(int argc, char** argv) {
             "Suite 2h-supplied-ablation: active supplied Ablation (empty options.ablation) blocks save, throws on explicit, declines auto");
     }
 
-    // 2h-consumed-weight-toctou: private 4608-byte embed_norm shard mutated on disk right after Load 1 loads weights
-    // (before Load 1 writes its checkpoint): Load 1's checkpoint MUST bind Load 1's consumed +embed_norm bytes so
-    // Load 2 (which consumes -embed_norm) declines auto-resume & throws on explicit resume!
+    // 2h-consumed-weight-toctou + unknown-reader explicit-resume gating:
+    //   1. Mutate private 4608-byte embed_norm shard on disk DURING Load 1 (triggered via inotify IN_ACCESS on
+    //      final_norm_priv.safetensors right after load_weights reads embed_norm and before flush/digest complete).
+    //      Load 1's checkpoint MUST bind Load 1's consumed +embed_norm bytes so Load 2 (which consumes -embed_norm)
+    //      declines auto-resume and throws on explicit resume.
+    //   2. Unknown-reader explicit resume (tiered expert offload AND caller-supplied given weights) MUST reject
+    //      Load 1's stamped checkpoint BEFORE import (even on mismatched prompts), while preserving explicit resume
+    //      for unstamped legacy checkpoints.
     if (std::filesystem::exists(dir / "model.safetensors.index.json")) {
       const std::filesystem::path priv_dir =
           std::filesystem::temp_directory_path() / ("s3_priv_toctou_" + std::string(use_kv_q4 ? "q4" : "fp8"));
       const std::filesystem::path ckpt_toctou = priv_dir / "toctou_pos64.bin";
+      const std::filesystem::path ckpt_toctou_legacy = priv_dir / "toctou_pos64_legacy.bin";
       std::error_code ec;
       std::filesystem::remove_all(priv_dir, ec);
       std::filesystem::create_directories(priv_dir);
-      // Symlink large weight shard(s) and config/quant files; override ONLY embed_norm into a tiny private shard.
+      // Symlink large weight shard(s) and config/quant files; override embed_norm and final_norm into tiny shards.
       for (const auto& entry : std::filesystem::directory_iterator(dir)) {
         const std::string fname = entry.path().filename().string();
         if (fname == "model.safetensors.index.json") continue;
         std::filesystem::create_symlink(entry.path(), priv_dir / fname, ec);
       }
       const std::string en_name = "model.llm.embed_norm.weight";
+      const std::string fn_name = "model.llm.norm.weight";
       const std::filesystem::path priv_shard = priv_dir / "embed_norm_priv.safetensors";
-      std::vector<std::byte> en_raw;
-      std::string en_dtype;
-      std::vector<std::int64_t> en_shape;
+      const std::filesystem::path fn_shard = priv_dir / "final_norm_priv.safetensors";
+      std::vector<std::byte> en_raw, fn_raw;
+      std::string en_dtype, fn_dtype;
+      std::vector<std::int64_t> en_shape, fn_shape;
       {
         const ingine::SafetensorsModel orig_m(dir);
-        const ingine::SafetensorsRef ref = orig_m.at(en_name);
-        en_dtype = ref->dtype;
-        en_shape = ref->shape;
+        const ingine::SafetensorsRef eref = orig_m.at(en_name);
+        en_dtype = eref->dtype;
+        en_shape = eref->shape;
         en_raw = orig_m.read(en_name);
+        const ingine::SafetensorsRef fref = orig_m.at(fn_name);
+        fn_dtype = fref->dtype;
+        fn_shape = fref->shape;
+        fn_raw = orig_m.read(fn_name);
       }
-      auto write_priv_embed_norm = [&](const std::vector<std::byte>& raw) {
+      auto write_single_shard = [](const std::filesystem::path& p, const std::string& tname, const std::string& dt,
+                                   const std::vector<std::int64_t>& shape, const std::vector<std::byte>& raw) {
         Json sh = Json::array();
-        for (auto d : en_shape) sh.push_back(d);
-        Json hdr = {{en_name, {{"dtype", en_dtype}, {"shape", sh}, {"data_offsets", Json::array({0, raw.size()})}}}};
+        for (auto d : shape) sh.push_back(d);
+        Json hdr = {{tname, {{"dtype", dt}, {"shape", sh}, {"data_offsets", Json::array({0, raw.size()})}}}};
         const std::string hdr_s = hdr.dump();
         const std::uint64_t hlen = std::uint64_t(hdr_s.size());
-        std::ofstream out(priv_shard, std::ios::binary | std::ios::trunc);
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
         out.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
         out.write(hdr_s.data(), std::streamsize(hdr_s.size()));
         out.write(reinterpret_cast<const char*>(raw.data()), std::streamsize(raw.size()));
+        out.flush();
       };
-      write_priv_embed_norm(en_raw);
+      write_single_shard(priv_shard, en_name, en_dtype, en_shape, en_raw);
+      write_single_shard(fn_shard, fn_name, fn_dtype, fn_shape, fn_raw);
       {
         std::ifstream in(dir / "model.safetensors.index.json");
         Json idx = Json::parse(in);
         idx["weight_map"][en_name] = "embed_norm_priv.safetensors";
+        idx["weight_map"][fn_name] = "final_norm_priv.safetensors";
         std::ofstream out(priv_dir / "model.safetensors.index.json", std::ios::trunc);
         out << idx.dump();
       }
@@ -744,53 +765,150 @@ int main(int argc, char** argv) {
       }
 
       const std::vector<std::int32_t> short_p(rp_root.ids.begin(), rp_root.ids.begin() + 100);
-      RunOut out1, out2_auto;
+      const std::vector<std::int32_t> exact_p(rp_root.ids.begin(), rp_root.ids.begin() + 64);
+      std::vector<std::int32_t> other_exact_p = exact_p;
+      other_exact_p[0] = (other_exact_p[0] == 1000) ? 1001 : 1000;
+
+      RuntimeOptions toctou_base = base_opt;
+      toctou_base.model_dir = priv_dir;
+      toctou_base.max_ctx = 512;
+      toctou_base.prefill_chunk = 64;
+      toctou_base.park_mb = 0;
+      toctou_base.park_host_mb = 0;
+
+      RunOut out1_exact, out2_auto;
+      bool mutated_during_load = false;
       bool toctou_saved = false;
       bool toctou_explicit_threw = false;
       {
-        RuntimeOptions topt = base_opt;
-        topt.model_dir = priv_dir;
-        topt.prefill_chunk = 64;
-        topt.park_mb = 0;
-        topt.park_host_mb = 0;
+        RuntimeOptions topt = toctou_base;
         topt.kv_ckpt_path = ckpt_toctou;
         topt.kv_ckpt_every = 64;
-        auto gen1 = make_generator(topt);  // consumes +embed_norm into GPU and hashes those exact bytes
-        // Mutate private embed_norm shard on disk to -embed_norm AFTER load_weights, BEFORE saving checkpoint!
-        write_priv_embed_norm(en_neg);
-        out1 = run_prompt(*gen1, Prompt{short_p, {}, 0}, 8, greedy);
+        // Watch final_norm_priv.safetensors: load_weights reads embed_norm first, then final_norm, then flushes
+        // ~1.8 GB embed/unembed and computes content_sha256. Overwrite embed_norm_priv.safetensors mid-load!
+        std::atomic<bool> load_done{false};
+        std::atomic<bool> flipped_mid_load{false};
+        const int ifd = ::inotify_init1(IN_NONBLOCK);
+        const int wd = (ifd >= 0) ? ::inotify_add_watch(ifd, fn_shard.c_str(), IN_ACCESS) : -1;
+        std::thread mutator([&] {
+          if (ifd < 0 || wd < 0) return;
+          char ibuf[512];
+          while (!load_done.load(std::memory_order_acquire)) {
+            struct pollfd pfd{ifd, POLLIN, 0};
+            if (::poll(&pfd, 1, 20) > 0 && (pfd.revents & POLLIN)) {
+              const ssize_t nr = ::read(ifd, ibuf, sizeof(ibuf));
+              if (nr > 0) {
+                write_single_shard(priv_shard, en_name, en_dtype, en_shape, en_neg);
+                flipped_mid_load.store(!load_done.load(std::memory_order_acquire), std::memory_order_release);
+                break;
+              }
+            }
+          }
+        });
+        auto gen1 = make_generator(topt);  // consumes +embed_norm; shard flips to -embed_norm mid-load!
+        load_done.store(true, std::memory_order_release);
+        mutator.join();
+        if (wd >= 0) ::inotify_rm_watch(ifd, wd);
+        if (ifd >= 0) ::close(ifd);
+        mutated_during_load = flipped_mid_load.load(std::memory_order_acquire);
+        (void)run_prompt(*gen1, Prompt{short_p, {}, 0}, 8, greedy);
+        out1_exact = run_prompt(*gen1, Prompt{exact_p, {}, 0, "", true}, 16, greedy);
         toctou_saved = std::filesystem::exists(ckpt_toctou) && inspect_kv_checkpoint(ckpt_toctou).pos == 64 &&
                        inspect_kv_checkpoint(ckpt_toctou).has_producer_identity;
       }
       {
-        RuntimeOptions topt = base_opt;
-        topt.model_dir = priv_dir;
-        topt.prefill_chunk = 64;
-        topt.park_mb = 0;
-        topt.park_host_mb = 0;
+        RuntimeOptions topt = toctou_base;
         topt.kv_ckpt_path = ckpt_toctou;
         topt.kv_ckpt_every = 0;
         auto gen2 = make_generator(topt);  // consumes -embed_norm -> different consumed producer digest!
-        out2_auto = run_prompt(*gen2, Prompt{short_p, {}, 0}, 8, greedy);
+        out2_auto = run_prompt(*gen2, Prompt{exact_p, {}, 0}, 16, greedy);
       }
       {
-        RuntimeOptions topt = base_opt;
-        topt.model_dir = priv_dir;
-        topt.prefill_chunk = 64;
-        topt.park_mb = 0;
-        topt.park_host_mb = 0;
+        RuntimeOptions topt = toctou_base;
         topt.kv_ckpt_resume = ckpt_toctou;
         auto gen3 = make_generator(topt);
         try {
-          run_prompt(*gen3, Prompt{short_p, {}, 0}, 8, greedy);
-        } catch (const std::exception&) {
-          toctou_explicit_threw = true;
+          run_prompt(*gen3, Prompt{exact_p, {}, 0}, 8, greedy);
+        } catch (const std::runtime_error& e) {
+          toctou_explicit_threw =
+              std::string(e.what()).find("producer identity mismatch") != std::string::npos;
+        }
+      }
+      check(mutated_during_load && toctou_saved && out2_auto.stats.reuse == Reuse::None &&
+                out2_auto.stats.reused_tokens == 0 && out2_auto.tokens != out1_exact.tokens && toctou_explicit_threw,
+            "Suite 2h-consumed-weight-toctou: during-load embed_norm mutation yields distinct consumed producer SHA (auto declines & explicit throws)");
+
+      // Unknown-reader explicit-resume gating on revision B (-embed_norm) against revision A's stamped checkpoint:
+      //   * Branch 1: tiered expert offload (offload_vram_mb=12288, offload_ram_mb=512)
+      //   * Branch 2: caller-supplied given-weights overload (make_generator(opt, load_weights(...), Ablation{}))
+      //   * Unstamped legacy checkpoint remains explicitly resumable (isolated, root_entries==0).
+      bool tiered_stamped_rejected = false;
+      bool given_stamped_rejected = false;
+      bool unknown_legacy_preserved = false;
+      if (toctou_saved) {
+        {
+          RuntimeOptions topt = toctou_base;
+          topt.offload_vram_mb = 12288;
+          topt.offload_ram_mb = 512;
+          topt.kv_ckpt_resume = ckpt_toctou;
+          auto gen_t = make_generator(topt);
+          bool threw_match = false, threw_other = false;
+          try {
+            run_prompt(*gen_t, Prompt{exact_p, {}, 0}, 16, greedy);
+          } catch (const std::runtime_error& e) {
+            threw_match = std::string(e.what()).find("cannot verify stamped checkpoint producer") != std::string::npos;
+          }
+          try {
+            run_prompt(*gen_t, Prompt{other_exact_p, {}, 0}, 16, greedy);
+          } catch (const std::runtime_error& e) {
+            threw_other = std::string(e.what()).find("cannot verify stamped checkpoint producer") != std::string::npos;
+          }
+          const PrefixCacheStats cs = gen_t->cache_stats();
+          tiered_stamped_rejected =
+              threw_match && threw_other && cs.root_entries == 0 && cs.vram_entries == 0 && cs.host_entries == 0;
+        }
+        {
+          RuntimeOptions gopt = toctou_base;
+          gopt.kv_ckpt_resume = ckpt_toctou;
+          cudaStream_t s;
+          INGINE_TEST_CUDA(cudaStreamCreate(&s));
+          Weights w = load_weights(priv_dir, gopt.dense_fp8, s);
+          INGINE_TEST_CUDA(cudaStreamDestroy(s));
+          const bool w_has_sha = w.content_sha256.has_value();
+          auto gen_g = make_generator(gopt, std::move(w), Ablation{});
+          bool threw_match = false, threw_other = false;
+          try {
+            run_prompt(*gen_g, Prompt{exact_p, {}, 0}, 16, greedy);
+          } catch (const std::runtime_error& e) {
+            threw_match = std::string(e.what()).find("cannot verify stamped checkpoint producer") != std::string::npos;
+          }
+          try {
+            run_prompt(*gen_g, Prompt{other_exact_p, {}, 0}, 16, greedy);
+          } catch (const std::runtime_error& e) {
+            threw_other = std::string(e.what()).find("cannot verify stamped checkpoint producer") != std::string::npos;
+          }
+          const PrefixCacheStats cs = gen_g->cache_stats();
+          given_stamped_rejected = w_has_sha && threw_match && threw_other && cs.root_entries == 0 &&
+                                   cs.vram_entries == 0 && cs.host_entries == 0;
+        }
+        strip_producer_from_kv_checkpoint(ckpt_toctou, ckpt_toctou_legacy);
+        {
+          RuntimeOptions lopt = toctou_base;
+          lopt.park_mb = 512;
+          lopt.kv_ckpt_resume = ckpt_toctou_legacy;
+          cudaStream_t s;
+          INGINE_TEST_CUDA(cudaStreamCreate(&s));
+          Weights w = load_weights(priv_dir, lopt.dense_fp8, s);
+          INGINE_TEST_CUDA(cudaStreamDestroy(s));
+          auto gen_l = make_generator(lopt, std::move(w), Ablation{});
+          const RunOut leg = run_prompt(*gen_l, Prompt{short_p, {}, 64}, 8, greedy);
+          unknown_legacy_preserved = (leg.stats.reuse == Reuse::Checkpoint && leg.stats.reused_tokens == 64 &&
+                                      gen_l->cache_stats().root_entries == 0);
         }
       }
       std::filesystem::remove_all(priv_dir, ec);
-      check(toctou_saved && out2_auto.stats.reuse == Reuse::None && out2_auto.stats.reused_tokens == 0 &&
-                out2_auto.tokens != out1.tokens && toctou_explicit_threw,
-            "Suite 2h-consumed-weight-toctou: mutated embed_norm after Load 1 yields distinct consumed producer SHA (auto declines & explicit throws)");
+      check(tiered_stamped_rejected && given_stamped_rejected && unknown_legacy_preserved,
+            "Suite 2h-unknown-reader-explicit: tiered offload & given-weights reject stamped ckpt pre-import while preserving unstamped legacy");
     }
   }
 
