@@ -43,6 +43,11 @@ inline constexpr std::string_view END_SAMPLING = "<|content_model_end_sampling|>
 inline constexpr std::string_view ENDOFTEXT = "<|endoftext|>";
 inline constexpr std::string_view EFFORT_LEVELS[] = {"none", "minimal", "low", "medium", "high", "xhigh", "max"};
 
+enum class ChatFormatKind : std::uint8_t {
+  Inkling2 = 0,
+  Qwen3_5 = 1,
+};
+
 // Invalid chat request (HTTP 400); `param` names the offending request field. what() is the Python message.
 struct ChatError : std::runtime_error {
   std::string param;
@@ -130,7 +135,7 @@ class StreamParser {
  private:
   friend class ChatFormat;
   enum class State { Outside, Header, Body };
-  enum class Kind { None, Thinking, Text, ToolJson };
+  enum class Kind { None, Thinking, Text, ToolJson, ToolXml };
   struct Detokenizer {
     std::vector<int32_t> ids;
     std::size_t prefix = 0, read = 0;
@@ -157,6 +162,7 @@ class StreamParser {
   void tool_args(const ToolState& t, const std::string& args, std::vector<Delta>& out);
   void tool_text(const std::string& text, std::vector<Delta>& out);
   void close_tool(std::vector<Delta>& out);
+  void close_qwen_tool(std::vector<Delta>& out, bool complete);
 
   std::shared_ptr<const detail::FormatData> fmt_;
   std::vector<std::string> stop_;
@@ -169,6 +175,8 @@ class StreamParser {
   Detokenizer detok_;
   std::string hold_;  // content withheld while it may begin a stop string
   std::optional<ToolState> tool_;
+  std::string xml_tool_buf_;
+  bool qwen_strip_leading_newlines_ = false;
   std::string reasoning_, content_;
   std::vector<ToolCall> tool_calls_;
   int num_tokens_ = 0;
@@ -214,6 +222,7 @@ class ChatFormat {
   // Build a per-request JSON / JSON-Schema token masker primed with prefill_ids (nullptr for None).
   std::shared_ptr<model::TokenMasker> make_json_masker(const JsonFormatSpec& spec,
                                                        std::span<const int32_t> prefill_ids) const;
+  ChatFormatKind kind() const noexcept;
 
  private:
   explicit ChatFormat(std::shared_ptr<const detail::FormatData> data) : data_(std::move(data)) {}

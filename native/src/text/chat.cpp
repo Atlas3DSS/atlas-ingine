@@ -41,11 +41,13 @@ struct VocabIndexCache {
 };
 
 struct FormatData {
+  ChatFormatKind kind = ChatFormatKind::Inkling2;
   Tokenizer tokenizer;
   JinjaTemplate chat_template;
   int32_t message_model = -1, message_user = -1, message_system = -1, message_tool = -1;
   int32_t content_text = -1, content_thinking = -1, content_invoke_tool_json = -1, end_message = -1, end_sampling = -1,
           endoftext = -1;
+  int32_t im_start = -1, im_end = -1, think = -1, end_think = -1, tool_call = -1, end_tool_call = -1;
   std::unordered_set<int32_t> stop_ids;
   std::unordered_map<int32_t, int> content_kind;  // tag id -> StreamParser kind (1 thinking, 2 text, 3 tool json)
   std::unique_ptr<RenderCache> cache = std::make_unique<RenderCache>();
@@ -355,25 +357,43 @@ std::vector<Delta> merge_deltas(const std::vector<Delta>& deltas) {
 
 ChatFormat ChatFormat::load(const std::filesystem::path& model_dir) {
   auto data = std::make_shared<detail::FormatData>(detail::FormatData{
-      Tokenizer::load(model_dir), JinjaTemplate(read_file(model_dir / "chat_template.jinja"))});
+      ChatFormatKind::Inkling2, Tokenizer::load(model_dir), JinjaTemplate(read_file(model_dir / "chat_template.jinja"))});
   const Tokenizer& tok = data->tokenizer;
-  data->message_model = require_id(tok, MESSAGE_MODEL);
-  data->message_user = require_id(tok, MESSAGE_USER);
-  data->message_system = require_id(tok, MESSAGE_SYSTEM);
-  data->message_tool = require_id(tok, MESSAGE_TOOL);
-  data->content_text = require_id(tok, CONTENT_TEXT);
-  data->content_thinking = require_id(tok, CONTENT_THINKING);
-  data->content_invoke_tool_json = require_id(tok, CONTENT_INVOKE_TOOL_JSON);
-  data->end_message = require_id(tok, END_MESSAGE);
-  data->end_sampling = require_id(tok, END_SAMPLING);
-  data->endoftext = require_id(tok, ENDOFTEXT);
-  data->stop_ids = {data->end_sampling, data->endoftext, data->message_user, data->message_system,
-                    data->message_tool};
-  data->content_kind = {{data->content_thinking, 1},
-                        {data->content_text, 2},
-                        {require_id(tok, CONTENT_TOOL_ERROR), 2},
-                        {require_id(tok, CONTENT_INVOKE_TOOL_TEXT), 2},
-                        {data->content_invoke_tool_json, 3}};
+  if (tok.token_id(MESSAGE_MODEL).has_value()) {
+    data->kind = ChatFormatKind::Inkling2;
+    data->message_model = require_id(tok, MESSAGE_MODEL);
+    data->message_user = require_id(tok, MESSAGE_USER);
+    data->message_system = require_id(tok, MESSAGE_SYSTEM);
+    data->message_tool = require_id(tok, MESSAGE_TOOL);
+    data->content_text = require_id(tok, CONTENT_TEXT);
+    data->content_thinking = require_id(tok, CONTENT_THINKING);
+    data->content_invoke_tool_json = require_id(tok, CONTENT_INVOKE_TOOL_JSON);
+    data->end_message = require_id(tok, END_MESSAGE);
+    data->end_sampling = require_id(tok, END_SAMPLING);
+    data->endoftext = require_id(tok, ENDOFTEXT);
+    data->stop_ids = {data->end_sampling, data->endoftext, data->message_user, data->message_system,
+                      data->message_tool};
+    data->content_kind = {{data->content_thinking, 1},
+                          {data->content_text, 2},
+                          {require_id(tok, CONTENT_TOOL_ERROR), 2},
+                          {require_id(tok, CONTENT_INVOKE_TOOL_TEXT), 2},
+                          {data->content_invoke_tool_json, 3}};
+  } else if (tok.token_id("<|im_start|>").has_value() && tok.token_id("<|im_end|>").has_value() &&
+             tok.token_id(ENDOFTEXT).has_value() && tok.token_id("<think>").has_value() &&
+             tok.token_id("</think>").has_value() && tok.token_id("<tool_call>").has_value() &&
+             tok.token_id("</tool_call>").has_value()) {
+    data->kind = ChatFormatKind::Qwen3_5;
+    data->im_start = require_id(tok, "<|im_start|>");
+    data->im_end = require_id(tok, "<|im_end|>");
+    data->endoftext = require_id(tok, ENDOFTEXT);
+    data->think = require_id(tok, "<think>");
+    data->end_think = require_id(tok, "</think>");
+    data->tool_call = require_id(tok, "<tool_call>");
+    data->end_tool_call = require_id(tok, "</tool_call>");
+    data->stop_ids = {data->endoftext, data->im_end};
+  } else {
+    throw std::invalid_argument("unsupported chat format in " + model_dir.string());
+  }
   return ChatFormat(std::move(data));
 }
 
@@ -391,6 +411,8 @@ std::shared_ptr<model::TokenMasker> ChatFormat::make_json_masker(const JsonForma
   if (spec.mode == JsonFormatMode::None) return nullptr;
   return make_json_fsm(vocab_index(), spec, prefill_ids);
 }
+
+ChatFormatKind ChatFormat::kind() const noexcept { return data_->kind; }
 
 void ChatFormat::clear_render_cache() const {
   std::lock_guard lock(data_->cache->mu);
@@ -416,7 +438,10 @@ std::vector<int32_t> ChatFormat::stop_ids() const {
   return ids;
 }
 
-std::vector<int32_t> ChatFormat::no_thinking_prefill() const { return {data_->message_model, data_->content_text}; }
+std::vector<int32_t> ChatFormat::no_thinking_prefill() const {
+  if (data_->kind == ChatFormatKind::Qwen3_5) return {};
+  return {data_->message_model, data_->content_text};
+}
 
 int32_t ChatFormat::content_invoke_tool_json_id() const { return data_->content_invoke_tool_json; }
 
@@ -428,7 +453,22 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
   const auto t0 = std::chrono::steady_clock::now();
   Json msgs = normalize_messages(messages);
   if (!tools.is_null() && !tools.is_array()) throw ChatError("'tools' must be a list", "tools");
-  const Json effort = normalize_effort(options.reasoning_effort);
+  const bool thinking_enabled = py::truthy(options.enable_thinking);
+  Json effort;
+  if (data_->kind == ChatFormatKind::Inkling2) {
+    effort = normalize_effort(options.reasoning_effort);
+  } else if (thinking_enabled && !options.reasoning_effort.is_null()) {
+    if (!options.reasoning_effort.is_string()) {
+      throw ChatError("invalid reasoning_effort: expected one of xhigh, medium, low", "reasoning_effort");
+    }
+    const std::string key = uni::py_lower(uni::py_strip(options.reasoning_effort.get_ref<const std::string&>()));
+    if (key != "xhigh" && key != "medium" && key != "low") {
+      throw ChatError("invalid reasoning_effort " + py::repr(options.reasoning_effort) +
+                          ": expected one of xhigh, medium, low",
+                      "reasoning_effort");
+    }
+    effort = Json(key);
+  }
 
   // tokenizer.apply_chat_template(msgs, tools=tools or None, tokenize=False, reasoning_effort=effort, **kwargs)
   Json context = Json::object();
@@ -489,8 +529,14 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
   context["messages"] = std::move(msgs);
   context["tools"] = std::move(tool_schemas);
   context["documents"] = nullptr;
-  context["add_generation_prompt"] = false;
-  context["reasoning_effort"] = effort;
+  if (data_->kind == ChatFormatKind::Qwen3_5) {
+    context["add_generation_prompt"] = true;
+    context["enable_thinking"] = thinking_enabled;
+    if (!effort.is_null()) context["reasoning_effort"] = effort;
+  } else {
+    context["add_generation_prompt"] = false;
+    context["reasoning_effort"] = effort;
+  }
 
   RenderedPrompt prompt;
   try {
@@ -498,10 +544,14 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
   } catch (const TemplateError& e) {
     throw ChatError(std::string("chat template error: ") + e.what());
   }
-  if (!py::truthy(options.enable_thinking)) {
-    prompt.text += MESSAGE_MODEL;
-    prompt.text += CONTENT_TEXT;
-    prompt.prefill_ids = no_thinking_prefill();
+  if (data_->kind == ChatFormatKind::Inkling2) {
+    if (!thinking_enabled) {
+      prompt.text += MESSAGE_MODEL;
+      prompt.text += CONTENT_TEXT;
+      prompt.prefill_ids = no_thinking_prefill();
+    }
+  } else {
+    if (thinking_enabled) prompt.prefill_ids = {data_->think};
   }
   prompt.ids = encode_prompt(*data_, prompt.text, prompt.stats);
   // Verified stable root-prefix boundary directly on the actual rendered token IDs:
@@ -565,6 +615,10 @@ StreamParser::StreamParser(std::shared_ptr<const detail::FormatData> fmt, std::v
     stop_.push_back(std::move(s));
   }
   hold_len_ = longest - 1;
+  if (fmt_->kind == ChatFormatKind::Qwen3_5) {
+    state_ = State::Body;
+    kind_ = Kind::Text;
+  }
 }
 
 Completion StreamParser::result() const {
@@ -581,6 +635,49 @@ std::vector<Delta> StreamParser::feed(int32_t tok) {
   if (fmt.stop_ids.contains(tok)) {
     end_body(out);
     saw_stop_token_ = true;
+    return out;
+  }
+  if (fmt.kind == ChatFormatKind::Qwen3_5) {
+    if (tok == fmt.think) {
+      if (state_ != State::Body || kind_ != Kind::Thinking) {
+        end_body(out);
+        state_ = State::Body;
+        kind_ = Kind::Thinking;
+        qwen_strip_leading_newlines_ = false;
+      }
+      return out;
+    }
+    if (tok == fmt.end_think) {
+      end_body(out);
+      state_ = State::Body;
+      kind_ = Kind::Text;
+      qwen_strip_leading_newlines_ = true;
+      return out;
+    }
+    if (tok == fmt.tool_call) {
+      end_body(out);
+      state_ = State::Body;
+      kind_ = Kind::ToolXml;
+      xml_tool_buf_.clear();
+      qwen_strip_leading_newlines_ = false;
+      return out;
+    }
+    if (tok == fmt.end_tool_call) {
+      if (state_ == State::Body && kind_ == Kind::ToolXml) {
+        const std::string tail = detok_flush();
+        if (!tail.empty()) xml_tool_buf_ += tail;
+        close_qwen_tool(out, true);
+      }
+      state_ = State::Body;
+      kind_ = Kind::Text;
+      qwen_strip_leading_newlines_ = true;
+      return out;
+    }
+    if (fmt.tokenizer.is_special(tok)) return out;
+    if (state_ == State::Body) {
+      const std::string text = detok_push(tok);
+      if (!text.empty()) route(text, out);
+    }
     return out;
   }
   if (const auto kind = fmt.content_kind.find(tok); kind != fmt.content_kind.end()) {
@@ -685,6 +782,8 @@ void StreamParser::end_body(std::vector<Delta>& out) {
     hold_.clear();
   } else if (kind_ == Kind::ToolJson && tool_) {
     close_tool(out);
+  } else if (kind_ == Kind::ToolXml) {
+    close_qwen_tool(out, false);
   }
   state_ = State::Outside;
   kind_ = Kind::None;
@@ -695,9 +794,19 @@ void StreamParser::route(const std::string& text, std::vector<Delta>& out) {
     reasoning_ += text;
     out.push_back(Delta{.reasoning_content = text});
   } else if (kind_ == Kind::Text) {
+    if (fmt_->kind == ChatFormatKind::Qwen3_5 && qwen_strip_leading_newlines_) {
+      std::size_t i = 0;
+      while (i < text.size() && text[i] == '\n') ++i;
+      if (i == text.size()) return;
+      qwen_strip_leading_newlines_ = false;
+      this->text(text.substr(i), out);
+      return;
+    }
     this->text(text, out);
   } else if (kind_ == Kind::ToolJson) {
     tool_text(text, out);
+  } else if (kind_ == Kind::ToolXml) {
+    xml_tool_buf_ += text;
   }
 }
 
@@ -794,6 +903,77 @@ void StreamParser::close_tool(std::vector<Delta>& out) {
   t.name = name;
   announce(t, out);
   tool_args(t, arguments, out);
+}
+
+void StreamParser::close_qwen_tool(std::vector<Delta>& out, bool complete) {
+  const std::string raw = std::move(xml_tool_buf_);
+  xml_tool_buf_.clear();
+  const std::string_view sv(raw);
+  constexpr std::string_view kFnPrefix = "<function=";
+  constexpr std::string_view kFnEnd = "</function>";
+  constexpr std::string_view kParamPrefix = "<parameter=";
+  constexpr std::string_view kParamEnd = "</parameter>";
+
+  const std::size_t fn_pos = sv.find(kFnPrefix);
+  if (fn_pos == std::string_view::npos) return;
+  const std::size_t name_start = fn_pos + kFnPrefix.size();
+  const std::size_t name_end = sv.find('>', name_start);
+  if (name_end == std::string_view::npos) return;
+  const std::string name(uni::py_strip(sv.substr(name_start, name_end - name_start)));
+  if (name.empty()) return;
+
+  const std::size_t body_start = name_end + 1;
+  const std::size_t fn_end = sv.find(kFnEnd, body_start);
+  if (fn_end == std::string_view::npos && !complete) return;
+  const std::string_view body =
+      fn_end == std::string_view::npos ? sv.substr(body_start) : sv.substr(body_start, fn_end - body_start);
+
+  Json args_obj = Json::object();
+  std::size_t cursor = 0;
+  while (cursor < body.size()) {
+    const std::size_t p_pos = body.find(kParamPrefix, cursor);
+    if (p_pos == std::string_view::npos) break;
+    const std::size_t pname_start = p_pos + kParamPrefix.size();
+    const std::size_t pname_end = body.find('>', pname_start);
+    if (pname_end == std::string_view::npos) break;
+    const std::string pname(uni::py_strip(body.substr(pname_start, pname_end - pname_start)));
+    std::size_t val_start = pname_end + 1;
+    if (val_start < body.size() && body[val_start] == '\r') ++val_start;
+    if (val_start < body.size() && body[val_start] == '\n') ++val_start;
+
+    std::size_t val_end = body.find(kParamEnd, val_start);
+    if (val_end == std::string_view::npos) {
+      const std::size_t next_p = body.find(kParamPrefix, val_start);
+      val_end = (next_p == std::string_view::npos) ? body.size() : next_p;
+      cursor = val_end;
+    } else {
+      cursor = val_end + kParamEnd.size();
+    }
+    std::string_view val = body.substr(val_start, val_end - val_start);
+    if (!val.empty() && val.back() == '\n') val.remove_suffix(1);
+    if (!val.empty() && val.back() == '\r') val.remove_suffix(1);
+
+    if (!pname.empty()) {
+      const std::string_view stripped = uni::py_strip(val);
+      bool parsed_json = false;
+      if (!stripped.empty() &&
+          (stripped.front() == '{' || stripped.front() == '[' || stripped == "true" || stripped == "false" ||
+           stripped == "null" || (stripped.front() == '-' || (stripped.front() >= '0' && stripped.front() <= '9')))) {
+        try {
+          args_obj[pname] = py::json_loads(stripped);
+          parsed_json = true;
+        } catch (const py::JsonDecodeError&) {
+        }
+      }
+      if (!parsed_json) args_obj[pname] = std::string(val);
+    }
+  }
+
+  const int idx = static_cast<int>(tool_calls_.size());
+  const std::string id = new_id_();
+  const std::string arguments = py::json_dumps(args_obj);
+  tool_calls_.push_back(ToolCall{id, name, arguments});
+  out.push_back(Delta{.tool_call = ToolCallDelta{idx, id, name, arguments}});
 }
 
 }  // namespace ingine::text

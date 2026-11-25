@@ -7,8 +7,10 @@
 #include <utf8proc/utf8proc.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -24,6 +26,13 @@ constexpr std::string_view kSplitPattern =
     "|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     "|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
+constexpr std::string_view kQwen2SplitPattern =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)"
+    "|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+"
+    "|\\p{N}"
+    "| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*"
+    "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
 void require(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(std::string("tokenizer.json: unsupported ") + what);
 }
@@ -32,30 +41,53 @@ bool has_type(const Json& v, const char* name) {
   return v.is_object() && v.contains("type") && v["type"] == name;
 }
 
-// The pipeline this tokenizer implements; anything else is rejected rather than silently mis-tokenised.
-void validate_pipeline(const Json& root, const Json& model) {
-  require(!root.contains("normalizer") || root["normalizer"].is_null(), "normalizer (expected none)");
+struct PipelineSpec {
+  Tokenizer::NormalizerKind normalizer = Tokenizer::NormalizerKind::None;
+  Tokenizer::SplitMode split = Tokenizer::SplitMode::O200k;
+  bool ignore_merges = true;
+};
+
+// The pipelines this tokenizer implements; anything else is rejected rather than silently mis-tokenised.
+PipelineSpec validate_pipeline(const Json& root, const Json& model) {
+  PipelineSpec spec;
+  if (!root.contains("normalizer") || root["normalizer"].is_null()) {
+    spec.normalizer = Tokenizer::NormalizerKind::None;
+  } else if (has_type(root["normalizer"], "NFC")) {
+    spec.normalizer = Tokenizer::NormalizerKind::Nfc;
+  } else {
+    require(false, "normalizer");
+  }
   const Json& pre = root.at("pre_tokenizer");
   require(has_type(pre, "Sequence") && pre.contains("pretokenizers") && pre["pretokenizers"].is_array() &&
               pre["pretokenizers"].size() == 2,
           "pre_tokenizer");
   const Json& split = pre["pretokenizers"][0];
   const Json& bytes = pre["pretokenizers"][1];
-  require(has_type(split, "Split") && split.contains("pattern") && split["pattern"].is_object() &&
-              split["pattern"].value("Regex", std::string{}) == kSplitPattern &&
-              split.value("behavior", std::string{}) == "Isolated" && split.value("invert", Json(false)) == false,
+  const std::string regex =
+      split.contains("pattern") && split["pattern"].is_object() ? split["pattern"].value("Regex", std::string{}) : std::string{};
+  if (regex == kSplitPattern) {
+    spec.split = Tokenizer::SplitMode::O200k;
+  } else if (regex == kQwen2SplitPattern) {
+    spec.split = Tokenizer::SplitMode::Qwen2;
+  } else {
+    require(false, "pre_tokenizer.Split");
+  }
+  require(has_type(split, "Split") && split.value("behavior", std::string{}) == "Isolated" &&
+              split.value("invert", Json(false)) == false,
           "pre_tokenizer.Split");
   require(has_type(bytes, "ByteLevel") && bytes.value("add_prefix_space", Json(true)) == false &&
               bytes.value("use_regex", Json(true)) == false,
           "pre_tokenizer.ByteLevel");
   require(has_type(root.at("decoder"), "ByteLevel"), "decoder");
   require(has_type(model, "BPE"), "model.type");
-  require(model.value("ignore_merges", Json(false)) == true, "model.ignore_merges (expected true)");
+  require(model.contains("ignore_merges") && model["ignore_merges"].is_boolean(), "model.ignore_merges");
+  spec.ignore_merges = model["ignore_merges"].get<bool>();
   require(model.value("byte_fallback", Json(false)) == false, "model.byte_fallback");
   require(!model.contains("dropout") || model["dropout"].is_null(), "model.dropout");
   for (const char* field : {"continuing_subword_prefix", "end_of_word_suffix"}) {
     require(!model.contains(field) || model[field].is_null() || model[field] == "", field);
   }
+  return spec;
 }
 
 // GPT-2 byte <-> unicode alphabet.
@@ -124,6 +156,8 @@ bool c_lower(std::uint16_t m) { return (m & (kLl | kLm | kLo | kM)) != 0; }     
 bool c_number(std::uint16_t m) { return (m & kN) != 0; }                                 // \p{N}
 bool c_blank(std::uint16_t m) { return (m & kBlank) != 0; }                              // ' '
 bool c_symbol(std::uint16_t m) { return !(m & (kSpace | kLetter | kN)); }                // [^\s\p{L}\p{N}]
+bool c_letter_or_mark(std::uint16_t m) { return (m & (kLetter | kM)) != 0; }             // [\p{L}\p{M}]
+bool c_qwen_symbol(std::uint16_t m) { return !(m & (kSpace | kLetter | kM | kN)); }      // [^\s\p{L}\p{M}\p{N}]
 bool c_crlf_slash(std::uint16_t m) { return (m & (kCrLf | kSlash)) != 0; }               // [\r\n/]
 bool c_crlf(std::uint16_t m) { return (m & kCrLf) != 0; }                                // [\r\n]
 bool c_space(std::uint16_t m) { return (m & kSpace) != 0; }                              // \s
@@ -194,6 +228,23 @@ std::size_t piece_end(const Text& t, std::size_t pos) {
   return pos + 1;  // unreachable: every character matches some alternative; an unmatched one is its own piece
 }
 
+std::size_t piece_end_qwen2(const Text& t, std::size_t pos) {
+  static constexpr Element kQ2[] = {{c_prefix, 0, 1}, {c_letter_or_mark, 1, kMany}};
+  static constexpr Element kQ3[] = {{c_number, 1, 1}};
+  static constexpr Element kQ4[] = {{c_blank, 0, 1}, {c_qwen_symbol, 1, kMany}, {c_crlf, 0, kMany}};
+  static constexpr Element kA5[] = {{c_space, 0, kMany}, {c_crlf, 1, kMany}};
+  static constexpr Element kA6[] = {{c_space, 1, kMany}};
+  if (const std::size_t cont = contraction(t, pos); cont > pos) return cont;
+  std::size_t end = pos;
+  if (match_elements(t, kQ2, pos, false, end)) return end;
+  if (match_elements(t, kQ3, pos, false, end)) return end;
+  if (match_elements(t, kQ4, pos, false, end)) return end;
+  if (match_elements(t, kA5, pos, false, end)) return end;
+  if (match_elements(t, kA6, pos, true, end)) return end;
+  if (match_elements(t, kA6, pos, false, end)) return end;
+  return pos + 1;
+}
+
 struct BpeNode {
   std::int32_t symbol = -1;
   std::int32_t previous = -1;
@@ -252,13 +303,16 @@ Tokenizer Tokenizer::load(const std::filesystem::path& model_dir) {
 Tokenizer Tokenizer::from_json(std::string_view tokenizer_json) {
   const Json root = Json::parse(tokenizer_json);
   const Json& model = root.at("model");
-  validate_pipeline(root, model);
+  const PipelineSpec spec = validate_pipeline(root, model);
 
   std::unordered_map<std::int32_t, char> byte_decoder;
   const auto b2c = byte_to_codepoint();
   for (int b = 0; b < 256; ++b) byte_decoder.emplace(b2c[static_cast<std::size_t>(b)], static_cast<char>(b));
 
   Tokenizer tok;
+  tok.normalizer_ = spec.normalizer;
+  tok.split_mode_ = spec.split;
+  tok.ignore_merges_ = spec.ignore_merges;
   const Json& vocab = model.at("vocab");
   std::unordered_map<std::string, std::int32_t> by_symbol;  // byte-level token string -> id (load only)
   by_symbol.reserve(vocab.size());
@@ -345,9 +399,11 @@ Tokenizer Tokenizer::from_json(std::string_view tokenizer_json) {
 
 void Tokenizer::encode_piece(std::string_view piece, std::vector<int32_t>& ids) const {
   // ignore_merges: a piece that is itself a vocabulary token is emitted whole.
-  if (const auto it = vocab_by_bytes_.find(std::string(piece)); it != vocab_by_bytes_.end()) {
-    ids.push_back(it->second);
-    return;
+  if (ignore_merges_) {
+    if (const auto it = vocab_by_bytes_.find(std::string(piece)); it != vocab_by_bytes_.end()) {
+      ids.push_back(it->second);
+      return;
+    }
   }
   std::vector<BpeNode> nodes(piece.size());
   for (std::size_t i = 0; i < piece.size(); ++i) {
@@ -392,7 +448,21 @@ void Tokenizer::encode_piece(std::string_view piece, std::vector<int32_t>& ids) 
 
 void Tokenizer::encode_ordinary(std::string_view text, std::vector<int32_t>& ids) const {
   if (text.empty()) return;
-  const auto spans = uni::utf8_codepoints(text, "Tokenizer::encode input");
+  std::unique_ptr<utf8proc_uint8_t, decltype(&std::free)> nfc_buf(nullptr, &std::free);
+  auto spans = uni::utf8_codepoints(text, "Tokenizer::encode input");
+  if (normalizer_ == NormalizerKind::Nfc) {
+    utf8proc_uint8_t* raw = nullptr;
+    const utf8proc_ssize_t len =
+        utf8proc_map(reinterpret_cast<const utf8proc_uint8_t*>(text.data()),
+                     static_cast<utf8proc_ssize_t>(text.size()), &raw,
+                     static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE));
+    nfc_buf.reset(raw);
+    if (len < 0 || !raw) {
+      throw std::invalid_argument(std::string("utf8proc_map NFC failed: ") + utf8proc_errmsg(len));
+    }
+    text = std::string_view(reinterpret_cast<const char*>(raw), static_cast<std::size_t>(len));
+    spans = uni::utf8_codepoints(text, "Tokenizer::encode NFC");
+  }
   std::vector<std::int32_t> cps(spans.size());
   std::vector<std::uint16_t> cls(spans.size());
   for (std::size_t i = 0; i < spans.size(); ++i) {
@@ -401,7 +471,7 @@ void Tokenizer::encode_ordinary(std::string_view text, std::vector<int32_t>& ids
   }
   const Text t{cps, cls};
   for (std::size_t pos = 0; pos < cps.size();) {
-    const std::size_t end = piece_end(t, pos);
+    const std::size_t end = split_mode_ == SplitMode::Qwen2 ? piece_end_qwen2(t, pos) : piece_end(t, pos);
     const std::size_t b = spans[pos].offset;
     const std::size_t e = end < spans.size() ? spans[end].offset : text.size();
     encode_piece(text.substr(b, e - b), ids);

@@ -106,6 +106,7 @@ ingine_add_component(src/text)
 ingine_add_component(src/image)
 ingine_add_component(src/persona)
 ingine_add_component(src/engine)
+ingine_add_component(src/backends/qwen38)
 
 if(INGINE_BACKEND STREQUAL "CUDA")
   set(INGINE_KERNEL_AREAS common dense moe attn head prefill draft vision batch)

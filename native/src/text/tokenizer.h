@@ -93,11 +93,20 @@ class Tokenizer {
   // Number of ids (vocabulary + added tokens), i.e. one past the largest id.
   std::size_t vocab_size() const noexcept { return token_bytes_.size(); }
 
+  enum class NormalizerKind : std::uint8_t { None = 0, Nfc = 1 };
+  enum class SplitMode : std::uint8_t { O200k = 0, Qwen2 = 1 };
+
+  NormalizerKind normalizer_kind() const noexcept { return normalizer_; }
+  SplitMode split_mode() const noexcept { return split_mode_; }
+
  private:
   Tokenizer() = default;
   void encode_ordinary(std::string_view text, std::vector<int32_t>& ids) const;
   void encode_piece(std::string_view piece, std::vector<int32_t>& ids) const;
 
+  NormalizerKind normalizer_ = NormalizerKind::None;
+  SplitMode split_mode_ = SplitMode::O200k;
+  bool ignore_merges_ = true;
   std::vector<std::string> token_bytes_;  // raw bytes per id (added tokens: their content)
   std::vector<bool> special_;
   std::vector<bool> added_;

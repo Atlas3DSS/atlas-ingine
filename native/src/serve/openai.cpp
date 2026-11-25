@@ -523,14 +523,18 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
       clamp_int(std::max<int64_t>(0, num_int(body, "top_k", Bound{-1, "-1"}).value_or(defaults.top_k)));
   if (auto seed = num_int(body, "seed")) req.sampling.seed = static_cast<uint64_t>(*seed);
   if (req.sampling.top_p <= 0.0f) throw BadRequest("'top_p' must be in (0, 1]", "top_p");
-  // When no tools are declared, ban <|content_invoke_tool_json|> so the model cannot emit a hallucinated tool call.
+  // When no tools are declared, ban the model's tool-invoke control token if the chat format defines one.
   const bool has_tools = effective_tools.is_array() && !effective_tools.empty();
   if (!has_tools) {
-    req.sampling.banned_tokens.push_back(fmt.content_invoke_tool_json_id());
+    if (const int32_t id = fmt.content_invoke_tool_json_id(); id >= 0) {
+      req.sampling.banned_tokens.push_back(id);
+    }
   }
-  // When thinking is disabled, ban <|content_thinking|> so the model cannot spontaneously enter a reasoning turn.
+  // When thinking is disabled, ban the thinking-start control token if the chat format defines one.
   if (!thinking_enabled) {
-    req.sampling.banned_tokens.push_back(fmt.content_thinking_id());
+    if (const int32_t id = fmt.content_thinking_id(); id >= 0) {
+      req.sampling.banned_tokens.push_back(id);
+    }
   }
   // Token-level JSON / JSON-Schema FSM masker (nullptr for default/text -> zero overhead).
   if (parsed_rf.spec.mode != text::JsonFormatMode::None) {

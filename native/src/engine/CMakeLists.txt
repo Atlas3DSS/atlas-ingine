@@ -3,6 +3,7 @@
 add_library(ingine_engine STATIC
   fake_generator.cpp
   log.cpp
+  model_backend.cpp
   scheduler.cpp
 )
 ingine_internal_includes(ingine_engine)

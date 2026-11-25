@@ -1,0 +1,257 @@
+// Shared host/model-family contract for atlas-ingine (#821, #822, #833, #834).
+//
+// Strictly CUDA-free public header extending ingine::model::Generator without altering existing Inkling callers
+// or continuous-batching slot semantics (native/include/ingine/generator.h remains unchanged).
+//
+// Ownership split:
+//   * Host (ingine_engine / ingine_serve): selects pinned ModelBackend / WorkerProfile, tokenizer & chat template,
+//     advertised capabilities, request admission, scheduling, and cancellation.
+//   * ModelBackend (native/src/backends/<family>/): owns weights, prefill, decode, opaque per-session state,
+//     exact checkpoint/state cache identities, and exact token-prefix checks.
+//   * HAL (core/hal.h, core/ops.h, #835): owns device placement, buffers, streams, events, and device ops.
+#pragma once
+
+#include "ingine/generator.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace ingine::model {
+
+enum class ModelFamily : std::uint8_t {
+  Unknown = 0,
+  Inkling2 = 1,
+  Qwen3_5 = 2,
+  DeepSeekV4 = 3,
+  GlmFlash = 4,
+};
+
+enum class CheckpointFormat : std::uint8_t {
+  Unknown = 0,
+  Safetensors = 1,
+  Gguf = 2,
+};
+
+enum class ActivationDtype : std::uint8_t {
+  Unknown = 0,
+  Bf16 = 1,
+  Fp16 = 2,
+  Fp32 = 3,
+};
+
+const char* to_string(ModelFamily family) noexcept;
+const char* to_string(CheckpointFormat fmt) noexcept;
+const char* to_string(ActivationDtype dt) noexcept;
+ModelFamily parse_model_family(std::string_view s);
+// Detects model family from model_dir/config.json (or Inkling tokenizer markers when config.json is absent).
+// Throws std::invalid_argument fail-closed on unknown or malformed model directories.
+ModelFamily detect_model_family(const std::filesystem::path& model_dir);
+// Dispatches checkpoint container format from model_dir (Safetensors vs GGUF);
+// throws std::invalid_argument fail-closed on missing, empty, or ambiguous directories.
+CheckpointFormat detect_checkpoint_format(const std::filesystem::path& model_dir);
+
+// Cryptographic identity of the checkpoint artifacts and verified loaded weights.
+// weight_manifest_verified MUST be true only when headers/manifests were explicitly verified at load time.
+// shard_digests_verified MUST be true only when full shard file digests were verified against expected SHA-256s.
+struct CheckpointIdentity {
+  CheckpointFormat format = CheckpointFormat::Unknown;
+  std::string schema_variant;
+  std::string model_id;
+  std::string revision;
+  std::uint32_t shard_count = 0;
+  std::array<std::uint8_t, 32> shard_set_sha256{};
+  std::array<std::uint8_t, 32> config_sha256{};
+  std::array<std::uint8_t, 32> tokenizer_sha256{};
+  std::array<std::uint8_t, 32> chat_template_sha256{};
+  std::array<std::uint8_t, 32> weight_manifest_sha256{};
+  bool weight_manifest_verified = false;
+  bool shard_digests_verified = false;
+
+  bool operator==(const CheckpointIdentity&) const = default;
+};
+
+// Advertised backend capabilities checked fail-closed before mutating live model state.
+struct BackendCapabilities {
+  ModelFamily family = ModelFamily::Unknown;
+  std::string backend_name;
+  std::string architecture;
+  bool supports_text = true;
+  bool supports_images = false;
+  bool supports_speculation = false;
+  bool supports_continuous_batching = false;
+  int max_supported_batch = 1;
+  bool supports_prefix_cache = false;
+  bool supports_host_park = false;
+  bool supports_weight_parking = false;
+  bool supports_tiered_residency = false;
+  bool supports_disk_checkpoint = false;
+  bool supports_persona_hooks = false;
+  bool supports_ablation = false;
+  bool supports_logit_capture = false;
+  bool supports_mtp = false;
+  std::vector<std::string> supported_gears;
+  std::vector<std::string> supported_kv_cache_modes;
+  std::vector<std::string> supported_quant_layouts;
+  int vocab_size = 0;
+  int max_position_embeddings = 0;
+};
+
+// Complete runtime/model/profile identity required for prefix-cache or session-state reuse across all families.
+// Any mismatch MUST fail closed to a cache miss.
+struct BackendStateIdentity {
+  ModelFamily family = ModelFamily::Unknown;
+  std::string backend_name;
+  CheckpointIdentity checkpoint;
+  std::string state_layout_id;  // per-family KV/recurrent/conv state layout version
+  ActivationDtype act_dtype = ActivationDtype::Unknown;  // effective compute numeric ABI (distinct Bf16/Fp16)
+  std::string weight_precision;
+  std::string kv_format;
+  std::string kv_cache_mode;
+  std::string gear;
+  int max_ctx = 0;
+  int prefill_chunk = 0;
+  bool spec_enabled = false;
+  bool mtp_enabled = false;
+  bool media_enabled = false;
+  std::uint64_t persona_key = 0;
+  std::string persona_fingerprint;
+  std::string cache_namespace;
+  std::string rendering_fingerprint;
+  std::string family_state_fingerprint;
+
+  bool operator==(const BackendStateIdentity&) const = default;
+
+  // True iff both identities carry verified weight manifests, valid family/state layout, and exact equality.
+  [[nodiscard]] bool is_reusable_with(const BackendStateIdentity& other) const noexcept;
+};
+
+// Index hash ONLY (never used for cache equality without BackendStateIdentity::is_reusable_with() and
+// exact std::equal verification of the cached token-ID prefix).
+std::uint64_t hash_backend_state_identity(const BackendStateIdentity& id) noexcept;
+
+// Exact token-ID prefix check required alongside BackendStateIdentity::is_reusable_with() on any cache lookup.
+bool prefix_matches_exact(std::span<const std::int32_t> cached_ids, std::span<const std::int32_t> prompt_ids,
+                          std::size_t prefix_len) noexcept;
+
+// Exact token-ID + per-token boundary/Engram mask prefix check required for DeepSeek/token-mask families.
+bool prefix_matches_exact_with_mask(std::span<const std::int32_t> cached_ids,
+                                    std::span<const std::uint8_t> cached_mask,
+                                    std::span<const std::int32_t> prompt_ids,
+                                    std::span<const std::uint8_t> prompt_mask, std::size_t prefix_len) noexcept;
+
+// Tiered residency telemetry (#836, GLM/DeepSeek/Qwen unified memory accounting behind #835 HAL).
+struct ResidencyReport {
+  std::uint64_t device_bytes = 0;
+  std::uint64_t host_ram_bytes = 0;
+  std::uint64_t mmap_bytes = 0;
+  std::uint64_t nvme_swap_bytes = 0;
+  std::uint64_t process_rss_bytes = 0;
+  std::uint64_t weights_device_bytes = 0;
+  std::uint64_t state_device_bytes = 0;
+  std::uint64_t cache_device_bytes = 0;
+};
+
+// Admission footprint estimate (#836) before allocating buffers for a workload profile.
+struct AdmissionEstimate {
+  std::uint64_t required_device_bytes = 0;
+  std::uint64_t required_host_ram_bytes = 0;
+  std::uint64_t required_mmap_bytes = 0;
+  std::uint64_t required_nvme_swap_bytes = 0;
+  bool fits_current_budget = false;
+  std::string reason;
+};
+
+// Host-visible worker capability & profile descriptor (aligned with #822 / #829 / #838 dispatch).
+struct WorkerProfile {
+  ModelFamily family = ModelFamily::Unknown;
+  std::string model_id;
+  std::string gear;
+  std::string kv_cache_mode;
+  std::string tokenizer_format;
+  std::string chat_template_family;
+  int max_ctx = 0;
+  int max_batch = 1;
+  BackendCapabilities capabilities;
+  BackendStateIdentity state_identity;
+};
+
+// Opaque per-session handle owned by a ModelBackend (opaque KV, recurrent, conv, or parked state).
+class BackendSession {
+ public:
+  virtual ~BackendSession() = default;
+  virtual void reset() = 0;
+  virtual std::size_t state_bytes() const noexcept = 0;
+  virtual std::span<const std::int32_t> committed_tokens() const noexcept = 0;
+  virtual const BackendStateIdentity& identity() const noexcept = 0;
+  virtual void truncate(std::size_t /*new_token_count*/) {
+    throw std::logic_error("session does not support truncate");
+  }
+};
+
+struct LogitStep {
+  int position = 0;
+  std::span<const float> logits;
+};
+
+using LogitCallback = std::function<void(const LogitStep&)>;
+
+// Fail-closed admission validators; MUST be invoked before allocating or mutating live model state.
+void validate_runtime_options_against_capabilities(const BackendCapabilities& caps, const RuntimeOptions& options);
+void validate_request_against_capabilities(const BackendCapabilities& caps, int max_model_len, const Prompt& prompt,
+                                           int max_new_tokens, const Sampling& sampling);
+
+// Model-family backend interface extending Generator without changing existing Generator callers or slot APIs.
+class ModelBackend : public Generator {
+ public:
+  virtual const BackendCapabilities& capabilities() const = 0;
+  virtual const WorkerProfile& worker_profile() const = 0;
+  virtual const BackendStateIdentity& state_identity() const = 0;
+  virtual void reset_session() = 0;
+
+  // Optional tiered-residency / #836 memory pressure hooks.
+  virtual ResidencyReport residency_report() const { return {}; }
+  virtual AdmissionEstimate admission_estimate(int /*max_ctx*/, int /*max_batch*/) const { return {}; }
+  virtual void park_weights() { throw std::logic_error("backend does not support park_weights"); }
+  virtual std::uint64_t evict_caches(std::uint64_t /*target_free_bytes*/) { return 0; }
+
+  // Optional teacher-forced prefill/decode logit capture at requested 0-based positions for parity validation.
+  virtual void evaluate_teacher_forced(std::span<const std::int32_t> /*token_ids*/,
+                                       std::span<const int> /*capture_positions*/, bool /*use_prefix_cache*/,
+                                       const LogitCallback& /*on_logits*/) {
+    throw std::logic_error("backend does not support teacher-forced logit capture");
+  }
+};
+
+struct BackendRegistration {
+  ModelFamily family = ModelFamily::Unknown;
+  std::string name;
+  std::function<std::unique_ptr<ModelBackend>(const RuntimeOptions&)> create;
+};
+
+// Thread-safe static registry mapping ModelFamily -> backend factory.
+class BackendRegistry {
+ public:
+  static BackendRegistry& instance();
+
+  void register_backend(BackendRegistration reg);
+  [[nodiscard]] const BackendRegistration* find(ModelFamily family) const;
+  [[nodiscard]] std::unique_ptr<ModelBackend> create(ModelFamily family, const RuntimeOptions& options) const;
+  [[nodiscard]] std::vector<ModelFamily> registered_families() const;
+
+ private:
+  BackendRegistry() = default;
+};
+
+// Default capability baseline describing the existing Inkling-2-Mini backend contract.
+BackendCapabilities inkling_default_capabilities();
+
+}  // namespace ingine::model
