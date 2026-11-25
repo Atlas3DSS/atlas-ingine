@@ -58,7 +58,16 @@ struct BatchedAttnArgs {
   ActT* out = nullptr;  // [B, 3072]
 };
 
-// Workspace bytes required for batched_attn_decode up to max_b rows.
+struct AttnWorkspaceLayout {
+  int splits = 1;
+  std::size_t part_bytes = 0;        // bytes written to part for (B, W) when splits > 1
+  std::size_t saved_nkv_offset = 0;  // byte offset of saved_nkv inside workspace
+  std::size_t saved_nst_offset = 0;  // byte offset of saved_nst inside workspace
+  std::size_t total_bytes = 0;       // total workspace bytes required for max_b = B
+};
+
+// Workspace layout and total bytes required for batched_attn_decode up to max_b rows.
+AttnWorkspaceLayout attn_workspace_layout(int B);
 std::size_t attn_workspace_bytes(int max_b);
 
 // Launches batched 1-token-per-slot attention for B independent sequences.
@@ -153,7 +162,8 @@ struct BatchedVerifyAttnArgs {
   ActT* out = nullptr;  // [B * W, 3072]
 };
 
-// Workspace bytes required for batched_attn_verify up to (max_b, max_w).
+// Workspace layout and total bytes required for batched_attn_verify up to (max_b, max_w).
+AttnWorkspaceLayout attn_verify_workspace_layout(int B, int W);
 std::size_t attn_verify_workspace_bytes(int max_b, int max_w);
 
 // Launches race-free batched multi-token causal verify attention for B slots x W trial tokens.

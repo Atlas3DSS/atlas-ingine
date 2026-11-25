@@ -340,6 +340,7 @@ struct DivergentCase {
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
   run_validator_negative_controls();
 
   int vram_limit_mb = 0;
@@ -439,6 +440,7 @@ int main(int argc, char** argv) {
       for (int i = 0; i < B; ++i) ps.push_back(Prompt{prompt_ids[std::size_t(i)], {}});
       plain_refs.push_back(run_batch_greedy_w1(*gen_plain, ps, kGenLen));
       vram.sample();
+      std::printf("Phase A plain reference B=%-2d: %d seqs x %d tokens ok\n", B, B, kGenLen);
     }
   }  // gen_plain destroyed here -> 100% of plain weights & KV rings freed BEFORE gen_spec loads!
 

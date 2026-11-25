@@ -183,6 +183,39 @@ void test_diff_check_corrupt_control() {
   }
 }
 
+void test_attn_workspace_layouts() {
+  // Exhaustive CPU regression for intra-workspace overlap & monotonicity across ALL B = 1..64
+  // (specifically catches non-power-of-two B in {3, 5, 6, 7, 9..15}, e.g. B=12 splits=2 -> 24 slabs!).
+  for (int B = 1; B <= 64; ++B) {
+    const bk::AttnWorkspaceLayout l = bk::attn_workspace_layout(B);
+    const std::size_t nkv_bytes = std::size_t(B) * HKV * 2 * D * sizeof(ActT);
+    const std::size_t nst_bytes = std::size_t(B) * HKV * 3 * 2 * D * sizeof(float);
+    CHECK(l.part_bytes <= l.saved_nkv_offset);
+    CHECK(l.saved_nkv_offset + nkv_bytes <= l.saved_nst_offset);
+    CHECK(l.saved_nst_offset + nst_bytes <= l.total_bytes);
+    CHECK(l.total_bytes == bk::attn_workspace_bytes(B));
+    for (int max_b = B; max_b <= 64; ++max_b) {
+      CHECK(l.total_bytes <= bk::attn_workspace_bytes(max_b));
+    }
+    for (int W : {1, 2, 4, 8}) {
+      const bk::AttnWorkspaceLayout vl = bk::attn_verify_workspace_layout(B, W);
+      const std::size_t vnkv_bytes = std::size_t(B) * HKV * 2 * std::size_t(W) * D * sizeof(ActT);
+      CHECK(vl.part_bytes <= vl.saved_nkv_offset);
+      CHECK(vl.saved_nkv_offset + vnkv_bytes <= vl.saved_nst_offset);
+      CHECK(vl.saved_nst_offset + nst_bytes <= vl.total_bytes);
+      CHECK(vl.total_bytes == bk::attn_verify_workspace_bytes(B, W));
+      for (int max_b = B; max_b <= 64; ++max_b) {
+        CHECK(vl.total_bytes <= bk::attn_verify_workspace_bytes(max_b, W));
+      }
+    }
+  }
+  // Explicit B=12 pin (the exact failure case from full-model parity a6667e7):
+  const bk::AttnWorkspaceLayout l12 = bk::attn_workspace_layout(12);
+  CHECK(l12.splits == 2);
+  CHECK(l12.part_bytes == std::size_t(24) * 8 * 3 * (128 + 4) * sizeof(float));
+  CHECK(l12.saved_nkv_offset >= l12.part_bytes);
+}
+
 void test_static_conv() {
   std::mt19937 rng(42);
   const int max_slots = 68;
@@ -1593,13 +1626,14 @@ void test_verify_partial_rollback_and_w1_to_wider(bool full, bool cache_fp8) {
 
 int main() {
   test_diff_check_corrupt_control();
+  test_attn_workspace_layouts();
   int n_dev = 0;
   if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev == 0) {
     std::fprintf(stderr, "batch_kernels: no CUDA device, skipping\n");
-    return 77;
+    return g_failures ? 1 : 77;
   }
   test_static_conv();
-  for (int B : {1, 4, 16, 64}) {
+  for (int B : {1, 3, 4, 6, 12, 15, 16, 64}) {
     for (bool proj_fp32 : {true, false}) {
       test_batched_attn_vs_single(false, false, proj_fp32, B);  // sliding
       test_batched_attn_vs_single(true, false, proj_fp32, B);   // paged full BF16/FP16
@@ -1609,7 +1643,7 @@ int main() {
   test_head_softcap_and_scatter_gather();
   test_static_conv_verify();
   for (int W : {1, 2, 4, 8}) {
-    for (int B : {1, 4, 16}) {
+    for (int B : {1, 3, 4, 6, 12, 16}) {
       for (bool proj_fp32 : {true, false}) {
         test_batched_attn_verify_and_rollback(false, false, proj_fp32, B, W);  // sliding + wrap P=1024
         test_batched_attn_verify_and_rollback(true, false, proj_fp32, B, W);   // paged full BF16/FP16 + page cross

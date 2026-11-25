@@ -53,14 +53,31 @@ int choose_splits(int B) {
   return s;
 }
 
+int max_total_splits_up_to(int max_b) {
+  int m = 16;
+  const int lim = std::min(max_b, 15);
+  for (int b = 1; b <= lim; ++b) {
+    const int s = choose_splits(b);
+    if (s > 1) m = std::max(m, b * s);
+  }
+  return std::max(m, max_b);
+}
+
+std::size_t ws_part_bytes_for(int B) {
+  const int s = choose_splits(B);
+  return s > 1 ? std::size_t(B) * std::size_t(s) * HKV * GQA * PSTR * sizeof(float) : 0;
+}
+
 constexpr std::size_t align256(std::size_t n) { return (n + 255) & ~std::size_t(255); }
 
-// Workspace layout for up to max_b sequences (splits * B <= max(16, max_b)):
-//   part:      fp32 [max_total_splits, HKV, GQA, PSTR]
+// Workspace layout for up to max_b sequences (non-power-of-two B in 3..15 can have B * choose_splits(B) up to 30):
+//   part:      fp32 [max_total_splits_up_to(max_b), HKV, GQA, PSTR]
 //   saved_nkv: ActT [max_b, HKV, 2, D]
 //   saved_nst: fp32 [max_b, HKV, 3, 2, D]
+// Monotonic in max_b so ws_total_bytes(B) <= ws_total_bytes(max_b) and part never overlaps saved_nkv/saved_nst.
 std::size_t ws_nkv_off(int max_b) {
-  const int max_ts = std::max(16 * INGINE_TP_SIZE + 16, max_b);
+  const int max_ts = (INGINE_TP_SIZE > 1) ? std::max(16 * INGINE_TP_SIZE + 16, max_total_splits_up_to(max_b))
+                                          : max_total_splits_up_to(max_b);
   return align256(std::size_t(max_ts) * HKV * GQA * PSTR * sizeof(float));
 }
 std::size_t ws_nst_off(int max_b) {
@@ -909,6 +926,17 @@ void dispatch_attn(const BatchedAttnKernelParams& kp, cudaStream_t stream) {
 
 }  // namespace
 
+AttnWorkspaceLayout attn_workspace_layout(int B) {
+  require(B >= 1, "B must be >= 1");
+  return AttnWorkspaceLayout{
+      choose_splits(B),
+      ws_part_bytes_for(B),
+      ws_nkv_off(B),
+      ws_nst_off(B),
+      ws_total_bytes(B),
+  };
+}
+
 std::size_t attn_workspace_bytes(int max_b) {
   require(max_b >= 1, "max_b must be >= 1");
   return ws_total_bytes(max_b);
@@ -929,8 +957,12 @@ void batched_attn_decode(const BatchedAttnArgs& a, cudaStream_t stream) {
     require(a.k_ring_visit && a.v_ring_visit && a.ring_pos_visit, "sliding layer needs ring pointers");
   }
   const int splits = choose_splits(a.B);
+  const std::size_t nkv_off = ws_nkv_off(a.B);
+  const std::size_t nst_off = ws_nst_off(a.B);
+  const std::size_t total_b = ws_total_bytes(a.B);
   if (splits > 1) {
-    require(a.workspace && a.workspace_size >= ws_total_bytes(a.B), "workspace too small");
+    require(ws_part_bytes_for(a.B) <= nkv_off, "batched_attn_decode: part overlaps saved_nkv");
+    require(a.workspace && a.workspace_size >= total_b, "workspace too small");
   }
 
   BatchedAttnKernelParams kp{};
@@ -963,8 +995,8 @@ void batched_attn_decode(const BatchedAttnArgs& a, cudaStream_t stream) {
   if (a.workspace) {
     char* ws = static_cast<char*>(a.workspace);
     kp.part = reinterpret_cast<float*>(ws);
-    kp.saved_nkv = reinterpret_cast<ActT*>(ws + ws_nkv_off(a.B));
-    kp.saved_nst = reinterpret_cast<float*>(ws + ws_nst_off(a.B));
+    kp.saved_nkv = reinterpret_cast<ActT*>(ws + nkv_off);
+    kp.saved_nst = reinterpret_cast<float*>(ws + nst_off);
   }
   kp.out = a.out;
 
@@ -2040,6 +2072,20 @@ __global__ void batched_advance_pos_by_kernel(const std::int32_t* __restrict__ s
 
 }  // namespace
 
+AttnWorkspaceLayout attn_verify_workspace_layout(int B, int W) {
+  require(B >= 1 && (W == 1 || W == 2 || W == 4 || W == 8), "attn_verify_workspace_layout: bad args");
+  const int splits = choose_verify_splits(B);
+  const std::size_t part_b =
+      splits > 1 ? std::size_t(B) * std::size_t(splits) * HKV * std::size_t(W) * GQA * PSTR * sizeof(float) : 0;
+  return AttnWorkspaceLayout{
+      splits,
+      part_b,
+      verify_ws_nkv_off(B, W),
+      verify_ws_nst_off(B, W),
+      verify_ws_total_bytes(B, W),
+  };
+}
+
 std::size_t attn_verify_workspace_bytes(int max_b, int max_w) {
   require(max_b >= 1 && (max_w == 1 || max_w == 2 || max_w == 4 || max_w == 8), "attn_verify_workspace_bytes: bad args");
   return verify_ws_total_bytes(max_b, max_w);
@@ -2059,10 +2105,11 @@ void batched_attn_verify(const BatchedVerifyAttnArgs& a, cudaStream_t stream) {
   } else {
     require(a.k_ring_visit && a.v_ring_visit && a.ring_pos_visit, "batched_attn_verify: sliding layer needs rings");
   }
-  const int splits = choose_verify_splits(a.B);
+  const AttnWorkspaceLayout lay = attn_verify_workspace_layout(a.B, a.W);
+  const int splits = lay.splits;
   if (splits > 1) {
-    require(a.workspace && a.workspace_size >= verify_ws_total_bytes(a.B, a.W),
-            "batched_attn_verify: workspace too small");
+    require(lay.part_bytes <= lay.saved_nkv_offset, "batched_attn_verify: part overlaps saved_nkv");
+    require(a.workspace && a.workspace_size >= lay.total_bytes, "batched_attn_verify: workspace too small");
   }
 
   BatchedVerifyAttnKernelParams kp{};
