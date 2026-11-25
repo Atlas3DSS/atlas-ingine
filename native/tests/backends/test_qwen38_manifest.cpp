@@ -9,11 +9,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #define CHECK(cond)                                                                         \
@@ -108,7 +110,8 @@ std::string minimal_bf16_config() {
   })";
 }
 
-void write_synthetic_safetensors_dir(const std::filesystem::path& dir, bool corrupt_extra_tensor = false) {
+void write_synthetic_safetensors_dir(const std::filesystem::path& dir, bool corrupt_extra_tensor = false,
+                                     std::uint64_t extra_excluded_visual_bytes = 0) {
   write_str(dir / "config.json", minimal_bf16_config());
   write_str(dir / "tokenizer.json", R"({"version":"1.0"})");
   write_str(dir / "chat_template.jinja", "{{ messages }}");
@@ -153,6 +156,10 @@ void write_synthetic_safetensors_dir(const std::filesystem::path& dir, bool corr
       {"model.visual.patch_embed.proj.weight", "BF16", {4}, 2},
       {"mtp.layers.0.norm.weight", "BF16", {16}, 2},
   };
+  if (extra_excluded_visual_bytes > 0) {
+    specs.push_back(
+        {"model.visual.large_blob.weight", "U8", {static_cast<std::int64_t>(extra_excluded_visual_bytes)}, 1});
+  }
   if (corrupt_extra_tensor) {
     specs.push_back({"model.language_model.stray.weight", "BF16", {4}, 2});
   }
@@ -168,10 +175,25 @@ void write_synthetic_safetensors_dir(const std::filesystem::path& dir, bool corr
   }
   const std::string hdr_str = hdr.dump();
   const std::uint64_t hdr_len = hdr_str.size();
-  std::vector<std::uint8_t> st(8 + hdr_len + offset, 0u);
-  for (int i = 0; i < 8; ++i) st[i] = static_cast<std::uint8_t>((hdr_len >> (8 * i)) & 0xffu);
-  std::memcpy(st.data() + 8, hdr_str.data(), hdr_len);
-  write_bytes(dir / "model.safetensors", st.data(), st.size());
+  const std::filesystem::path out_path = dir / "model.safetensors";
+  if (extra_excluded_visual_bytes == 0) {
+    std::vector<std::uint8_t> st(8 + hdr_len + offset, 0u);
+    for (int i = 0; i < 8; ++i) st[i] = static_cast<std::uint8_t>((hdr_len >> (8 * i)) & 0xffu);
+    std::memcpy(st.data() + 8, hdr_str.data(), hdr_len);
+    write_bytes(out_path, st.data(), st.size());
+  } else {
+    const int fd = ::open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0);
+    std::array<std::uint8_t, 8> len_buf{};
+    for (int i = 0; i < 8; ++i) len_buf[i] = static_cast<std::uint8_t>((hdr_len >> (8 * i)) & 0xffu);
+    CHECK(::write(fd, len_buf.data(), 8) == 8);
+    CHECK(::write(fd, hdr_str.data(), hdr_len) == static_cast<ssize_t>(hdr_len));
+    const std::uint64_t total_size = 8ull + hdr_len + offset;
+    CHECK(::ftruncate(fd, static_cast<off_t>(total_size)) == 0);
+    const std::uint8_t marker = 0x5au;
+    CHECK(::pwrite(fd, &marker, 1, static_cast<off_t>(total_size - 1)) == 1);
+    ::close(fd);
+  }
 }
 
 void test_config_validation() {
@@ -400,6 +422,20 @@ void test_real_checkpoints() {
                        real_prof.capabilities, real_prof.max_ctx, p, 8, ingine::model::Sampling{}),
                    std::invalid_argument);
     }
+    CHECK(std::find(m.shard_files.begin(), m.shard_files.end(), "model-00001-of-00003.safetensors") !=
+          m.shard_files.end());
+    for (const std::string& shard : m.shard_files) {
+      CHECK(m.shard_sizes.at(shard) > 256ull * 1024ull * 1024ull);
+      // Header-only manifest MUST fail closed under both read_verified_file_bytes and stream_verified_file.
+      CHECK_THROWS(m.read_verified_file_bytes(q27, shard), std::invalid_argument);
+      bool admitted = false;
+      bool aborted = false;
+      CHECK_THROWS(m.stream_verified_file(
+                       q27, shard, [](std::uint64_t, std::span<const std::uint8_t>) {},
+                       [&](const Qwen38StreamResult&) { admitted = true; }, [&]() { aborted = true; }),
+                   std::invalid_argument);
+      CHECK(!admitted && aborted);
+    }
     std::printf("  27B manifest verified: active=%zu text_bytes=%llu\n", m.active_text_tensor_count,
                 static_cast<unsigned long long>(m.memory_budget.text_weight_bytes));
   }
@@ -422,12 +458,178 @@ void test_real_checkpoints() {
   }
 }
 
+void test_bounded_streaming_and_same_size_mutation() {
+  // 1. Unpinned manifests (HeadersOnly / SelfHashed) MUST NOT admit verified reads/streams or verify_open_fd.
+  {
+    TempDir unpinned("stream_unpinned");
+    write_synthetic_safetensors_dir(unpinned.path, false);
+    const auto m_hdr = Qwen38Manifest::inspect(unpinned.path, false, "r1");
+    const auto m_self = Qwen38Manifest::inspect(unpinned.path, true, "r1");
+    for (const auto* mp : {&m_hdr, &m_self}) {
+      bool admitted = false;
+      bool aborted = false;
+      CHECK_THROWS(mp->stream_verified_file(
+                       unpinned.path, "model.safetensors", [](std::uint64_t, std::span<const std::uint8_t>) {},
+                       [&](const Qwen38StreamResult&) { admitted = true; }, [&]() { aborted = true; }),
+                   std::invalid_argument);
+      CHECK(!admitted && aborted);
+      CHECK_THROWS(mp->read_verified_file_bytes(unpinned.path, "config.json"), std::invalid_argument);
+      const int fd = ::open((unpinned.path / "model.safetensors").c_str(), O_RDONLY);
+      CHECK(fd >= 0);
+      CHECK_THROWS(mp->verify_open_fd(fd, "model.safetensors"), std::invalid_argument);
+      ::close(fd);
+    }
+  }
+
+  // 2. Ordinary same-size in-place shard update MUST fail both verify_open_fd and stream_verified_file (no admit).
+  {
+    TempDir same_sz("stream_same_size");
+    write_synthetic_safetensors_dir(same_sz.path, false);
+    const auto m_self = Qwen38Manifest::inspect(same_sz.path, true, "r1");
+    ingine::model::CheckpointPinSpec pins;
+    pins.config_sha256 = m_self.checkpoint.config_sha256;
+    pins.tokenizer_sha256 = m_self.checkpoint.tokenizer_sha256;
+    pins.chat_template_sha256 = m_self.checkpoint.chat_template_sha256;
+    pins.shards = {
+        {"model.safetensors", m_self.shard_sizes.at("model.safetensors"),
+         ingine::model::parse_sha256_hex(m_self.shard_sha256.at("model.safetensors"))},
+    };
+    const auto m_pin = Qwen38Manifest::inspect_pinned(same_sz.path, pins, "r1");
+
+    // Good state: both verify_open_fd and stream_verified_file pass and fire on_admit.
+    const std::filesystem::path st_path = same_sz.path / "model.safetensors";
+    {
+      const int fd = ::open(st_path.c_str(), O_RDONLY);
+      CHECK(fd >= 0);
+      m_pin.verify_open_fd(fd, "model.safetensors");
+      ::close(fd);
+    }
+    {
+      std::uint64_t seen = 0;
+      bool admitted = false;
+      bool aborted = false;
+      const auto res = m_pin.stream_verified_file(
+          same_sz.path, "model.safetensors",
+          [&](std::uint64_t off, std::span<const std::uint8_t> ch) {
+            CHECK(off == seen);
+            seen += ch.size();
+          },
+          [&](const Qwen38StreamResult& r) {
+            CHECK(r.admitted && r.bytes_delivered == seen);
+            admitted = true;
+          },
+          [&]() { aborted = true; }, 1024);
+      CHECK(admitted && !aborted && res.admitted && res.bytes_delivered == m_pin.shard_sizes.at("model.safetensors"));
+    }
+
+    // Mutate 1 byte in-place keeping the exact same inode and byte size.
+    const int rwfd = ::open(st_path.c_str(), O_RDWR);
+    CHECK(rwfd >= 0);
+    std::uint8_t byte = 0;
+    const off_t mut_off = static_cast<off_t>(m_pin.shard_sizes.at("model.safetensors") - 64);
+    CHECK(::pread(rwfd, &byte, 1, mut_off) == 1);
+    byte ^= 0x01u;
+    CHECK(::pwrite(rwfd, &byte, 1, mut_off) == 1);
+    ::close(rwfd);
+
+    const int rofd = ::open(st_path.c_str(), O_RDONLY);
+    CHECK(rofd >= 0);
+    CHECK_THROWS(m_pin.verify_open_fd(rofd, "model.safetensors"), std::invalid_argument);
+    ::close(rofd);
+
+    bool admitted = false;
+    bool aborted = false;
+    CHECK_THROWS(m_pin.stream_verified_file(
+                     same_sz.path, "model.safetensors", [](std::uint64_t, std::span<const std::uint8_t>) {},
+                     [&](const Qwen38StreamResult&) { admitted = true; }, [&]() { aborted = true; }, 1024),
+                 std::invalid_argument);
+    CHECK(!admitted && aborted);
+  }
+
+  // 3. >256 MiB shard bounded streaming: rejects read_verified_file_bytes(), streams in <=1 MiB chunks,
+  //    admits only on full pin match, and catches same-size in-place mutation past 256 MiB.
+  {
+    TempDir big("stream_over_256m");
+    constexpr std::uint64_t kLargeBlobBytes = 260ull * 1024ull * 1024ull;
+    write_synthetic_safetensors_dir(big.path, false, kLargeBlobBytes);
+    const auto m_self = Qwen38Manifest::inspect(big.path, true, "r1");
+    CHECK(m_self.shard_sizes.at("model.safetensors") > 256ull * 1024ull * 1024ull);
+
+    ingine::model::CheckpointPinSpec pins;
+    pins.config_sha256 = m_self.checkpoint.config_sha256;
+    pins.tokenizer_sha256 = m_self.checkpoint.tokenizer_sha256;
+    pins.chat_template_sha256 = m_self.checkpoint.chat_template_sha256;
+    pins.shards = {
+        {"model.safetensors", m_self.shard_sizes.at("model.safetensors"),
+         ingine::model::parse_sha256_hex(m_self.shard_sha256.at("model.safetensors"))},
+    };
+    const auto m_pin = Qwen38Manifest::inspect_pinned(big.path, pins, "r1");
+
+    // 256 MiB metadata reader rejects >256 MiB production shards fail-closed.
+    CHECK_THROWS(m_pin.read_verified_file_bytes(big.path, "model.safetensors"), std::invalid_argument);
+
+    constexpr std::size_t kChunkBytes = 1024ull * 1024ull;
+    std::uint64_t seen = 0;
+    std::size_t max_chunk = 0;
+    int admit_calls = 0;
+    bool aborted = false;
+    const auto res = m_pin.stream_verified_file(
+        big.path, "model.safetensors",
+        [&](std::uint64_t off, std::span<const std::uint8_t> ch) {
+          CHECK(off == seen);
+          CHECK(!ch.empty() && ch.size() <= kChunkBytes);
+          seen += ch.size();
+          max_chunk = std::max(max_chunk, ch.size());
+        },
+        [&](const Qwen38StreamResult& r) {
+          CHECK(r.admitted && r.bytes_delivered == m_pin.shard_sizes.at("model.safetensors"));
+          ++admit_calls;
+        },
+        [&]() { aborted = true; }, kChunkBytes);
+    CHECK(res.admitted && admit_calls == 1 && !aborted);
+    CHECK(seen == m_pin.shard_sizes.at("model.safetensors") && max_chunk <= kChunkBytes);
+
+    const std::filesystem::path st_path = big.path / "model.safetensors";
+    {
+      const int fd = ::open(st_path.c_str(), O_RDONLY);
+      CHECK(fd >= 0);
+      m_pin.verify_open_fd(fd, "model.safetensors", kChunkBytes);
+      ::close(fd);
+    }
+
+    // Mutate 1 byte past 256 MiB in-place (same inode, same size).
+    const int rwfd = ::open(st_path.c_str(), O_RDWR);
+    CHECK(rwfd >= 0);
+    std::uint8_t byte = 0;
+    const off_t mut_off = static_cast<off_t>(m_pin.shard_sizes.at("model.safetensors") - 1);
+    CHECK(::pread(rwfd, &byte, 1, mut_off) == 1);
+    byte ^= 0x01u;
+    CHECK(::pwrite(rwfd, &byte, 1, mut_off) == 1);
+    ::close(rwfd);
+
+    const int rofd = ::open(st_path.c_str(), O_RDONLY);
+    CHECK(rofd >= 0);
+    CHECK_THROWS(m_pin.verify_open_fd(rofd, "model.safetensors", kChunkBytes), std::invalid_argument);
+    ::close(rofd);
+
+    bool mut_admitted = false;
+    bool mut_aborted = false;
+    CHECK_THROWS(m_pin.stream_verified_file(
+                     big.path, "model.safetensors", [](std::uint64_t, std::span<const std::uint8_t>) {},
+                     [&](const Qwen38StreamResult&) { mut_admitted = true; }, [&]() { mut_aborted = true; },
+                     kChunkBytes),
+                 std::invalid_argument);
+    CHECK(!mut_admitted && mut_aborted);
+  }
+}
+
 }  // namespace
 
 int main() {
   test_config_validation();
   test_synthetic_manifest();
   test_real_checkpoints();
+  test_bounded_streaming_and_same_size_mutation();
   std::printf("qwen38_manifest: PASS\n");
   return 0;
 }

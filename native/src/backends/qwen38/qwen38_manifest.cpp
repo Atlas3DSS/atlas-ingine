@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -18,6 +19,13 @@
 
 namespace ingine::backends::qwen38 {
 namespace {
+
+bool is_zero_digest(const std::array<std::uint8_t, 32>& d) noexcept {
+  for (std::uint8_t b : d) {
+    if (b != 0) return false;
+  }
+  return true;
+}
 
 class Sha256 {
  public:
@@ -569,36 +577,152 @@ std::string qwen38_config_fingerprint_hex(const Qwen38Config& config) {
   return to_hex(qwen38_config_fingerprint(config));
 }
 
-void Qwen38Manifest::verify_open_fd(int fd, std::string_view filename) const {
-  const auto it = verified_files.find(std::string(filename));
-  if (it == verified_files.end()) {
-    throw std::invalid_argument("file not present in verified manifest inventory: " + std::string(filename));
+Qwen38StreamResult Qwen38Manifest::stream_verified_open_fd(
+    int fd, std::string_view filename,
+    const std::function<void(std::uint64_t offset, std::span<const std::uint8_t> chunk)>& on_chunk,
+    const std::function<void(const Qwen38StreamResult&)>& on_admit,
+    const std::function<void()>& on_abort,
+    std::size_t chunk_bytes) const {
+  static_assert(sizeof(off_t) >= 8, "64-bit off_t required for >2 GiB shard streaming");
+  constexpr std::size_t kMaxChunkBytes = 16ull * 1024ull * 1024ull;
+
+  Qwen38StreamResult res;
+  try {
+    if (chunk_bytes == 0 || chunk_bytes > kMaxChunkBytes) {
+      throw std::invalid_argument("bounded streaming chunk_bytes must be in (0, 16 MiB]");
+    }
+    if (checkpoint.verification_level != ingine::model::VerificationLevel::PinnedVerified ||
+        !checkpoint.shard_digests_verified) {
+      throw std::invalid_argument("verified stream consumption requires VerificationLevel::PinnedVerified manifest");
+    }
+    const auto it = verified_files.find(std::string(filename));
+    if (it == verified_files.end()) {
+      throw std::invalid_argument("file not present in verified manifest inventory: " + std::string(filename));
+    }
+    const Qwen38VerifiedFile& v = it->second;
+    if (!v.payload_hashed || is_zero_digest(v.sha256)) {
+      throw std::invalid_argument("file lacks non-zero verified payload pin: " + std::string(filename));
+    }
+    if (v.byte_size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+      throw std::invalid_argument("verified file size overflows off_t for '" + std::string(filename) + "'");
+    }
+
+    const struct stat st_pre = fstat_regular(fd, filename);
+    if (static_cast<std::uint64_t>(st_pre.st_dev) != v.dev || static_cast<std::uint64_t>(st_pre.st_ino) != v.ino ||
+        static_cast<std::uint64_t>(st_pre.st_size) != v.byte_size) {
+      throw std::invalid_argument("open FD identity mismatch (file replaced or resized since inspection) for '" +
+                                  std::string(filename) + "'");
+    }
+
+    std::vector<std::uint8_t> buf(chunk_bytes);
+    Sha256 h;
+    std::uint64_t offset = 0;
+    while (true) {
+      const ssize_t got = ::pread(fd, buf.data(), buf.size(), static_cast<off_t>(offset));
+      if (got < 0) {
+        if (errno == EINTR) continue;
+        throw std::invalid_argument("pread error while streaming '" + std::string(filename) +
+                                    "': " + std::strerror(errno));
+      }
+      if (got == 0) break;
+      const std::uint64_t chunk = static_cast<std::uint64_t>(got);
+      if (chunk > v.byte_size - offset) {
+        throw std::invalid_argument("concurrent file growth detected while streaming '" + std::string(filename) + "'");
+      }
+      h.update(buf.data(), static_cast<std::size_t>(chunk));
+      if (on_chunk) {
+        on_chunk(offset, std::span<const std::uint8_t>(buf.data(), static_cast<std::size_t>(chunk)));
+      }
+      offset += chunk;
+    }
+
+    const struct stat st_post = fstat_regular(fd, filename);
+    if (static_cast<std::uint64_t>(st_post.st_dev) != v.dev ||
+        static_cast<std::uint64_t>(st_post.st_ino) != v.ino ||
+        static_cast<std::uint64_t>(st_post.st_size) != v.byte_size || offset != v.byte_size) {
+      throw std::invalid_argument("concurrent file modification/truncation during verified stream for '" +
+                                  std::string(filename) + "'");
+    }
+
+    const std::array<std::uint8_t, 32> digest = h.finalize();
+    if (digest != v.sha256) {
+      throw std::invalid_argument("SHA-256 mismatch on streamed consumption (in-place mutation or corruption) for '" +
+                                  std::string(filename) + "'");
+    }
+
+    res.bytes_delivered = offset;
+    res.sha256 = digest;
+    res.admitted = true;
+  } catch (...) {
+    if (on_abort) {
+      try {
+        on_abort();
+      } catch (...) {
+      }
+    }
+    throw;
   }
-  const Qwen38VerifiedFile& v = it->second;
-  const struct stat st = fstat_regular(fd, filename);
-  if (static_cast<std::uint64_t>(st.st_dev) != v.dev || static_cast<std::uint64_t>(st.st_ino) != v.ino ||
-      static_cast<std::uint64_t>(st.st_size) != v.byte_size) {
-    throw std::invalid_argument("open FD identity mismatch (file replaced or modified since inspection) for '" +
-                                std::string(filename) + "'");
+  if (on_admit) {
+    on_admit(res);
   }
+  return res;
+}
+
+Qwen38StreamResult Qwen38Manifest::stream_verified_file(
+    const std::filesystem::path& model_dir, std::string_view filename,
+    const std::function<void(std::uint64_t offset, std::span<const std::uint8_t> chunk)>& on_chunk,
+    const std::function<void(const Qwen38StreamResult&)>& on_admit,
+    const std::function<void()>& on_abort,
+    std::size_t chunk_bytes) const {
+  int raw_fd = -1;
+  try {
+    raw_fd = open_readonly_fd(model_dir / std::string(filename), filename.data());
+  } catch (...) {
+    if (on_abort) {
+      try {
+        on_abort();
+      } catch (...) {
+      }
+    }
+    throw;
+  }
+  ScopedFd fd(raw_fd);
+  return stream_verified_open_fd(fd.get(), filename, on_chunk, on_admit, on_abort, chunk_bytes);
+}
+
+void Qwen38Manifest::verify_open_fd(int fd, std::string_view filename, std::size_t chunk_bytes) const {
+  (void)stream_verified_open_fd(fd, filename, {}, {}, {}, chunk_bytes);
 }
 
 std::string Qwen38Manifest::read_verified_file_bytes(const std::filesystem::path& model_dir,
                                                      std::string_view filename) const {
+  constexpr std::uint64_t kMaxMetadataBytes = 256ull * 1024ull * 1024ull;
   const auto it = verified_files.find(std::string(filename));
   if (it == verified_files.end()) {
     throw std::invalid_argument("file not present in verified manifest inventory: " + std::string(filename));
   }
-  const Qwen38VerifiedFile& v = it->second;
-  const std::filesystem::path full_path = model_dir / std::string(filename);
-  ScopedFd fd(open_readonly_fd(full_path, filename.data()));
-  verify_open_fd(fd.get(), filename);
-
-  const VerifiedSmallFile consumed = consume_and_hash_small_fd(fd.get(), full_path, filename);
-  if (v.payload_hashed && consumed.identity.sha256 != v.sha256) {
-    throw std::invalid_argument("SHA-256 mismatch on verified file consumption for '" + std::string(filename) + "'");
+  if (it->second.byte_size > kMaxMetadataBytes) {
+    throw std::invalid_argument("file '" + std::string(filename) + "' (" + std::to_string(it->second.byte_size) +
+                                " bytes) exceeds 256 MiB metadata buffer cap; use stream_verified_file()");
   }
-  return consumed.bytes;
+  std::string staged;
+  staged.reserve(static_cast<std::size_t>(it->second.byte_size));
+  std::string admitted_bytes;
+  (void)stream_verified_file(
+      model_dir, filename,
+      [&](std::uint64_t /*offset*/, std::span<const std::uint8_t> chunk) {
+        if (staged.size() + chunk.size() > kMaxMetadataBytes) {
+          throw std::invalid_argument("metadata file grew beyond 256 MiB during verified read: " +
+                                      std::string(filename));
+        }
+        staged.append(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+      },
+      [&](const Qwen38StreamResult& /*res*/) { admitted_bytes = std::move(staged); },
+      [&]() {
+        staged.clear();
+        admitted_bytes.clear();
+      });
+  return admitted_bytes;
 }
 
 Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, bool hash_shards,

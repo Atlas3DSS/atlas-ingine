@@ -6,6 +6,8 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -20,6 +22,12 @@ struct Qwen38VerifiedFile {
   std::uint64_t byte_size = 0;
   std::array<std::uint8_t, 32> sha256{};
   bool payload_hashed = false;
+};
+
+struct Qwen38StreamResult {
+  std::uint64_t bytes_delivered = 0;
+  std::array<std::uint8_t, 32> sha256{};
+  bool admitted = false;  // true ONLY after full stream EOF + exact size + expected SHA-256 pin match
 };
 
 struct Qwen38TensorInfo {
@@ -59,10 +67,35 @@ struct Qwen38Manifest {
   std::array<std::uint8_t, 32> parsed_config_fingerprint{};
   std::vector<std::int32_t> media_token_ids;
 
-  // Verifies an already-open file descriptor matches the fstat (dev, ino, size) recorded at inspection.
-  void verify_open_fd(int fd, std::string_view filename) const;
-  // Opens `model_dir / filename` once, verifies FD identity and full-byte SHA-256 (if hashed),
-  // and returns exact consumed bytes. Throws std::invalid_argument fail-closed on any mismatch.
+  // Verifies an already-open file descriptor against the pinned manifest: requires PinnedVerified,
+  // matching fstat (S_ISREG, dev, ino, byte_size), and a full bounded streaming SHA-256 verification
+  // over the FD so same-size in-place mutations are rejected fail-closed at any file size.
+  void verify_open_fd(int fd, std::string_view filename, std::size_t chunk_bytes = 1024ull * 1024ull) const;
+
+  // Streams exact bytes from an open FD (starting at offset 0 via pread) in bounded chunks
+  // (default 1 MiB, max 16 MiB), hashing the exact delivered bytes with SHA-256 in the same pass.
+  // Calls `on_admit(res)` ONLY after all `byte_size` bytes are delivered, EOF has no trailing
+  // bytes, and computed SHA-256 matches the expected pin. On any mismatch/error (including
+  // unpinned manifests or same-size mutations), `on_admit` is never called, `on_abort` is
+  // invoked to discard staged state, and std::invalid_argument is thrown fail-closed.
+  Qwen38StreamResult stream_verified_open_fd(
+      int fd, std::string_view filename,
+      const std::function<void(std::uint64_t offset, std::span<const std::uint8_t> chunk)>& on_chunk,
+      const std::function<void(const Qwen38StreamResult&)>& on_admit = {},
+      const std::function<void()>& on_abort = {},
+      std::size_t chunk_bytes = 1024ull * 1024ull) const;
+
+  // Opens `model_dir / filename` once and delegates to stream_verified_open_fd().
+  Qwen38StreamResult stream_verified_file(
+      const std::filesystem::path& model_dir, std::string_view filename,
+      const std::function<void(std::uint64_t offset, std::span<const std::uint8_t> chunk)>& on_chunk,
+      const std::function<void(const Qwen38StreamResult&)>& on_admit = {},
+      const std::function<void()>& on_abort = {},
+      std::size_t chunk_bytes = 1024ull * 1024ull) const;
+
+  // Bounded metadata helper (<= 256 MiB): opens `model_dir / filename` via stream_verified_file() and
+  // admits buffered bytes ONLY after full expected-pin verification. Rejects > 256 MiB shards
+  // fail-closed (use stream_verified_file() / stream_verified_open_fd() for production shards).
   std::string read_verified_file_bytes(const std::filesystem::path& model_dir, std::string_view filename) const;
 
   // Header inspection (hash_shards=false -> HeadersOnly; hash_shards=true -> SelfHashed).
