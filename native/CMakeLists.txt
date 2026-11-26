@@ -41,6 +41,17 @@ if(INGINE_TP_SIZE GREATER 1 AND NOT INGINE_BACKEND STREQUAL "CUDA")
   message(FATAL_ERROR "INGINE_TP_SIZE=${INGINE_TP_SIZE} requires INGINE_BACKEND=CUDA")
 endif()
 add_compile_definitions(INGINE_TP_SIZE=${INGINE_TP_SIZE})
+# Expert tensor parallelism: every rank holds 1/TP of every expert's intermediate dimension (all 128 experts) instead
+# of 1/TP of the experts. Decode work then splits evenly whatever the routing. GGUF models only.
+option(INGINE_TP_ETP "TP>1: split each expert's intermediate dimension across ranks (GGUF models)" OFF)
+if(INGINE_TP_ETP)
+  if(INGINE_TP_SIZE EQUAL 1)
+    message(FATAL_ERROR "INGINE_TP_ETP needs INGINE_TP_SIZE > 1")
+  endif()
+  add_compile_definitions(INGINE_TP_ETP=1)
+else()
+  add_compile_definitions(INGINE_TP_ETP=0)
+endif()
 
 if(INGINE_BACKEND STREQUAL "CUDA")
   # Detect pre-Ampere (< sm_80) and Ampere+ (>= sm_80) architectures.

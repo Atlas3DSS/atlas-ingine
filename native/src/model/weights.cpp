@@ -892,6 +892,9 @@ Weights load_weights_sharded(const fs::path& model_dir, bool dense_fp8, cudaStre
     if (dense_fp8) throw std::invalid_argument("--dense-fp8 would re-quantize the GGUF dense weights; drop it");
     return load_weights_gguf(model_dir, stream, tp_rank, tp_size, keep_full_unembed);
   }
+#if INGINE_TP_ETP
+  throw std::invalid_argument("expert tensor parallel builds (INGINE_TP_ETP) load GGUF models only");
+#endif
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;

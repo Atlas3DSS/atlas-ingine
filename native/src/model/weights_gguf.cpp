@@ -283,16 +283,27 @@ void repack_row(GgmlType t, const std::uint8_t* src, int K, std::uint8_t* code, 
   }
 }
 
-// EP-sharded experts of one projection ("gate_up" -> w13 with interleaved rows, "down" -> w2).
-void load_experts(GgufLoader& ld, const std::string& b, const char* proj, int e_begin, int e_per, ExpertFormat& fmt,
-                  Tensor& wt, Tensor& sc, Tensor& fac, Tensor& wptrs, Tensor& sptrs) {
+// Experts of one projection ("gate_up" -> w13 with interleaved rows, "down" -> w2): experts [e_begin, + e_per), and
+// of each the intermediate slice [i_begin, + i_per) (expert tensor parallelism; else 0, INTER): w13 rows of those
+// i, w2 columns of those i (a whole number of GGUF blocks: checked).
+void load_experts(GgufLoader& ld, const std::string& b, const char* proj, int e_begin, int e_per, int i_begin,
+                  int i_per, ExpertFormat& fmt, Tensor& wt, Tensor& sc, Tensor& fac, Tensor& wptrs, Tensor& sptrs) {
   const GgufFile& f = ld.file();
   const GgufTensor& t = f.at(b + "ffn_" + proj + "_exps.weight");
   const bool up = std::strcmp(proj, "gate_up") == 0;
-  const int K = int(t.row_len());
-  const int rows = up ? 2 * INTER : HIDDEN;
-  if (K != (up ? HIDDEN : INTER) || t.rows() != std::int64_t(rows) * EXPERTS)
+  const int K_src = int(t.row_len());
+  const int rows_src = up ? 2 * INTER : HIDDEN;
+  if (K_src != (up ? HIDDEN : INTER) || t.rows() != std::int64_t(rows_src) * EXPERTS)
     throw std::runtime_error("weights_gguf: " + t.name + " has an unexpected shape");
+  const int K = up ? K_src : i_per;
+  const int rows = up ? 2 * i_per : HIDDEN;
+  std::size_t k_off_bytes = 0;  // byte offset of column i_begin in a source row (down)
+  if (!up && i_per != INTER) {
+    const std::size_t blk_vals = std::size_t(ggml_block_values(t.type)), blk_bytes = ggml_block_bytes(t.type);
+    if (i_begin % blk_vals || i_per % blk_vals)
+      throw std::runtime_error("weights_gguf: " + t.name + " blocks do not split at the expert-TP slice");
+    k_off_bytes = std::size_t(i_begin) / blk_vals * blk_bytes;
+  }
   fmt = gguf_expert_format(t.type);
   std::size_t cb, sbytes;
   row_bytes(fmt, K, cb, sbytes);
@@ -301,8 +312,9 @@ void load_experts(GgufLoader& ld, const std::string& b, const char* proj, int e_
   parallel_for(std::int64_t(e_per) * rows, [&](std::int64_t i) {
     const int el = int(i / rows), r = int(i % rows);
     const int e = e_begin + el;
-    const int src_r = up ? ((r & 1) ? INTER + r / 2 : r / 2) : r;  // w13: row 2i gate i, 2i + 1 up i
-    repack_row(t.type, reinterpret_cast<const std::uint8_t*>(t.row(std::int64_t(e) * rows + src_r)), K,
+    // w13: row 2i gate i, 2i + 1 up i (i = i_begin + r / 2)
+    const int src_r = up ? ((r & 1) ? INTER + i_begin + r / 2 : i_begin + r / 2) : r;
+    repack_row(t.type, reinterpret_cast<const std::uint8_t*>(t.row(std::int64_t(e) * rows_src + src_r)) + k_off_bytes, K,
                codes.data() + el * c_exp + std::size_t(r) * cb, scales.data() + el * s_exp + std::size_t(r) * sbytes);
   });
   void* wd = ld.upload(codes.data(), codes.size());
@@ -629,10 +641,17 @@ Layer load_layer_gguf(GgufLoader& ld, int l, int tp_rank, int tp_size) {
   Experts& ex = layer.experts;
   ex.ep_rank = tp_rank;
   ex.ep_size = tp_size;
+#if INGINE_TP_ETP
+  // expert tensor parallelism: all experts, intermediate rows [tp_rank * INTER_LOCAL, + INTER_LOCAL)
+  const int e_per = EXPERTS, e_begin = 0;
+  const int i_per = tp_size > 1 ? INTER_LOCAL : INTER, i_begin = tp_size > 1 ? tp_rank * INTER_LOCAL : 0;
+#else
   const int e_per = EXPERTS / tp_size, e_begin = tp_rank * e_per;
-  load_experts(ld, b, "gate_up", e_begin, e_per, ex.w13_fmt, ex.w13, ex.w13_scale, ex.w13_factor, ex.w13_ptrs,
-               ex.w13_scale_ptrs);
-  load_experts(ld, b, "down", e_begin, e_per, ex.w2_fmt, ex.w2, ex.w2_scale, ex.w2_factor, ex.w2_ptrs,
+  const int i_per = INTER, i_begin = 0;
+#endif
+  load_experts(ld, b, "gate_up", e_begin, e_per, i_begin, i_per, ex.w13_fmt, ex.w13, ex.w13_scale, ex.w13_factor,
+               ex.w13_ptrs, ex.w13_scale_ptrs);
+  load_experts(ld, b, "down", e_begin, e_per, i_begin, i_per, ex.w2_fmt, ex.w2, ex.w2_scale, ex.w2_factor, ex.w2_ptrs,
                ex.w2_scale_ptrs);
   ex.fmt = ex.w13_fmt;
   {

@@ -50,7 +50,7 @@ struct Cfg {
   static constexpr int CODE_ROW = (FMT == FMT_NVFP4 || is_gguf_fmt(FMT)) ? K / 2 : (FMT == FMT_MXFP8 ? K : (FMT == FMT_ATLAS2 ? K / 4 : (K * 3) / 8));
   static constexpr int SCALE_ROW = FMT == FMT_GQ5 ? (K / 32) * 12 : (FMT == FMT_GQI4 ? (K / 32) * 4 : (FMT == FMT_MXFP8 ? K / 32 : K / 16));
   // weight chunk: 128 elements for NVFP4/ATLAS2/ATLAS3 (64/32/48 code bytes per row, all multiples of 16), 64 for MXFP8
-  static constexpr int WK = FMT == FMT_MXFP8 ? 64 : 128;
+  static constexpr int WK = (FMT == FMT_MXFP8 || K % 128 != 0) ? 64 : 128;  // (K = 576: expert TP down)
   static constexpr int R = WK / BK;  // activation steps per weight chunk
   static constexpr int KC = K / WK;  // weight chunks
   static constexpr int AS_STG = LOW_SMEM ? 2 : AS;
@@ -61,9 +61,10 @@ struct Cfg {
   static constexpr bool VOLTA_COMPACT = INGINE_ACT_FP16 && !LOW_SMEM;
   static constexpr bool STAGE_W = !VOLTA_DIRECT;
   static constexpr bool STAGE_SC = !VOLTA_COMPACT && !is_gguf_fmt(FMT);
-  static constexpr int WS = (LOW_SMEM || VOLTA_COMPACT) ? (FMT == FMT_MXFP8 ? 3 : 2)
-                                     : (TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6)
-                                                 : (FMT == FMT_MXFP8 ? 4 : 3));
+  static constexpr bool W64 = WK == 64;  // (MXFP8, or a K that is not a multiple of 128: stage as MXFP8 does)
+  static constexpr int WS = (LOW_SMEM || VOLTA_COMPACT) ? (W64 ? 3 : 2)
+                                     : (TM <= 32 ? (W64 ? 7 : 6)
+                                                 : (W64 ? 4 : 3));
   static_assert(R * (WS - 1) >= AS_STG);
   static constexpr int WCODE = (FMT == FMT_NVFP4 || is_gguf_fmt(FMT)) ? WK / 2 : (FMT == FMT_MXFP8 ? WK : (FMT == FMT_ATLAS2 ? WK / 4 : (WK * 3) / 8));
   static constexpr int WSTRIDE = WCODE + 16;                    // padded: fragment loads on distinct banks
