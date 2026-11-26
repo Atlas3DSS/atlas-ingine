@@ -650,14 +650,34 @@ def wait_for_health(base_url: str, proc: subprocess.Popen[str] | None, timeout_s
     raise TimeoutError(f"Server at {base_url}/health did not become ready within {timeout_s}s")
 
 
-AUTHORITATIVE_IDENTITY_SOURCES: frozenset[str] = frozenset(
+AUTHORITATIVE_SOURCE_TOKENS: frozenset[str] = frozenset(
     {
         "runtime_http",
         "managed_process_telemetry",
-        "runtime_http+managed_process_telemetry",
     }
 )
 KNOWN_BACKENDS: frozenset[str] = frozenset({"hip", "cuda", "cpu", "mlx", "sycl"})
+
+
+def _split_source_tokens(value: Any) -> set[str]:
+    if not isinstance(value, str):
+        return set()
+    return {tok.strip().lower() for tok in value.split("+") if tok.strip()}
+
+
+def _canonical_source(sources: list[str] | set[str]) -> str:
+    tokens: set[str] = set()
+    for s in sources:
+        tokens.update(_split_source_tokens(s))
+    if "conflict" in tokens:
+        return "conflict"
+    tokens.discard("missing")
+    return "+".join(sorted(tokens)) if tokens else "missing"
+
+
+def _is_authoritative_source(value: Any) -> bool:
+    tokens = _split_source_tokens(value)
+    return bool(tokens) and tokens.issubset(AUTHORITATIVE_SOURCE_TOKENS)
 
 
 def _norm_backend(value: Any) -> str | None:
@@ -1452,8 +1472,7 @@ def run_benchmark_suite(
     if accel_conflict:
         accel_source = "conflict"
     else:
-        accel_srcs = {s for s in (be_src, arch_src) if s not in ("missing", "conflict")}
-        accel_source = "+".join(sorted(accel_srcs)) if accel_srcs else "missing"
+        accel_source = _canonical_source([be_src, arch_src])
 
     if model_conflict:
         observed_sha = None
@@ -1521,9 +1540,9 @@ def score_report(
     gfx1151 = bool((preflight.get("rocm") or {}).get("gfx1151_detected", False))
 
     accel = bench.get("accelerator") if isinstance(bench.get("accelerator"), dict) else {}
-    accel_source = str(accel.get("source") or "missing").strip().lower()
+    accel_source = _canonical_source([str(accel.get("source") or "missing")])
     accel_conflict = bool(accel.get("conflict", False)) or (accel_source == "conflict")
-    accel_authoritative = (accel_source in AUTHORITATIVE_IDENTITY_SOURCES) and (not accel_conflict)
+    accel_authoritative = _is_authoritative_source(accel_source) and (not accel_conflict)
     selected_backend = _norm_backend(accel.get("backend"))
     selected_arch = _norm_arch(accel.get("selected_device_arch"))
     exp_backend = _norm_backend(expected_backend if expected_backend is not None else accel.get("expected_backend"))
@@ -1541,11 +1560,11 @@ def score_report(
     )
 
     model_ident = bench.get("model_identity") if isinstance(bench.get("model_identity"), dict) else {}
-    model_source = str(model_ident.get("source") or "missing").strip().lower()
+    model_source = _canonical_source([str(model_ident.get("source") or "missing")])
     model_conflict = bool(model_ident.get("conflict", False)) or (model_source == "conflict")
     model_entry_matched = model_ident.get("model_entry_matched")
     model_authoritative = (
-        (model_source in AUTHORITATIVE_IDENTITY_SOURCES)
+        _is_authoritative_source(model_source)
         and (not model_conflict)
         and (model_entry_matched is not False)
     )

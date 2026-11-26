@@ -902,6 +902,54 @@ class TestStrixHaloVerify(unittest.TestCase):
             self.assertEqual(s_ok["verdict"], "PASS_STRIX_HALO_FLOOR")
             self.assertTrue(s_ok["hardware_verified"])
 
+            # 4d. Managed launcher where BOTH HTTP and stderr loader telemetry agree (including asymmetric
+            #     backend-in-both + arch-in-stderr-only) -> canonical deduplicated source passes PASS_STRIX_HALO_FLOOR!
+            both_bin = Path(td) / "mock_serve_both_agree.py"
+            _write_mock_serve_launcher(both_bin)
+            bsrc = both_bin.read_text(encoding="utf-8")
+            bsrc = bsrc.replace(
+                'b = b\'{"status":"ok"}\'',
+                f'b = b\'{{"status":"ok","backend":"hip","content_sha256":"{sha_a}"}}\'',
+            )
+            binj = (
+                f'sys.stderr.write("loader: backend=hip selected_device_arch=gfx1151 '
+                f'content_sha256={sha_a}\\n"); sys.stderr.flush()\n'
+            )
+            both_bin.write_text(
+                bsrc.replace("S((a.host, a.port), H).serve_forever()", binj + "S((a.host, a.port), H).serve_forever()"),
+                encoding="utf-8",
+            )
+            res_both = shv.run_benchmark_suite(
+                base_url=None,
+                serve_bin=both_bin,
+                model_dir=mdir,
+                model_id_override=None,
+                fake_smoke=False,
+                extra_serve_args=[],
+                decode_max_tokens=4,
+                prefill_lengths=[64],
+                agent_lengths=[64],
+                cold_tokens=64,
+                startup_timeout_s=10.0,
+                expected_model_sha256=sha_a,
+                selected_backend="hip",
+                selected_device_arch="gfx1151",
+            )
+            self.assertEqual(res_both["accelerator"]["source"], "managed_process_telemetry+runtime_http")
+            self.assertEqual(res_both["model_identity"]["source"], "managed_process_telemetry+runtime_http")
+            self.assertFalse(res_both["accelerator"]["conflict"])
+            self.assertFalse(res_both["model_identity"]["conflict"])
+            res_both["decode_runs"] = q["decode_runs"]
+            res_both["prefill_runs"] = q["prefill_runs"]
+            res_both["agent_runs"] = q["agent_runs"]
+            res_both["cold_run"] = q["cold_run"]
+            s_both = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": res_both})
+            self.assertEqual(s_both["verdict"], "PASS_STRIX_HALO_FLOOR")
+            self.assertTrue(s_both["hardware_verified"])
+            self.assertEqual(s_both["accelerator_source"], "managed_process_telemetry+runtime_http")
+            self.assertEqual(s_both["model_identity_source"], "managed_process_telemetry+runtime_http")
+            self.assertEqual(s_both["passed"], 11)
+
             # 4c. Managed launcher with conflicting HTTP vs stderr telemetry -> fails closed as mismatch!
             conflict_bin = Path(td) / "mock_serve_conflict.py"
             _write_mock_serve_launcher(conflict_bin)
