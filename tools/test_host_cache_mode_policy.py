@@ -25,6 +25,8 @@ def start_mock_worker(
     body_mode_override: str | None = None,
     cached_tokens: object = 0,
     omit_cached_tokens: bool = False,
+    loop_passes: int | None = None,
+    models_loop_passes_override: int | None = None,
 ):
     received: list[dict] = []
 
@@ -45,35 +47,36 @@ def start_mock_worker(
         def do_GET(self):
             hdr = header_override if header_override is not None else active_mode
             if self.path == "/health":
-                self._send(
-                    200,
-                    {
-                        "status": "ok",
-                        "model": model_id,
-                        "kv_cache_mode": active_mode,
-                        "supported_kv_cache_modes": supported_modes,
-                        "kv_cache_mode_mutable": False,
-                        "max_batch": max_batch,
-                        "waiting": 0,
-                        "running": False,
-                    },
-                    mode_hdr=hdr,
-                )
+                health_obj = {
+                    "status": "ok",
+                    "model": model_id,
+                    "kv_cache_mode": active_mode,
+                    "supported_kv_cache_modes": supported_modes,
+                    "kv_cache_mode_mutable": False,
+                    "max_batch": max_batch,
+                    "waiting": 0,
+                    "running": False,
+                }
+                if loop_passes is not None:
+                    health_obj["loop_passes"] = loop_passes
+                self._send(200, health_obj, mode_hdr=hdr)
             elif self.path == "/v1/models":
+                card_obj = {
+                    "id": model_id,
+                    "object": "model",
+                    "max_model_len": max_model_len,
+                    "kv_cache_mode": active_mode,
+                    "supported_kv_cache_modes": supported_modes,
+                    "kv_cache_mode_mutable": False,
+                }
+                card_lp = models_loop_passes_override if models_loop_passes_override is not None else loop_passes
+                if card_lp is not None:
+                    card_obj["loop_passes"] = card_lp
                 self._send(
                     200,
                     {
                         "object": "list",
-                        "data": [
-                            {
-                                "id": model_id,
-                                "object": "model",
-                                "max_model_len": max_model_len,
-                                "kv_cache_mode": active_mode,
-                                "supported_kv_cache_modes": supported_modes,
-                                "kv_cache_mode_mutable": False,
-                            }
-                        ],
+                        "data": [card_obj],
                     },
                     mode_hdr=hdr,
                 )
@@ -508,6 +511,124 @@ class TestHostCacheModePolicy(unittest.TestCase):
                     self.assertEqual(reg.get_session_mode("sess-strict"), "last_full")
         finally:
             for s in (srv_pp, srv_lf_ok, srv_lf_null, srv_lf_omit, srv_lf_pos):
+                s.shutdown()
+                s.server_close()
+
+    def test_loop_passes_discovery_sizing_identity_and_cross_depth_guard(self):
+        # Exact #838 depth-aware memory math (reproduces L6 @ 8,192 total tokens, fp8 KV):
+        # L6 has 14 full slots (224 MiB), 70 sliding visits (280 MiB rings + 0.546875 MiB ring_pos),
+        # and 84 conv visits (6.3984375 MiB) -> 510.9453125 MiB total.
+        self.assertAlmostEqual(pol.estimate_full_kv_mib(8192, "fp8", "per_pass", loop_passes=6), 224.0, places=9)
+        self.assertAlmostEqual(
+            pol.estimate_total_state_mib(8192, "fp8", "per_pass", loop_passes=6), 510.9453125, places=9
+        )
+        with self.assertRaises(ValueError):
+            pol.estimate_full_kv_mib(8192, "fp8", "last_full", loop_passes=6)
+
+        srv_l1, url_l1, _ = start_mock_worker("per_pass", ["per_pass"], loop_passes=1)
+        srv_l3, url_l3, _ = start_mock_worker("per_pass", ["per_pass", "last_full"], loop_passes=3)
+        srv_l6, url_l6, _ = start_mock_worker("per_pass", ["per_pass"], loop_passes=6)
+        srv_legacy, url_legacy, _ = start_mock_worker("per_pass", ["per_pass", "last_full"], loop_passes=None)
+        srv_bad_lf, url_bad_lf, _ = start_mock_worker("per_pass", ["per_pass", "last_full"], loop_passes=5)
+        srv_mismatch, url_mismatch, _ = start_mock_worker(
+            "per_pass", ["per_pass"], loop_passes=3, models_loop_passes_override=6
+        )
+        try:
+            w_l1 = pol.discover_worker_capability("w-l1", url_l1, kv_format="fp8", available_kv_vram_mib=2048.0)
+            w_l3 = pol.discover_worker_capability("w-l3", url_l3, kv_format="fp8", available_kv_vram_mib=2048.0)
+            w_l6 = pol.discover_worker_capability("w-l6", url_l6, kv_format="fp8", available_kv_vram_mib=2048.0)
+            w_legacy = pol.discover_worker_capability("w-legacy", url_legacy, kv_format="fp8", available_kv_vram_mib=2048.0)
+
+            self.assertEqual(w_l1.loop_passes, 1)
+            self.assertEqual(w_l3.loop_passes, 3)
+            self.assertEqual(w_l6.loop_passes, 6)
+            self.assertEqual(w_legacy.loop_passes, 3)  # legacy server omitting loop_passes defaults to 3
+            self.assertFalse(w_l1.supports_mode("last_full"))
+            self.assertFalse(w_l6.supports_mode("last_full"))
+            self.assertTrue(w_l3.supports_mode("last_full"))
+
+            with self.assertRaisesRegex(RuntimeError, "incompatible last_full"):
+                pol.discover_worker_capability("w-bad-lf", url_bad_lf)
+            with self.assertRaisesRegex(RuntimeError, "inconsistent loop_passes"):
+                pol.discover_worker_capability("w-mismatch", url_mismatch)
+
+            # L6 at 8,192 total tokens, fp8 KV, 350 MiB budget MUST BE REJECTED (510.9453125 > 350 MiB).
+            req_budget = pol.AdmissionRequest(
+                task_id="t-l6-budget",
+                session_id="s-l6",
+                cache_namespace="tenant-a",
+                context_tokens=8064,
+                expected_new_tokens=128,
+                prefix_sha256="deadbeef",
+                budgets=pol.AdmissionBudgets(memory_budget_mib=350.0),
+            )
+            dec_l6_tight = pol.evaluate_worker_for_mode(w_l6, req_budget, "per_pass")
+            self.assertFalse(dec_l6_tight.admitted)
+            self.assertIn("memory_budget_exceeded", dec_l6_tight.reason)
+            self.assertAlmostEqual(dec_l6_tight.estimated_state_mib, 510.9453125, places=6)
+
+            # L1, L3, L6 under sufficient budget MUST produce distinct checkpoint digests and cache namespaces.
+            req_open = pol.AdmissionRequest(
+                task_id="t-depth-id",
+                session_id="s-id",
+                cache_namespace="tenant-a",
+                context_tokens=8064,
+                expected_new_tokens=128,
+                prefix_sha256="deadbeef",
+                budgets=pol.AdmissionBudgets(memory_budget_mib=1024.0),
+            )
+            dec_l1 = pol.evaluate_worker_for_mode(w_l1, req_open, "per_pass")
+            dec_l3 = pol.evaluate_worker_for_mode(w_l3, req_open, "per_pass")
+            dec_l6 = pol.evaluate_worker_for_mode(w_l6, req_open, "per_pass")
+            self.assertTrue(dec_l1.admitted and dec_l3.admitted and dec_l6.admitted)
+            self.assertEqual(len({dec_l1.effective_cache_namespace, dec_l3.effective_cache_namespace, dec_l6.effective_cache_namespace}), 3)
+            self.assertEqual(
+                len(
+                    {
+                        dec_l1.checkpoint_identity.identity_digest(),
+                        dec_l3.checkpoint_identity.identity_digest(),
+                        dec_l6.checkpoint_identity.identity_digest(),
+                    }
+                ),
+                3,
+            )
+            self.assertEqual(dec_l3.effective_cache_namespace, "tenant-a:kv_mode=per_pass")
+            self.assertEqual(dec_l1.effective_cache_namespace, "tenant-a:kv_mode=per_pass:loop_passes=1")
+            self.assertEqual(dec_l6.effective_cache_namespace, "tenant-a:kv_mode=per_pass:loop_passes=6")
+
+            # Cross-depth session switch (L3 -> L6) in HostCacheModeRegistry MUST fail closed without authorized_replay.
+            with tempfile.TemporaryDirectory() as td:
+                db = Path(td) / "depth_switch.sqlite"
+                with pol.HostCacheModeRegistry(db) as reg:
+                    out_l3 = reg.dispatch_chat_completion([w_l3], req_open, [{"role": "user", "content": "hi"}])
+                    self.assertTrue(out_l3["admitted"])
+                    self.assertEqual(reg.get_session_state("s-id"), ("per_pass", 3))
+
+                    out_l6_blocked = reg.dispatch_chat_completion([w_l6], req_open, [{"role": "user", "content": "hi"}])
+                    self.assertFalse(out_l6_blocked["admitted"])
+                    self.assertIn("mode_switch_blocked_no_authorized_replay", out_l6_blocked["decision"]["reason"])
+                    self.assertEqual(reg.get_session_state("s-id"), ("per_pass", 3))
+
+                    req_l6_replay = pol.AdmissionRequest(
+                        task_id="t-depth-replay",
+                        session_id="s-id",
+                        cache_namespace="tenant-a",
+                        context_tokens=8064,
+                        expected_new_tokens=128,
+                        prefix_sha256="deadbeef",
+                        budgets=pol.AdmissionBudgets(memory_budget_mib=1024.0),
+                        mode_switch=pol.ModeSwitchContext(
+                            prior_kv_cache_mode="per_pass",
+                            prior_loop_passes=3,
+                            replay_authorized=True,
+                            authorized_replay_tokens=8064,
+                        ),
+                    )
+                    out_l6_ok = reg.dispatch_chat_completion([w_l6], req_l6_replay, [{"role": "user", "content": "hi"}])
+                    self.assertTrue(out_l6_ok["admitted"])
+                    self.assertEqual(reg.get_session_state("s-id"), ("per_pass", 6))
+        finally:
+            for s in (srv_l1, srv_l3, srv_l6, srv_legacy, srv_bad_lf, srv_mismatch):
                 s.shutdown()
                 s.server_close()
 

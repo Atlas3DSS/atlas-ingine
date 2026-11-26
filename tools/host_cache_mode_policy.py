@@ -41,20 +41,36 @@ from typing import Any, Iterable, Optional
 
 VALID_KV_CACHE_MODES = ("per_pass", "last_full")
 DEFAULT_KV_CACHE_MODE = "per_pass"
+DEFAULT_LOOP_PASSES = 3
+MIN_LOOP_PASSES = 1
+MAX_LOOP_PASSES = 8
 
-# Exact Inkling-2-Mini full-attention KV bytes per token across full slots:
-# 4 KV heads * 256 head_dim = 1024 KV_DIM; 8 full slots in per_pass, 4 in last_full.
-# Sliding rings (40 visits * 1024 * 1024 * 2 * 2 B = 160 MiB) and conv states (~3.7 MiB)
-# remain strictly pass-local and invariant across modes.
-FULL_KV_BYTES_PER_TOKEN: dict[tuple[str, str], int] = {
-    ("q4_0", "per_pass"): 9216,     # 9 KiB/tok -> 9.00 GiB at 1,048,576 tokens
-    ("q4_0", "last_full"): 4608,    # 4.5 KiB/tok -> 4.50 GiB at 1,048,576 tokens
-    ("fp8", "per_pass"): 16384,     # 16 KiB/tok -> 16.00 GiB at 1,048,576 tokens
-    ("fp8", "last_full"): 8192,     # 8 KiB/tok -> 8.00 GiB at 1,048,576 tokens
-    ("bf16", "per_pass"): 32768,    # 32 KiB/tok -> 32.00 GiB at 1,048,576 tokens
-    ("bf16", "last_full"): 16384,   # 16 KiB/tok -> 16.00 GiB at 1,048,576 tokens
+# Exact Inkling-2-Mini KV/state geometry (mirrors native/src/model/model_data.h & state.cpp):
+#   - VisitPlan(L): visits = 12 + 12*L, sliding = 10 + 10*L, full(per_pass) = 2 + 2*L, full(last_full, L=3) = 4.
+#   - Full-attention KV bytes per (slot, token) across K+V (KV_DIM = 8*128 = 1024; Q4_0 row = 576 B):
+#       q4_0: 2 * 576 = 1152 B/slot/tok (L=3 per_pass 9216 B/tok -> 9.00 GiB @ 1M; last_full 4608 -> 4.50 GiB)
+#       fp8:  2 * 1024 * 1 = 2048 B/slot/tok
+#       bf16: 2 * 1024 * 2 = 4096 B/slot/tok
+#   - Pass-local state bytes for depth L:
+#       sliding rings (k_ring + v_ring, 2 B/elem, WINDOW=1024, KV_DIM=1024): ns * 4,194,304 B (4 MiB / sliding visit)
+#       ring_pos (int64, WINDOW=1024):                                        ns * 8,192 B
+#       conv states (conv_k, conv_v [1024], conv_attn, conv_mlp [2304], 3*FP32): nv * 79,872 B
+FULL_KV_BYTES_PER_SLOT_TOKEN: dict[str, int] = {
+    "q4_0": 1152,
+    "fp8": 2048,
+    "bf16": 4096,
 }
-FIXED_PASS_LOCAL_STATE_MIB = 164.0  # 160 MiB sliding rings + ~3.7 MiB conv states
+FULL_KV_BYTES_PER_TOKEN: dict[tuple[str, str], int] = {
+    ("q4_0", "per_pass"): 9216,     # 9 KiB/tok -> 9.00 GiB at 1,048,576 tokens (L=3)
+    ("q4_0", "last_full"): 4608,    # 4.5 KiB/tok -> 4.50 GiB at 1,048,576 tokens (L=3)
+    ("fp8", "per_pass"): 16384,     # 16 KiB/tok -> 16.00 GiB at 1,048,576 tokens (L=3)
+    ("fp8", "last_full"): 8192,     # 8 KiB/tok -> 8.00 GiB at 1,048,576 tokens (L=3)
+    ("bf16", "per_pass"): 32768,    # 32 KiB/tok -> 32.00 GiB at 1,048,576 tokens (L=3)
+    ("bf16", "last_full"): 16384,   # 16 KiB/tok -> 16.00 GiB at 1,048,576 tokens (L=3)
+}
+SLIDING_RING_BYTES_PER_VISIT = 2 * 1024 * 1024 * 2  # 4,194,304 B (4 MiB)
+RING_POS_BYTES_PER_VISIT = 1024 * 8                 # 8,192 B
+CONV_BYTES_PER_VISIT = 3 * (2 * 1024 + 2 * 2304) * 4  # 79,872 B
 
 
 def validate_kv_cache_mode(mode: str) -> str:
@@ -63,38 +79,98 @@ def validate_kv_cache_mode(mode: str) -> str:
     return mode
 
 
-def estimate_full_kv_mib(context_tokens: int, kv_format: str, kv_cache_mode: str) -> float:
+def validate_loop_passes(loop_passes: int) -> int:
+    if type(loop_passes) is not int or loop_passes < MIN_LOOP_PASSES or loop_passes > MAX_LOOP_PASSES:
+        raise ValueError(
+            f"invalid loop_passes {loop_passes!r} (expected integer in {MIN_LOOP_PASSES}..{MAX_LOOP_PASSES})"
+        )
+    return loop_passes
+
+
+def num_visits_for_passes(loop_passes: int = DEFAULT_LOOP_PASSES) -> int:
+    lp = validate_loop_passes(loop_passes)
+    return 12 + 12 * lp
+
+
+def num_sliding_visits_for_passes(loop_passes: int = DEFAULT_LOOP_PASSES) -> int:
+    lp = validate_loop_passes(loop_passes)
+    return 10 + 10 * lp
+
+
+def num_full_slots_for_passes(loop_passes: int, kv_cache_mode: str) -> int:
+    lp = validate_loop_passes(loop_passes)
     validate_kv_cache_mode(kv_cache_mode)
+    if kv_cache_mode == "last_full":
+        if lp != DEFAULT_LOOP_PASSES:
+            raise ValueError(f"last_full kv_cache_mode requires loop_passes={DEFAULT_LOOP_PASSES} (got {lp})")
+        return 4
+    return 2 + 2 * lp
+
+
+def estimate_pass_local_state_mib(loop_passes: int = DEFAULT_LOOP_PASSES) -> float:
+    ns = num_sliding_visits_for_passes(loop_passes)
+    nv = num_visits_for_passes(loop_passes)
+    total_bytes = ns * (SLIDING_RING_BYTES_PER_VISIT + RING_POS_BYTES_PER_VISIT) + nv * CONV_BYTES_PER_VISIT
+    return total_bytes / (1024.0 * 1024.0)
+
+
+FIXED_PASS_LOCAL_STATE_MIB = estimate_pass_local_state_mib(DEFAULT_LOOP_PASSES)
+
+
+def estimate_full_kv_mib(
+    context_tokens: int,
+    kv_format: str,
+    kv_cache_mode: str,
+    loop_passes: int = DEFAULT_LOOP_PASSES,
+) -> float:
+    validate_kv_cache_mode(kv_cache_mode)
+    lp = validate_loop_passes(loop_passes)
     fmt = kv_format.lower()
-    key = (fmt, kv_cache_mode)
-    if key not in FULL_KV_BYTES_PER_TOKEN:
+    if fmt not in FULL_KV_BYTES_PER_SLOT_TOKEN:
         raise ValueError(f"unsupported kv_format {kv_format!r} (expected q4_0, fp8, or bf16)")
     if context_tokens < 0:
         raise ValueError("context_tokens must be non-negative")
-    return (context_tokens * FULL_KV_BYTES_PER_TOKEN[key]) / (1024.0 * 1024.0)
+    slots = num_full_slots_for_passes(lp, kv_cache_mode)
+    return (context_tokens * slots * FULL_KV_BYTES_PER_SLOT_TOKEN[fmt]) / (1024.0 * 1024.0)
 
 
-def estimate_total_state_mib(context_tokens: int, kv_format: str, kv_cache_mode: str) -> float:
-    return FIXED_PASS_LOCAL_STATE_MIB + estimate_full_kv_mib(context_tokens, kv_format, kv_cache_mode)
+def estimate_total_state_mib(
+    context_tokens: int,
+    kv_format: str,
+    kv_cache_mode: str,
+    loop_passes: int = DEFAULT_LOOP_PASSES,
+) -> float:
+    lp = validate_loop_passes(loop_passes)
+    return estimate_pass_local_state_mib(lp) + estimate_full_kv_mib(context_tokens, kv_format, kv_cache_mode, lp)
 
 
-def mode_scoped_namespace(base_namespace: str, kv_cache_mode: str) -> str:
+def mode_scoped_namespace(
+    base_namespace: str,
+    kv_cache_mode: str,
+    loop_passes: int = DEFAULT_LOOP_PASSES,
+) -> str:
     validate_kv_cache_mode(kv_cache_mode)
+    lp = validate_loop_passes(loop_passes)
     base = (base_namespace or "default").strip()
-    marker = f":kv_mode={kv_cache_mode}"
-    if base.endswith(marker):
-        return base
+    # Strip any prior :loop_passes=<n> and :kv_mode=<m> suffixes for idempotence.
+    lp_tag = ":loop_passes="
+    idx = base.rfind(lp_tag)
+    if idx != -1 and base[idx + len(lp_tag) :].isdigit():
+        base = base[:idx]
     for m in VALID_KV_CACHE_MODES:
         suffix = f":kv_mode={m}"
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
-    return f"{base}{marker}"
+    scoped = f"{base}:kv_mode={kv_cache_mode}"
+    if lp != DEFAULT_LOOP_PASSES:
+        scoped = f"{scoped}:loop_passes={lp}"
+    return scoped
 
 
 @dataclass(frozen=True)
 class CheckpointIdentity:
-    """Explicit checkpoint / prefix identity binding mode, model, format, namespace, and prefix hash."""
+    """Explicit checkpoint / prefix identity binding mode, depth, model, format, namespace, and prefix hash."""
 
     model_id: str
     kv_format: str
@@ -103,9 +179,13 @@ class CheckpointIdentity:
     prefix_tokens: int
     prefix_sha256: str
     checkpoint_path: Optional[str] = None
+    loop_passes: int = DEFAULT_LOOP_PASSES
 
     def __post_init__(self) -> None:
         validate_kv_cache_mode(self.kv_cache_mode)
+        lp = validate_loop_passes(self.loop_passes)
+        if self.kv_cache_mode == "last_full" and lp != DEFAULT_LOOP_PASSES:
+            raise ValueError(f"last_full checkpoint identity requires loop_passes={DEFAULT_LOOP_PASSES} (got {lp})")
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -127,6 +207,7 @@ class WorkerCapability:
     kv_cache_mode_mutable: bool = False
     max_model_len: int = 65536
     max_batch: int = 1
+    loop_passes: int = DEFAULT_LOOP_PASSES
     spec_enabled: bool = False
     tp_size: int = 1
     kv_format: str = "q4_0"
@@ -138,13 +219,16 @@ class WorkerCapability:
 
     def __post_init__(self) -> None:
         validate_kv_cache_mode(self.active_kv_cache_mode)
+        lp = validate_loop_passes(self.loop_passes)
         for m in self.supported_kv_cache_modes:
             validate_kv_cache_mode(m)
+        if self.active_kv_cache_mode == "last_full" and lp != DEFAULT_LOOP_PASSES:
+            raise ValueError(f"worker {self.worker_id} cannot use active last_full with loop_passes={lp}")
 
     def supports_mode(self, mode: str) -> bool:
         validate_kv_cache_mode(mode)
         if mode == "last_full":
-            if self.max_batch > 1 or self.spec_enabled or self.tp_size > 1:
+            if self.max_batch > 1 or self.spec_enabled or self.tp_size > 1 or self.loop_passes != DEFAULT_LOOP_PASSES:
                 return False
         return mode in self.supported_kv_cache_modes
 
@@ -170,15 +254,17 @@ class AdmissionBudgets:
 
 @dataclass(frozen=True)
 class ModeSwitchContext:
-    """Prior session state & authorized transition proof when changing cache modes."""
+    """Prior session state & authorized transition proof when changing cache modes or loop depth."""
 
     prior_kv_cache_mode: str
     compatible_checkpoint: Optional[CheckpointIdentity] = None
     replay_authorized: bool = False
     authorized_replay_tokens: int = 0
+    prior_loop_passes: int = DEFAULT_LOOP_PASSES
 
     def __post_init__(self) -> None:
         validate_kv_cache_mode(self.prior_kv_cache_mode)
+        validate_loop_passes(self.prior_loop_passes)
 
 
 @dataclass(frozen=True)
@@ -220,6 +306,7 @@ class AdmissionDecision:
     estimated_state_mib: Optional[float] = None
     estimated_latency_seconds: Optional[float] = None
     worker_supported_modes: tuple[str, ...] = ()
+    worker_loop_passes: int = DEFAULT_LOOP_PASSES
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -236,12 +323,13 @@ class AdmissionDecision:
                 self.checkpoint_identity.identity_digest() if self.checkpoint_identity else None
             ),
             "estimated_state_mib": (
-                round(self.estimated_state_mib, 3) if self.estimated_state_mib is not None else None
+                round(self.estimated_state_mib, 6) if self.estimated_state_mib is not None else None
             ),
             "estimated_latency_seconds": (
                 round(self.estimated_latency_seconds, 4) if self.estimated_latency_seconds is not None else None
             ),
             "worker_supported_modes": list(self.worker_supported_modes),
+            "worker_loop_passes": self.worker_loop_passes,
         }
 
 
@@ -311,6 +399,29 @@ def discover_worker_capability(
     max_model_len = int(card.get("max_model_len", 65536))
     model_id = str(card.get("id") or health.get("model") or "unknown")
 
+    has_health_lp = "loop_passes" in health and health["loop_passes"] is not None
+    has_card_lp = "loop_passes" in card and card["loop_passes"] is not None
+    if has_health_lp and has_card_lp:
+        lp_health = validate_loop_passes(health["loop_passes"])
+        lp_card = validate_loop_passes(card["loop_passes"])
+        if lp_health != lp_card:
+            raise RuntimeError(
+                f"worker {worker_id} inconsistent loop_passes: /health={lp_health!r}, /v1/models={lp_card!r}"
+            )
+        loop_passes = lp_health
+    elif has_health_lp:
+        loop_passes = validate_loop_passes(health["loop_passes"])
+    elif has_card_lp:
+        loop_passes = validate_loop_passes(card["loop_passes"])
+    else:
+        loop_passes = DEFAULT_LOOP_PASSES
+
+    if loop_passes != DEFAULT_LOOP_PASSES and (active_health == "last_full" or "last_full" in supported):
+        raise RuntimeError(
+            f"worker {worker_id} advertises incompatible last_full with loop_passes={loop_passes}: "
+            f"active={active_health!r}, supported={supported!r}"
+        )
+
     return WorkerCapability(
         worker_id=worker_id,
         base_url=url,
@@ -320,6 +431,7 @@ def discover_worker_capability(
         kv_cache_mode_mutable=mutable,
         max_model_len=max_model_len,
         max_batch=max_batch,
+        loop_passes=loop_passes,
         spec_enabled=spec_enabled,
         tp_size=tp_size,
         kv_format=kv_format,
@@ -336,19 +448,18 @@ def _validate_mode_switch(
     req: AdmissionRequest,
     target_mode: str,
 ) -> tuple[bool, str, str, bool, int, Optional[str]]:
-    """Enforce fail-closed mode-switch rules.
+    """Enforce fail-closed mode-switch and loop-depth transition rules.
 
     Returns: (ok, reason, action, bypass_prefix_cache, extra_replay_tokens, ckpt_path)
     """
     ms = req.mode_switch
-    if ms is None or ms.prior_kv_cache_mode == target_mode:
+    if ms is None or (ms.prior_kv_cache_mode == target_mode and ms.prior_loop_passes == worker.loop_passes):
         return True, "same_or_fresh_mode", "none", False, 0, None
 
-    # Mode change requested: raw cross-mode KV reuse is strictly forbidden.
+    # Mode or loop_passes change requested: raw cross-mode / cross-depth KV reuse is strictly forbidden.
     # HTTP /v1/chat/completions has no runtime checkpoint-restore operation or restore receipt
-    # (and `usage.cached_tokens` can come from ordinary in-memory prefix hits), so HTTP mode
-    # switches strictly require explicit authorized replay until a verified runtime restore
-    # receipt exists.
+    # (and `usage.cached_tokens` can come from ordinary in-memory prefix hits), so HTTP transitions
+    # strictly require explicit authorized replay until a verified runtime restore receipt exists.
     if ms.replay_authorized and ms.authorized_replay_tokens > 0:
         return (
             True,
@@ -371,7 +482,10 @@ def _validate_mode_switch(
 
     return (
         False,
-        f"mode_switch_blocked_no_authorized_replay:{ms.prior_kv_cache_mode}->{target_mode}",
+        (
+            f"mode_switch_blocked_no_authorized_replay:"
+            f"{ms.prior_kv_cache_mode}(L={ms.prior_loop_passes})->{target_mode}(L={worker.loop_passes})"
+        ),
         "none",
         True,
         0,
@@ -426,7 +540,7 @@ def evaluate_worker_for_mode(
                 worker_supported_modes=worker.supported_kv_cache_modes,
             )
 
-    state_mib = estimate_total_state_mib(total_tokens, worker.kv_format, mode)
+    state_mib = estimate_total_state_mib(total_tokens, worker.kv_format, mode, loop_passes=worker.loop_passes)
     eff_mem_limit = worker.available_kv_vram_mib - req.budgets.vram_headroom_mib
     if req.budgets.memory_budget_mib is not None:
         eff_mem_limit = min(eff_mem_limit, req.budgets.memory_budget_mib)
@@ -435,9 +549,10 @@ def evaluate_worker_for_mode(
             admitted=False,
             worker_id=worker.worker_id,
             selected_mode=None,
-            reason=f"memory_budget_exceeded:{state_mib:.1f}MiB>{eff_mem_limit:.1f}MiB",
+            reason=f"memory_budget_exceeded:{state_mib:.3f}MiB>{eff_mem_limit:.3f}MiB",
             estimated_state_mib=state_mib,
             worker_supported_modes=worker.supported_kv_cache_modes,
+            worker_loop_passes=worker.loop_passes,
         )
 
     sw_ok, sw_reason, sw_action, bypass_cache, replay_tokens, ckpt_path = _validate_mode_switch(worker, req, mode)
@@ -449,6 +564,7 @@ def evaluate_worker_for_mode(
             reason=sw_reason,
             estimated_state_mib=state_mib,
             worker_supported_modes=worker.supported_kv_cache_modes,
+            worker_loop_passes=worker.loop_passes,
         )
 
     prefill_tokens = max(req.context_tokens, replay_tokens) if sw_action == "authorized_replay" else req.context_tokens
@@ -466,9 +582,10 @@ def evaluate_worker_for_mode(
             estimated_state_mib=state_mib,
             estimated_latency_seconds=est_latency,
             worker_supported_modes=worker.supported_kv_cache_modes,
+            worker_loop_passes=worker.loop_passes,
         )
 
-    eff_ns = mode_scoped_namespace(req.cache_namespace, mode)
+    eff_ns = mode_scoped_namespace(req.cache_namespace, mode, loop_passes=worker.loop_passes)
     ckpt_id = CheckpointIdentity(
         model_id=worker.model_id,
         kv_format=worker.kv_format,
@@ -477,6 +594,7 @@ def evaluate_worker_for_mode(
         prefix_tokens=req.context_tokens,
         prefix_sha256=req.prefix_sha256,
         checkpoint_path=ckpt_path,
+        loop_passes=worker.loop_passes,
     )
 
     if not worker.can_serve_immediately(mode):
@@ -493,6 +611,7 @@ def evaluate_worker_for_mode(
             estimated_state_mib=state_mib,
             estimated_latency_seconds=est_latency,
             worker_supported_modes=worker.supported_kv_cache_modes,
+            worker_loop_passes=worker.loop_passes,
         )
 
     reason = (
@@ -513,6 +632,7 @@ def evaluate_worker_for_mode(
         estimated_state_mib=state_mib,
         estimated_latency_seconds=est_latency,
         worker_supported_modes=worker.supported_kv_cache_modes,
+        worker_loop_passes=worker.loop_passes,
     )
 
 
@@ -610,11 +730,16 @@ class HostCacheModeRegistry:
             CREATE TABLE IF NOT EXISTS session_modes (
                 session_id TEXT PRIMARY KEY,
                 kv_cache_mode TEXT NOT NULL,
+                loop_passes INTEGER NOT NULL DEFAULT 3,
                 checkpoint_identity_digest TEXT,
                 updated_at REAL NOT NULL
             );
             """
         )
+        # Backwards-compatible migration for pre-existing #829 SQLite registries lacking loop_passes.
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(session_modes)").fetchall()}
+        if "loop_passes" not in cols:
+            self.conn.execute("ALTER TABLE session_modes ADD COLUMN loop_passes INTEGER NOT NULL DEFAULT 3")
         self.conn.commit()
 
     def close(self) -> None:
@@ -632,6 +757,13 @@ class HostCacheModeRegistry:
             (session_id,),
         ).fetchone()
         return str(row["kv_cache_mode"]) if row else None
+
+    def get_session_state(self, session_id: str) -> Optional[tuple[str, int]]:
+        row = self.conn.execute(
+            "SELECT kv_cache_mode, loop_passes FROM session_modes WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return (str(row["kv_cache_mode"]), int(row["loop_passes"])) if row else None
 
     def record_dispatch(self, req: AdmissionRequest, decision: AdmissionDecision) -> str:
         dispatch_id = f"disp-{uuid.uuid4().hex[:12]}"
@@ -686,6 +818,7 @@ class HostCacheModeRegistry:
         elapsed_seconds: Optional[float] = None,
         checkpoint_identity_digest: Optional[str] = None,
         error_detail: Optional[str] = None,
+        loop_passes: int = DEFAULT_LOOP_PASSES,
     ) -> None:
         verified = 1 if (server_mode == admitted_mode and status == "ok") else 0
         now = time.time()
@@ -714,14 +847,15 @@ class HostCacheModeRegistry:
         if verified:
             self.conn.execute(
                 """
-                INSERT INTO session_modes (session_id, kv_cache_mode, checkpoint_identity_digest, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO session_modes (session_id, kv_cache_mode, loop_passes, checkpoint_identity_digest, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     kv_cache_mode = excluded.kv_cache_mode,
+                    loop_passes = excluded.loop_passes,
                     checkpoint_identity_digest = excluded.checkpoint_identity_digest,
                     updated_at = excluded.updated_at
                 """,
-                (session_id, admitted_mode, checkpoint_identity_digest, now),
+                (session_id, admitted_mode, validate_loop_passes(loop_passes), checkpoint_identity_digest, now),
             )
         self.conn.commit()
 
@@ -747,21 +881,28 @@ class HostCacheModeRegistry:
         bound_max_tokens = req.expected_new_tokens
 
         worker_map = {w.worker_id: w for w in workers}
-        prior_mode = self.get_session_mode(req.session_id)
+        prior_state = self.get_session_state(req.session_id)
         eff_req = req
-        if prior_mode is not None:
-            # Always bind mode transitions to the registry-confirmed prior session mode,
+        if prior_state is not None:
+            prior_mode, prior_lp = prior_state
+            # Always bind mode/depth transitions to the registry-confirmed prior session state,
             # even if the caller supplied stale ModeSwitchContext.
             if req.mode_switch is None:
-                eff_req = dataclasses.replace(req, mode_switch=ModeSwitchContext(prior_kv_cache_mode=prior_mode))
-            elif req.mode_switch.prior_kv_cache_mode != prior_mode:
+                eff_req = dataclasses.replace(
+                    req,
+                    mode_switch=ModeSwitchContext(prior_kv_cache_mode=prior_mode, prior_loop_passes=prior_lp),
+                )
+            elif (
+                req.mode_switch.prior_kv_cache_mode != prior_mode
+                or req.mode_switch.prior_loop_passes != prior_lp
+            ):
                 stale_dec = AdmissionDecision(
                     admitted=False,
                     worker_id=None,
                     selected_mode=None,
                     reason=(
                         f"stale_session_mode_context:caller_prior={req.mode_switch.prior_kv_cache_mode}"
-                        f"!=registry_prior={prior_mode}"
+                        f"(L={req.mode_switch.prior_loop_passes})!=registry_prior={prior_mode}(L={prior_lp})"
                     ),
                 )
                 dispatch_id = self.record_dispatch(eff_req, stale_dec)
@@ -896,6 +1037,7 @@ class HostCacheModeRegistry:
             completion_tokens=usage.get("completion_tokens"),
             elapsed_seconds=elapsed,
             checkpoint_identity_digest=ckpt_digest,
+            loop_passes=worker.loop_passes,
         )
         return {
             "dispatch_id": dispatch_id,

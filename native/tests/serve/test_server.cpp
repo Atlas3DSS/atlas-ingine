@@ -346,12 +346,32 @@ void test_models_and_health() {
   CHECK(Json::parse(nope.body)["error"]["message"] == "no route for GET /nope");
   CHECK(request(s->port(), "POST", "/v1/completions", "{}").status == 404);
 
-  // Non-default loop_passes metadata propagation (/health, /v1/models, /v1/models/<id>)
+  // Non-default loop_passes metadata propagation (/health, /v1/models, /v1/models/<id>) and last_full restriction
   auto s5 = serve(THINK_TEXT, 0.0, 4, 0, {}, {}, 5);
   Json m5 = Json::parse(request(s5->port(), "GET", "/v1/models").body)["data"][0];
   CHECK(m5["loop_passes"] == 5);
+  CHECK(m5["kv_cache_mode"] == "per_pass");
+  CHECK(m5["supported_kv_cache_modes"] == Json::array({"per_pass"}));
   CHECK(Json::parse(request(s5->port(), "GET", "/v1/models/inkling-test").body)["loop_passes"] == 5);
-  CHECK(health(s5->port())["loop_passes"] == 5);
+  Json h5 = health(s5->port());
+  CHECK(h5["loop_passes"] == 5);
+  CHECK(h5["kv_cache_mode"] == "per_pass");
+  CHECK(h5["supported_kv_cache_modes"] == Json::array({"per_pass"}));
+
+  // FakeGenerator rejects incompatible loop_passes != 3 with last_full, matching real serving.
+  bool fake_rejected_l5_lf = false;
+  try {
+    FakeGenerator bad(g_fmt->tokenizer(), "inkling-test", 1 << 20, {}, 0.0, 5, ingine::model::KvCacheMode::LastFull);
+    (void)bad;
+  } catch (const std::invalid_argument&) {
+    fake_rejected_l5_lf = true;
+  }
+  CHECK(fake_rejected_l5_lf);
+
+  // L=3 FakeGenerator with explicit last_full serves last_full consistently.
+  FakeGenerator fg_lf(g_fmt->tokenizer(), "inkling-test", 1 << 20, {}, 0.0, 3, ingine::model::KvCacheMode::LastFull);
+  CHECK(fg_lf.kv_cache_mode() == ingine::model::KvCacheMode::LastFull);
+  CHECK(fg_lf.supported_kv_cache_modes().size() == 2);
 }
 
 void test_non_streaming() {

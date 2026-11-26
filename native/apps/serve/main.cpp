@@ -223,9 +223,36 @@ int main(int argc, char** argv) {
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
     std::unique_ptr<ingine::model::Generator> generator;
     if (fake) {
+      const auto parsed_kv_mode = ingine::model::parse_kv_cache_mode(kv_cache_mode);
+      if (loop_passes != 3) {
+        if (parsed_kv_mode == ingine::model::KvCacheMode::LastFull) {
+          throw std::invalid_argument("--loop-passes != 3 is not supported with --kv-cache-mode last_full");
+        }
+        if (spec) {
+          throw std::invalid_argument("--loop-passes != 3 is not supported with --spec (DSpark drafter requires 3 passes)");
+        }
+        if (!ablation.empty()) {
+          throw std::invalid_argument("--loop-passes != 3 is not supported with --ablation (48-visit ablation file)");
+        }
+        if (personas != nullptr || persona_probe_mode) {
+          throw std::invalid_argument("--loop-passes != 3 is not supported with persona hooks (fixed 48-visit hook ABI)");
+        }
+        if (max_batch > 1) {
+          throw std::invalid_argument("--loop-passes != 3 currently requires --max-batch 1");
+        }
+      }
+      if (parsed_kv_mode == ingine::model::KvCacheMode::LastFull) {
+        if (spec) {
+          throw std::invalid_argument("--kv-cache-mode last_full cannot be combined with --spec (B=1 non-spec control)");
+        }
+        if (max_batch > 1) {
+          throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
+        }
+      }
+      const bool fake_allow_last_full = (loop_passes == 3) && !spec && (max_batch <= 1);
       generator = std::make_unique<ingine::engine::FakeGenerator>(
-          fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir), ingine::engine::FakeGenerator::Responder{},
-          fake_delay, loop_passes);
+          fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir),
+          ingine::engine::FakeGenerator::Responder{}, fake_delay, loop_passes, parsed_kv_mode, fake_allow_last_full);
     } else {
 #ifdef INGINE_WITH_MODEL
       ingine::model::RuntimeOptions options;

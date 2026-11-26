@@ -60,13 +60,38 @@ std::optional<std::pair<std::string, std::string>> match_call(std::string_view s
 }  // namespace
 
 FakeGenerator::FakeGenerator(const text::Tokenizer& tokenizer, std::string model_id, int max_model_len,
-                             Responder responder, double token_delay, int loop_passes)
+                             Responder responder, double token_delay, int loop_passes,
+                             model::KvCacheMode kv_cache_mode, bool allow_last_full)
     : tokenizer_(tokenizer),
       model_id_(std::move(model_id)),
       max_model_len_(max_model_len),
       loop_passes_(loop_passes),
       responder_(std::move(responder)),
-      token_delay_(token_delay) {}
+      token_delay_(token_delay),
+      kv_cache_mode_(kv_cache_mode) {
+  if (loop_passes_ < 1 || loop_passes_ > 8) {
+    throw std::invalid_argument("loop_passes must be in 1..8");
+  }
+  const bool can_last_full = allow_last_full && (loop_passes_ == 3);
+  if (kv_cache_mode_ == model::KvCacheMode::LastFull && !can_last_full) {
+    if (loop_passes_ != 3) {
+      throw std::invalid_argument("--loop-passes != 3 is not supported with --kv-cache-mode last_full");
+    }
+    throw std::invalid_argument("--kv-cache-mode last_full is not supported with this worker configuration");
+  }
+  if (can_last_full) {
+    supported_kv_cache_modes_ = {model::KvCacheMode::PerPass, model::KvCacheMode::LastFull};
+  } else {
+    supported_kv_cache_modes_ = {model::KvCacheMode::PerPass};
+  }
+}
+
+void FakeGenerator::set_kv_cache_mode(model::KvCacheMode mode) {
+  if (mode == model::KvCacheMode::LastFull && loop_passes_ != 3) {
+    throw std::invalid_argument("--loop-passes != 3 is not supported with --kv-cache-mode last_full");
+  }
+  kv_cache_mode_ = mode;
+}
 
 std::string FakeGenerator::echo(std::span<const int32_t> prompt_ids) const {
   const std::string text = tokenizer_.decode(prompt_ids);

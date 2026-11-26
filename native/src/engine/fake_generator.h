@@ -43,7 +43,8 @@ class FakeGenerator final : public model::Generator {
 
   explicit FakeGenerator(const text::Tokenizer& tokenizer, std::string model_id = "Inkling-2-Mini-fake",
                          int max_model_len = 1 << 20, Responder responder = {}, double token_delay = 0.0,
-                         int loop_passes = 3);
+                         int loop_passes = 3, model::KvCacheMode kv_cache_mode = model::KvCacheMode::PerPass,
+                         bool allow_last_full = true);
 
   std::string model_id() const override { return model_id_; }
   int max_model_len() const override { return max_model_len_; }
@@ -66,7 +67,7 @@ class FakeGenerator final : public model::Generator {
   bool supports_images() const override { return true; }
   model::KvCacheMode kv_cache_mode() const override { return kv_cache_mode_; }
   std::vector<model::KvCacheMode> supported_kv_cache_modes() const override { return supported_kv_cache_modes_; }
-  void set_kv_cache_mode(model::KvCacheMode mode) { kv_cache_mode_ = mode; }
+  void set_kv_cache_mode(model::KvCacheMode mode);
   void set_supported_kv_cache_modes(std::vector<model::KvCacheMode> modes) {
     supported_kv_cache_modes_ = std::move(modes);
   }
