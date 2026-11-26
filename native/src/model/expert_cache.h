@@ -40,6 +40,7 @@ struct OffloadConfig {
   int prefill_chunk = 512;
   bool kv_fp8 = true;
   bool kv_q4 = false;
+  bool kv_last_full = false;
   bool spec = false;
   int kv_vram_mb = 0;  // when > 0, full KV cache is paged and capped to kv_vram_mb MiB of VRAM
 };

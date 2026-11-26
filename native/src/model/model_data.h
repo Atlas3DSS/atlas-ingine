@@ -63,6 +63,7 @@ struct Visit {
 
 inline constexpr int NUM_VISITS = 48;
 inline constexpr int NUM_FULL_VISITS = 8;
+inline constexpr int NUM_FULL_SLOTS_LAST_FULL = 4;  // physical full layers: L5, L11 (shared across passes 0..2), L17 (shared), L23
 inline constexpr int NUM_SLIDING_VISITS = NUM_VISITS - NUM_FULL_VISITS;
 
 // weights.visit_plan(): layers 0-5, layers 6-17 three times, layers 18-23
@@ -89,6 +90,21 @@ inline constexpr std::array<int, NUM_VISITS> FULL_INDEX = [] {
   for (int v = 0; v < NUM_VISITS; ++v) r[v] = is_full_layer(VISITS[v].layer) ? n++ : -1;
   return r;
 }();
+// LastFull mode: L5 -> 0, L11 (passes 0,1,2) -> 1, L17 (passes 0,1,2) -> 2, L23 -> 3; sliding visits -> -1.
+inline constexpr std::array<int, NUM_VISITS> FULL_INDEX_LAST_FULL = [] {
+  std::array<int, NUM_VISITS> r{};
+  for (int v = 0; v < NUM_VISITS; ++v) {
+    const int l = VISITS[v].layer;
+    r[v] = (l == 5) ? 0 : (l == 11) ? 1 : (l == 17) ? 2 : (l == 23) ? 3 : -1;
+  }
+  return r;
+}();
+inline constexpr int full_slot_count(bool kv_last_full) noexcept {
+  return kv_last_full ? NUM_FULL_SLOTS_LAST_FULL : NUM_FULL_VISITS;
+}
+inline constexpr int full_slot_index(int v, bool kv_last_full) noexcept {
+  return kv_last_full ? FULL_INDEX_LAST_FULL[v] : FULL_INDEX[v];
+}
 
 // model.TAP_VISITS: DSpark features = the partial block entering these visits, then the final normed hidden
 inline constexpr std::array<int, 3> TAP_VISITS = {5, 23, 41};
@@ -263,16 +279,19 @@ struct State {
   int max_ctx = 0;
   bool kv_fp8 = false;
   bool kv_q4 = false;
+  bool kv_last_full = false;
   std::shared_ptr<PagedKvCache> paged_kv;  // non-null when 3-tier paged Q4_0 full-attention KV is enabled
   Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
-  Tensor k_full, v_full;      // bf16/fp8 [8, max_ctx, 8, 128] or q4_0 u8 [8, max_ctx, 576] (full visits)
+  Tensor k_full, v_full;      // bf16/fp8 [num_full_slots, max_ctx, 8, 128] or q4_0 u8 [num_full_slots, max_ctx, 576]
   Tensor conv_k, conv_v;      // fp32 [48, 3, 1024] previous 3 key/value conv inputs (oldest first)
   Tensor conv_attn, conv_mlp; // fp32 [48, 3, H]
   int length = 0;             // tokens in the context (host copy; decode steps do not advance it)
 
   std::vector<DeviceBuffer> storage;
 
+  int num_full_slots() const noexcept { return full_slot_count(kv_last_full); }
+  int full_slot(int v) const noexcept { return full_slot_index(v, kv_last_full); }
   std::size_t full_row_bytes() const { return kv_q4 ? KV_Q4_ROW_BYTES : std::size_t(KV_DIM) * (kv_fp8 ? 1 : 2); }
 
   // per-visit views

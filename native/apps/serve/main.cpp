@@ -68,6 +68,7 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
+  std::string kv_cache_mode = "per_pass";
   std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
@@ -106,8 +107,11 @@ int main(int argc, char** argv) {
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
-  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok, ~2.25 GiB at 262144 positions; SWA stays BF16)",
+  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok per_pass, 4.5 KiB/tok last_full; SWA stays BF16)",
           &kv_q4);
+  ap.option("--kv-cache-mode", "{per_pass,last_full}",
+            "full-attention KV mode: per_pass (default, 8 visit slots) or last_full (opt-in L11/L17 shared across passes, 4 slots; B=1 non-spec)",
+            &kv_cache_mode, {"per_pass", "last_full"});
   ap.flag("--kv-paged", "3-tier paged Q4_0 full-attention KV cache (VRAM LRU + pinned UVA RAM + NVMe SwapFile)", &kv_paged);
   ap.option("--kv-vram-mb", "", "VRAM cap in MiB for paged Q4_0 KV cache (implies --kv-paged --kv-q4)", &kv_vram_mb);
   ap.option("--kv-ram-mb", "", "pinned UVA host RAM cap in MiB for paged Q4_0 KV before NVMe SwapFile spill (default 12288)",
@@ -237,6 +241,7 @@ int main(int argc, char** argv) {
       options.dense_fp8 = dense_fp8;
       options.kv_fp8 = kv_fp8;
       options.kv_q4 = kv_q4;
+      options.kv_cache_mode = ingine::model::parse_kv_cache_mode(kv_cache_mode);
       options.kv_paged = kv_paged || kv_vram_mb > 0;
       options.kv_vram_mb = kv_vram_mb;
       options.kv_ram_mb = kv_ram_mb;
@@ -295,7 +300,8 @@ int main(int argc, char** argv) {
                                     ? fmt::format("on (at most {} tokens per image, {} images and {} image tokens per request)",
                                                   image_max_tokens, max_images, max_image_tokens)
                                     : std::string("off"));
-    log.info("serving {} on http://{}:{}/v1", server.model_id(), host, server.port());
+    log.info("serving {} on http://{}:{}/v1 (kv_cache_mode={})", server.model_id(), host, server.port(),
+             ingine::model::to_string(generator->kv_cache_mode()));
     bool listened = true;
     std::thread listener([&] {
       listened = server.listen();

@@ -138,6 +138,8 @@ class EngineGenerator final : public Generator {
     return cache_stats_locked();
   }
 
+  KvCacheMode kv_cache_mode() const override { return options_.kv_cache_mode; }
+
   std::string offload_summary() const override {
     std::string out;
     if (rt_.weights().expert_cache) out = rt_.weights().expert_cache->summary();
@@ -206,6 +208,7 @@ class EngineGenerator final : public Generator {
     base_identity_.act_dtype = (kActDType == DType::FP16) ? 1u : 0u;
     base_identity_.dense_fp8 = options_.dense_fp8;
     base_identity_.kv_format = options_.kv_q4 ? 2u : (options_.kv_fp8 ? 1u : 0u);
+    base_identity_.kv_cache_mode = static_cast<std::uint32_t>(options_.kv_cache_mode);
     base_identity_.max_ctx = options_.max_ctx;
     base_identity_.prefill_chunk = options_.prefill_chunk;
     base_identity_.spec_enabled = (drafter_ != nullptr);
@@ -635,6 +638,11 @@ class EngineGenerator final : public Generator {
               [&](const KvCheckpointInfo& info) -> bool {
                 if (!kv_checkpoint_auto_resume_eligible(info, req_identity, disk_producer_sha_, n, options_.max_ctx,
                                                         has_media_before(info.pos))) {
+                  if (info.kv_cache_mode != options_.kv_cache_mode) {
+                    std::fprintf(stderr, "[kv-ckpt] skipping auto-resume %s: kv_cache_mode mismatch (ckpt=%s, engine=%s)\n",
+                                 options_.kv_ckpt_path.c_str(), to_string(info.kv_cache_mode),
+                                 to_string(options_.kv_cache_mode));
+                  }
                   return false;
                 }
                 const auto psha = sha256_bytes(ids.data(), std::size_t(info.pos) * sizeof(std::int32_t));
@@ -1329,6 +1337,9 @@ class EngineGenerator final : public Generator {
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
   if (options.max_batch > 1) {
+    if (options.kv_cache_mode != KvCacheMode::PerPass) {
+      throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
+    }
     if (options.enable_persona_hooks) {
       throw std::invalid_argument("persona hooks require --max-batch 1 (continuous batching with hooked persona tables is not yet enabled)");
     }
@@ -1339,6 +1350,9 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options, Weights weights, Ablation ablation) {
   if (options.max_batch > 1) {
+    if (options.kv_cache_mode != KvCacheMode::PerPass) {
+      throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
+    }
     if (options.enable_persona_hooks) {
       throw std::invalid_argument("persona hooks require --max-batch 1 (continuous batching with hooked persona tables is not yet enabled)");
     }

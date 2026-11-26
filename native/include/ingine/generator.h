@@ -15,9 +15,32 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ingine::model {
+
+// Full-attention KV cache sharing mode across loop passes (layers 11 and 17).
+// PerPass (default): all 8 full-attention visits (L5, L11x3, L17x3, L23) have independent KV slots.
+// LastFull (opt-in): L11 passes 0..2 share one slot and L17 passes 0..2 share one slot (4 full slots total);
+// prior tokens use the final pass's persisted KV while sliding rings (40) and conv states (48) stay pass-local.
+enum class KvCacheMode : std::uint8_t {
+  PerPass = 0,
+  LastFull = 1,
+};
+
+inline const char* to_string(KvCacheMode mode) {
+  switch (mode) {
+    case KvCacheMode::LastFull: return "last_full";
+    default: return "per_pass";
+  }
+}
+
+inline KvCacheMode parse_kv_cache_mode(std::string_view s) {
+  if (s == "per_pass") return KvCacheMode::PerPass;
+  if (s == "last_full") return KvCacheMode::LastFull;
+  throw std::invalid_argument("invalid kv_cache_mode '" + std::string(s) + "' (expected 'per_pass' or 'last_full')");
+}
 
 struct Sampling {
   float temperature = 1.0f;  // 0 => greedy
@@ -127,6 +150,7 @@ struct RuntimeOptions {
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, kv_q4 = false, spec = false;
+  KvCacheMode kv_cache_mode = KvCacheMode::PerPass;
   float spec_threshold = 0.8f;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
@@ -208,6 +232,7 @@ class Generator {
     return stats;
   }
   virtual bool supports_images() const { return false; }
+  virtual KvCacheMode kv_cache_mode() const { return KvCacheMode::PerPass; }
   virtual std::string offload_summary() const { return {}; }
   virtual PrefixCacheStats cache_stats() const { return {}; }
 

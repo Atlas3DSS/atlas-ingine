@@ -68,6 +68,7 @@ class ChatServer {
   const text::ChatFormat& fmt_;
   const std::string model_id_;
   const int max_model_len_;
+  const model::KvCacheMode kv_cache_mode_;
   const model::Sampling sampling_defaults_;
   const ImageOptions image_options_;
   const std::shared_ptr<const persona::PersonaCatalog> personas_;

@@ -155,30 +155,107 @@ struct alignas(8) RawHeader {
   std::uint64_t full_kv_bytes;
   std::uint8_t prompt_sha256[32];
   std::uint8_t model_sha256[32];
-  // Optional v1 extended producer trailer inside the existing zero-padded 4096-byte header page.
+  // Bytes 144..191: Optional v1 extended producer trailer (#827) inside the 4096-byte header page.
   // Legacy INGCKPT1 files have bytes 144..4095 zeroed (producer_flags == 0).
+  // Standalone #829 4-slot files wrote kv_cache_mode=1 at byte 144 with bytes 148..4095 zeroed and num_full_visits=4.
   std::uint32_t producer_flags;
   std::uint32_t producer_dense_fp8;
   std::int32_t producer_prefill_chunk;
   std::uint32_t producer_reserved;
   std::uint8_t producer_sha256[32];
+  // Bytes 192..199: Unambiguous combined #829 v2 KV cache mode extension (disjoint from producer trailer).
+  std::uint32_t kv_mode_flags;     // bit 0 (kKvModeFlagValid = 1): kv_cache_mode_v2 is explicitly encoded
+  std::uint32_t kv_cache_mode_v2;  // 0 = per_pass (8 full slots), 1 = last_full (4 full slots)
 };
 
+constexpr std::uint32_t kKvModeFlagValid = 1u;
+
+static_assert(offsetof(RawHeader, producer_flags) == 144, "producer_flags must remain at byte 144");
+static_assert(offsetof(RawHeader, kv_mode_flags) == 192, "kv_mode_flags must sit at byte 192");
 static_assert(sizeof(RawHeader) <= kHeaderBytes, "RawHeader exceeds 4 KiB page");
 
-KvCheckpointInfo info_from_raw_header(const RawHeader& hdr) noexcept {
+bool producer_trailer_tail_is_zero(const RawHeader& hdr) noexcept {
+  if (hdr.producer_dense_fp8 != 0u || hdr.producer_prefill_chunk != 0 || hdr.producer_reserved != 0u) return false;
+  for (std::uint8_t b : hdr.producer_sha256) {
+    if (b != 0u) return false;
+  }
+  return true;
+}
+
+KvCheckpointInfo info_from_raw_header(const RawHeader& hdr) {
+  if (hdr.num_full_visits != NUM_FULL_VISITS && hdr.num_full_visits != NUM_FULL_SLOTS_LAST_FULL) {
+    throw std::runtime_error("kv_checkpoint: unsupported num_full_visits " + std::to_string(hdr.num_full_visits));
+  }
+  if (hdr.pos < 0) {
+    throw std::runtime_error("kv_checkpoint: negative checkpoint pos " + std::to_string(hdr.pos));
+  }
+  const std::uint64_t expected_full_b =
+      2u * std::uint64_t(hdr.num_full_visits) * std::uint64_t(hdr.pos) * hdr.row_bytes;
+  if (hdr.full_kv_bytes != expected_full_b) {
+    throw std::runtime_error("kv_checkpoint: full_kv_bytes (" + std::to_string(hdr.full_kv_bytes) +
+                             ") disagrees with num_full_visits=" + std::to_string(hdr.num_full_visits) +
+                             " pos=" + std::to_string(hdr.pos) + " row_bytes=" + std::to_string(hdr.row_bytes));
+  }
+
   KvCheckpointInfo info;
   info.pos = hdr.pos;
   info.max_ctx_at_save = hdr.max_ctx_at_save;
   info.act_dtype = hdr.act_dtype;
   info.kv_format = hdr.kv_format;
+  info.num_full_slots = hdr.num_full_visits;
   info.has_logits = hdr.has_logits != 0;
-  info.has_producer_identity = (hdr.producer_flags & kProducerFlagValid) != 0;
-  if (info.has_producer_identity) {
-    info.producer_dense_fp8 = hdr.producer_dense_fp8 != 0;
-    info.producer_prefill_chunk = hdr.producer_prefill_chunk;
-    std::memcpy(info.producer_sha256.data(), hdr.producer_sha256, 32);
+
+  if ((hdr.kv_mode_flags & ~kKvModeFlagValid) != 0u) {
+    throw std::runtime_error("kv_checkpoint: unsupported kv_mode_flags " + std::to_string(hdr.kv_mode_flags));
   }
+  if ((hdr.kv_mode_flags & kKvModeFlagValid) != 0u) {
+    // Fresh combined #827+#829 header: mode at byte 196, producer trailer at bytes 144..191.
+    if (hdr.kv_cache_mode_v2 > 1u) {
+      throw std::runtime_error("kv_checkpoint: unsupported kv_cache_mode " + std::to_string(hdr.kv_cache_mode_v2));
+    }
+    info.kv_cache_mode = (hdr.kv_cache_mode_v2 == 1u) ? KvCacheMode::LastFull : KvCacheMode::PerPass;
+    const int want_slots = (info.kv_cache_mode == KvCacheMode::LastFull) ? NUM_FULL_SLOTS_LAST_FULL : NUM_FULL_VISITS;
+    if (hdr.num_full_visits != want_slots) {
+      throw std::runtime_error("kv_checkpoint: kv_cache_mode=" + std::string(to_string(info.kv_cache_mode)) +
+                               " disagrees with num_full_visits=" + std::to_string(hdr.num_full_visits));
+    }
+    if ((hdr.producer_flags & ~kProducerFlagValid) != 0u) {
+      throw std::runtime_error("kv_checkpoint: unsupported producer_flags " + std::to_string(hdr.producer_flags));
+    }
+    if ((hdr.producer_flags & kProducerFlagValid) != 0u) {
+      if (producer_trailer_tail_is_zero(hdr)) {
+        throw std::runtime_error("kv_checkpoint: producer_flags valid bit set with empty producer trailer");
+      }
+      info.has_producer_identity = true;
+      info.producer_dense_fp8 = hdr.producer_dense_fp8 != 0;
+      info.producer_prefill_chunk = hdr.producer_prefill_chunk;
+      std::memcpy(info.producer_sha256.data(), hdr.producer_sha256, 32);
+    }
+  } else if (hdr.num_full_visits == NUM_FULL_VISITS) {
+    // Legacy or #827 producer-tagged per_pass header (8 full slots, bytes 192..199 zeroed).
+    info.kv_cache_mode = KvCacheMode::PerPass;
+    if ((hdr.producer_flags & ~kProducerFlagValid) != 0u) {
+      throw std::runtime_error("kv_checkpoint: unsupported producer_flags " + std::to_string(hdr.producer_flags));
+    }
+    if ((hdr.producer_flags & kProducerFlagValid) != 0u) {
+      if (producer_trailer_tail_is_zero(hdr)) {
+        throw std::runtime_error("kv_checkpoint: producer_flags valid bit set with empty producer trailer");
+      }
+      info.has_producer_identity = true;
+      info.producer_dense_fp8 = hdr.producer_dense_fp8 != 0;
+      info.producer_prefill_chunk = hdr.producer_prefill_chunk;
+      std::memcpy(info.producer_sha256.data(), hdr.producer_sha256, 32);
+    }
+  } else {
+    // Standalone #829 4-slot file: wrote kv_cache_mode=1 at byte 144 with bytes 148..191 zeroed and NO producer
+    // trailer. NEVER promote byte 144 to has_producer_identity; fail closed on any other 4-slot legacy layout.
+    if (hdr.producer_flags != 1u || !producer_trailer_tail_is_zero(hdr)) {
+      throw std::runtime_error("kv_checkpoint: corrupt or ambiguous 4-slot legacy header");
+    }
+    info.kv_cache_mode = KvCacheMode::LastFull;
+    info.has_producer_identity = false;
+  }
+
   std::memcpy(info.prompt_sha256.data(), hdr.prompt_sha256, 32);
   std::memcpy(info.model_sha256.data(), hdr.model_sha256, 32);
   return info;
@@ -472,6 +549,11 @@ std::array<std::uint8_t, 32> compute_disk_producer_sha256(const StateIdentity& i
   ctx.update(&dense_fp8, sizeof(dense_fp8));
   ctx.update(&identity.kv_format, sizeof(identity.kv_format));
   ctx.update(&identity.prefill_chunk, sizeof(identity.prefill_chunk));
+  if (identity.kv_cache_mode != 0u) {
+    static constexpr char kKvModeDomain[] = "KVMODE";
+    ctx.update(kKvModeDomain, sizeof(kKvModeDomain) - 1);
+    ctx.update(&identity.kv_cache_mode, sizeof(identity.kv_cache_mode));
+  }
   return ctx.finish();
 }
 
@@ -517,10 +599,11 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
                              std::strerror(errno));
   }
 
+  const int nfull = st.num_full_slots();
   const std::uint64_t row_b = state_row_bytes(st);
   const std::uint64_t swa_b = swa_total_bytes(st);
   const std::uint64_t per_visit_half = std::uint64_t(pos) * row_b;
-  const std::uint64_t full_b = 2u * std::uint64_t(NUM_FULL_VISITS) * per_visit_half;
+  const std::uint64_t full_b = 2u * std::uint64_t(nfull) * per_visit_half;
 
   RawHeader hdr{};
   std::memcpy(hdr.magic, kMagic, 8);
@@ -530,7 +613,7 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
   hdr.kv_format = state_kv_format(st);
   hdr.max_ctx_at_save = st.max_ctx;
   hdr.pos = pos;
-  hdr.num_full_visits = NUM_FULL_VISITS;
+  hdr.num_full_visits = nfull;
   hdr.num_sliding_visits = NUM_SLIDING_VISITS;
   hdr.window = WINDOW;
   hdr.num_visits = NUM_VISITS;
@@ -539,6 +622,8 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
   hdr.row_bytes = row_b;
   hdr.swa_bytes = swa_b;
   hdr.full_kv_bytes = full_b;
+  hdr.kv_mode_flags = kKvModeFlagValid;
+  hdr.kv_cache_mode_v2 = static_cast<std::uint32_t>(st.kv_last_full ? KvCacheMode::LastFull : KvCacheMode::PerPass);
 
   const auto psha = sha256_bytes(prompt_prefix.data(), prompt_prefix.size_bytes());
   const auto msha = sha256_file_or_zero(model_dir / "config.json");
@@ -577,13 +662,13 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
       }
     }
 
-    // 3. Full-attention KV [fi = 0..7][K rows 0..pos-1][V rows 0..pos-1]
+    // 3. Full-attention KV [fi = 0..nfull-1][K rows 0..pos-1][V rows 0..pos-1]
     if (pos > 0) {
       if (st.paged_kv) {
         const int num_pages = (pos + PagedKvCache::kPageTokens - 1) / PagedKvCache::kPageTokens;
         auto* k_buf = buf.data();
         auto* v_buf = buf.data() + PagedKvCache::kKPageBytes;
-        for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+        for (int fi = 0; fi < nfull; ++fi) {
           for (int p = 0; p < num_pages; ++p) {
             const int rows = std::min(PagedKvCache::kPageTokens, pos - p * PagedKvCache::kPageTokens);
             st.paged_kv->export_page_to_host(fi, p, k_buf, nullptr, stream);
@@ -596,7 +681,7 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
           }
         }
       } else {
-        for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+        for (int fi = 0; fi < nfull; ++fi) {
           for (const Tensor& half : {st.k_full_at(fi), st.v_full_at(fi)}) {
             const auto* dev = static_cast<const std::uint8_t*>(half.data);
             std::size_t rem = std::size_t(per_visit_half);
@@ -671,8 +756,16 @@ KvCheckpointLoadResult load_kv_checkpoint_checked(
                                " row=" + std::to_string(hdr.row_bytes) + ", engine fmt=" +
                                std::to_string(state_kv_format(st)) + " row=" + std::to_string(state_row_bytes(st)) + ")");
     }
-    if (hdr.num_full_visits != NUM_FULL_VISITS || hdr.num_sliding_visits != NUM_SLIDING_VISITS ||
-        hdr.window != WINDOW || hdr.num_visits != NUM_VISITS || hdr.conv_k != CONV_K) {
+    const int expected_nfull = st.num_full_slots();
+    const KvCacheMode expected_mode = st.kv_last_full ? KvCacheMode::LastFull : KvCacheMode::PerPass;
+    if (info.kv_cache_mode != expected_mode || info.num_full_slots != expected_nfull) {
+      throw std::runtime_error("kv_checkpoint: kv_cache_mode mismatch (ckpt=" + std::string(to_string(info.kv_cache_mode)) +
+                               " full_slots=" + std::to_string(info.num_full_slots) + ", engine=" +
+                               std::string(to_string(expected_mode)) + " full_slots=" +
+                               std::to_string(expected_nfull) + ")");
+    }
+    if (hdr.num_sliding_visits != NUM_SLIDING_VISITS || hdr.window != WINDOW || hdr.num_visits != NUM_VISITS ||
+        hdr.conv_k != CONV_K) {
       throw std::runtime_error("kv_checkpoint: model architecture geometry mismatch");
     }
     if (hdr.swa_bytes != swa_total_bytes(st)) {
@@ -729,10 +822,10 @@ KvCheckpointLoadResult load_kv_checkpoint_checked(
       if (st.paged_kv) {
         st.paged_kv->reset();
         const int num_pages = (hdr.pos + PagedKvCache::kPageTokens - 1) / PagedKvCache::kPageTokens;
-        const int hot_per_visit = std::max(1, st.paged_kv->vram_slot_count() / NUM_FULL_VISITS);
+        const int hot_per_visit = std::max(1, st.paged_kv->vram_slot_count() / expected_nfull);
         auto* k_buf = buf.data();
         auto* v_buf = buf.data() + PagedKvCache::kKPageBytes;
-        for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+        for (int fi = 0; fi < expected_nfull; ++fi) {
           const std::uint64_t k_base = off + std::uint64_t(fi) * 2u * per_visit_half;
           const std::uint64_t v_base = k_base + per_visit_half;
           for (int p = 0; p < num_pages; ++p) {
@@ -751,7 +844,7 @@ KvCheckpointLoadResult load_kv_checkpoint_checked(
         st.paged_kv->flush_all_tables(stream);
         off += hdr.full_kv_bytes;
       } else {
-        for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+        for (int fi = 0; fi < expected_nfull; ++fi) {
           for (Tensor half : {st.k_full_at(fi), st.v_full_at(fi)}) {
             auto* dev = static_cast<std::uint8_t*>(half.data);
             std::size_t rem = std::size_t(per_visit_half);

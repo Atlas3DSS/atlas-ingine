@@ -66,6 +66,9 @@ void GraphExec::launch(cudaStream_t stream) const {
 
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  if (options_.kv_cache_mode == KvCacheMode::LastFull && options_.spec) {
+    throw std::invalid_argument("--kv-cache-mode last_full cannot be combined with --spec (B=1 non-spec control)");
+  }
   if (options_.kv_paged || options_.kv_vram_mb > 0) {
     options_.kv_paged = true;
     options_.kv_q4 = true;
@@ -88,6 +91,7 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   offload.prefill_chunk = options_.prefill_chunk;
   offload.kv_fp8 = options_.kv_fp8;
   offload.kv_q4 = options_.kv_q4;
+  offload.kv_last_full = (options_.kv_cache_mode == KvCacheMode::LastFull);
   offload.spec = options_.spec;
   offload.kv_vram_mb = options_.kv_paged ? options_.kv_vram_mb : 0;
   weights_ = load_weights(options_.model_dir, options_.dense_fp8, stream_, offload);
@@ -98,6 +102,9 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
 Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablation)
     : options_(options), weights_(std::move(weights)), ablation_(std::move(ablation)) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  if (options_.kv_cache_mode == KvCacheMode::LastFull && options_.spec) {
+    throw std::invalid_argument("--kv-cache-mode last_full cannot be combined with --spec (B=1 non-spec control)");
+  }
   // Decoder/Prefiller always dereference the ablation buffers (zeroed when inactive); materialize an
   // empty device ablation if the caller passed a default-constructed Ablation{}.
   if (!ablation_.active && (!ablation_.attn_dirs.data || !ablation_.attn_w.data || !ablation_.mlp_dirs.data ||
@@ -118,7 +125,8 @@ void Runtime::init() {
     pkv.prefill_chunk = options.prefill_chunk;
     pkv.swap_dir = options.kv_swap_dir;
   }
-  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_q4, pkv);
+  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_q4, pkv,
+                      options.kv_cache_mode == KvCacheMode::LastFull);
   if (state_.paged_kv) {
     state_.paged_kv->ensure_decode_pages(0, kMaxWidth, stream_);
   }
@@ -406,21 +414,23 @@ std::size_t Runtime::full_rows_bytes(int n) const {
   if (n < 0 || n > options_.max_ctx)
     throw std::invalid_argument("full_rows_bytes: n = " + std::to_string(n) + " outside [0, max_ctx = " +
                                 std::to_string(options_.max_ctx) + "]");
-  const std::size_t row = state_.k_full.bytes() / NUM_FULL_VISITS / std::size_t(options_.max_ctx);
-  return 2 * std::size_t(NUM_FULL_VISITS) * row * std::size_t(n);
+  const int nfull = state_.num_full_slots();
+  const std::size_t row = state_.k_full.bytes() / std::size_t(nfull) / std::size_t(options_.max_ctx);
+  return 2 * std::size_t(nfull) * row * std::size_t(n);
 }
 
-// Copy NUM_FULL_VISITS visits of n positions packed contiguously (k visits, then v visits).
-// Per-visit 1D copies avoid CUDA's 2 GiB cudaMemcpy2DAsync pitch ceiling at >=1M context lengths.
+// Copy active full slots (8 in per_pass, 4 in last_full) of n positions packed contiguously (k slots, then v slots).
+// Per-slot 1D copies avoid CUDA's 2 GiB cudaMemcpy2DAsync pitch ceiling at >=1M context lengths.
 std::size_t Runtime::save_full_rows(void* dst, int n) {
-  const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
+  const int nfull = state_.num_full_slots();
+  const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / std::size_t(nfull);
   if (n == 0) return 0;
-  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+  const std::size_t pitch = state_.k_full.bytes() / std::size_t(nfull);
   char* p = static_cast<char*>(dst);
   std::size_t copied = 0;
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
     const char* src = static_cast<const char*>(t->data);
-    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+    for (int f = 0; f < nfull; ++f) {
       CUDA_CHECK(cudaMemcpyAsync(p + std::size_t(f) * width, src + std::size_t(f) * pitch, width, cudaMemcpyDefault,
                                  stream_));
       copied += width;
@@ -431,15 +441,16 @@ std::size_t Runtime::save_full_rows(void* dst, int n) {
 }
 
 std::size_t Runtime::restore_full_rows(const void* src, int n) {
+  const int nfull = state_.num_full_slots();
   const std::size_t total = full_rows_bytes(n);
-  const std::size_t bytes = total / 2, width = bytes / NUM_FULL_VISITS;
+  const std::size_t bytes = total / 2, width = bytes / std::size_t(nfull);
   if (n == 0) return 0;
-  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+  const std::size_t pitch = state_.k_full.bytes() / std::size_t(nfull);
   const char* p = static_cast<const char*>(src);
   std::size_t copied = 0;
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
     char* dst = static_cast<char*>(t->data);
-    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+    for (int f = 0; f < nfull; ++f) {
       CUDA_CHECK(cudaMemcpyAsync(dst + std::size_t(f) * pitch, p + std::size_t(f) * width, width, cudaMemcpyDefault,
                                  stream_));
       copied += width;

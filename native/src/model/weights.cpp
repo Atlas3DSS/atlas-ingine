@@ -578,7 +578,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     const std::size_t kv_full_bytes =
         offload.kv_vram_mb > 0
             ? (std::size_t(offload.kv_vram_mb) << 20)
-            : (std::size_t(NUM_FULL_VISITS) * std::size_t(offload.max_ctx) *
+            : (std::size_t(full_slot_count(offload.kv_last_full)) * std::size_t(offload.max_ctx) *
                (offload.kv_q4 ? (2 * std::size_t(KV_Q4_ROW_BYTES)) : (std::size_t(KV_DIM) * (offload.kv_fp8 ? 2 : 4))));
     const std::size_t checkpoint_bytes = kv_ring_bytes + (std::size_t(16) << 20);
     // Prefiller aliases Attention vs MLP scratch (including EXL3 scratch) in one phase arena (~269 KB/tok + 42 MiB).

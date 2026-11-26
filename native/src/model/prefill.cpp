@@ -355,7 +355,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::AttnParams at;
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
     if (layer.full) {
-      const int fi = FULL_INDEX[v];
+      const int fi = st.full_slot(v);
       if (st.paged_kv) {
         st.paged_kv->ensure_write_pages(fi, pos0, T, s);
         ap.k_out = nullptr, ap.v_out = nullptr;
@@ -398,7 +398,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::conv_state_update(st.conv_v_at(v), proj_ + SEG_BEGIN[SEG_V], R, T, KV_DIM, s);
     pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
     if (layer.full && st.paged_kv) {
-      st.paged_kv->prefill_attention(FULL_INDEX[v], at, s);
+      st.paged_kv->prefill_attention(st.full_slot(v), at, s);
     } else {
       pk::attention(at, s);
     }

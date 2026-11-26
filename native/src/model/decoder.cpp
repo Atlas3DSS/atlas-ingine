@@ -208,7 +208,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     a.workspace_size = attn_ws_.bytes;
     a.out = bf16m(b.attn_out);
     if (layer.full) {
-      const int fi = FULL_INDEX[v];
+      const int fi = st.full_slot(v);
       if (streamed_paged_kv) {
         st.paged_kv->decode_attention_with_swap(fi, layer, v, f32p(proj_out), m, int(streamed_h_pos), st.conv_k_at(v),
                                                 st.conv_v_at(v), bf16m(b.attn_out), stream);

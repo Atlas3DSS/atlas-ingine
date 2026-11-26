@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <vector>
 
 using namespace ingine::model;
@@ -70,6 +71,7 @@ int main() {
     a.act_dtype = 0;
     a.dense_fp8 = true;
     a.kv_format = 1;
+    a.kv_cache_mode = 0;
     a.max_ctx = 65536;
     a.prefill_chunk = 3072;
     a.spec_enabled = false;
@@ -86,6 +88,9 @@ int main() {
     b = a;
     b.kv_format = 2;
     expect(!(a == b), "StateIdentity kv_format isolation");
+    b = a;
+    b.kv_cache_mode = 1;
+    expect(!(a == b) && hash_state_identity(a) != hash_state_identity(b), "StateIdentity kv_cache_mode isolation");
     b = a;
     b.prefill_chunk = 512;
     expect(!(a == b), "StateIdentity prefill_chunk isolation");
@@ -309,6 +314,49 @@ int main() {
     std::filesystem::remove_all(pkg_base, ec);
   }
 #endif
+
+  // #829 opt-in L11/L17 last_full KV sharing invariants (CPU-verifiable):
+  expect(NUM_FULL_SLOTS_LAST_FULL == 4, "last_full has 4 physical full slots");
+  expect(full_slot_count(false) == 8 && full_slot_count(true) == 4, "full_slot_count");
+  for (int i = 0; i < NUM_VISITS; ++i) {
+    const int l = VISITS[i].layer;
+    const int expected_lf = (l == 5) ? 0 : (l == 11) ? 1 : (l == 17) ? 2 : (l == 23) ? 3 : -1;
+    expect(FULL_INDEX_LAST_FULL[i] == expected_lf, "FULL_INDEX_LAST_FULL mapping");
+    expect(full_slot_index(i, false) == FULL_INDEX[i], "full_slot_index per_pass");
+    expect(full_slot_index(i, true) == expected_lf, "full_slot_index last_full");
+  }
+  // Verify exact pass sharing on L11 (visits 11, 23, 35 -> slot 1) and L17 (visits 17, 29, 41 -> slot 2).
+  expect(FULL_INDEX_LAST_FULL[5] == 0 && FULL_INDEX_LAST_FULL[47] == 3, "L5=0 and L23=3");
+  expect(FULL_INDEX_LAST_FULL[11] == 1 && FULL_INDEX_LAST_FULL[23] == 1 && FULL_INDEX_LAST_FULL[35] == 1,
+         "L11 passes 0,1,2 share slot 1");
+  expect(FULL_INDEX_LAST_FULL[17] == 2 && FULL_INDEX_LAST_FULL[29] == 2 && FULL_INDEX_LAST_FULL[41] == 2,
+         "L17 passes 0,1,2 share slot 2");
+  // Verify projected 1M-token Q4_0 full-KV buffer size: 9.00 GiB -> 4.50 GiB (exact 50% of full-KV buffer).
+  const ingine::Tensor kq4_lf = rm(nullptr, ingine::DType::U8, {NUM_FULL_SLOTS_LAST_FULL, kOneM, KV_Q4_ROW_BYTES});
+  expect(kq4_lf.bytes() == 2415919104ull, "1M q4_0 last_full k_full == 2.25 GiB");
+  expect(kq4_lf.bytes() * 2 == 4831838208ull, "1M q4_0 last_full k+v == 4.50 GiB");
+  // State helper methods match mode.
+  State st_pp;
+  st_pp.kv_last_full = false;
+  State st_lf;
+  st_lf.kv_last_full = true;
+  expect(st_pp.num_full_slots() == 8 && st_lf.num_full_slots() == 4, "State::num_full_slots");
+  expect(st_pp.full_slot(35) == 5 && st_lf.full_slot(35) == 1, "State::full_slot L11 pass 2");
+  expect(st_pp.full_slot(41) == 6 && st_lf.full_slot(41) == 2, "State::full_slot L17 pass 2");
+  // KvCacheMode string parsing & default.
+  RuntimeOptions default_opts;
+  expect(default_opts.kv_cache_mode == KvCacheMode::PerPass, "RuntimeOptions defaults to per_pass");
+  expect(std::strcmp(to_string(KvCacheMode::PerPass), "per_pass") == 0, "to_string per_pass");
+  expect(std::strcmp(to_string(KvCacheMode::LastFull), "last_full") == 0, "to_string last_full");
+  expect(parse_kv_cache_mode("per_pass") == KvCacheMode::PerPass, "parse per_pass");
+  expect(parse_kv_cache_mode("last_full") == KvCacheMode::LastFull, "parse last_full");
+  bool threw_bad_mode = false;
+  try {
+    (void)parse_kv_cache_mode("invalid_mode");
+  } catch (const std::invalid_argument&) {
+    threw_bad_mode = true;
+  }
+  expect(threw_bad_mode, "parse_kv_cache_mode rejects unknown string");
 
   std::printf("%s model_data constants\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;

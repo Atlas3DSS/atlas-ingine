@@ -162,6 +162,7 @@ std::string default_model_dir() {
 int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
+  std::string kv_cache_mode = "per_pass";
   std::string concurrency_csv;
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
@@ -186,7 +187,10 @@ int main(int argc, char** argv) {
   ap.flag("--dense-fp8", "", &dense_fp8);
   ap.flag("--vision", "also load the vision tower", &vision);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
-  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok; SWA stays BF16)", &kv_q4);
+  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok per_pass, 4.5 KiB/tok last_full; SWA stays BF16)", &kv_q4);
+  ap.option("--kv-cache-mode", "{per_pass,last_full}",
+            "full-attention KV mode: per_pass (default, 8 visit slots) or last_full (opt-in L11/L17 shared, 4 slots; B=1 non-spec)",
+            &kv_cache_mode, {"per_pass", "last_full"});
   ap.flag("--kv-paged", "3-tier paged Q4_0 full-attention KV cache (VRAM LRU + pinned UVA RAM + NVMe SwapFile)", &kv_paged);
   ap.option("--kv-vram-mb", "", "VRAM cap in MiB for paged Q4_0 KV cache (implies --kv-paged --kv-q4)", &kv_vram_mb);
   ap.option("--kv-ram-mb", "", "pinned UVA host RAM cap in MiB for paged Q4_0 KV before NVMe SwapFile spill (default 12288)",
@@ -266,6 +270,7 @@ int main(int argc, char** argv) {
     options.dense_fp8 = dense_fp8;
     options.kv_fp8 = kv_fp8;
     options.kv_q4 = kv_q4;
+    options.kv_cache_mode = ingine::model::parse_kv_cache_mode(kv_cache_mode);
     options.kv_paged = kv_paged || kv_vram_mb > 0;
     options.kv_vram_mb = kv_vram_mb;
     options.kv_ram_mb = kv_ram_mb;
@@ -292,7 +297,8 @@ int main(int argc, char** argv) {
     size_t free1 = 0;
     cudaMemGetInfo(&free1, &total);
     const double vram_gb = double(free0 > free1 ? free0 - free1 : 0) / 1e9;
-    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d)\n", load_s, vram_gb, gen->max_batch_size());
+    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s)\n", load_s, vram_gb,
+                gen->max_batch_size(), ingine::model::to_string(gen->kv_cache_mode()));
     std::fflush(stdout);
     if (!forced.empty()) {
       std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace, forced_free).c_str());
