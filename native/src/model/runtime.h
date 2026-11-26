@@ -98,7 +98,7 @@ class Decoder {
   State& st_;
   bool pdl_;
   DeviceBuffer attn_ws_;  // attn workspace for up to 8 rows (zeroed once)
-  DeviceBuffer moe_down_ws_;  // EXL3 moe_down workspace: bf16 [8 * 8 * H] = 288 KiB
+  DeviceBuffer moe_down_ws_;  // Per-decoder MoE workspace: EXL3 moe_down (288 KiB) & pre-SM80 NVFP4 dp4a M>1 scratch (90 KiB)
   std::map<std::vector<const float*>, DeviceBuffer> tables_;  // device pointer tables for mix
   std::array<DeviceBuffer, 2> segments_;  // proj segment tables: [single-input sliding, three-input]
   DeviceBuffer full_segments_;

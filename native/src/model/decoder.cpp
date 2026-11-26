@@ -52,7 +52,7 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl)
       st_(st),
       pdl_(pdl),
       attn_ws_(attn::workspace_bytes(8)),
-      moe_down_ws_(std::size_t(8) * TOP_K * HIDDEN * 2) {
+      moe_down_ws_(std::max<std::size_t>(std::size_t(8) * TOP_K * HIDDEN * 2, moe::kDp4aScratchBytes)) {
   attn_ws_.fill(0);  // zeroed once; the kernel resets its counter itself
   segments_[0] = upload_ints(proj_layout(false, true));
   segments_[1] = upload_ints(proj_layout(false, false));
@@ -303,7 +303,8 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       float* y2_p = f32m(b.y2) + std::size_t(tok_off) * H;
       float* hist_p = history ? f32m(b.hist_mlp) + (std::size_t(v) * m + std::size_t(tok_off)) * H : nullptr;
       moe::moe_up(xm_p, tok_m, idx_p, ex.w13.data, exl13 ? ex.w13_rin.data : ex.w13_scale.data,
-                  exl13 ? nullptr : f32p(ex.w13_factor), fmt13, act_p, moe_pdl, stream, ex.w13_rout.data, eptrs_p);
+                  exl13 ? nullptr : f32p(ex.w13_factor), fmt13, act_p, moe_pdl, stream, ex.w13_rout.data, eptrs_p,
+                  moe_down_ws_.p);
       if (hooks) {
         moe::apply_expert_hooks_decode(act_p, idx_p, tok_m, &hooks->expert[v], pos, stream, tok_off);
         moe::moe_down(act_p, tok_m, idx_p, wts_p, ex.w2.data, exl2 ? ex.w2_rin.data : ex.w2_scale.data,

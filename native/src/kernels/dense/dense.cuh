@@ -48,7 +48,8 @@ __device__ __forceinline__ void unpack_bf16x8(const uint4& v, float* f) {
   f[6] = bf_lo(v.w); f[7] = bf_hi(v.w);
 }
 
-// Adapted from ashalliants/ninfer-3090 (Apache-2.0): exact E4M3 * 2^-8 -> FP16x2 in 3 ALU ops (zero branches/LUTs).
+// Adapted from ashalliants/ninfer-3090 (src/ops/moe_situ/moe_situ.cu @ 8ea67ce, Apache-2.0):
+// exact E4M3 * 2^-8 -> FP16x2 in 3 ALU ops (zero branches/LUTs).
 // Valid for all finite E4M3 codes (zeros, subnormals, normals); caller scales result by 256.f.
 __device__ __forceinline__ uint32_t e4m3x2_to_half2_m8(uint32_t u) {
   const uint32_t t = __byte_perm(u, 0u, 0x4140u);

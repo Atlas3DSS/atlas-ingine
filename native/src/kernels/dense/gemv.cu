@@ -247,7 +247,7 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 }
 
 // 2 E4M3 (low 16 bits of u) -> Act2T. On pre-Ada FP16 builds (sm_60/61/70/75), use exact 3-op E4M3 * 2^-8 -> FP16x2
-// (adapted from ashalliants/ninfer-3090, Apache-2.0) and fold * 256.f into the epilogue scale.
+// (adapted from ashalliants/ninfer-3090 @ 8ea67ce, Apache-2.0) and fold * 256.f into the epilogue scale.
 __device__ __forceinline__ uint32_t e4m3x2_to_mma_act2(uint32_t u) {
 #if INGINE_ACT_FP16 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
   return e4m3x2_to_half2_m8(u);

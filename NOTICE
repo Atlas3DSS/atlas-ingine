@@ -130,3 +130,9 @@ Modifications by Atlas3DSS:
     escha-mlx and Kintsugi-Inkling-2-Mini (Apache License 2.0).
 - Native OpenAI response_format (text, json_object, json_schema) and automatic
   tool-invocation token suppression when tools are omitted.
+- Volta (sm_70) and pre-Ampere FP16 single-stream decode kernels (NVFP4 INT8-act
+  dp4a MoE, branchless E2M1/E4M3 decoders, and zero-SMEM FP8 dense GEMV):
+  * Branchless __byte_perm E2M1 decode (e2m1_twice8 / e2m1_twice_i8x4), 3-op
+    E4M3->FP16x2 shift-decode, and per-group INT8-activation dp4a streaming GEMV
+    design adapted from ashalliants/ninfer-3090
+    (https://github.com/ashalliants/ninfer-3090, commit 8ea67ce, Apache License 2.0).

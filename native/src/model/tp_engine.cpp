@@ -1740,6 +1740,7 @@ class TpDecoder {
   TpDecoder(const Weights& w, const Ablation& abl, State& st, int rank, ncclComm_t comm, TpWorkerPool::RankInfo& rinfo)
       : w_(w), abl_(abl), st_(st), rank_(rank), comm_(comm), rinfo_(rinfo),
         attn_ws_(attn::workspace_bytes(8)),
+        moe_ws_(moe::kDp4aScratchBytes),
         wo_f32_(std::size_t(8) * H * sizeof(float)),
         moe_f32_(std::size_t(8) * H * sizeof(float)),
         local_logits_(std::size_t(8) * LOCAL_VOCAB_CHUNK * sizeof(float)),
@@ -1932,10 +1933,10 @@ class TpDecoder {
       eptrs.w2 = static_cast<const std::uint8_t* const*>(ex.w2_ptrs.data);
       eptrs.w2_scale = static_cast<const std::uint8_t* const*>(ex.w2_scale_ptrs.data);
       moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), nullptr, nullptr, f32p(ex.w13_factor),
-                  fmt13, bf16m(b.act), false, stream, nullptr, &eptrs);
+                  fmt13, bf16m(b.act), false, stream, nullptr, &eptrs, moe_ws_.p);
       moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), nullptr, nullptr,
                     f32p(ex.w2_factor), fmt2, nullptr, nullptr, static_cast<float*>(moe_f32_.p), nullptr, false,
-                    stream, nullptr, nullptr, &eptrs);
+                    stream, nullptr, static_cast<ActT*>(moe_ws_.p), &eptrs);
       NCCL_CHECK(ncclAllReduce(moe_f32_.p, moe_f32_.p, std::size_t(m) * H, ncclFloat32, ncclSum, comm_, stream));
       dense::static_conv_decode(static_cast<const float*>(moe_f32_.p), m, f32p(layer.mlp_conv), st.conv_mlp_at(v),
                                 f32m(b.y2), history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, stream);
@@ -1975,7 +1976,7 @@ class TpDecoder {
   int rank_;
   ncclComm_t comm_;
   TpWorkerPool::RankInfo& rinfo_;
-  DeviceBuffer attn_ws_, wo_f32_, moe_f32_, local_logits_, gathered_logits_;
+  DeviceBuffer attn_ws_, moe_ws_, wo_f32_, moe_f32_, local_logits_, gathered_logits_;
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
   std::array<DeviceBuffer, 2> segments_;
   DeviceBuffer full_segments_;

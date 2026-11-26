@@ -10,11 +10,17 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ingine::kernels::moe {
 
 enum class Format : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5 };
+
+// Minimum size (bytes, 16-byte aligned) of caller-owned fixed-address device scratch for pre-SM80 M > 1 NVFP4
+// dp4a activation pre-quantization (moe_up needs 23,040 B; moe_down needs 92,160 B). Sequential callers on one
+// stream may reuse one buffer; passing nullptr selects a scratch-free inline-quantization path (identical numerics).
+inline constexpr std::size_t kDp4aScratchBytes = 92160;
 
 // Optional per-expert device pointer table ([128] base pointers for one layer) for tiered expert offloading.
 // When null, kernels index contiguous [128, ...] weight arrays as before.
@@ -32,16 +38,19 @@ struct ExpertPtrs {
 // MXFP8: w13 e4m3 [128, 2I, H], w13_scale u8 E8M0 [128, 2I, H/32], factor unused (may be null).
 // EXL3_2 / EXL3_3: w13 u8 [128, 144, 144, 32*bits] (stacked [gate; up]), w13_scale = w13_rin f16 [128, H],
 // w13_rout = f16 [128, 2I], w13_factor unused.
+// workspace (optional): caller-owned fixed-address device scratch (>= kDp4aScratchBytes, 16-byte aligned)
+// used by pre-SM80 M > 1 NVFP4 dp4a pre-quantization; when null, M > 1 runs scratch-free inline quantization.
 // pdl: the kernel waits for its predecessor before reading anything.
 void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w13_scale,
             const float* w13_factor, Format fmt, ActT* out, bool pdl, cudaStream_t stream,
-            const void* w13_rout = nullptr, const ExpertPtrs* ptrs = nullptr);
+            const void* w13_rout = nullptr, const ExpertPtrs* ptrs = nullptr, void* workspace = nullptr);
 
 // moe_down: W2 GEMV + routing-weighted sum + post-MLP conv with state update. act ActT [M, 8, I],
 // wts fp32 [M, 8], w2 [128, H, I(/2)] + scales [128, H, I/16 | I/32] (+ factor), conv_w fp32 [H, 4],
 // conv_state fp32 [3, H], out fp32 [M, H], conv_hist fp32 [M, H] (ActT-rounded conv inputs) or null.
 // EXL3_2 / EXL3_3: w2 u8 [128, 144, 72, 32*bits], w2_scale = w2_rin f16 [128, I], w2_rout = f16 [128, H],
-// workspace = ActT [M * 8 * H] scratch buffer.
+// workspace = ActT [M * 8 * H] scratch buffer. For pre-SM80 M > 1 NVFP4 dp4a, optional caller-owned fixed-address
+// scratch (>= kDp4aScratchBytes, 16-byte aligned); when null, M > 1 runs scratch-free inline quantization.
 // pdl: valid only right after moe_up (idx is read before the PDL wait).
 void moe_down(const ActT* act, int M, const int* idx, const float* wts, const void* w2,
               const void* w2_scale, const float* w2_factor, Format fmt, const float* conv_w, float* conv_state,

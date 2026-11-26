@@ -231,15 +231,17 @@ __device__ __forceinline__ Chunk<FMT> load_chunk(const uint8_t* codes, const uin
 
 // ------------------------------------------------------------------------------------------ decode
 
-// Adapted from ashalliants/ninfer-3090 (Apache-2.0): exact E4M3 * 2^-8 -> FP16x2 in 3 ALU ops (zero branches/LUTs).
+// Adapted from ashalliants/ninfer-3090 (src/ops/moe_situ/moe_situ.cu @ 8ea67ce, Apache-2.0):
+// exact E4M3 * 2^-8 -> FP16x2 in 3 ALU ops (zero branches/LUTs).
 // Valid for all finite E4M3 codes (zeros, subnormals, normals); caller scales result by 256.f.
 __device__ __forceinline__ uint32_t e4m3x2_to_half2_m8(uint32_t u) {
     const uint32_t t = __byte_perm(u, 0u, 0x4140u);
     return ((t & 0x00800080u) << 8) | ((t & 0x007f007fu) << 7);
 }
 
-// Adapted from ashalliants/ninfer-3090 (Apache-2.0): branchless, zero-LUT decode of 8 NVFP4 E2M1 nibbles packed
-// in `q` (even element in low nibble, odd in high nibble of each byte) into 8 exact FP32 values = 2 * e2m1_value.
+// Adapted from ashalliants/ninfer-3090 (src/ops/moe_situ/moe_situ.cu @ 8ea67ce, Apache-2.0):
+// branchless, zero-LUT decode of 8 NVFP4 E2M1 nibbles packed in `q` (even element in low nibble,
+// odd in high nibble of each byte) into 8 exact FP32 values = 2 * e2m1_value.
 __device__ __forceinline__ void e2m1_twice8(uint32_t q, float (&out)[8]) {
     constexpr uint32_t kPos0 = 0x0F0E0D0Cu, kPos1 = 0x18141210u;  // nibbles 0..7: 2v + 12 = 12,13,14,15,16,18,20,24
     constexpr uint32_t kNeg0 = 0x090A0B0Cu, kNeg1 = 0x00040608u;  // nibbles 8..15: 12,11,10,9,8,6,4,0
@@ -257,7 +259,7 @@ __device__ __forceinline__ void e2m1_twice8(uint32_t q, float (&out)[8]) {
     }
 }
 
-// Adapted from ashalliants/ninfer-3090 (Apache-2.0) & iammrduncan/tensorless (Apache-2.0):
+// Adapted from ashalliants/ninfer-3090 (src/ops/moe_situ/moe_situ.cu @ 8ea67ce, Apache-2.0):
 // Branchless decode of 8 NVFP4 E2M1 nibbles into two signed int8x4 words holding exact 2 * e2m1 in [-12, +12],
 // feeding __dp4a directly with zero bias subtraction.
 __device__ __forceinline__ void e2m1_twice_i8x4(uint32_t q, int32_t& w0, int32_t& w1) {
@@ -1663,7 +1665,8 @@ moe_down_fp16_stream_kernel(const ActT* __restrict__ act, const int* __restrict_
 }
 
 // ----------------------------------------------------------------- NVFP4 INT8-act dp4a MoE kernels
-// Adapted from ashalliants/ninfer-3090 (Apache-2.0) & iammrduncan/tensorless (Apache-2.0):
+// Adapted from ashalliants/ninfer-3090 (src/ops/moe_situ/moe_situ.cu and
+// src/ops/linear/common/stream_dp4a.cuh @ 8ea67ce, Apache-2.0):
 // Per-16-element symmetric INT8 activation quantization + exact signed 2*e2m1 __dp4a dot products.
 // Identical arithmetic across M = 1..8 (preserves M=1 vs speculative verify parity) and stays
 // HBM2-bandwidth-bound across all active-token widths on sm_61 / sm_70 / sm_75.
@@ -1680,13 +1683,16 @@ __device__ __forceinline__ int dp4a_s8(int32_t a, int32_t b, int c) {
 #endif
 }
 
-// Fixed-address L1/L2-resident INT8 activation buffers for M > 1 NVFP4 dp4a MoE (CUDA-graph safe: single-stream
-// producer->consumer). Eliminates redundant per-block FP16->INT8 quantization across 144..2304 CTAs and drops
-// moe_up SMEM to 0 B and moe_down SMEM from 44.7 KiB to ~6 KiB (full SM occupancy, zero POOL batching).
-__device__ int32_t g_moe_up_q8[MAXM * 72 * 8];
-__device__ float g_moe_up_xs[MAXM * 144];
-__device__ int32_t g_moe_down_q8[MAXM * TOPK * 36 * 8];
-__device__ float g_moe_down_xs[MAXM * TOPK * 72];
+// Layout inside caller-owned fixed-address scratch for M > 1 NVFP4 dp4a pre-quantization.
+// Each Runtime/Decoder (or standalone multi-stream caller) owns its own fixed-address scratch buffer so
+// concurrent generators and concurrently replayed CUDA graphs never alias intermediate INT8 activations.
+constexpr std::size_t kDp4aUpQ8Elems = static_cast<std::size_t>(MAXM) * 72 * 8;
+constexpr std::size_t kDp4aUpXsElems = static_cast<std::size_t>(MAXM) * 144;
+constexpr std::size_t kDp4aDownQ8Elems = static_cast<std::size_t>(MAXM) * TOPK * 36 * 8;
+constexpr std::size_t kDp4aDownXsElems = static_cast<std::size_t>(MAXM) * TOPK * 72;
+static_assert(kDp4aUpQ8Elems * sizeof(int32_t) + kDp4aUpXsElems * sizeof(float) <= kDp4aScratchBytes);
+static_assert(kDp4aDownQ8Elems * sizeof(int32_t) + kDp4aDownXsElems * sizeof(float) <= kDp4aScratchBytes);
+static_assert((kDp4aUpQ8Elems * sizeof(int32_t)) % 16 == 0 && (kDp4aDownQ8Elems * sizeof(int32_t)) % 16 == 0);
 
 template <int K_CHUNKS>
 __global__ void __launch_bounds__(128)
@@ -1805,10 +1811,10 @@ moe_up_nvfp4_dp4a_m1_kernel(const ActT* __restrict__ x, const int* __restrict__ 
     }
 }
 
-template <int MAX_T>
+template <int MAX_T, bool HAS_WS>
 __global__ void __launch_bounds__(256)
-moe_up_nvfp4_dp4a_l1_kernel(const int32_t* __restrict__ q8_in, const float* __restrict__ xs_in,
-                            const int* __restrict__ idx, const uint8_t* __restrict__ w,
+moe_up_nvfp4_dp4a_l1_kernel(const ActT* __restrict__ x_in, const int32_t* __restrict__ q8_in,
+                            const float* __restrict__ xs_in, const int* __restrict__ idx, const uint8_t* __restrict__ w,
                             const uint8_t* __restrict__ ws, const float* __restrict__ wfactor, int M,
                             ActT* __restrict__ out, const uint8_t* const* __restrict__ w_ptrs,
                             const uint8_t* const* __restrict__ ws_ptrs) {
@@ -1845,8 +1851,6 @@ moe_up_nvfp4_dp4a_l1_kernel(const int32_t* __restrict__ q8_in, const float* __re
 
     if (ntok == 1) {
         const int tok = toks[0];
-        const int32_t* xq_row = q8_in + tok * (72 * 8);
-        const float2* xs_row = reinterpret_cast<const float2*>(xs_in + tok * 144);
         float acc_g = 0.f, acc_u = 0.f;
         Chunk<0> cg_cur = load_chunk<0>(wg_ptr, wsg_ptr, lane8, wpol);
         Chunk<0> cu_cur = load_chunk<0>(wu_ptr, wsu_ptr, lane8, wpol);
@@ -1859,9 +1863,22 @@ moe_up_nvfp4_dp4a_l1_kernel(const int32_t* __restrict__ q8_in, const float* __re
                 cu_nxt = load_chunk<0>(wu_ptr, wsu_ptr, cn, wpol);
             }
             const int c = 8 * step + lane8;
-            const int4 xv0 = __ldg(reinterpret_cast<const int4*>(xq_row + c * 8));
-            const int4 xv1 = __ldg(reinterpret_cast<const int4*>(xq_row + c * 8 + 4));
-            const float2 xs = __ldg(xs_row + c);
+            int4 xv0, xv1;
+            float2 xs;
+            if constexpr (HAS_WS) {
+                const int32_t* xq_row = q8_in + tok * (72 * 8);
+                const float2* xs_row = reinterpret_cast<const float2*>(xs_in + tok * 144);
+                xv0 = __ldg(reinterpret_cast<const int4*>(xq_row + c * 8));
+                xv1 = __ldg(reinterpret_cast<const int4*>(xq_row + c * 8 + 4));
+                xs = __ldg(xs_row + c);
+            } else {
+                int32_t q0[4], q1[4];
+                const ActT* src_c = x_in + static_cast<size_t>(tok) * H + c * 32;
+                quant16_act_to_i8(src_c, q0, xs.x);
+                quant16_act_to_i8(src_c + 16, q1, xs.y);
+                xv0 = make_int4(q0[0], q0[1], q0[2], q0[3]);
+                xv1 = make_int4(q1[0], q1[1], q1[2], q1[3]);
+            }
             int32_t w0, w1;
             int ig0 = 0, ig1 = 0, iu0 = 0, iu1 = 0;
             e2m1_twice_i8x4(cg_cur.q.x, w0, w1); ig0 = dp4a_s8(w0, xv0.x, ig0); ig0 = dp4a_s8(w1, xv0.y, ig0);
@@ -1932,9 +1949,20 @@ moe_up_nvfp4_dp4a_l1_kernel(const int32_t* __restrict__ q8_in, const float* __re
             const float2 scu = __half22float2(*reinterpret_cast<const __half2*>(&su2));
             for (int ti = 0; ti < ntok; ++ti) {
                 const int tok = toks[ti];
-                const int4 xv0 = __ldg(reinterpret_cast<const int4*>(q8_in + tok * (72 * 8) + c * 8));
-                const int4 xv1 = __ldg(reinterpret_cast<const int4*>(q8_in + tok * (72 * 8) + c * 8 + 4));
-                const float2 xs = __ldg(reinterpret_cast<const float2*>(xs_in + tok * 144) + c);
+                int4 xv0, xv1;
+                float2 xs;
+                if constexpr (HAS_WS) {
+                    xv0 = __ldg(reinterpret_cast<const int4*>(q8_in + tok * (72 * 8) + c * 8));
+                    xv1 = __ldg(reinterpret_cast<const int4*>(q8_in + tok * (72 * 8) + c * 8 + 4));
+                    xs = __ldg(reinterpret_cast<const float2*>(xs_in + tok * 144) + c);
+                } else {
+                    int32_t q0[4], q1[4];
+                    const ActT* src_c = x_in + static_cast<size_t>(tok) * H + c * 32;
+                    quant16_act_to_i8(src_c, q0, xs.x);
+                    quant16_act_to_i8(src_c + 16, q1, xs.y);
+                    xv0 = make_int4(q0[0], q0[1], q0[2], q0[3]);
+                    xv1 = make_int4(q1[0], q1[1], q1[2], q1[3]);
+                }
                 int ig0 = dp4a_s8(gw[0], xv0.x, dp4a_s8(gw[1], xv0.y, dp4a_s8(gw[2], xv0.z, dp4a_s8(gw[3], xv0.w, 0))));
                 int ig1 = dp4a_s8(gw[4], xv1.x, dp4a_s8(gw[5], xv1.y, dp4a_s8(gw[6], xv1.z, dp4a_s8(gw[7], xv1.w, 0))));
                 int iu0 = dp4a_s8(uw[0], xv0.x, dp4a_s8(uw[1], xv0.y, dp4a_s8(uw[2], xv0.z, dp4a_s8(uw[3], xv0.w, 0))));
@@ -2086,10 +2114,10 @@ moe_down_nvfp4_dp4a_m1_kernel(const ActT* __restrict__ act, const int* __restric
     }
 }
 
-template <int MAX_T>
+template <int MAX_T, bool HAS_WS>
 __global__ void __launch_bounds__(512)
-moe_down_nvfp4_dp4a_l1_kernel(const int32_t* __restrict__ q8_in, const float* __restrict__ xs_in,
-                              const int* __restrict__ idx, const float* __restrict__ wts,
+moe_down_nvfp4_dp4a_l1_kernel(const ActT* __restrict__ act_in, const int32_t* __restrict__ q8_in,
+                              const float* __restrict__ xs_in, const int* __restrict__ idx, const float* __restrict__ wts,
                               const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws,
                               const float* __restrict__ wfactor, int M, const float* __restrict__ conv_w,
                               float* __restrict__ conv_state, float* __restrict__ out, float* __restrict__ conv_hist,
@@ -2166,8 +2194,6 @@ moe_down_nvfp4_dp4a_l1_kernel(const int32_t* __restrict__ q8_in, const float* __
 
         if (ntok == 1) {
             const int src_slot = u_slot[u][0];
-            const int32_t* xq_row = q8_in + src_slot * (36 * 8);
-            const float2* xs_row = reinterpret_cast<const float2*>(xs_in + src_slot * 72);
             Chunk<0> ch[3];
             float acc = 0.f;
 #pragma unroll
@@ -2177,9 +2203,22 @@ moe_down_nvfp4_dp4a_l1_kernel(const int32_t* __restrict__ q8_in, const float* __
 #pragma unroll
                 for (int b = 0; b < 3; ++b) {
                     const int c = 4 * (sb + b) + lane4;
-                    const int4 xv0 = __ldg(reinterpret_cast<const int4*>(xq_row + c * 8));
-                    const int4 xv1 = __ldg(reinterpret_cast<const int4*>(xq_row + c * 8 + 4));
-                    const float2 xs = __ldg(xs_row + c);
+                    int4 xv0, xv1;
+                    float2 xs;
+                    if constexpr (HAS_WS) {
+                        const int32_t* xq_row = q8_in + src_slot * (36 * 8);
+                        const float2* xs_row = reinterpret_cast<const float2*>(xs_in + src_slot * 72);
+                        xv0 = __ldg(reinterpret_cast<const int4*>(xq_row + c * 8));
+                        xv1 = __ldg(reinterpret_cast<const int4*>(xq_row + c * 8 + 4));
+                        xs = __ldg(xs_row + c);
+                    } else {
+                        int32_t q0[4], q1[4];
+                        const ActT* src_c = act_in + static_cast<size_t>(src_slot) * I + c * 32;
+                        quant16_act_to_i8(src_c, q0, xs.x);
+                        quant16_act_to_i8(src_c + 16, q1, xs.y);
+                        xv0 = make_int4(q0[0], q0[1], q0[2], q0[3]);
+                        xv1 = make_int4(q1[0], q1[1], q1[2], q1[3]);
+                    }
                     int32_t w0, w1;
                     int id0 = 0, id1 = 0;
                     e2m1_twice_i8x4(ch[b].q.x, w0, w1);
@@ -2230,9 +2269,20 @@ moe_down_nvfp4_dp4a_l1_kernel(const int32_t* __restrict__ q8_in, const float* __
                 const float2 sc = __half22float2(*reinterpret_cast<const __half2*>(&s2));
                 for (int ti = 0; ti < ntok; ++ti) {
                     const int src_slot = u_slot[u][ti];
-                    const int4 xv0 = __ldg(reinterpret_cast<const int4*>(q8_in + src_slot * (36 * 8) + c * 8));
-                    const int4 xv1 = __ldg(reinterpret_cast<const int4*>(q8_in + src_slot * (36 * 8) + c * 8 + 4));
-                    const float2 xs = __ldg(reinterpret_cast<const float2*>(xs_in + src_slot * 72) + c);
+                    int4 xv0, xv1;
+                    float2 xs;
+                    if constexpr (HAS_WS) {
+                        xv0 = __ldg(reinterpret_cast<const int4*>(q8_in + src_slot * (36 * 8) + c * 8));
+                        xv1 = __ldg(reinterpret_cast<const int4*>(q8_in + src_slot * (36 * 8) + c * 8 + 4));
+                        xs = __ldg(reinterpret_cast<const float2*>(xs_in + src_slot * 72) + c);
+                    } else {
+                        int32_t q0[4], q1[4];
+                        const ActT* src_c = act_in + static_cast<size_t>(src_slot) * I + c * 32;
+                        quant16_act_to_i8(src_c, q0, xs.x);
+                        quant16_act_to_i8(src_c + 16, q1, xs.y);
+                        xv0 = make_int4(q0[0], q0[1], q0[2], q0[3]);
+                        xv1 = make_int4(q1[0], q1[1], q1[2], q1[3]);
+                    }
                     int id0 = dp4a_s8(wv[0], xv0.x, dp4a_s8(wv[1], xv0.y, dp4a_s8(wv[2], xv0.z, dp4a_s8(wv[3], xv0.w, 0))));
                     int id1 = dp4a_s8(wv[4], xv1.x, dp4a_s8(wv[5], xv1.y, dp4a_s8(wv[6], xv1.z, dp4a_s8(wv[7], xv1.w, 0))));
                     acc[ti] = fmaf(float(id0), sc.x * xs.x, fmaf(float(id1), sc.y * xs.y, acc[ti]));
@@ -2902,7 +2952,7 @@ void set_max_shared_once(KernelT kernel, std::atomic<uint32_t>& done_mask) {
 
 void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w13_scale,
             const float* w13_factor, Format fmt, ActT* out, bool pdl, cudaStream_t stream,
-            const void* w13_rout, const ExpertPtrs* ptrs) {
+            const void* w13_rout, const ExpertPtrs* ptrs, void* workspace) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     const uint8_t* const* wp = ptrs ? ptrs->w13 : nullptr;
     const uint8_t* const* wsp = ptrs ? ptrs->w13_scale : nullptr;
@@ -2935,19 +2985,28 @@ void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w
                 if (use_nvfp4_dp4a()) {
                     if (M == 1) {
                         launch(moe_up_nvfp4_dp4a_m1_kernel, sgrid, 256, pdl, stream, x, idx, w, ws, wf, M, out, wp, wsp);
-                    } else {
-                        int32_t* q8_ptr = nullptr;
-                        float* xs_ptr = nullptr;
-                        CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&q8_ptr), g_moe_up_q8));
-                        CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&xs_ptr), g_moe_up_xs));
+                    } else if (workspace != nullptr) {
+                        require((reinterpret_cast<std::uintptr_t>(workspace) & 15u) == 0,
+                                "moe_up: workspace must be 16-byte aligned");
+                        int32_t* q8_ptr = static_cast<int32_t*>(workspace);
+                        float* xs_ptr = reinterpret_cast<float*>(q8_ptr + kDp4aUpQ8Elems);
                         moe_quant_i8_kernel<72><<<M, 128, 0, stream>>>(x, q8_ptr, xs_ptr);
                         CUDA_CHECK(cudaGetLastError());
                         if (M == 2) {
-                            launch(moe_up_nvfp4_dp4a_l1_kernel<2>, sgrid, 256, pdl, stream, q8_ptr, xs_ptr, idx, w, ws, wf, M, out, wp, wsp);
+                            launch(moe_up_nvfp4_dp4a_l1_kernel<2, true>, sgrid, 256, pdl, stream, nullptr, q8_ptr, xs_ptr, idx, w, ws, wf, M, out, wp, wsp);
                         } else if (M <= 4) {
-                            launch(moe_up_nvfp4_dp4a_l1_kernel<4>, sgrid, 256, pdl, stream, q8_ptr, xs_ptr, idx, w, ws, wf, M, out, wp, wsp);
+                            launch(moe_up_nvfp4_dp4a_l1_kernel<4, true>, sgrid, 256, pdl, stream, nullptr, q8_ptr, xs_ptr, idx, w, ws, wf, M, out, wp, wsp);
                         } else {
-                            launch(moe_up_nvfp4_dp4a_l1_kernel<8>, sgrid, 256, pdl, stream, q8_ptr, xs_ptr, idx, w, ws, wf, M, out, wp, wsp);
+                            launch(moe_up_nvfp4_dp4a_l1_kernel<8, true>, sgrid, 256, pdl, stream, nullptr, q8_ptr, xs_ptr, idx, w, ws, wf, M, out, wp, wsp);
+                        }
+                    } else {
+                        // Scratch-free M > 1 path when caller provides no workspace (bit-identical numerics).
+                        if (M == 2) {
+                            launch(moe_up_nvfp4_dp4a_l1_kernel<2, false>, sgrid, 256, pdl, stream, x, nullptr, nullptr, idx, w, ws, wf, M, out, wp, wsp);
+                        } else if (M <= 4) {
+                            launch(moe_up_nvfp4_dp4a_l1_kernel<4, false>, sgrid, 256, pdl, stream, x, nullptr, nullptr, idx, w, ws, wf, M, out, wp, wsp);
+                        } else {
+                            launch(moe_up_nvfp4_dp4a_l1_kernel<8, false>, sgrid, 256, pdl, stream, x, nullptr, nullptr, idx, w, ws, wf, M, out, wp, wsp);
                         }
                     }
                 } else {
@@ -3009,19 +3068,28 @@ void moe_down(const ActT* act, int M, const int* idx, const float* wts, const vo
                         static std::atomic<uint32_t> dn1_attr{0};
                         set_max_shared_once(moe_down_nvfp4_dp4a_m1_kernel, dn1_attr);
                         launch(moe_down_nvfp4_dp4a_m1_kernel, dim3(H / TILE), 512, pdl, stream, act, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
-                    } else {
-                        int32_t* q8_ptr = nullptr;
-                        float* xs_ptr = nullptr;
-                        CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&q8_ptr), g_moe_down_q8));
-                        CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&xs_ptr), g_moe_down_xs));
+                    } else if (workspace != nullptr) {
+                        require((reinterpret_cast<std::uintptr_t>(workspace) & 15u) == 0,
+                                "moe_down: workspace must be 16-byte aligned");
+                        int32_t* q8_ptr = reinterpret_cast<int32_t*>(workspace);
+                        float* xs_ptr = reinterpret_cast<float*>(q8_ptr + kDp4aDownQ8Elems);
                         moe_quant_i8_kernel<36><<<M * TOPK, 128, 0, stream>>>(act, q8_ptr, xs_ptr);
                         CUDA_CHECK(cudaGetLastError());
                         if (M == 2) {
-                            launch(moe_down_nvfp4_dp4a_l1_kernel<2>, dim3(H / TILE), 512, pdl, stream, q8_ptr, xs_ptr, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
+                            launch(moe_down_nvfp4_dp4a_l1_kernel<2, true>, dim3(H / TILE), 512, pdl, stream, nullptr, q8_ptr, xs_ptr, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
                         } else if (M <= 4) {
-                            launch(moe_down_nvfp4_dp4a_l1_kernel<4>, dim3(H / TILE), 512, pdl, stream, q8_ptr, xs_ptr, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
+                            launch(moe_down_nvfp4_dp4a_l1_kernel<4, true>, dim3(H / TILE), 512, pdl, stream, nullptr, q8_ptr, xs_ptr, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
                         } else {
-                            launch(moe_down_nvfp4_dp4a_l1_kernel<8>, dim3(H / TILE), 512, pdl, stream, q8_ptr, xs_ptr, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
+                            launch(moe_down_nvfp4_dp4a_l1_kernel<8, true>, dim3(H / TILE), 512, pdl, stream, nullptr, q8_ptr, xs_ptr, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
+                        }
+                    } else {
+                        // Scratch-free M > 1 path when caller provides no workspace (bit-identical numerics).
+                        if (M == 2) {
+                            launch(moe_down_nvfp4_dp4a_l1_kernel<2, false>, dim3(H / TILE), 512, pdl, stream, act, nullptr, nullptr, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
+                        } else if (M <= 4) {
+                            launch(moe_down_nvfp4_dp4a_l1_kernel<4, false>, dim3(H / TILE), 512, pdl, stream, act, nullptr, nullptr, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
+                        } else {
+                            launch(moe_down_nvfp4_dp4a_l1_kernel<8, false>, dim3(H / TILE), 512, pdl, stream, act, nullptr, nullptr, idx, wts, w, ws, wf, M, conv_w, conv_state, out, conv_hist, wp, wsp);
                         }
                     }
                 } else {

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -19,44 +20,48 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ingine::cuda_check((expr), #expr, __FILE__, __LINE__)
 
-// Cached compute capability major version for the active CUDA device (safe inside CUDA graph capture).
+// Cached compute capability major version for the active CUDA device (thread-safe, safe inside CUDA graph capture).
 inline int current_sm_major() {
-    static std::array<int, 16> cached{};
+    static std::array<std::atomic<int>, 16> cached{};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 8;
-    if (cached[dev] == 0) {
+    int v = cached[dev].load(std::memory_order_acquire);
+    if (v == 0) {
         int maj = 0;
         if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && maj > 0) {
-            cached[dev] = maj;
+            v = maj;
+            cached[dev].store(v, std::memory_order_release);
         } else {
             return 8;
         }
     }
-    return cached[dev];
+    return v;
 }
 
 // Cached compute capability version as major * 10 + minor (e.g. 60, 61, 70, 75, 86, 90, 120).
 inline int current_sm_version() {
-    static std::array<int, 16> cached{};
+    static std::array<std::atomic<int>, 16> cached{};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 80;
-    if (cached[dev] == 0) {
+    int v = cached[dev].load(std::memory_order_acquire);
+    if (v == 0) {
         int maj = 0, min = 0;
         if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
             cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess && maj > 0) {
-            cached[dev] = maj * 10 + min;
+            v = maj * 10 + min;
+            cached[dev].store(v, std::memory_order_release);
         } else {
             return 80;
         }
     }
-    return cached[dev];
+    return v;
 }
 
-// Cached maximum opt-in dynamic shared memory per block in bytes (safe inside CUDA graph capture).
+// Cached maximum opt-in dynamic shared memory per block in bytes (thread-safe, safe inside CUDA graph capture).
 // Pascal sm_60/61: 49,152 B; Turing sm_75: 65,536 B; Volta sm_70: 98,304 B; Ampere+: >= 101,376 B.
 // Honors INGINE_TEST_MAX_SMEM (cap in bytes) for exercising lower-SMEM paths on larger-SMEM GPUs.
 inline int current_max_smem_optin() {
-    static std::array<int, 16> cached{};
+    static std::array<std::atomic<int>, 16> cached{};
     static const int cap = [] {
         const char* e = std::getenv("INGINE_TEST_MAX_SMEM");
         const int v = e ? std::atoi(e) : 0;
@@ -64,16 +69,18 @@ inline int current_max_smem_optin() {
     }();
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return cap > 0 ? std::min(49152, cap) : 49152;
-    if (cached[dev] == 0) {
+    int v = cached[dev].load(std::memory_order_acquire);
+    if (v == 0) {
         int bytes = 0;
         if (cudaDeviceGetAttribute(&bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess || bytes <= 0) {
             if (cudaDeviceGetAttribute(&bytes, cudaDevAttrMaxSharedMemoryPerBlock, dev) != cudaSuccess || bytes <= 0) {
                 bytes = 49152;
             }
         }
-        cached[dev] = bytes;
+        v = bytes;
+        cached[dev].store(v, std::memory_order_release);
     }
-    return cap > 0 ? std::min(cached[dev], cap) : cached[dev];
+    return cap > 0 ? std::min(v, cap) : v;
 }
 
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device
