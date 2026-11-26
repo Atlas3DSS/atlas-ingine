@@ -16,7 +16,6 @@
 
 #include "core/act.h"
 #include "core/gguf.h"
-#include "engine/log.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -575,8 +574,9 @@ Weights load_weights_gguf(const fs::path& model_dir, cudaStream_t stream, int tp
   ck(cudaStreamSynchronize(stream), "sync");
   std::size_t bytes = 0;
   for (const auto& s : w.storage) bytes += s.bytes;
-  ingine::engine::server_log().info("weights_gguf: {} (rank {}/{}): {:.2f} GiB on the device", path.filename().string(),
-                                    tp_rank, tp_size, double(bytes) / double(1ull << 30));
+  // stderr, not the server log: the model library also links into tools without the engine library
+  std::fprintf(stderr, "weights_gguf: %s (rank %d/%d): %.2f GiB on the device\n", path.filename().string().c_str(),
+               tp_rank, tp_size, double(bytes) / double(1ull << 30));
   return w;
 }
 
