@@ -247,4 +247,79 @@ void sampled_accept(const float* p, const float* draft_logits, int V, const std:
                     float temperature, const float* qstats, const float* u, float* ws, float* resid,
                     AcceptResult* out, cudaStream_t stream);
 
+// ---- Batched multi-slot DSpark helpers (S <= 4 active slots, shared weights, per-slot contexts) ---------
+
+// Descriptor of up to kMaxBatchSlots active slots in a batched commit+draft step.
+// Passed via a device pointer `const BatchSlotDesc* slots` so captured CUDA graphs for a given active slot
+// count `S` work for any subset/permutation of physical slots without re-capture.
+inline constexpr int kMaxBatchSlots = 4;
+
+struct BatchSlotDesc {
+  DraftParams* params[kMaxBatchSlots] = {};
+  CtxLayers ctx[kMaxBatchSlots]{};
+  ActT* f_rnn[kMaxBatchSlots] = {};
+  ActT* state[kMaxBatchSlots] = {};
+  ActT* latent[kMaxBatchSlots] = {};
+  unsigned long long* picks[kMaxBatchSlots] = {};
+  std::int32_t* tokens[kMaxBatchSlots] = {};
+  float* conf[kMaxBatchSlots] = {};
+  float* qstats[kMaxBatchSlots] = {};
+  int count = 0;  // S in 1..kMaxBatchSlots
+};
+
+// Batched embed_block across S slots: writes res [S * BLOCK, H], xn [S * BLOCK, H], zeroes picks[s][0..6].
+void embed_block_batch(const ActT* embed, const float* embed_norm, const ActT* mask_embed,
+                       const ActT* in_norm, const BatchSlotDesc* slots, int S, ActT* res, ActT* xn,
+                       cudaStream_t stream, bool embed_q4 = false, bool embed_q8 = false);
+
+// Batched small commit across S slots (each slot commits up to max_commit <= BLOCK rows; total M = S * max_commit):
+// xin is [3, S * max_commit, H], kv is [S * max_commit, 3 * 2 * KV_DIM].
+void commit_mix_batch(const BatchSlotDesc* slots, int S, int max_commit, const ActT* alpha, const ActT* f_norm,
+                      ActT* xin, cudaStream_t stream);
+void commit_store_batch(const float* kv, const BatchSlotDesc* slots, int S, int max_commit, cudaStream_t stream);
+
+// Single-slot chunked prefill commit using FP8 wkv_all_ (no BF16 wkv_ctx / cuBLASLt needed):
+// `n` rows (1..chunk_stride, e.g. chunk_stride = 32) from `feats` [n, 4, H] at positions `start..start+n-1`.
+void prefill_commit_mix(const ActT* feats, int n, int chunk_stride, bool last_piece, const ActT* alpha,
+                        const CtxLayers& L, const ActT* f_norm, ActT* xin, ActT* f_rnn, cudaStream_t stream);
+void prefill_commit_store(const float* kv, int n, int start, int keep_from_local, const CtxLayers& L,
+                          cudaStream_t stream);
+
+// Batched qkv_rope across S slots for layer `layer` (0..2): qkv is [S * BLOCK, QKV_ROWS], q_out is [S * BLOCK, Q_DIM].
+void qkv_rope_batch(const float* qkv, const ActT* q_norm, const ActT* k_norm, const BatchSlotDesc* slots, int S,
+                    int layer, ActT* q_out, bool local, int ctx, cudaStream_t stream);
+
+// Graph-capturable single-slot block_attention that reads k_cache/v_cache/ctx_pos/params from device `slots[slot_idx]`.
+void block_attention_slot(const ActT* q_slot, const BatchSlotDesc* slots, int slot_idx, int layer, int nkeys,
+                          bool local, bool fp8, float* ws, ActT* out_slot, cudaStream_t stream);
+
+// Compacts rows 1..draft_len of each slot's 8-row block from xn [S * BLOCK, H] into h [S * draft_len, H].
+void gather_draft_h(const ActT* xn, int S, int draft_len, ActT* h, cudaStream_t stream);
+
+// Batched Markov head across S slots (greedy-only: no [7, V] draft_logits scatter):
+// draft_len in 1..GAMMA; h is [S * draft_len, H], part is [S * draft_len, RNN_OUT],
+// cand_val/cand_idx/cand_logits are [S * draft_len, CANDIDATES].
+void markov_pre_batch(const ActT* rnn_w, const ActT* h, const BatchSlotDesc* slots, int S, int draft_len, float* part,
+                      cudaStream_t stream);
+void markov_step_batch(int i, const ActT* rnn_w, const ActT* rnn_b, const ActT* w1, const float* part,
+                       const std::int32_t* cand_idx, const BatchSlotDesc* slots, int S, int draft_len,
+                       cudaStream_t stream);
+void markov_logits_batch(int i, const ActT* fold_w, const ActT* fold_b, const float* cand_val,
+                         const std::int32_t* cand_idx, const BatchSlotDesc* slots, int S, int draft_len,
+                         float* cand_logits, cudaStream_t stream);
+void markov_finish_batch(const std::int32_t* cand_idx, const float* cand_logits, const BatchSlotDesc* slots, int S,
+                         int draft_len, cudaStream_t stream);
+
+// Batched greedy acceptance across S slots (1 launch):
+// For each active slot i in [0, S): checks target_argmax[slot_row0[i] + j] == slots->tokens[i][j] for j < slot_m[i]-1,
+// writes out_accepted[i] = acc, out_commit[i] = acc + 1, out_next[i] = target_argmax[slot_row0[i] + acc],
+// and updates slots->params[i] for the subsequent batched commit + draft:
+//   commit_feats = taps + slot_row0[i] * 4 * H, ncommit = acc + 1, start = slot_pos[active_slots[i]],
+//   anchor = out_next[i], P = start + acc + 1.
+void batch_greedy_accept(const std::int32_t* target_argmax, const std::int32_t* active_slots,
+                         const std::int32_t* slot_row0, const std::int32_t* slot_m,
+                         const std::int64_t* slot_pos, const ActT* taps, const BatchSlotDesc* slots, int S,
+                         std::int32_t* out_accepted, std::int32_t* out_commit, std::int32_t* out_next,
+                         cudaStream_t stream);
+
 }  // namespace ingine::kernels::draft

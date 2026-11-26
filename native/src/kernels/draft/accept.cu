@@ -15,6 +15,43 @@ __global__ void greedy_accept_kernel(const std::int32_t* __restrict__ target, co
   out->next = target[acc];
 }
 
+__global__ void batch_greedy_accept_kernel(const std::int32_t* __restrict__ target_argmax,
+                                           const std::int32_t* __restrict__ active_slots,
+                                           const std::int32_t* __restrict__ slot_row0,
+                                           const std::int32_t* __restrict__ slot_m,
+                                           const std::int64_t* __restrict__ slot_pos, const ActT* taps,
+                                           const BatchSlotDesc* slots, int S, std::int32_t* __restrict__ out_accepted,
+                                           std::int32_t* __restrict__ out_commit, std::int32_t* __restrict__ out_next) {
+  const int i = threadIdx.x;
+  if (i >= S) return;
+  const int phys = active_slots[i];
+  const int m = slot_m[i];
+  if (phys < 0 || m <= 0) {
+    out_accepted[i] = 0;
+    out_commit[i] = 0;
+    out_next[i] = 0;
+    if (slots != nullptr && slots->params[i] != nullptr) slots->params[i]->ncommit = 0;
+    return;
+  }
+  const int row0 = slot_row0[i];
+  const std::int32_t* target = target_argmax + row0;
+  const std::int32_t* drafts = slots->tokens[i];
+  int acc = 0;
+  while (acc < m - 1 && drafts[acc] == target[acc]) ++acc;
+  const std::int32_t next_tok = target[acc];
+  out_accepted[i] = acc;
+  out_commit[i] = acc + 1;
+  out_next[i] = next_tok;
+  DraftParams* p = slots->params[i];
+  const int start = int(slot_pos[phys]);
+  p->commit_feats = taps + std::size_t(row0) * 4 * H;
+  p->ncommit = acc + 1;
+  p->start = start;
+  p->anchor = next_tok;
+  p->P = start + acc + 1;
+  p->temperature = 0.f;
+}
+
 constexpr int R_THREADS = 256;
 constexpr int R_PER = 4;  // elements per thread in the residual kernels
 constexpr int R_SPAN = R_THREADS * R_PER;
@@ -104,6 +141,17 @@ void sampled_accept(const float* p, const float* draft_logits, int V, const std:
              ws, resid, out);
   launch_pdl(residual_fallback_kernel, blocks, dim3(R_THREADS), stream, p, V, static_cast<const float*>(ws), resid,
              static_cast<const AcceptResult*>(out));
+}
+
+void batch_greedy_accept(const std::int32_t* target_argmax, const std::int32_t* active_slots,
+                         const std::int32_t* slot_row0, const std::int32_t* slot_m,
+                         const std::int64_t* slot_pos, const ActT* taps, const BatchSlotDesc* slots, int S,
+                         std::int32_t* out_accepted, std::int32_t* out_commit, std::int32_t* out_next,
+                         cudaStream_t stream) {
+  if (S < 1 || S > kMaxBatchSlots) throw std::invalid_argument("batch_greedy_accept: S out of range");
+  batch_greedy_accept_kernel<<<1, 32, 0, stream>>>(target_argmax, active_slots, slot_row0, slot_m, slot_pos, taps,
+                                                   slots, S, out_accepted, out_commit, out_next);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace ingine::kernels::draft

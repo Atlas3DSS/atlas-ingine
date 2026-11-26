@@ -85,7 +85,9 @@ template <bool LOCAL, bool FP8>
 __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q, const uint8_t* k_cache,
                                                                   const uint8_t* v_cache, int nkeys, int chunk_keys,
                                                                   const std::int32_t* ctx_pos, const DraftParams* p,
-                                                                  float* ws_o, float* ws_ml) {
+                                                                  float* ws_o, float* ws_ml,
+                                                                  const BatchSlotDesc* slots = nullptr,
+                                                                  int slot_idx = 0, int layer = 0) {
   constexpr int ROW_BYTES = FP8 ? HEAD_DIM : 2 * HEAD_DIM;
   constexpr int NL = TileRegs<FP8>::NL;
   __shared__ __align__(16) ActT qs[QH][BLOCK][HEAD_DIM];    // the queries, by head
@@ -95,6 +97,13 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
   __shared__ unsigned vmask[2];                                      // valid keys of a tile
   pdl_trigger();
   pdl_wait();
+  if (slots != nullptr) {
+    const CtxLayers& L = slots->ctx[slot_idx];
+    k_cache = static_cast<const uint8_t*>(L.k_cache[layer]);
+    v_cache = static_cast<const uint8_t*>(L.v_cache[layer]);
+    ctx_pos = L.ctx_pos[layer];
+    p = slots->params[slot_idx];
+  }
   const int chunk = blockIdx.x, g = blockIdx.y, tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
   const int gl = lane >> 2, t = lane & 3, lm = lane >> 3, lr = lane & 7;  // ldmatrix: matrix lm, row lr
   const int k0 = chunk * chunk_keys, k1 = min(k0 + chunk_keys, nkeys);
@@ -426,15 +435,44 @@ void block_attention(const ActT* q, const void* k_cache, const void* v_cache, in
   const dim3 grid(chunks, KV_HEADS), block(ATT_THREADS);
   const auto* k = static_cast<const uint8_t*>(k_cache);
   const auto* v = static_cast<const uint8_t*>(v_cache);
+  const BatchSlotDesc* no_slots = nullptr;
   if (ctx_pos != nullptr)
-    launch_pdl(attn_partial_kernel<true, false>, grid, block, stream, q, k, v, nkeys, chunk_keys, ctx_pos, p, ws_o, ws_ml);
+    launch_pdl(attn_partial_kernel<true, false>, grid, block, stream, q, k, v, nkeys, chunk_keys, ctx_pos, p, ws_o,
+               ws_ml, no_slots, 0, 0);
   else if (fp8)
-    launch_pdl(attn_partial_kernel<false, true>, grid, block, stream, q, k, v, nkeys, chunk_keys, ctx_pos, p, ws_o, ws_ml);
+    launch_pdl(attn_partial_kernel<false, true>, grid, block, stream, q, k, v, nkeys, chunk_keys, ctx_pos, p, ws_o,
+               ws_ml, no_slots, 0, 0);
   else
     launch_pdl(attn_partial_kernel<false, false>, grid, block, stream, q, k, v, nkeys, chunk_keys, ctx_pos, p, ws_o,
-               ws_ml);
+               ws_ml, no_slots, 0, 0);
   launch_pdl(attn_combine_kernel, dim3(KV_HEADS * NQ), dim3(HEAD_DIM), stream, static_cast<const float*>(ws_o),
              static_cast<const float*>(ws_ml), chunks, out);
+}
+
+void block_attention_slot(const ActT* q_slot, const BatchSlotDesc* slots, int slot_idx, int layer, int nkeys,
+                          bool local, bool fp8, float* ws, ActT* out_slot, cudaStream_t stream) {
+  if (nkeys <= 0 || slot_idx < 0 || slot_idx >= kMaxBatchSlots || layer < 0 || layer >= 3)
+    throw std::invalid_argument("block_attention_slot: invalid argument");
+  if (local && (nkeys != WINDOW + BLOCK || fp8))
+    throw std::invalid_argument("block_attention_slot: local layers attend to WINDOW + 8 BF16 keys");
+  const int chunks = att_chunks(nkeys), chunk_keys = ATT_TILE * att_tiles_per_chunk(nkeys);
+  float* ws_o = ws;
+  float* ws_ml = ws + std::size_t(chunks) * KV_HEADS * NQ * HEAD_DIM;
+  const dim3 grid(chunks, KV_HEADS), block(ATT_THREADS);
+  const uint8_t* null_u8 = nullptr;
+  const std::int32_t* null_i32 = nullptr;
+  const DraftParams* null_p = nullptr;
+  if (local)
+    launch_pdl(attn_partial_kernel<true, false>, grid, block, stream, q_slot, null_u8, null_u8, nkeys, chunk_keys,
+               null_i32, null_p, ws_o, ws_ml, slots, slot_idx, layer);
+  else if (fp8)
+    launch_pdl(attn_partial_kernel<false, true>, grid, block, stream, q_slot, null_u8, null_u8, nkeys, chunk_keys,
+               null_i32, null_p, ws_o, ws_ml, slots, slot_idx, layer);
+  else
+    launch_pdl(attn_partial_kernel<false, false>, grid, block, stream, q_slot, null_u8, null_u8, nkeys, chunk_keys,
+               null_i32, null_p, ws_o, ws_ml, slots, slot_idx, layer);
+  launch_pdl(attn_combine_kernel, dim3(KV_HEADS * NQ), dim3(HEAD_DIM), stream, static_cast<const float*>(ws_o),
+             static_cast<const float*>(ws_ml), chunks, out_slot);
 }
 
 }  // namespace ingine::kernels::draft

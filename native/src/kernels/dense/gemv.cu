@@ -260,12 +260,17 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
   // Native Volta sm_70 HMMA.884: lane (qp, idx) owns ONE row rv = r0 + (qp>=2 ? 8 : 0) + idx and
   // TWO contiguous chunks (2*CPL cols) per SPAN step, feeding sm70_mma_f16_direct with ZERO shuffles!
+  constexpr int NG = (M + 7) / 8;
   const int qp = (lane >> 2) & 3, idx = (lane & 3) | ((lane & 16) >> 2);
   const int rv = r0 + (qp >= 2 ? 8 : 0) + idx;
   const int iv = rv < rows ? epi.input_of(rv) : -1;
   const int c0_v = warp * KS + (qp & 1) * (2 * CPL);
   float c[4] = {0.f, 0.f, 0.f, 0.f};
-  float c8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  float c8[NG][8];
+#pragma unroll
+  for (int gi = 0; gi < NG; ++gi)
+#pragma unroll
+    for (int k = 0; k < 8; ++k) c8[gi][k] = 0.f;
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
   float acc_a[M], acc_b[M];
 #pragma unroll
@@ -277,9 +282,9 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
   auto pass = [&](int cur) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
-    const bool lv = iv == cur, lx = idx < M;
+    const bool lv = iv == cur;
     const uint8_t* wv = w + size_t(lv ? rv : 0) * ROW_BYTES;
-    const ActT* xg = epi.x_of(cur) + size_t(lx ? idx : 0) * K;
+    const ActT* xbase = epi.x_of(cur);
 #pragma unroll 1
     for (int jb = 0; jb < NJ; jb += U) {
       uint4 W0[U], W1[U];
@@ -302,27 +307,39 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
       for (int u = 0; u < U; ++u) {
         const int col0 = c0_v + (jb + u) * SPAN;
         if constexpr (FP8) {
-          const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
-          const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
-          const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
-          const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_bf16x2(W0[u].x), e4m3x2_to_bf16x2(W0[u].x >> 16),
-                                   e4m3x2_to_bf16x2(W0[u].y), e4m3x2_to_bf16x2(W0[u].y >> 16),
-                                   x0.x ^ dep, x0.y, x0.z, x0.w);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_bf16x2(W0[u].z), e4m3x2_to_bf16x2(W0[u].z >> 16),
-                                   e4m3x2_to_bf16x2(W0[u].w), e4m3x2_to_bf16x2(W0[u].w >> 16),
-                                   x1.x, x1.y, x1.z, x1.w);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_bf16x2(W1[u].x), e4m3x2_to_bf16x2(W1[u].x >> 16),
-                                   e4m3x2_to_bf16x2(W1[u].y), e4m3x2_to_bf16x2(W1[u].y >> 16),
-                                   x2.x, x2.y, x2.z, x2.w);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_bf16x2(W1[u].z), e4m3x2_to_bf16x2(W1[u].z >> 16),
-                                   e4m3x2_to_bf16x2(W1[u].w), e4m3x2_to_bf16x2(W1[u].w >> 16),
-                                   x3.x, x3.y, x3.z, x3.w);
+          const uint32_t a00 = e4m3x2_to_bf16x2(W0[u].x), a01 = e4m3x2_to_bf16x2(W0[u].x >> 16);
+          const uint32_t a02 = e4m3x2_to_bf16x2(W0[u].y), a03 = e4m3x2_to_bf16x2(W0[u].y >> 16);
+          const uint32_t a10 = e4m3x2_to_bf16x2(W0[u].z), a11 = e4m3x2_to_bf16x2(W0[u].z >> 16);
+          const uint32_t a12 = e4m3x2_to_bf16x2(W0[u].w), a13 = e4m3x2_to_bf16x2(W0[u].w >> 16);
+          const uint32_t a20 = e4m3x2_to_bf16x2(W1[u].x), a21 = e4m3x2_to_bf16x2(W1[u].x >> 16);
+          const uint32_t a22 = e4m3x2_to_bf16x2(W1[u].y), a23 = e4m3x2_to_bf16x2(W1[u].y >> 16);
+          const uint32_t a30 = e4m3x2_to_bf16x2(W1[u].z), a31 = e4m3x2_to_bf16x2(W1[u].z >> 16);
+          const uint32_t a32 = e4m3x2_to_bf16x2(W1[u].w), a33 = e4m3x2_to_bf16x2(W1[u].w >> 16);
+#pragma unroll
+          for (int gi = 0; gi < NG; ++gi) {
+            const int mi = 8 * gi + idx;
+            const bool lx = mi < M;
+            const ActT* xg = xbase + size_t(lx ? mi : 0) * K;
+            const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
+            const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
+            const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
+            const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
+            mma::sm70_mma_f16_direct(c8[gi], a00, a01, a02, a03, x0.x ^ (gi == 0 ? dep : 0u), x0.y, x0.z, x0.w);
+            mma::sm70_mma_f16_direct(c8[gi], a10, a11, a12, a13, x1.x, x1.y, x1.z, x1.w);
+            mma::sm70_mma_f16_direct(c8[gi], a20, a21, a22, a23, x2.x, x2.y, x2.z, x2.w);
+            mma::sm70_mma_f16_direct(c8[gi], a30, a31, a32, a33, x3.x, x3.y, x3.z, x3.w);
+          }
         } else {
-          const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
-          const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
-          mma::sm70_mma_f16_direct(c8, W0[u].x, W0[u].y, W0[u].z, W0[u].w, x0.x ^ dep, x0.y, x0.z, x0.w);
-          mma::sm70_mma_f16_direct(c8, W1[u].x, W1[u].y, W1[u].z, W1[u].w, x1.x, x1.y, x1.z, x1.w);
+#pragma unroll
+          for (int gi = 0; gi < NG; ++gi) {
+            const int mi = 8 * gi + idx;
+            const bool lx = mi < M;
+            const ActT* xg = xbase + size_t(lx ? mi : 0) * K;
+            const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
+            const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
+            mma::sm70_mma_f16_direct(c8[gi], W0[u].x, W0[u].y, W0[u].z, W0[u].w, x0.x ^ (gi == 0 ? dep : 0u), x0.y, x0.z, x0.w);
+            mma::sm70_mma_f16_direct(c8[gi], W1[u].x, W1[u].y, W1[u].z, W1[u].w, x1.x, x1.y, x1.z, x1.w);
+          }
         }
       }
     }
@@ -431,7 +448,33 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
   }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
-  mma::sm70_reduce_acc8_to_d4(c8, c);
+  if constexpr (NG > 1 && Epi::kScatter) {
+    auto total = [&](int r, int ml) {
+      float s = 0.f;
+#pragma unroll
+      for (int k = 0; k < SPLITK; ++k) s += cs[k][r][ml];
+      return s;
+    };
+#pragma unroll
+    for (int gi = 0; gi < NG; ++gi) {
+      if (gi > 0) __syncthreads();
+      float cg[4] = {0.f, 0.f, 0.f, 0.f};
+      mma::sm70_reduce_acc8_to_d4(c8[gi], cg);
+      cs[warp][g][2 * t] = cg[0];
+      cs[warp][g][2 * t + 1] = cg[1];
+      cs[warp][g + 8][2 * t] = cg[2];
+      cs[warp][g + 8][2 * t + 1] = cg[3];
+      __syncthreads();
+      const int gm = (M - 8 * gi) < 8 ? (M - 8 * gi) : 8;
+      for (int k = threadIdx.x; k < 16 * gm; k += 32 * SPLITK) {
+        const int r = k / gm, ml = k % gm, row = r0 + r;
+        if (row < rows && epi.input_of(row) >= 0)
+          epi.store1(row, 8 * gi + ml, total(r, ml) * (FP8 ? __ldg(w_scale + row) : 1.f));
+      }
+    }
+    return;
+  }
+  mma::sm70_reduce_acc8_to_d4(c8[0], c);
   cs[warp][g][2 * t] = c[0];
   cs[warp][g][2 * t + 1] = c[1];
   cs[warp][g + 8][2 * t] = c[2];
@@ -507,8 +550,8 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
                                                                   const uint16_t* __restrict__ q8s, uint32_t zero,
                                                                   Epi epi) {
   constexpr int KS = K / SPLITK;
-  constexpr int NG = (M + 7) / 8;  // 1 for M <= 8 (bit-identical), 2 for M = 9..16 (shared weight decode)
-  __shared__ float cs[SPLITK][16][8 * NG];
+  constexpr int NG = (M + 7) / 8;  // 1 for M <= 8 (bit-identical), 2..4 for M = 9..32 (shared weight decode)
+  __shared__ float cs[SPLITK][16][8];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
   const int r0 = blockIdx.x * 16;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
@@ -517,8 +560,11 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
   const int iv = rv < rows ? epi.input_of(rv) : -1;
   const std::int32_t soff = blk_soff[blockIdx.x];
   const uint8_t* base = w + blk_off[blockIdx.x];
-  float c8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  float c8_hi[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  float c8[NG][8];
+#pragma unroll
+  for (int gi = 0; gi < NG; ++gi)
+#pragma unroll
+    for (int k = 0; k < 8; ++k) c8[gi][k] = 0.f;
   float c[4] = {0.f, 0.f, 0.f, 0.f};
   bool waited = false;
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
@@ -534,13 +580,11 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
     static_assert(KS % (SPAN * U) == 0, "K slice must split into unrolled steps");
     constexpr size_t ROW_BYTES = size_t(K) * (Q8 ? 1 : 2);
     const int c0_v = warp * KS + (qp & 1) * (2 * CPL);
-    const bool lv = iv == cur, lx = idx < M;
-    const bool lx1 = (NG == 2) && ((idx + 8) < M);
+    const bool lv = iv == cur;
     const uint8_t* wv = base + size_t(lv ? rl : 0) * ROW_BYTES;
     const uint16_t* sv = q8s + (FMT == 1 ? soff + (lv ? rl : 0) * (K / 32) : 0);
     const float* svf = reinterpret_cast<const float*>(q8s + (FMT == 2 ? -2 - soff : 0)) + (FMT == 2 && lv ? rl * (K / 16) : 0);
-    const ActT* xg = epi.x_of(cur) + size_t(lx ? idx : 0) * K;
-    const ActT* xg1 = epi.x_of(cur) + size_t(lx1 ? (idx + 8) : 0) * K;
+    const ActT* xbase = epi.x_of(cur);
 #pragma unroll 1
     for (int jb = 0; jb < NJ; jb += U) {
       uint4 W0[U], W1[U];
@@ -570,19 +614,7 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
         if constexpr (Q8) {
           [[maybe_unused]] const __half2 d =
               FMT == 1 ? __halves2half2(__ushort_as_half(S[u]), __ushort_as_half(S[u])) : __half2{};
-          const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
-          const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
-          const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
-          const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
           const uint32_t ww[8] = {W0[u].x, W0[u].y, W0[u].z, W0[u].w, W1[u].x, W1[u].y, W1[u].z, W1[u].w};
-          const uint4 xx[4] = {x0, x1, x2, x3};
-          [[maybe_unused]] uint4 yy[4];
-          if constexpr (NG == 2) {
-            yy[0] = lx1 ? ld_act(xg1 + col0) : make_uint4(0, 0, 0, 0);
-            yy[1] = lx1 ? ld_act(xg1 + col0 + 8) : make_uint4(0, 0, 0, 0);
-            yy[2] = lx1 ? ld_act(xg1 + col0 + 16) : make_uint4(0, 0, 0, 0);
-            yy[3] = lx1 ? ld_act(xg1 + col0 + 24) : make_uint4(0, 0, 0, 0);
-          }
 #pragma unroll
           for (int s = 0; s < 4; ++s) {
             uint32_t a0, a1, a2, a3;
@@ -594,21 +626,24 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
               q8x4_h2(ww[2 * s], d, a0, a1);
               q8x4_h2(ww[2 * s + 1], d, a2, a3);
             }
-            mma::sm70_mma_f16_direct(c8, a0, a1, a2, a3, xx[s].x ^ (s == 0 ? dep : 0u), xx[s].y, xx[s].z, xx[s].w);
-            if constexpr (NG == 2) {
-              mma::sm70_mma_f16_direct(c8_hi, a0, a1, a2, a3, yy[s].x, yy[s].y, yy[s].z, yy[s].w);
+#pragma unroll
+            for (int gi = 0; gi < NG; ++gi) {
+              const int mi = 8 * gi + idx;
+              const bool lx = mi < M;
+              const uint4 xs = lx ? ld_act(xbase + size_t(mi) * K + col0 + 8 * s) : make_uint4(0, 0, 0, 0);
+              mma::sm70_mma_f16_direct(c8[gi], a0, a1, a2, a3, xs.x ^ ((s == 0 && gi == 0) ? dep : 0u), xs.y, xs.z, xs.w);
             }
           }
         } else {
-          const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
-          const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
-          mma::sm70_mma_f16_direct(c8, W0[u].x, W0[u].y, W0[u].z, W0[u].w, x0.x ^ dep, x0.y, x0.z, x0.w);
-          mma::sm70_mma_f16_direct(c8, W1[u].x, W1[u].y, W1[u].z, W1[u].w, x1.x, x1.y, x1.z, x1.w);
-          if constexpr (NG == 2) {
-            const uint4 y0 = lx1 ? ld_act(xg1 + col0) : make_uint4(0, 0, 0, 0);
-            const uint4 y1 = lx1 ? ld_act(xg1 + col0 + 8) : make_uint4(0, 0, 0, 0);
-            mma::sm70_mma_f16_direct(c8_hi, W0[u].x, W0[u].y, W0[u].z, W0[u].w, y0.x, y0.y, y0.z, y0.w);
-            mma::sm70_mma_f16_direct(c8_hi, W1[u].x, W1[u].y, W1[u].z, W1[u].w, y1.x, y1.y, y1.z, y1.w);
+#pragma unroll
+          for (int gi = 0; gi < NG; ++gi) {
+            const int mi = 8 * gi + idx;
+            const bool lx = mi < M;
+            const ActT* xg = xbase + size_t(lx ? mi : 0) * K;
+            const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
+            const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
+            mma::sm70_mma_f16_direct(c8[gi], W0[u].x, W0[u].y, W0[u].z, W0[u].w, x0.x ^ (gi == 0 ? dep : 0u), x0.y, x0.z, x0.w);
+            mma::sm70_mma_f16_direct(c8[gi], W1[u].x, W1[u].y, W1[u].z, W1[u].w, x1.x, x1.y, x1.z, x1.w);
           }
         }
       }
@@ -630,26 +665,37 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
     pdl_wait_fenced(zero);
     pdl_trigger();
   }
-  mma::sm70_reduce_acc8_to_d4(c8, c);
+  auto total = [&](int r, int ml) {
+    float s = 0.f;
+#pragma unroll
+    for (int k = 0; k < SPLITK; ++k) s += cs[k][r][ml];
+    return s;
+  };
+  if constexpr (NG > 1 && Epi::kScatter) {
+#pragma unroll
+    for (int gi = 0; gi < NG; ++gi) {
+      if (gi > 0) __syncthreads();
+      float cg[4] = {0.f, 0.f, 0.f, 0.f};
+      mma::sm70_reduce_acc8_to_d4(c8[gi], cg);
+      cs[warp][g][2 * t] = cg[0];
+      cs[warp][g][2 * t + 1] = cg[1];
+      cs[warp][g + 8][2 * t] = cg[2];
+      cs[warp][g + 8][2 * t + 1] = cg[3];
+      __syncthreads();
+      const int gm = (M - 8 * gi) < 8 ? (M - 8 * gi) : 8;
+      for (int k = threadIdx.x; k < 16 * gm; k += 32 * SPLITK) {
+        const int r = k / gm, ml = k % gm, row = r0 + r;
+        if (row < rows && epi.input_of(row) >= 0) epi.store1(row, 8 * gi + ml, total(r, ml));
+      }
+    }
+    return;
+  }
+  mma::sm70_reduce_acc8_to_d4(c8[0], c);
   cs[warp][g][2 * t] = c[0];
   cs[warp][g][2 * t + 1] = c[1];
   cs[warp][g + 8][2 * t] = c[2];
   cs[warp][g + 8][2 * t + 1] = c[3];
-  if constexpr (NG == 2) {
-    float c_hi[4] = {0.f, 0.f, 0.f, 0.f};
-    mma::sm70_reduce_acc8_to_d4(c8_hi, c_hi);
-    cs[warp][g][8 + 2 * t] = c_hi[0];
-    cs[warp][g][8 + 2 * t + 1] = c_hi[1];
-    cs[warp][g + 8][8 + 2 * t] = c_hi[2];
-    cs[warp][g + 8][8 + 2 * t + 1] = c_hi[3];
-  }
   __syncthreads();
-  auto total = [&](int r, int m) {
-    float s = 0.f;
-#pragma unroll
-    for (int k = 0; k < SPLITK; ++k) s += cs[k][r][m];
-    return s;
-  };
   if constexpr (Epi::kScatter) {
     for (int k = threadIdx.x; k < 16 * M; k += 32 * SPLITK) {
       const int r = k / M, m = k % M, row = r0 + r;
@@ -730,6 +776,13 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     launch_ex(gemv_blk_v70_kernel<K, MM, SPLITK, E>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, rows,
               w.blk_off, w.blk_soff, w.q8_scale, 0u, epi);
   };
+  auto go_fp8_hi = [&](auto mc) {
+    constexpr int MM = decltype(mc)::value;
+    auto epi = make(std::integral_constant<int, MM>{});
+    using E = decltype(epi);
+    launch_ex(gemv_mma_kernel<true, K, MM, SPLITK, UFP8, E>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp,
+              sc, rows, 0u, epi);
+  };
   if (w.blk_off && M > 8) {
     if constexpr (Epi<1>::kScatter) {
       switch (M) {
@@ -741,7 +794,26 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
         case 14: go_blk(std::integral_constant<int, 14>{}); return;
         case 15: go_blk(std::integral_constant<int, 15>{}); return;
         case 16: go_blk(std::integral_constant<int, 16>{}); return;
-        default: require(false, "M must be in 1..16");
+        case 21: go_blk(std::integral_constant<int, 21>{}); return;
+        case 28: go_blk(std::integral_constant<int, 28>{}); return;
+        default: require(false, "M must be in 1..16, 21, or 28");
+      }
+    } else {
+      require(false, "M must be in 1..8");
+    }
+  }
+  if (fp8 && !w.blk_off && M > 8) {
+    if constexpr (Epi<1>::kScatter) {
+      switch (M) {
+        case 9: go_fp8_hi(std::integral_constant<int, 9>{}); return;
+        case 12: go_fp8_hi(std::integral_constant<int, 12>{}); return;
+        case 14: go_fp8_hi(std::integral_constant<int, 14>{}); return;
+        case 16: go_fp8_hi(std::integral_constant<int, 16>{}); return;
+        case 21: go_fp8_hi(std::integral_constant<int, 21>{}); return;
+        case 24: go_fp8_hi(std::integral_constant<int, 24>{}); return;
+        case 28: go_fp8_hi(std::integral_constant<int, 28>{}); return;
+        case 32: go_fp8_hi(std::integral_constant<int, 32>{}); return;
+        default: require(false, "FP8 GEMV M must be in 1..8, 12, 14, 16, 21, 24, 28, or 32");
       }
     } else {
       require(false, "M must be in 1..8");

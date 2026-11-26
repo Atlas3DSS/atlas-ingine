@@ -446,6 +446,183 @@ __global__ void gather_head_rows_shards_kernel(HeadShards hs, int row_chunks, co
   if (threadIdx.x == 0) map[dst_r] = id;
 }
 
+// ---- Batched multi-slot Markov head kernels ------------------------------------------------------------
+
+// One pass over rnn_w [768, 4608] for all S slots (reads the 7 MB weight matrix ONCE).
+template <int S>
+__global__ void __launch_bounds__(PRE_THREADS) markov_pre_batch_kernel(const ActT* __restrict__ rnn_w, const ActT* h,
+                                                                       const BatchSlotDesc* slots, int draft_len,
+                                                                       float* part) {
+  pdl_trigger();
+  const int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+  const ActT* wr = rnn_w + size_t(row) * RNN_IN + 2 * RANK;
+  pdl_wait();
+  const ActT* f_rnn_ptrs[S];
+#pragma unroll
+  for (int s = 0; s < S; ++s) f_rnn_ptrs[s] = slots->f_rnn[s];
+  float acc[S][GAMMA];
+#pragma unroll
+  for (int s = 0; s < S; ++s)
+#pragma unroll
+    for (int i = 0; i < GAMMA; ++i) acc[s][i] = 0.f;
+#pragma unroll 2
+  for (int j = 0; j < PRE_PER_LANE; ++j) {
+    const int col = 8 * (lane + 32 * j);
+    float w[8];
+    unpack8(ld_weight(wr + col), w);
+    if (col < H) {
+#pragma unroll
+      for (int s = 0; s < S; ++s) {
+        const ActT* hs = h + size_t(s) * draft_len * H + col;
+        for (int i = 0; i < draft_len; ++i) {
+          float z[8];
+          unpack8(*reinterpret_cast<const uint4*>(hs + size_t(i) * H), z);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[s][i] = fmaf(w[e], z[e], acc[s][i]);
+        }
+      }
+    } else {
+      const int fcol = col - H;
+#pragma unroll
+      for (int s = 0; s < S; ++s) {
+        float z[8];
+        unpack8(*reinterpret_cast<const uint4*>(f_rnn_ptrs[s] + fcol), z);
+        float sum = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) sum = fmaf(w[e], z[e], sum);
+        for (int i = 0; i < draft_len; ++i) acc[s][i] += sum;
+      }
+    }
+  }
+#pragma unroll
+  for (int s = 0; s < S; ++s) {
+    float* ps = part + size_t(s) * draft_len * RNN_OUT;
+    for (int i = 0; i < draft_len; ++i) {
+      const float t = warp_sum(acc[s][i]);
+      if (lane == 0) ps[i * RNN_OUT + row] = t;
+    }
+  }
+}
+
+// grid (RANK * 32 / 256, S), block 256
+__global__ void __launch_bounds__(256) markov_step_batch_kernel(int i, const ActT* __restrict__ rnn_w,
+                                                                const ActT* __restrict__ rnn_b,
+                                                                const ActT* __restrict__ w1, const float* part,
+                                                                const std::int32_t* cand_idx,
+                                                                const BatchSlotDesc* slots, int draft_len) {
+  pdl_trigger();
+  const int j = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31, s = blockIdx.y;
+  uint4 wa[3], wb[3];
+#pragma unroll
+  for (int g = 0; g < 3; ++g) {
+    const ActT* wr = rnn_w + size_t(g * RANK + j) * RNN_IN;
+    wa[g] = ld_weight(wr + 8 * lane);
+    wb[g] = ld_weight(wr + RANK + 8 * lane);
+  }
+  pdl_wait();
+  const DraftParams* p = slots->params[s];
+  const unsigned long long* picks = slots->picks[s];
+  const std::int32_t* cand_idx_s = cand_idx + size_t(s) * draft_len * CANDIDATES;
+  const float* part_s = part + size_t(s) * draft_len * RNN_OUT;
+  ActT* state = slots->state[s];
+  ActT* latent = slots->latent[s];
+  const int prev = step_prev(i, picks, cand_idx_s, p);
+  float z0[8], z1[8];
+  unpack8(*reinterpret_cast<const uint4*>(state + size_t(i) * RANK + 8 * lane), z0);
+  unpack8(*reinterpret_cast<const uint4*>(w1 + size_t(prev) * RANK + 8 * lane), z1);
+  float raw[3];
+#pragma unroll
+  for (int g = 0; g < 3; ++g) {
+    const int row = g * RANK + j;
+    float w0[8], wv1[8];
+    unpack8(wa[g], w0);
+    unpack8(wb[g], wv1);
+    float acc = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) acc = fmaf(w0[e], z0[e], fmaf(wv1[e], z1[e], acc));
+    acc = warp_sum(acc);
+    raw[g] = bf_round(__fadd_rn(bf_round(acc + part_s[i * RNN_OUT + row]), bf(rnn_b[row])));
+  }
+  if (lane == 0) {
+    const float gate = bf_round(__fdiv_rn(1.f, __fadd_rn(1.f, expf(-raw[0]))));
+    const float cell = bf_round(tanhf(raw[1]));
+    const float sv = bf(state[size_t(i) * RANK + j]);
+    const float gs = bf_round(__fmul_rn(gate, sv));
+    const float om = bf_round(__fsub_rn(1.f, gate));
+    const float oc = bf_round(__fmul_rn(om, cell));
+    state[size_t(i + 1) * RANK + j] = act::from_float(__fadd_rn(gs, oc));
+    latent[j] = act::from_float(tanhf(raw[2]));
+  }
+}
+
+// grid (CANDIDATES * 32 / 256, S), block 256
+__global__ void __launch_bounds__(256) markov_logits_batch_kernel(int i, const ActT* __restrict__ fold_w,
+                                                                  const ActT* __restrict__ fold_b,
+                                                                  const float* cand_val, const std::int32_t* cand_idx,
+                                                                  const BatchSlotDesc* slots, int draft_len,
+                                                                  float* cand_logits) {
+  pdl_trigger();
+  pdl_wait();
+  const int k = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31, s = blockIdx.y;
+  const int at = (s * draft_len + i) * CANDIDATES + k;
+  const int c = cand_idx[at];
+  const ActT* latent = slots->latent[s];
+  float w[8], l[8];
+  unpack8(*reinterpret_cast<const uint4*>(fold_w + size_t(c) * RANK + 8 * lane), w);
+  unpack8(*reinterpret_cast<const uint4*>(latent + 8 * lane), l);
+  float acc = 0.f;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) acc = fmaf(w[e], l[e], acc);
+  acc = warp_sum(acc);
+  if (lane == 0) {
+    const float bias = bf_round(__fadd_rn(bf(fold_b[c]), bf_round(acc)));
+    const float t = bf_round(__fadd_rn(cand_val[at], bias));
+    const float logit = bf_round(__fmul_rn(30.f, tanhf(__fdiv_rn(t, 30.f))));
+    cand_logits[at] = logit;
+    const DraftParams* p = slots->params[s];
+    const float T = p->temperature;
+    float score = logit;
+    if (T > 0.f)
+      score = __fadd_rn(__fdiv_rn(logit, fmaxf(T, 1e-6f)), gumbel(p->seed, p->draws, uint32_t(i), uint32_t(k)));
+    atomicMax(&slots->picks[s][i], pack_argmax(score, uint32_t(k)));
+  }
+}
+
+// grid (draft_len, S), block CANDIDATES (1024); greedy-only (no [7, V] draft_logits scatter)
+__global__ void __launch_bounds__(CANDIDATES) markov_finish_batch_kernel(const std::int32_t* cand_idx,
+                                                                         const float* cand_logits,
+                                                                         const BatchSlotDesc* slots, int draft_len) {
+  __shared__ float scratch[33];
+  pdl_trigger();
+  pdl_wait();
+  const int i = blockIdx.x, s = blockIdx.y, t = threadIdx.x;
+  const int at = (s * draft_len + i) * CANDIDATES + t;
+  const float l = cand_logits[at];
+  const float m = block_max(l, scratch);
+  const float sum_exp = block_sum(expf(l - m), scratch);
+  DraftParams* p = slots->params[s];
+  const float T = p->temperature;
+  float qm = 0.f, qs = 0.f;
+  if (T > 0.f && slots->qstats[s] != nullptr) {
+    const float x = __fdiv_rn(l, T);
+    qm = block_max(x, scratch);
+    qs = block_sum(expf(__fsub_rn(x, qm)), scratch);
+  }
+  if (t == 0) {
+    slots->conf[s][i] = 1.f / sum_exp;
+    if (slots->qstats[s] != nullptr) {
+      slots->qstats[s][2 * i] = qm;
+      slots->qstats[s][2 * i + 1] = qs;
+    }
+    const int pick_idx = int(unpack_argmax_index(slots->picks[s][i]));
+    slots->tokens[s][i] = cand_idx[(s * draft_len + i) * CANDIDATES + pick_idx];
+    if (i == 0) {
+      p->draws += 1;
+      p->round_start = p->P;
+    }
+  }
+}
+
 }  // namespace
 
 void gather_head_rows(const void* src, const float* src_scale, std::size_t row_bytes, const std::int32_t* ids, int n,
@@ -510,6 +687,45 @@ void markov_finish(const std::int32_t* cand_idx, const float* cand_logits, const
                    float* qstats, DraftParams* p, cudaStream_t stream) {
   launch_pdl(markov_finish_kernel, dim3(GAMMA), dim3(CANDIDATES), stream, cand_idx, cand_logits, picks, prev_cand,
              draft_logits, V, tokens, conf, qstats, p);
+}
+
+void markov_pre_batch(const ActT* rnn_w, const ActT* h, const BatchSlotDesc* slots, int S, int draft_len, float* part,
+                      cudaStream_t stream) {
+  if (draft_len < 1 || draft_len > GAMMA) throw std::invalid_argument("markov_pre_batch: draft_len out of range");
+  const dim3 grid(RNN_OUT * 32 / PRE_THREADS);
+  switch (S) {
+    case 1: launch_pdl(markov_pre_batch_kernel<1>, grid, dim3(PRE_THREADS), stream, rnn_w, h, slots, draft_len, part); break;
+    case 2: launch_pdl(markov_pre_batch_kernel<2>, grid, dim3(PRE_THREADS), stream, rnn_w, h, slots, draft_len, part); break;
+    case 3: launch_pdl(markov_pre_batch_kernel<3>, grid, dim3(PRE_THREADS), stream, rnn_w, h, slots, draft_len, part); break;
+    case 4: launch_pdl(markov_pre_batch_kernel<4>, grid, dim3(PRE_THREADS), stream, rnn_w, h, slots, draft_len, part); break;
+    default: throw std::invalid_argument("markov_pre_batch: S must be in 1..4");
+  }
+}
+
+void markov_step_batch(int i, const ActT* rnn_w, const ActT* rnn_b, const ActT* w1, const float* part,
+                       const std::int32_t* cand_idx, const BatchSlotDesc* slots, int S, int draft_len,
+                       cudaStream_t stream) {
+  if (i < 0 || i >= draft_len || draft_len < 1 || draft_len > GAMMA || S < 1 || S > kMaxBatchSlots)
+    throw std::invalid_argument("markov_step_batch: step, draft_len, or S out of range");
+  launch_pdl(markov_step_batch_kernel, dim3(RANK * 32 / 256, S), dim3(256), stream, i, rnn_w, rnn_b, w1, part,
+             cand_idx, slots, draft_len);
+}
+
+void markov_logits_batch(int i, const ActT* fold_w, const ActT* fold_b, const float* cand_val,
+                         const std::int32_t* cand_idx, const BatchSlotDesc* slots, int S, int draft_len,
+                         float* cand_logits, cudaStream_t stream) {
+  if (i < 0 || i >= draft_len || draft_len < 1 || draft_len > GAMMA || S < 1 || S > kMaxBatchSlots)
+    throw std::invalid_argument("markov_logits_batch: step, draft_len, or S out of range");
+  launch_pdl(markov_logits_batch_kernel, dim3(CANDIDATES * 32 / 256, S), dim3(256), stream, i, fold_w, fold_b,
+             cand_val, cand_idx, slots, draft_len, cand_logits);
+}
+
+void markov_finish_batch(const std::int32_t* cand_idx, const float* cand_logits, const BatchSlotDesc* slots, int S,
+                         int draft_len, cudaStream_t stream) {
+  if (S < 1 || S > kMaxBatchSlots || draft_len < 1 || draft_len > GAMMA)
+    throw std::invalid_argument("markov_finish_batch: S or draft_len out of range");
+  launch_pdl(markov_finish_batch_kernel, dim3(draft_len, S), dim3(CANDIDATES), stream, cand_idx, cand_logits, slots,
+             draft_len);
 }
 
 }  // namespace ingine::kernels::draft

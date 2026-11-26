@@ -345,6 +345,198 @@ __global__ void fill_kernel(float* x, size_t n, float value) {
     x[i] = value;
 }
 
+// ---- Batched multi-slot DSpark kernels -----------------------------------------------------------------
+
+// grid (BLOCK, S), block ROW_THREADS
+__global__ void __launch_bounds__(ROW_THREADS) embed_block_batch_kernel(const ActT* embed, const float* embed_norm,
+                                                                        const ActT* mask_embed, const ActT* in_norm,
+                                                                        const BatchSlotDesc* slots, ActT* res, ActT* xn,
+                                                                        bool embed_q4, bool embed_q8) {
+  __shared__ float scratch[33];
+  pdl_trigger();
+  const int r = blockIdx.x, s = blockIdx.y, c = 8 * threadIdx.x;
+  const uint4 wv = ld_weight(in_norm + c);
+  uint4 aux[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
+  if (r == 0) {
+    aux[0] = ld_weight(embed_norm + c);
+    aux[1] = ld_weight(embed_norm + c + 4);
+  } else {
+    aux[0] = ld_weight(mask_embed + c);
+  }
+  pdl_wait();
+  const int anchor = slots->params[s]->anchor;
+  float x[8];
+  if (r == 0) {
+    float v[8];
+    if (embed_q8) {
+      const uint8_t* row = reinterpret_cast<const uint8_t*>(embed) + size_t(anchor) * (size_t(H / 32) * 34);
+      const uint8_t* bp = row + 34 * (c >> 5);
+      const float d = __half2float(__ushort_as_half(uint16_t(bp[0] | (bp[1] << 8))));
+      const uint8_t* q = bp + 2 + (c & 31);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) v[j] = bf_round(float(int8_t(q[j])) * d);
+    } else if (embed_q4) {
+      const uint8_t* row = reinterpret_cast<const uint8_t*>(embed) + size_t(anchor) * 1296;
+      const uint32_t nib4 = *reinterpret_cast<const uint32_t*>(row + (c >> 1));
+      const float d = __half2float(reinterpret_cast<const __half*>(row + 1152)[c >> 5]);
+      const float m8d = -8.f * d;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) v[j] = fmaf(float((nib4 >> (4 * j)) & 0xfu), d, m8d);
+    } else {
+      unpack8(*reinterpret_cast<const uint4*>(embed + size_t(anchor) * H + c), v);
+    }
+    const float rs = rms_scale(v, scratch);
+    const float en[8] = {__uint_as_float(aux[0].x), __uint_as_float(aux[0].y), __uint_as_float(aux[0].z),
+                         __uint_as_float(aux[0].w), __uint_as_float(aux[1].x), __uint_as_float(aux[1].y),
+                         __uint_as_float(aux[1].z), __uint_as_float(aux[1].w)};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = bf_round(__fmul_rn(__fmul_rn(v[j], rs), en[j]));
+  } else {
+    unpack8(aux[0], x);
+  }
+  const size_t row_idx = size_t(s) * BLOCK + r;
+  *reinterpret_cast<uint4*>(res + row_idx * H + c) = pack8(x);
+  *reinterpret_cast<uint4*>(xn + row_idx * H + c) = rms_norm(x, wv, scratch);
+  if (r == 0 && threadIdx.x < GAMMA) slots->picks[s][threadIdx.x] = 0ull;
+}
+
+// grid (max_commit, 4, S), block ROW_THREADS
+__global__ void __launch_bounds__(ROW_THREADS) commit_mix_batch_kernel(const BatchSlotDesc* slots, int S,
+                                                                       int max_commit, const ActT* alpha,
+                                                                       const ActT* f_norm, ActT* xin) {
+  __shared__ float scratch[33];
+  pdl_trigger();
+  const int r = blockIdx.x, part = blockIdx.y, s = blockIdx.z, c = 8 * threadIdx.x;
+  float a[4];
+  load_alpha(alpha, part, a);
+  pdl_wait();
+  const DraftParams* p = slots->params[s];
+  const CtxLayers& L = slots->ctx[s];
+  const ActT* norm = part < 3 ? L.ctx_norm[part] : f_norm;
+  const uint4 wv = ld_weight(norm + c);
+  const int n = p->ncommit;
+  const ActT* feats = p->commit_feats;
+  if (part == 3) {
+    if (n > 0 && r == n - 1)
+      *reinterpret_cast<uint4*>(slots->f_rnn[s] + c) = mix_row(feats + size_t(r) * 4 * H, c, a, wv, scratch);
+    return;
+  }
+  const size_t total_m = size_t(S) * max_commit;
+  uint4* out = reinterpret_cast<uint4*>(xin + (size_t(part) * total_m + size_t(s) * max_commit + r) * H + c);
+  if (r >= n) {
+    *out = make_uint4(0, 0, 0, 0);
+    return;
+  }
+  *out = mix_row(feats + size_t(r) * 4 * H, c, a, wv, scratch);
+}
+
+// grid (max_commit, KV_HEADS, 3 * S), block HEAD_DIM
+__global__ void __launch_bounds__(HEAD_DIM) commit_store_batch_kernel(const float* kv, const BatchSlotDesc* slots,
+                                                                      int max_commit) {
+  __shared__ float scratch[33];
+  __shared__ float pair[HEAD_DIM];
+  pdl_trigger();
+  pdl_wait();
+  const int r = blockIdx.x, g = blockIdx.y, s = blockIdx.z / 3, l = blockIdx.z % 3, d = threadIdx.x;
+  const DraftParams* p = slots->params[s];
+  if (r >= p->ncommit) return;
+  const CtxLayers& L = slots->ctx[s];
+  const int pos = p->start + r;
+  const int slot = pos % L.size[l];
+  const float* row = kv + size_t(s * max_commit + r) * 3 * 2 * KV_DIM + size_t(l) * 2 * KV_DIM;
+  const float k = norm_rope_head(row[g * HEAD_DIM + d], L.k_norm_ctx[l], pos, scratch, pair);
+  const size_t at = (size_t(slot) * KV_HEADS + g) * HEAD_DIM + d;
+  store_cache(L.k_cache[l], at, k, L.fp8[l]);
+  store_cache(L.v_cache[l], at, row[KV_DIM + g * HEAD_DIM + d], L.fp8[l]);
+  if (L.ctx_pos[l] != nullptr && g == 0 && d == 0) L.ctx_pos[l][slot] = pos;
+}
+
+// grid (chunk_stride, 4), block ROW_THREADS: prepares [3, chunk_stride, H] for FP8 wkv_all_ prefill chunk
+__global__ void __launch_bounds__(ROW_THREADS) prefill_commit_mix_kernel(const ActT* feats, int n, int chunk_stride,
+                                                                         bool last_piece, const ActT* alpha,
+                                                                         CtxLayers L, const ActT* f_norm, ActT* xin,
+                                                                         ActT* f_rnn) {
+  __shared__ float scratch[33];
+  pdl_trigger();
+  const int r = blockIdx.x, part = blockIdx.y, c = 8 * threadIdx.x;
+  const ActT* norm = part < 3 ? L.ctx_norm[part] : f_norm;
+  const uint4 wv = ld_weight(norm + c);
+  float a[4];
+  load_alpha(alpha, part, a);
+  pdl_wait();
+  if (part == 3) {
+    if (last_piece && r == n - 1)
+      *reinterpret_cast<uint4*>(f_rnn + c) = mix_row(feats + size_t(r) * 4 * H, c, a, wv, scratch);
+    return;
+  }
+  uint4* out = reinterpret_cast<uint4*>(xin + (size_t(part) * chunk_stride + r) * H + c);
+  if (r >= n) {
+    *out = make_uint4(0, 0, 0, 0);
+    return;
+  }
+  *out = mix_row(feats + size_t(r) * 4 * H, c, a, wv, scratch);
+}
+
+// grid (n, KV_HEADS, 3), block HEAD_DIM
+__global__ void __launch_bounds__(HEAD_DIM) prefill_commit_store_kernel(const float* kv, int start, int keep_from_local,
+                                                                        CtxLayers L) {
+  __shared__ float scratch[33];
+  __shared__ float pair[HEAD_DIM];
+  pdl_trigger();
+  pdl_wait();
+  const int r = blockIdx.x, g = blockIdx.y, l = blockIdx.z, d = threadIdx.x;
+  if (L.ctx_pos[l] != nullptr && r < keep_from_local) return;
+  const int pos = start + r;
+  const int slot = pos % L.size[l];
+  const float* row = kv + size_t(r) * 3 * 2 * KV_DIM + size_t(l) * 2 * KV_DIM;
+  const float k = norm_rope_head(row[g * HEAD_DIM + d], L.k_norm_ctx[l], pos, scratch, pair);
+  const size_t at = (size_t(slot) * KV_HEADS + g) * HEAD_DIM + d;
+  store_cache(L.k_cache[l], at, k, L.fp8[l]);
+  store_cache(L.v_cache[l], at, row[KV_DIM + g * HEAD_DIM + d], L.fp8[l]);
+  if (L.ctx_pos[l] != nullptr && g == 0 && d == 0) L.ctx_pos[l][slot] = pos;
+}
+
+// grid (BLOCK, HEADS + 2 * KV_HEADS, S), block HEAD_DIM
+__global__ void __launch_bounds__(HEAD_DIM) qkv_rope_batch_kernel(const float* qkv, const ActT* __restrict__ q_norm,
+                                                                  const ActT* __restrict__ k_norm,
+                                                                  const BatchSlotDesc* slots, int layer, ActT* q_out,
+                                                                  bool local, int ctx) {
+  __shared__ float scratch[33];
+  __shared__ float pair[HEAD_DIM];
+  pdl_trigger();
+  pdl_wait();
+  const int r = blockIdx.x, h = blockIdx.y, s = blockIdx.z, d = threadIdx.x;
+  const DraftParams* p = slots->params[s];
+  const CtxLayers& L = slots->ctx[s];
+  const int pos = p->P + r;
+  const size_t row_idx = size_t(s) * BLOCK + r;
+  const float* row = qkv + row_idx * QKV_ROWS;
+  const int slot = local ? WINDOW + r : pos % ctx;
+  const bool fp8 = L.fp8[layer];
+  if (h < HEADS) {
+    const float q = norm_rope_head(row[h * HEAD_DIM + d], q_norm, pos, scratch, pair);
+    q_out[(row_idx * HEADS + h) * HEAD_DIM + d] = act::from_float(q);
+  } else if (h < HEADS + KV_HEADS) {
+    const int g = h - HEADS;
+    const float k = norm_rope_head(row[Q_DIM + g * HEAD_DIM + d], k_norm, pos, scratch, pair);
+    store_cache(L.k_cache[layer], (size_t(slot) * KV_HEADS + g) * HEAD_DIM + d, k, fp8);
+  } else {
+    const int g = h - HEADS - KV_HEADS;
+    store_cache(L.v_cache[layer], (size_t(slot) * KV_HEADS + g) * HEAD_DIM + d,
+                row[Q_DIM + KV_DIM + g * HEAD_DIM + d], fp8);
+  }
+}
+
+// grid (draft_len, S), block ROW_THREADS
+__global__ void __launch_bounds__(ROW_THREADS) gather_draft_h_kernel(const ActT* xn, int draft_len, ActT* h) {
+  pdl_trigger();
+  pdl_wait();
+  const int i = blockIdx.x, s = blockIdx.y, c = 8 * threadIdx.x;
+  const size_t src_row = size_t(s) * BLOCK + 1 + i;
+  const size_t dst_row = size_t(s) * draft_len + i;
+  *reinterpret_cast<uint4*>(h + dst_row * H + c) = *reinterpret_cast<const uint4*>(xn + src_row * H + c);
+}
+
 void check_launch() { CUDA_CHECK(cudaGetLastError()); }
 
 // rows are read and written 16 bytes at a time
@@ -452,6 +644,58 @@ void fill(float* x, std::size_t n, float value, cudaStream_t stream) {
   const unsigned blocks = unsigned(std::min<std::size_t>((n + 255) / 256, 4096));
   fill_kernel<<<blocks, 256, 0, stream>>>(x, n, value);
   check_launch();
+}
+
+void embed_block_batch(const ActT* embed, const float* embed_norm, const ActT* mask_embed,
+                       const ActT* in_norm, const BatchSlotDesc* slots, int S, ActT* res, ActT* xn,
+                       cudaStream_t stream, bool embed_q4, bool embed_q8) {
+  if (S < 1 || S > kMaxBatchSlots) throw std::invalid_argument("embed_block_batch: S out of range");
+  require_aligned(embed, "embed_block_batch: embed must be 16-byte aligned");
+  launch_pdl(embed_block_batch_kernel, dim3(BLOCK, S), dim3(ROW_THREADS), stream, embed, embed_norm, mask_embed,
+             in_norm, slots, res, xn, embed_q4, embed_q8);
+}
+
+void commit_mix_batch(const BatchSlotDesc* slots, int S, int max_commit, const ActT* alpha, const ActT* f_norm,
+                      ActT* xin, cudaStream_t stream) {
+  if (S < 1 || S > kMaxBatchSlots || max_commit < 1 || max_commit > BLOCK)
+    throw std::invalid_argument("commit_mix_batch: bad S or max_commit");
+  launch_pdl(commit_mix_batch_kernel, dim3(max_commit, 4, S), dim3(ROW_THREADS), stream, slots, S, max_commit, alpha,
+             f_norm, xin);
+}
+
+void commit_store_batch(const float* kv, const BatchSlotDesc* slots, int S, int max_commit, cudaStream_t stream) {
+  if (S < 1 || S > kMaxBatchSlots || max_commit < 1 || max_commit > BLOCK)
+    throw std::invalid_argument("commit_store_batch: bad S or max_commit");
+  launch_pdl(commit_store_batch_kernel, dim3(max_commit, KV_HEADS, 3 * S), dim3(HEAD_DIM), stream, kv, slots,
+             max_commit);
+}
+
+void prefill_commit_mix(const ActT* feats, int n, int chunk_stride, bool last_piece, const ActT* alpha,
+                        const CtxLayers& L, const ActT* f_norm, ActT* xin, ActT* f_rnn, cudaStream_t stream) {
+  if (n < 1 || n > chunk_stride) throw std::invalid_argument("prefill_commit_mix: bad n/chunk_stride");
+  require_aligned(feats, "prefill_commit_mix: feats must be 16-byte aligned");
+  launch_pdl(prefill_commit_mix_kernel, dim3(chunk_stride, 4), dim3(ROW_THREADS), stream, feats, n, chunk_stride,
+             last_piece, alpha, L, f_norm, xin, f_rnn);
+}
+
+void prefill_commit_store(const float* kv, int n, int start, int keep_from_local, const CtxLayers& L,
+                          cudaStream_t stream) {
+  if (n <= 0) return;
+  launch_pdl(prefill_commit_store_kernel, dim3(n, KV_HEADS, 3), dim3(HEAD_DIM), stream, kv, start, keep_from_local, L);
+}
+
+void qkv_rope_batch(const float* qkv, const ActT* q_norm, const ActT* k_norm, const BatchSlotDesc* slots, int S,
+                    int layer, ActT* q_out, bool local, int ctx, cudaStream_t stream) {
+  if (S < 1 || S > kMaxBatchSlots || layer < 0 || layer >= 3)
+    throw std::invalid_argument("qkv_rope_batch: bad S or layer");
+  launch_pdl(qkv_rope_batch_kernel, dim3(BLOCK, HEADS + 2 * KV_HEADS, S), dim3(HEAD_DIM), stream, qkv, q_norm, k_norm,
+             slots, layer, q_out, local, ctx);
+}
+
+void gather_draft_h(const ActT* xn, int S, int draft_len, ActT* h, cudaStream_t stream) {
+  if (S < 1 || S > kMaxBatchSlots || draft_len < 1 || draft_len > GAMMA)
+    throw std::invalid_argument("gather_draft_h: S or draft_len out of range");
+  launch_pdl(gather_draft_h_kernel, dim3(draft_len, S), dim3(ROW_THREADS), stream, xn, draft_len, h);
 }
 
 }  // namespace ingine::kernels::draft
