@@ -298,7 +298,7 @@ __device__ __forceinline__ uint32_t e4m3x2_to_mma_act2(uint32_t u) {
 // (xor of all the batch's loads) & zero, so ptxas cannot interleave the mma with the batch's loads and
 // all U steps' loads of a warp are in flight together (otherwise it issues one step's loads at a time,
 // ~1 KB per warp, and scattered 64-byte requests from 16 rows run at ~40% of DRAM bandwidth).
-template <bool FP8, int K, int M, int SPLITK, int U, class Epi>
+template <bool FP8, int K, int M, int SPLITK, int U, class Epi, bool FORCE_SIMT = false>
 __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __restrict__ w,
                                                               const float* __restrict__ w_scale, int rows,
                                                               uint32_t zero, Epi epi) {
@@ -317,203 +317,249 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
   const int c0 = warp * KS + t * CPL;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
-  // Native Volta sm_70 HMMA.884: lane (qp, idx) owns ONE row rv = r0 + (qp>=2 ? 8 : 0) + idx and
-  // TWO contiguous chunks (2*CPL cols) per SPAN step, feeding sm70_mma_f16_direct with ZERO shuffles!
-  const int qp = (lane >> 2) & 3, idx = (lane & 3) | ((lane & 16) >> 2);
-  const int rv = r0 + (qp >= 2 ? 8 : 0) + idx;
-  const int iv = rv < rows ? epi.input_of(rv) : -1;
-  const int c0_v = warp * KS + (qp & 1) * (2 * CPL);
-  float c[4] = {0.f, 0.f, 0.f, 0.f};
-  float c8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  constexpr bool kSm70Hmma = !FORCE_SIMT;
+  constexpr bool kSimtMma = FORCE_SIMT;
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
-  float acc_a[M], acc_b[M];
-#pragma unroll
-  for (int m = 0; m < M; ++m) acc_a[m] = acc_b[m] = 0.f;
+  constexpr bool kSm70Hmma = false;
+  constexpr bool kSimtMma = true;
 #else
-  float c[4] = {0.f, 0.f, 0.f, 0.f};
+  constexpr bool kSm70Hmma = false;
+  constexpr bool kSimtMma = false;
 #endif
   bool waited = false;
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
-  auto pass = [&](int cur) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
-    const bool lv = iv == cur, lx = idx < M;
-    const uint8_t* wv = w + size_t(lv ? rv : 0) * ROW_BYTES;
-    const ActT* xg = epi.x_of(cur) + size_t(lx ? idx : 0) * K;
-#pragma unroll 1
-    for (int jb = 0; jb < NJ; jb += U) {
-      uint4 W0[U], W1[U];
-#pragma unroll
-      for (int u = 0; u < U; ++u) {
-        const size_t off0 = size_t(c0_v + (jb + u) * SPAN) * (FP8 ? 1 : 2);
-        W0[u] = lv ? l2::ld_stream<WEIGHT_L2>(wv + off0, wpol) : make_uint4(0, 0, 0, 0);
-        W1[u] = lv ? l2::ld_stream<WEIGHT_L2>(wv + off0 + 16, wpol) : make_uint4(0, 0, 0, 0);
-      }
-      if (!waited) {
-        pdl_wait_fenced(zero);
-        pdl_trigger();
-        waited = true;
-      }
-      uint32_t dep = 0;
-#pragma unroll
-      for (int u = 0; u < U; ++u) dep ^= W0[u].x ^ W0[u].w ^ W1[u].x ^ W1[u].w;
-      dep &= zero;
-#pragma unroll
-      for (int u = 0; u < U; ++u) {
-        const int col0 = c0_v + (jb + u) * SPAN;
-        if constexpr (FP8) {
-          const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
-          const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
-          const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
-          const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W0[u].x), e4m3x2_to_mma_act2(W0[u].x >> 16),
-                                   e4m3x2_to_mma_act2(W0[u].y), e4m3x2_to_mma_act2(W0[u].y >> 16),
-                                   x0.x ^ dep, x0.y, x0.z, x0.w);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W0[u].z), e4m3x2_to_mma_act2(W0[u].z >> 16),
-                                   e4m3x2_to_mma_act2(W0[u].w), e4m3x2_to_mma_act2(W0[u].w >> 16),
-                                   x1.x, x1.y, x1.z, x1.w);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W1[u].x), e4m3x2_to_mma_act2(W1[u].x >> 16),
-                                   e4m3x2_to_mma_act2(W1[u].y), e4m3x2_to_mma_act2(W1[u].y >> 16),
-                                   x2.x, x2.y, x2.z, x2.w);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W1[u].z), e4m3x2_to_mma_act2(W1[u].z >> 16),
-                                   e4m3x2_to_mma_act2(W1[u].w), e4m3x2_to_mma_act2(W1[u].w >> 16),
-                                   x3.x, x3.y, x3.z, x3.w);
-        } else {
-          const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
-          const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
-          mma::sm70_mma_f16_direct(c8, W0[u].x, W0[u].y, W0[u].z, W0[u].w, x0.x ^ dep, x0.y, x0.z, x0.w);
-          mma::sm70_mma_f16_direct(c8, W1[u].x, W1[u].y, W1[u].z, W1[u].w, x1.x, x1.y, x1.z, x1.w);
-        }
-      }
-    }
-#else
-    const bool la = ia == cur, lb = ib == cur, lx = g < M;
-    const uint8_t* wa = w + size_t(la ? ra : 0) * ROW_BYTES;
-    const uint8_t* wb = w + size_t(lb ? rb : 0) * ROW_BYTES;
-    const ActT* xg = epi.x_of(cur) + size_t(lx ? g : 0) * K;
-#pragma unroll 1
-    for (int jb = 0; jb < NJ; jb += U) {
-      uint4 A[U], B[U], X[U][CPL / 8];
-#pragma unroll
-      for (int u = 0; u < U; ++u) {
-        const size_t off = size_t(c0 + (jb + u) * SPAN) * (FP8 ? 1 : 2);
-        A[u] = la ? l2::ld_stream<WEIGHT_L2>(wa + off, wpol) : make_uint4(0, 0, 0, 0);
-        B[u] = lb ? l2::ld_stream<WEIGHT_L2>(wb + off, wpol) : make_uint4(0, 0, 0, 0);
-      }
-      if (!waited) {  // the first batch of weights is in flight; activations come from earlier kernels
-        pdl_wait_fenced(zero);
-        pdl_trigger();
-        waited = true;
-      }
-#pragma unroll
-      for (int u = 0; u < U; ++u) {
-        const int col = c0 + (jb + u) * SPAN;
-#pragma unroll
-        for (int h = 0; h < CPL / 8; ++h) X[u][h] = lx ? ld_act(xg + col + 8 * h) : make_uint4(0, 0, 0, 0);
-      }
-      uint32_t dep = 0;
-#pragma unroll
-      for (int u = 0; u < U; ++u) {
-        dep ^= A[u].x ^ A[u].w ^ B[u].x ^ B[u].w;
-#pragma unroll
-        for (int h = 0; h < CPL / 8; ++h) dep ^= X[u][h].x;
-      }
-      dep &= zero;
-#pragma unroll
-      for (int u = 0; u < U; ++u) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
-        // Pascal sm_60/sm_61: compute ONLY active columns 0..M-1 with hoisted weight unpacks and exact FP32 fmaf.
-        if constexpr (FP8) {
-          const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
-          const uint32_t xw[8] = {X[u][0].x ^ dep, X[u][0].y, X[u][0].z, X[u][0].w,
-                                  X[u][1].x,       X[u][1].y, X[u][1].z, X[u][1].w};
-#pragma unroll
-          for (int s = 0; s < 4; ++s) {
-            const float2 fa0 = act::unpack2(e4m3x2_to_mma_act2(aw[s]));
-            const float2 fa1 = act::unpack2(e4m3x2_to_mma_act2(aw[s] >> 16));
-            const float2 fb0 = act::unpack2(e4m3x2_to_mma_act2(bw[s]));
-            const float2 fb1 = act::unpack2(e4m3x2_to_mma_act2(bw[s] >> 16));
-#pragma unroll
-            for (int m = 0; m < M; ++m) {
-              const int sl = 4 * m + t;
-              const float2 fx0 = act::unpack2(__shfl_sync(0xffffffffu, xw[2 * s], sl));
-              const float2 fx1 = act::unpack2(__shfl_sync(0xffffffffu, xw[2 * s + 1], sl));
-              acc_a[m] = fmaf(fa1.y, fx1.y, fmaf(fa1.x, fx1.x, fmaf(fa0.y, fx0.y, fmaf(fa0.x, fx0.x, acc_a[m]))));
-              acc_b[m] = fmaf(fb1.y, fx1.y, fmaf(fb1.x, fx1.x, fmaf(fb0.y, fx0.y, fmaf(fb0.x, fx0.x, acc_b[m]))));
-            }
-          }
-        } else {
-          const uint32_t ah[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bh[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
-          const uint32_t xw[4] = {X[u][0].x ^ dep, X[u][0].y, X[u][0].z, X[u][0].w};
-#pragma unroll
-          for (int s = 0; s < 4; ++s) {
-            const float2 fa = act::unpack2(ah[s]);
-            const float2 fb = act::unpack2(bh[s]);
-#pragma unroll
-            for (int m = 0; m < M; ++m) {
-              const int sl = 4 * m + t;
-              const float2 fx = act::unpack2(__shfl_sync(0xffffffffu, xw[s], sl));
-              acc_a[m] = fmaf(fa.y, fx.y, fmaf(fa.x, fx.x, acc_a[m]));
-              acc_b[m] = fmaf(fb.y, fx.y, fmaf(fb.x, fx.x, acc_b[m]));
-            }
-          }
-        }
-#else
-        if constexpr (FP8) {
-          // 16 columns = 4 k-steps of 4 columns (2 k-pairs) each
-          const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
-          const uint32_t xw[8] = {X[u][0].x, X[u][0].y, X[u][0].z, X[u][0].w,
-                                  X[u][1].x, X[u][1].y, X[u][1].z, X[u][1].w};
-#pragma unroll
-          for (int s = 0; s < 4; ++s)
-            mma_bf16(c, e4m3x2_to_mma_act2(aw[s]), e4m3x2_to_mma_act2(bw[s]), e4m3x2_to_mma_act2(aw[s] >> 16),
-                     e4m3x2_to_mma_act2(bw[s] >> 16), xw[2 * s] ^ dep, xw[2 * s + 1]);
-        } else {
-          mma_bf16(c, A[u].x, B[u].x, A[u].y, B[u].y, X[u][0].x ^ dep, X[u][0].y);
-          mma_bf16(c, A[u].z, B[u].z, A[u].w, B[u].w, X[u][0].z ^ dep, X[u][0].w);
-        }
-#endif
-      }
-    }
-#endif
-  };
-  if constexpr (Epi::kInputs == 1) {
-    pass(0);
-  } else {
-    // inputs present among the block's 16 rows (warp-uniform; every warp sees the same rows)
-#pragma unroll 1
-    for (int i = 0; i < Epi::kInputs; ++i)
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
-      if (__any_sync(0xffffffffu, iv == i)) pass(i);
-#else
-      if (__any_sync(0xffffffffu, ia == i || ib == i)) pass(i);
-#endif
-  }
 
+  if constexpr (kSm70Hmma) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
-  mma::sm70_reduce_acc8_to_d4(c8, c);
-  cs[warp][g][2 * t] = c[0];
-  cs[warp][g][2 * t + 1] = c[1];
-  cs[warp][g + 8][2 * t] = c[2];
-  cs[warp][g + 8][2 * t + 1] = c[3];
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+    const int qp = (lane >> 2) & 3, idx = (lane & 3) | ((lane & 16) >> 2);
+    const int rv = r0 + (qp >= 2 ? 8 : 0) + idx;
+    const int iv = rv < rows ? epi.input_of(rv) : -1;
+    const int c0_v = warp * KS + (qp & 1) * (2 * CPL);
+    float c[4] = {0.f, 0.f, 0.f, 0.f};
+    float c8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    auto pass_v = [&](int cur) {
+      const bool lv = iv == cur, lx = idx < M;
+      const uint8_t* wv = w + size_t(lv ? rv : 0) * ROW_BYTES;
+      const ActT* xg = epi.x_of(cur) + size_t(lx ? idx : 0) * K;
+#pragma unroll 1
+      for (int jb = 0; jb < NJ; jb += U) {
+        uint4 W0[U], W1[U];
 #pragma unroll
-  for (int m = 0; m < M; ++m) {
-    acc_a[m] += __shfl_xor_sync(0xffffffffu, acc_a[m], 1);
-    acc_a[m] += __shfl_xor_sync(0xffffffffu, acc_a[m], 2);
-    acc_b[m] += __shfl_xor_sync(0xffffffffu, acc_b[m], 1);
-    acc_b[m] += __shfl_xor_sync(0xffffffffu, acc_b[m], 2);
-    if (t == 0) {
-      cs[warp][g][m] = acc_a[m];
-      cs[warp][g + 8][m] = acc_b[m];
+        for (int u = 0; u < U; ++u) {
+          const size_t off0 = size_t(c0_v + (jb + u) * SPAN) * (FP8 ? 1 : 2);
+          W0[u] = lv ? l2::ld_stream<WEIGHT_L2>(wv + off0, wpol) : make_uint4(0, 0, 0, 0);
+          W1[u] = lv ? l2::ld_stream<WEIGHT_L2>(wv + off0 + 16, wpol) : make_uint4(0, 0, 0, 0);
+        }
+        if (!waited) {
+          pdl_wait_fenced(zero);
+          pdl_trigger();
+          waited = true;
+        }
+        uint32_t dep = 0;
+#pragma unroll
+        for (int u = 0; u < U; ++u) dep ^= W0[u].x ^ W0[u].w ^ W1[u].x ^ W1[u].w;
+        dep &= zero;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const int col0 = c0_v + (jb + u) * SPAN;
+          if constexpr (FP8) {
+            const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
+            const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
+            const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
+            const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
+            mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W0[u].x), e4m3x2_to_mma_act2(W0[u].x >> 16),
+                                     e4m3x2_to_mma_act2(W0[u].y), e4m3x2_to_mma_act2(W0[u].y >> 16),
+                                     x0.x ^ dep, x0.y, x0.z, x0.w);
+            mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W0[u].z), e4m3x2_to_mma_act2(W0[u].z >> 16),
+                                     e4m3x2_to_mma_act2(W0[u].w), e4m3x2_to_mma_act2(W0[u].w >> 16),
+                                     x1.x, x1.y, x1.z, x1.w);
+            mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W1[u].x), e4m3x2_to_mma_act2(W1[u].x >> 16),
+                                     e4m3x2_to_mma_act2(W1[u].y), e4m3x2_to_mma_act2(W1[u].y >> 16),
+                                     x2.x, x2.y, x2.z, x2.w);
+            mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W1[u].z), e4m3x2_to_mma_act2(W1[u].z >> 16),
+                                     e4m3x2_to_mma_act2(W1[u].w), e4m3x2_to_mma_act2(W1[u].w >> 16),
+                                     x3.x, x3.y, x3.z, x3.w);
+          } else {
+            const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
+            const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
+            mma::sm70_mma_f16_direct(c8, W0[u].x, W0[u].y, W0[u].z, W0[u].w, x0.x ^ dep, x0.y, x0.z, x0.w);
+            mma::sm70_mma_f16_direct(c8, W1[u].x, W1[u].y, W1[u].z, W1[u].w, x1.x, x1.y, x1.z, x1.w);
+          }
+        }
+      }
+    };
+    if constexpr (Epi::kInputs == 1) {
+      pass_v(0);
+    } else {
+#pragma unroll 1
+      for (int i = 0; i < Epi::kInputs; ++i)
+        if (__any_sync(0xffffffffu, iv == i)) pass_v(i);
     }
-  }
-#else
-  // C fragment: c0, c1 = rows g, tokens 2t, 2t+1; c2, c3 = row g + 8
-  cs[warp][g][2 * t] = c[0];
-  cs[warp][g][2 * t + 1] = c[1];
-  cs[warp][g + 8][2 * t] = c[2];
-  cs[warp][g + 8][2 * t + 1] = c[3];
+    mma::sm70_reduce_acc8_to_d4(c8, c);
+    cs[warp][g][2 * t] = c[0];
+    cs[warp][g][2 * t + 1] = c[1];
+    cs[warp][g + 8][2 * t] = c[2];
+    cs[warp][g + 8][2 * t + 1] = c[3];
 #endif
+  } else if constexpr (kSimtMma) {
+    float acc_a[M], acc_b[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc_a[m] = acc_b[m] = 0.f;
+    auto pass_s = [&](int cur) {
+      const bool la = ia == cur, lb = ib == cur, lx = g < M;
+      const uint8_t* wa = w + size_t(la ? ra : 0) * ROW_BYTES;
+      const uint8_t* wb = w + size_t(lb ? rb : 0) * ROW_BYTES;
+      const ActT* xg = epi.x_of(cur) + size_t(lx ? g : 0) * K;
+#pragma unroll 1
+      for (int jb = 0; jb < NJ; jb += U) {
+        uint4 A[U], B[U], X[U][CPL / 8];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const size_t off = size_t(c0 + (jb + u) * SPAN) * (FP8 ? 1 : 2);
+          A[u] = la ? l2::ld_stream<WEIGHT_L2>(wa + off, wpol) : make_uint4(0, 0, 0, 0);
+          B[u] = lb ? l2::ld_stream<WEIGHT_L2>(wb + off, wpol) : make_uint4(0, 0, 0, 0);
+        }
+        if (!waited) {
+          pdl_wait_fenced(zero);
+          pdl_trigger();
+          waited = true;
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const int col = c0 + (jb + u) * SPAN;
+#pragma unroll
+          for (int h = 0; h < CPL / 8; ++h) X[u][h] = lx ? ld_act(xg + col + 8 * h) : make_uint4(0, 0, 0, 0);
+        }
+        uint32_t dep = 0;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          dep ^= A[u].x ^ A[u].w ^ B[u].x ^ B[u].w;
+#pragma unroll
+          for (int h = 0; h < CPL / 8; ++h) dep ^= X[u][h].x;
+        }
+        dep &= zero;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          if constexpr (FP8) {
+            const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
+            const uint32_t xw[8] = {X[u][0].x ^ dep, X[u][0].y, X[u][0].z, X[u][0].w,
+                                    X[u][1].x,       X[u][1].y, X[u][1].z, X[u][1].w};
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+              const float2 fa0 = act::unpack2(e4m3x2_to_mma_act2(aw[s]));
+              const float2 fa1 = act::unpack2(e4m3x2_to_mma_act2(aw[s] >> 16));
+              const float2 fb0 = act::unpack2(e4m3x2_to_mma_act2(bw[s]));
+              const float2 fb1 = act::unpack2(e4m3x2_to_mma_act2(bw[s] >> 16));
+#pragma unroll
+              for (int m = 0; m < M; ++m) {
+                const int sl = 4 * m + t;
+                const float2 fx0 = act::unpack2(__shfl_sync(0xffffffffu, xw[2 * s], sl));
+                const float2 fx1 = act::unpack2(__shfl_sync(0xffffffffu, xw[2 * s + 1], sl));
+                acc_a[m] = fmaf(fa1.y, fx1.y, fmaf(fa1.x, fx1.x, fmaf(fa0.y, fx0.y, fmaf(fa0.x, fx0.x, acc_a[m]))));
+                acc_b[m] = fmaf(fb1.y, fx1.y, fmaf(fb1.x, fx1.x, fmaf(fb0.y, fx0.y, fmaf(fb0.x, fx0.x, acc_b[m]))));
+              }
+            }
+          } else {
+            const uint32_t ah[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bh[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
+            const uint32_t xw[4] = {X[u][0].x ^ dep, X[u][0].y, X[u][0].z, X[u][0].w};
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+              const float2 fa = act::unpack2(ah[s]);
+              const float2 fb = act::unpack2(bh[s]);
+#pragma unroll
+              for (int m = 0; m < M; ++m) {
+                const int sl = 4 * m + t;
+                const float2 fx = act::unpack2(__shfl_sync(0xffffffffu, xw[s], sl));
+                acc_a[m] = fmaf(fa.y, fx.y, fmaf(fa.x, fx.x, acc_a[m]));
+                acc_b[m] = fmaf(fb.y, fx.y, fmaf(fb.x, fx.x, acc_b[m]));
+              }
+            }
+          }
+        }
+      }
+    };
+    if constexpr (Epi::kInputs == 1) {
+      pass_s(0);
+    } else {
+#pragma unroll 1
+      for (int i = 0; i < Epi::kInputs; ++i)
+        if (__any_sync(0xffffffffu, ia == i || ib == i)) pass_s(i);
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      acc_a[m] += __shfl_xor_sync(0xffffffffu, acc_a[m], 1);
+      acc_a[m] += __shfl_xor_sync(0xffffffffu, acc_a[m], 2);
+      acc_b[m] += __shfl_xor_sync(0xffffffffu, acc_b[m], 1);
+      acc_b[m] += __shfl_xor_sync(0xffffffffu, acc_b[m], 2);
+      if (t == 0) {
+        cs[warp][g][m] = acc_a[m];
+        cs[warp][g + 8][m] = acc_b[m];
+      }
+    }
+  } else {
+    float c[4] = {0.f, 0.f, 0.f, 0.f};
+    auto pass_m = [&](int cur) {
+      const bool la = ia == cur, lb = ib == cur, lx = g < M;
+      const uint8_t* wa = w + size_t(la ? ra : 0) * ROW_BYTES;
+      const uint8_t* wb = w + size_t(lb ? rb : 0) * ROW_BYTES;
+      const ActT* xg = epi.x_of(cur) + size_t(lx ? g : 0) * K;
+#pragma unroll 1
+      for (int jb = 0; jb < NJ; jb += U) {
+        uint4 A[U], B[U], X[U][CPL / 8];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const size_t off = size_t(c0 + (jb + u) * SPAN) * (FP8 ? 1 : 2);
+          A[u] = la ? l2::ld_stream<WEIGHT_L2>(wa + off, wpol) : make_uint4(0, 0, 0, 0);
+          B[u] = lb ? l2::ld_stream<WEIGHT_L2>(wb + off, wpol) : make_uint4(0, 0, 0, 0);
+        }
+        if (!waited) {
+          pdl_wait_fenced(zero);
+          pdl_trigger();
+          waited = true;
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const int col = c0 + (jb + u) * SPAN;
+#pragma unroll
+          for (int h = 0; h < CPL / 8; ++h) X[u][h] = lx ? ld_act(xg + col + 8 * h) : make_uint4(0, 0, 0, 0);
+        }
+        uint32_t dep = 0;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          dep ^= A[u].x ^ A[u].w ^ B[u].x ^ B[u].w;
+#pragma unroll
+          for (int h = 0; h < CPL / 8; ++h) dep ^= X[u][h].x;
+        }
+        dep &= zero;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          if constexpr (FP8) {
+            const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
+            const uint32_t xw[8] = {X[u][0].x, X[u][0].y, X[u][0].z, X[u][0].w,
+                                    X[u][1].x, X[u][1].y, X[u][1].z, X[u][1].w};
+#pragma unroll
+            for (int s = 0; s < 4; ++s)
+              mma_bf16(c, e4m3x2_to_mma_act2(aw[s]), e4m3x2_to_mma_act2(bw[s]), e4m3x2_to_mma_act2(aw[s] >> 16),
+                       e4m3x2_to_mma_act2(bw[s] >> 16), xw[2 * s] ^ dep, xw[2 * s + 1]);
+          } else {
+            mma_bf16(c, A[u].x, B[u].x, A[u].y, B[u].y, X[u][0].x ^ dep, X[u][0].y);
+            mma_bf16(c, A[u].z, B[u].z, A[u].w, B[u].w, X[u][0].z ^ dep, X[u][0].w);
+          }
+        }
+      }
+    };
+    if constexpr (Epi::kInputs == 1) {
+      pass_m(0);
+    } else {
+#pragma unroll 1
+      for (int i = 0; i < Epi::kInputs; ++i)
+        if (__any_sync(0xffffffffu, ia == i || ib == i)) pass_m(i);
+    }
+    cs[warp][g][2 * t] = c[0];
+    cs[warp][g][2 * t + 1] = c[1];
+    cs[warp][g + 8][2 * t] = c[2];
+    cs[warp][g + 8][2 * t + 1] = c[3];
+  }
   __syncthreads();
   auto total = [&](int r, int m) {
     float s = 0.f;
@@ -826,7 +872,7 @@ __global__ void __launch_bounds__(128) gemv_q5_k_kernel(const uint8_t* __restric
 // whole row per lane would not fit in registers); SPLITK: warps per 16-row block of the M >= 2 kernel;
 // UFP8: steps per load batch of its FP8 instantiation.
 template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, int UBF16 = MMA_U_BF16, class Make>
-void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make) {
+void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make, bool force_simt = false) {
   const bool fp8 = w.scale != nullptr;
   require(w.w != nullptr && w.rows > 0, "weight matrix is empty");
   require(!(w.q5_k && fp8), "weight matrix cannot be both Q5_K and FP8");
@@ -874,6 +920,13 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
       }
     } else {
       const dim3 blocks((rows + 15) / 16);
+      if constexpr (kActIsFP16) {
+        if (force_simt) {
+          if (fp8) launch_ex(gemv_mma_kernel<true, K, MM, SPLITK, UFP8, E, true>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
+          else launch_ex(gemv_mma_kernel<false, K, MM, SPLITK, UBF16, E, true>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
+          return;
+        }
+      }
       if (fp8) launch_ex(gemv_mma_kernel<true, K, MM, SPLITK, UFP8, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
       else launch_ex(gemv_mma_kernel<false, K, MM, SPLITK, UBF16, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
     }
@@ -1471,13 +1524,13 @@ __global__ void loopcd_hidden_from_residual_kernel(float* __restrict__ dst, cons
 }  // namespace
 
 void proj(const ActT* xin, int M, Matrix w, const int* segments, int nseg, float* out, bool pdl,
-          cudaStream_t stream) {
+          cudaStream_t stream, bool force_simt) {
   require(xin && segments && out && nseg > 0, "proj: null argument");
   const int R = w.rows;
   launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi>(w, M, pdl, stream, [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
     return ProjEpi<MM>{xin, segments, nseg, R, out};
-  });
+  }, force_simt);
 }
 
 void proj_q5_k_raw_f32(const ActT* xin, int M, int K, Matrix w, const int* segments, int nseg, float* out, bool pdl,
@@ -1512,7 +1565,7 @@ void proj_q5_k_raw_f32(const ActT* xin, int M, int K, Matrix w, const int* segme
 }
 
 void proj_conv(const ActT* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,
-               float* conv_hist, bool pdl, cudaStream_t stream) {
+               float* conv_hist, bool pdl, cudaStream_t stream, bool force_simt) {
   require(x && conv_w && conv_state && out, "proj_conv: null argument");
   require(w.rows == H, "proj_conv: w must have 2304 rows");
   // M = 1: 2304 rows = 1152-2304 warps; 32-thread blocks spread them evenly over the SMs (measured: equal
@@ -1520,16 +1573,16 @@ void proj_conv(const ActT* x, int M, Matrix w, const float* conv_w, float* conv_
   launch_gemv<3072, 32, CONV_SPLITK, CONV_U_FP8, ConvEpi>(w, M, pdl, stream, [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
     return ConvEpi<MM>{x, conv_w, conv_state, out, conv_hist};
-  });
+  }, force_simt);
 }
 
-void head(const ActT* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream) {
+void head(const ActT* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream, bool force_simt) {
   require(x && out, "head: null argument");
   const int V = w.rows;
   launch_gemv<H, 256, HEAD_SPLITK, MMA_U_FP8, HeadEpi>(w, M, pdl, stream, [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
     return HeadEpi<MM>{x, V, out};
-  });
+  }, force_simt);
 }
 
 void head_loopcd(const ActT* x_strong, const ActT* x_weak, int M, Matrix w, float omega_max, float* out,

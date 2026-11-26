@@ -80,6 +80,11 @@ const std::int64_t* Decoder::block_table(const std::vector<const float*>& blocks
 void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
                      const kernels::persona::PersonaDeviceTable* hooks) {
   const int m = b.m;
+  // On SM70 FP16, M=1 dense GEMV accumulates in FP32 FMA while M>1 Volta HMMA.884 introduces small
+  // rounding deltas that amplify through downstream per-16 INT8 DP4A quantization during multi-token
+  // speculative verification. Scope the FP32 SIMT path to FP16 M>1 verification with rollback history
+  // so M=1 decode and TP2 paths stay untouched.
+  const bool spec_verify_simt = kActIsFP16 && history && m > 1;
   const int H = HIDDEN;
   const bool pdl = pdl_;
   const Weights& w = w_;
@@ -215,7 +220,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     const Tensor& proj_out = layer.full ? b.proj_full : b.proj_sliding;
     const int R = proj_rows(layer.full);
     dense::proj(bf16m(b.xin), m, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full),
-                f32m(proj_out), pdl, stream);
+                f32m(proj_out), pdl, stream, spec_verify_simt);
     // b.hist_k/hist_v[v] (K and V segments of proj_out) are copied by the MLP-side mix below
     attn::DecodeArgs a;
     a.proj = f32p(proj_out);
@@ -270,7 +275,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       attn::attn_decode(a, stream);
     }
     dense::proj_conv(bf16m(b.attn_out), m, matrix(layer.wo), f32p(layer.attn_conv), st.conv_attn_at(v), f32m(b.y),
-                     history ? f32m(b.hist_attn) + std::size_t(v) * m * H : nullptr, pdl, stream);
+                     history ? f32m(b.hist_attn) + std::size_t(v) * m * H : nullptr, pdl, stream, spec_verify_simt);
     if (hooks) dense::residual_steer(f32m(b.y), m, &hooks->steer_attn[v], stream);
     // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)
     std::vector<const float*> mlp_blocks = blocks;
@@ -366,7 +371,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     dense::head_loopcd(bf16m(b.xf), bf16m(b.xf_weak), m, matrix(w.unembed), loopcd_omega_, f32m(b.logits),
                        f32m(b.logits_weak), f32m(b.loopcd_reduce), pdl, stream);
   } else {
-    dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
+    dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream, spec_verify_simt);
   }
 }
 

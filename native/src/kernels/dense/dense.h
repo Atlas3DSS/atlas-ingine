@@ -34,7 +34,7 @@ struct Matrix {
 // proj: multi-segment GEMV. xin bf16 [3, M, H]; segments int32 device [nseg, 3] = (row_begin, row_end,
 // input index); out fp32 [M, R] = bf16(w[r] . xin[seg(r).input, m]), R = w.rows.
 void proj(const ActT* xin, int M, Matrix w, const int* segments, int nseg, float* out, bool pdl,
-          cudaStream_t stream);
+          cudaStream_t stream, bool force_simt = false);
 
 // Diagnostic raw pre-ActT FP32 accumulator output for Q5_K proj (K=2304) and proj_conv (K=3072).
 // Runs the identical gemv_q5_k_kernel accumulation loop without the epilogue round_bf16/ActT cast.
@@ -45,10 +45,10 @@ void proj_q5_k_raw_f32(const ActT* xin, int M, int K, Matrix w, const int* segme
 // x bf16 [M, 3072]; conv_w fp32 [H, 4]; conv_state fp32 [3, H]; out fp32 [M, H]; conv_hist fp32 [M, H]
 // (BF16-rounded conv inputs, for speculative rollback) or nullptr.
 void proj_conv(const ActT* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,
-               float* conv_hist, bool pdl, cudaStream_t stream);
+               float* conv_hist, bool pdl, cudaStream_t stream, bool force_simt = false);
 
 // head: out[m, v] = 30 tanh(bf16(w_v . x[m]) / 30), x bf16 [M, H], out fp32 [M, V], V = w.rows.
-void head(const ActT* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream);
+void head(const ActT* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream, bool force_simt = false);
 
 // Fused single-pass dual-vector lm_head GEMV + adaptive contrastive logits (Apple LoopCD, arXiv:2610.02185 Eq. 3-4).
 // Reads each [V, H] weight row ONCE into registers to compute both z_s = head(x_strong) and z_w = head(x_weak),
