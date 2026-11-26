@@ -1,7 +1,8 @@
-// Pure native C++20 Apple MLX/Metal safetensors streaming uploader using bounded unified staging ring
-// and parallel pread chunks (zero Python, zero external ggml runtime).
+// Pure native C++20 Apple MLX/Metal safetensors full-destination chunked uploader using parallel
+// POSIX pread directly into caller-allocated unified shared buffers (zero Python, zero external
+// ggml runtime). Strictly honors UploadOptions::chunk_bytes per read/copy chunk; does not cap
+// destination buffer size or perform dynamic weight-layer eviction.
 #include "core/safetensors.h"
-#include "core/vendor_policy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -76,9 +77,8 @@ struct DeviceUploader::Impl {
     const auto start = std::chrono::steady_clock::now();
     std::vector<Chunk> chunks;
     UploadStats stats;
-    // Slice at options_.chunk_bytes bounded by 1 MiB subreads inside read_range so compact 2.3-3.0 GiB
-    // streaming rings never experience large page-cache spikes on 4-8 GB Apple Silicon.
-    const std::uint64_t max_chunk = std::max<std::uint64_t>(vendor::mlx::kDefaultPreadPieceBytes, options_.chunk_bytes);
+    // Slice strictly at options_.chunk_bytes so caller-supplied read/copy limits are honored verbatim.
+    const std::uint64_t max_chunk = options_.chunk_bytes;
     for (const UploadRequest& r : requests) {
       if (r.bytes == 0) continue;
       if (r.file == nullptr || r.dst == nullptr) {

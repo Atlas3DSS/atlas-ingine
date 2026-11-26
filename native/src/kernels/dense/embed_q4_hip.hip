@@ -36,13 +36,10 @@ __device__ __forceinline__ float decode_round_act(float x, int rounding_mode) no
 }
 
 __device__ __forceinline__ float4 decode_q4_0_x4(std::uint16_t b2, std::uint16_t scale_bits) noexcept {
-  const float d_raw = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-  const float d = isfinite(d_raw) ? d_raw : 0.f;
-  const float m8d = -8.f * d;
-  return make_float4(fmaf(static_cast<float>(b2 & 0xfu), d, m8d),
-                     fmaf(static_cast<float>((b2 >> 4) & 0xfu), d, m8d),
-                     fmaf(static_cast<float>((b2 >> 8) & 0xfu), d, m8d),
-                     fmaf(static_cast<float>((b2 >> 12) & 0xfu), d, m8d));
+  return make_float4(arch::decode_q4_0_nibble_canonical(static_cast<std::uint8_t>(b2 & 0xfu), scale_bits),
+                     arch::decode_q4_0_nibble_canonical(static_cast<std::uint8_t>((b2 >> 4) & 0xfu), scale_bits),
+                     arch::decode_q4_0_nibble_canonical(static_cast<std::uint8_t>((b2 >> 8) & 0xfu), scale_bits),
+                     arch::decode_q4_0_nibble_canonical(static_cast<std::uint8_t>((b2 >> 12) & 0xfu), scale_bits));
 }
 
 __global__ void decode_q4_0_hip_kernel(const std::uint8_t* __restrict__ table, int hidden_size,

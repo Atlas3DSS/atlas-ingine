@@ -34,13 +34,14 @@
 #include <vector>
 
 namespace ingine {
-namespace {
 
 id<MTLDevice> shared_mtl_device() {
   static id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
   if (!dev) throw std::runtime_error("HAL(MLX/Metal): no Metal GPU device available");
   return dev;
 }
+
+namespace {
 
 std::size_t query_apple_physical_ram() noexcept {
   std::uint64_t memsize = 0;
@@ -59,6 +60,17 @@ struct MtlEventState {
   id<MTLSharedEvent> shared_event = nil;
   std::uint64_t value = 0;
 };
+
+id<MTLCommandQueue> default_mtl_queue() {
+  static std::mutex q_mutex;
+  static id<MTLCommandQueue> default_q = nil;
+  std::lock_guard<std::mutex> lock(q_mutex);
+  if (!default_q) {
+    default_q = [shared_mtl_device() newCommandQueue];
+    if (!default_q) throw std::runtime_error("HAL(MLX/Metal): failed to create default MTLCommandQueue");
+  }
+  return default_q;
+}
 
 struct AllocTable {
   std::mutex mutex;
@@ -112,15 +124,26 @@ bool is_power_of_two(std::size_t value) { return value != 0 && (value & (value -
 
 }  // namespace
 
-id<MTLBuffer> lookup_metal_buffer_for_ptr(const void* ptr, std::size_t& out_offset) {
+id<MTLCommandQueue> metal_queue_for_stream(hal::StreamHandle stream) {
+  if (!stream.native) return default_mtl_queue();
+  auto* st = static_cast<MtlStreamState*>(stream.native);
+  if (!st->queue) throw std::invalid_argument("HAL(MLX/Metal): invalid stream handle without MTLCommandQueue");
+  return st->queue;
+}
+
+id<MTLBuffer> lookup_metal_buffer_for_range(const void* ptr, std::size_t bytes, std::size_t& out_offset) {
+  if (!ptr) return nil;
   std::lock_guard<std::mutex> lock(alloc_table().mutex);
   const auto base_addr = reinterpret_cast<std::uintptr_t>(ptr);
   for (const auto& [base_ptr, buf] : alloc_table().buffers) {
     const auto start = reinterpret_cast<std::uintptr_t>(base_ptr);
     const std::size_t len = static_cast<std::size_t>([buf length]);
-    if (base_addr >= start && base_addr < start + len) {
-      out_offset = static_cast<std::size_t>(base_addr - start);
-      return buf;
+    if (base_addr >= start && (base_addr - start) < len) {
+      const std::size_t off = static_cast<std::size_t>(base_addr - start);
+      if (bytes <= len - off) {
+        out_offset = off;
+        return buf;
+      }
     }
   }
   return nil;
@@ -174,17 +197,26 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
 }
 
 void DeviceBuffer::fill(int byte_value) {
-  if (bytes > 0) std::memset(p, byte_value, bytes);
+  if (bytes > 0) {
+    hal::stream_synchronize(hal::StreamHandle{});
+    std::memset(p, byte_value, bytes);
+  }
 }
 
 void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
   require_range(byte_offset, count, "host-to-device copy");
-  if (count > 0) std::memcpy(static_cast<std::uint8_t*>(p) + byte_offset, source, count);
+  if (count > 0) {
+    hal::stream_synchronize(hal::StreamHandle{});
+    std::memcpy(static_cast<std::uint8_t*>(p) + byte_offset, source, count);
+  }
 }
 
 void DeviceBuffer::copy_to_host(void* destination, std::size_t count, std::size_t byte_offset) const {
   require_range(byte_offset, count, "device-to-host copy");
-  if (count > 0) std::memcpy(destination, static_cast<const std::uint8_t*>(p) + byte_offset, count);
+  if (count > 0) {
+    hal::stream_synchronize(hal::StreamHandle{});
+    std::memcpy(destination, static_cast<const std::uint8_t*>(p) + byte_offset, count);
+  }
 }
 
 void DeviceBuffer::require_range(std::size_t byte_offset, std::size_t count, const char* operation) const {
@@ -456,12 +488,12 @@ void Event::release() noexcept {
 void Event::record(StreamHandle stream) {
   if (!handle_) throw std::logic_error("hal::Event::record on empty event");
   auto* ev = static_cast<MtlEventState*>(handle_.native);
-  auto* st = static_cast<MtlStreamState*>(stream.native);
-  if (!st || !st->queue) throw std::invalid_argument("hal::Event::record(MLX): null stream");
+  id<MTLCommandQueue> q = metal_queue_for_stream(stream);
   @autoreleasepool {
-    id<MTLCommandBuffer> cb = [st->queue commandBuffer];
-    ev->value += 1u;
-    [cb encodeSignalEvent:ev->shared_event value:ev->value];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    if (!cb) throw std::runtime_error("hal::Event::record(MLX): failed to create MTLCommandBuffer");
+    const std::uint64_t next_val = ++ev->value;
+    [cb encodeSignalEvent:ev->shared_event value:next_val];
     [cb commit];
   }
 }
@@ -469,10 +501,10 @@ void Event::record(StreamHandle stream) {
 void Event::wait(StreamHandle stream) const {
   if (!handle_) throw std::logic_error("hal::Event::wait on empty event");
   auto* ev = static_cast<const MtlEventState*>(handle_.native);
-  auto* st = static_cast<MtlStreamState*>(stream.native);
-  if (!st || !st->queue) throw std::invalid_argument("hal::Event::wait(MLX): null stream");
+  id<MTLCommandQueue> q = metal_queue_for_stream(stream);
   @autoreleasepool {
-    id<MTLCommandBuffer> cb = [st->queue commandBuffer];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    if (!cb) throw std::runtime_error("hal::Event::wait(MLX): failed to create MTLCommandBuffer");
     [cb encodeWaitForEvent:ev->shared_event value:ev->value];
     [cb commit];
   }
@@ -571,36 +603,68 @@ void require_conditional_switch_or_eager(const DeviceCaps& caps, bool allow_eage
   require_graph_capture_or_eager(caps, allow_eager, caller, GraphRequirement::ConditionalSwitch);
 }
 
-void memcpy_h2d_async(void* dst_dev, const void* src_host, std::size_t bytes, StreamHandle /*stream*/) {
+void memcpy_h2d_async(void* dst_dev, const void* src_host, std::size_t bytes, StreamHandle stream) {
   if (bytes == 0) return;
   if (!dst_dev || !src_host) throw std::invalid_argument("hal::memcpy_h2d_async(MLX): null pointer");
+  // Drain prior GPU work on `stream` so unified-memory write does not race earlier commands and is visible
+  // before any subsequent command committed on `stream`.
+  stream_synchronize(stream);
   std::memcpy(dst_dev, src_host, bytes);
 }
 
 void memcpy_d2h_async(void* dst_host, const void* src_dev, std::size_t bytes, StreamHandle stream) {
-  stream_synchronize(stream);
   if (bytes == 0) return;
   if (!dst_host || !src_dev) throw std::invalid_argument("hal::memcpy_d2h_async(MLX): null pointer");
+  stream_synchronize(stream);
   std::memcpy(dst_host, src_dev, bytes);
 }
 
-void memcpy_d2d_async(void* dst_dev, const void* src_dev, std::size_t bytes, StreamHandle /*stream*/) {
+void memcpy_d2d_async(void* dst_dev, const void* src_dev, std::size_t bytes, StreamHandle stream) {
   if (bytes == 0) return;
   if (!dst_dev || !src_dev) throw std::invalid_argument("hal::memcpy_d2d_async(MLX): null pointer");
-  std::memcpy(dst_dev, src_dev, bytes);
+  std::size_t src_off = 0, dst_off = 0;
+  id<MTLBuffer> b_src = lookup_metal_buffer_for_range(src_dev, bytes, src_off);
+  id<MTLBuffer> b_dst = lookup_metal_buffer_for_range(dst_dev, bytes, dst_off);
+  if (b_src && b_dst && vendor::mlx::can_async_blit_d2d(b_src == b_dst, src_off, dst_off, bytes)) {
+    id<MTLCommandQueue> q = metal_queue_for_stream(stream);
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = [q commandBuffer];
+      id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+      [blit copyFromBuffer:b_src sourceOffset:src_off toBuffer:b_dst destinationOffset:dst_off size:bytes];
+      [blit endEncoding];
+      [cb commit];
+    }
+    return;
+  }
+  stream_synchronize(stream);
+  std::memmove(dst_dev, src_dev, bytes);
 }
 
-void memset_async(void* dst_dev, int byte_value, std::size_t bytes, StreamHandle /*stream*/) {
+void memset_async(void* dst_dev, int byte_value, std::size_t bytes, StreamHandle stream) {
   if (bytes == 0) return;
   if (!dst_dev) throw std::invalid_argument("hal::memset_async(MLX): null pointer");
+  std::size_t dst_off = 0;
+  id<MTLBuffer> b_dst = lookup_metal_buffer_for_range(dst_dev, bytes, dst_off);
+  if (b_dst) {
+    id<MTLCommandQueue> q = metal_queue_for_stream(stream);
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = [q commandBuffer];
+      id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+      [blit fillBuffer:b_dst range:NSMakeRange(dst_off, bytes) value:static_cast<std::uint8_t>(byte_value)];
+      [blit endEncoding];
+      [cb commit];
+    }
+    return;
+  }
+  stream_synchronize(stream);
   std::memset(dst_dev, byte_value, bytes);
 }
 
 void stream_synchronize(StreamHandle stream) {
-  auto* st = static_cast<MtlStreamState*>(stream.native);
-  if (!st || !st->queue) return;
+  id<MTLCommandQueue> q = metal_queue_for_stream(stream);
   @autoreleasepool {
-    id<MTLCommandBuffer> barrier = [st->queue commandBuffer];
+    id<MTLCommandBuffer> barrier = [q commandBuffer];
+    if (!barrier) throw std::runtime_error("hal::stream_synchronize(MLX): failed to create MTLCommandBuffer");
     [barrier commit];
     [barrier waitUntilCompleted];
   }

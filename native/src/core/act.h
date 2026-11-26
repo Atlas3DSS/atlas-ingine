@@ -114,12 +114,17 @@ inline std::uint16_t host_float_to_bf16_bits(float f) {
   return std::uint16_t((w + 0x7fffu + ((w >> 16) & 1u)) >> 16);
 }
 
-// IEEE-754 binary16 -> binary32 on host (exact).
-inline float host_fp16_bits_to_float(std::uint16_t h) {
+// IEEE-754 binary16 -> binary32 (exact, callable from both host and CUDA/HIP device code).
+#if defined(__CUDACC__) || defined(__HIPCC__)
+__host__ __device__ __forceinline__
+#else
+inline
+#endif
+float fp16_bits_to_float_portable(std::uint16_t h) noexcept {
   const std::uint32_t s = std::uint32_t(h & 0x8000u) << 16;
   const std::uint32_t e = (h >> 10) & 0x1fu;
   const std::uint32_t m = h & 0x03ffu;
-  std::uint32_t w;
+  std::uint32_t w = 0;
   if (e == 0) {
     if (m == 0) {
       w = s;
@@ -138,9 +143,18 @@ inline float host_fp16_bits_to_float(std::uint16_t h) {
   } else {
     w = s | ((e + 112u) << 23) | (m << 13);
   }
-  float f;
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+  return __uint_as_float(w);
+#else
+  float f = 0.0f;
   std::memcpy(&f, &w, 4);
   return f;
+#endif
+}
+
+// IEEE-754 binary16 -> binary32 on host (exact).
+inline float host_fp16_bits_to_float(std::uint16_t h) {
+  return fp16_bits_to_float_portable(h);
 }
 
 // IEEE-754 binary32 -> binary16 on host, round-to-nearest-even, finite values clamped to +-65504.

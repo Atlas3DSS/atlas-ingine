@@ -232,8 +232,8 @@ Studying **Project Maya / StrataEngine** (`v1.1.73`/`v1.1.75`, MIT) alongside `g
 1. **Direct Compressed-to-LDS MoE Tile Streaming (RDNA3/4 Wave32):** Instead of materializing intermediate FP16 weight buffers before GEMM, wave32 RDNA kernels stream compressed NVFP4 / Q4_0 / Q8_0 blocks directly into 64 KiB LDS (`32 KiB` per `256x256` 4-bit tile) and execute `16x16x16` `wmma_f16` (`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32[_gfx12]`) with architecture-specific result row mapping (`wmma_result_row`, handling RDNA3 `2*i + hi` vs RDNA4 `8*hi + i`) and LDS-only barriers (`lds_sync` keeping next global tile loads in flight).
 2. **Packed Byte & Dot4 Instructions Without Scratch Spills:** HIP maps `__byte_perm` to single-instruction `v_perm_b32` (`__builtin_amdgcn_perm`, avoiding HIP's private-memory array fallback), maps signed dot4 to `v_dot4_i32_iu8` (`sudot4`, RDNA3/4) or `v_dot4_i32_i8` (`sdot4`, RDNA2/CDNA), and uses Hacker's Delight SWAR `vsub4` where `gfx11`/`gfx12` lack native packed 8-bit subtract.
 3. **CDNA Wave64 Half-Wavefront Determinism & `-ffp-contract=on`:** Wave64 GPUs (`gfx906`, `gfx908`, `gfx90a`, `gfx942`, `gfx950`) execute 32-lane algorithms inside logical half-wavefronts (`ballot >> (__lane_id() & 32)`), while CDNA3/4 (`gfx942`/`gfx950`) build with `-ffp-contract=on` so clang's SLP vectorizer does not alter `v_pk_fma_f32` contraction across multi-activation vs single-activation GEMVs. EXL3 scalar prompt tile policies (`select_exl3_scalar_rows`: `8`, `auto -> -1`, `12`, `16`, `24`) stay host-testable in `vendor::hip`.
-4. **Unified-Memory Zero-Copy vs Fixed 2.3–3.0 GiB Streaming Ring (Apple Silicon / Mobile):** High-RAM Apple Silicon (`>= 24 GiB` unified RAM) keeps our ~9 GiB EXL3 pack resident in `MTLResourceStorageModeShared`, whereas constrained `4–8 GB` Apple Silicon / iPhone / iPad targets enforce `StreamingBudgetPlan::BoundedStreamingRing` capped at `2.3 GiB` (phone class) or `3.0 GiB` (tablet / 8 GB class) fed by parallel `1 MiB` `pread` chunks (`ParallelReader` / `safetensors_upload_mlx.cpp`).
-5. **Intel Level Zero Direct Alloc & Subgroup `8`/`16`/`32`:** SYCL enables `ze_loader` / Level Zero direct device USM allocation (`INGINE_SYCL_LEVEL_ZERO`) to bypass TTM/DMA-buf system RAM staging on discrete Intel GPUs, selects workgroup sizes cleanly divisible by queried `SubgroupCaps` (`8`/`16`/`32`), and enforces `DNNL_GPU_VENDOR=INTEL`.
+4. **Unified-Memory Budget Planning vs Current Full-Destination Uploader (Apple Silicon / Mobile):** `vendor::mlx::plan_streaming_budget` models when high-RAM Apple Silicon (`>= 24 GiB` unified RAM) fits our ~9 GiB EXL3 pack resident in `MTLResourceStorageModeShared` (`FullUnifiedResident`) versus when constrained `4–8 GB` Apple Silicon / mobile targets should budget a `BoundedStreamingRing` (`2.3 GiB` phone cap / `3.0 GiB` tablet/8 GB cap). Currently, `safetensors_upload_mlx.cpp` implements parallel chunked POSIX `pread` directly into caller-allocated unified shared destination buffers after `hal::stream_synchronize(stream)` and strictly honors `UploadOptions::chunk_bytes` (verified locally at `64 KiB` and `2 MiB` on a `3 MiB` fixture in `core_mlx_uploader_host`); it does **not** yet cap total destination allocations or implement dynamic layer eviction/ring cycling, which remains planned alongside Apple MLX model-runtime bringup.
+5. **Intel Level Zero Direct Alloc & Subgroup `8`/`16`/`32`:** SYCL filters enumeration strictly to verified Intel GPUs (`vendor_id == 0x8086` or `"intel"` vendor string, prioritizing Level Zero over OpenCL without falling back to CPU devices), derives XMX/BF16/architecture flags from queried device info and `sycl::aspect::ext_intel_matrix` (never inferring Battlemage or XMX from subgroup width alone), enables `ze_loader` / Level Zero direct device USM allocation (`INGINE_SYCL_LEVEL_ZERO`) for discrete Intel GPUs, selects workgroup sizes cleanly divisible by queried `SubgroupCaps` (`8`/`16`/`32`), and enforces `DNNL_GPU_VENDOR=INTEL`.
 
 ### 6.2 Caller Contract Clarification (`TokenBoundsMode::DeferredFlag`)
 
@@ -244,7 +244,62 @@ Consistent with `core/ops.h`, whenever a caller runs `TokenBoundsMode::DeferredF
 | Engine / Baseline | Hardware & Context | Status & Measured / Target Role |
 |---|---|---|
 | **`atlas-ingine` (`feat/multi-vendor-backends @ 15309801`)** | RTX PRO 6000 Blackwell WS (`sm_120`), `NVFP4+MXFP8`, `--dense-fp8 --kv-fp8 --spec`, 64K ctx | **HAL signed off (`att-20afe6df`, container `att-91d3b0b1`)**: **`506.8 tok/s`** chat, **`622.7 tok/s`** code, **`14,137 tok/s`** 64K prefill; 48/48 bitlock deterministic; 3/3 model-goldens PASS. *Baseline note:* reported standalone — the `README.md` `fa4ecb9` native row (`460.6 / 586.1`, `job-1124071206-ce294a`) used `--max-ctx 4096 --runs 3` without long prefill and the 64K README rows use Elastic weights (`atlas-12g`/`atlas-10g`), so a matched back-to-back pre-HAL (`b823de5`) vs `15309801` native 64K PRO 6000 comparison remains staged for one post-queue local PRO 6000 lease. |
-| **`atlas-ingine` Native (`feat/multi-vendor-phase3`)** | AMD HIP (`INGINE_BACKEND=HIP`), Apple MLX/Metal (`INGINE_BACKEND=MLX`), Intel SYCL (`INGINE_BACKEND=SYCL`) | **Compile/host-testable pure C++20 slices** (`core_vendor_portability` + CPU/CUDA zero-regression verified); target GPU hardware qualification pending |
+| **`atlas-ingine` Native (`feat/multi-vendor-phase3`)** | AMD HIP (`INGINE_BACKEND=HIP`), Apple MLX/Metal (`INGINE_BACKEND=MLX`), Intel SYCL (`INGINE_BACKEND=SYCL`) | **Compile/host-testable pure C++20 slices**: locally verified via `core_vendor_portability`, `core_arch_ops_cuda` (NVCC `--Werror cross-execution-space-call` device execution of shared `arch_ops.cuh`/`warp.cuh`), `core_mlx_uploader_host` (real `safetensors_upload_mlx.cpp` TU), plus CPU/CUDA zero-regression suites; target HIP/Metal/SYCL device TUs (`hal_{hip,mlx,sycl}.cpp`, `ops_{hip,mlx,sycl}.cpp`, `embed_q4_hip.hip`, `safetensors_upload_{hip,sycl}.cpp`) are source-reviewed only and await target GPU hardware/SDK qualification |
 | **Project Maya (`v1.1.73`/`v1.1.75` MIT)** | RTX 3090 24 GB bare multi-turn Blender (6 seqs / 24 shots; different engine/workload) + AMD ROCm/HIP / Apple Metal ref | External baseline (`README.md` RTX 3090 bare showdown: `atlas-ingine` Native `220.15 tok/s` = `1.86×` Project Maya `118.26 tok/s`, different kernel stack) |
 | **StrataEngine** | Tesla P100 16 GB (thinking off, prompt length unstated; different hardware/workload) | External baseline (`README.md`: `35.0 tok/s`, not directly comparable to `--effort medium` thinking-on runs) |
 | **vLLM / SGLang / Kern / `llama.cpp`** | Single RTX PRO 5000 72 GB (`@SuJinYan123`) & RTX 3090 (`llama.cpp v7+DSpark`) | External baselines (`README.md`: PRO 5000 `c=1` `152`–`256`, `c=8` `478`–`693 tok/s`; 3090 `llama.cpp v7+DSpark` `104.16 tok/s` — different cards, quants, and serving setups) |
+
+---
+
+## 7. AMD Strix Halo (`gfx1151`) + `Qwen3.8-Flash-Next` Performance Floor & `#835`×`#849` Plan (Owner Directive)
+
+### 7.1 Owner-Pinned Minimum Target Floor (`peonist-ai/halogen-flash-server 0.20.7`)
+
+> **Clean-room license boundary:** `peonist-ai/halogen-flash-server` (`0.20.7`) is proprietary under the Peonist EULA. Only the benchmark floor numbers below are recorded as our minimum target to beat; **zero code, binaries, shaders, or implementation artifacts may be inspected or reused**. All `#835` / `#849` Strix Halo work is authored clean-room in native `atlas-ingine` C++20 / HIP.
+
+| Metric | Target Platform / Model | Minimum Floor to Beat (Strict) | Notes / Operating Regime |
+|---|---|---|---|
+| **Decode — Code** | Strix Halo Ryzen AI Max+ 395 128 GB (`gfx1151`) + `Qwen3.8-Flash-Next` | `> 100 tok/s` | Primary coding decode throughput |
+| **Decode — Prose** | Same | `> 70 tok/s` | Long-form prose generation |
+| **Decode — Edit** | Same | `> 121 tok/s` | Targeted code-edit turns |
+| **Decode — Tool** | Same | `> 88 tok/s` | Tool-calling agent turns |
+| **Decode — 6 Languages** | Same | `> 67 tok/s` | Multilingual coding/text benchmark |
+| **Prefill (8K / 32K / 131K)** | Same | `> 1983` / `> 1876` / `> 1796 tok/s` | Sustained long-context prefill without collapse at 131K |
+| **Agent Turn Latency (30K–96K ctx)** | Same | `< 2.1 s` total turn (`< 1.2 s` TTFT) | Warm prefix-cached agentic loop |
+| **Cold Load + 34K Run** | Same | `< 19 s` | Cold process/model load through 34K completion |
+
+### 7.2 First-Principles Clean-Room HIP Architecture Pillars (`#835` × `#849`)
+
+1. **Zero-Copy Unified-Memory Residency (`INGPACK1` + `host_memory_hip.cpp`) for Cold 34K `< 19 s`:**
+   - RDNA 3.5 APUs (`gfx1151`, `HipArchInfo::is_unified_apu == true`) share physical LPDDR5X with the host CPU (`caps.primary_space == MemorySpace::Unified`).
+   - Pair Phase B's 2 MiB-aligned `WeightPack` (`INGPACK1`, `O_DIRECT`-friendly page alignment) with `mmap` + `madvise(MADV_HUGEPAGE)` + `hipHostRegisterMapped` (`host_memory_hip.cpp`) and `hipHostGetDevicePointer` so weights execute zero-copy directly out of page-locked unified host memory without a multi-second H2D duplicate copy.
+2. **Bandwidth-Roofline Decode (`>100` code / `>70` prose / `>121` edit / `>88` tool / `>67` 6-lang):**
+   - Use compact 4-bit / sub-4-bit MoE weights (`#849` Elastic / pack formats) to minimize LPDDR5X byte traffic per routed expert token.
+   - Stream compressed MoE blocks directly into wave32 LDS (`64 KiB`) in `moe` HIP kernels using single-instruction `v_perm_b32` (`__builtin_amdgcn_perm` in `arch_ops.cuh`) and `v_dot4_i32_iu8` (`sudot4`), avoiding scratch spills or intermediate FP16 buffers.
+   - Wire `Qwen3.8-Flash-Next` native MTP speculative drafting over `hal::GraphDefinition` / linear `hipGraph` capture (`decode_graph_hip.cpp`) to amplify tokens per memory read.
+3. **Compute-Bound Long-Context Prefill (`>1983` @ 8K / `>1876` @ 32K / `>1796` @ 131K):**
+   - Use RDNA 3.5 `16x16x16` wave32 WMMA (`hipBLASLt` / `rocBLAS` fallback + fused compressed-to-LDS WMMA) for dense & GDN projections, linear-time chunked Gated DeltaNet (`GDN`) state updates, and tiled FlashAttention-style QSA v2 so throughput stays flat from 8K through 131K.
+4. **Warm 30K–96K Agent Turn Latency (`< 2.1 s` turn, `< 1.2 s` TTFT):**
+   - Reuse `#827` host/device prefix caching with exact hybrid GDN recurrent/conv + partial-RoPE full-attention `BackendStateIdentity` (`qwen38_backend`) so 30K–96K multi-turn agent histories only prefill new delta tokens.
+
+### 7.3 Architectural Boundary (`#835` Hardware Backend vs `#849` Model Family)
+
+| Layer | Scope & Deliverables |
+|---|---|
+| **ROCm/HIP Hardware Backend (`#835`)** | `INGINE_BACKEND=HIP` CMake/HAL/Ops runtime, `gfx1151` unified-APU residency (`INGPACK1` + `hipHostRegisterMapped`), `hipGraph` capture (`decode_graph_hip.cpp`), shared wave32 `arch_ops.cuh`/`warp.cuh` + HIP primitive/fused GEMM/GEMV/GDN/QSA ops, `StrixHaloTargetFloor` policy & clean-room benchmark harness |
+| **`Qwen3.8-Flash-Next` Model Family (`#849`)** | `Qwen3.8-Flash-Next` model-family config/manifest & weight layout, Elastic/4-bit pack export & HF verification, native MTP drafting head wiring, GDN + QSA v2 `BackendStateIdentity` prefix-cache semantics, FP64/CPU oracle parity gates |
+
+### 7.4 Self-Contained External-Tester Verification Harness (`tools/strix_halo_verify.py`)
+
+To allow external verification on physical AMD Strix Halo (`gfx1151`) hardware with zero Python dependencies beyond the standard library, `tools/strix_halo_verify.py` (tested by `tools/test_strix_halo_verify.py`) packages preflight fingerprinting, HIP build/CTest + zero-CUDA `ldd` audit, clean-room OpenAI SSE benchmarking, and strict target-floor scoring into a single entry point alongside the `hip-strix-dev` preset (`native/CMakePresets.json`, `INGINE_HIP_ARCHITECTURES=gfx1151`):
+
+```sh
+python3 tools/strix_halo_verify.py all \
+  --preset hip-strix-dev \
+  --require-gfx1151 \
+  --model-dir /path/to/Qwen3.8-Flash-Next-ingine \
+  --out-dir ./strix_halo_verification_out
+```
+
+- Writes `strix_halo_report.json` (hardware/ROCm provenance, CTest results, per-request timings/token counts/cache-hit ratios, cold process-spawn 34K timing) and `strix_halo_scorecard.md`.
+- Enforces honest labeling: `--fake-smoke` dry runs (used on non-AMD CI hosts to validate the harness against `ingine-serve --fake`) are strictly tagged `UNMEASURED_FAKE_MODE` (`hardware_verified=false`) and cannot pass the real Strix Halo floor gate. Physical `gfx1151` hardware numbers remain **unmeasured** until executed on target Strix Halo silicon with the `#835`+`#849` build.

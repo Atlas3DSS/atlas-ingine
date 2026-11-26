@@ -2,6 +2,7 @@
 // core/arena.h, and core/ops.h on both CPU and CUDA with zero direct CUDA headers in the test translation unit.
 #include "core/act.h"
 #include "core/arena.h"
+#include "core/backend_contract.h"
 #include "core/hal.h"
 #include "core/ops.h"
 #include "common/scalar_oracle.h"
@@ -172,18 +173,13 @@ bool check_decode_q4_bit_exact(hal::Stream& stream) {
 
 bool check_caps_and_graph_policy(const hal::DeviceCaps& caps) {
   bool ok = true;
-#if INGINE_BACKEND_CUDA
-  ok &= (hal::active_backend() == hal::BackendKind::Cuda);
-  ok &= (caps.backend == hal::BackendKind::Cuda);
-  ok &= (caps.subgroup.preferred_width == 32 && caps.subgroup.min_width == 32 && caps.subgroup.max_width == 32);
+  const hal::BackendKind expected_backend = ingine::test_contract::expected_compiled_backend();
+  ok &= (hal::active_backend() == expected_backend);
+  ok &= ingine::test_contract::check_backend_caps_contract(hal::active_backend(), caps);
   ok &= (!hal::conditional_graphs_enabled(-1) && !hal::conditional_graphs_enabled(999));
-#else
-  ok &= (hal::active_backend() == hal::BackendKind::Cpu);
-  ok &= (caps.backend == hal::BackendKind::Cpu);
-  ok &= (!caps.supports_conditional_graph && !caps.supports_graph_capture);
-  ok &= (!hal::conditional_graphs_enabled(0));
-  ok &= (caps.subgroup.preferred_width == 1);
-#endif
+  if (hal::active_backend() != hal::BackendKind::Cuda) {
+    ok &= (!caps.supports_conditional_graph && !hal::conditional_graphs_enabled(0));
+  }
   ok &= (!hal::is_stream_capturing({}));
 
   // Env-off toggle check (restores original env state on exit).
@@ -326,12 +322,16 @@ bool check_embed_q4_rmsnorm_case(int M, const std::vector<std::int64_t>& tok_ids
   run_once(out1, path1);
   run_once(out2, path2);
 
-  const bool expect_fallback =
-      force_fallback || (hal::active_backend() == hal::BackendKind::Cuda &&
-                         (out_stride != kInklingHidden || desc.output_rounding != ops::default_act_rounding()));
+  const bool expect_fallback = ingine::test_contract::expect_embed_q4_fallback(
+      hal::active_backend(), force_fallback, desc.hidden_size, out_stride, desc.output_rounding, desc.eps);
+  const ops::OpResolution resolved = ops::resolve_embed_q4_rmsnorm(desc, /*allow_fallback=*/true);
+  const ops::DispatchPath resolved_effective =
+      force_fallback ? ops::DispatchPath::PortableFallback : resolved.path;
   const ops::DispatchPath expected_path =
       expect_fallback ? ops::DispatchPath::PortableFallback : ops::DispatchPath::Native;
-  bool ok = (path1 == expected_path && path2 == expected_path && out1.size() == out2.size());
+  bool ok = (resolved.supported && resolved.backend == hal::active_backend() &&
+             resolved_effective == expected_path &&
+             path1 == expected_path && path2 == expected_path && out1.size() == out2.size());
   for (std::size_t i = 0; i < out1.size() && ok; ++i) {
     if (std::memcmp(&out1[i], &out2[i], sizeof(float)) != 0) ok = false;
   }
@@ -529,8 +529,8 @@ bool check_token_bounds_contract(int vocab_size, const std::vector<std::uint8_t>
     }
   }
 
-  // 4. On CUDA, PreValidated still guards OOB kernel reads without fabricating zero rows and records invalid_token_flag.
-  if (hal::active_backend() == hal::BackendKind::Cuda) {
+  // 4. Native GPU backends enforce PreValidated kernel OOB guards without fabricating zero rows.
+  if (ingine::test_contract::backend_has_native_prevalidated_guard(hal::active_backend())) {
     const std::vector<std::int64_t> bad_ids = {vocab_size + 5, 0};
     d_tok.copy_from_host(bad_ids.data(), bad_ids.size() * sizeof(std::int64_t));
     d_out.copy_from_host(init_out.data(), init_out.size() * sizeof(float));
@@ -562,7 +562,119 @@ bool check_token_bounds_contract(int vocab_size, const std::vector<std::uint8_t>
 
   std::printf("%s unified token-bounds contract checks (actual-buffer Validate, DeferredFlag, fallback, oracle%s)\n",
               ok ? "PASS" : "FAIL",
-              hal::active_backend() == hal::BackendKind::Cuda ? ", cuda PreValidated kernel guard" : "");
+              ingine::test_contract::backend_has_native_prevalidated_guard(hal::active_backend())
+                  ? ", native PreValidated kernel guard"
+                  : "");
+  return ok;
+}
+
+bool check_stream_ordering_copy_kernel_read(const std::vector<std::uint8_t>& table,
+                                           const std::vector<float>& norm_f32, int vocab_size) {
+  constexpr int M = 2;
+  const std::vector<std::int64_t> ids_a = {3, 17};
+  const std::vector<std::int64_t> ids_b = {5, 19};
+  const std::size_t tok_bytes = std::size_t(M) * sizeof(std::int64_t);
+  const std::size_t out_bytes = std::size_t(M) * kInklingHidden * sizeof(float);
+  const auto desc = ops::make_inkling_embed_q4_desc(M, vocab_size, /*allow_pdl=*/false);
+
+  DeviceBuffer d_tbl(table.size()), d_norm(norm_f32.size() * sizeof(float));
+  d_tbl.copy_from_host(table.data(), table.size());
+  d_norm.copy_from_host(norm_f32.data(), norm_f32.size() * sizeof(float));
+
+  // Build synchronized reference outputs first.
+  hal::Stream ref_stream(0);
+  DeviceBuffer d_ref_tok(tok_bytes), d_ref_out(out_bytes);
+  std::vector<float> ref_a(std::size_t(M) * kInklingHidden, 0.f);
+  std::vector<float> ref_b(std::size_t(M) * kInklingHidden, 0.f);
+  std::vector<float> ref_dec(std::size_t(M) * kInklingHidden, 0.f);
+
+  const ops::EmbedQ4RmsNormArgs ref_args{
+      static_cast<const std::int64_t*>(d_ref_tok.p), d_tbl.p,
+      static_cast<const float*>(d_norm.p), static_cast<float*>(d_ref_out.p), nullptr};
+  hal::memcpy_h2d_async(d_ref_tok.p, ids_a.data(), tok_bytes, ref_stream.handle());
+  (void)ops::run_embed_q4_rmsnorm(desc, ref_args, ref_stream.handle(), false, false);
+  hal::memcpy_d2h_async(ref_a.data(), d_ref_out.p, out_bytes, ref_stream.handle());
+  ref_stream.synchronize();
+
+  hal::memcpy_h2d_async(d_ref_tok.p, ids_b.data(), tok_bytes, ref_stream.handle());
+  (void)ops::run_embed_q4_rmsnorm(desc, ref_args, ref_stream.handle(), false, false);
+  hal::memcpy_d2h_async(ref_b.data(), d_ref_out.p, out_bytes, ref_stream.handle());
+  ops::decode_q4_0(d_tbl.p, M, kInklingHidden, static_cast<float*>(d_ref_out.p), ref_stream.handle());
+  hal::memcpy_d2h_async(ref_dec.data(), d_ref_out.p, out_bytes, ref_stream.handle());
+  ref_stream.synchronize();
+
+  if (std::memcmp(ref_a.data(), ref_b.data(), out_bytes) == 0) return false;
+
+  hal::Stream explicit_stream(0);
+  const std::pair<const char*, hal::StreamHandle> streams[2] = {
+      {"default", hal::StreamHandle{}},
+      {"explicit", explicit_stream.handle()},
+  };
+
+  bool ok = true;
+  DeviceBuffer d_tok(tok_bytes), d_out_a(out_bytes), d_copy_a(out_bytes), d_out_b(out_bytes),
+      d_dec_src(out_bytes), d_dec_copy(out_bytes);
+  for (const auto& [label, s] : streams) {
+    const ops::EmbedQ4RmsNormArgs args_a{
+        static_cast<const std::int64_t*>(d_tok.p), d_tbl.p,
+        static_cast<const float*>(d_norm.p), static_cast<float*>(d_out_a.p), nullptr};
+    const ops::EmbedQ4RmsNormArgs args_b{
+        static_cast<const std::int64_t*>(d_tok.p), d_tbl.p,
+        static_cast<const float*>(d_norm.p), static_cast<float*>(d_out_b.p), nullptr};
+
+    // Enqueue copy -> kernel -> D2D -> clobber memset -> H2D -> kernel -> decode -> D2D -> memset -> D2H
+    // on `s` without intermediate host sync to prove strict in-order execution on default and explicit streams.
+    hal::memset_async(d_out_a.p, 0, out_bytes, s);
+    hal::memset_async(d_copy_a.p, 0, out_bytes, s);
+    hal::memset_async(d_out_b.p, 0, out_bytes, s);
+    hal::memset_async(d_dec_src.p, 0, out_bytes, s);
+    hal::memset_async(d_dec_copy.p, 0, out_bytes, s);
+
+    hal::memcpy_h2d_async(d_tok.p, ids_a.data(), tok_bytes, s);
+    (void)ops::run_embed_q4_rmsnorm(desc, args_a, s, false, false);
+    hal::memcpy_d2d_async(d_copy_a.p, d_out_a.p, out_bytes, s);
+    hal::memset_async(d_out_a.p, 0x5a, out_bytes, s);
+
+    hal::memcpy_h2d_async(d_tok.p, ids_b.data(), tok_bytes, s);
+    (void)ops::run_embed_q4_rmsnorm(desc, args_b, s, false, false);
+
+    ops::decode_q4_0(d_tbl.p, M, kInklingHidden, static_cast<float*>(d_dec_src.p), s);
+    hal::memcpy_d2d_async(d_dec_copy.p, d_dec_src.p, out_bytes, s);
+    hal::memset_async(d_dec_src.p, 0x3c, out_bytes, s);
+
+    hal::Event done(0);
+    done.record(s);
+
+    std::vector<float> got_copy_a(std::size_t(M) * kInklingHidden, 0.f);
+    std::vector<std::uint8_t> got_clobber_a(out_bytes, 0u);
+    std::vector<float> got_b(std::size_t(M) * kInklingHidden, 0.f);
+    std::vector<float> got_dec_copy(std::size_t(M) * kInklingHidden, 0.f);
+    std::vector<std::uint8_t> got_dec_clobber(out_bytes, 0u);
+
+    hal::memcpy_d2h_async(got_copy_a.data(), d_copy_a.p, out_bytes, s);
+    hal::memcpy_d2h_async(got_clobber_a.data(), d_out_a.p, out_bytes, s);
+    hal::memcpy_d2h_async(got_b.data(), d_out_b.p, out_bytes, s);
+    hal::memcpy_d2h_async(got_dec_copy.data(), d_dec_copy.p, out_bytes, s);
+    hal::memcpy_d2h_async(got_dec_clobber.data(), d_dec_src.p, out_bytes, s);
+    hal::stream_synchronize(s);
+    done.synchronize();
+
+    const bool copy_a_ok = (std::memcmp(got_copy_a.data(), ref_a.data(), out_bytes) == 0);
+    const bool b_ok = (std::memcmp(got_b.data(), ref_b.data(), out_bytes) == 0);
+    const bool dec_ok = (std::memcmp(got_dec_copy.data(), ref_dec.data(), out_bytes) == 0);
+    bool clobber_ok = true;
+    for (std::uint8_t v : got_clobber_a) clobber_ok &= (v == 0x5au);
+    for (std::uint8_t v : got_dec_clobber) clobber_ok &= (v == 0x3cu);
+    const bool stream_ok = done.ready() && copy_a_ok && b_ok && dec_ok && clobber_ok;
+    if (!stream_ok) {
+      std::fprintf(stderr, "stream-ordering(%s) failed: copy_a=%d b=%d dec=%d clobber=%d ready=%d\n",
+                   label, int(copy_a_ok), int(b_ok), int(dec_ok), int(clobber_ok), int(done.ready()));
+    }
+    ok &= stream_ok;
+  }
+
+  std::printf("%s stream ordering (copy -> kernel -> D2D -> memset -> read on default & explicit streams)\n",
+              ok ? "PASS" : "FAIL");
   return ok;
 }
 
@@ -625,6 +737,7 @@ int main() {
                                     kInklingHidden, stream, arena, alt_rounding);
 
   ok &= check_token_bounds_contract(V, table, norm_f32, stream);
+  ok &= check_stream_ordering_copy_kernel_read(table, norm_f32, V);
 
   // Explicit rejection checks: disabled fallback and invalid descriptors.
   {
@@ -658,7 +771,7 @@ int main() {
     }
     ok &= invalid_stride_rejected;
 
-    if (hal::active_backend() == hal::BackendKind::Cuda) {
+    if (ingine::test_contract::backend_rejects_strided_without_fallback(hal::active_backend())) {
       auto strided = packed_desc;
       strided.out_row_stride = kInklingHidden + 64;
       const ops::OpResolution res = ops::resolve_embed_q4_rmsnorm(strided, /*allow_fallback=*/false);

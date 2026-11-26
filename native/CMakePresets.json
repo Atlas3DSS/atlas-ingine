@@ -112,6 +112,15 @@
       }
     },
     {
+      "name": "hip-strix-dev",
+      "displayName": "AMD Strix Halo (gfx1151) ROCm/HIP pure native C++ backend build (zero CUDA)",
+      "inherits": "hip-dev",
+      "binaryDir": "${sourceDir}/build-hip-gfx1151",
+      "cacheVariables": {
+        "INGINE_HIP_ARCHITECTURES": "gfx1151"
+      }
+    },
+    {
       "name": "mlx-dev",
       "displayName": "Apple MLX C++20 / Metal native backend build (macOS Apple Silicon)",
       "generator": "Ninja",
@@ -147,6 +156,7 @@
     { "name": "legacy-fp16", "configurePreset": "legacy-fp16" },
     { "name": "cpu-dev", "configurePreset": "cpu-dev" },
     { "name": "hip-dev", "configurePreset": "hip-dev" },
+    { "name": "hip-strix-dev", "configurePreset": "hip-strix-dev" },
     { "name": "mlx-dev", "configurePreset": "mlx-dev" },
     { "name": "sycl-dev", "configurePreset": "sycl-dev" }
   ],
@@ -179,6 +189,11 @@
     {
       "name": "hip-dev",
       "configurePreset": "hip-dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "hip-strix-dev",
+      "configurePreset": "hip-strix-dev",
       "output": { "outputOnFailure": true }
     },
     {

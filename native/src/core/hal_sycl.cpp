@@ -28,6 +28,11 @@
 namespace ingine {
 namespace {
 
+std::string to_lower_ascii(std::string s) {
+  for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return s;
+}
+
 std::vector<sycl::device> enumerate_sycl_devices() {
   static const bool guard_applied = [] {
     if (std::getenv("DNNL_GPU_VENDOR") == nullptr) {
@@ -36,17 +41,30 @@ std::vector<sycl::device> enumerate_sycl_devices() {
     return true;
   }();
   (void)guard_applied;
-  auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
-  if (!gpus.empty()) return gpus;
-  return sycl::device::get_devices(sycl::info::device_type::all);
+  const auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
+  if (gpus.empty()) return {};
+  std::vector<std::string> lower_vendors;
+  lower_vendors.reserve(gpus.size());
+  std::vector<vendor::sycl::SyclDeviceCandidate> cands;
+  cands.reserve(gpus.size());
+  for (const auto& dev : gpus) {
+    lower_vendors.push_back(to_lower_ascii(dev.get_info<sycl::info::device::vendor>()));
+    const auto vid = static_cast<std::uint32_t>(dev.get_info<sycl::info::device::vendor_id>());
+    const bool is_l0 = (dev.get_backend() == sycl::backend::ext_oneapi_level_zero);
+    cands.push_back(vendor::sycl::SyclDeviceCandidate{dev.is_gpu(), is_l0, lower_vendors.back(), vid});
+  }
+  const std::vector<std::size_t> indices = vendor::sycl::select_intel_gpu_indices(cands);
+  std::vector<sycl::device> out;
+  out.reserve(indices.size());
+  for (const std::size_t idx : indices) out.push_back(gpus[idx]);
+  return out;
 }
 
 const sycl::device& get_sycl_device(int device_id) {
-  const auto& devs = enumerate_sycl_devices();
-  static std::vector<sycl::device> cached = devs;
-  if (cached.empty()) throw std::runtime_error("HAL(SYCL): no SYCL devices available");
+  static const std::vector<sycl::device> cached = enumerate_sycl_devices();
+  if (cached.empty()) throw std::runtime_error("HAL(SYCL): no Intel GPU SYCL devices available");
   if (device_id < 0 || static_cast<std::size_t>(device_id) >= cached.size()) {
-    throw std::invalid_argument("HAL(SYCL): invalid device id " + std::to_string(device_id));
+    throw std::invalid_argument("HAL(SYCL): invalid Intel GPU device id " + std::to_string(device_id));
   }
   return cached[static_cast<std::size_t>(device_id)];
 }
@@ -67,6 +85,8 @@ sycl::queue* unwrap_queue(hal::StreamHandle stream) {
 }
 
 }  // namespace
+
+const sycl::device& sycl_device_for_id(int device_id) { return get_sycl_device(device_id); }
 
 sycl::queue* sycl_queue_for_stream(hal::StreamHandle stream) { return unwrap_queue(stream); }
 
@@ -367,7 +387,8 @@ std::uint64_t mem_available_bytes() { return read_meminfo_kib("MemAvailable:"); 
 namespace hal {
 
 Stream::Stream(int device_id) : device_id_(device_id) {
-  auto* q = new sycl::queue{get_sycl_device(device_id), sycl::property::queue::in_order{}};
+  auto* q = new sycl::queue{default_device_queue(device_id).get_context(), get_sycl_device(device_id),
+                            sycl::property::queue::in_order{}};
   handle_ = StreamHandle::from_native(q);
 }
 
@@ -460,27 +481,52 @@ bool conditional_graphs_enabled(int /*device_id*/) { return false; }
 DeviceCaps query_device_caps(int device_id) {
   const sycl::device& dev = get_sycl_device(device_id);
   const std::string raw_name = dev.get_info<sycl::info::device::name>();
-  std::string lower_name = raw_name;
-  for (char& ch : lower_name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  const std::string lower_name = to_lower_ascii(raw_name);
+  const std::string lower_vendor = to_lower_ascii(dev.get_info<sycl::info::device::vendor>());
+  const auto vendor_id = static_cast<std::uint32_t>(dev.get_info<sycl::info::device::vendor_id>());
   const auto sg_sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
-  int min_sg = 8, max_sg = 16;
+  int min_sg = 0, max_sg = 0;
+  bool sg8 = false, sg16 = false, sg32 = false;
   if (!sg_sizes.empty()) {
     min_sg = static_cast<int>(*std::min_element(sg_sizes.begin(), sg_sizes.end()));
     max_sg = static_cast<int>(*std::max_element(sg_sizes.begin(), sg_sizes.end()));
+    for (const auto w : sg_sizes) {
+      if (w == 8) sg8 = true;
+      else if (w == 16) sg16 = true;
+      else if (w == 32) sg32 = true;
+    }
   }
-  const auto arch = vendor::sycl::classify_intel_device(lower_name, max_sg);
+
+  vendor::sycl::SyclDeviceProbe probe;
+  probe.is_gpu = dev.is_gpu();
+  probe.is_level_zero = (dev.get_backend() == sycl::backend::ext_oneapi_level_zero);
+  probe.host_unified_memory = dev.get_info<sycl::info::device::host_unified_memory>();
+  probe.vendor_lower = lower_vendor;
+  probe.vendor_id = vendor_id;
+  probe.name_lower = lower_name;
+  probe.min_subgroup = min_sg;
+  probe.max_subgroup = max_sg;
+  probe.supports_sg8 = sg8;
+  probe.supports_sg16 = sg16;
+  probe.supports_sg32 = sg32;
+  probe.has_runtime_xmx_dpas = dev.has(sycl::aspect::ext_intel_matrix);
+  probe.has_runtime_bf16 = dev.has(sycl::aspect::ext_oneapi_bfloat16_math_functions);
+
+  const auto arch = vendor::sycl::classify_intel_device(probe);
+  if (arch.preferred_subgroup <= 0) {
+    throw std::runtime_error("HAL(SYCL): selected device is not a validated Intel GPU with subgroup support: " +
+                             raw_name);
+  }
 
   DeviceCaps caps;
   caps.backend = BackendKind::Sycl;
-  caps.primary_space = dev.has(sycl::aspect::usm_host_allocations) && !dev.is_gpu()
-                           ? MemorySpace::Host
-                           : MemorySpace::Device;
+  caps.primary_space = MemorySpace::Device;
   caps.name = raw_name;
   caps.arch_name = arch.has_xmx_dpas ? "intel-xe-xmx" : "intel-xe";
   caps.device_id = device_id;
-  caps.subgroup = SubgroupCaps{min_sg, max_sg, arch.preferred_subgroup};
+  caps.subgroup = SubgroupCaps{arch.min_subgroup, arch.max_subgroup, arch.preferred_subgroup};
   caps.max_shared_mem_bytes = static_cast<std::size_t>(dev.get_info<sycl::info::device::local_mem_size>());
-  caps.supports_bf16 = dev.has(sycl::aspect::ext_oneapi_bfloat16_math_functions) || arch.has_xmx_dpas;
+  caps.supports_bf16 = probe.has_runtime_bf16;
   caps.supports_fp16 = dev.has(sycl::aspect::fp16);
   caps.supports_fp8_e4m3 = false;
   caps.supports_graph_capture = false;
@@ -488,7 +534,7 @@ DeviceCaps query_device_caps(int device_id) {
   caps.supports_pdl = false;
   caps.supports_wmma_or_xmx = arch.has_xmx_dpas;
   caps.prefers_direct_device_alloc = arch.prefer_level_zero_direct_alloc;
-  caps.unified_memory = dev.get_info<sycl::info::device::host_unified_memory>();
+  caps.unified_memory = probe.host_unified_memory;
   return caps;
 }
 

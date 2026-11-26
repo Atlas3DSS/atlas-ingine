@@ -19,6 +19,9 @@
 #include <vector>
 
 namespace ingine {
+const sycl::device& sycl_device_for_id(int device_id);
+sycl::queue* sycl_queue_for_stream(hal::StreamHandle stream);
+
 namespace {
 
 std::atomic<int> g_fail_worker_index{-1};
@@ -46,10 +49,7 @@ struct DeviceUploader::Impl {
     if (options_.chunk_bytes > std::numeric_limits<std::size_t>::max() / n) {
       throw std::invalid_argument("DeviceUploader(SYCL): staging size overflows");
     }
-    queue_.emplace(sycl::device::get_devices(sycl::info::device_type::gpu).empty()
-                       ? sycl::device{sycl::default_selector_v}
-                       : sycl::device{sycl::gpu_selector_v},
-                   sycl::property::queue::in_order{});
+    queue_ = sycl_queue_for_stream(hal::StreamHandle{});
     pinned_ = sycl::aligned_alloc_host(4096, options_.chunk_bytes * n, *queue_);
     if (!pinned_) throw std::runtime_error("DeviceUploader(SYCL): aligned_alloc_host failed");
     slots_.resize(n);
@@ -91,12 +91,12 @@ struct DeviceUploader::Impl {
     for (Slot& s : slots_) {
       if (s.copy_inflight) s.done.wait();
     }
-    if (pinned_) sycl::free(pinned_, *queue_);
+    if (pinned_ && queue_ != nullptr) sycl::free(pinned_, *queue_);
   }
 
   UploadStats upload(std::span<const UploadRequest> requests, hal::StreamHandle stream) {
     const auto start = std::chrono::steady_clock::now();
-    sycl::queue* target_q = stream.native ? static_cast<sycl::queue*>(stream.native) : &(*queue_);
+    sycl::queue* target_q = stream.native ? static_cast<sycl::queue*>(stream.native) : sycl_queue_for_stream(stream);
     std::vector<Chunk> chunks;
     UploadStats stats;
     for (const UploadRequest& r : requests) {
@@ -208,7 +208,7 @@ struct DeviceUploader::Impl {
   }
 
   UploadOptions options_;
-  std::optional<sycl::queue> queue_;
+  sycl::queue* queue_ = nullptr;
   sycl::queue* active_queue_ = nullptr;
   void* pinned_ = nullptr;
   std::vector<Slot> slots_;

@@ -119,14 +119,21 @@ INGINE_ARCH_HD std::uint32_t vsub4_u8(std::uint32_t ua, std::uint32_t ub) noexce
 }
 
 // Canonical Q4_0 SoA single-nibble decode rule matching CUDA/CPU bit-for-bit (including negative scale * nibble=8 -> +0.0f).
+// Fully host- and device-callable without host-only calls.
 INGINE_ARCH_HD float decode_q4_0_nibble_canonical(std::uint8_t nibble, std::uint16_t fp16_scale_bits) noexcept {
-  const float d_raw = ingine::act::host_fp16_bits_to_float(fp16_scale_bits);
-  const float d = std::isfinite(d_raw) ? d_raw : 0.0f;
-  const float m8d = -8.0f * d;
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-  return fmaf(static_cast<float>(nibble & 0x0fu), d, m8d);
+  if ((fp16_scale_bits & 0x7c00u) == 0x7c00u) return 0.0f;
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && INGINE_BACKEND_CUDA
+  const float d = __half2float(__ushort_as_half(fp16_scale_bits));
+  return fmaf(static_cast<float>(nibble & 0x0fu), d, -8.0f * d);
+#elif defined(__HIP_DEVICE_COMPILE__) && INGINE_BACKEND_HIP
+  const float d = __half2float(*reinterpret_cast<const __half*>(&fp16_scale_bits));
+  return fmaf(static_cast<float>(nibble & 0x0fu), d, -8.0f * d);
+#elif defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+  const float d = ingine::act::fp16_bits_to_float_portable(fp16_scale_bits);
+  return fmaf(static_cast<float>(nibble & 0x0fu), d, -8.0f * d);
 #else
-  return std::fmaf(static_cast<float>(nibble & 0x0fu), d, m8d);
+  const float d = ingine::act::fp16_bits_to_float_portable(fp16_scale_bits);
+  return std::fmaf(static_cast<float>(nibble & 0x0fu), d, -8.0f * d);
 #endif
 }
 

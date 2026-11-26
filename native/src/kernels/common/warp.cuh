@@ -5,23 +5,29 @@
 
 #include <cstdint>
 
-#if defined(__HIP_DEVICE_COMPILE__)
+#if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_version.h>
-#elif defined(__CUDA_ARCH__)
+#elif defined(__CUDACC__)
 #include <cuda_runtime.h>
 #endif
 
 namespace ingine::kernels::warp {
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define INGINE_WARP_HD __host__ __device__ __forceinline__
+#else
+#define INGINE_WARP_HD inline
+#endif
+
 inline constexpr std::uint32_t kFullWave32Mask = 0xffffffffu;
 
 // Shifts a 64-lane CDNA ballot down by 32 when executing in the upper half-wavefront, yielding the local 32-lane mask.
-inline std::uint32_t logical_32_half_ballot(std::uint64_t wave64_ballot, int lane_id) noexcept {
+INGINE_WARP_HD std::uint32_t logical_32_half_ballot(std::uint64_t wave64_ballot, int lane_id) noexcept {
   return static_cast<std::uint32_t>(wave64_ballot >> (lane_id & 32));
 }
 
-#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__CUDACC__) && !defined(__HIPCC__)
 
 __device__ __forceinline__ int lane_id_32() noexcept { return static_cast<int>(threadIdx.x & 31u); }
 
@@ -39,21 +45,23 @@ __device__ __forceinline__ std::uint32_t ballot_32(int pred) noexcept {
   return __ballot_sync(kFullWave32Mask, pred);
 }
 
-#elif defined(__HIP_DEVICE_COMPILE__)
+#elif defined(__HIPCC__)
 
 __device__ __forceinline__ int lane_id_32() noexcept { return static_cast<int>(threadIdx.x & 31u); }
 
 __device__ __forceinline__ void sync_32() noexcept {
+#if defined(__HIP_DEVICE_COMPILE__)
 #ifdef INGINE_HIP_WAVE64
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
   __builtin_amdgcn_wave_barrier();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-#elif HIP_VERSION_MAJOR >= 7
+#elif defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >= 7)
   __syncwarp(kFullWave32Mask);
 #else
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
   __builtin_amdgcn_wave_barrier();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+#endif
 #endif
 }
 
@@ -74,6 +82,7 @@ using wmma_h16 = _Float16 __attribute__((ext_vector_type(16)));
 using wmma_f8 = float __attribute__((ext_vector_type(8)));
 
 __device__ __forceinline__ wmma_f8 wmma_f16(wmma_h16 a, wmma_h16 b, wmma_f8 c) noexcept {
+#if defined(__HIP_DEVICE_COMPILE__)
 #if defined(__GFX12__)
   using h8 = _Float16 __attribute__((ext_vector_type(8)));
   const int k0 = static_cast<int>((threadIdx.x & 31u) / 16u) * 8;
@@ -87,18 +96,25 @@ __device__ __forceinline__ wmma_f8 wmma_f16(wmma_h16 a, wmma_h16 b, wmma_f8 c) n
 #else
   return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 #endif
+#else
+  (void)a;
+  (void)b;
+  return c;
+#endif
 }
 
 __device__ __forceinline__ void lds_sync() noexcept {
+#if defined(__HIP_DEVICE_COMPILE__)
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
   __builtin_amdgcn_s_barrier();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#endif
 }
 #endif  // __GFX11__ || __GFX12__
 
 #endif  // device dialects
 
-#if (defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)) || defined(__HIP_DEVICE_COMPILE__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 __device__ __forceinline__ float reduce_sum_32(float val) noexcept {
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) val += shfl_down_f32(val, o);
@@ -120,5 +136,7 @@ __device__ __forceinline__ float allreduce_max_32(float val) noexcept {
   return val;
 }
 #endif
+
+#undef INGINE_WARP_HD
 
 }  // namespace ingine::kernels::warp
