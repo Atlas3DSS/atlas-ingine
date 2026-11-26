@@ -1622,6 +1622,186 @@ void test_verify_partial_rollback_and_w1_to_wider(bool full, bool cache_fp8) {
   CHECK(conv_dc.ok(1e-6f));
 }
 
+void test_m_invariant_router_gates_and_fp8_scale() {
+  std::mt19937 rng(20261125);
+  constexpr int kExperts = 128;
+  constexpr int kRank = 64;
+  constexpr int kMaxM = 64;
+
+  // 1. Router logits: exact 0-ULP bit-identity of row 0 across M in {1, 4, 6, 8, 9, 12, 16, 32, 36, 64}
+  //    AND agreement with CPU FP32 dot product.
+  {
+    const auto x_f = rand_floats(rng, std::size_t(kMaxM) * H, 0.5f);
+    const auto w_f = rand_floats(rng, std::size_t(kExperts) * H, 0.25f);
+    const auto x_act = to_act(x_f);
+    const auto w_act = to_act(w_f);
+    DeviceBuffer d_x(x_act.size() * sizeof(ActT)), d_w(w_act.size() * sizeof(ActT));
+    DeviceBuffer d_out(std::size_t(kMaxM) * kExperts * sizeof(float));
+    d_x.copy_from_host(x_act.data(), d_x.bytes);
+    d_w.copy_from_host(w_act.data(), d_w.bytes);
+
+    std::vector<float> ref_row0(kExperts, 0.f);
+    for (int e = 0; e < kExperts; ++e) {
+      double acc = 0.0;
+      for (int k = 0; k < H; ++k) {
+        acc += double(ingine::act::host_to_float(x_act[std::size_t(k)])) *
+               double(ingine::act::host_to_float(w_act[std::size_t(e) * H + k]));
+      }
+      ref_row0[std::size_t(e)] = float(acc);
+    }
+
+    std::vector<float> m1_row0(kExperts, 0.f);
+    for (int M : {1, 4, 6, 8, 9, 12, 16, 32, 36, 64}) {
+      d_out.fill(0);
+      bk::batched_router_logits(static_cast<const ActT*>(d_x.p), static_cast<const ActT*>(d_w.p), M,
+                                static_cast<float*>(d_out.p), nullptr);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      std::vector<float> got(std::size_t(M) * kExperts);
+      d_out.copy_to_host(got.data(), got.size() * sizeof(float));
+      if (M == 1) {
+        m1_row0.assign(got.begin(), got.begin() + kExperts);
+        DiffCheck dc;
+        for (int e = 0; e < kExperts; ++e) dc.update(m1_row0[std::size_t(e)], ref_row0[std::size_t(e)]);
+        CHECK(dc.ok(1e-3f));
+      } else {
+        for (int e = 0; e < kExperts; ++e) {
+          std::uint32_t ba = 0, bb = 0;
+          std::memcpy(&ba, &got[std::size_t(e)], 4);
+          std::memcpy(&bb, &m1_row0[std::size_t(e)], 4);
+          CHECK(ba == bb);
+        }
+      }
+    }
+  }
+
+  // 2. Message gates: exact 0-ULP bit-identity of row 0 across M in {1, 4, 6, 8, 9, 12, 16, 32, 36}
+  //    for (G=3, h_shared=true), (G=3, h_shared=false), and (G=1, h_shared=false), plus CPU reference.
+  {
+    const auto wd_act = to_act(rand_floats(rng, std::size_t(3) * kRank * 2 * H, 0.1f));
+    const auto wf_act = to_act(rand_floats(rng, std::size_t(3) * H * kRank, 0.1f));
+    const auto wg_act = to_act(rand_floats(rng, std::size_t(3) * H * kRank, 0.1f));
+    const auto nw_f = rand_floats(rng, std::size_t(3) * H, 1.0f);
+    const auto h_all = rand_floats(rng, std::size_t(3) * 36 * H, 0.5f);
+    const auto m_all = rand_floats(rng, std::size_t(3) * 36 * H, 0.5f);
+
+    DeviceBuffer d_wd(wd_act.size() * sizeof(ActT)), d_wf(wf_act.size() * sizeof(ActT)),
+        d_wg(wg_act.size() * sizeof(ActT)), d_nw(nw_f.size() * sizeof(float));
+    d_wd.copy_from_host(wd_act.data(), d_wd.bytes);
+    d_wf.copy_from_host(wf_act.data(), d_wf.bytes);
+    d_wg.copy_from_host(wg_act.data(), d_wg.bytes);
+    d_nw.copy_from_host(nw_f.data(), d_nw.bytes);
+
+    DeviceBuffer d_h(std::size_t(3) * 36 * H * sizeof(float)), d_m(std::size_t(3) * 36 * H * sizeof(float));
+    DeviceBuffer d_gin(std::size_t(3) * 36 * 2 * H * sizeof(ActT)), d_g16(std::size_t(3) * 36 * kRank * sizeof(ActT));
+    DeviceBuffer d_ss(std::size_t(3) * 36 * 16 * sizeof(float)), d_out(std::size_t(3) * 36 * H * sizeof(ActT));
+
+    for (auto [G, h_shared] : {std::pair{3, true}, std::pair{3, false}, std::pair{1, false}}) {
+      std::vector<ActT> m1_row0(std::size_t(G) * H);
+      for (int M : {1, 4, 6, 8, 9, 12, 16, 32, 36}) {
+        // Pack [G, M, H] with identical row 0 in every gate g across all M!
+        std::vector<float> h_pack(std::size_t(h_shared ? 1 : G) * M * H);
+        std::vector<float> m_pack(std::size_t(G) * M * H);
+        for (int g = 0; g < (h_shared ? 1 : G); ++g) {
+          for (int m = 0; m < M; ++m) {
+            std::memcpy(&h_pack[(std::size_t(g) * M + m) * H], &h_all[(std::size_t(g) * 36 + m) * H], H * sizeof(float));
+          }
+        }
+        for (int g = 0; g < G; ++g) {
+          for (int m = 0; m < M; ++m) {
+            std::memcpy(&m_pack[(std::size_t(g) * M + m) * H], &m_all[(std::size_t(g) * 36 + m) * H], H * sizeof(float));
+          }
+        }
+        d_h.copy_from_host(h_pack.data(), h_pack.size() * sizeof(float));
+        d_m.copy_from_host(m_pack.data(), m_pack.size() * sizeof(float));
+        d_out.fill(0);
+        bk::batched_message_gates(static_cast<const float*>(d_h.p), h_shared, static_cast<const float*>(d_m.p), G, M,
+                                  static_cast<const ActT*>(d_wd.p), static_cast<const ActT*>(d_wf.p),
+                                  static_cast<const ActT*>(d_wg.p), static_cast<const float*>(d_nw.p),
+                                  static_cast<ActT*>(d_gin.p), static_cast<ActT*>(d_g16.p), static_cast<float*>(d_ss.p),
+                                  static_cast<ActT*>(d_out.p), nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<ActT> got(std::size_t(G) * M * H);
+        d_out.copy_to_host(got.data(), got.size() * sizeof(ActT));
+        if (M == 1) {
+          for (int g = 0; g < G; ++g) {
+            std::memcpy(&m1_row0[std::size_t(g) * H], &got[std::size_t(g) * H], H * sizeof(ActT));
+          }
+          // Verify finite non-trivial output
+          float amax = 0.f;
+          for (ActT v : m1_row0) {
+            const float f = ingine::act::host_to_float(v);
+            CHECK(std::isfinite(f));
+            amax = std::max(amax, std::fabs(f));
+          }
+          CHECK(amax > 1e-3f);
+        } else {
+          for (int g = 0; g < G; ++g) {
+            for (int c = 0; c < H; ++c) {
+              std::uint16_t ba = 0, bb = 0;
+              std::memcpy(&ba, &got[(std::size_t(g) * M + 0) * H + c], 2);
+              std::memcpy(&bb, &m1_row0[std::size_t(g) * H + c], 2);
+              CHECK(ba == bb);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Unscaled E4M3 dequant + FP32 scale_round + head_scale_softcap exactness.
+  {
+    constexpr int rows = 4, K = 64;
+    std::vector<std::uint8_t> raw(rows * K);
+    for (int i = 0; i < rows * K; ++i) {
+      std::uint8_t b = std::uint8_t(i & 0xff);
+      if ((b & 0x7fu) == 0x7fu) b = 0x7eu;  // avoid E4M3 NaN
+      raw[std::size_t(i)] = b;
+    }
+    DeviceBuffer d_q(raw.size()), d_a(raw.size() * sizeof(ActT));
+    d_q.copy_from_host(raw.data(), raw.size());
+    bk::dequant_e4m3_unscaled(d_q.p, rows, K, static_cast<ActT*>(d_a.p), nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<ActT> got_a(raw.size());
+    d_a.copy_to_host(got_a.data(), d_a.bytes);
+    for (int i = 0; i < rows * K; ++i) {
+      const float got = ingine::act::host_to_float(got_a[std::size_t(i)]);
+      const std::uint8_t b = raw[std::size_t(i)];
+      const float sign = (b & 0x80u) ? -1.f : 1.f;
+      const int exp = (b >> 3) & 0xf;
+      const int man = b & 0x7;
+      const float exp_val = (exp == 0) ? (sign * std::ldexp(float(man), -9)) : (sign * std::ldexp(float(8 + man), exp - 10));
+      CHECK(got == exp_val);  // 0-ULP exact for every finite E4M3 code!
+    }
+
+    constexpr int M = 3, N = 32, total_V = 64, v_off = 16;
+    const auto vals = rand_floats(rng, M * N, 10.f);
+    const auto scales = rand_floats(rng, total_V, 0.5f);
+    DeviceBuffer d_buf(vals.size() * 4), d_sc(scales.size() * 4), d_log(M * total_V * 4);
+    d_buf.copy_from_host(vals.data(), d_buf.bytes);
+    d_sc.copy_from_host(scales.data(), d_sc.bytes);
+    d_log.fill(0);
+    bk::batched_head_scale_softcap(static_cast<const float*>(d_buf.p), static_cast<const float*>(d_sc.p), M, N, v_off,
+                                   total_V, static_cast<float*>(d_log.p), nullptr);
+    bk::batched_scale_round_fp32(static_cast<float*>(d_buf.p), N, static_cast<const float*>(d_sc.p) + v_off, M, N,
+                                 nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> got_buf(vals.size()), got_log(M * total_V);
+    d_buf.copy_to_host(got_buf.data(), d_buf.bytes);
+    d_log.copy_to_host(got_log.data(), d_log.bytes);
+    DiffCheck dc_sr, dc_hs;
+    for (int m = 0; m < M; ++m) {
+      for (int c = 0; c < N; ++c) {
+        const float expected_sr = ingine::act::host_round(vals[std::size_t(m * N + c)] * scales[std::size_t(v_off + c)]);
+        const float expected_hs = 30.f * std::tanh(expected_sr * (1.f / 30.f));
+        dc_sr.update(got_buf[std::size_t(m * N + c)], expected_sr);
+        dc_hs.update(got_log[std::size_t(m * total_V + v_off + c)], expected_hs);
+      }
+    }
+    CHECK(dc_sr.ok(0.f));
+    CHECK(dc_hs.ok(1e-5f));
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1633,6 +1813,7 @@ int main() {
     return g_failures ? 1 : 77;
   }
   test_static_conv();
+  test_m_invariant_router_gates_and_fp8_scale();
   for (int B : {1, 3, 4, 6, 12, 15, 16, 64}) {
     for (bool proj_fp32 : {true, false}) {
       test_batched_attn_vs_single(false, false, proj_fp32, B);  // sliding

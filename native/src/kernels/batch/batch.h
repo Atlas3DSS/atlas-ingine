@@ -112,6 +112,27 @@ void copy_tail_kv_to_pool_page(const void* src_tail_k, const void* src_tail_v, i
 void batched_head_softcap(const ActT* in, int B, int chunk_V, int v_offset, int total_V, float* out,
                           cudaStream_t stream);
 
+// Exact unscaled E4M3 -> ActT conversion (0-ULP lossless; row scale is applied once in FP32 after GEMM).
+void dequant_e4m3_unscaled(const void* q, int rows, int K, ActT* out, cudaStream_t stream);
+
+// Multiplies each FP32 GEMM output row by optional per-column FP32 weight scale and rounds once to ActT.
+void batched_scale_round_fp32(float* buf, int ld, const float* scale, int M, int N, cudaStream_t stream);
+
+// Applies optional per-row FP32 unembed scale, rounds once to ActT, and applies 30*tanh(x/30) into logits.
+void batched_head_scale_softcap(const float* in, const float* scale, int M, int chunk_V, int v_offset, int total_V,
+                                float* out, cudaStream_t stream);
+
+// Deterministic M-invariant MoE router logits `[M, 128]` FP32 from `x [M, 2304]` and `w [128, 2304]` ActT.
+// Uses a fixed K-reduction order identical across all M >= 1 (0 ULP cross-batch-size drift).
+void batched_router_logits(const ActT* x, const ActT* w, int M, float* out, cudaStream_t stream);
+
+// Deterministic M-invariant loop-pass message gates for all M >= 1 (0 ULP cross-batch-size drift).
+// `gin` is `[G, M, 2 * 2304]` ActT (aliased internally as FP32 `[G, M, 2304]` gated scratch after down-proj);
+// `g16` is `[G, M, 64]` ActT; `ssall` is `[G, M, 16]` FP32.
+void batched_message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const ActT* w_down,
+                           const ActT* w_forget, const ActT* w_gain, const float* norm_w, ActT* gin, ActT* g16,
+                           float* ssall, ActT* out_bf16, cudaStream_t stream);
+
 // Advances slot_pos[slot_ids[b]] += 1 on device for every b in [0, B) with slot_ids[b] >= 0.
 void batched_advance_pos(const std::int32_t* slot_ids, int B, std::int64_t* slot_pos, cudaStream_t stream);
 

@@ -902,6 +902,314 @@ __global__ void batched_head_softcap_kernel(const ActT* __restrict__ in, int B, 
   out[std::size_t(b) * total_V + v_offset + v] = 30.f * tanhf(x * (1.f / 30.f));
 }
 
+__global__ void dequant_e4m3_unscaled_kernel(const __nv_fp8_storage_t* __restrict__ q, long long total16,
+                                             ActT* __restrict__ out) {
+  const long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
+  if (i >= total16) return;
+  const uint4 u = reinterpret_cast<const uint4*>(q)[i];
+  float f0[8], f1[8];
+  unpack8(make_uint2(u.x, u.y), f0);
+  unpack8(make_uint2(u.z, u.w), f1);
+  uint4* dst = reinterpret_cast<uint4*>(out + i * 16);
+  dst[0] = make_uint4(act::pack2(f0[0], f0[1]), act::pack2(f0[2], f0[3]),
+                      act::pack2(f0[4], f0[5]), act::pack2(f0[6], f0[7]));
+  dst[1] = make_uint4(act::pack2(f1[0], f1[1]), act::pack2(f1[2], f1[3]),
+                      act::pack2(f1[4], f1[5]), act::pack2(f1[6], f1[7]));
+}
+
+__global__ void batched_scale_round_fp32_kernel(float* __restrict__ buf, int ld, const float* __restrict__ scale, int M,
+                                                int N) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int m = blockIdx.y;
+  if (c >= N || m >= M) return;
+  float v = buf[std::size_t(m) * ld + c];
+  if (scale) v *= __ldg(scale + c);
+  buf[std::size_t(m) * ld + c] = bf16r(v);
+}
+
+__global__ void batched_head_scale_softcap_kernel(const float* __restrict__ in, const float* __restrict__ scale, int M,
+                                                  int chunk_V, int v_offset, int total_V, float* __restrict__ out) {
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  const int m = blockIdx.y;
+  if (v >= chunk_V || m >= M) return;
+  float x = in[std::size_t(m) * chunk_V + v];
+  if (scale) x *= __ldg(scale + v_offset + v);
+  out[std::size_t(m) * total_V + v_offset + v] = 30.f * tanhf(bf16r(x) * (1.f / 30.f));
+}
+
+// Deterministic M-invariant router logits: 16 CTAs x 8 expert rows = 128 experts; each CTA tiles 8 tokens.
+// Every token/expert dot product executes the exact same 9x8 FMA + wsum order regardless of M.
+__global__ void __launch_bounds__(256) batched_router_logits_kernel(const ActT* __restrict__ x,
+                                                                    const ActT* __restrict__ w, int M,
+                                                                    float* __restrict__ out) {
+  constexpr int EXPERTS = 128;
+  constexpr int RPC = 8;
+  constexpr int CH = H_DIM / (8 * 32);  // 9
+  constexpr int TM = 8;
+  __shared__ __align__(16) ActT xs[TM][H_DIM];
+
+  const int m0 = blockIdx.y * TM;
+  const int cm = min(TM, M - m0);
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int row = blockIdx.x * RPC + warp;
+
+  const int total_u4 = cm * (H_DIM / 8);
+  for (int k = tid; k < total_u4; k += 256) {
+    const int m = k / (H_DIM / 8);
+    const int c8 = k % (H_DIM / 8);
+    reinterpret_cast<uint4*>(&xs[m][0])[c8] =
+        __ldg(reinterpret_cast<const uint4*>(x + std::size_t(m0 + m) * H_DIM) + c8);
+  }
+  const ActT* wr = w + std::size_t(row) * H_DIM;
+  uint4 wv[CH];
+#pragma unroll
+  for (int i = 0; i < CH; ++i) {
+    wv[i] = __ldg(reinterpret_cast<const uint4*>(wr + (i * 32 + lane) * 8));
+  }
+  __syncthreads();
+
+  float acc[TM];
+#pragma unroll
+  for (int m = 0; m < TM; ++m) acc[m] = 0.f;
+#pragma unroll
+  for (int i = 0; i < CH; ++i) {
+    const int col = (i * 32 + lane) * 8;
+    float wf[8];
+    unpack8(wv[i], wf);
+    for (int m = 0; m < cm; ++m) {
+      float xf[8];
+      unpack8(*reinterpret_cast<const uint4*>(&xs[m][col]), xf);
+      float a = acc[m];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) a = fmaf(wf[j], xf[j], a);
+      acc[m] = a;
+    }
+  }
+  for (int m = 0; m < cm; ++m) {
+    const float s = wsum(acc[m]);
+    if (lane == 0) out[std::size_t(m0 + m) * EXPERTS + row] = s;
+  }
+}
+
+// Deterministic M-invariant message gates (4 tiny kernels, 0 ULP across all M >= 1):
+// 1. gate_inputs: 1 CTA per (t, g), 576 threads x 4 floats.
+__global__ void __launch_bounds__(H_DIM / 4) batched_gate_inputs_kernel(const float* __restrict__ h, bool h_shared,
+                                                                        const float* __restrict__ msg, int M,
+                                                                        ActT* __restrict__ gin) {
+  constexpr int ROW_W = (H_DIM / 4) / 32;  // 18 warps
+  __shared__ float red[ROW_W][2];
+
+  const int t = blockIdx.x;
+  const int g = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int c = tid * 4;
+
+  const float* hg = h + (h_shared ? std::size_t(0) : std::size_t(g) * M * H_DIM) + std::size_t(t) * H_DIM;
+  const float* mg = msg + std::size_t(g) * M * H_DIM + std::size_t(t) * H_DIM;
+  const float4 hv = *reinterpret_cast<const float4*>(hg + c);
+  const float4 mv = *reinterpret_cast<const float4*>(mg + c);
+
+  float sh = wsum(hv.x * hv.x + hv.y * hv.y + hv.z * hv.z + hv.w * hv.w);
+  float sm = wsum(mv.x * mv.x + mv.y * mv.y + mv.z * mv.z + mv.w * mv.w);
+  if (lane == 0) {
+    red[warp][0] = sh;
+    red[warp][1] = sm;
+  }
+  __syncthreads();
+
+  float tot_h = 0.f, tot_m = 0.f;
+#pragma unroll
+  for (int w = 0; w < ROW_W; ++w) {
+    tot_h += red[w][0];
+    tot_m += red[w][1];
+  }
+  const float rh = rsqrtf(tot_h * (1.f / float(H_DIM)) + 1e-6f);
+  const float rm = rsqrtf(tot_m * (1.f / float(H_DIM)) + 1e-6f);
+  ActT* dst = gin + (std::size_t(g) * M + t) * (2 * H_DIM);
+  *reinterpret_cast<uint2*>(dst + c) = make_uint2(act::pack2(hv.x * rh, hv.y * rh), act::pack2(hv.z * rh, hv.w * rh));
+  *reinterpret_cast<uint2*>(dst + H_DIM + c) =
+      make_uint2(act::pack2(mv.x * rm, mv.y * rm), act::pack2(mv.z * rm, mv.w * rm));
+}
+
+// 2. gate_down: 16 CTAs x 4 rows = 64 rank rows, 2 warps per row (half 0 = h, half 1 = msg), TM = 4 tokens/CTA.
+__global__ void __launch_bounds__(256) batched_gate_down_kernel(const ActT* __restrict__ gin,
+                                                                const ActT* __restrict__ w_down, int M,
+                                                                ActT* __restrict__ g16) {
+  constexpr int RANK = 64;
+  constexpr int RPC = 4;
+  constexpr int CH = H_DIM / (8 * 32);  // 9
+  constexpr int TM = 4;
+  __shared__ __align__(16) ActT xs[TM][2 * H_DIM];
+  __shared__ float part[TM][2][RPC];
+
+  const int rank = blockIdx.x;
+  const int g = blockIdx.y;
+  const int m0 = blockIdx.z * TM;
+  const int cm = min(TM, M - m0);
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int rl = warp >> 1;
+  const int half = warp & 1;
+
+  const int total_u4 = cm * (2 * H_DIM / 8);
+  const ActT* gbase = gin + (std::size_t(g) * M + m0) * (2 * H_DIM);
+  for (int k = tid; k < total_u4; k += 256) {
+    const int m = k / (2 * H_DIM / 8);
+    const int c8 = k % (2 * H_DIM / 8);
+    reinterpret_cast<uint4*>(&xs[m][0])[c8] =
+        __ldg(reinterpret_cast<const uint4*>(gbase + std::size_t(m) * (2 * H_DIM)) + c8);
+  }
+  const ActT* wr = w_down + (std::size_t(g) * RANK + rank * RPC + rl) * (2 * H_DIM) + half * H_DIM;
+  uint4 wv[CH];
+#pragma unroll
+  for (int i = 0; i < CH; ++i) {
+    wv[i] = __ldg(reinterpret_cast<const uint4*>(wr + (i * 32 + lane) * 8));
+  }
+  __syncthreads();
+
+  float acc[TM];
+#pragma unroll
+  for (int m = 0; m < TM; ++m) acc[m] = 0.f;
+#pragma unroll
+  for (int i = 0; i < CH; ++i) {
+    const int col = half * H_DIM + (i * 32 + lane) * 8;
+    float wf[8];
+    unpack8(wv[i], wf);
+    for (int m = 0; m < cm; ++m) {
+      float xf[8];
+      unpack8(*reinterpret_cast<const uint4*>(&xs[m][col]), xf);
+      float a = acc[m];
+#pragma unroll
+      for (int e = 0; e < 8; ++e) a = fmaf(wf[e], xf[e], a);
+      acc[m] = a;
+    }
+  }
+  for (int m = 0; m < cm; ++m) {
+    const float s = wsum(acc[m]);
+    if (lane == 0) part[m][half][rl] = s;
+  }
+  __syncthreads();
+  if (tid < cm * RPC) {
+    const int m = tid / RPC;
+    const int r = tid % RPC;
+    g16[(std::size_t(g) * M + m0 + m) * RANK + rank * RPC + r] = act::from_float(part[m][0][r] + part[m][1][r]);
+  }
+}
+
+// 3. gate_fg: 16 CTAs x 144 channels = 2304, TM = 8 tokens/CTA. Writes FP32 gated output + per-CTA sum-of-squares.
+__global__ void __launch_bounds__(256) batched_gate_fg_kernel(const float* __restrict__ h, bool h_shared,
+                                                              const float* __restrict__ msg,
+                                                              const ActT* __restrict__ g16,
+                                                              const ActT* __restrict__ w_forget,
+                                                              const ActT* __restrict__ w_gain, int M,
+                                                              float* __restrict__ gated, float* __restrict__ ssall) {
+  constexpr int CL = 16;
+  constexpr int CPC = H_DIM / CL;  // 144
+  constexpr int RANK = 64;
+  constexpr int TM = 8;
+  __shared__ float gs[TM][RANK];
+  __shared__ float red[8][TM];
+
+  const int rank = blockIdx.x;
+  const int g = blockIdx.y;
+  const int m0 = blockIdx.z * TM;
+  const int cm = min(TM, M - m0);
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  for (int i = tid; i < cm * RANK; i += 256) {
+    const int m = i / RANK;
+    const int k = i % RANK;
+    gs[m][k] = act::to_float(g16[(std::size_t(g) * M + m0 + m) * RANK + k]);
+  }
+  __syncthreads();
+
+  float sq[TM];
+#pragma unroll
+  for (int m = 0; m < TM; ++m) sq[m] = 0.f;
+
+  if (tid < CPC) {
+    const int c = rank * CPC + tid;
+    const uint4* fr = reinterpret_cast<const uint4*>(w_forget + (std::size_t(g) * H_DIM + c) * RANK);
+    const uint4* gr = reinterpret_cast<const uint4*>(w_gain + (std::size_t(g) * H_DIM + c) * RANK);
+    float df[TM], dg[TM];
+#pragma unroll
+    for (int m = 0; m < TM; ++m) df[m] = dg[m] = 0.f;
+#pragma unroll
+    for (int k = 0; k < RANK / 8; ++k) {
+      float wf[8], wg[8];
+      unpack8(__ldg(fr + k), wf);
+      unpack8(__ldg(gr + k), wg);
+      for (int m = 0; m < cm; ++m) {
+        float a_f = df[m], a_g = dg[m];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const float gv = gs[m][k * 8 + e];
+          a_f = fmaf(wf[e], gv, a_f);
+          a_g = fmaf(wg[e], gv, a_g);
+        }
+        df[m] = a_f;
+        dg[m] = a_g;
+      }
+    }
+    const float* hg = h + (h_shared ? std::size_t(0) : std::size_t(g) * M * H_DIM);
+    const float* mg = msg + std::size_t(g) * M * H_DIM;
+    for (int m = 0; m < cm; ++m) {
+      const float hv = hg[std::size_t(m0 + m) * H_DIM + c];
+      const float mv = mg[std::size_t(m0 + m) * H_DIM + c];
+      const float y = __fadd_rn(__fmul_rn(__fsub_rn(1.f, tanhf(df[m])), hv), __fmul_rn(tanhf(dg[m]), mv));
+      gated[(std::size_t(g) * M + m0 + m) * H_DIM + c] = y;
+      sq[m] = y * y;
+    }
+  }
+  for (int m = 0; m < cm; ++m) {
+    const float s = wsum(sq[m]);
+    if (lane == 0) red[warp][m] = s;
+  }
+  __syncthreads();
+  if (tid < cm) {
+    float s = 0.f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) s += red[w][tid];
+    ssall[(std::size_t(g) * M + m0 + tid) * CL + rank] = s;
+  }
+}
+
+// 4. gate_norm: 16 CTAs x 144 channels, TM = 8 tokens/CTA. Fixed d=0..15 reduction order.
+__global__ void __launch_bounds__(256) batched_gate_norm_kernel(const float* __restrict__ gated,
+                                                                const float* __restrict__ ssall,
+                                                                const float* __restrict__ norm_w, int M,
+                                                                ActT* __restrict__ out_bf16) {
+  constexpr int CL = 16;
+  constexpr int CPC = H_DIM / CL;  // 144
+  constexpr int TM = 8;
+
+  const int rank = blockIdx.x;
+  const int g = blockIdx.y;
+  const int m0 = blockIdx.z * TM;
+  const int cm = min(TM, M - m0);
+  const int tid = threadIdx.x;
+  if (tid >= CPC) return;
+
+  const int c = rank * CPC + tid;
+  const float nw = norm_w[std::size_t(g) * H_DIM + c];
+  for (int m = 0; m < cm; ++m) {
+    float ss = 0.f;
+    const float* sp = ssall + (std::size_t(g) * M + m0 + m) * CL;
+#pragma unroll
+    for (int d = 0; d < CL; ++d) ss += sp[d];
+    const float r = rsqrtf(ss * (1.f / float(H_DIM)) + 1e-6f);
+    const std::size_t idx = (std::size_t(g) * M + m0 + m) * H_DIM + c;
+    out_bf16[idx] = act::from_float(gated[idx] * r * nw);
+  }
+}
+
 __global__ void batched_advance_pos_kernel(const std::int32_t* __restrict__ slot_ids, int B,
                                            std::int64_t* __restrict__ slot_pos) {
   const int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1124,6 +1432,58 @@ void batched_head_softcap(const ActT* in, int B, int chunk_V, int v_offset, int 
           "batched_head_softcap: bad args");
   const dim3 grid((chunk_V + 255) / 256, B);
   batched_head_softcap_kernel<<<grid, 256, 0, stream>>>(in, B, chunk_V, v_offset, total_V, out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void dequant_e4m3_unscaled(const void* q, int rows, int K, ActT* out, cudaStream_t stream) {
+  require(q && out && rows >= 0 && K > 0 && K % 16 == 0, "dequant_e4m3_unscaled: bad args");
+  const long long total16 = static_cast<long long>(rows) * K / 16;
+  if (total16 > 0) {
+    dequant_e4m3_unscaled_kernel<<<static_cast<unsigned>((total16 + 255) / 256), 256, 0, stream>>>(
+        static_cast<const __nv_fp8_storage_t*>(q), total16, out);
+    CUDA_CHECK(cudaGetLastError());
+  }
+}
+
+void batched_scale_round_fp32(float* buf, int ld, const float* scale, int M, int N, cudaStream_t stream) {
+  require(buf && M >= 1 && N >= 1 && ld >= N, "batched_scale_round_fp32: bad args");
+  const dim3 grid((N + 255) / 256, M);
+  batched_scale_round_fp32_kernel<<<grid, 256, 0, stream>>>(buf, ld, scale, M, N);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void batched_head_scale_softcap(const float* in, const float* scale, int M, int chunk_V, int v_offset, int total_V,
+                                float* out, cudaStream_t stream) {
+  require(in && out && M >= 1 && chunk_V >= 1 && v_offset >= 0 && v_offset + chunk_V <= total_V,
+          "batched_head_scale_softcap: bad args");
+  const dim3 grid((chunk_V + 255) / 256, M);
+  batched_head_scale_softcap_kernel<<<grid, 256, 0, stream>>>(in, scale, M, chunk_V, v_offset, total_V, out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void batched_router_logits(const ActT* x, const ActT* w, int M, float* out, cudaStream_t stream) {
+  require(x && w && out && M >= 1, "batched_router_logits: bad args");
+  const dim3 grid(16, (M + 7) / 8);
+  batched_router_logits_kernel<<<grid, 256, 0, stream>>>(x, w, M, out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void batched_message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const ActT* w_down,
+                           const ActT* w_forget, const ActT* w_gain, const float* norm_w, ActT* gin, ActT* g16,
+                           float* ssall, ActT* out_bf16, cudaStream_t stream) {
+  require(h && msg && w_down && w_forget && w_gain && norm_w && gin && g16 && ssall && out_bf16 && G >= 1 && G <= 3 &&
+              M >= 1,
+          "batched_message_gates: bad args");
+  batched_gate_inputs_kernel<<<dim3(M, G), H_DIM / 4, 0, stream>>>(h, h_shared, msg, M, gin);
+  CUDA_CHECK(cudaGetLastError());
+  batched_gate_down_kernel<<<dim3(16, G, (M + 3) / 4), 256, 0, stream>>>(gin, w_down, M, g16);
+  CUDA_CHECK(cudaGetLastError());
+  // `gin` ([G, M, 2*H] ActT) is dead after gate_down and has exact byte capacity for FP32 gated [G, M, H].
+  float* gated = reinterpret_cast<float*>(gin);
+  batched_gate_fg_kernel<<<dim3(16, G, (M + 7) / 8), 256, 0, stream>>>(h, h_shared, msg, g16, w_forget, w_gain, M,
+                                                                       gated, ssall);
+  CUDA_CHECK(cudaGetLastError());
+  batched_gate_norm_kernel<<<dim3(16, G, (M + 7) / 8), 256, 0, stream>>>(gated, ssall, norm_w, M, out_bf16);
   CUDA_CHECK(cudaGetLastError());
 }
 
