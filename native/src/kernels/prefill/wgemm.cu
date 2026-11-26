@@ -48,16 +48,23 @@ struct Cfg {
   static constexpr int R = WK / BK;  // activation steps per weight chunk
   static constexpr int KC = K / WK;  // weight chunks
   static constexpr int AS_STG = LOW_SMEM ? 2 : AS;
-  // On Volta sm_70 (INGINE_ACT_FP16 && !LOW_SMEM), each warp owns its 16 weight rows exclusively
-  // and cp.async does not exist. Streaming NVFP4/MXFP8 weights + scales directly via __ldg into
-  // registers eliminates w_smem (20 KiB) and sc_smem (18 KiB), dropping TM=32 SMEM from 88 KiB -> 8.2 KiB!
-  static constexpr bool VOLTA_DIRECT = INGINE_ACT_FP16 && !LOW_SMEM && (FMT == FMT_NVFP4 || FMT == FMT_MXFP8);
-  static constexpr bool VOLTA_COMPACT = INGINE_ACT_FP16 && !LOW_SMEM;
+  // On Volta sm_70 native HMMA (INGINE_ACT_FP16 && !LOW_SMEM && !INGINE_FORCE_SIMT_MMA), each warp owns
+  // its 16 weight rows exclusively and cp.async does not exist. Streaming NVFP4/MXFP8 weights + scales
+  // directly via __ldg into registers eliminates w_smem (20 KiB) and sc_smem (18 KiB), dropping TM=32 SMEM
+  // from 88 KiB -> 8.2 KiB. When INGINE_FORCE_SIMT_MMA is enabled, the kernel takes the #else SIMT loop
+  // which reads staged w_smem/sc_smem, so VOLTA_DIRECT/VOLTA_COMPACT must be disabled to keep SMEM sized.
+#if defined(INGINE_FORCE_SIMT_MMA)
+  static constexpr bool VOLTA_NATIVE = false;
+#else
+  static constexpr bool VOLTA_NATIVE = INGINE_ACT_FP16 && !LOW_SMEM;
+#endif
+  static constexpr bool VOLTA_DIRECT = VOLTA_NATIVE && (FMT == FMT_NVFP4 || FMT == FMT_MXFP8);
+  static constexpr bool VOLTA_COMPACT = VOLTA_NATIVE;
   static constexpr bool STAGE_W = !VOLTA_DIRECT;
   static constexpr bool STAGE_SC = !VOLTA_COMPACT;
   static constexpr int WS = (LOW_SMEM || VOLTA_COMPACT) ? (FMT == FMT_MXFP8 ? 3 : 2)
                                      : (TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6)
-                                                 : (FMT == FMT_MXFP8 ? 4 : 3));
+                                                 : (INGINE_ACT_FP16 ? 3 : (FMT == FMT_MXFP8 ? 4 : 3)));
   static_assert(R * (WS - 1) >= AS_STG);
   static constexpr int WCODE = FMT == FMT_NVFP4 ? WK / 2 : (FMT == FMT_MXFP8 ? WK : (FMT == FMT_ATLAS2 ? WK / 4 : (WK * 3) / 8));
   static constexpr int WSTRIDE = WCODE + 16;                    // padded: fragment loads on distinct banks
