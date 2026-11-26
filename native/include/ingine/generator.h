@@ -43,6 +43,45 @@ inline KvCacheMode parse_kv_cache_mode(std::string_view s) {
   throw std::invalid_argument("invalid kv_cache_mode '" + std::string(s) + "' (expected 'per_pass' or 'last_full')");
 }
 
+// Training-free Loop-wise Contrastive Decoding (Apple LoopCD, arXiv:2610.02185) for looped architectures (L >= 2).
+// Off (default): standard decoding from final pass h_L (zero overhead, 100% bit-identical to baseline).
+// LogitsAdaptive: fused single-pass dual-vector lm_head GEMV over h_L and h_{L-1} with adaptive omega = omega_max * (1 - (p1 - p2)).
+// Hidden: pre-coda hidden-state extrapolation h' = h_L + omega * (h_L - h_{L-1}) before coda layers 18..23.
+enum class LoopCdMode : std::uint8_t {
+  Off = 0,
+  LogitsAdaptive = 1,
+  Hidden = 2,
+};
+
+inline const char* to_string(LoopCdMode mode) {
+  switch (mode) {
+    case LoopCdMode::LogitsAdaptive: return "logits-adaptive";
+    case LoopCdMode::Hidden: return "hidden";
+    default: return "off";
+  }
+}
+
+inline LoopCdMode parse_loopcd_mode(std::string_view s) {
+  if (s == "off") return LoopCdMode::Off;
+  if (s == "logits-adaptive") return LoopCdMode::LogitsAdaptive;
+  if (s == "hidden") return LoopCdMode::Hidden;
+  throw std::invalid_argument("invalid loopcd mode '" + std::string(s) +
+                              "' (expected 'off', 'logits-adaptive', or 'hidden')");
+}
+
+inline constexpr float default_loopcd_omega(LoopCdMode mode) noexcept {
+  switch (mode) {
+    case LoopCdMode::LogitsAdaptive: return 0.5f;
+    case LoopCdMode::Hidden: return 0.3f;
+    default: return 0.0f;
+  }
+}
+
+inline constexpr float effective_loopcd_omega(LoopCdMode mode, float requested) noexcept {
+  if (mode == LoopCdMode::Off) return 0.0f;
+  return requested >= 0.0f ? requested : default_loopcd_omega(mode);
+}
+
 struct Sampling {
   float temperature = 1.0f;  // 0 => greedy
   float top_p = 1.0f;
@@ -197,6 +236,10 @@ struct RuntimeOptions {
   int max_kv_tokens = 0;
   // Number of recurrent passes over layers 6..17 (default 3 = 48 visits; 1..8 supported for varloop models).
   int loop_passes = 3;
+  // Loop-wise Contrastive Decoding (arXiv:2610.02185): opt-in off|logits-adaptive|hidden (requires loop_passes >= 2).
+  LoopCdMode loopcd_mode = LoopCdMode::Off;
+  // Contrastive strength omega_max (logits-adaptive) or omega (hidden); < 0 uses mode default (0.5 / 0.3), 0 = no-op control.
+  float loopcd_omega = -1.0f;
   // Optional VRAM lease cap in MiB for batched pool/drafter/prefix-cache auto-sizing (0 = unbounded).
   int vram_limit_mb = 0;
   // True when caller explicitly passed --loop-passes (non-looped backends reject explicit loop overrides fail-closed).
@@ -261,6 +304,7 @@ class Generator {
   // at worker init.
   virtual std::vector<KvCacheMode> supported_kv_cache_modes() const { return {kv_cache_mode()}; }
   virtual int loop_passes() const { return 3; }
+  virtual LoopCdMode loopcd_mode() const { return LoopCdMode::Off; }
   virtual std::string offload_summary() const { return {}; }
   virtual PrefixCacheStats cache_stats() const { return {}; }
 

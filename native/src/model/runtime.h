@@ -71,7 +71,7 @@ Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, 
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
 State make_state(int max_ctx, bool kv_fp8, bool kv_q4 = false, const PagedKvConfig& paged_kv = {},
                  bool kv_last_full = false, int loop_passes = PASSES);
-Buffers make_buffers(int m, int loop_passes = PASSES);
+Buffers make_buffers(int m, int loop_passes = PASSES, LoopCdMode loopcd_mode = LoopCdMode::Off);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
 void reset_state(State& state, cudaStream_t stream);
@@ -79,7 +79,8 @@ void reset_state(State& state, cudaStream_t stream);
 // ---- fast.FastDecoder
 class Decoder {
  public:
-  Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl = true);
+  Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl = true,
+          LoopCdMode loopcd_mode = LoopCdMode::Off, float loopcd_omega = 0.0f);
   ~Decoder();
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
@@ -97,6 +98,8 @@ class Decoder {
   const Ablation& abl_;
   State& st_;
   bool pdl_;
+  LoopCdMode loopcd_mode_ = LoopCdMode::Off;
+  float loopcd_omega_ = 0.0f;
   DeviceBuffer attn_ws_;  // attn workspace for up to 8 rows (zeroed once)
   DeviceBuffer moe_down_ws_;  // Per-decoder MoE workspace: EXL3 moe_down (288 KiB) & pre-SM80 NVFP4 dp4a M>1 scratch (90 KiB)
   std::map<std::vector<const float*>, DeviceBuffer> tables_;  // device pointer tables for mix

@@ -179,6 +179,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       kv_cache_mode_(generator.kv_cache_mode()),
       supported_kv_cache_modes_(generator.supported_kv_cache_modes()),
       loop_passes_(generator.loop_passes()),
+      loopcd_mode_(generator.loopcd_mode()),
       supports_logit_masker_(generator.supports_logit_masker()),
       sampling_defaults_(options.sampling),
       image_options_([&] {
@@ -230,6 +231,7 @@ Json ChatServer::model_card() const {
               {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
               {"kv_cache_mode_mutable", false},
               {"loop_passes", loop_passes_},
+              {"loopcd", model::to_string(loopcd_mode_)},
               {"supports_structured_output", supports_logit_masker_},
               {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
 }
@@ -267,6 +269,7 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
     const engine::SchedulerStats st = scheduler_.stats();
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+    res.set_header("X-Ingine-LoopCD", model::to_string(loopcd_mode_));
     send_json(res, 200,
               Json{{"status", "ok"},
                    {"model", model_id_},
@@ -275,6 +278,7 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                    {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
                    {"kv_cache_mode_mutable", false},
                    {"loop_passes", loop_passes_},
+                   {"loopcd", model::to_string(loopcd_mode_)},
                    {"supports_structured_output", supports_logit_masker_},
                    {"waiting", st.waiting},
                    {"running", st.running},
@@ -284,10 +288,12 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
   } else if (path == "/v1/models") {
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+    res.set_header("X-Ingine-LoopCD", model::to_string(loopcd_mode_));
     send_json(res, 200, Json{{"object", "list"}, {"data", Json::array({model_card()})}});
   } else if (path == "/v1/models/" + model_id_) {
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+    res.set_header("X-Ingine-LoopCD", model::to_string(loopcd_mode_));
     send_json(res, 200, model_card());
   } else if (path == "/v1/personas") {
     send_json(res, 200, personas_list());
@@ -466,6 +472,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
     if (x->req.sampling.persona) resp["persona_metadata"] = persona_meta_json(*x->req.sampling.persona);
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+    res.set_header("X-Ingine-LoopCD", model::to_string(loopcd_mode_));
     send_json(res, 200, resp);
     return;
   }
@@ -474,6 +481,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
   res.set_header("Cache-Control", "no-cache");
   res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
   res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+  res.set_header("X-Ingine-LoopCD", model::to_string(loopcd_mode_));
   res.set_chunked_content_provider(
       "text/event-stream",
       [this, state](size_t, httplib::DataSink& sink) -> bool {
@@ -573,6 +581,7 @@ void ChatServer::complete_anthropic(const httplib::Request& req, httplib::Respon
                                                  x->parser.num_tokens(), cached);
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+    res.set_header("X-Ingine-LoopCD", model::to_string(loopcd_mode_));
     send_json(res, 200, resp);
     return;
   }
@@ -581,6 +590,7 @@ void ChatServer::complete_anthropic(const httplib::Request& req, httplib::Respon
   res.set_header("Cache-Control", "no-cache");
   res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
   res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+  res.set_header("X-Ingine-LoopCD", model::to_string(loopcd_mode_));
   res.set_chunked_content_provider(
       "text/event-stream",
       [this, state, msg_id](size_t, httplib::DataSink& sink) -> bool {

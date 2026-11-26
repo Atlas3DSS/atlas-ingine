@@ -49,6 +49,8 @@ class FakeGenerator final : public model::Generator {
   std::string model_id() const override { return model_id_; }
   int max_model_len() const override { return max_model_len_; }
   int loop_passes() const override { return loop_passes_; }
+  model::LoopCdMode loopcd_mode() const override { return loopcd_mode_; }
+  void set_loopcd_mode(model::LoopCdMode mode) { loopcd_mode_ = mode; }
   model::GenerateStats generate(std::span<const int32_t> prompt, int max_new_tokens,
                                 const model::Sampling& sampling, std::span<const int32_t> stop_ids,
                                 const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
@@ -87,6 +89,7 @@ class FakeGenerator final : public model::Generator {
   std::string model_family_ = "inkling2";
   int max_model_len_;
   int loop_passes_;
+  model::LoopCdMode loopcd_mode_ = model::LoopCdMode::Off;
   bool supports_images_ = true;
   bool supports_logit_masker_ = true;
   Responder responder_;

@@ -399,7 +399,10 @@ struct Buffers {
   Tensor wts;                       // fp32 [m, 8]
   Tensor act;                       // bf16 [m, 8, I]
   Tensor xf;                        // bf16 [1, m, H]
+  Tensor xf_weak;                   // bf16 [1, m, H] (allocated only when LoopCdMode::LogitsAdaptive)
   Tensor logits;                    // fp32 [m, UNPADDED_VOCAB]
+  Tensor logits_weak;               // fp32 [m, UNPADDED_VOCAB] (allocated only when LoopCdMode::LogitsAdaptive)
+  Tensor loopcd_reduce;             // fp32 [m * 384] (allocated only when LoopCdMode::LogitsAdaptive)
   Tensor taps;                      // bf16 [m, 4, H]: partial block entering TAP_VISITS + final normed hidden
   // convolution inputs of each row per visit, for rolling back rejected rows (history = true)
   Tensor hist_attn, hist_mlp;       // fp32 [48, m, H]

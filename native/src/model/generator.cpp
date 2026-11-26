@@ -34,6 +34,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -152,11 +153,14 @@ class EngineGenerator final : public Generator {
   KvCacheMode kv_cache_mode() const override { return options_.kv_cache_mode; }
 
   std::vector<KvCacheMode> supported_kv_cache_modes() const override {
-    if (options_.spec || options_.loop_passes != PASSES) return {KvCacheMode::PerPass};
+    if (options_.spec || options_.loop_passes != PASSES || options_.loopcd_mode != LoopCdMode::Off) {
+      return {KvCacheMode::PerPass};
+    }
     return {KvCacheMode::PerPass, KvCacheMode::LastFull};
   }
 
   int loop_passes() const override { return options_.loop_passes; }
+  LoopCdMode loopcd_mode() const override { return options_.loopcd_mode; }
 
   std::string offload_summary() const override {
     std::string out;
@@ -193,7 +197,9 @@ class EngineGenerator final : public Generator {
       : options_(runtime->options()),
         runtime_(std::move(runtime)),
         rt_(*runtime_),
-        prefiller_(rt_.weights(), rt_.ablation(), rt_.options().prefill_chunk, rt_.stream(), rt_.options().loop_passes),
+        prefiller_(rt_.weights(), rt_.ablation(), rt_.options().prefill_chunk, rt_.stream(), rt_.options().loop_passes,
+                   rt_.options().loopcd_mode,
+                   effective_loopcd_omega(rt_.options().loopcd_mode, rt_.options().loopcd_omega)),
         chunk_tokens_(std::size_t(rt_.options().prefill_chunk) * sizeof(std::int32_t)),
         logits_(std::size_t(UNPADDED_VOCAB) * sizeof(float)),
         token_(sizeof(std::int32_t)),
@@ -229,6 +235,15 @@ class EngineGenerator final : public Generator {
     base_identity_.kv_format = options_.kv_q4 ? 2u : (options_.kv_fp8 ? 1u : 0u);
     base_identity_.kv_cache_mode = static_cast<std::uint32_t>(options_.kv_cache_mode);
     base_identity_.loop_passes = options_.loop_passes;
+    base_identity_.loopcd_mode = static_cast<std::uint32_t>(options_.loopcd_mode);
+    if (options_.loopcd_mode != LoopCdMode::Off) {
+      const float eff_omega = effective_loopcd_omega(options_.loopcd_mode, options_.loopcd_omega);
+      std::uint32_t omega_bits = 0u;
+      std::memcpy(&omega_bits, &eff_omega, sizeof(omega_bits));
+      base_identity_.loopcd_omega_bits = omega_bits;
+    } else {
+      base_identity_.loopcd_omega_bits = 0u;
+    }
     base_identity_.max_ctx = options_.max_ctx;
     base_identity_.prefill_chunk = options_.prefill_chunk;
     base_identity_.spec_enabled = (drafter_ != nullptr);
@@ -1439,6 +1454,26 @@ bool has_detectable_model_metadata(const std::filesystem::path& model_dir) {
   return false;
 }
 
+void validate_loopcd_options(const RuntimeOptions& options) {
+  if (!std::isfinite(options.loopcd_omega) ||
+      (options.loopcd_omega < 0.0f && options.loopcd_omega != -1.0f) || options.loopcd_omega > 4.0f) {
+    throw std::invalid_argument("--loopcd-omega must be finite and in [0, 4]");
+  }
+  if (options.loopcd_mode == LoopCdMode::Off) return;
+  if (options.loop_passes < 2) {
+    throw std::invalid_argument("--loopcd requires --loop-passes >= 2 (needs earlier pass L-1 for contrast)");
+  }
+  if (options.kv_cache_mode != KvCacheMode::PerPass) {
+    throw std::invalid_argument("--loopcd requires --kv-cache-mode per_pass");
+  }
+#if INGINE_TP_SIZE > 1
+  throw std::invalid_argument("--loopcd currently requires TP=1");
+#endif
+  if (options.max_batch > 1) {
+    throw std::invalid_argument("--loopcd currently requires --max-batch 1");
+  }
+}
+
 }  // namespace
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
@@ -1460,6 +1495,7 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
   if (options.loop_passes < 1 || options.loop_passes > MAX_PASSES) {
     throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
   }
+  validate_loopcd_options(options);
   if (!options.dflash2_dir.empty()) {
     if (!options.spec) {
       throw std::invalid_argument("--dflash2-dir requires --spec");
@@ -1502,6 +1538,7 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options, Weights
   if (options.loop_passes < 1 || options.loop_passes > MAX_PASSES) {
     throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
   }
+  validate_loopcd_options(options);
   if (!options.dflash2_dir.empty()) {
     if (!options.spec) {
       throw std::invalid_argument("--dflash2-dir requires --spec");

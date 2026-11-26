@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <csignal>
 #include <exception>
 #include <filesystem>
@@ -93,6 +94,7 @@ int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, dflash2_dir, backend = "fast", model_id, log_level = "INFO";
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   std::string kv_cache_mode = "per_pass";
+  std::string loopcd_mode = "off";
   std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
@@ -102,7 +104,7 @@ int main(int argc, char** argv) {
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
        no_vision = false, atlas_6g = false, persona_probe_mode = false, no_prefix_cache = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
-  double spec_threshold = 0.8, fake_delay = 0.02;
+  double spec_threshold = 0.8, fake_delay = 0.02, loopcd_omega = -1.0;
   // sampling defaults; negative: from generation_config.json
   double temperature = -1, top_p = -1;
   int top_k = -1;
@@ -192,6 +194,12 @@ int main(int argc, char** argv) {
             "with Authorization/user/prompt_cache_key fail-closed bypass reuse when unset)",
             &cache_namespace_header);
   ap.option("--loop-passes", "", "recurrent loop passes over layers 6..17 (1..8, default 3 = 48 visits)", &loop_passes);
+  ap.option("--loopcd", "{off,logits-adaptive,hidden}",
+            "LoopCD loop-contrastive decoding (arXiv:2610.02185): off (default), logits-adaptive (fused single-pass lm_head), or hidden",
+            &loopcd_mode, {"off", "logits-adaptive", "hidden"});
+  ap.option("--loopcd-omega", "",
+            "LoopCD contrast strength in [0, 4] (default: 0.5 for logits-adaptive, 0.3 for hidden; 0 = exact no-op control)",
+            &loopcd_omega);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
   ap.option("--log-level", "", "", &log_level);
@@ -213,6 +221,11 @@ int main(int argc, char** argv) {
   }
   if (loop_passes < 1 || loop_passes > 8) {
     std::cerr << "ingine-serve: error: --loop-passes must be in [1, 8]\n";
+    return 2;
+  }
+  const auto parsed_loopcd_mode = ingine::model::parse_loopcd_mode(loopcd_mode);
+  if (ap.given("--loopcd-omega") && (!std::isfinite(loopcd_omega) || loopcd_omega < 0.0 || loopcd_omega > 4.0)) {
+    std::cerr << "ingine-serve: error: --loopcd-omega must be finite and in [0, 4]\n";
     return 2;
   }
   if (temperature > 2 || top_p == 0 || top_p > 1) {
@@ -258,6 +271,10 @@ int main(int argc, char** argv) {
       if (loop_passes_explicit) {
         throw std::invalid_argument(
             "qwen38-dense is a non-looped dense architecture and does not support --loop-passes");
+      }
+      if (parsed_loopcd_mode != ingine::model::LoopCdMode::Off) {
+        throw std::invalid_argument(
+            "qwen38-dense is a non-looped dense architecture and does not support --loopcd");
       }
       if (!ap.given("--max-ctx")) max_ctx = 8192;
       if (!ap.given("--prefill-chunk")) prefill_chunk = 256;
@@ -317,10 +334,27 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
           }
         }
-        const bool fake_allow_last_full = (loop_passes == 3) && !spec && (max_batch <= 1);
-        generator = std::make_unique<ingine::engine::FakeGenerator>(
+        if (parsed_loopcd_mode != ingine::model::LoopCdMode::Off) {
+          if (loop_passes < 2) {
+            throw std::invalid_argument("--loopcd requires --loop-passes >= 2");
+          }
+          if (parsed_kv_mode == ingine::model::KvCacheMode::LastFull) {
+            throw std::invalid_argument("--loopcd requires --kv-cache-mode per_pass");
+          }
+          if (max_batch > 1) {
+            throw std::invalid_argument("--loopcd currently requires --max-batch 1");
+          }
+          if (parsed_loopcd_mode == ingine::model::LoopCdMode::Hidden && !ablation.empty()) {
+            throw std::invalid_argument("--loopcd hidden cannot be combined with --ablation");
+          }
+        }
+        const bool fake_allow_last_full =
+            (loop_passes == 3) && !spec && (max_batch <= 1) && (parsed_loopcd_mode == ingine::model::LoopCdMode::Off);
+        auto ifake = std::make_unique<ingine::engine::FakeGenerator>(
             fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir),
             ingine::engine::FakeGenerator::Responder{}, fake_delay, loop_passes, parsed_kv_mode, fake_allow_last_full);
+        ifake->set_loopcd_mode(parsed_loopcd_mode);
+        generator = std::move(ifake);
       }
     } else {
 #ifdef INGINE_WITH_MODEL
@@ -366,6 +400,8 @@ int main(int argc, char** argv) {
       options.max_kv_tokens = max_kv_tokens;
       options.loop_passes = loop_passes;
       options.loop_passes_explicit = loop_passes_explicit;
+      options.loopcd_mode = parsed_loopcd_mode;
+      options.loopcd_omega = ap.given("--loopcd-omega") ? float(loopcd_omega) : -1.0f;
       options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
       options.refusal_map = refusal_map;
       generator = ingine::model::make_generator(options);
@@ -407,8 +443,9 @@ int main(int argc, char** argv) {
                                     ? fmt::format("on (at most {} tokens per image, {} images and {} image tokens per request)",
                                                   image_max_tokens, max_images, max_image_tokens)
                                     : std::string("off"));
-    log.info("serving {} on http://{}:{}/v1 (kv_cache_mode={})", server.model_id(), host, server.port(),
-             ingine::model::to_string(generator->kv_cache_mode()));
+    log.info("serving {} on http://{}:{}/v1 (kv_cache_mode={}, loop_passes={}, loopcd={})", server.model_id(), host,
+             server.port(), ingine::model::to_string(generator->kv_cache_mode()), generator->loop_passes(),
+             ingine::model::to_string(generator->loopcd_mode()));
     bool listened = true;
     std::thread listener([&] {
       listened = server.listen();

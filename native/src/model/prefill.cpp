@@ -45,11 +45,14 @@ std::vector<const float*> blocks_of(int l, int p, int last_pass, const float* B0
 
 }  // namespace
 
-Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int loop_passes)
+Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int loop_passes,
+                     LoopCdMode loopcd_mode, float loopcd_omega)
     : w_(w),
       abl_(abl),
       max_chunk_(max_chunk),
       loop_passes_(loop_passes),
+      loopcd_mode_(loopcd_mode),
+      loopcd_omega_(loopcd_omega),
       stream_(stream),
       gemm_(std::make_unique<pk::Gemm>()) {
   if (max_chunk < 1) throw std::invalid_argument("Prefiller: max_chunk must be positive");
@@ -79,6 +82,10 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
   g16_ = bf16(C * GATE_RANK);
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
+  if (loopcd_mode_ == LoopCdMode::LogitsAdaptive) {
+    logits_weak_ = f32(UNPADDED_VOCAB);
+    loopcd_reduce_ = f32(dense::kLoopCdReduceFloatsPerRow);
+  }
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
 
   // Disjoint-lifetime phase arena: Attention phase (mixf/xin -> proj/q/rel/krows/vrows/attn_out/wo_out)
@@ -303,6 +310,12 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       hid = l == 6 ? B1_ : l == 12 ? B2_[p] : l == 18 ? E_[last_pass] : hid_;
       base = part_, write = y2_;
     }
+    // LoopCD-Hidden (arXiv:2610.02185 Eq. 2): match Decoder::decode identically across all T prompt rows.
+    if (l == LOOP_END && loopcd_mode_ == LoopCdMode::Hidden && last_pass > 0) {
+      dense::loopcd_hidden_from_residual(E_[last_pass], base, write, E_[last_pass - 1], T, loopcd_omega_, false, s);
+      base = E_[last_pass];
+      write = nullptr;
+    }
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = abl_.active ? (mlp_dirs + std::size_t(pv) * H) : mlp_dirs;
     const float* w_prev = abl_.active ? (mlp_w + 4 * std::size_t(pv)) : mlp_w;
@@ -499,7 +512,17 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   if (tap_out)
     CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
-  pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
+  if (loopcd_mode_ == LoopCdMode::LogitsAdaptive && last_pass > 0) {
+    const int ref_pass = last_pass - 1;
+    // Reuse dead xm_ [C, H] scratch for the weak final_read so block_table keeps constant base pointers.
+    mix({B0_, B1_, B2_[ref_pass], E_[ref_pass]}, part_, y2_, r_last, w_last, nullptr, f32p(w.final_query), 1,
+        f32p(w.final_norm), xm_, nullptr, nullptr);
+    const dense::Matrix unembed{w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB};
+    dense::head_loopcd(xf_ + std::size_t(T - 1) * H, xm_ + std::size_t(T - 1) * H, 1, unembed, loopcd_omega_, logits,
+                       logits_weak_, loopcd_reduce_, false, s);
+  } else {
+    pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
+  }
   CUDA_CHECK(cudaGetLastError());
   st.length = pos0 + T;
 }

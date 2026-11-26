@@ -177,10 +177,16 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
   if (!options.dflash2_dir.empty()) {
     throw std::invalid_argument("qwen38-dense does not support --dflash2-dir (speculative decoding unsupported)");
   }
+  if (options.loopcd_mode != ingine::model::LoopCdMode::Off) {
+    throw std::invalid_argument("qwen38-dense is a non-looped dense architecture and does not support --loopcd");
+  }
 }
 
 Qwen38RuntimeDispatchPlan resolve_qwen38_runtime_options(const ingine::model::RuntimeOptions& options,
                                                          bool allow_unpinned) {
+  if (options.loopcd_mode != ingine::model::LoopCdMode::Off) {
+    throw std::invalid_argument("qwen38-dense is a non-looped dense architecture and does not support --loopcd");
+  }
   if (options.model_dir.empty()) {
     throw std::invalid_argument("qwen38-dense dispatch requires a non-empty model_dir");
   }

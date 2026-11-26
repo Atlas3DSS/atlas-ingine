@@ -46,11 +46,13 @@ DeviceBuffer upload_ints(const std::vector<int>& v) {
 
 }  // namespace
 
-Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl)
+Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, LoopCdMode loopcd_mode, float loopcd_omega)
     : w_(w),
       abl_(abl),
       st_(st),
       pdl_(pdl),
+      loopcd_mode_(loopcd_mode),
+      loopcd_omega_(loopcd_omega),
       attn_ws_(attn::workspace_bytes(8)),
       moe_down_ws_(std::max<std::size_t>(std::size_t(8) * TOP_K * HIDDEN * 2, moe::kDp4aScratchBytes)) {
   attn_ws_.fill(0);  // zeroed once; the kernel resets its counter itself
@@ -154,6 +156,14 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     } else {
       hid = l == 6 ? f32m(b.B1) : l == 12 ? f32m(b.B2[p]) : l == 18 ? f32m(b.E[last_pass]) : f32m(b.hid);
       base = f32p(b.part), write = f32p(b.y2);
+    }
+    // LoopCD-Hidden (arXiv:2610.02185 Eq. 2): extrapolate final loop pass output E[last_pass] away from
+    // earlier pass E[last_pass - 1] right before coda layers 18..23 (0 extra lm_head passes).
+    if (l == LOOP_END && loopcd_mode_ == LoopCdMode::Hidden && last_pass > 0) {
+      dense::loopcd_hidden_from_residual(f32m(b.E[last_pass]), base, write, f32p(b.E[last_pass - 1]), m, loopcd_omega_,
+                                         pdl, stream);
+      base = f32p(b.E[last_pass]);
+      write = nullptr;
     }
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = abl.active ? (mlp_dirs + std::size_t(pv) * H) : mlp_dirs;
@@ -338,7 +348,19 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   fp.out_copy_stride = std::int64_t(NUM_TAPS) * H;
   if (hooks) dense::mix_hooked(fp, &hooks->depth_output, pos, 0, false, stream);
   else dense::mix(fp, pdl, stream);
-  dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
+  if (loopcd_mode_ == LoopCdMode::LogitsAdaptive && last_pass > 0) {
+    const int ref_pass = last_pass - 1;
+    // Earlier-pass reference state h_{L-1} at the same trained 5-term final_query/final_norm interface:
+    // substitutes loop-pass blocks (B2[ref_pass], E[ref_pass]) for (B2[last_pass], E[last_pass]) alongside coda.
+    dense::MixParams fp_weak =
+        mix_params({f32p(b.B0), f32p(b.B1), f32p(b.B2[ref_pass]), f32p(b.E[ref_pass])}, f32p(b.part), f32p(b.y2),
+                   r_last, w_last, nullptr, &w.final_query, f32p(final_norm1), bf16m(b.xf_weak), nullptr);
+    dense::mix(fp_weak, pdl, stream);
+    dense::head_loopcd(bf16m(b.xf), bf16m(b.xf_weak), m, matrix(w.unembed), loopcd_omega_, f32m(b.logits),
+                       f32m(b.logits_weak), f32m(b.loopcd_reduce), pdl, stream);
+  } else {
+    dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
+  }
 }
 
 }  // namespace ingine::model

@@ -179,6 +179,7 @@ int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, dflash2_dir, effort = "low", forced, forced_trace;
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   std::string kv_cache_mode = "per_pass";
+  std::string loopcd_mode = "off";
   std::string concurrency_csv, arrival_trace_csv;
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
@@ -188,7 +189,7 @@ int main(int argc, char** argv) {
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
        ignore_eos = false, staggered = false, no_prefix_cache = false;
-  double spec_threshold = 0.8, temperature = 0.0;
+  double spec_threshold = 0.8, temperature = 0.0, loopcd_omega = -1.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
                               "End-to-end ingine speed: prefill tokens/s and greedy decode tokens/s for one or many concurrent requests.");
@@ -252,6 +253,12 @@ int main(int argc, char** argv) {
   ap.option("--max-batch", "", "override max batch slots (default: max of --concurrency, or 1)", &max_batch);
   ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity (0 = auto)", &max_kv_tokens);
   ap.option("--loop-passes", "", "recurrent loop passes over layers 6..17 (1..8, default 3 = 48 visits)", &loop_passes);
+  ap.option("--loopcd", "{off,logits-adaptive,hidden}",
+            "LoopCD loop-contrastive decoding (arXiv:2610.02185): off (default), logits-adaptive, or hidden",
+            &loopcd_mode, {"off", "logits-adaptive", "hidden"});
+  ap.option("--loopcd-omega", "",
+            "LoopCD contrast strength in [0, 4] (default: 0.5 for logits-adaptive, 0.3 for hidden; 0 = exact no-op control)",
+            &loopcd_omega);
   ap.option("--vram-limit-mb", "", "bound batched pool/drafter/cache allocations to this VRAM lease cap in MiB (0 = auto)",
             &vram_limit_mb);
   ap.flag("--ignore-eos", "with --concurrency: decode full --tokens per request (steady-state peak throughput)", &ignore_eos);
@@ -279,10 +286,18 @@ int main(int argc, char** argv) {
     }
 
     const bool loop_passes_explicit = ap.given("--loop-passes");
+    const auto parsed_loopcd_mode = ingine::model::parse_loopcd_mode(loopcd_mode);
+    if (ap.given("--loopcd-omega") && (!std::isfinite(loopcd_omega) || loopcd_omega < 0.0 || loopcd_omega > 4.0)) {
+      throw std::invalid_argument("--loopcd-omega must be finite and in [0, 4]");
+    }
     if (ingine::model::detect_model_family(model_dir) == ingine::model::ModelFamily::Qwen3_5) {
       if (loop_passes_explicit) {
         throw std::invalid_argument(
             "qwen38-dense is a non-looped dense architecture and does not support --loop-passes");
+      }
+      if (parsed_loopcd_mode != ingine::model::LoopCdMode::Off) {
+        throw std::invalid_argument(
+            "qwen38-dense is a non-looped dense architecture and does not support --loopcd");
       }
       if (!ap.given("--max-ctx")) max_ctx = 8192;
       if (!ap.given("--prefill-chunk")) prefill_chunk = 256;
@@ -358,13 +373,15 @@ int main(int argc, char** argv) {
     options.loop_passes = loop_passes;
     options.vram_limit_mb = vram_limit_mb;
     options.loop_passes_explicit = loop_passes_explicit;
+    options.loopcd_mode = parsed_loopcd_mode;
+    options.loopcd_omega = ap.given("--loopcd-omega") ? float(loopcd_omega) : -1.0f;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     vram.mark_after_load();
     const double vram_gb = vram.load_delta_gb();
-    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s, loop_passes=%d, vram_limit_mb=%d)\n",
+    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s, loop_passes=%d, loopcd=%s, vram_limit_mb=%d)\n",
                 load_s, vram_gb, gen->max_batch_size(), ingine::model::to_string(gen->kv_cache_mode()),
-                gen->loop_passes(), vram_limit_mb);
+                gen->loop_passes(), ingine::model::to_string(gen->loopcd_mode()), vram_limit_mb);
     std::fflush(stdout);
     if (!forced.empty()) {
       std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace, forced_free).c_str());

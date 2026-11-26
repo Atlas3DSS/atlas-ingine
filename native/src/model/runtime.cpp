@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <stdexcept>
 
 namespace ingine::model {
@@ -69,6 +70,27 @@ void validate_loop_passes_options(const RuntimeOptions& options, bool ablation_a
     if (options.kv_cache_mode == KvCacheMode::LastFull) {
       throw std::invalid_argument("--loop-passes != 3 is not supported with --kv-cache-mode last_full");
     }
+  }
+  if (!std::isfinite(options.loopcd_omega) ||
+      (options.loopcd_omega < 0.0f && options.loopcd_omega != -1.0f) || options.loopcd_omega > 4.0f) {
+    throw std::invalid_argument("--loopcd-omega must be finite and in [0.0, 4.0]");
+  }
+  if (options.loopcd_mode != LoopCdMode::Off) {
+    if (options.loop_passes < 2) {
+      throw std::invalid_argument("--loopcd requires --loop-passes >= 2 (need earlier pass h_{L-1} to contrast with h_L)");
+    }
+    if (options.max_batch > 1) {
+      throw std::invalid_argument("--loopcd currently requires --max-batch 1");
+    }
+    if (options.kv_cache_mode == KvCacheMode::LastFull) {
+      throw std::invalid_argument("--loopcd requires --kv-cache-mode per_pass");
+    }
+    if (options.loopcd_mode == LoopCdMode::Hidden && (!options.ablation.empty() || ablation_active)) {
+      throw std::invalid_argument("--loopcd hidden cannot be combined with --ablation");
+    }
+#if INGINE_TP_SIZE > 1
+    throw std::invalid_argument("--loopcd currently requires TP=1");
+#endif
   }
 }
 
@@ -162,7 +184,8 @@ void Runtime::init() {
   if (state_.paged_kv) {
     state_.paged_kv->ensure_decode_pages(0, kMaxWidth, stream_);
   }
-  decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
+  decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true, options.loopcd_mode,
+                                       effective_loopcd_omega(options.loopcd_mode, options.loopcd_omega));
   persona_rt_ = std::make_unique<PersonaRuntime>();
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
@@ -181,11 +204,11 @@ void Runtime::init() {
     undo_[i].pos = c.take<std::int64_t>(std::size_t(plan.num_sliding_visits));
   }
 
-  buffers_.emplace(1, make_buffers(1, options.loop_passes));
+  buffers_.emplace(1, make_buffers(1, options.loop_passes, options.loopcd_mode));
   history_[1] = false;
   if (options.spec) {
     for (int w : kVerifyWidths) {
-      buffers_.emplace(w, make_buffers(w, options.loop_passes));
+      buffers_.emplace(w, make_buffers(w, options.loop_passes, options.loopcd_mode));
       history_[w] = true;
       verify_widths_.push_back(w);
     }

@@ -3,6 +3,7 @@
 
 #include "core/act.h"
 #include "core/arena.h"
+#include "ingine/generator.h"
 #include "kernels/common/persona_abi.h"
 #include "model/model_data.h"
 
@@ -39,7 +40,8 @@ struct EmbedRows {
 
 class Prefiller {
  public:
-  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int loop_passes = PASSES);
+  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int loop_passes = PASSES,
+            LoopCdMode loopcd_mode = LoopCdMode::Off, float loopcd_omega = 0.0f);
   ~Prefiller();
   Prefiller(const Prefiller&) = delete;
   Prefiller& operator=(const Prefiller&) = delete;
@@ -58,6 +60,8 @@ class Prefiller {
   const Ablation& abl_;
   int max_chunk_;
   int loop_passes_;
+  LoopCdMode loopcd_mode_ = LoopCdMode::Off;
+  float loopcd_omega_ = 0.0f;
   cudaStream_t stream_;
   std::unique_ptr<kernels::prefill::Gemm> gemm_;
   std::vector<DeviceBuffer> storage_;
@@ -78,6 +82,8 @@ class Prefiller {
   int4* tiles_;
   ActT *act_, *down_, *moe_sum_, *exl3_scratch_;
   ActT* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
+  float* logits_weak_ = nullptr;    // [UNPADDED_VOCAB] scratch when loopcd_mode_ == LogitsAdaptive
+  float* loopcd_reduce_ = nullptr;  // [kLoopCdReduceFloatsPerRow] scratch when loopcd_mode_ == LogitsAdaptive
   std::int64_t* ids_;
   int kpos_rows_;
 };

@@ -6,6 +6,8 @@
 
 #include <stdexcept>
 
+#include "kernels/dense/dense.h"
+
 namespace ingine::model {
 namespace {
 
@@ -91,7 +93,7 @@ void reset_state(State& st, cudaStream_t stream) {
   st.length = 0;
 }
 
-Buffers make_buffers(int m, int loop_passes) {
+Buffers make_buffers(int m, int loop_passes, LoopCdMode loopcd_mode) {
   if (m < 1 || m > 8) throw std::invalid_argument("call width must be in 1..8");
   const VisitPlan plan = make_visit_plan(loop_passes);
   Buffers b;
@@ -123,6 +125,11 @@ Buffers make_buffers(int m, int loop_passes) {
   b.act = zeros(s, kActDType, {m, TOP_K, INTER});
   b.xf = zeros(s, kActDType, {1, m, H});
   b.logits = zeros(s, DType::FP32, {m, UNPADDED_VOCAB});
+  if (loopcd_mode == LoopCdMode::LogitsAdaptive) {
+    b.xf_weak = zeros(s, kActDType, {1, m, H});
+    b.logits_weak = zeros(s, DType::FP32, {m, UNPADDED_VOCAB});
+    b.loopcd_reduce = zeros(s, DType::FP32, {m * kernels::dense::kLoopCdReduceFloatsPerRow});
+  }
   b.taps = zeros(s, kActDType, {m, NUM_TAPS, H});
   b.hist_attn = zeros(s, DType::FP32, {plan.num_visits, m, H});
   b.hist_mlp = zeros(s, DType::FP32, {plan.num_visits, m, H});

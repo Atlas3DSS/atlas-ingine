@@ -577,6 +577,12 @@ std::array<std::uint8_t, 32> compute_disk_producer_sha256(const StateIdentity& i
     ctx.update(kLoopDomain, sizeof(kLoopDomain) - 1);
     ctx.update(&identity.loop_passes, sizeof(identity.loop_passes));
   }
+  if (identity.loopcd_mode != 0u) {
+    static constexpr char kLoopCdDomain[] = "LOOPCD";
+    ctx.update(kLoopCdDomain, sizeof(kLoopCdDomain) - 1);
+    ctx.update(&identity.loopcd_mode, sizeof(identity.loopcd_mode));
+    ctx.update(&identity.loopcd_omega_bits, sizeof(identity.loopcd_omega_bits));
+  }
   return ctx.finish();
 }
 
