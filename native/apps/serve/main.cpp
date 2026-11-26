@@ -11,6 +11,10 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#if defined(__linux__) && defined(INGINE_WITH_MODEL)
+#include <cuda_runtime.h>
+#endif
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -62,6 +66,26 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
   }
   return s;
 }
+
+#if defined(__linux__) && defined(INGINE_WITH_MODEL)
+bool is_geforce_rtx_20_30_40(std::string_view name) {
+  return name.find("GeForce RTX 20") != std::string_view::npos ||
+         name.find("GeForce RTX 30") != std::string_view::npos ||
+         name.find("GeForce RTX 40") != std::string_view::npos;
+}
+
+void maybe_log_gpu_unlock_notice(spdlog::logger& log) {
+  int dev = 0;
+  cudaDeviceProp prop{};
+  if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return;
+  const std::string_view name(prop.name);
+  if (!is_geforce_rtx_20_30_40(name)) return;
+  std::error_code ec;
+  if (std::filesystem::exists("/sys/module/gpu_unlock", ec)) return;
+  log.info("Linux GeForce RTX 20/30/40 ({}) without /sys/module/gpu_unlock: for optional multi-GPU P2P/compute tuning see external https://github.com/Zagitta/gpu-unlock (GPL-2.0, not bundled)",
+           name);
+}
+#endif
 
 }  // namespace
 
@@ -345,6 +369,9 @@ int main(int argc, char** argv) {
       options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
       options.refusal_map = refusal_map;
       generator = ingine::model::make_generator(options);
+#if defined(__linux__)
+      maybe_log_gpu_unlock_notice(log);
+#endif
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
       return 1;

@@ -404,7 +404,9 @@ Start the server on a 24 GB card (RTX 3090 / RTX 4090, 64K context with vision +
   --spec --spec-threshold 0.8 --park-mb 0
 ```
 
-Add `--no-vision` to save ~0.6 GiB VRAM on text-only workloads, or `--ablation /path/to/inkling-2-mini-abliterated.safetensors` to apply the optional abliteration patch (omitting `--ablation` serves the original model as `inkling-2-mini`).
+Add `--no-vision` to save ~0.6 GiB VRAM on text-only workloads, `--dflash2-dir /path/to/Inkling-2-Mini-DFlash2` to use the native Apache-2.0 DFlash2 block-diffusion drafter (`--max-batch 1`, `--loop-passes 3`, `--kv-cache-mode per_pass`), or `--ablation /path/to/inkling-2-mini-abliterated.safetensors` to apply the optional abliteration patch (omitting `--ablation` serves the original model as `inkling-2-mini`). For DGX Spark (`sm_121a`), use `cmake --preset sm121 -S native` or `./scripts/start.sh` (compile-verified on CUDA 12.9; physically unmeasured on GB10 hardware).
+
+**Linux GeForce RTX 20/30/40 note:** When `ingine-serve --engine` starts on a Linux GeForce RTX 20/30/40 GPU without `/sys/module/gpu_unlock`, it logs a one-line notice pointing to the optional external [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module (GPL-2.0; zero code or firmware is bundled in this repository).
 
 ### Option B: Hardware-aware auto-tuner & interactive installer
 
@@ -481,6 +483,8 @@ instead of a generation when the server runs a different depth.
 * `stop`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`.
 * `stream: true` (SSE with `reasoning_content` and `content` deltas; `stream_options.include_usage` adds usage).
 * Vision inputs as base64 `data:` URIs (`image_url`, `input_image`, or Anthropic `image` blocks; PNG, JPEG, WebP, GIF, BMP). Remote URLs are not fetched.
+
+`ingine-serve` also exposes Anthropic-compatible `POST /v1/messages` (non-streaming JSON and SSE with thinking/text/tool_use blocks, exact `stop_sequence` reporting, and `tool_choice` `"auto"`/`"none"`; `"any"` and named `"tool"` return HTTP 400 before inference) and `POST /v1/messages/count_tokens`.
 
 ```bash
 curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/json' -d '{
