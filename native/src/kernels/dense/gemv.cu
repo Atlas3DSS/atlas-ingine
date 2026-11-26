@@ -1446,9 +1446,8 @@ __global__ void quantize_q5_k_rows_kernel(const ActT* __restrict__ w, int rows, 
   uint8_t* dst = out + size_t(blk_idx) * q5k::kBlockBytes;
 
   float vals[8];
-  float sb_scale[8];
-  float sb_min[8];
-  float max_scale = 0.f;
+  float sb_mn[8];
+  float sb_mx[8];
   float max_min = 0.f;
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
@@ -1461,27 +1460,35 @@ __global__ void quantize_q5_k_rows_kernel(const ActT* __restrict__ w, int rows, 
       mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, o));
       mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
     }
-    const float sc = (mx - mn) / 31.0f;
-    const float neg_mn = -mn;
-    sb_scale[j] = sc;
-    sb_min[j] = neg_mn;
-    max_scale = fmaxf(max_scale, sc);
-    max_min = fmaxf(max_min, neg_mn);
+    sb_mn[j] = mn;
+    sb_mx[j] = mx;
+    max_min = fmaxf(max_min, -mn);
   }
 
-  const __half d_h = __float2half_rn(max_scale / 63.0f);
-  const __half dm_h = __float2half_rn(max_min / 63.0f);
-  const float d_val = __half2float(d_h);
+  const __half dm_h = __float2half_rn(__fdiv_rn(max_min, 63.0f));
   const float dm_val = __half2float(dm_h);
 
-  uint8_t sc_q[8];
   uint8_t m_q[8];
+  float need_sc[8];
+  float max_scale = 0.f;
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    const int sq = (d_val > 0.f) ? min(63, max(0, int(rintf(sb_scale[j] / d_val)))) : 0;
-    const int mq = (dm_val > 0.f) ? min(63, max(0, int(rintf(sb_min[j] / dm_val)))) : 0;
-    sc_q[j] = static_cast<uint8_t>(sq);
+    const int mq = (dm_val > 0.f) ? min(63, max(0, int(ceilf(__fdiv_rn(-sb_mn[j], dm_val))))) : 0;
     m_q[j] = static_cast<uint8_t>(mq);
+    const float eff_m = dm_val * float(mq);
+    const float sc = fmaxf(0.f, __fdiv_rn(sb_mx[j] + eff_m, 31.0f));
+    need_sc[j] = sc;
+    max_scale = fmaxf(max_scale, sc);
+  }
+
+  const __half d_h = __float2half_rn(__fdiv_rn(max_scale, 63.0f));
+  const float d_val = __half2float(d_h);
+
+  uint8_t sc_q[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int sq = (d_val > 0.f) ? min(63, max(0, int(ceilf(__fdiv_rn(need_sc[j], d_val))))) : 0;
+    sc_q[j] = static_cast<uint8_t>(sq);
   }
 
   if (lane == 0) {

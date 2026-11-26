@@ -191,11 +191,13 @@ class ExpertCache {
   static ExpertLayout layout_for(ExpertFormat w13_fmt, ExpertFormat w2_fmt);
   void set_host_ptrs(int l, int e, std::uint8_t* base);
   void clear_host_ptrs(int l, int e);
+  void verify_hot_hit_ptrs(int l, int e) const;
+  void verify_staged_hit_ptrs(int l, int e, int slot) const;
   bool stage_expert(int l, int e, std::uint64_t pin_gen);
   void flush_layer_table(int l);
   void read_cold_to_host(int l, int e, std::uint8_t* dst);
-  void complete_inflight_swap(int inf_idx);
-  void poll_inflight_swaps();
+  void complete_inflight_swap(int inf_idx, cudaStream_t compute_stream);
+  void poll_inflight_swaps(cudaStream_t compute_stream);
   void finalize_all_inflight_swaps(cudaStream_t compute_stream);
   void drain_swap_queue_async(int current_layer, std::uint64_t cur_pin_gen, cudaStream_t compute_stream);
 

@@ -1,12 +1,21 @@
 // Gate 0 pure-CPU verification for #888 (opt-in small-card knobs, strictly NO silent --tail-skip):
 //   1. Pinned GGML BlockQ5K (176 B / 256 elems) pack/unpack + multi-block K=2304 & K=3072 oracle
-//      covering both BF16 and pre-packed FP8-E4M3FN sources + FP64 GEMV reference.
+//      covering both BF16 and pre-packed FP8-E4M3FN sources, strictly enforcing the frozen <= 2.5%
+//      per-32-value sub-block source-range bound (0 failures across all 5,376 sub-blocks) + FP64 GEMV.
 //   2. Recomputed persistent, scratch, and packed-payload byte accounting.
-//   3. BoundedSwapQueue strict opt-in (default 0), forced promotion, eviction with verified immutable
-//      backing, byte-identical re-fetch of evicted expert, queue saturation (dropped_bound separate
-//      from experts_dropped == 0), pin/layer overlap guards, and independent 8-expert parity audit.
+//   3. Production LruSlotIndex + BoundedSwapQueue + ExpertCache host/device dispatch-pointer lifecycle
+//      for BOTH decode and prefill (Pass 0 / Pass 1):
+//        - Exact att-be17aa24 regression: stage into LRU -> hit -> promote to HOT (must erase LRU key)
+//          -> hit in HOT (decode + prefill) -> demote from HOT (clears dispatch ptr) -> re-route in
+//          decode & prefill (must miss LRU, re-fetch byte-identically from immutable backing, never
+//          dereference nullptr or stale slot).
+//        - Actual 8-expert SwiGLU numerical output verified at 0-ULP across 60+ interleaved decode &
+//          prefill steps with repeated promotions, demotions, staging-LRU hits, HOT hits, LRU
+//          evictions, queue saturation (dropped_bound separate from experts_dropped == 0), and
+//          pin-generation reuse protection.
 //   4. RuntimeOptions defaults, parse_attn_requant_mode, StateIdentity bidirectional isolation,
 //      and null-safe elided FP32 alias views.
+#include "core/lru_index.h"
 #include "core/q5_k.h"
 #include "ingine/generator.h"
 #include "ingine/prefix_cache.h"
@@ -49,7 +58,6 @@ void roundtrip_fp8_row(const float* in, float* out, int K) {
   }
   for (int k = 0; k < K; ++k) {
     float x = std::clamp(in[k] / scale, -448.0f, 448.0f);
-    // Round to E4M3FN precision (3 mantissa bits, bias 7, subnormal step 2^-9)
     const float sgn = x < 0.f ? -1.f : 1.f;
     const float ax = std::fabs(x);
     float q = 0.f;
@@ -57,7 +65,7 @@ void roundtrip_fp8_row(const float* in, float* out, int K) {
       q = std::nearbyint(ax * 512.0f) / 512.0f;
     } else {
       int e = 0;
-      const float m = std::frexp(ax, &e);  // ax = m * 2^e, m in [0.5, 1)
+      (void)std::frexp(ax, &e);
       const float step = std::ldexp(1.0f, e - 4);
       q = std::min(448.0f, std::nearbyint(ax / step) * step);
     }
@@ -74,6 +82,62 @@ double cosine_sim(const std::vector<double>& a, const std::vector<double>& b) {
   }
   return (na > 0.0 && nb > 0.0) ? (dot / std::sqrt(na * nb)) : 0.0;
 }
+
+// Compact numerical payload for each (layer, expert) representing a real SwiGLU expert MLP:
+//   up_w[4][4], gate_w[4][4], down_w[4][4] -> output y[4] = down_w @ (silu(gate_w @ x) * (up_w @ x)).
+struct ExpertWeights {
+  static constexpr int kDim = 4;
+  float up[kDim][kDim]{};
+  float gate[kDim][kDim]{};
+  float down[kDim][kDim]{};
+};
+
+ExpertWeights make_expert_weights(int l, int e) {
+  ExpertWeights w{};
+  std::uint64_t s = 0x9e3779b97f4a7c15ULL ^ (std::uint64_t(l + 1) << 32) ^ std::uint64_t(e * 1315423911u + 17u);
+  auto next = [&]() -> float {
+    s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+    const double u = double((s >> 11) & ((1ULL << 53) - 1)) / double(1ULL << 53);
+    return float((u - 0.5) * 0.5);
+  };
+  for (int i = 0; i < ExpertWeights::kDim; ++i) {
+    for (int j = 0; j < ExpertWeights::kDim; ++j) {
+      w.up[i][j] = next();
+      w.gate[i][j] = next();
+      w.down[i][j] = next();
+    }
+  }
+  return w;
+}
+
+std::array<double, ExpertWeights::kDim> eval_expert_mlp(const ExpertWeights& w,
+                                                        const std::array<double, ExpertWeights::kDim>& x) {
+  std::array<double, ExpertWeights::kDim> hidden{};
+  for (int i = 0; i < ExpertWeights::kDim; ++i) {
+    double g = 0.0, u = 0.0;
+    for (int j = 0; j < ExpertWeights::kDim; ++j) {
+      g += double(w.gate[i][j]) * x[std::size_t(j)];
+      u += double(w.up[i][j]) * x[std::size_t(j)];
+    }
+    const double silu = g / (1.0 + std::exp(-g));
+    hidden[std::size_t(i)] = silu * u;
+  }
+  std::array<double, ExpertWeights::kDim> y{};
+  for (int i = 0; i < ExpertWeights::kDim; ++i) {
+    double acc = 0.0;
+    for (int j = 0; j < ExpertWeights::kDim; ++j) {
+      acc += double(w.down[i][j]) * hidden[std::size_t(j)];
+    }
+    y[std::size_t(i)] = acc;
+  }
+  return y;
+}
+
+constexpr std::uint64_t make_key(int l, int e) noexcept {
+  return (static_cast<std::uint64_t>(l) << 8) | static_cast<std::uint64_t>(e);
+}
+constexpr int key_layer(std::uint64_t k) noexcept { return static_cast<int>(k >> 8); }
+constexpr int key_expert(std::uint64_t k) noexcept { return static_cast<int>(k & 0xffu); }
 
 }  // namespace
 
@@ -92,7 +156,6 @@ int main() {
   expect(row_bytes(3072) == 12 * 176 && row_bytes(3072) == 2112, "K=3072 -> 12 super-blocks (2112 B/row)");
 
   {
-    // Exact pack_scale_min_k4 / get_scale_min_k4 round-trip over all 8 sub-blocks (full 6-bit range 0..63).
     std::uint8_t sc[kSubBlocks] = {0, 17, 31, 63, 1, 22, 48, 63};
     std::uint8_t mn[kSubBlocks] = {63, 42, 15, 0, 59, 33, 16, 7};
     std::uint8_t packed[kScaleBytes]{};
@@ -104,7 +167,6 @@ int main() {
     }
   }
 
-  // Exact FP16 bit-conversion round-trip on normal, subnormal, zero, and clamp edges.
   {
     const float probes[] = {0.0f, -0.0f, 1.0f, -2.5f, 0.1f, 1e-4f, 65504.0f, 100000.0f};
     for (float v : probes) {
@@ -121,6 +183,7 @@ int main() {
   }
 
   // ------------------------------------------------------------------ 2. Multi-block K=2304 & K=3072 (BF16 + FP8)
+  // Strictly enforces the frozen <= 2.5% per-32-value sub-block source-range bound (0/5376 failures).
   for (int K : {2304, 3072}) {
     const int R = 16;
     const int M = 3;
@@ -134,7 +197,6 @@ int main() {
       return float((u - 0.5) * 2.0);
     };
     for (int r = 0; r < R; ++r) {
-      // Varied per-sub-block scales, asymmetric offsets, and occasional outlier
       for (int k = 0; k < K; ++k) {
         const int sb = (k / 32) % 8;
         const float mag = 0.04f * float(1 + (sb % 5));
@@ -153,16 +215,45 @@ int main() {
       std::vector<float> deq(src.size(), 0.f);
       dequant_rows_cpu(packed.data(), R, K, deq.data());
 
-      // Check nonzero reconstruction and tight elementwise fidelity
-      double max_err = 0.0, max_abs = 0.0;
       int nonzero = 0;
       for (std::size_t i = 0; i < src.size(); ++i) {
         if (deq[i] != 0.f) ++nonzero;
-        max_abs = std::max(max_abs, double(std::fabs(src[i])));
-        max_err = std::max(max_err, double(std::fabs(src[i] - deq[i])));
       }
       expect(nonzero > int(src.size() * 9 / 10), label);
-      expect(max_err < max_abs * 0.06, label);
+
+      // Frozen per-32-value sub-block source-range bound: max|src - deq| <= 2.5% * (max - min) in every sub-block.
+      const int nb = K / kBlockElems;
+      int total_sb = 0;
+      int fail_sb = 0;
+      double worst_rel = 0.0;
+      for (int r = 0; r < R; ++r) {
+        const float* srow = src.data() + std::size_t(r) * K;
+        const float* drow = deq.data() + std::size_t(r) * K;
+        for (int b = 0; b < nb; ++b) {
+          for (int j = 0; j < kSubBlocks; ++j) {
+            const int off = b * kBlockElems + j * kSubBlockElems;
+            double mn = srow[off], mx = srow[off], sb_err = 0.0;
+            for (int i = 0; i < kSubBlockElems; ++i) {
+              const double sv = srow[off + i];
+              const double dv = drow[off + i];
+              mn = std::min(mn, sv);
+              mx = std::max(mx, sv);
+              sb_err = std::max(sb_err, std::fabs(sv - dv));
+            }
+            const double sb_range = mx - mn;
+            ++total_sb;
+            if (sb_range > 0.0) {
+              const double rel = sb_err / sb_range;
+              worst_rel = std::max(worst_rel, rel);
+              if (rel > 0.025) ++fail_sb;
+            } else if (sb_err > 0.0) {
+              ++fail_sb;
+            }
+          }
+        }
+      }
+      expect(fail_sb == 0, "Q5_K frozen <= 2.5% per-32-value source-range bound across all sub-blocks");
+      expect(worst_rel <= 0.025, "Q5_K worst sub-block relative error <= 2.5%");
 
       // Compare FP64 GEMV over packed BlockQ5K vs original FP64 GEMV
       std::vector<double> ref_orig(std::size_t(M) * R, 0.0);
@@ -180,7 +271,6 @@ int main() {
       const double cos = cosine_sim(ref_orig, ref_q5k);
       expect(cos >= 0.999, label);
 
-      // Verify gemv_fp64_ref agrees bit-identically with explicit deq dot product
       double max_deq_diff = 0.0;
       for (int m = 0; m < M; ++m) {
         for (int r = 0; r < R; ++r) {
@@ -192,11 +282,23 @@ int main() {
         }
       }
       expect(max_deq_diff == 0.0, "gemv_fp64_ref matches explicit dequant_rows_cpu dot product bit-for-bit");
-      std::printf("PASS q5k_%s K=%d: cos=%.6f max_err=%.5f (max_abs=%.4f) nonzero=%d/%zu\n", label, K, cos, max_err,
-                  max_abs, nonzero, src.size());
+      std::printf("PASS q5k_%s K=%d: cos=%.6f subblock_fails=%d/%d worst_sb_rel=%.3f%% nonzero=%d/%zu\n", label, K, cos,
+                  fail_sb, total_sb, worst_rel * 100.0, nonzero, src.size());
     };
     check_source("bf16_src", w_bf16);
     check_source("fp8_disk_src", w_fp8);
+  }
+
+  // Zero-range constant sub-block edge case
+  {
+    std::vector<float> z(kBlockElems, 0.0f);
+    BlockQ5K blk{};
+    quantize_block_cpu(z.data(), blk);
+    std::vector<float> out(kBlockElems, 1.0f);
+    dequant_block_cpu(blk, out.data());
+    double max_z = 0.0;
+    for (float v : out) max_z = std::max(max_z, double(std::fabs(v)));
+    expect(max_z == 0.0, "Q5_K all-zero block round-trips identically to 0");
   }
 
   // ------------------------------------------------------------------ 3. Recomputed persistent & scratch byte accounting
@@ -220,21 +322,46 @@ int main() {
     expect(attn_q5k_bytes == 444128256ull, "wproj+wo Q5_K == 423.55 MiB");
     const double payload_red = 1.0 - double(kBlockBytes) / double(kBlockElems);
     expect(std::fabs(payload_red - 0.3125) < 1e-12, "Q5_K packed payload reduction vs FP8 == 31.25%");
-    const std::size_t wscratch_bytes = std::max(std::size_t(PROJ_ROWS_FULL) * HIDDEN,
-                                                std::size_t(HIDDEN) * TOTAL_HEADS * HEAD_DIM) * 2;
+    const std::size_t wscratch_bytes =
+        std::max(std::size_t(PROJ_ROWS_FULL) * HIDDEN, std::size_t(HIDDEN) * TOTAL_HEADS * HEAD_DIM) * 2;
     expect(wscratch_bytes == 39923712ull, "Prefiller::wscratch_ == 38.07 MiB");
   }
 
-  // ------------------------------------------------------------------ 4. BoundedSwapQueue & full 8-expert parity audit
+  // ------------------------------------------------------------------ 4. LruSlotIndex erase + pin_gen guard unit check
   {
-    // 4a. Default max_swaps=0 is strictly disabled (retains unmodified offload behavior).
+    ingine::LruSlotIndex lru(2);
+    auto a0 = lru.acquire(make_key(1, 5), /*pin_gen=*/10);
+    auto a1 = lru.acquire(make_key(1, 6), /*pin_gen=*/10);
+    expect(!a0.hit && !a1.hit && lru.find(make_key(1, 5)) == a0.slot, "LruSlotIndex initial acquire");
+    expect(lru.erase(make_key(1, 5)), "LruSlotIndex::erase removes resident key");
+    expect(lru.find(make_key(1, 5)) == -1, "erased key absent from find()");
+    expect(lru.touch_and_pin(make_key(1, 5), 11) == -1, "erased key cannot hit touch_and_pin()");
+    expect(!lru.erase(make_key(1, 5)), "second erase returns false");
+    // Slot a0 was pinned at pin_gen=10; acquiring in pin_gen=10 must throw (both slots still pinned at gen 10).
+    bool pinned_threw = false;
+    try {
+      (void)lru.acquire(make_key(1, 7), /*pin_gen=*/10);
+    } catch (const std::runtime_error&) {
+      pinned_threw = true;
+    }
+    expect(pinned_threw, "LruSlotIndex::erase preserves pin_gen guard against same-step reuse");
+    // In pin_gen=11, vacated slot a0 is reused cleanly without evicting live key (1, 6).
+    auto a2 = lru.acquire(make_key(1, 7), /*pin_gen=*/11);
+    expect(!a2.evicted && a2.slot == a0.slot && lru.find(make_key(1, 6)) == a1.slot,
+           "vacated erased slot reused cleanly in next pin_gen");
+  }
+
+  // ------------------------------------------------------------------ 5. Reconciled ExpertCache slot & pointer lifecycle
+  // Uses production LruSlotIndex + BoundedSwapQueue + host/device pointer tables + decode & prefill Pass 0/1
+  // and validates actual 8-expert SwiGLU numerical outputs (0-ULP) across repeated promote/demote/hit/refetch cycles.
+  {
+    // 5a. Strict opt-in default: max_swaps=0 disables promotions completely.
     BoundedSwapQueue q0(0);
     expect(!q0.enabled() && q0.capacity() == 0, "BoundedSwapQueue(0) disabled");
     for (int i = 0; i < 10; ++i) {
       expect(q0.record_access(6, 5, false) == BoundedSwapQueue::EnqueueStatus::Disabled, "max_swaps=0 never enqueues");
     }
     expect(q0.queued_total() == 0 && q0.dropped_bound() == 0, "max_swaps=0 zero queued/dropped");
-
     bool neg_threw = false;
     try {
       BoundedSwapQueue qneg(-1);
@@ -243,134 +370,391 @@ int main() {
     }
     expect(neg_threw, "BoundedSwapQueue(-1) throws invalid_argument");
 
-    // 4b. Forced promotion, eviction, re-fetch of evicted expert, queue saturation, and independent 8-expert audit.
-    constexpr int kCap = 4;
-    BoundedSwapQueue q(kCap, /*promote_threshold=*/2, /*hysteresis=*/2, /*decay_interval=*/100000);
-    expect(q.enabled() && q.capacity() == kCap, "BoundedSwapQueue(4) enabled");
+    // 5b. Full decode + prefill lifecycle model with actual ExpertWeights buffers & h_ptr / d_ptr dispatch tables.
+    constexpr int kHotCap = 4;
+    constexpr int kLruCap = 12;  // >= TOP_K (8) for single-slice decode, small enough to force real LRU evictions
+    constexpr int kSwapCap = 4;
+    BoundedSwapQueue swap_q(kSwapCap, /*promote_threshold=*/2, /*hysteresis=*/2, /*decay_interval=*/100000);
+    ingine::LruSlotIndex lru(kLruCap);
 
-    // Simulated ground-truth expert payloads (layer, expert) -> unique deterministic value.
-    auto ground_truth = [](int l, int e) -> double { return double((l + 1) * 1000 + e) * 0.00125; };
-
-    // 4 HOT slots (layer 0, experts 0..3) all with verified immutable backing (2 WARM + 2 COLD).
-    enum class SimTier { Hot, Warm, Cold };
-    struct SimMeta {
-      SimTier tier = SimTier::Warm;
+    enum class Tier { Hot, Warm, Cold };
+    struct Meta {
+      Tier tier = Tier::Warm;
       bool has_warm = false;
       bool has_cold = false;
       int hot_slot = -1;
-      double warm_val = 0.0;
-      double cold_val = 0.0;
+      int inflight_slot = -1;
+      ExpertWeights warm_buf{};
+      ExpertWeights cold_buf{};
     };
-    std::array<std::array<SimMeta, 128>, 24> meta{};
-    std::vector<BoundedSwapQueue::HotSlotState> slots;
-    std::vector<double> slot_vram;
+    struct Inflight {
+      bool active = false;
+      int hot_slot = -1;
+      int nl = -1;
+      int ne = -1;
+      ExpertWeights* dst = nullptr;
+    };
+
+    std::vector<std::array<Meta, 128>> meta(24);
+    std::vector<ExpertWeights> hot_vram(kHotCap);
+    std::vector<ExpertWeights> lru_vram(kLruCap);
+    std::vector<BoundedSwapQueue::HotSlotState> hot_slots;
+    std::array<Inflight, 2> inflight{};
+
+    // Separate host_mirror and device_table pointer arrays (mirrors ExpertCache::LayerDeviceTables).
+    std::vector<std::array<const ExpertWeights*, 128>> h_ptr(24);
+    std::vector<std::array<const ExpertWeights*, 128>> d_ptr(24);
+    std::array<bool, 24> dirty{};
     for (int l = 0; l < 24; ++l) {
+      h_ptr[l].fill(nullptr);
+      d_ptr[l].fill(nullptr);
       for (int e = 0; e < 128; ++e) {
-        meta[l][e].tier = (e % 2 == 0) ? SimTier::Warm : SimTier::Cold;
+        const ExpertWeights gt = make_expert_weights(l, e);
+        meta[l][e].tier = (e % 2 == 0) ? Tier::Warm : Tier::Cold;
         meta[l][e].has_warm = (e % 2 == 0);
-        meta[l][e].has_cold = true;  // every expert has verified immutable cold backing
-        meta[l][e].warm_val = ground_truth(l, e);
-        meta[l][e].cold_val = ground_truth(l, e);
+        meta[l][e].has_cold = true;
+        meta[l][e].warm_buf = gt;
+        meta[l][e].cold_buf = gt;
       }
     }
-    for (int e = 0; e < 4; ++e) {
-      meta[0][e].tier = SimTier::Hot;
+    // Initial 4 HOT experts: (0, 0..3)
+    for (int e = 0; e < kHotCap; ++e) {
+      meta[0][e].tier = Tier::Hot;
       meta[0][e].has_warm = (e < 2);
       meta[0][e].has_cold = true;
       meta[0][e].hot_slot = e;
-      slots.push_back(BoundedSwapQueue::HotSlotState{0, e, true, false, 0, std::uint64_t(e + 1)});
-      slot_vram.push_back(ground_truth(0, e));
+      hot_vram[std::size_t(e)] = meta[0][e].cold_buf;
+      h_ptr[0][e] = &hot_vram[std::size_t(e)];
+      d_ptr[0][e] = &hot_vram[std::size_t(e)];
+      hot_slots.push_back(BoundedSwapQueue::HotSlotState{0, e, true, false, 0, std::uint64_t(e + 1)});
     }
 
-    std::uint64_t promotions = 0, evictions = 0, refetches_of_evicted = 0, experts_dropped = 0;
-    std::array<bool, 4> was_evicted{};
-    std::uint64_t pin_gen = 0, tick = 10;
+    auto set_host = [&](int l, int e, const ExpertWeights* p) {
+      h_ptr[l][e] = p;
+      dirty[l] = true;
+    };
+    auto clear_host = [&](int l, int e) {
+      h_ptr[l][e] = nullptr;
+      dirty[l] = true;
+    };
+    auto flush_table = [&](int l) {
+      if (!dirty[l]) return;
+      d_ptr[l] = h_ptr[l];
+      dirty[l] = false;
+    };
 
-    auto execute_step = [&](int cur_layer, const std::array<int, 8>& selected, bool drain_after) {
-      const std::uint64_t gen = ++pin_gen;
-      double ref_sum = 0.0;
-      double exec_sum = 0.0;
-      std::array<int, 8> exec_ids{};
-      for (int k = 0; k < 8; ++k) {
-        const int e = selected[k];
-        const double w = 0.125 * double(k + 1);
-        ref_sum += w * ground_truth(cur_layer, e);
-        SimMeta& m = meta[cur_layer][e];
-        double payload = 0.0;
-        if (m.tier == SimTier::Hot) {
-          slots[std::size_t(m.hot_slot)].pin_gen = gen;
-          slots[std::size_t(m.hot_slot)].last_use = ++tick;
-          payload = slot_vram[std::size_t(m.hot_slot)];
-          (void)q.record_access(cur_layer, e, true);
-        } else {
-          // Verify immutable backing on re-fetch (NEVER drop expert!)
-          expect(m.has_warm || m.has_cold, "non-HOT expert must have verified immutable backing");
-          payload = (m.tier == SimTier::Warm) ? m.warm_val : m.cold_val;
-          if (cur_layer == 0 && e < 4 && was_evicted[e]) ++refetches_of_evicted;
-          (void)q.record_access(cur_layer, e, false);
-        }
-        exec_ids[k] = e;
-        exec_sum += w * payload;
-      }
-      // Independently compare all 8 selected IDs and exact sum contribution
-      expect(exec_ids == selected, "all 8 routed expert IDs executed identically");
-      expect(exec_sum == ref_sum, "0-ULP contribution parity across all 8 selected experts");
-
-      if (drain_after) {
-        BoundedSwapQueue::Entry cand{};
-        if (q.pop(cand)) {
-          const int victim = q.select_victim(slots, cur_layer, gen, q.live_hits(cand.layer, cand.expert));
-          if (victim >= 0) {
-            auto& vs = slots[std::size_t(victim)];
-            SimMeta& old_m = meta[vs.layer][vs.expert];
-            expect(old_m.has_warm || old_m.has_cold, "evicted HOT victim has immutable backing");
-            old_m.tier = old_m.has_warm ? SimTier::Warm : SimTier::Cold;
-            old_m.hot_slot = -1;
-            if (vs.layer == 0 && vs.expert < 4) was_evicted[vs.expert] = true;
-            ++evictions;
-
-            SimMeta& new_m = meta[cand.layer][cand.expert];
-            const double fetched = new_m.has_warm ? new_m.warm_val : new_m.cold_val;
-            slot_vram[std::size_t(victim)] = fetched;
-            new_m.tier = SimTier::Hot;
-            new_m.hot_slot = victim;
-            vs.layer = cand.layer;
-            vs.expert = cand.expert;
-            vs.last_use = ++tick;
-            ++promotions;
+    // Strict mutual-exclusion & pointer-validity invariant checked after EVERY transition.
+    auto check_invariants = [&]() {
+      for (int l = 0; l < 24; ++l) {
+        for (int e = 0; e < 128; ++e) {
+          const int lru_slot = lru.find(make_key(l, e));
+          if (meta[l][e].tier == Tier::Hot) {
+            expect(lru_slot == -1, "INVARIANT: HOT expert must never also exist in staging LRU");
+            expect(meta[l][e].hot_slot >= 0 && h_ptr[l][e] == &hot_vram[std::size_t(meta[l][e].hot_slot)],
+                   "INVARIANT: HOT expert host pointer matches hot_vram slot");
+          } else {
+            expect(meta[l][e].hot_slot == -1, "INVARIANT: non-HOT expert has hot_slot == -1");
+            if (lru_slot >= 0) {
+              expect(h_ptr[l][e] == &lru_vram[std::size_t(lru_slot)],
+                     "INVARIANT: staging-LRU resident expert has matching non-null host pointer");
+            } else {
+              expect(h_ptr[l][e] == nullptr, "INVARIANT: non-resident expert has null host pointer");
+            }
           }
         }
       }
     };
 
-    // Burst 8 distinct WARM/COLD experts in layer 6 twice without draining -> forces queue saturation (cap=4).
-    const std::array<int, 8> burst_l6 = {10, 11, 12, 13, 14, 15, 16, 17};
-    execute_step(6, burst_l6, /*drain_after=*/false);
-    execute_step(6, burst_l6, /*drain_after=*/false);
-    expect(q.size() == kCap, "bounded swap queue saturated at exact capacity");
-    expect(q.dropped_bound() == 4, "4 excess promotion requests counted in dropped_bound");
-    expect(experts_dropped == 0, "experts_dropped remains strictly 0 during saturation");
+    std::uint64_t pin_gen = 0, tick = 10;
+    std::uint64_t promotions = 0, evictions = 0, lru_hits = 0, refetches_after_demote = 0, experts_dropped = 0;
+    std::array<std::array<bool, 128>, 24> ever_demoted{};
 
-    // Verify avoid_layer guard: trying to select a victim from layer 0 while cur_layer==0 returns -1.
-    expect(q.select_victim(slots, /*avoid_layer=*/0, pin_gen, 10) == -1,
-           "avoid_layer prevents evicting victim from currently executing layer");
+    auto complete_swap = [&](int idx) {
+      Inflight& inf = inflight[std::size_t(idx)];
+      if (!inf.active) return;
+      // Mirrors repaired ExpertCache::complete_inflight_swap: erase any surviving staging-LRU key first!
+      (void)lru.erase(make_key(inf.nl, inf.ne));
+      Meta& nem = meta[inf.nl][inf.ne];
+      nem.tier = Tier::Hot;
+      nem.hot_slot = inf.hot_slot;
+      nem.inflight_slot = -1;
+      set_host(inf.nl, inf.ne, inf.dst);
+      auto& hs = hot_slots[std::size_t(inf.hot_slot)];
+      hs.layer = inf.nl;
+      hs.expert = inf.ne;
+      hs.evictable = true;
+      hs.swap_inflight = false;
+      hs.last_use = ++tick;
+      swap_q.mark_inflight(inf.nl, inf.ne, false);
+      inf.active = false;
+      ++promotions;
+    };
 
-    // Now drain promotions while executing layer 6 -> evicts layer 0's cold HOT experts (hits=0 vs hits>=2).
-    for (int step = 0; step < 4; ++step) execute_step(6, burst_l6, /*drain_after=*/true);
-    expect(promotions == 4 && evictions == 4, "forced 4 promotions and 4 HOT evictions");
-    for (int e = 0; e < 4; ++e) expect(was_evicted[e], "each original HOT expert evicted cleanly");
+    auto finalize_all_swaps = [&]() {
+      for (int i = 0; i < 2; ++i) complete_swap(i);
+      for (int l = 0; l < 24; ++l) flush_table(l);
+    };
 
-    // Now return to layer 0 and route to the evicted experts 0..3 -> verifies byte-identical re-fetch!
-    const std::array<int, 8> ret_l0 = {0, 1, 2, 3, 20, 21, 22, 23};
-    execute_step(0, ret_l0, /*drain_after=*/false);
-    expect(refetches_of_evicted == 4, "all 4 evicted HOT experts re-fetched byte-identically from immutable backing");
-    std::printf("PASS swap_queue: promo=%llu evict=%llu refetch=%llu qdrop=%llu edrop=%llu\n",
+    auto stage_expert = [&](int l, int e, std::uint64_t gen) {
+      expect(meta[l][e].tier != Tier::Hot, "stage_expert never called on HOT expert");
+      auto res = lru.acquire(make_key(l, e), gen, is_loop_layer(l));
+      if (res.hit) {
+        expect(h_ptr[l][e] == &lru_vram[std::size_t(res.slot)], "stage_expert hit has valid ptr");
+        ++lru_hits;
+        return;
+      }
+      if (res.evicted) {
+        const int el = key_layer(res.evicted_key);
+        const int ee = key_expert(res.evicted_key);
+        expect(meta[el][ee].tier != Tier::Hot, "LRU eviction never touches HOT expert");
+        clear_host(el, ee);
+      }
+      const Meta& em = meta[l][e];
+      expect(em.has_warm || em.has_cold, "non-HOT expert has verified immutable backing");
+      lru_vram[std::size_t(res.slot)] = (em.tier == Tier::Warm) ? em.warm_buf : em.cold_buf;
+      if (ever_demoted[l][e]) ++refetches_after_demote;
+      set_host(l, e, &lru_vram[std::size_t(res.slot)]);
+    };
+
+    auto drain_async = [&](int cur_layer, std::uint64_t gen, bool complete_now) {
+      int free_i = -1;
+      for (int i = 0; i < 2; ++i) {
+        if (!inflight[std::size_t(i)].active) {
+          free_i = i;
+          break;
+        }
+      }
+      if (free_i < 0) return;
+      BoundedSwapQueue::Entry cand{};
+      while (swap_q.pop(cand)) {
+        Meta& nem = meta[cand.layer][cand.expert];
+        if (nem.tier == Tier::Hot || nem.inflight_slot >= 0) continue;
+        const int victim = swap_q.select_victim(hot_slots, cur_layer, gen, swap_q.live_hits(cand.layer, cand.expert));
+        if (victim < 0) continue;
+        auto& vs = hot_slots[std::size_t(victim)];
+        const int ol = vs.layer, oe = vs.expert;
+        // Mirrors repaired ExpertCache::drain_swap_queue_async invariant check.
+        expect(lru.find(make_key(ol, oe)) == -1, "demoted HOT victim must not be present in staging LRU");
+        Meta& oem = meta[ol][oe];
+        oem.tier = oem.has_warm ? Tier::Warm : Tier::Cold;
+        oem.hot_slot = -1;
+        clear_host(ol, oe);
+        ever_demoted[ol][oe] = true;
+        ++evictions;
+
+        vs.swap_inflight = true;
+        nem.inflight_slot = free_i;
+        swap_q.mark_inflight(cand.layer, cand.expert, true);
+        hot_vram[std::size_t(victim)] = nem.has_warm ? nem.warm_buf : nem.cold_buf;
+        inflight[std::size_t(free_i)] = Inflight{true, victim, cand.layer, cand.expert, &hot_vram[std::size_t(victim)]};
+        if (complete_now) complete_swap(free_i);
+        break;
+      }
+    };
+
+    // Execute one decode layer and verify ACTUAL 8-expert SwiGLU numerical output at 0-ULP by dereferencing d_ptr[l].
+    auto run_decode_step = [&](int l, const std::array<int, 8>& sel, const std::array<double, 4>& x, bool poll_first,
+                               bool drain_after, bool complete_immediately) {
+      if (poll_first) {
+        for (int i = 0; i < 2; ++i) complete_swap(i);
+      }
+      std::vector<int> hot_ids, non_hot_ids;
+      for (int e : sel) {
+        if (meta[l][e].inflight_slot >= 0) complete_swap(meta[l][e].inflight_slot);
+        if (meta[l][e].tier == Tier::Hot) {
+          expect(h_ptr[l][e] == &hot_vram[std::size_t(meta[l][e].hot_slot)], "decode HOT ptr valid");
+          hot_ids.push_back(e);
+        } else {
+          non_hot_ids.push_back(e);
+        }
+      }
+      const std::uint64_t gen = ++pin_gen;
+      for (int e : hot_ids) {
+        hot_slots[std::size_t(meta[l][e].hot_slot)].pin_gen = gen;
+        hot_slots[std::size_t(meta[l][e].hot_slot)].last_use = ++tick;
+        (void)swap_q.record_access(l, e, true);
+      }
+      for (int e : non_hot_ids) (void)swap_q.record_access(l, e, false);
+
+      std::vector<int> misses;
+      for (int e : non_hot_ids) {
+        const int slot = lru.touch_and_pin(make_key(l, e), gen, is_loop_layer(l));
+        if (slot >= 0) {
+          expect(h_ptr[l][e] == &lru_vram[std::size_t(slot)], "decode staging-LRU hit has non-null matching ptr");
+          ++lru_hits;
+        } else {
+          misses.push_back(e);
+        }
+      }
+      for (int e : misses) stage_expert(l, e, gen);
+      flush_table(l);
+
+      // Compute actual 8-expert numerical output EXCLUSIVELY via d_ptr[l][e] (must never be null) vs ground truth!
+      std::array<double, 4> y_got{}, y_ref{};
+      for (int k = 0; k < 8; ++k) {
+        const int e = sel[std::size_t(k)];
+        const double rw = 0.05 * double(k + 1);
+        const ExpertWeights* dp = d_ptr[l][e];
+        expect(dp != nullptr, "decode device dispatch pointer non-null for all 8 routed experts");
+        if (dp) {
+          const auto ye = eval_expert_mlp(*dp, x);
+          for (int d = 0; d < 4; ++d) y_got[std::size_t(d)] += rw * ye[std::size_t(d)];
+        }
+        const auto yr = eval_expert_mlp(make_expert_weights(l, e), x);
+        for (int d = 0; d < 4; ++d) y_ref[std::size_t(d)] += rw * yr[std::size_t(d)];
+      }
+      for (int d = 0; d < 4; ++d) {
+        expect(y_got[std::size_t(d)] == y_ref[std::size_t(d)], "decode 8-expert SwiGLU output 0-ULP exact");
+      }
+      if (drain_after) drain_async(l, gen, complete_immediately);
+      check_invariants();
+    };
+
+    // Execute one prefill layer (Pass 0 overlapped HOT+LRU hits using d_ptr BEFORE Pass 1 flush, then Pass 1).
+    auto run_prefill_step = [&](int l, const std::array<int, 8>& sel, const std::array<double, 4>& x) {
+      // Mirrors repaired finalize_all_inflight_swaps: completes swaps AND flushes all dirty tables before Pass 0!
+      finalize_all_swaps();
+      std::vector<int> active_hot, misses;
+      for (int e : sel) {
+        if (meta[l][e].tier == Tier::Hot) active_hot.push_back(e);
+        else misses.push_back(e);
+      }
+      const std::uint64_t gen = ++pin_gen;
+      std::vector<int> p0_lru_hits, to_stage;
+      for (int e : misses) {
+        const int slot = lru.touch_and_pin(make_key(l, e), gen, is_loop_layer(l));
+        if (slot >= 0) {
+          expect(h_ptr[l][e] == &lru_vram[std::size_t(slot)], "prefill staging-LRU hit has non-null matching ptr");
+          ++lru_hits;
+          p0_lru_hits.push_back(e);
+        } else {
+          to_stage.push_back(e);
+        }
+      }
+      std::array<double, 4> y_got{}, y_ref{};
+      std::array<std::array<double, 4>, 8> per_expert_got{};
+      std::array<bool, 8> expert_computed{};
+      // Pass 0 executes active_hot + p0_lru_hits using EXISTING d_ptr[l] BEFORE staging `to_stage`!
+      for (int k = 0; k < 8; ++k) {
+        const int e = sel[std::size_t(k)];
+        const bool in_p0 = (std::find(active_hot.begin(), active_hot.end(), e) != active_hot.end()) ||
+                           (std::find(p0_lru_hits.begin(), p0_lru_hits.end(), e) != p0_lru_hits.end());
+        if (in_p0) {
+          const ExpertWeights* dp = d_ptr[l][e];
+          expect(dp != nullptr, "prefill Pass 0 device dispatch pointer non-null before Pass 1 flush");
+          if (dp) {
+            per_expert_got[std::size_t(k)] = eval_expert_mlp(*dp, x);
+            expert_computed[std::size_t(k)] = true;
+          }
+        }
+      }
+      // Pass 1 stages `to_stage`, flushes d_ptr[l], and evaluates the remaining experts.
+      for (int e : to_stage) stage_expert(l, e, gen);
+      flush_table(l);
+      for (int k = 0; k < 8; ++k) {
+        const int e = sel[std::size_t(k)];
+        const double rw = 0.05 * double(k + 1);
+        if (std::find(to_stage.begin(), to_stage.end(), e) != to_stage.end()) {
+          const ExpertWeights* dp = d_ptr[l][e];
+          expect(dp != nullptr, "prefill Pass 1 device dispatch pointer non-null");
+          if (dp) {
+            per_expert_got[std::size_t(k)] = eval_expert_mlp(*dp, x);
+            expert_computed[std::size_t(k)] = true;
+          }
+        }
+        expect(expert_computed[std::size_t(k)], "all 8 routed prefill experts computed (experts_dropped == 0)");
+        const auto yr = eval_expert_mlp(make_expert_weights(l, e), x);
+        for (int d = 0; d < 4; ++d) {
+          expect(per_expert_got[std::size_t(k)][std::size_t(d)] == yr[std::size_t(d)],
+                 "prefill per-expert SwiGLU output 0-ULP exact");
+          y_got[std::size_t(d)] += rw * per_expert_got[std::size_t(k)][std::size_t(d)];
+          y_ref[std::size_t(d)] += rw * yr[std::size_t(d)];
+        }
+      }
+      for (int d = 0; d < 4; ++d) {
+        expect(y_got[std::size_t(d)] == y_ref[std::size_t(d)], "prefill 8-expert SwiGLU output 0-ULP exact");
+      }
+      check_invariants();
+    };
+
+    const std::array<double, 4> x_probe = {0.35, -0.22, 0.71, -0.48};
+    // Exact att-be17aa24 regression scenario:
+    // Step 1-2: Layer 6 routes {10..17} twice -> stages in LRU, hits in LRU, saturates bounded swap queue (cap=4, qdrop=4).
+    const std::array<int, 8> l6_a = {10, 11, 12, 13, 14, 15, 16, 17};
+    run_decode_step(6, l6_a, x_probe, false, false, false);
+    run_decode_step(6, l6_a, x_probe, false, false, false);
+    expect(swap_q.size() == kSwapCap && swap_q.dropped_bound() == 4, "bounded queue saturated (qdrop=4)");
+    expect(experts_dropped == 0, "experts_dropped == 0 during saturation");
+
+    // Step 3: Promote (6, 10..13) into HOT (evicting (0, 0..3)) WHILE (6, 10..13) are LIVE in staging LRU!
+    // Before our fix, (6, 10..13) remained live in staging LRU after promotion.
+    for (int step = 0; step < 4; ++step) run_decode_step(6, l6_a, x_probe, true, true, true);
+    expect(promotions == 4 && evictions == 4, "4 HOT promotions + 4 HOT evictions");
+    for (int e = 10; e < 14; ++e) {
+      expect(meta[6][e].tier == Tier::Hot && lru.find(make_key(6, e)) == -1,
+             "promoted experts erased from staging LRU immediately on promotion");
+    }
+
+    // Step 4: Prefill on layer 6 while (6, 10..13) are HOT and dirty[6] may have just changed (Pass 0 check).
+    run_prefill_step(6, {10, 11, 12, 13, 40, 41, 42, 43}, x_probe);
+
+    // Step 5: Promote layer 12 experts {50..53} with higher hit counts (>= 6 + hysteresis 2 = 8, plus 4 drain steps)
+    // to DEMOTE all 4 (6, 10..13) back to WARM/COLD!
+    // Note: (6, 10..13) were previously staged in LRU, then promoted to HOT, and are NOW demoted (h_ptr cleared).
+    const std::array<int, 8> l12_hot = {50, 51, 52, 53, 54, 55, 56, 57};
+    for (int rep = 0; rep < 14; ++rep) run_decode_step(12, l12_hot, x_probe, true, true, false);
+    finalize_all_swaps();
+    int demoted_l6 = 0;
+    for (int e = 10; e < 14; ++e) {
+      if (meta[6][e].tier != Tier::Hot) ++demoted_l6;
+    }
+    expect(demoted_l6 == 4, "all 4 previously-promoted layer-6 experts demoted by hotter layer-12 experts");
+
+    // Step 6: Immediately re-route (6, 10..13) in BOTH decode AND prefill!
+    // Before our fix, touch_and_pin hit the stale staging-LRU key while h_ptr/d_ptr was nullptr!
+    run_decode_step(6, l6_a, x_probe, true, false, false);
+    run_prefill_step(6, l6_a, x_probe);
+    // Also re-route originally evicted (0, 0..3) in decode & prefill.
+    run_decode_step(0, {0, 1, 2, 3, 20, 21, 22, 23}, x_probe, true, true, false);
+    run_prefill_step(0, {0, 1, 2, 3, 24, 25, 26, 27}, x_probe);
+
+    // Step 7: 40-step stress storm interleaving decode, deferred-completion async swaps, and prefill across layers.
+    std::uint64_t srng = 0x888CAFEBABEULL;
+    for (int step = 0; step < 40; ++step) {
+      const int layer = (step % 3 == 0) ? 0 : ((step % 3 == 1) ? 6 : 12);
+      std::array<int, 8> sel{};
+      for (int k = 0; k < 8; ++k) {
+        srng = srng * 6364136223846793005ULL + 1442695040888963407ULL;
+        const int base = ((step / 8) % 2 == 0) ? 0 : 10;
+        sel[std::size_t(k)] = (base + int((srng >> 32) % 20) + k * 3) % 128;
+      }
+      // Deduplicate 8 distinct expert IDs (realistic TOP_K routing)
+      for (int k = 0; k < 8; ++k) {
+        while (std::find(sel.begin(), sel.begin() + k, sel[std::size_t(k)]) != sel.begin() + k) {
+          sel[std::size_t(k)] = (sel[std::size_t(k)] + 1) % 128;
+        }
+      }
+      const std::array<double, 4> xs = {0.1 * double(step % 7 - 3), 0.25, -0.4 + 0.01 * step, 0.6};
+      if (step % 5 == 4) {
+        run_prefill_step(layer, sel, xs);
+      } else {
+        run_decode_step(layer, sel, xs, /*poll_first=*/(step % 2 == 0), /*drain_after=*/true,
+                        /*complete_immediately=*/(step % 4 == 0));
+      }
+    }
+    finalize_all_swaps();
+    check_invariants();
+
+    expect(promotions >= 8 && evictions >= 8, "repeated HOT promotions and demotions exercised");
+    expect(lru_hits > 0 && refetches_after_demote >= 4, "staging LRU hits and post-demotion re-fetches verified");
+    std::printf("PASS lifecycle_8expert: promo=%llu evict=%llu lru_hits=%llu refetch=%llu qdrop=%llu edrop=%llu\n",
                 static_cast<unsigned long long>(promotions), static_cast<unsigned long long>(evictions),
-                static_cast<unsigned long long>(refetches_of_evicted),
-                static_cast<unsigned long long>(q.dropped_bound()), static_cast<unsigned long long>(experts_dropped));
+                static_cast<unsigned long long>(lru_hits), static_cast<unsigned long long>(refetches_after_demote),
+                static_cast<unsigned long long>(swap_q.dropped_bound()),
+                static_cast<unsigned long long>(experts_dropped));
   }
 
-  // ------------------------------------------------------------------ 5. Defaults, parsing, StateIdentity, null-safety
+  // ------------------------------------------------------------------ 6. Defaults, parsing, StateIdentity, null-safety
   {
     RuntimeOptions def;
     expect(def.loop_bf16 == false, "RuntimeOptions::loop_bf16 defaults false");
@@ -386,7 +770,6 @@ int main() {
     }
     expect(bad_threw, "parse_attn_requant_mode rejects invalid value");
 
-    // Bidirectional StateIdentity isolation (off <-> q5_k)
     StateIdentity id_off;
     id_off.attn_requant = static_cast<std::uint8_t>(AttnRequantMode::Off);
     StateIdentity id_q5 = id_off;
@@ -394,7 +777,6 @@ int main() {
     expect(!(id_off == id_q5) && !(id_q5 == id_off), "StateIdentity bidirectional attn_requant inequality");
     expect(hash_state_identity(id_off) != hash_state_identity(id_q5), "hash_state_identity distinguishes attn_requant");
 
-    // Null-safety of elided FP32 alias views in Layer (absent tensors carry data == nullptr)
     Layer layer;
     auto null_safe_at = [](const ingine::Tensor& stack, int g, ingine::DType dt, std::int32_t a, std::int32_t b) {
       if (!stack.data) return ingine::Tensor{};

@@ -132,10 +132,17 @@ inline void pack_scale_min_k4(const std::uint8_t sc[kSubBlocks], const std::uint
 }
 
 // Quantize 256 FP32 weights into one exact GGML BlockQ5K (matches GPU quantize_q5_k_rows_kernel).
+// Two-pass no-clip sub-block quantization:
+//   1. Quantize dmin = f16(max_j(-mn_j) / 63), then round each sub-block m_q[j] = ceil((-mn_j) / dmin)
+//      so -dmin * m_q[j] <= mn_j (no lower-tail clipping).
+//   2. Compute required per-sub-block scale need_sc[j] = (mx_j + dmin * m_q[j]) / 31, quantize
+//      d = f16(max_j(need_sc[j]) / 63), and round sc_q[j] = ceil(need_sc[j] / d) so
+//      31 * d * sc_q[j] - dmin * m_q[j] >= mx_j (no upper-tail clipping).
+// This eliminates sub-block scale/min clipping when an outlier inflates another sub-block in the same
+// 256-element super-block, enforcing <= 2.5% per-32-value source-range reconstruction error.
 inline void quantize_block_cpu(const float* src, BlockQ5K& dst) noexcept {
-  float sb_scale[kSubBlocks];
-  float sb_min[kSubBlocks];
-  float max_scale = 0.f;
+  float sb_mn[kSubBlocks];
+  float sb_mx[kSubBlocks];
   float max_min = 0.f;
   for (int j = 0; j < kSubBlocks; ++j) {
     float mn = 0.f;
@@ -146,28 +153,36 @@ inline void quantize_block_cpu(const float* src, BlockQ5K& dst) noexcept {
       if (v < mn) mn = v;
       if (v > mx) mx = v;
     }
-    const float sc = (mx - mn) / 31.0f;
+    sb_mn[j] = mn;
+    sb_mx[j] = mx;
     const float neg_mn = -mn;
-    sb_scale[j] = sc;
-    sb_min[j] = neg_mn;
-    if (sc > max_scale) max_scale = sc;
     if (neg_mn > max_min) max_min = neg_mn;
   }
 
-  const float d_f = max_scale / 63.0f;
   const float dmin_f = max_min / 63.0f;
-  dst.d = f32_to_f16_bits(d_f);
   dst.dmin = f32_to_f16_bits(dmin_f);
-  const float d_val = f16_bits_to_f32(dst.d);
   const float dmin_val = f16_bits_to_f32(dst.dmin);
 
-  std::uint8_t sc_q[kSubBlocks];
   std::uint8_t m_q[kSubBlocks];
+  float need_sc[kSubBlocks];
+  float max_scale = 0.f;
   for (int j = 0; j < kSubBlocks; ++j) {
-    const int sq = (d_val > 0.f) ? std::clamp(int(std::nearbyint(sb_scale[j] / d_val)), 0, 63) : 0;
-    const int mq = (dmin_val > 0.f) ? std::clamp(int(std::nearbyint(sb_min[j] / dmin_val)), 0, 63) : 0;
-    sc_q[j] = static_cast<std::uint8_t>(sq);
+    const int mq = (dmin_val > 0.f) ? std::clamp(int(std::ceil((-sb_mn[j]) / dmin_val)), 0, 63) : 0;
     m_q[j] = static_cast<std::uint8_t>(mq);
+    const float eff_m = dmin_val * float(mq);
+    const float sc = std::max(0.f, (sb_mx[j] + eff_m) / 31.0f);
+    need_sc[j] = sc;
+    if (sc > max_scale) max_scale = sc;
+  }
+
+  const float d_f = max_scale / 63.0f;
+  dst.d = f32_to_f16_bits(d_f);
+  const float d_val = f16_bits_to_f32(dst.d);
+
+  std::uint8_t sc_q[kSubBlocks];
+  for (int j = 0; j < kSubBlocks; ++j) {
+    const int sq = (d_val > 0.f) ? std::clamp(int(std::ceil(need_sc[j] / d_val)), 0, 63) : 0;
+    sc_q[j] = static_cast<std::uint8_t>(sq);
   }
   pack_scale_min_k4(sc_q, m_q, dst.scales);
 

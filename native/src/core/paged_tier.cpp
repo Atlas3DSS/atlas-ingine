@@ -301,82 +301,34 @@ VramLruSlab::VramLruSlab(int num_slots, std::size_t slot_bytes)
     : slot_bytes_((slot_bytes + 255) / 256 * 256) {
   if (num_slots <= 0 || slot_bytes == 0) return;
   storage_ = DeviceBuffer(std::size_t(num_slots) * slot_bytes_);
-  slots_.resize(std::size_t(num_slots));
+  slot_ptrs_.resize(std::size_t(num_slots));
   auto* base = static_cast<std::uint8_t*>(storage_.p);
   for (int i = 0; i < num_slots; ++i) {
-    slots_[i].vram_ptr = base + std::size_t(i) * slot_bytes_;
+    slot_ptrs_[std::size_t(i)] = base + std::size_t(i) * slot_bytes_;
   }
-  index_.reserve(std::size_t(num_slots) * 2);
+  lru_.reset(num_slots);
 }
 
-int VramLruSlab::find(std::uint64_t key) const noexcept {
-  auto it = index_.find(key);
-  return it == index_.end() ? -1 : it->second;
-}
+int VramLruSlab::find(std::uint64_t key) const noexcept { return lru_.find(key); }
 
 int VramLruSlab::touch_and_pin(std::uint64_t key, std::uint64_t pin_gen, bool priority) noexcept {
-  auto it = index_.find(key);
-  if (it == index_.end()) return -1;
-  Slot& s = slots_[it->second];
-  s.last_use = ++tick_ + (priority ? std::uint64_t(slots_.size()) : 0ull);
-  s.pin_gen = pin_gen;
-  return it->second;
+  return lru_.touch_and_pin(key, pin_gen, priority);
 }
 
+bool VramLruSlab::erase(std::uint64_t key) noexcept { return lru_.erase(key); }
+
 VramLruSlab::AcquireResult VramLruSlab::acquire(std::uint64_t key, std::uint64_t pin_gen, bool priority) {
+  const auto ir = lru_.acquire(key, pin_gen, priority);
   AcquireResult r{};
-  if (slots_.empty()) throw std::runtime_error("VramLruSlab::acquire on empty slab");
-  if (auto it = index_.find(key); it != index_.end()) {
-    Slot& s = slots_[it->second];
-    s.last_use = ++tick_ + (priority ? std::uint64_t(slots_.size()) : 0ull);
-    s.pin_gen = pin_gen;
-    r.slot = it->second;
-    r.vram_ptr = s.vram_ptr;
-    r.hit = true;
-    return r;
-  }
-  // Pick an empty slot first, else least-recently-used unpinned slot.
-  int victim = -1;
-  std::uint64_t best_use = std::numeric_limits<std::uint64_t>::max();
-  for (int i = 0; i < int(slots_.size()); ++i) {
-    if (slots_[i].key == kEmptyKey) {
-      victim = i;
-      break;
-    }
-    if (slots_[i].pin_gen == pin_gen) continue;
-    if (slots_[i].last_use < best_use) {
-      best_use = slots_[i].last_use;
-      victim = i;
-    }
-  }
-  if (victim < 0) {
-    throw std::runtime_error("VramLruSlab::acquire: all " + std::to_string(slots_.size()) +
-                             " slots are pinned in the same step");
-  }
-  Slot& s = slots_[victim];
-  if (s.key != kEmptyKey) {
-    r.evicted = true;
-    r.evicted_key = s.key;
-    index_.erase(s.key);
-  }
-  s.key = key;
-  s.last_use = ++tick_ + (priority ? std::uint64_t(slots_.size()) : 0ull);
-  s.pin_gen = pin_gen;
-  index_[key] = victim;
-  r.slot = victim;
-  r.vram_ptr = s.vram_ptr;
-  r.hit = false;
+  r.slot = ir.slot;
+  r.vram_ptr = slot_ptrs_[std::size_t(ir.slot)];
+  r.hit = ir.hit;
+  r.evicted = ir.evicted;
+  r.evicted_key = ir.evicted_key;
   return r;
 }
 
-void VramLruSlab::clear() noexcept {
-  index_.clear();
-  for (auto& s : slots_) {
-    s.key = kEmptyKey;
-    s.last_use = 0;
-    s.pin_gen = 0;
-  }
-}
+void VramLruSlab::clear() noexcept { lru_.clear(); }
 
 // ---------------------------------------------------------------------------------------- TieredDmaStream
 

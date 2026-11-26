@@ -622,6 +622,25 @@ void ExpertCache::clear_host_ptrs(int l, int e) {
   tb.dirty = true;
 }
 
+void ExpertCache::verify_hot_hit_ptrs(int l, int e) const {
+  const ExpertMeta& em = meta_[l][e];
+  const ExpertLayout& lo = layouts_[l];
+  if (em.tier != Tier::HotVram || em.hot_ptr == nullptr || tables_[l].h_w13[e] != em.hot_ptr + lo.off_w13 ||
+      tables_[l].h_w2[e] != em.hot_ptr + lo.off_w2) {
+    throw std::logic_error("expert_cache: HOT hit dispatch pointer invariant violated");
+  }
+}
+
+void ExpertCache::verify_staged_hit_ptrs(int l, int e, int slot) const {
+  const int b = layer_slab_[l];
+  const ExpertLayout& lo = layouts_[l];
+  const std::uint8_t* base = slabs_[b].slot_ptr(slot);
+  if (meta_[l][e].tier == Tier::HotVram || base == nullptr || tables_[l].h_w13[e] != base + lo.off_w13 ||
+      tables_[l].h_w2[e] != base + lo.off_w2) {
+    throw std::logic_error("expert_cache: staging LRU hit dispatch pointer invariant violated");
+  }
+}
+
 void ExpertCache::flush_layer_table(int l) {
   LayerDeviceTables& tb = tables_[l];
   if (!tb.dirty) return;
@@ -656,17 +675,22 @@ bool ExpertCache::stage_expert(int l, int e, std::uint64_t pin_gen) {
   const int b = layer_slab_[l];
   const ExpertLayout& lo = layouts_[l];
   const ExpertMeta& em = meta_[l][e];
+  if (em.tier == Tier::HotVram) {
+    throw std::logic_error("expert_cache: stage_expert called for HOT expert");
+  }
   const auto res = slabs_[b].acquire(make_key(l, e), pin_gen, is_loop_layer(l));
   if (res.hit) {
+    verify_staged_hit_ptrs(l, e, res.slot);
     ++stats_.lru_hits;
     return false;
   }
   if (res.evicted) {
     const int el = key_layer(res.evicted_key);
     const int ee = key_expert(res.evicted_key);
-    if (meta_[el][ee].tier != Tier::HotVram) {
-      clear_host_ptrs(el, ee);
+    if (meta_[el][ee].tier == Tier::HotVram) {
+      throw std::logic_error("expert_cache: evicted staging LRU key belongs to a HOT expert");
     }
+    clear_host_ptrs(el, ee);
   }
   if (em.tier == Tier::WarmRam) {
     const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(warm_ram_.data()) + em.warm_offset;
@@ -684,7 +708,7 @@ bool ExpertCache::stage_expert(int l, int e, std::uint64_t pin_gen) {
   return true;
 }
 
-void ExpertCache::complete_inflight_swap(int inf_idx) {
+void ExpertCache::complete_inflight_swap(int inf_idx, cudaStream_t compute_stream) {
   InflightSwap& inf = inflight_[std::size_t(inf_idx)];
   if (!inf.active) return;
   const int nl = inf.new_layer;
@@ -692,6 +716,14 @@ void ExpertCache::complete_inflight_swap(int inf_idx) {
   const int b = inf.bucket;
   const int hs = inf.hot_slot;
   ExpertMeta& nem = meta_[nl][ne];
+  // Enforce mutual exclusion between permanent HOT VRAM and the staging LRU slab: if (nl, ne) was
+  // resident in the staging LRU prior to promotion, erase its key now so a subsequent HOT demotion
+  // cannot leave a surviving staging key with cleared dispatch pointers. Order dma_.stream() after
+  // compute_stream before any future H2D can reuse the vacated LRU slot.
+  if (slabs_[b].capacity() > 0 && slabs_[b].erase(make_key(nl, ne))) {
+    CUDA_CHECK(cudaEventRecord(victim_release_ev_, compute_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(dma_.stream(), victim_release_ev_, 0));
+  }
   nem.tier = Tier::HotVram;
   nem.hot_ptr = inf.dst_vram;
   nem.hot_slot = hs;
@@ -709,12 +741,12 @@ void ExpertCache::complete_inflight_swap(int inf_idx) {
   ++stats_.async_swaps_completed;
 }
 
-void ExpertCache::poll_inflight_swaps() {
+void ExpertCache::poll_inflight_swaps(cudaStream_t compute_stream) {
   for (int i = 0; i < kMaxInflightSwaps; ++i) {
     if (!inflight_[std::size_t(i)].active) continue;
     const cudaError_t st = cudaEventQuery(inflight_[std::size_t(i)].done);
     if (st == cudaSuccess) {
-      complete_inflight_swap(i);
+      complete_inflight_swap(i, compute_stream);
     } else if (st != cudaErrorNotReady) {
       CUDA_CHECK(st);
     }
@@ -722,14 +754,23 @@ void ExpertCache::poll_inflight_swaps() {
 }
 
 void ExpertCache::finalize_all_inflight_swaps(cudaStream_t compute_stream) {
-  if (!swap_queue_.enabled()) return;
-  bool any = false;
-  for (int i = 0; i < kMaxInflightSwaps; ++i) {
-    if (!inflight_[std::size_t(i)].active) continue;
-    complete_inflight_swap(i);
-    any = true;
+  if (swap_queue_.enabled()) {
+    for (int i = 0; i < kMaxInflightSwaps; ++i) {
+      if (!inflight_[std::size_t(i)].active) continue;
+      complete_inflight_swap(i, compute_stream);
+    }
   }
-  if (any) {
+  bool any_dirty = false;
+  for (int l = 0; l < LAYERS; ++l) {
+    if (tables_[l].dirty) {
+      any_dirty = true;
+      break;
+    }
+  }
+  if (any_dirty) {
+    // Wait for prior compute kernels to finish reading old device tables before flushing updates.
+    CUDA_CHECK(cudaEventRecord(victim_release_ev_, compute_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(dma_.stream(), victim_release_ev_, 0));
     for (int l = 0; l < LAYERS; ++l) flush_layer_table(l);
     dma_.record_and_wait_on(compute_stream);
   }
@@ -737,7 +778,7 @@ void ExpertCache::finalize_all_inflight_swaps(cudaStream_t compute_stream) {
 
 void ExpertCache::drain_swap_queue_async(int current_layer, std::uint64_t cur_pin_gen, cudaStream_t compute_stream) {
   if (!swap_queue_.enabled() || mode_ != OffloadMode::DmaLru) return;
-  poll_inflight_swaps();
+  poll_inflight_swaps(compute_stream);
   int free_inf = -1;
   for (int i = 0; i < kMaxInflightSwaps; ++i) {
     if (!inflight_[std::size_t(i)].active) {
@@ -766,6 +807,9 @@ void ExpertCache::drain_swap_queue_async(int current_layer, std::uint64_t cur_pi
     ExpertMeta& oem = meta_[ol][oe];
     if (!oem.has_warm_backing && !oem.has_cold_backing) {
       throw std::logic_error("expert_cache: evictable HOT expert lacks immutable backing");
+    }
+    if (slabs_[b].capacity() > 0 && slabs_[b].find(make_key(ol, oe)) >= 0) {
+      throw std::logic_error("expert_cache: demoted HOT victim still present in staging LRU");
     }
     // Demote victim back to its immutable WARM/COLD tier (0 bytes D2H).
     oem.tier = oem.has_warm_backing ? Tier::WarmRam : Tier::ColdNvme;
@@ -853,8 +897,10 @@ void ExpertCache::prepare_decode(int l, const int* d_idx, int m, cudaStream_t co
   for (int i = 0; i < nuniq; ++i) {
     const int e = uniq[i];
     if (meta_[l][e].tier == Tier::HotVram) {
+      verify_hot_hit_ptrs(l, e);
       ++stats_.hot_hits;
-    } else if (slabs_[b].touch_and_pin(make_key(l, e), gen, prio) >= 0) {
+    } else if (const int slot = slabs_[b].touch_and_pin(make_key(l, e), gen, prio); slot >= 0) {
+      verify_staged_hit_ptrs(l, e, slot);
       ++stats_.lru_hits;
     } else {
       misses[nmiss++] = e;
@@ -934,7 +980,7 @@ void ExpertCache::run_decode_layer(
   }
 
   const bool swaps_on = swap_queue_.enabled();
-  if (swaps_on) poll_inflight_swaps();
+  if (swaps_on) poll_inflight_swaps(compute_stream);
 
   int t0 = 0;
   while (t0 < m) {
@@ -961,10 +1007,11 @@ void ExpertCache::run_decode_layer(
         word |= bit;
         ExpertMeta& em = meta_[l][e];
         if (swaps_on && em.inflight_slot >= 0) {
-          complete_inflight_swap(em.inflight_slot);
+          complete_inflight_swap(em.inflight_slot, compute_stream);
           need_wait = true;
         }
         if (em.tier == Tier::HotVram) {
+          verify_hot_hit_ptrs(l, e);
           add_hot[n_add_hot++] = e;
         } else {
           add_non_hot[n_add_non_hot++] = e;
@@ -1000,7 +1047,8 @@ void ExpertCache::run_decode_layer(
     int nmiss = 0;
     for (int i = 0; i < n_non_hot; ++i) {
       const int e = slice_non_hot[i];
-      if (slabs_[b].touch_and_pin(make_key(l, e), gen, prio) >= 0) {
+      if (const int slot = slabs_[b].touch_and_pin(make_key(l, e), gen, prio); slot >= 0) {
+        verify_staged_hit_ptrs(l, e, slot);
         ++stats_.lru_hits;
       } else {
         misses[nmiss++] = e;
@@ -1047,6 +1095,7 @@ void ExpertCache::run_prefill_layer(
     if (counts[e] <= 0) continue;
     router_hits_[l][e] += std::uint64_t(counts[e]);
     if (meta_[l][e].tier == Tier::HotVram) {
+      verify_hot_hit_ptrs(l, e);
       active_hot.push_back(e);
       ++stats_.hot_hits;
     } else {
@@ -1085,7 +1134,8 @@ void ExpertCache::run_prefill_layer(
     lru_hits.reserve(misses.size());
     to_stage.reserve(misses.size());
     for (int e : misses) {
-      if (slabs_[b].touch_and_pin(make_key(l, e), gen, prio) >= 0) {
+      if (const int slot = slabs_[b].touch_and_pin(make_key(l, e), gen, prio); slot >= 0) {
+        verify_staged_hit_ptrs(l, e, slot);
         ++stats_.lru_hits;
         lru_hits.push_back(e);
       } else {
@@ -1146,7 +1196,8 @@ void ExpertCache::run_prefill_layer(
     batch_stage.reserve(end - off);
     for (std::size_t j = off; j < end; ++j) {
       const int e = misses[j];
-      if (slabs_[b].touch_and_pin(make_key(l, e), gen, prio) >= 0) {
+      if (const int slot = slabs_[b].touch_and_pin(make_key(l, e), gen, prio); slot >= 0) {
+        verify_staged_hit_ptrs(l, e, slot);
         ++stats_.lru_hits;
         batch_hits.push_back(e);
       } else {
