@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -26,12 +27,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 namespace {
 
@@ -251,6 +257,34 @@ void test_cpu_thread_pool() {
   std::printf("  default_cpu_pool_threads()=%d, detected ISA=%s\n",
               detected, cpu_isa_name(detect_cpu_isa()));
   INGINE_CHECK(detected >= 1);
+
+#ifdef __linux__
+  // Pin only this short-lived thread, leaving the test runner's affinity intact.
+  std::thread([] {
+    const int cpu = ::sched_getcpu();
+    INGINE_CHECK(cpu >= 0);
+    const auto bytes = CPU_ALLOC_SIZE(cpu + 1);
+    const auto free_set = [](cpu_set_t* mask) { CPU_FREE(mask); };
+    std::unique_ptr<cpu_set_t, decltype(free_set)> mask(CPU_ALLOC(cpu + 1), free_set);
+    INGINE_CHECK(mask != nullptr);
+    CPU_ZERO_S(bytes, mask.get());
+    CPU_SET_S(cpu, bytes, mask.get());
+    INGINE_CHECK(::sched_setaffinity(0, bytes, mask.get()) == 0);
+    ScopedEnvVar automatic("INGINE_CPU_THREADS", nullptr);
+    INGINE_CHECK(default_cpu_pool_threads() == 1);
+    ScopedEnvVar oversized("INGINE_CPU_THREADS", "64");
+    INGINE_CHECK(default_cpu_pool_threads() == 1);
+  }).join();
+#endif
+
+  CpuThreadPool boundary_pool(2);
+  std::atomic<int> chunks{0};
+  boundary_pool.parallel_for(INT_MAX, INT_MAX - 1, [&](int begin, int end) {
+    INGINE_CHECK((begin == 0 && end == INT_MAX / 2 + 1) ||
+                 (begin == INT_MAX / 2 + 1 && end == INT_MAX));
+    ++chunks;
+  });
+  INGINE_CHECK(chunks == 2);
 
   for (int nt : {1, 2, 4, 8, 16}) {
     CpuThreadPool pool(nt, /*spin_iters=*/2000);

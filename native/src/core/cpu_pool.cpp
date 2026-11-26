@@ -4,8 +4,9 @@
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
-#include <filesystem>
 #include <fstream>
+#include <memory>
+#include <new>
 #include <set>
 #include <string>
 
@@ -15,6 +16,7 @@
 
 #if defined(__linux__)
 #include <linux/futex.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -72,31 +74,46 @@ int parse_env_int(const char* name, int fallback) noexcept {
 
 int default_cpu_pool_threads() noexcept {
   const int env_n = parse_env_int("INGINE_CPU_THREADS", 0);
-  if (env_n > 0) return std::clamp(env_n, 1, 64);
+  const unsigned hw = std::thread::hardware_concurrency();
+  int fallback = env_n > 0 ? std::min(env_n, 64) : static_cast<int>(hw ? std::min(hw, 64u) : 4);
 
 #if defined(__linux__)
-  namespace fs = std::filesystem;
-  std::error_code ec;
-  std::set<std::string> physical_cores;
-  const fs::path cpu_root("/sys/devices/system/cpu");
-  if (fs::exists(cpu_root, ec)) {
-    for (const auto& entry : fs::directory_iterator(cpu_root, ec)) {
-      const std::string name = entry.path().filename().string();
-      if (name.rfind("cpu", 0) != 0 || name.size() < 4 || name[3] < '0' || name[3] > '9') continue;
-      std::ifstream f(entry.path() / "topology/thread_siblings_list");
-      std::string sibs;
-      if (std::getline(f, sibs) && !sibs.empty()) {
-        physical_cores.insert(sibs);
+  try {
+    // A kernel affinity mask can exceed libc's fixed-size cpu_set_t.
+    const auto free_set = [](cpu_set_t* mask) { CPU_FREE(mask); };
+    for (int capacity = CPU_SETSIZE; ; capacity *= 2) {
+      const auto bytes = CPU_ALLOC_SIZE(capacity);
+      std::unique_ptr<cpu_set_t, decltype(free_set)> allowed(CPU_ALLOC(capacity), free_set);
+      if (!allowed) break;
+      if (::sched_getaffinity(0, bytes, allowed.get()) != 0) {
+        if (errno == EINVAL && capacity <= INT_MAX / 2) continue;
+        break;
       }
+      const int logical = CPU_COUNT_S(bytes, allowed.get());
+      if (logical <= 0) break;
+      fallback = std::min(logical, 64);
+      if (env_n > 0) return std::min(env_n, fallback);
+
+      std::set<std::string> physical_cores;
+      int unknown_cores = 0;
+      for (int cpu = 0; cpu < capacity; ++cpu) {
+        if (!CPU_ISSET_S(cpu, bytes, allowed.get())) continue;
+        std::ifstream topology("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                               "/topology/thread_siblings_list");
+        std::string siblings;
+        if (std::getline(topology, siblings) && !siblings.empty()) {
+          physical_cores.insert(siblings);
+        } else {
+          ++unknown_cores;
+        }
+      }
+      return std::min(fallback, static_cast<int>(physical_cores.size()) + unknown_cores);
     }
-  }
-  if (!physical_cores.empty()) {
-    return std::clamp(static_cast<int>(physical_cores.size()), 1, 64);
+  } catch (const std::bad_alloc&) {
+    // Topology discovery is optional when the process is under memory pressure.
   }
 #endif
-
-  const unsigned hw = std::thread::hardware_concurrency();
-  return hw > 0 ? std::clamp(static_cast<int>(hw), 1, 64) : 4;
+  return fallback;
 }
 
 CpuThreadPool::CpuThreadPool(int num_threads, int spin_iters) {
@@ -108,13 +125,22 @@ CpuThreadPool::CpuThreadPool(int num_threads, int spin_iters) {
   }
   if (num_threads_ > 1) {
     workers_.reserve(static_cast<std::size_t>(num_threads_ - 1));
-    for (int tid = 1; tid < num_threads_; ++tid) {
-      workers_.emplace_back([this, tid]() { worker_loop(tid); });
+    try {
+      for (int tid = 1; tid < num_threads_; ++tid) {
+        workers_.emplace_back([this, tid]() { worker_loop(tid); });
+      }
+    } catch (...) {
+      stop_workers();
+      throw;
     }
   }
 }
 
 CpuThreadPool::~CpuThreadPool() {
+  stop_workers();
+}
+
+void CpuThreadPool::stop_workers() noexcept {
   if (!workers_.empty()) {
     {
       std::lock_guard<std::mutex> lock(dispatch_mu_);

@@ -13,7 +13,7 @@
 
 namespace ingine::ops::cpu {
 
-// Returns detected physical CPU core count (honors INGINE_CPU_THREADS when set, clamped to [1, 64]).
+// Defaults to available physical cores. Linux affinity also bounds an INGINE_CPU_THREADS override.
 int default_cpu_pool_threads() noexcept;
 
 class CpuThreadPool {
@@ -31,14 +31,14 @@ class CpuThreadPool {
   [[nodiscard]] int num_threads() const noexcept { return num_threads_; }
 
   // Dispatches `fn(tid, active_threads, ctx)` for tid in [0, active_threads).
-  // Calling thread executes tid = 0 directly and spin-waits for workers 1..active_threads-1.
+  // The caller executes tid = 0 and waits for every worker to acknowledge the dispatch.
   void dispatch(int n_threads, TaskFn fn, void* ctx);
 
   template <typename Fn>
   void parallel_for(int n_items, int min_items_per_thread, Fn&& fn) {
     if (n_items <= 0) return;
     const int min_chunk = min_items_per_thread > 0 ? min_items_per_thread : 1;
-    const int wanted = (n_items + min_chunk - 1) / min_chunk;
+    const int wanted = 1 + (n_items - 1) / min_chunk;
     const int active = wanted < num_threads_ ? wanted : num_threads_;
     if (active <= 1) {
       fn(0, n_items);
@@ -64,6 +64,7 @@ class CpuThreadPool {
   }
 
  private:
+  void stop_workers() noexcept;
   void worker_loop(int tid);
   void capture_exception() noexcept;
 
