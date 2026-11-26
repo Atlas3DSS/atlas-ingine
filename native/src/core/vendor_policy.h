@@ -163,6 +163,22 @@ constexpr int select_exl3_scalar_rows(int mode, bool gate_up, int max_rows, int 
   return gate_up ? (max_rows < gate_up_min ? 8 : 12) : (max_rows < down_min ? 12 : 24);
 }
 
+// Decide whether an open 2 MiB-aligned INGPACK1 mmap should be zero-copy device-mapped via
+// hipHostRegisterMapped / cudaHostRegisterMapped instead of copied through DeviceUploader.
+// Enabled by default on unified-memory APUs (e.g., AMD Strix Halo gfx1151 128 GB LPDDR5X);
+// opt-out via INGINE_UNIFIED_PACK_ZEROCOPY=0, opt-in override via INGINE_UNIFIED_PACK_ZEROCOPY=1.
+constexpr bool should_use_zero_copy_weight_pack(bool unified_memory, bool is_weight_pack,
+                                                std::string_view env_override = {}) noexcept {
+  if (!is_weight_pack) return false;
+  if (env_override == "0" || env_override == "false" || env_override == "FALSE" || env_override == "off") {
+    return false;
+  }
+  if (env_override == "1" || env_override == "true" || env_override == "TRUE" || env_override == "on") {
+    return true;
+  }
+  return unified_memory;
+}
+
 }  // namespace hip
 
 namespace mlx {

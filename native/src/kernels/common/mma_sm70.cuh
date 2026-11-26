@@ -18,33 +18,54 @@
 #pragma once
 
 #include "core/act.h"
-
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstdint>
 
 namespace ingine::kernels::mma {
 
-__device__ __forceinline__ std::uint32_t ld_smem_u32(unsigned saddr) {
+__device__ __forceinline__ std::uint32_t ld_smem_u32(ingine::gpu::SmemAddr saddr) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   std::uint32_t v;
   asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(saddr));
   return v;
+#else
+  return *reinterpret_cast<const std::uint32_t*>(saddr);
+#endif
 }
 
-__device__ __forceinline__ uint2 ld_smem_u64(unsigned saddr) {
+__device__ __forceinline__ uint2 ld_smem_u64(ingine::gpu::SmemAddr saddr) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   uint2 v;
   asm volatile("ld.shared.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "r"(saddr));
   return v;
+#else
+  return *reinterpret_cast<const uint2*>(saddr);
+#endif
 }
 
-__device__ __forceinline__ std::uint16_t ld_smem_u16(unsigned saddr) {
+__device__ __forceinline__ std::uint16_t ld_smem_u16(ingine::gpu::SmemAddr saddr) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   std::uint16_t v;
   asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(saddr));
   return v;
+#else
+  return *reinterpret_cast<const std::uint16_t*>(saddr);
+#endif
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+__device__ __forceinline__ ingine::gpu::SmemAddr shfl_smem_addr(ingine::gpu::SmemAddr saddr, int src_lane) {
+#if defined(INGINE_BACKEND_HIP) && INGINE_BACKEND_HIP
+  const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(saddr);
+  const std::uint32_t lo = __shfl_sync(0xffffffffu, static_cast<std::uint32_t>(raw), src_lane);
+  const std::uint32_t hi = __shfl_sync(0xffffffffu, static_cast<std::uint32_t>(raw >> 32), src_lane);
+  return reinterpret_cast<ingine::gpu::SmemAddr>((static_cast<std::uintptr_t>(hi) << 32) | lo);
+#else
+  return __shfl_sync(0xffffffffu, saddr, src_lane);
+#endif
+}
+
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
 // Native Volta sm_70 HMMA.884 primitives: keep acc[8] across entire K-loops and eliminate
 // per-step accumulator reductions (and per-step input shuffles when A/B are loaded directly).
 __device__ __forceinline__ void sm70_mma_f16_direct(float (&acc)[8], unsigned ma0, unsigned ma1, unsigned na0,
@@ -138,8 +159,9 @@ __device__ __forceinline__ void sm70_reduce_acc8_to_d4(const float (&acc)[8], fl
 #endif
 
 // Drop-in replacement for ldmatrix.sync.aligned.m8n8.x4.shared.b16
-__device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned saddr) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+__device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
+                                            ingine::gpu::SmemAddr saddr) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 750
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                : "r"(saddr)
@@ -148,17 +170,17 @@ __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned
   const int lane = threadIdx.x & 31;
   const int g = lane >> 2;
   const unsigned off = static_cast<unsigned>(lane & 3) * 4u;
-  r0 = ld_smem_u32(__shfl_sync(0xffffffffu, saddr, g) + off);
-  r1 = ld_smem_u32(__shfl_sync(0xffffffffu, saddr, 8 + g) + off);
-  r2 = ld_smem_u32(__shfl_sync(0xffffffffu, saddr, 16 + g) + off);
-  r3 = ld_smem_u32(__shfl_sync(0xffffffffu, saddr, 24 + g) + off);
+  r0 = ld_smem_u32(shfl_smem_addr(saddr, g) + off);
+  r1 = ld_smem_u32(shfl_smem_addr(saddr, 8 + g) + off);
+  r2 = ld_smem_u32(shfl_smem_addr(saddr, 16 + g) + off);
+  r3 = ld_smem_u32(shfl_smem_addr(saddr, 24 + g) + off);
 #endif
 }
 
 // Drop-in replacement for ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16
 __device__ __forceinline__ void ldmatrix_x4_trans(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
-                                                  unsigned saddr) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+                                                  ingine::gpu::SmemAddr saddr) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 750
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                : "r"(saddr)
@@ -169,8 +191,8 @@ __device__ __forceinline__ void ldmatrix_x4_trans(unsigned& r0, unsigned& r1, un
   const int row0 = (lane & 3) * 2;
   const int row1 = row0 + 1;
   auto load_t = [&](int base) -> unsigned {
-    const unsigned a0 = __shfl_sync(0xffffffffu, saddr, base + row0);
-    const unsigned a1 = __shfl_sync(0xffffffffu, saddr, base + row1);
+    const ingine::gpu::SmemAddr a0 = shfl_smem_addr(saddr, base + row0);
+    const ingine::gpu::SmemAddr a1 = shfl_smem_addr(saddr, base + row1);
     return static_cast<unsigned>(ld_smem_u16(a0 + off)) | (static_cast<unsigned>(ld_smem_u16(a1 + off)) << 16);
   };
   r0 = load_t(0);
@@ -181,8 +203,8 @@ __device__ __forceinline__ void ldmatrix_x4_trans(unsigned& r0, unsigned& r1, un
 }
 
 // Drop-in replacement for ldmatrix.sync.aligned.m8n8.x2.shared.b16
-__device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned saddr) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+__device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, ingine::gpu::SmemAddr saddr) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 750
   asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                : "=r"(r0), "=r"(r1)
                : "r"(saddr)
@@ -191,15 +213,16 @@ __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned
   const int lane = threadIdx.x & 31;
   const int g = lane >> 2;
   const unsigned off = static_cast<unsigned>(lane & 3) * 4u;
-  r0 = ld_smem_u32(__shfl_sync(0xffffffffu, saddr, g) + off);
-  r1 = ld_smem_u32(__shfl_sync(0xffffffffu, saddr, 8 + g) + off);
+  r0 = ld_smem_u32(shfl_smem_addr(saddr, g) + off);
+  r1 = ld_smem_u32(shfl_smem_addr(saddr, 8 + g) + off);
 #endif
 }
 
-// D += A * B, m16n8k16, FP16 inputs, FP32 accumulation (native m16n8k16 on sm_80+, native HMMA.884 on sm_70).
+// D += A * B, m16n8k16, FP16 inputs, FP32 accumulation (native m16n8k16 on sm_80+, native HMMA.884 on sm_70,
+// portable wave32 SIMT on HIP and pre-sm70).
 __device__ __forceinline__ void mma_f16(float (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                         unsigned b1) {
-#if __CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)
+#if defined(__HIP_DEVICE_COMPILE__) || !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)
   // SIMT seam for targets without tensor cores. Each lane owns two columns
   // in two rows of the m16n8k16 tile; exchange the packed K pairs within the warp.
   const int row = (threadIdx.x & 31) / 4;
@@ -239,7 +262,7 @@ __device__ __forceinline__ void mma_f16(float (&d)[4], unsigned a0, unsigned a1,
                "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                : "r"(a2), "r"(a3), "r"(b1));
-#else
+#elif defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
   const int lane = threadIdx.x & 31;
   const int g = lane >> 2;
   const int t = lane & 3;
@@ -313,16 +336,40 @@ __device__ __forceinline__ void mma_f16(float (&d)[4], unsigned a0, unsigned a1,
 #endif
 }
 
-// D += A * B, m16n8k16, ActT inputs (FP16 on INGINE_ACT_FP16 / sm_70, BF16 on sm_80+), FP32 accumulation.
+// D += A * B, m16n8k16, ActT inputs (FP16 on INGINE_ACT_FP16 / sm_70, BF16 on sm_80+ and HIP BF16), FP32 accumulation.
 __device__ __forceinline__ void mma_act(float (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                         unsigned b1) {
-#if INGINE_ACT_FP16 || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+#if INGINE_ACT_FP16 || (defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ < 800)
   mma_f16(d, a0, a1, a2, a3, b0, b1);
-#else
+#elif defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+  // Portable BF16 m16n8k16 with exact FP32 accumulation for HIP (matches CUDA fragment layout).
+  const int row = (threadIdx.x & 31) / 4;
+  const int col = (threadIdx.x & 3) * 2;
+#pragma unroll
+  for (int pair = 0; pair < 8; ++pair) {
+    const int a_lane = 4 * row + (pair & 3);
+    const int b_lane = 4 * col + (pair & 3);
+    const unsigned top = __shfl_sync(0xffffffffu, pair < 4 ? a0 : a2, a_lane);
+    const unsigned bottom = __shfl_sync(0xffffffffu, pair < 4 ? a1 : a3, a_lane);
+    const unsigned left = __shfl_sync(0xffffffffu, pair < 4 ? b0 : b1, b_lane);
+    const unsigned right = __shfl_sync(0xffffffffu, pair < 4 ? b0 : b1, b_lane + 4);
+#pragma unroll
+    for (int element = 0; element < 2; ++element) {
+      const float x0 = act::bits_to_float(static_cast<std::uint16_t>(top >> (16 * element)));
+      const float x1 = act::bits_to_float(static_cast<std::uint16_t>(bottom >> (16 * element)));
+      const float y0 = act::bits_to_float(static_cast<std::uint16_t>(left >> (16 * element)));
+      const float y1 = act::bits_to_float(static_cast<std::uint16_t>(right >> (16 * element)));
+      d[0] = fmaf(x0, y0, d[0]);
+      d[1] = fmaf(x0, y1, d[1]);
+      d[2] = fmaf(x1, y0, d[2]);
+      d[3] = fmaf(x1, y1, d[3]);
+    }
+  }
 #endif
 }
 

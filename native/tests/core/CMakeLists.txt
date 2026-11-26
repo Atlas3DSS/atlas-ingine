@@ -22,22 +22,24 @@ if(UNIX AND NOT APPLE)
   target_link_options(core_mlx_uploader_host PRIVATE -Wl,--wrap=pread)
 endif()
 add_test(NAME core_mlx_uploader_host COMMAND core_mlx_uploader_host)
-if(INGINE_BACKEND STREQUAL "CUDA")
-  ingine_add_test(NAME core_arch_ops_cuda SOURCES test_arch_ops_device.cu LIBS ingine_core CUDA::cudart GPU)
-  target_compile_options(core_arch_ops_cuda PRIVATE
-    "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--Werror cross-execution-space-call>")
-  ingine_add_test(NAME hal_embed_q4_parity SOURCES test_embed_q4_parity.cpp LIBS ingine_ops ingine_core CUDA::cudart
+if(INGINE_BACKEND STREQUAL "CUDA" OR INGINE_BACKEND STREQUAL "HIP")
+  ingine_add_test(NAME core_arch_ops_cuda SOURCES test_arch_ops_device.cu LIBS ingine_core ${INGINE_GPU_RUNTIME_TARGET} GPU)
+  if(INGINE_BACKEND STREQUAL "CUDA")
+    target_compile_options(core_arch_ops_cuda PRIVATE
+      "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--Werror cross-execution-space-call>")
+  endif()
+  ingine_add_test(NAME hal_embed_q4_parity SOURCES test_embed_q4_parity.cpp LIBS ingine_ops ingine_core ${INGINE_GPU_RUNTIME_TARGET}
                   GPU ORACLE)
-  ingine_add_test(NAME hal_embed_q4_capture SOURCES test_embed_q4_capture.cpp LIBS ingine_ops ingine_core CUDA::cudart
+  ingine_add_test(NAME hal_embed_q4_capture SOURCES test_embed_q4_capture.cpp LIBS ingine_ops ingine_core ${INGINE_GPU_RUNTIME_TARGET}
                   GPU)
   ingine_add_test(NAME core_arena SOURCES test_arena.cpp LIBS ingine_core GPU)
   ingine_add_test(NAME core_paged_tier SOURCES test_paged_tier.cpp LIBS ingine_core GPU)
   ingine_add_test(NAME core_upload SOURCES test_upload.cpp LIBS ingine_core GPU)
-  ingine_add_test(NAME core_baremetal_cpu SOURCES test_baremetal_cpu.cpp LIBS ingine_ops ingine_core CUDA::cudart
+  ingine_add_test(NAME core_baremetal_cpu SOURCES test_baremetal_cpu.cpp LIBS ingine_ops ingine_core ${INGINE_GPU_RUNTIME_TARGET}
                   GPU ORACLE)
   ingine_add_test(NAME core_baremetal_cuda SOURCES test_baremetal_cuda.cpp LIBS ingine_ops ingine_core
-                  ingine_kernels_moe CUDA::cudart GPU ORACLE)
-  ingine_add_test(NAME core_weight_pack SOURCES test_weight_pack.cpp LIBS ingine_core CUDA::cudart GPU)
+                  ingine_kernels_moe ${INGINE_GPU_RUNTIME_TARGET} GPU ORACLE)
+  ingine_add_test(NAME core_weight_pack SOURCES test_weight_pack.cpp LIBS ingine_core ${INGINE_GPU_RUNTIME_TARGET} GPU)
 else()
   ingine_add_test(NAME hal_embed_q4_parity SOURCES test_embed_q4_parity.cpp LIBS ingine_ops ingine_core ORACLE)
   ingine_add_test(NAME core_upload SOURCES test_upload.cpp LIBS ingine_core)

@@ -2,7 +2,7 @@
 #include "core/device.h"
 #include "core/paged_tier.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstdint>
 #include <cstdio>

@@ -3,8 +3,7 @@
 #pragma once
 
 #include "core/device.h"
-
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <stdexcept>
 #include <string>
@@ -17,36 +16,36 @@ inline void require(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(std::string("dense: ") + what);
 }
 
-// Split cluster barrier (SM90+ only; no-ops on SM8x which use non-cluster fallbacks).
+// Split cluster barrier (SM90+ only; no-ops on SM8x / HIP which use non-cluster fallbacks).
 __device__ __forceinline__ void cluster_arrive_relaxed() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 #endif
 }
 __device__ __forceinline__ void cluster_arrive() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
 #endif
 }
 __device__ __forceinline__ void cluster_wait() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 #endif
 }
 
-// Programmatic dependent launch (SM90+ only; no-ops on SM8x).
+// Programmatic dependent launch (SM90+ only; no-ops on SM8x / HIP).
 __device__ __forceinline__ void pdl_wait() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
 __device__ __forceinline__ void pdl_trigger() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
 }
 __device__ __forceinline__ void pdl_wait_fenced(uint32_t zero) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
 #pragma unroll 1
   for (uint32_t i = 0; i <= zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
 #else
@@ -59,6 +58,7 @@ __device__ __forceinline__ void pdl_wait_fenced(uint32_t zero) {
 template <class... KArgs, class... Args>
 void launch_ex(void (*kernel)(KArgs...), dim3 grid, int block, int smem, int cl, bool pdl, cudaStream_t stream,
                Args&&... args) {
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
   const bool sm90 = current_sm_major() >= 9;
   if (sm90 && cl > 8) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
   if (smem > 0) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
@@ -84,6 +84,13 @@ void launch_ex(void (*kernel)(KArgs...), dim3 grid, int block, int smem, int cl,
   cfg.attrs = attr;
   cfg.numAttrs = n;
   CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...));
+#else
+  static_cast<void>(cl);
+  static_cast<void>(pdl);
+  if (smem > 0) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  kernel<<<grid, dim3(block), static_cast<std::size_t>(smem), stream>>>(std::forward<Args>(args)...);
+  CUDA_CHECK(cudaGetLastError());
+#endif
 }
 
 }  // namespace ingine::kernels::dense

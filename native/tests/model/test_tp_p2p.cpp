@@ -2,7 +2,7 @@
 // Uses explicit runtime checks (never assert()) so all assertions stay active under Release (-DNDEBUG) builds.
 #include "model/tp_engine.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstdio>
 #include <cstdlib>

@@ -1,14 +1,11 @@
 // Device helpers shared by the DSpark draft and speculative-acceptance kernels.
 #pragma once
 
+#include "core/act.h"
 #include "core/device.h"
+#include "core/gpu_compat.h"
 #include "kernels/common/pdl.cuh"
 #include "kernels/draft/rng.h"
-
-#include "core/act.h"
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <utility>
@@ -20,29 +17,12 @@ __device__ __forceinline__ float bf(const ActT& x) { return act::to_float(x); }
 
 // One element of a key/value cache: BF16, or E4M3 without a scale (nearest even, saturating at +-448).
 __device__ __forceinline__ void store_cache(void* cache, size_t at, float x, bool fp8) {
-  if (fp8) static_cast<__nv_fp8_storage_t*>(cache)[at] = __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+  if (fp8) static_cast<uint8_t*>(cache)[at] = ingine::gpu::float_to_e4m3fn_sat(x);
   else static_cast<ActT*>(cache)[at] = act::from_float(x);
 }
-// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one cvt.rn.bf16x2.e4m3x2 on sm_120a, hw f16 on sm_89, portable on sm_86.
+// 2 E4M3 (low 16 bits of u) -> Act2T, exact across CUDA (sm_70..sm_120a) and HIP.
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-#if INGINE_ACT_FP16
-  return act::e4m3x2_to_half2_bits(u);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-  uint32_t r;
-  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
-  return r;
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-  uint32_t h2;
-  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(static_cast<unsigned short>(u)));
-  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
-  const __nv_bfloat162 b = __float22bfloat162_rn(f);
-  return *reinterpret_cast<const uint32_t*>(&b);
-#else
-  const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
-  const float2 f = __half22float2(__half2(h));
-  const __nv_bfloat162 b = __float22bfloat162_rn(f);
-  return *reinterpret_cast<const uint32_t*>(&b);
-#endif
+  return act::e4m3x2_to_act2_bits(u);
 }
 
 // 8 BF16 values (one uint4) -> 8 floats.
@@ -103,9 +83,13 @@ __device__ __forceinline__ uint32_t unpack_argmax_index(unsigned long long p) {
 // wait (it may sink .nc loads below it, see kernels/common/pdl.cuh), so the weights are in flight while the
 // predecessor finishes.
 __device__ __forceinline__ uint4 ld_weight(const void* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   uint4 r;
   asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
   return r;
+#else
+  return *static_cast<const uint4*>(p);
+#endif
 }
 
 // Launches `kernel` as a programmatic dependent of its stream predecessor (kernels/common/pdl.cuh). The

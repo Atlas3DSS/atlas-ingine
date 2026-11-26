@@ -24,4 +24,4 @@ add_library(ingine_kernels_draft STATIC
 )
 ingine_cuda_target(ingine_kernels_draft)
 ingine_internal_includes(ingine_kernels_draft)
-target_link_libraries(ingine_kernels_draft PUBLIC ingine_core CUDA::cudart CUDA::cublasLt)
+target_link_libraries(ingine_kernels_draft PUBLIC ingine_core ${INGINE_GPU_RUNTIME_TARGET} ${INGINE_GPU_BLAS_TARGETS})

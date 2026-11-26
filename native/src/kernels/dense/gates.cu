@@ -30,7 +30,9 @@
 // kernel: same thread layout, expressions and order of every FP32 sum; changed are the barriers (norms of
 // several tokens in one reduction, tokens staged in groups, single-barrier block sums, mbarrier exchanges),
 // the single read of the inputs and the prefetch.
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
 #include <cooperative_groups.h>
+#endif
 
 #include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
@@ -41,7 +43,9 @@
 
 #include <type_traits>
 
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
 namespace cg = cooperative_groups;
+#endif
 
 namespace ingine::kernels::dense {
 namespace {
@@ -99,7 +103,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   __shared__ float red[C::NW * 32], red2[C::NW * 32];
   __shared__ __align__(8) uint64_t mbar[2];  // g, sums of squares
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
 #else

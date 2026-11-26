@@ -49,24 +49,28 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], 
 // ldmatrix: lane l < 8 n gives the address of row l % 8 (8 BF16) of matrix l / 8; every lane (g, t) receives
 // elements (g, 2 t), (g, 2 t + 1) of each matrix, or with `trans` elements (2 t, g), (2 t + 1, g).
 __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* row) {
-  mma::ldmatrix_x4(r[0], r[1], r[2], r[3], static_cast<unsigned>(__cvta_generic_to_shared(row)));
+  mma::ldmatrix_x4(r[0], r[1], r[2], r[3], ingine::gpu::make_smem_addr(row));
 }
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&r)[4], const void* row) {
-  mma::ldmatrix_x4_trans(r[0], r[1], r[2], r[3], static_cast<unsigned>(__cvta_generic_to_shared(row)));
+  mma::ldmatrix_x4_trans(r[0], r[1], r[2], r[3], ingine::gpu::make_smem_addr(row));
 }
 __device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[2], const void* row) {
-  mma::ldmatrix_x2(r[0], r[1], static_cast<unsigned>(__cvta_generic_to_shared(row)));
+  mma::ldmatrix_x2(r[0], r[1], ingine::gpu::make_smem_addr(row));
 }
 
 // 16-byte coherent load issued where it is written (queries and cache rows are written by earlier kernels).
 // The caches are read once per draft: no L1 allocation.
 __device__ __forceinline__ uint4 ld_cache(const void* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   uint4 r;
   asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".v4.u32 {%0,%1,%2,%3}, [%4];"
                : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
                : "l"(p)
                : "memory");
   return r;
+#else
+  return *static_cast<const uint4*>(p);
+#endif
 }
 
 // A tile's raw keys and values in registers (16 bytes per thread and load) and, in threads 0..15 of local
@@ -138,7 +142,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
   __syncthreads();
   const bool head = w < QH;       // warp-uniform
   const int hw = head ? w : 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
   const int v_qp = (lane >> 2) & 3;
   const int v_idx = (lane & 3) | ((lane & 16) >> 2);
   const int v_row_a = (v_qp >= 2 ? 8 : 0) + v_idx;
@@ -146,12 +150,12 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
   uint32_t qb_v[HEAD_DIM / 16][4];
 #pragma unroll
   for (int s = 0; s < HEAD_DIM / 16; ++s) {
-    const uint2 q0 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&qs[hw][v_idx][16 * s + v_kh])));
-    const uint2 q1 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&qs[hw][v_idx][16 * s + 8 + v_kh])));
+    const uint2 q0 = mma::ld_smem_u64(ingine::gpu::make_smem_addr(&qs[hw][v_idx][16 * s + v_kh]));
+    const uint2 q1 = mma::ld_smem_u64(ingine::gpu::make_smem_addr(&qs[hw][v_idx][16 * s + 8 + v_kh]));
     qb_v[s][0] = q0.x, qb_v[s][1] = q0.y, qb_v[s][2] = q1.x, qb_v[s][3] = q1.y;
   }
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
-  // Pascal sm_60/sm_61: reads qs directly from SMEM via uint4 in tile() with exact FP32 fmaf (0 shuffles).
+#elif defined(__HIP_DEVICE_COMPILE__) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)))
+  // Pascal sm_60/sm_61 and HIP: reads qs directly from SMEM via uint4 in tile() with exact FP32 fmaf (0 shuffles).
 #else
   uint32_t qb[HEAD_DIM / 16][2];  // this head's queries as B fragments (16 dims x 8 queries), per 16 dims
 #pragma unroll
@@ -208,16 +212,16 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
 
     // scores: keys gl (0, 1) and gl + 8 (2, 3) against queries 2 t, 2 t + 1
     float sc[4] = {0.f, 0.f, 0.f, 0.f};
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
     float sc8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
     for (int s = 0; s < HEAD_DIM / 16; ++s) {
-      const uint2 k0 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&kt[buf][v_row_a][16 * s + v_kh])));
-      const uint2 k1 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&kt[buf][v_row_a][16 * s + 8 + v_kh])));
+      const uint2 k0 = mma::ld_smem_u64(ingine::gpu::make_smem_addr(&kt[buf][v_row_a][16 * s + v_kh]));
+      const uint2 k1 = mma::ld_smem_u64(ingine::gpu::make_smem_addr(&kt[buf][v_row_a][16 * s + 8 + v_kh]));
       mma::sm70_mma_f16_direct(sc8, k0.x, k0.y, k1.x, k1.y, qb_v[s][0], qb_v[s][1], qb_v[s][2], qb_v[s][3]);
     }
     mma::sm70_reduce_acc8_to_d4(sc8, sc);
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+#elif defined(__HIP_DEVICE_COMPILE__) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)))
 #pragma unroll
     for (int s = 0; s < HEAD_DIM / 16; ++s) {
 #pragma unroll
@@ -284,9 +288,9 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
     __syncwarp();
     // O^T = O^T alpha + V^T P^T: the tile's 16 keys are the k of the mma
     const bool rescale = __any_sync(0xffffffffu, al[0] != 1.f || al[1] != 1.f);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
-    const uint2 p0 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&pt[w][v_idx][v_kh])));
-    const uint2 p1 = mma::ld_smem_u64(static_cast<unsigned>(__cvta_generic_to_shared(&pt[w][v_idx][8 + v_kh])));
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+    const uint2 p0 = mma::ld_smem_u64(ingine::gpu::make_smem_addr(&pt[w][v_idx][v_kh]));
+    const uint2 p1 = mma::ld_smem_u64(ingine::gpu::make_smem_addr(&pt[w][v_idx][8 + v_kh]));
 #pragma unroll
     for (int d = 0; d < HEAD_DIM / 16; ++d) {
       if (rescale) {
@@ -296,20 +300,20 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
         oacc[d][3] *= al[1];
       }
       const int dc = 16 * d + v_row_a;
-      const unsigned v0 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 0][dc])));
-      const unsigned v1 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 1][dc])));
-      const unsigned v2 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 2][dc])));
-      const unsigned v3 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 3][dc])));
-      const unsigned v8 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 8][dc])));
-      const unsigned v9 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 9][dc])));
-      const unsigned v10 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 10][dc])));
-      const unsigned v11 = mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][v_kh + 11][dc])));
+      const unsigned v0 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][v_kh + 0][dc]));
+      const unsigned v1 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][v_kh + 1][dc]));
+      const unsigned v2 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][v_kh + 2][dc]));
+      const unsigned v3 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][v_kh + 3][dc]));
+      const unsigned v8 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][v_kh + 8][dc]));
+      const unsigned v9 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][v_kh + 9][dc]));
+      const unsigned v10 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][v_kh + 10][dc]));
+      const unsigned v11 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][v_kh + 11][dc]));
       float ov[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
       mma::sm70_mma_f16_direct(ov, v0 | (v1 << 16), v2 | (v3 << 16), v8 | (v9 << 16), v10 | (v11 << 16),
                                p0.x, p0.y, p1.x, p1.y);
       mma::sm70_reduce_acc8_to_d4(ov, oacc[d]);
     }
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+#elif defined(__HIP_DEVICE_COMPILE__) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)))
     const uint4 pq0a = *reinterpret_cast<const uint4*>(&pt[w][2 * t][0]);
     const uint4 pq0b = *reinterpret_cast<const uint4*>(&pt[w][2 * t][8]);
     const uint4 pq1a = *reinterpret_cast<const uint4*>(&pt[w][2 * t + 1][0]);
@@ -333,10 +337,10 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
       const int da = 16 * d + gl, db = da + 8;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
-        const float va0 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k][da]))));
-        const float va1 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k + 1][da]))));
-        const float vb0 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k][db]))));
-        const float vb1 = act::bits_to_float(mma::ld_smem_u16(static_cast<unsigned>(__cvta_generic_to_shared(&vt[buf][2 * k + 1][db]))));
+        const float va0 = act::bits_to_float(mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][2 * k][da])));
+        const float va1 = act::bits_to_float(mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][2 * k + 1][da])));
+        const float vb0 = act::bits_to_float(mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][2 * k][db])));
+        const float vb1 = act::bits_to_float(mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][2 * k + 1][db])));
         oacc[d][0] = fmaf(va1, fp0[k].y, fmaf(va0, fp0[k].x, oacc[d][0]));
         oacc[d][1] = fmaf(va1, fp1[k].y, fmaf(va0, fp1[k].x, oacc[d][1]));
         oacc[d][2] = fmaf(vb1, fp0[k].y, fmaf(vb0, fp0[k].x, oacc[d][2]));

@@ -2,11 +2,9 @@
 // Ported from engine/csrc/dense/dense.cuh.
 #pragma once
 
-#include "kernels/common/copy.cuh"
-
 #include "core/act.h"
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include "core/gpu_compat.h"
+#include "kernels/common/copy.cuh"
 #include <stdint.h>
 
 namespace ingine::kernels::dense {
@@ -18,22 +16,26 @@ constexpr float EPS = 1e-6f;
 // volatile load, not ld.global.nc: activations are written by the preceding kernel, and with programmatic
 // dependent launch they must not be read (or hoisted by the compiler) before griddepcontrol.wait.
 __device__ __forceinline__ uint4 ld_act(const void* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   uint4 r;
   asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
                : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
                : "l"(p)
                : "memory");
   return r;
+#else
+  return *static_cast<const uint4*>(p);
+#endif
 }
 
 // 16-byte asynchronous global -> shared copy (L2 only); complete with cp.async.commit_group / wait.
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
-#if __CUDA_ARCH__ < 800
-  copy::sync<16>(smem, gmem);
-#else
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(static_cast<unsigned>(__cvta_generic_to_shared(smem))),
                "l"(gmem)
                : "memory");
+#else
+  copy::sync<16>(smem, gmem);
 #endif
 }
 
@@ -56,9 +58,9 @@ __device__ __forceinline__ uint32_t e4m3_to_bf16_bits_portable(uint32_t b) {
   return s | (a >= 8u ? norm : sub);
 }
 
-// 4 E4M3 values (one uint32, element 0 in the low byte) -> 4 floats (exact: hw cvt on SM89+, branchless ALU on SM86).
+// 4 E4M3 values (one uint32, element 0 in the low byte) -> 4 floats (exact: hw cvt on SM89+, branchless ALU on SM86 / HIP).
 __device__ __forceinline__ void unpack_e4m3x4(uint32_t u, float* f) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 890
   __half2_raw lo = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
   __half2_raw hi = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u >> 16), __NV_E4M3);
   float2 a = __half22float2(*reinterpret_cast<__half2*>(&lo));

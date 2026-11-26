@@ -5,7 +5,7 @@
 #include "kernels/prefill/prefill.h"
 #include "prefill/prefill_test.h"
 
-#include <cuda_fp16.h>
+#include "core/gpu_compat.h"
 
 #include <algorithm>
 #include <cmath>

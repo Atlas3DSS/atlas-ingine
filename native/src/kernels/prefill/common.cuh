@@ -4,29 +4,26 @@
 #pragma once
 
 #include "core/act.h"
+#include "kernels/common/arch_ops.cuh"
+#include "core/gpu_compat.h"
 #include "kernels/common/copy.cuh"
 #include "kernels/common/mma_sm70.cuh"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
 
 #include <cstdint>
 
 namespace ingine::kernels::prefill {
 
-__device__ __forceinline__ unsigned smem_addr(const void* ptr) {
-  return static_cast<unsigned>(__cvta_generic_to_shared(ptr));
+__device__ __forceinline__ ingine::gpu::SmemAddr smem_addr(const void* ptr) {
+  return ingine::gpu::make_smem_addr(ptr);
 }
 
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
-                                            unsigned addr) {
+                                            ingine::gpu::SmemAddr addr) {
   mma::ldmatrix_x4(r0, r1, r2, r3, addr);
 }
 
 __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
-                                              unsigned addr) {
+                                              ingine::gpu::SmemAddr addr) {
   mma::ldmatrix_x4_trans(r0, r1, r2, r3, addr);
 }
 
@@ -42,12 +39,12 @@ __device__ __forceinline__ void mma_f16(float (&c)[4], const unsigned (&a)[4], u
 
 // 16-byte cp.async (L2 only); src_bytes < 16 zero-fills the rest (0: nothing is read).
 __device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src, int src_bytes = 16) {
-#if __CUDA_ARCH__ < 800
-  copy::sync<16>(smem_dst, gmem_src, src_bytes);
-#else
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                :
                : "r"(smem_addr(smem_dst)), "l"(gmem_src), "r"(src_bytes));
+#else
+  copy::sync<16>(smem_dst, gmem_src, src_bytes);
 #endif
 }
 
@@ -89,7 +86,7 @@ __device__ __forceinline__ uint32_t e4m3x2_to_half2(uint16_t u) {
 
 // float -> E4M3 code, round to nearest even after saturating to +-448 (torch clamp + .to(float8_e4m3fn)).
 __device__ __forceinline__ uint8_t f2e4m3(float x) {
-  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(fminf(fmaxf(x, -448.f), 448.f), __NV_SATFINITE, __NV_E4M3));
+  return ingine::gpu::float_to_e4m3fn_sat(fminf(fmaxf(x, -448.f), 448.f));
 }
 
 // Swizzled [rows][Chunks x 16 B] tile: element offset (in 16-bit units) of 16-byte chunk `chunk` of `row`.

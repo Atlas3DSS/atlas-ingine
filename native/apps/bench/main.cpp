@@ -11,7 +11,7 @@
 #include "serve/cli.h"
 #include "text/chat.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 #include <nlohmann/json.hpp>
 #include <utf8proc/utf8proc.h>
 

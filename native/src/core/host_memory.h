@@ -4,8 +4,11 @@
 // Large host memory regions (pinned or registered staging) and device-mapped exchange buffers.
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace ingine {
+
+class WeightPack;
 
 inline constexpr std::size_t kHugePageBytes = 2ull << 20;
 
@@ -82,6 +85,49 @@ private:
     std::size_t mapped_bytes_  = 0;
     bool via_hugepage_mmap_    = false;
     bool hugepage_advised_     = false;
+};
+
+// RAII zero-copy device registration of an open 2 MiB-aligned INGPACK1 WeightPack mmap for unified-memory
+// APUs (e.g., AMD Strix Halo gfx1151 128 GB LPDDR5X). Keeps the WeightPack mapping alive until after
+// hipHostUnregister / cudaHostUnregister completes. Registration failure is non-fatal (registered() == false).
+class UnifiedWeightPackPin {
+public:
+    UnifiedWeightPackPin() noexcept = default;
+    explicit UnifiedWeightPackPin(std::shared_ptr<const WeightPack> pack);
+    ~UnifiedWeightPackPin();
+
+    UnifiedWeightPackPin(const UnifiedWeightPackPin&)            = delete;
+    UnifiedWeightPackPin& operator=(const UnifiedWeightPackPin&) = delete;
+    UnifiedWeightPackPin(UnifiedWeightPackPin&& other) noexcept;
+    UnifiedWeightPackPin& operator=(UnifiedWeightPackPin&& other) noexcept;
+
+    // Registers the WeightPack's mapped address space with the active GPU runtime (portable | mapped | read-only,
+    // retrying without read-only if the driver rejects read-only file mappings). Idempotent; returns registered().
+    bool pin();
+    void unpin() noexcept;
+
+    [[nodiscard]] bool registered() const noexcept { return registered_; }
+    [[nodiscard]] bool readonly() const noexcept { return readonly_; }
+    [[nodiscard]] const void* host_base() const noexcept { return host_base_; }
+    [[nodiscard]] void* device_base() const noexcept { return device_base_; }
+    [[nodiscard]] std::size_t mapped_bytes() const noexcept { return size_; }
+    [[nodiscard]] double register_seconds() const noexcept { return register_seconds_; }
+    [[nodiscard]] const WeightPack* pack() const noexcept { return owner_.get(); }
+
+    // Device pointer for an in-bounds byte range [offset, offset + bytes) within the pinned WeightPack, or nullptr.
+    [[nodiscard]] void* tensor_device_ptr(std::uint64_t offset, std::uint64_t bytes) const noexcept;
+
+private:
+    void release() noexcept;
+
+    // Declared first so `owner_` is destroyed strictly AFTER release() unregisters host_base_.
+    std::shared_ptr<const WeightPack> owner_;
+    const void* host_base_   = nullptr;
+    void* device_base_       = nullptr;
+    std::size_t size_        = 0;
+    bool registered_         = false;
+    bool readonly_           = false;
+    double register_seconds_ = 0.0;
 };
 
 // /proc/meminfo MemAvailable in bytes (0 when unreadable).

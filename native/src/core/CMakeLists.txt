@@ -36,6 +36,7 @@ elseif(INGINE_BACKEND STREQUAL "HIP")
     dtype.cpp
     hal_hip.cpp
     host_memory_hip.cpp
+    paged_tier.cpp
     safetensors_io.cpp
     safetensors_upload_hip.cpp
     tensor.cpp

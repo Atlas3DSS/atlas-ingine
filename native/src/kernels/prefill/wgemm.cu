@@ -83,10 +83,10 @@ struct GemmArgs {
 };
 
 __device__ __forceinline__ void cp_async4(void* smem_dst, const void* gmem_src) {
-#if __CUDA_ARCH__ < 800
-  copy::sync<4>(smem_dst, gmem_src);
-#else
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(smem_addr(smem_dst)), "l"(gmem_src));
+#else
+  copy::sync<4>(smem_dst, gmem_src);
 #endif
 }
 
@@ -97,7 +97,7 @@ __device__ __forceinline__ float softcap(float x, float cap) { return tanhf(x * 
 template <int MT, int TM, class After>
 __device__ __forceinline__ void mma_step(float (&acc)[TM / 16][2][4], const uint16_t* A,
                                          const unsigned (&b)[BK / 16][2][2], int lane, After&& after) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
+#if defined(__HIP_DEVICE_COMPILE__) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)))
   // Pascal sm_60/sm_61 fast path: direct SMEM uint4 A reads (0 shuffles) + hoisted B shuffles and FP32
   // unpacks across MT + exact FP32 fmaf accumulation.
   const int g = lane >> 2, c = lane & 3;
@@ -153,7 +153,7 @@ __device__ __forceinline__ void mma_step(float (&acc)[TM / 16][2][4], const uint
 #endif
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
 // Native Volta sm_70 HMMA.884 step: direct SMEM A-loads + direct Volta B-frags -> ZERO warp shuffles in K-loop!
 template <int MT, int TM, class DecodeB>
 __device__ __forceinline__ void mma_step_sm70(float (&acc_v)[TM / 16][2][8], const uint16_t* A, int lane,
@@ -327,13 +327,15 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
         b[kk][nt][0] = pack_bf16x2((lut[c0] * s) * factor, (lut[c1] * s) * factor);
         b[kk][nt][1] = pack_bf16x2((lut[c2] * s) * factor, (lut[c3] * s) * factor);
       }
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
       asm volatile("" : "+r"(b[kk][nt][0]), "+r"(b[kk][nt][1]));
+#endif
     }
   };
 
   // Software pipeline: step ks's MMAs run on fragments decoded during step ks - 1; the decoding of step ks + 1
   // is interleaved with them (its chunk has landed: R (WS - 1) >= AS, and the barrier published it).
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
   // Native Volta sm_70 path: keep acc_v[TM/16][2][8] across entire K-loop, decode B directly into
   // Volta HMMA.884 layout, load A directly from SMEM -> ZERO shuffles inside K-loop, 1 reduction at end!
   float acc_v[TM / 16][2][8];
@@ -400,7 +402,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
             const uint32_t byte = (w4 >> (8 * bi)) & 0xffu;
             const uint32_t sel = ((byte & 7u) << 4) | (((byte >> 4) & 7u) << 12);
             const uint32_t hbits =
-                __byte_perm(0x3E3C3800u, 0x46444240u, sel) | ((byte & 0x08u) << 12) | ((byte & 0x80u) << 24);
+                ingine::kernels::arch::byte_perm(0x3E3C3800u, 0x46444240u, sel) | ((byte & 0x08u) << 12) | ((byte & 0x80u) << 24);
             const __half2 scaled = __hmul2(*reinterpret_cast<const __half2*>(&hbits), sfh);
             b[nt][bi] = *reinterpret_cast<const unsigned*>(&scaled);
           }

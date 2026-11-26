@@ -47,11 +47,9 @@
 #include "kernels/common/l2.cuh"
 #include "kernels/common/mma_sm70.cuh"
 
+#include "kernels/common/arch_ops.cuh"
 #include "core/device.h"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include "core/gpu_compat.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -77,15 +75,16 @@ constexpr int DOWN_WARPS = DOWN_GROUPS * DOWN_PAR;
 constexpr l2::Evict WEIGHT_L2 = l2::Evict::first;
 
 // L1::no_allocate and L2::256B prefetch hints are available from SM80 onward.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
 #define INGINE_MOE_LD_HINTS ".L1::no_allocate.L2::256B"
 #else
 #define INGINE_MOE_LD_HINTS ""
 #endif
 
 __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint4 v;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 800
     if constexpr (l2::hinted<WEIGHT_L2>) {
         asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
                      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
@@ -99,10 +98,15 @@ __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
                      : "l"(p));
     }
     return v;
+#else
+    static_cast<void>(pol);
+    return *static_cast<const uint4*>(p);
+#endif
 }
 __device__ __forceinline__ uint2 ld_stream_u2(const void* p, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint2 v;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 800
     if constexpr (l2::hinted<WEIGHT_L2>) {
         asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v2.u32 {%0,%1}, [%2], %3;"
                      : "=r"(v.x), "=r"(v.y)
@@ -116,10 +120,15 @@ __device__ __forceinline__ uint2 ld_stream_u2(const void* p, std::uint64_t pol) 
                      : "l"(p));
     }
     return v;
+#else
+    static_cast<void>(pol);
+    return *static_cast<const uint2*>(p);
+#endif
 }
 __device__ __forceinline__ uint32_t ld_stream_u1(const void* p, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint32_t v;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 800
     if constexpr (l2::hinted<WEIGHT_L2>) {
         asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.u32 %0, [%1], %2;"
                      : "=r"(v)
@@ -133,20 +142,34 @@ __device__ __forceinline__ uint32_t ld_stream_u1(const void* p, std::uint64_t po
                      : "l"(p));
     }
     return v;
+#else
+    static_cast<void>(pol);
+    return *static_cast<const uint32_t*>(p);
+#endif
 }
 #undef INGINE_MOE_LD_HINTS
 
 __device__ __forceinline__ uint16_t ld_scale2(const void* p, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint16_t v;
     if constexpr (l2::hinted<WEIGHT_L2>) asm volatile("ld.global.nc.L2::cache_hint.u16 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
     else asm volatile("ld.global.nc.u16 %0, [%1];" : "=h"(v) : "l"(p));
     return v;
+#else
+    static_cast<void>(pol);
+    return *static_cast<const uint16_t*>(p);
+#endif
 }
 __device__ __forceinline__ uint8_t ld_scale1(const void* p, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint16_t v;
     if constexpr (l2::hinted<WEIGHT_L2>) asm volatile("ld.global.nc.L2::cache_hint.u8 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
     else asm volatile("ld.global.nc.u8 %0, [%1];" : "=h"(v) : "l"(p));
     return uint8_t(v);
+#else
+    static_cast<void>(pol);
+    return *static_cast<const uint8_t*>(p);
+#endif
 }
 
 // Inputs written by earlier kernels (x, act, idx, wts, conv_state) use coherent loads in volatile asm with a
@@ -154,22 +177,43 @@ __device__ __forceinline__ uint8_t ld_scale1(const void* p, std::uint64_t pol) {
 // starts, so these loads must neither be non-coherent (.nc requires data read-only for the kernel's
 // lifetime) nor be movable above griddepcontrol.wait (an __ldg is an invariant load the compiler may hoist).
 __device__ __forceinline__ uint4 ld_dep(const void* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint4 v;
     asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                  : "l"(p)
                  : "memory");
     return v;
+#else
+    return *static_cast<const uint4*>(p);
+#endif
 }
 __device__ __forceinline__ int ld_dep(const int* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     int v;
     asm volatile("ld.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
     return v;
+#else
+    return *p;
+#endif
 }
 __device__ __forceinline__ float ld_dep(const float* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     float v;
     asm volatile("ld.global.f32 %0, [%1];" : "=f"(v) : "l"(p) : "memory");
     return v;
+#else
+    return *p;
+#endif
+}
+__device__ __forceinline__ uint16_t ld_dep_u16(const void* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
+    uint16_t v;
+    asm volatile("ld.global.u16 %0, [%1];" : "=h"(v) : "l"(p) : "memory");
+    return v;
+#else
+    return *static_cast<const uint16_t*>(p);
+#endif
 }
 
 // One 32-column chunk of one row in checkpoint encoding.
@@ -238,7 +282,7 @@ __device__ __forceinline__ uint16_t e4m3_to_f16_bits_portable(uint32_t b) {
 }
 
 __device__ __forceinline__ uint32_t f16x2_from_e4m3x2(uint16_t v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 890
     uint32_t r;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(v));
     return r;
@@ -249,7 +293,7 @@ __device__ __forceinline__ uint32_t f16x2_from_e4m3x2(uint16_t v) {
 }
 
 __device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 1200
     asm("{\n"
         ".reg .b8 b0, b1, b2, b3;\n"
         "mov.b32 {b0, b1, b2, b3}, %4;\n"
@@ -261,12 +305,12 @@ __device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) 
         : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
         : "r"(w));
 #else
-    // Bit-identical to cvt.rn.f16x2.e2m1x2 via single __byte_perm (zero LUT/memory traffic on SM86/SM89).
+    // Bit-identical to cvt.rn.f16x2.e2m1x2 via byte_perm (zero LUT/memory traffic on SM86/SM89/HIP).
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
         const uint32_t byte = (w >> (8 * b)) & 0xffu;
         const uint32_t sel = ((byte & 7u) << 4) | (((byte >> 4) & 7u) << 12);
-        h[b] = __byte_perm(0x3E3C3800u, 0x46444240u, sel) | ((byte & 0x08u) << 12) | ((byte & 0x80u) << 24);
+        h[b] = ingine::kernels::arch::byte_perm(0x3E3C3800u, 0x46444240u, sel) | ((byte & 0x08u) << 12) | ((byte & 0x80u) << 24);
     }
 #endif
 }
@@ -370,7 +414,7 @@ __device__ __forceinline__ void decode(const Chunk<3>& ch, float factor, uint32_
             const uint32_t m1 = (c1 & 4u) ? (c1 & 3u) : (3u - (c1 & 3u));
             const uint32_t sel = m0 | ((m0 + 4u) << 4) | (m1 << 8) | ((m1 + 4u) << 12);
             const uint32_t sgn = (((~c0) & 4u) << 13) | (((~c1) & 4u) << 29);
-            const uint32_t h2 = __byte_perm(0x0000A040u, 0x403D3933u, sel) | sgn;
+            const uint32_t h2 = ingine::kernels::arch::byte_perm(0x0000A040u, 0x403D3933u, sel) | sgn;
             const float2 v = scale_h2_to_f2(h2, sch, sc_f);
             o[8 * half + b] = pack_bf16(v.x * factor, v.y * factor);
         }
@@ -453,7 +497,7 @@ __device__ __forceinline__ void decode_f2(const Chunk<3>& ch, float factor, floa
             const uint32_t m1 = (c1 & 4u) ? (c1 & 3u) : (3u - (c1 & 3u));
             const uint32_t sel = m0 | ((m0 + 4u) << 4) | (m1 << 8) | ((m1 + 4u) << 12);
             const uint32_t sgn = (((~c0) & 4u) << 13) | (((~c1) & 4u) << 29);
-            const uint32_t h2 = __byte_perm(0x0000A040u, 0x403D3933u, sel) | sgn;
+            const uint32_t h2 = ingine::kernels::arch::byte_perm(0x0000A040u, 0x403D3933u, sel) | sgn;
             const float2 hv = __half22float2(*reinterpret_cast<const __half2*>(&h2));
             o[8 * half + b] = round_act_f2((hv.x * sc_f) * factor, (hv.y * sc_f) * factor);
         }
@@ -560,12 +604,12 @@ __device__ __forceinline__ void load_x(Frag<FMT>& f, const ActT* xrow, int c) {
 
 // Programmatic dependent launch (no-ops when the kernel is launched without the PDL attribute).
 __device__ __forceinline__ void pdl_wait() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
 __device__ __forceinline__ void pdl_trigger() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
 }
@@ -951,8 +995,7 @@ moe_up_exl3_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, cons
             float v[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                uint16_t raw;
-                asm volatile("ld.global.u16 %0, [%1];" : "=h"(raw) : "l"(xm + i) : "memory");
+                const uint16_t raw = ld_dep_u16(xm + i);
                 v[i] = act::bits_to_float(raw) * r_in[i];
             }
             exl3::fwht_128_warp(v, lane);
@@ -1220,8 +1263,7 @@ moe_down_exl3_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, 
             float v[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                uint16_t raw;
-                asm volatile("ld.global.u16 %0, [%1];" : "=h"(raw) : "l"(am + i) : "memory");
+                const uint16_t raw = ld_dep_u16(am + i);
                 v[i] = act::bits_to_float(raw) * r_in[i];
             }
             exl3::fwht_128_warp(v, lane);
@@ -1426,8 +1468,7 @@ moe_down_combine_conv_kernel(const ActT* __restrict__ ws, const float* __restric
 #pragma unroll
             for (int k = 0; k < TOPK; ++k) {
                 const int sl = m * TOPK + k;
-                uint16_t raw;
-                asm volatile("ld.global.u16 %0, [%1];" : "=h"(raw) : "l"(ws + size_t(sl) * H + ch) : "memory");
+                const uint16_t raw = ld_dep_u16(ws + size_t(sl) * H + ch);
                 s = __fadd_rn(s, __fmul_rn(ld_dep(wts + sl), act::bits_to_float(raw)));
             }
             ext[m + 3] = bf16_round(s);
@@ -1463,6 +1504,7 @@ void require(bool ok, const char* what) {
 // (programmatic dependent launch, captured as a programmatic edge in CUDA graphs).
 template <typename... Params, typename... Args>
 void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStream_t stream, Args... args) {
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = grid;
     cfg.blockDim = dim3(threads);
@@ -1473,6 +1515,11 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
     cfg.attrs = attr;
     cfg.numAttrs = (pdl && current_sm_major() >= 9) ? 1 : 0;
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<Params>(args)...));
+#else
+    static_cast<void>(pdl);
+    kernel<<<grid, dim3(threads), 0, stream>>>(static_cast<Params>(args)...);
+    CUDA_CHECK(cudaGetLastError());
+#endif
 }
 
 }  // namespace

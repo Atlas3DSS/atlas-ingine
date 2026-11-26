@@ -22,8 +22,14 @@
 #endif
 #endif
 
+#ifndef INGINE_BACKEND_HIP
+#define INGINE_BACKEND_HIP 0
+#endif
+
 #if INGINE_BACKEND_CUDA
 #include <cuda_runtime.h>
+#elif INGINE_BACKEND_HIP
+#include <hip/hip_runtime.h>
 #endif
 
 #include <cstddef>
@@ -92,6 +98,9 @@ struct StreamHandle {
 #if INGINE_BACKEND_CUDA
   constexpr StreamHandle(cudaStream_t s) noexcept : native(s) {}
   constexpr operator cudaStream_t() const noexcept { return static_cast<cudaStream_t>(native); }
+#elif INGINE_BACKEND_HIP
+  constexpr StreamHandle(hipStream_t s) noexcept : native(s) {}
+  constexpr operator hipStream_t() const noexcept { return static_cast<hipStream_t>(native); }
 #else
   constexpr StreamHandle(std::nullptr_t) noexcept : native(nullptr) {}
   constexpr explicit StreamHandle(void* p) noexcept : native(p) {}
@@ -99,6 +108,8 @@ struct StreamHandle {
   constexpr static StreamHandle from_native(void* p) noexcept {
 #if INGINE_BACKEND_CUDA
     return StreamHandle(static_cast<cudaStream_t>(p));
+#elif INGINE_BACKEND_HIP
+    return StreamHandle(static_cast<hipStream_t>(p));
 #else
     return StreamHandle(p);
 #endif
@@ -114,6 +125,9 @@ struct EventHandle {
 #if INGINE_BACKEND_CUDA
   constexpr EventHandle(cudaEvent_t e) noexcept : native(e) {}
   constexpr operator cudaEvent_t() const noexcept { return static_cast<cudaEvent_t>(native); }
+#elif INGINE_BACKEND_HIP
+  constexpr EventHandle(hipEvent_t e) noexcept : native(e) {}
+  constexpr operator hipEvent_t() const noexcept { return static_cast<hipEvent_t>(native); }
 #else
   constexpr EventHandle(std::nullptr_t) noexcept : native(nullptr) {}
   constexpr explicit EventHandle(void* p) noexcept : native(p) {}
@@ -121,6 +135,8 @@ struct EventHandle {
   constexpr static EventHandle from_native(void* p) noexcept {
 #if INGINE_BACKEND_CUDA
     return EventHandle(static_cast<cudaEvent_t>(p));
+#elif INGINE_BACKEND_HIP
+    return EventHandle(static_cast<hipEvent_t>(p));
 #else
     return EventHandle(p);
 #endif

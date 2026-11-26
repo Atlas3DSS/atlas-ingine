@@ -4,6 +4,7 @@
 // and cross-backend HAL GraphRequirement / DeferredFlag contract invariants.
 #include "core/act.h"
 #include "core/backend_contract.h"
+#include "core/gpu_compat.h"
 #include "core/hal.h"
 #include "core/ops.h"
 #include "core/vendor_policy.h"
@@ -159,6 +160,46 @@ void test_hip_policies_and_warp_mapping() {
   const std::uint64_t wave64_mask = 0x12345678abcdef01ull;
   VP_CHECK(ingine::kernels::warp::logical_32_half_ballot(wave64_mask, 5) == 0xabcdef01u);
   VP_CHECK(ingine::kernels::warp::logical_32_half_ballot(wave64_mask, 37) == 0x12345678u);
+
+  // Unified-APU zero-copy INGPACK1 policy (default on unified APU, off on discrete, env override).
+  VP_CHECK(!should_use_zero_copy_weight_pack(true, false));
+  VP_CHECK(!should_use_zero_copy_weight_pack(true, false, "1"));
+  VP_CHECK(should_use_zero_copy_weight_pack(true, true));
+  VP_CHECK(!should_use_zero_copy_weight_pack(false, true));
+  VP_CHECK(!should_use_zero_copy_weight_pack(true, true, "0"));
+  VP_CHECK(!should_use_zero_copy_weight_pack(true, true, "false"));
+  VP_CHECK(!should_use_zero_copy_weight_pack(true, true, "off"));
+  VP_CHECK(should_use_zero_copy_weight_pack(false, true, "1"));
+  VP_CHECK(should_use_zero_copy_weight_pack(false, true, "true"));
+  VP_CHECK(should_use_zero_copy_weight_pack(false, true, "on"));
+
+  // Portable OCP E4M3FN host conversion invariants (exact midpoints, saturation, NaN, full 254 finite roundtrip).
+  using namespace ingine::gpu;
+  VP_CHECK(float_to_e4m3fn_sat_portable(0.0f) == 0x00u);
+  VP_CHECK(float_to_e4m3fn_sat_portable(-0.0f) == 0x80u);
+  VP_CHECK(float_to_e4m3fn_sat_portable(448.0f) == 0x7eu);
+  VP_CHECK(float_to_e4m3fn_sat_portable(-448.0f) == 0xfeu);
+  VP_CHECK(float_to_e4m3fn_sat_portable(1000.0f) == 0x7eu);
+  VP_CHECK(float_to_e4m3fn_sat_portable(-1000.0f) == 0xfeu);
+  VP_CHECK(float_to_e4m3fn_sat_portable(INFINITY) == 0x7eu);
+  VP_CHECK(float_to_e4m3fn_sat_portable(-INFINITY) == 0xfeu);
+  VP_CHECK(float_to_e4m3fn_sat_portable(NAN) == 0x7fu);
+  VP_CHECK(float_to_e4m3fn_sat_portable(-NAN) == 0x7fu);
+  // Subnormal round-to-even midpoints: 0.5*2^-9 -> 0 (even), 1.5*2^-9 -> 2 (even), 7.5*2^-9 -> 8 (min normal 0x08).
+  VP_CHECK(float_to_e4m3fn_sat_portable(0.5f / 512.0f) == 0x00u);
+  VP_CHECK(float_to_e4m3fn_sat_portable(1.5f / 512.0f) == 0x02u);
+  VP_CHECK(float_to_e4m3fn_sat_portable(7.5f / 512.0f) == 0x08u);
+  VP_CHECK(e4m3fn_to_f16_bits_portable(0x7fu) == 0x7fffu);
+  VP_CHECK(e4m3fn_to_f16_bits_portable(0xffu) == 0x7fffu);
+  for (int code = 0; code < 256; ++code) {
+    const std::uint8_t c = static_cast<std::uint8_t>(code);
+    const float fv = e4m3fn_to_float_portable(c);
+    if ((code & 0x7f) == 0x7f) {
+      VP_CHECK(std::isnan(fv));
+    } else {
+      VP_CHECK(float_to_e4m3fn_sat_portable(fv) == c);
+    }
+  }
 }
 
 void test_mlx_and_sycl_policies() {

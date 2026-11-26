@@ -2,7 +2,7 @@
 ingine_add_test(NAME batch_scheduler SOURCES test_batch_scheduler.cpp LIBS ingine_engine LABELS batch serve TIMEOUT 60)
 ingine_add_test(NAME batch_prefix_cache SOURCES test_batch_prefix_cache.cpp LIBS ingine_core LABELS batch TIMEOUT 60)
 ingine_add_test(NAME batch_server SOURCES test_batch_server.cpp LIBS ingine_serve LABELS batch serve TIMEOUT 120)
-if(INGINE_BACKEND STREQUAL "CUDA")
+if(INGINE_BACKEND STREQUAL "CUDA" OR INGINE_BACKEND STREQUAL "HIP")
   ingine_add_test(NAME batch_kernels SOURCES test_batch_kernels.cpp LIBS ingine_kernels_batch ingine_kernels_attn ingine_core
                   LABELS batch GPU TIMEOUT 300)
   if(TARGET ingine_model)

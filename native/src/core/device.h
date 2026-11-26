@@ -18,7 +18,7 @@
 #endif
 
 #if INGINE_BACKEND_HIP
-#include <hip/hip_runtime.h>
+#include "core/gpu_compat.h"
 #elif INGINE_BACKEND_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -37,6 +37,7 @@ using BackendEventT = hipEvent_t;
 using BackendDevicePropT = hipDeviceProp_t;
 void hip_check(hipError_t err, const char* expr, const char* file, int line);
 #define HIP_CHECK(expr) ::ingine::hip_check((expr), #expr, __FILE__, __LINE__)
+#define CUDA_CHECK(expr) HIP_CHECK(expr)
 #elif INGINE_BACKEND_CUDA
 using BackendStreamT = cudaStream_t;
 using BackendEventT = cudaEvent_t;
@@ -45,22 +46,10 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 #define CUDA_CHECK(expr) ::ingine::cuda_check((expr), #expr, __FILE__, __LINE__)
 #endif
 
-// Cached compute capability major version for the active device (safe inside graph capture).
+// Cached NVIDIA CUDA SM compute capability major version for the active device (safe inside graph capture).
+// Returns 0 on non-CUDA backends (including HIP) so NVIDIA SM90+ cluster/PDL guards never trigger on AMD GPUs.
 inline int current_sm_major() {
-#if INGINE_BACKEND_HIP
-    static std::array<int, 16> cached{};
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return 11;
-    if (cached[dev] == 0) {
-        int maj = 0;
-        if (hipDeviceGetAttribute(&maj, hipDeviceAttributeComputeCapabilityMajor, dev) == hipSuccess && maj > 0) {
-            cached[dev] = maj;
-        } else {
-            return 11;
-        }
-    }
-    return cached[dev];
-#elif INGINE_BACKEND_CUDA
+#if INGINE_BACKEND_CUDA
     static std::array<int, 16> cached{};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 8;
@@ -75,6 +64,14 @@ inline int current_sm_major() {
     return cached[dev];
 #else
     return 0;
+#endif
+}
+
+inline bool has_cuda_sm90() {
+#if INGINE_BACKEND_CUDA
+    return current_sm_major() >= 9;
+#else
+    return false;
 #endif
 }
 

@@ -29,7 +29,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <array>
 #include <cstdint>

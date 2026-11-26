@@ -33,10 +33,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <library_types.h>
-#elif INGINE_BACKEND_HIP && defined(__HIPCC__)
-#include <hip/hip_bf16.h>
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
+#elif INGINE_BACKEND_HIP
+#include "core/gpu_compat.h"
 #endif
 
 #include <algorithm>
@@ -64,7 +62,7 @@ inline constexpr DType kActDType = DType::BF16;
 inline constexpr cudaDataType_t kCublasActType = CUDA_R_16BF;
 inline constexpr bool kActIsFP16 = false;
 #endif
-#elif INGINE_BACKEND_HIP && defined(__HIPCC__)
+#elif INGINE_BACKEND_HIP
 #if INGINE_ACT_FP16
 using ActT = __half;
 using Act2T = __half2;
@@ -228,6 +226,7 @@ inline
 std::uint16_t e4m3_to_f16_bits_portable_host(std::uint32_t b) {
   const std::uint32_t s = (b & 0x80u) << 8;
   const std::uint32_t a = b & 0x7fu;
+  if (a == 0x7fu) return 0x7fffu;  // FP16 canonical NaN, discard sign (matches cvt.rn.f16x2.e4m3x2 / cuda_fp8.hpp)
   const std::uint32_t norm = (a + 64u) << 7;
   const std::uint32_t sub = a ? (0x1800u + (((0xBA986400u >> (a * 4u)) & 0xfu) << 8)) : 0u;
   return static_cast<std::uint16_t>(s | (a >= 8u ? norm : sub));

@@ -13,11 +13,16 @@
 namespace ingine::kernels::dense {
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+#else
+  static_cast<void>(p);
+  return 0u;
+#endif
 }
 // address `a` (this CTA's shared memory) in CTA `rank` of the cluster (SM90+ only)
 __device__ __forceinline__ uint32_t remote(uint32_t a, int rank) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   uint32_t o;
   asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(o) : "r"(a), "r"(rank));
   return o;
@@ -28,7 +33,7 @@ __device__ __forceinline__ uint32_t remote(uint32_t a, int rank) {
 }
 // 4 floats (16 bytes, the widest st.async) to `addr` (SM90+ only).
 __device__ __forceinline__ void st_async4(uint32_t addr, float4 v, uint32_t mb) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(addr),
                "r"(__float_as_uint(v.x)), "r"(__float_as_uint(v.y)), "r"(__float_as_uint(v.z)),
                "r"(__float_as_uint(v.w)), "r"(mb)
@@ -38,7 +43,7 @@ __device__ __forceinline__ void st_async4(uint32_t addr, float4 v, uint32_t mb) 
 #endif
 }
 __device__ __forceinline__ void mb_init(uint32_t mb) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(mb) : "memory");
 #else
   static_cast<void>(mb);
@@ -46,13 +51,13 @@ __device__ __forceinline__ void mb_init(uint32_t mb) {
 }
 // makes the barrier initialisations visible to the cluster (SM90+ only)
 __device__ __forceinline__ void fence_mbarrier_init() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 #endif
 }
 // the single arrival of the phase, expecting `bytes` of st.async data (SM90+ only)
 __device__ __forceinline__ void mb_expect(uint32_t mb, uint32_t bytes) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(mb), "r"(bytes) : "memory");
 #else
   static_cast<void>(mb); static_cast<void>(bytes);
@@ -60,7 +65,7 @@ __device__ __forceinline__ void mb_expect(uint32_t mb, uint32_t bytes) {
 }
 // waits for phase 0 to complete (SM90+ only)
 __device__ __forceinline__ void mb_wait(uint32_t mb) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   asm volatile(
       "{\n .reg .pred p;\n W: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], 0;\n @!p bra W;\n}" ::"r"(mb)
       : "memory");

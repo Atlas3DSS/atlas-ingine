@@ -542,9 +542,11 @@ bool is_conditional_unsupported(cudaError_t err) noexcept {
     case cudaErrorNotSupported:
     case cudaErrorNotPermitted:
     case cudaErrorInsufficientDriver:
-    case cudaErrorCallRequiresNewerDriver:
     case cudaErrorOperatingSystem:
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
+    case cudaErrorCallRequiresNewerDriver:
     case cudaErrorUnsupportedPtxVersion:
+#endif
       return true;
     default:
       return false;
@@ -603,13 +605,13 @@ GraphExec Runtime::try_capture_switch(const std::function<cudaError_t(cudaStream
                                       const std::function<void(cudaStream_t, int)>& branch) {
   if (!supports_conditional_graphs_) return GraphExec{};
   if (verify_widths_.empty()) throw std::logic_error("capture_switch needs the speculative widths (options.spec)");
-#if CUDART_VERSION < 12080
+#if !(defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION) && CUDART_VERSION >= 12080)
   (void)head;
   (void)branch;
   supports_conditional_graphs_ = false;
   g_switch_capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
   return GraphExec{};
-#else
+#elif defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
   const cudaStream_t s = capture_stream_;
   cudaGraph_t graph = nullptr;
   struct Owned {

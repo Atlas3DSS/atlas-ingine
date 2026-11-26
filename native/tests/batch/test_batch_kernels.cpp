@@ -8,11 +8,9 @@
 #include "core/act.h"
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/gpu_compat.h"
 #include "kernels/attn/attn.h"
 #include "kernels/batch/batch.h"
-
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -60,7 +58,7 @@ std::vector<std::uint8_t> to_e4m3(const std::vector<float>& f) {
   std::vector<std::uint8_t> out(f.size());
   for (std::size_t i = 0; i < f.size(); ++i) {
     const float c = std::clamp(ingine::act::host_round(f[i]), -448.f, 448.f);
-    out[i] = static_cast<std::uint8_t>(__nv_cvt_float_to_fp8(c, __NV_SATFINITE, __NV_E4M3));
+    out[i] = ingine::gpu::float_to_e4m3fn_sat_portable(c);
   }
   return out;
 }

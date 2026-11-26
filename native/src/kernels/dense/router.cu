@@ -19,7 +19,9 @@
 // * pdl=True: weights and bias are loaded before griddepcontrol.wait (pdl_wait_fenced: ptxas would sink
 //   them below a plain wait), the activations after it.
 // Ported from engine/csrc/dense/router.cu (torch launchers -> raw pointers; mbarrier exchange).
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
 #include <cooperative_groups.h>
+#endif
 
 #include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
@@ -29,7 +31,9 @@
 
 #include <type_traits>
 
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
 namespace cg = cooperative_groups;
+#endif
 
 namespace ingine::kernels::dense {
 namespace {
@@ -56,7 +60,7 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const ActT* _
   __shared__ float sel_s[TOPK];
   __shared__ int sel_e[TOPK];
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
 #else
@@ -324,6 +328,7 @@ void launch_router_sm8x(int M, const ActT* x, const void* w, const float* bias, 
 
 // 16-CTA clusters need the non-portable opt-in and a GPC with 16 free SMs; fall back to 8 otherwise.
 int router_cluster_size() {
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
   static const int cl = [] {
     if (current_sm_major() < 9) return 1;
     auto k = router_kernel<16, true, 8>;
@@ -343,6 +348,9 @@ int router_cluster_size() {
     return n > 0 ? 16 : 8;
   }();
   return cl;
+#else
+  return 1;
+#endif
 }
 
 // Shared hooked selection phase for both SM90+ cluster router_hooked_kernel and SM70/8x router_sm8x_select_hooked_kernel.
@@ -485,7 +493,7 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_hooked_kernel(
   __shared__ float all_s[EXPERTS];
   __shared__ float all_sel[EXPERTS];
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
 #else

@@ -104,7 +104,7 @@ SafetensorsFile::SafetensorsFile(std::unique_ptr<WeightPack> pack)
 }
 
 void SafetensorsFile::init_from_pack(std::unique_ptr<WeightPack> pack) {
-    pack_        = std::move(pack);
+    pack_        = std::shared_ptr<WeightPack>(std::move(pack));
     file_size_   = pack_->file_size();
     data_offset_ = pack_->data_offset();
     metadata_    = pack_->metadata();

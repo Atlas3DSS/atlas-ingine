@@ -31,21 +31,20 @@
 // Both device helpers are no-ops in ordinary launches, so the same kernel serves eager prefill and
 // captured decode.
 #include "core/device.h"
-
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <utility>
 
 namespace ingine::kernels {
 
 __device__ __forceinline__ void pdl_trigger() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
 __device__ __forceinline__ void pdl_wait() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
@@ -53,22 +52,29 @@ __device__ __forceinline__ void pdl_wait() {
 // `pointer` without its kernel-parameter provenance (see above): loads through it are coherent.
 template <class T>
 __device__ __forceinline__ T* pdl_coherent(T* pointer) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     asm("" : "+l"(pointer));
+#endif
     return pointer;
 }
 
 // Load ahead of pdl_wait() of a value whose writer grid completed before this kernel could launch
 // (see above). gpu-scope loads bypass L1, which may still hold the line from an earlier kernel.
 __device__ __forceinline__ int pdl_load_settled(const int* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     int v;
     asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(p));
     return v;
+#else
+    return *p;
+#endif
 }
 
-// Launches `kernel` as a programmatic dependent of the preceding kernel in `stream` (SM90+); plain launch on SM8x.
+// Launches `kernel` as a programmatic dependent of the preceding kernel in `stream` (SM90+); plain launch on SM8x / HIP.
 template <class... Params, class... Args>
 cudaError_t pdl_launch(void (*kernel)(Params...), dim3 grid, dim3 block, std::size_t smem,
                        cudaStream_t stream, Args&&... args) {
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
     cudaLaunchConfig_t cfg{};
     cfg.gridDim          = grid;
     cfg.blockDim         = block;
@@ -82,6 +88,10 @@ cudaError_t pdl_launch(void (*kernel)(Params...), dim3 grid, dim3 block, std::si
         cfg.numAttrs                                       = 1;
     }
     return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
+#else
+    kernel<<<grid, block, smem, stream>>>(std::forward<Args>(args)...);
+    return cudaGetLastError();
+#endif
 }
 
 } // namespace ingine::kernels

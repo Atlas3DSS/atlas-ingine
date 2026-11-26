@@ -6,7 +6,7 @@
 #include "model/runtime.h"
 #include "common/test_util.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cmath>
 #include <cstdio>

@@ -7,6 +7,7 @@
 #include "core/hal.h"
 #include "core/host_memory.h"
 #include "core/hugepage.h"
+#include "core/weight_pack.h"
 
 #include <spdlog/spdlog.h>
 
@@ -462,6 +463,62 @@ void MappedHostBuffer::release() noexcept {
     via_hugepage_mmap_ = false;
     hugepage_advised_ = false;
   }
+}
+
+UnifiedWeightPackPin::UnifiedWeightPackPin(std::shared_ptr<const WeightPack> pack)
+    : owner_(std::move(pack)),
+      host_base_(owner_ ? static_cast<const void*>(owner_->mapped_base()) : nullptr),
+      size_(owner_ ? static_cast<std::size_t>(owner_->file_size()) : 0) {}
+
+UnifiedWeightPackPin::~UnifiedWeightPackPin() { release(); }
+
+UnifiedWeightPackPin::UnifiedWeightPackPin(UnifiedWeightPackPin&& other) noexcept
+    : owner_(std::move(other.owner_)),
+      host_base_(std::exchange(other.host_base_, nullptr)),
+      device_base_(std::exchange(other.device_base_, nullptr)),
+      size_(std::exchange(other.size_, 0)),
+      registered_(std::exchange(other.registered_, false)),
+      readonly_(std::exchange(other.readonly_, false)),
+      register_seconds_(other.register_seconds_) {}
+
+UnifiedWeightPackPin& UnifiedWeightPackPin::operator=(UnifiedWeightPackPin&& other) noexcept {
+  if (this != &other) {
+    release();
+    owner_            = std::move(other.owner_);
+    host_base_        = std::exchange(other.host_base_, nullptr);
+    device_base_      = std::exchange(other.device_base_, nullptr);
+    size_             = std::exchange(other.size_, 0);
+    registered_       = std::exchange(other.registered_, false);
+    readonly_         = std::exchange(other.readonly_, false);
+    register_seconds_ = other.register_seconds_;
+  }
+  return *this;
+}
+
+bool UnifiedWeightPackPin::pin() {
+  if (registered_ || !host_base_ || size_ == 0) return registered_;
+  device_base_ = const_cast<void*>(host_base_);
+  registered_  = true;
+  readonly_    = true;
+  return true;
+}
+
+void UnifiedWeightPackPin::unpin() noexcept {
+  registered_  = false;
+  readonly_    = false;
+  device_base_ = nullptr;
+}
+
+void UnifiedWeightPackPin::release() noexcept {
+  unpin();
+  host_base_ = nullptr;
+  size_      = 0;
+  owner_.reset();
+}
+
+void* UnifiedWeightPackPin::tensor_device_ptr(std::uint64_t offset, std::uint64_t bytes) const noexcept {
+  if (!registered_ || !device_base_ || offset > size_ || bytes > size_ - offset) return nullptr;
+  return static_cast<std::uint8_t*>(device_base_) + offset;
 }
 
 std::uint64_t mem_available_bytes() { return read_meminfo_kib("MemAvailable:"); }

@@ -10,7 +10,7 @@
 
 #include "kernels/attn/attn.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstring>
 #include <string>

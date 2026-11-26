@@ -18,7 +18,7 @@
 // stream, as the Generator uses). Their draws equal the one-CTA kernels' (more than 8 rows) token for token.
 #pragma once
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstdint>
 

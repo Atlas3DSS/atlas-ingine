@@ -8,7 +8,7 @@
 #include "kernels/draft/draft.h"
 #include "kernels/draft/draft_device.cuh"
 
-#include <cuda_fp16.h>
+#include "core/gpu_compat.h"
 
 #include <algorithm>
 #include <cmath>

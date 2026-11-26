@@ -4,10 +4,8 @@
 
 #include "core/act.h"
 #include "core/device.h"
+#include "core/gpu_compat.h"
 #include "kernels/common/l2.cuh"
-
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -89,7 +87,7 @@ __device__ __forceinline__ float clip_factor(float ss, float t) {
 }
 
 __device__ __forceinline__ float2 e4m3x2_f2(uint32_t pair) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 890
   return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3)));
 #else
   auto dec = [](uint32_t b) -> float {
@@ -113,14 +111,15 @@ __device__ __forceinline__ void unpack8(const uint2 u, float f[8]) {
 }
 
 __device__ __forceinline__ float e4m3r(float x) {
-  return __half2float(__half(__nv_cvt_fp8_to_halfraw(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3), __NV_E4M3)));
+  return ingine::gpu::e4m3fn_to_float(ingine::gpu::float_to_e4m3fn_sat(x));
 }
 
 __device__ __forceinline__ uint32_t pack_e4m3x2(float a, float b) {
-  return __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+  return ingine::gpu::float2_to_e4m3fnx2_sat(a, b);
 }
 
 __device__ __forceinline__ uint4 ld_kv(const void* ptr, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   uint4 v;
   if constexpr (l2::hinted<KV_L2>)
     asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
@@ -133,9 +132,14 @@ __device__ __forceinline__ uint4 ld_kv(const void* ptr, std::uint64_t pol) {
                  : "l"(ptr)
                  : "memory");
   return v;
+#else
+  static_cast<void>(pol);
+  return *static_cast<const uint4*>(ptr);
+#endif
 }
 
 __device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   uint2 v;
   if constexpr (l2::hinted<KV_L2>)
     asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.v2.u32 {%0,%1}, [%2], %3;"
@@ -145,6 +149,10 @@ __device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
   else
     asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
   return v;
+#else
+  static_cast<void>(pol);
+  return *static_cast<const uint2*>(ptr);
+#endif
 }
 
 template <bool PROJ_FP32>
@@ -225,7 +233,7 @@ struct AttnSmem {
 template <bool FULL, bool F8, bool PROJ_FP32, bool SPLIT>
 __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKernelParams p) {
   static_assert(FULL || !F8, "FP8 caches are full-layer only");
-  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
+  using CT = std::conditional_t<F8, uint8_t, ActT>;
   using KV = std::conditional_t<F8, uint2, uint4>;
 
   const int rank = blockIdx.x;
@@ -643,7 +651,7 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
 template <bool FULL, bool F8, bool PROJ_FP32>
 __global__ void __launch_bounds__(NT) batched_attn_reduce_kernel(const BatchedAttnKernelParams p) {
   static_assert(FULL || !F8, "FP8 caches are full-layer only");
-  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
+  using CT = std::conditional_t<F8, uint8_t, ActT>;
 
   const int g = blockIdx.y;
   const int b = blockIdx.z;

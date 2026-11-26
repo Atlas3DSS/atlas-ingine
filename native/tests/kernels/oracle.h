@@ -19,7 +19,7 @@ inline std::vector<ingine::ActT> to_bf16(const std::vector<float>& v) {
 
 using Check = OracleCheck;
 
-#if INGINE_BACKEND_CUDA
+#if INGINE_BACKEND_CUDA || INGINE_BACKEND_HIP
 inline std::vector<float> bf16_download(const DeviceArray<ingine::ActT>& d) {
   const auto h = d.download();
   std::vector<float> o(h.size());

@@ -22,26 +22,25 @@
 // INGINE_L2_HINTS=0 compile every access without hints.
 #pragma once
 
+#include "core/gpu_compat.h"
 #include "kernels/common/copy.cuh"
-
-#include <cuda_runtime.h>
 
 #include <cstdint>
 
 #ifndef INGINE_L2_HINTS
-#if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4)
+#if !defined(__HIP_DEVICE_COMPILE__) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
 #define INGINE_L2_HINTS 1
 #else
 #define INGINE_L2_HINTS 0
 #endif
 #endif
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(__HIP_DEVICE_COMPILE__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
 #undef INGINE_L2_HINTS
 #define INGINE_L2_HINTS 0
 #endif
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 750
 #define INGINE_L1_NO_ALLOCATE ".L1::no_allocate"
 #else
 #define INGINE_L1_NO_ALLOCATE ""
@@ -58,11 +57,13 @@ constexpr bool hinted = INGINE_L2_HINTS && E != Evict::none;
 template <Evict E>
 __device__ __forceinline__ std::uint64_t policy() {
   unsigned long long p = 0;
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   if constexpr (hinted<E>) {
     if constexpr (E == Evict::first) asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
     else if constexpr (E == Evict::last) asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
     else asm("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;" : "=l"(p));
   }
+#endif
   return p;
 }
 
@@ -71,6 +72,7 @@ __device__ __forceinline__ std::uint64_t policy() {
 // pdl_wait_fenced).
 template <Evict E>
 __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   uint4 r;
   if constexpr (hinted<E>) {
     asm volatile("ld.global.nc" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
@@ -82,14 +84,16 @@ __device__ __forceinline__ uint4 ld_stream(const void* p, std::uint64_t pol) {
                  : "l"(p));
   }
   return r;
+#else
+  static_cast<void>(pol);
+  return *static_cast<const uint4*>(p);
+#endif
 }
 
 // 16-byte asynchronous global -> shared copy (L2 only); complete with cp.async.commit_group / wait.
 template <Evict E>
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, std::uint64_t pol) {
-#if __CUDA_ARCH__ < 800
-  copy::sync<16>(smem, gmem);
-#else
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
   const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(smem));
   if constexpr (hinted<E>) {
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(dst), "l"(gmem), "l"(pol)
@@ -97,12 +101,16 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, std::ui
   } else {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(gmem) : "memory");
   }
+#else
+  static_cast<void>(pol);
+  copy::sync<16>(smem, gmem);
 #endif
 }
 
 // 16-byte store whose L2 line gets class E (e.g. Evict::last for a result read after a large stream).
 template <Evict E>
 __device__ __forceinline__ void st16(void* p, uint4 v, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   if constexpr (hinted<E>) {
     asm volatile("st.global.L2::cache_hint.v4.b32 [%0], {%1,%2,%3,%4}, %5;" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z),
                  "r"(v.w), "l"(pol)
@@ -110,12 +118,16 @@ __device__ __forceinline__ void st16(void* p, uint4 v, std::uint64_t pol) {
   } else {
     asm volatile("st.global.v4.b32 [%0], {%1,%2,%3,%4};" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
   }
+#else
+  static_cast<void>(pol);
+  *static_cast<uint4*>(p) = v;
+#endif
 }
 
 // Invalidates the 128-byte L2 line at `line` without writing it back. Only for lines whose data is dead:
 // every later read of the line must follow a new write.
 __device__ __forceinline__ void discard_line(const void* line) {
-#if INGINE_L2_HINTS
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && INGINE_L2_HINTS
   asm volatile("discard.global.L2 [%0], 128;" ::"l"(line) : "memory");
 #else
   static_cast<void>(line);
@@ -126,9 +138,13 @@ __device__ __forceinline__ void discard_line(const void* line) {
 // requests it with the default class).
 template <Evict E>
 __device__ __forceinline__ void prefetch(const void* p) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   if constexpr (hinted<E> && E == Evict::last) asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(p));
   else if constexpr (hinted<E> && E == Evict::normal) asm volatile("prefetch.global.L2::evict_normal [%0];" ::"l"(p));
   else asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+#else
+  static_cast<void>(p);
+#endif
 }
 
 }  // namespace ingine::kernels::l2

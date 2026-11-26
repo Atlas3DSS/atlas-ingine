@@ -4,9 +4,8 @@
 #pragma once
 
 #include "core/act.h"
+#include "core/gpu_compat.h"
 #include "kernels/common/persona_abi.h"
-
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>

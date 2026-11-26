@@ -15,7 +15,7 @@
 #include "kernels/draft/draft.h"
 #include "kernels/head/head.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>

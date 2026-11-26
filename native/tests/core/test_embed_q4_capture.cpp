@@ -11,7 +11,7 @@
 #include "core/hal.h"
 #include "core/ops.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstring>
 #include <stdexcept>

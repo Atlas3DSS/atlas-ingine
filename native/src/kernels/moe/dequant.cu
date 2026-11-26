@@ -11,10 +11,7 @@
 
 #include "kernels/common/exl3.cuh"
 #include "core/device.h"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include "core/gpu_compat.h"
 
 #include <stdexcept>
 
@@ -25,7 +22,7 @@ __constant__ float kE2M1[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -
 __constant__ float kAtlas2[4] = {-1.5f, -0.453125f, 0.453125f, 1.5f};
 __constant__ float kAtlas3[8] = {-2.0f, -1.25f, -0.703125f, -0.2265625f, 0.2265625f, 0.703125f, 1.25f, 2.0f};
 
-__global__ void dequant_nvfp4(const uint8_t* __restrict__ codes, const __nv_fp8_e4m3* __restrict__ scales,
+__global__ void dequant_nvfp4(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
                               const float* __restrict__ factor, const int32_t* __restrict__ experts,
                               ActT* __restrict__ out, int64_t blocks_per_expert, int64_t total) {
     int64_t b = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
@@ -34,7 +31,7 @@ __global__ void dequant_nvfp4(const uint8_t* __restrict__ codes, const __nv_fp8_
     int64_t e = experts[slot];
     int64_t src = e * blocks_per_expert + within;
     // the reference forms e2m1 * block_scale, then multiplies by the expert factor (both FP32)
-    const float scale = float(scales[src]), f = factor[e];
+    const float scale = ingine::gpu::e4m3fn_to_float(scales[src]), f = factor[e];
     uint2 c = *reinterpret_cast<const uint2*>(codes + src * 8);
     uint32_t w[2] = {c.x, c.y};
     __align__(16) ActT v[16];
@@ -49,7 +46,7 @@ __global__ void dequant_nvfp4(const uint8_t* __restrict__ codes, const __nv_fp8_
     dst[1] = reinterpret_cast<uint4*>(v)[1];
 }
 
-__global__ void dequant_mxfp8(const __nv_fp8_e4m3* __restrict__ codes, const uint8_t* __restrict__ scales,
+__global__ void dequant_mxfp8(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
                               const int32_t* __restrict__ experts, ActT* __restrict__ out,
                               int64_t blocks_per_expert, int64_t total) {
     int64_t b = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
@@ -62,16 +59,16 @@ __global__ void dequant_mxfp8(const __nv_fp8_e4m3* __restrict__ codes, const uin
 #pragma unroll
     for (int q = 0; q < 2; ++q) {
         uint4 raw = c[q];
-        const __nv_fp8_e4m3* f = reinterpret_cast<const __nv_fp8_e4m3*>(&raw);
+        const uint8_t* f = reinterpret_cast<const uint8_t*>(&raw);
         __align__(16) ActT v[16];
 #pragma unroll
-        for (int i = 0; i < 16; ++i) v[i] = act::from_float(float(f[i]) * s);
+        for (int i = 0; i < 16; ++i) v[i] = act::from_float(ingine::gpu::e4m3fn_to_float(f[i]) * s);
         dst[2 * q] = reinterpret_cast<uint4*>(v)[0];
         dst[2 * q + 1] = reinterpret_cast<uint4*>(v)[1];
     }
 }
 
-__global__ void dequant_atlas2(const uint8_t* __restrict__ codes, const __nv_fp8_e4m3* __restrict__ scales,
+__global__ void dequant_atlas2(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
                                const float* __restrict__ factor, const int32_t* __restrict__ experts,
                                ActT* __restrict__ out, int64_t blocks_per_expert, int64_t total) {
     int64_t b = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
@@ -79,7 +76,7 @@ __global__ void dequant_atlas2(const uint8_t* __restrict__ codes, const __nv_fp8
     int64_t slot = b / blocks_per_expert, within = b % blocks_per_expert;
     int64_t e = experts[slot];
     int64_t src = e * blocks_per_expert + within;
-    const float scale = float(scales[src]), f = factor[e];
+    const float scale = ingine::gpu::e4m3fn_to_float(scales[src]), f = factor[e];
     const uint32_t w = *reinterpret_cast<const uint32_t*>(codes + src * 4);
     __align__(16) ActT v[16];
 #pragma unroll
@@ -91,7 +88,7 @@ __global__ void dequant_atlas2(const uint8_t* __restrict__ codes, const __nv_fp8
     dst[1] = reinterpret_cast<uint4*>(v)[1];
 }
 
-__global__ void dequant_atlas3(const uint8_t* __restrict__ codes, const __nv_fp8_e4m3* __restrict__ scales,
+__global__ void dequant_atlas3(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
                                const float* __restrict__ factor, const int32_t* __restrict__ experts,
                                ActT* __restrict__ out, int64_t blocks_per_expert, int64_t total) {
     int64_t b = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
@@ -99,7 +96,7 @@ __global__ void dequant_atlas3(const uint8_t* __restrict__ codes, const __nv_fp8
     int64_t slot = b / blocks_per_expert, within = b % blocks_per_expert;
     int64_t e = experts[slot];
     int64_t src = e * blocks_per_expert + within;
-    const float scale = float(scales[src]), f = factor[e];
+    const float scale = ingine::gpu::e4m3fn_to_float(scales[src]), f = factor[e];
     const int64_t pair = src >> 1;
     const int half = int(src & 1);
     const uint8_t* blk = codes + pair * 12;
@@ -253,19 +250,19 @@ void dequant_experts(const void* codes, const void* scales, const float* factor,
     int64_t grid = (total + threads - 1) / threads;
     if (fmt == Format::NVFP4) {
         dequant_nvfp4<<<grid, threads, 0, stream>>>(
-            static_cast<const uint8_t*>(codes), static_cast<const __nv_fp8_e4m3*>(scales), factor, experts, out,
+            static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), factor, experts, out,
             per_expert_blocks, total);
     } else if (fmt == Format::MXFP8) {
         dequant_mxfp8<<<grid, threads, 0, stream>>>(
-            static_cast<const __nv_fp8_e4m3*>(codes), static_cast<const uint8_t*>(scales), experts, out,
+            static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), experts, out,
             per_expert_blocks, total);
     } else if (fmt == Format::ATLAS2) {
         dequant_atlas2<<<grid, threads, 0, stream>>>(
-            static_cast<const uint8_t*>(codes), static_cast<const __nv_fp8_e4m3*>(scales), factor, experts, out,
+            static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), factor, experts, out,
             per_expert_blocks, total);
     } else {
         dequant_atlas3<<<grid, threads, 0, stream>>>(
-            static_cast<const uint8_t*>(codes), static_cast<const __nv_fp8_e4m3*>(scales), factor, experts, out,
+            static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), factor, experts, out,
             per_expert_blocks, total);
     }
     CUDA_CHECK(cudaGetLastError());

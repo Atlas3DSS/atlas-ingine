@@ -7,7 +7,8 @@
 //   Escha W2 / Kintsugi-Inkling-2-Mini Map M2 128-pt Hadamard rotation convention (Apache-2.0).
 #pragma once
 
-#include <cuda_fp16.h>
+#include "kernels/common/arch_ops.cuh"
+#include "core/gpu_compat.h"
 
 #include <cstdint>
 
@@ -15,31 +16,32 @@ namespace ingine::kernels::exl3 {
 
 // Decode two 16-bit MCG codebook states into packed FP16 pair (lo = s0, hi = s1).
 __device__ __forceinline__ uint32_t decode_mcg_pair(uint32_t s0, uint32_t s1) {
-  uint32_t x0 = s0 * 0xCBAC1FEDu;
-  uint32_t x1 = s1 * 0xCBAC1FEDu;
-  asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-  asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 610
+  uint32_t x0 = ingine::kernels::arch::exl3_mcg_mask_xor(s0 * 0xCBAC1FEDu);
+  uint32_t x1 = ingine::kernels::arch::exl3_mcg_mask_xor(s1 * 0xCBAC1FEDu);
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 610
   // Pascal sm_61 (P40/1080Ti) executes FP16 __hadd2 at 1/64 rate; unpack and add in full-rate FP32.
   const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&x0));
   const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&x1));
   const __half2 res = __floats2half2_rn(f0.x + f0.y, f1.x + f1.y);
   return *reinterpret_cast<const uint32_t*>(&res);
-#else
+#elif defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   const __half2 h0 = *reinterpret_cast<const __half2*>(&x0);
   const __half2 h1 = *reinterpret_cast<const __half2*>(&x1);
   const __half2 res = __hadd2(__lows2half2(h0, h1), __highs2half2(h0, h1));
+  return *reinterpret_cast<const uint32_t*>(&res);
+#else
+  const uint32_t lo = (x0 & 0xffffu) | ((x1 & 0xffffu) << 16);
+  const uint32_t hi = (x0 >> 16) | (x1 & 0xffff0000u);
+  const __half2 res = __hadd2(*reinterpret_cast<const __half2*>(&lo), *reinterpret_cast<const __half2*>(&hi));
   return *reinterpret_cast<const uint32_t*>(&res);
 #endif
 }
 
 // Decode two 16-bit MCG codebook states directly into float2 (avoids FP16 round-trip on Pascal sm_60/sm_61).
 __device__ __forceinline__ float2 decode_mcg_pair_f2(uint32_t s0, uint32_t s1) {
-  uint32_t x0 = s0 * 0xCBAC1FEDu;
-  uint32_t x1 = s1 * 0xCBAC1FEDu;
-  asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-  asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600
+  uint32_t x0 = ingine::kernels::arch::exl3_mcg_mask_xor(s0 * 0xCBAC1FEDu);
+  uint32_t x1 = ingine::kernels::arch::exl3_mcg_mask_xor(s1 * 0xCBAC1FEDu);
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 600
   const __half2 h0 = *reinterpret_cast<const __half2*>(&x0);
   const __half2 h1 = *reinterpret_cast<const __half2*>(&x1);
   return __half22float2(__hadd2(__lows2half2(h0, h1), __highs2half2(h0, h1)));
@@ -68,13 +70,13 @@ __device__ __forceinline__ void dq8_mcg_f2(LoadWord&& load_word, int lane, float
   const uint32_t b0 = (w0b == w0a) ? a0 : ((w0b == w1a) ? a1 : load_word(w0b));
   const uint32_t b1 = (w1b == w1a) ? a1 : ((w1b == w0a) ? a0 : load_word(w1b));
 
-  const uint32_t wa = __funnelshift_l(a1, a0, b0a & 31);
+  const uint32_t wa = ingine::kernels::arch::funnelshift_l(a1, a0, static_cast<unsigned>(b0a & 31));
   const uint32_t s0 = wa >> 16;
   const uint32_t s1 = (wa >> (16 - BITS)) & 0xffffu;
   const uint32_t s2 = (wa >> (16 - 2 * BITS)) & 0xffffu;
   const uint32_t s3 = (wa >> (16 - 3 * BITS)) & 0xffffu;
 
-  const uint32_t wb = __funnelshift_l(b1, b0, b0b & 31);
+  const uint32_t wb = ingine::kernels::arch::funnelshift_l(b1, b0, static_cast<unsigned>(b0b & 31));
   const uint32_t s4 = wb >> 16;
   const uint32_t s5 = (wb >> (16 - BITS)) & 0xffffu;
   const uint32_t s6 = (wb >> (16 - 2 * BITS)) & 0xffffu;
@@ -92,7 +94,7 @@ __device__ __forceinline__ void dq8_mcg_f2(LoadWord&& load_word, int lane, float
 //   - Decode A-fragment (W_hat^T, 16_n x 16_k): a0 = h01, a1 = h45, a2 = h23, a3 = h67
 //   - Prefill B-fragments (W_hat, two 16_k x 8_n): b[0] = {h01, h23}, b[1] = {h45, h67}
 // Splitting into two 4-state windows guarantees bit span = 16 + 3*BITS <= 25 <= 32, so each
-// 4-state group fits in a single __funnelshift_l over 2 consecutive 32-bit words.
+// 4-state group fits in a single funnelshift_l over 2 consecutive 32-bit words.
 template <int BITS, class LoadWord>
 __device__ __forceinline__ void dq8_mcg(LoadWord&& load_word, int lane, uint32_t& h01, uint32_t& h23,
                                         uint32_t& h45, uint32_t& h67) {
@@ -111,13 +113,13 @@ __device__ __forceinline__ void dq8_mcg(LoadWord&& load_word, int lane, uint32_t
   const uint32_t b0 = (w0b == w0a) ? a0 : ((w0b == w1a) ? a1 : load_word(w0b));
   const uint32_t b1 = (w1b == w1a) ? a1 : ((w1b == w0a) ? a0 : load_word(w1b));
 
-  const uint32_t wa = __funnelshift_l(a1, a0, b0a & 31);
+  const uint32_t wa = ingine::kernels::arch::funnelshift_l(a1, a0, static_cast<unsigned>(b0a & 31));
   const uint32_t s0 = wa >> 16;
   const uint32_t s1 = (wa >> (16 - BITS)) & 0xffffu;
   const uint32_t s2 = (wa >> (16 - 2 * BITS)) & 0xffffu;
   const uint32_t s3 = (wa >> (16 - 3 * BITS)) & 0xffffu;
 
-  const uint32_t wb = __funnelshift_l(b1, b0, b0b & 31);
+  const uint32_t wb = ingine::kernels::arch::funnelshift_l(b1, b0, static_cast<unsigned>(b0b & 31));
   const uint32_t s4 = wb >> 16;
   const uint32_t s5 = (wb >> (16 - BITS)) & 0xffffu;
   const uint32_t s6 = (wb >> (16 - 2 * BITS)) & 0xffffu;

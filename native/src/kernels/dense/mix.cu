@@ -23,7 +23,7 @@
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
 
-#include <cuda_fp16.h>
+#include "core/gpu_compat.h"
 
 namespace ingine::kernels::dense {
 namespace {

@@ -6,6 +6,7 @@
 #include "core/arena.h"
 #include "core/fixture.h"
 #include "core/hal.h"
+#include "core/host_memory.h"
 #include "core/hugepage.h"
 #include "core/safetensors.h"
 #include "core/sha256.h"
@@ -1021,6 +1022,87 @@ void run_weight_pack_bench(const std::filesystem::path& dir) {
                 r_st, gib / (r_st * 1e-3), r_pk, gib / (r_pk * 1e-3), r_pk > 0.0 ? r_st / r_pk : 0.0);
 }
 
+void test_unified_weight_pack_pin(const std::filesystem::path& dir) {
+    const auto pin_dir = dir / "unified_pin";
+    std::filesystem::create_directories(pin_dir);
+    const auto st_path   = pin_dir / "model.safetensors";
+    const auto pack_path = pin_dir / "model.ingpack";
+    const auto pat_a     = pattern_bytes(65536, 71);
+    const auto pat_b     = pattern_bytes(131072, 93);
+    write_safetensors(st_path, {
+                                   {"layer.0.w", "U8", {256, 256}, pat_a},
+                                   {"layer.1.w", "BF16", {256, 256}, pat_b},
+                               });
+    (void)WeightPackBuilder::pack_from_safetensors(st_path, pack_path);
+
+    SafetensorsFile sf(pack_path);
+    INGINE_CHECK(sf.is_weight_pack());
+    auto shared_pack = sf.shared_weight_pack();
+    INGINE_CHECK(static_cast<bool>(shared_pack));
+
+    ingine::UnifiedWeightPackPin pin(shared_pack);
+    INGINE_CHECK(!pin.registered());
+    INGINE_CHECK(pin.device_base() == nullptr);
+    const auto& ta = sf.at("layer.0.w");
+    const auto& tb = sf.at("layer.1.w");
+    INGINE_CHECK(pin.tensor_device_ptr(ta.offset, ta.bytes) == nullptr);
+
+    const bool ok = pin.pin();
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
+    if (ok) {
+        INGINE_CHECK(pin.registered());
+        INGINE_CHECK(pin.device_base() != nullptr);
+        INGINE_CHECK(pin.mapped_bytes() == shared_pack->file_size());
+        void* dev_a = pin.tensor_device_ptr(ta.offset, ta.bytes);
+        void* dev_b = pin.tensor_device_ptr(tb.offset, tb.bytes);
+        INGINE_CHECK(dev_a != nullptr && dev_b != nullptr);
+        // Out-of-bounds offset or length must return nullptr.
+        INGINE_CHECK(pin.tensor_device_ptr(pin.mapped_bytes(), 1) == nullptr);
+        INGINE_CHECK(pin.tensor_device_ptr(ta.offset, pin.mapped_bytes() + 1) == nullptr);
+        INGINE_CHECK(pin.tensor_device_ptr(UINT64_MAX - 8, 16) == nullptr);
+
+        std::vector<std::uint8_t> got_a(ta.bytes), got_b(tb.bytes);
+        INGINE_TEST_CUDA(cudaMemcpy(got_a.data(), dev_a, ta.bytes, cudaMemcpyDeviceToHost));
+        INGINE_TEST_CUDA(cudaMemcpy(got_b.data(), dev_b, tb.bytes, cudaMemcpyDeviceToHost));
+        INGINE_CHECK(got_a == pat_a);
+        INGINE_CHECK(got_b == pat_b);
+    }
+#elif defined(INGINE_BACKEND_HIP) && INGINE_BACKEND_HIP
+    if (ok) {
+        INGINE_CHECK(pin.registered());
+        INGINE_CHECK(pin.device_base() != nullptr);
+        void* dev_a = pin.tensor_device_ptr(ta.offset, ta.bytes);
+        INGINE_CHECK(dev_a != nullptr);
+        INGINE_CHECK(pin.tensor_device_ptr(pin.mapped_bytes(), 1) == nullptr);
+        std::vector<std::uint8_t> got_a(ta.bytes);
+        INGINE_TEST_CUDA(cudaMemcpy(got_a.data(), dev_a, ta.bytes, cudaMemcpyDeviceToHost));
+        INGINE_CHECK(got_a == pat_a);
+    }
+#else
+    INGINE_CHECK(ok);
+    INGINE_CHECK(pin.registered());
+    INGINE_CHECK(pin.readonly());
+    INGINE_CHECK(pin.device_base() != nullptr);
+    INGINE_CHECK(pin.device_base() == pin.host_base());
+    INGINE_CHECK(pin.mapped_bytes() == shared_pack->file_size());
+    void* dev_a = pin.tensor_device_ptr(ta.offset, ta.bytes);
+    void* dev_b = pin.tensor_device_ptr(tb.offset, tb.bytes);
+    INGINE_CHECK(dev_a != nullptr && dev_b != nullptr);
+    INGINE_CHECK(pin.tensor_device_ptr(pin.mapped_bytes(), 1) == nullptr);
+    INGINE_CHECK(pin.tensor_device_ptr(ta.offset, pin.mapped_bytes() + 1) == nullptr);
+    INGINE_CHECK(pin.tensor_device_ptr(UINT64_MAX - 8, 16) == nullptr);
+    INGINE_CHECK(std::memcmp(dev_a, pat_a.data(), ta.bytes) == 0);
+    INGINE_CHECK(std::memcmp(dev_b, pat_b.data(), tb.bytes) == 0);
+#endif
+
+    // Unpin clears device pointers cleanly and is idempotent.
+    pin.unpin();
+    pin.unpin();
+    INGINE_CHECK(!pin.registered());
+    INGINE_CHECK(pin.device_base() == nullptr);
+    INGINE_CHECK(pin.tensor_device_ptr(ta.offset, ta.bytes) == nullptr);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1033,6 +1115,7 @@ int main(int argc, char** argv) {
     test_safetensors_and_uploader_integration(tmp.path);
     test_adversarial_corruption(tmp.path);
     test_weight_source_consistency(tmp.path);
+    test_unified_weight_pack_pin(tmp.path);
     if (bench) { run_weight_pack_bench(tmp.path); }
     std::printf("core_weight_pack: ALL PASSED\n");
     return 0;

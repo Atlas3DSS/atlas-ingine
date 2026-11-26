@@ -2,7 +2,7 @@
 // Modified for fngine from cinference:src/core/pdl.cuh @ 383e5db. See NOTICE.
 #pragma once
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstddef>
 #include <utility>
@@ -22,6 +22,7 @@ struct LaunchConfig {
 template <class... KernelArgs, class... CallArgs>
 [[nodiscard]] inline cudaError_t
 launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), CallArgs&&... args) {
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
     cudaLaunchAttribute attribute{};
     attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attribute.val.programmaticStreamSerializationAllowed = 1;
@@ -35,13 +36,26 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
     config.numAttrs         = 1;
 
     return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
+#else
+    kernel<<<launch.grid, launch.block, launch.dynamic_smem_bytes, launch.stream>>>(
+        std::forward<CallArgs>(args)...);
+    return cudaGetLastError();
+#endif
 }
 
 // Every producer CTA must call this at least once or exit. This enables dependent scheduling but
 // does not make producer writes visible to the consumer.
-__device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLaunchCompletion(); }
+__device__ __forceinline__ void trigger_dependents() {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
 
 // Call on every consumer control path before its first access to producer-dependent data.
-__device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
+__device__ __forceinline__ void wait_for_dependencies() {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
+    cudaGridDependencySynchronize();
+#endif
+}
 
 } // namespace ingine::pdl

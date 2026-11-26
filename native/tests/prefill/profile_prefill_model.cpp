@@ -8,9 +8,9 @@
 #include "model/prefill.h"
 #include "model/runtime.h"
 #include "common/test_util.h"
+#include "core/nvtx.h"
 
 #include <nlohmann/json.hpp>
-#include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -86,7 +86,9 @@ int main(int argc, char** argv) {
     run();
     INGINE_TEST_CUDA(cudaStreamSynchronize(s));
     const std::string range = "p" + std::to_string(T) + "_" + std::to_string(ctx);
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
     nvtxRangePushA(range.c_str());
+#endif
     float total = 0;
     for (int rep = 0; rep < 3; ++rep) {
       cudaEventRecord(e0, s);
@@ -97,7 +99,9 @@ int main(int argc, char** argv) {
       cudaEventElapsedTime(&ms, e0, e1);
       total += ms;
     }
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
     nvtxRangePop();
+#endif
     std::printf("T=%5d ctx=%6d: %8.2f ms  %7.0f tok/s\n", T, ctx, total / 3, T / (total / 3) * 1e3);
   }
   return 0;

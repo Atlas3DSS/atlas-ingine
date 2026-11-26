@@ -87,10 +87,13 @@ if(NOT TARGET roc::hipblas)
   message(FATAL_ERROR "ROCm hipblas package did not provide roc::hipblas")
 endif()
 
+set(INGINE_GPU_RUNTIME_TARGET hip::host)
 if(TARGET roc::hipblaslt)
   set(INGINE_HIPBLASLT_AVAILABLE ON)
+  set(INGINE_GPU_BLAS_TARGETS roc::hipblaslt roc::hipblas)
 else()
   set(INGINE_HIPBLASLT_AVAILABLE OFF)
+  set(INGINE_GPU_BLAS_TARGETS roc::hipblas)
   message(STATUS "ingine HIP: hipBLASLt not found; falling back to roc::hipblas for dense GEMMs")
 endif()
 
@@ -98,6 +101,7 @@ function(ingine_hip_target target)
   target_compile_definitions(${target} PRIVATE
     INGINE_HIP_ARCHS="${INGINE_HIP_ARCHS_CSV}"
     INGINE_HIP_HAS_WMMA=$<BOOL:${INGINE_HIP_HAS_WMMA}>
+    INGINE_HIPBLASLT_AVAILABLE=$<BOOL:${INGINE_HIPBLASLT_AVAILABLE}>
   )
   if(INGINE_HIP_WAVE64)
     target_compile_definitions(${target} PUBLIC INGINE_HIP_WAVE64=1)

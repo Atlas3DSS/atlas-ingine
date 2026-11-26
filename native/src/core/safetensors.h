@@ -80,6 +80,7 @@ public:
     [[nodiscard]] SafetensorsFileStat open_stat() const noexcept { return open_stat_; }
     [[nodiscard]] bool is_weight_pack() const noexcept { return static_cast<bool>(pack_); }
     [[nodiscard]] const WeightPack* weight_pack() const noexcept { return pack_.get(); }
+    [[nodiscard]] std::shared_ptr<const WeightPack> shared_weight_pack() const noexcept { return pack_; }
     [[nodiscard]] const std::byte* mapped_data() const noexcept;
     [[nodiscard]] const std::byte* tensor_mapped_ptr(const SafetensorsTensor& tensor) const noexcept;
     [[nodiscard]] std::uint64_t file_size() const noexcept { return file_size_; }
@@ -112,7 +113,7 @@ private:
 
     std::filesystem::path path_;
     int fd_                    = -1;
-    std::unique_ptr<WeightPack> pack_;
+    std::shared_ptr<WeightPack> pack_;
     SafetensorsFileStat open_stat_{};
     std::uint64_t file_size_   = 0;
     std::uint64_t data_offset_ = 0;

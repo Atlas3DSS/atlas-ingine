@@ -12,7 +12,7 @@
 #include "core/arena.h"
 #include "kernels/prefill/prefill.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <array>
 #include <cstddef>

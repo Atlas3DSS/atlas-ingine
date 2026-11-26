@@ -19,6 +19,10 @@
 #include <string>
 #include <vector>
 
+namespace ingine {
+class UnifiedWeightPackPin;
+}  // namespace ingine
+
 namespace ingine::model {
 
 class ExpertCache;
@@ -317,6 +321,9 @@ struct Weights {
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
   bool embed_q4() const { return embed.dtype == DType::U8; }
   std::shared_ptr<ExpertCache> expert_cache;  // non-null when tiered MoE offloading is enabled
+  // Keeps an open INGPACK1 WeightPack pinned and device-mapped when unified-APU zero-copy residency is active.
+  // Declared before `storage` so views stay valid throughout Weights lifetime and unpin runs cleanly on teardown.
+  std::shared_ptr<ingine::UnifiedWeightPackPin> unified_pack_pin;
   // Verified cryptographic digest over model metadata + 100% of weight tensor contents, populated only by
   // load_weights(model_dir, ...). Absent (std::nullopt) for caller-supplied/synthetic Weights with no identity.
   std::optional<std::array<std::uint8_t, 32>> content_sha256;

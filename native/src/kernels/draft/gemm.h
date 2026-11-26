@@ -1,15 +1,11 @@
-// BF16 GEMM through cuBLASLt for the drafter's BF16 matmuls (x @ W.T in dspark.py: o_proj, down_proj and the
-// context k/v projections): c bf16 [n, N] = bf16(a [n, K] . w [N, K]^T), FP32 accumulation, as torch's BF16
-// matmul. Plans (descriptors + heuristic algorithm) are cached per shape; run() is CUDA-graph capturable.
+// BF16/FP16 GEMM for the drafter's linear matmuls (o_proj, down_proj, and context k/v projections):
+// c [n, N] = act(a [n, K] . w [N, K]^T), FP32 accumulation. Plans are cached per shape; run() is graph-capturable.
 #pragma once
 
-#include <cublasLt.h>
 #include "core/act.h"
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstddef>
-#include <map>
-#include <tuple>
 
 namespace ingine::kernels::draft {
 
@@ -20,21 +16,11 @@ class Bf16Gemm {
   Bf16Gemm(const Bf16Gemm&) = delete;
   Bf16Gemm& operator=(const Bf16Gemm&) = delete;
 
-  void run(const ActT* a, int n, const ActT* w, int N, int K, ActT* c,
-           cudaStream_t stream);
+  void run(const ActT* a, int n, const ActT* w, int N, int K, ActT* c, cudaStream_t stream);
 
  private:
-  struct Plan {
-    cublasLtMatmulDesc_t op = nullptr;
-    cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
-    cublasLtMatmulAlgo_t algo{};
-  };
-  Plan& plan(int n, int N, int K);
-
-  cublasLtHandle_t handle_ = nullptr;
-  void* workspace_ = nullptr;
-  std::size_t workspace_bytes_ = 0;
-  std::map<std::tuple<int, int, int>, Plan> plans_;
+  struct Impl;
+  Impl* impl_;
 };
 
 }  // namespace ingine::kernels::draft

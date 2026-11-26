@@ -1,7 +1,7 @@
 // Counter-based RNG of the draft kernels (host and device): Philox4x32-10 (Salmon et al. 2011).
 #pragma once
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <algorithm>
 #include <bit>

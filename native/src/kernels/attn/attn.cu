@@ -82,11 +82,9 @@
 
 #include "kernels/common/l2.cuh"
 
-#include "core/device.h"
-
 #include "core/act.h"
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include "core/device.h"
+#include "core/gpu_compat.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -191,17 +189,19 @@ static_assert(Smem<8, false, false, true>::BYTES <= 49152, "LOW_SMEM M=8 BF16 mu
 static_assert(Smem<8, true, false, true>::BYTES <= 49152, "LOW_SMEM M=8 FP8 must fit 48 KiB SMEM");
 static_assert(Smem<8, false, true, true>::BYTES <= 49152, "LOW_SMEM M=8 Q4 must fit 48 KiB SMEM");
 
-__device__ __forceinline__ uint32_t smem_u32(const void* p) { return unsigned(__cvta_generic_to_shared(p)); }
+__device__ __forceinline__ ingine::gpu::SmemAddr smem_u32(const void* p) {
+  return ingine::gpu::make_smem_addr(p);
+}
 
-__device__ __forceinline__ void ldsm_x4(uint32_t addr, uint32_t (&r)[4]) {
+__device__ __forceinline__ void ldsm_x4(ingine::gpu::SmemAddr addr, uint32_t (&r)[4]) {
   mma::ldmatrix_x4(r[0], r[1], r[2], r[3], addr);
 }
 
-__device__ __forceinline__ void ldsm_x4_t(uint32_t addr, uint32_t (&r)[4]) {
+__device__ __forceinline__ void ldsm_x4_t(ingine::gpu::SmemAddr addr, uint32_t (&r)[4]) {
   mma::ldmatrix_x4_trans(r[0], r[1], r[2], r[3], addr);
 }
 
-__device__ __forceinline__ void ldsm_x2(uint32_t addr, uint32_t (&r)[2]) {
+__device__ __forceinline__ void ldsm_x2(ingine::gpu::SmemAddr addr, uint32_t (&r)[2]) {
   mma::ldmatrix_x2(r[0], r[1], addr);
 }
 
@@ -261,9 +261,9 @@ __device__ __forceinline__ void unpack8(const uint4 u, float f[8]) {
     act::unpack8(u, f);
 }
 
-// E4M3 pair (low byte = lower dim) to floats, exact (hw cvt.f16x2.e4m3x2 on SM89+, branchless ALU on SM86)
+// E4M3 pair (low byte = lower dim) to floats, exact (hw cvt.f16x2.e4m3x2 on SM89+, branchless ALU on SM86 / HIP)
 __device__ __forceinline__ float2 e4m3x2_f2(uint32_t pair) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 890
     return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3)));
 #else
     auto dec = [](uint32_t b) -> float {
@@ -308,12 +308,12 @@ __device__ __forceinline__ void unpack8(const Q4Chunk u, float f[8]) {
 
 // x rounded to E4M3: nearest even, saturated to +-448 (torch: x.clamp(-448, 448).to(float8_e4m3fn))
 __device__ __forceinline__ float e4m3r(float x) {
-    return __half2float(__half(__nv_cvt_fp8_to_halfraw(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3), __NV_E4M3)));
+    return ingine::gpu::e4m3fn_to_float(ingine::gpu::float_to_e4m3fn_sat(x));
 }
 
 // two floats holding E4M3 values to their bytes (a in the low byte)
 __device__ __forceinline__ uint32_t pack_e4m3x2(float a, float b) {
-    return __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+    return ingine::gpu::float2_to_e4m3fnx2_sat(a, b);
 }
 
 // Loads of anything an earlier kernel writes (caches, kpos, pos) are coherent `asm volatile` with a memory
@@ -323,6 +323,7 @@ __device__ __forceinline__ uint32_t pack_e4m3x2(float a, float b) {
 constexpr l2::Evict KV_L2 = l2::Evict::first;
 
 __device__ __forceinline__ uint4 ld_kv(const void* ptr, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint4 v;
     if constexpr (l2::hinted<KV_L2>)
         asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
@@ -335,9 +336,14 @@ __device__ __forceinline__ uint4 ld_kv(const void* ptr, std::uint64_t pol) {
                      : "l"(ptr)
                      : "memory");
     return v;
+#else
+    static_cast<void>(pol);
+    return *static_cast<const uint4*>(ptr);
+#endif
 }
 
 __device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint2 v;
     if constexpr (l2::hinted<KV_L2>)
         asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.v2.u32 {%0,%1}, [%2], %3;"
@@ -347,9 +353,14 @@ __device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
     else
         asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
     return v;
+#else
+    static_cast<void>(pol);
+    return *static_cast<const uint2*>(ptr);
+#endif
 }
 
 __device__ __forceinline__ uint32_t ld_kv4(const void* ptr, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint32_t v;
     if constexpr (l2::hinted<KV_L2>)
         asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.u32 %0, [%1], %2;"
@@ -359,9 +370,14 @@ __device__ __forceinline__ uint32_t ld_kv4(const void* ptr, std::uint64_t pol) {
     else
         asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".u32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
     return v;
+#else
+    static_cast<void>(pol);
+    return *static_cast<const uint32_t*>(ptr);
+#endif
 }
 
 __device__ __forceinline__ uint16_t ld_kv2(const void* ptr, std::uint64_t pol) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     uint16_t v;
     if constexpr (l2::hinted<KV_L2>)
         asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".L2::cache_hint.u16 %0, [%1], %2;"
@@ -371,38 +387,44 @@ __device__ __forceinline__ uint16_t ld_kv2(const void* ptr, std::uint64_t pol) {
     else
         asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".u16 %0, [%1];" : "=h"(v) : "l"(ptr) : "memory");
     return v;
+#else
+    static_cast<void>(pol);
+    return *static_cast<const uint16_t*>(ptr);
+#endif
 }
 
 __device__ __forceinline__ long long ld_s64(const long long* ptr) {
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     long long v;
     asm volatile("ld.global.s64 %0, [%1];" : "=l"(v) : "l"(ptr) : "memory");
     return v;
+#else
+    return *ptr;
+#endif
 }
 
 __device__ __forceinline__ void cp16(float* dst, const float* src) {
-#if __CUDA_ARCH__ < 800
-    copy::sync<16>(dst, src);
-#else
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(unsigned(__cvta_generic_to_shared(dst))),
                  "l"(src)
                  : "memory");
+#else
+    copy::sync<16>(dst, src);
 #endif
 }
 
 __device__ __forceinline__ void cp4(float* dst, const float* src) {
-#if __CUDA_ARCH__ < 800
-    copy::sync<4>(dst, src);
-#else
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(unsigned(__cvta_generic_to_shared(dst))), "l"(src)
                  : "memory");
+#else
+    copy::sync<4>(dst, src);
 #endif
 }
 
 // zero-filling variants: nothing is read when !ok (cp16z: cached K/V rows, KV_L2 lines)
 __device__ __forceinline__ void cp16z(float* dst, const float* src, bool ok, std::uint64_t pol) {
-#if __CUDA_ARCH__ < 800
-    copy::sync<16>(dst, src, ok ? 16 : 0);
-#else
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
     if constexpr (l2::hinted<KV_L2>)
         asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;" ::"r"(
                          unsigned(__cvta_generic_to_shared(dst))),
@@ -412,26 +434,29 @@ __device__ __forceinline__ void cp16z(float* dst, const float* src, bool ok, std
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(unsigned(__cvta_generic_to_shared(dst))),
                      "l"(src), "r"(ok ? 16 : 0)
                      : "memory");
+#else
+    static_cast<void>(pol);
+    copy::sync<16>(dst, src, ok ? 16 : 0);
 #endif
 }
 
 __device__ __forceinline__ void cp4z(float* dst, const float* src, bool ok) {
-#if __CUDA_ARCH__ < 800
-    copy::sync<4>(dst, src, ok ? 4 : 0);
-#else
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(unsigned(__cvta_generic_to_shared(dst))), "l"(src),
                  "r"(ok ? 4 : 0)
                  : "memory");
+#else
+    copy::sync<4>(dst, src, ok ? 4 : 0);
 #endif
 }
 
 __device__ __forceinline__ void cp8z(void* dst, const void* src, bool ok) {
-#if __CUDA_ARCH__ < 800
-    *static_cast<uint2*>(dst) = ok ? *static_cast<const uint2*>(src) : make_uint2(0u, 0u);
-#else
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(unsigned(__cvta_generic_to_shared(dst))), "l"(src),
                  "r"(ok ? 8 : 0)
                  : "memory");
+#else
+    *static_cast<uint2*>(dst) = ok ? *static_cast<const uint2*>(src) : make_uint2(0u, 0u);
 #endif
 }
 
@@ -460,7 +485,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, LOW_SMEM ? 1 : 2) attn_decode_k
     static_assert(!(F8 && Q4), "F8 and Q4 are mutually exclusive");
     static_assert(!LOW_SMEM || M > 1, "LOW_SMEM is only for M > 1");
     constexpr bool RAW_TILE = F8 || Q4;
-    using CT = std::conditional_t<Q4, uint8_t, std::conditional_t<F8, __nv_fp8_storage_t, ActT>>;
+    using CT = std::conditional_t<Q4, uint8_t, std::conditional_t<F8, uint8_t, ActT>>;
     using KV = std::conditional_t<Q4, Q4Chunk, std::conditional_t<F8, uint2, uint4>>;
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
     using L = Smem<M, F8, Q4, LOW_SMEM>;
@@ -652,7 +677,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, LOW_SMEM ? 1 : 2) attn_decode_k
         if (c0 < old_end) load_rp(A, c0);
         if (c0 + STEP < old_end) load_rp(B, c0 + STEP);
     }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
     // a loop ptxas cannot see through: it would sink the loads above below a plain wait
 #pragma unroll 1
     for (int i = 0; i <= p.zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -698,7 +723,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, LOW_SMEM ? 1 : 2) attn_decode_k
             if (rank * KT < L_old) issue(0, rank * KT);  // in flight during q / rel and the owner's work
         }
     }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
     // dependents (proj_conv) may launch now: their weight stream queues behind this block's K/V requests
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
@@ -1477,7 +1502,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, LOW_SMEM ? 1 : 2) attn_decode_k
         return;
     }
     // every partial of the head is written, and every block of the head is done reading the ring
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 900
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
 #endif
     if (!FULL && M > 1 && owner && tid == NT - 1) {  // kpos is read by every head: the last head writes it
@@ -1559,7 +1584,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, LOW_SMEM ? 1 : 2) attn_decode_k
 
 template <int M, bool FULL, bool F8, bool Q4 = false>
 __global__ void __launch_bounds__(NT) attn_decode_stage2_kernel(const Params p) {
-    using CT = std::conditional_t<Q4, uint8_t, std::conditional_t<F8, __nv_fp8_storage_t, ActT>>;
+    using CT = std::conditional_t<Q4, uint8_t, std::conditional_t<F8, uint8_t, ActT>>;
     constexpr int ROWS = GQA * M;
     const int g = blockIdx.y, rank = blockIdx.x, tid = threadIdx.x;
     const bool owner = rank == 0;
@@ -1660,6 +1685,7 @@ Kernel kernel_of() {
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     const uint32_t bit = 1u << (dev & 31);
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
     if (current_sm_major() >= 9) {
         const KernelFn f = attn_decode_kernel<M, FULL, F8, false, Q4>;
         if (!(attr_done.load(std::memory_order_acquire) & bit)) {
@@ -1668,7 +1694,9 @@ Kernel kernel_of() {
             attr_done.fetch_or(bit, std::memory_order_release);
         }
         return Kernel{f, nullptr, M, Smem<M, F8, Q4>::BYTES};
-    } else {
+    }
+#endif
+    {
         const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true, Q4>;
         const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8, Q4>;
         if constexpr (Smem<M, F8, Q4>::BYTES > 49152) {
@@ -1732,6 +1760,7 @@ Kernel select(int M) {
     }
 }
 
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
 // attrs[0]: cluster of CS blocks; attrs[1]: programmatic dependent launch (SM90+ only)
 cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunchAttribute* attrs) {
     cudaLaunchConfig_t cfg{};
@@ -1749,6 +1778,7 @@ cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunc
     }
     return cfg;
 }
+#endif
 
 }  // namespace
 
@@ -1759,6 +1789,7 @@ std::size_t workspace_bytes(int max_m) {
 
 int max_active_clusters(int M, int window) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
     if (current_sm_major() < 9) return HKV;
     // the FP8 variants have the same launch shape, shared memory and register cap (launch bounds)
     const Kernel k = window == 0 ? select<true>(M) : select<false>(M);
@@ -1768,6 +1799,10 @@ int max_active_clusters(int M, int window) {
     int n = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveClusters(&n, k.fn, &cfg));
     return n;
+#else
+    static_cast<void>(window);
+    return HKV;
+#endif
 }
 
 void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
@@ -1827,6 +1862,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
                                             : (a.cache_fp8 ? select_low_smem<true, true, false>(M)
                                                            : select_low_smem<true, false, false>(M)))
                               : select_low_smem<false, false, false>(M);
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
         cudaLaunchConfig_t cfg1{};
         cfg1.gridDim = dim3(CS, HKV);
         cfg1.blockDim = dim3(NT);
@@ -1838,11 +1874,18 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
         cfg2.blockDim = dim3(NT);
         cfg2.stream = stream;
         CUDA_CHECK(cudaLaunchKernelEx(&cfg2, k.fn_stage2, p));
+#else
+        k.fn<<<dim3(CS, HKV), dim3(NT), k.smem, stream>>>(p);
+        CUDA_CHECK(cudaGetLastError());
+        k.fn_stage2<<<dim3(CS, HKV), dim3(NT), 0, stream>>>(p);
+        CUDA_CHECK(cudaGetLastError());
+#endif
         return;
     }
     const Kernel k = full ? (a.cache_q4 ? select<true, false, true>(M)
                                         : (a.cache_fp8 ? select<true, true, false>(M) : select<true, false, false>(M)))
                           : select<false, false, false>(M);
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
@@ -1853,6 +1896,14 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
         cfg2.stream = stream;
         CUDA_CHECK(cudaLaunchKernelEx(&cfg2, k.fn_stage2, p));
     }
+#else
+    k.fn<<<dim3(CS, HKV), dim3(NT), k.smem, stream>>>(p);
+    CUDA_CHECK(cudaGetLastError());
+    if (k.fn_stage2) {
+        k.fn_stage2<<<dim3(CS, HKV), dim3(NT), 0, stream>>>(p);
+        CUDA_CHECK(cudaGetLastError());
+    }
+#endif
 }
 
 }  // namespace ingine::kernels::attn

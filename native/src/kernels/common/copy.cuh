@@ -2,7 +2,7 @@
 // synchronize participating threads before reading a tile produced by peers.
 #pragma once
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 namespace ingine::kernels::copy {
 
@@ -24,20 +24,20 @@ __device__ __forceinline__ void sync(void* dst, const void* src, int valid = Byt
 }
 
 __device__ __forceinline__ void commit() {
-#if __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
   asm volatile("cp.async.commit_group;" ::: "memory");
 #endif
 }
 
 template <int Groups>
 __device__ __forceinline__ void wait() {
-#if __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
   asm volatile("cp.async.wait_group %0;" :: "n"(Groups) : "memory");
 #endif
 }
 
 __device__ __forceinline__ void wait_all() {
-#if __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 800
   asm volatile("cp.async.wait_all;" ::: "memory");
 #endif
 }

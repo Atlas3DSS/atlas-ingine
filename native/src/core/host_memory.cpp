@@ -2,6 +2,7 @@
 #include "core/host_memory.h"
 
 #include "core/hugepage.h"
+#include "core/weight_pack.h"
 
 #include <cuda_runtime.h>
 #include <spdlog/spdlog.h>
@@ -208,6 +209,93 @@ void MappedHostBuffer::release() noexcept {
     mapped_bytes_      = 0;
     via_hugepage_mmap_ = false;
     hugepage_advised_  = false;
+}
+
+UnifiedWeightPackPin::UnifiedWeightPackPin(std::shared_ptr<const WeightPack> pack)
+    : owner_(std::move(pack)),
+      host_base_(owner_ ? static_cast<const void*>(owner_->mapped_base()) : nullptr),
+      size_(owner_ ? static_cast<std::size_t>(owner_->file_size()) : 0) {}
+
+UnifiedWeightPackPin::~UnifiedWeightPackPin() { release(); }
+
+UnifiedWeightPackPin::UnifiedWeightPackPin(UnifiedWeightPackPin&& other) noexcept
+    : owner_(std::move(other.owner_)),
+      host_base_(std::exchange(other.host_base_, nullptr)),
+      device_base_(std::exchange(other.device_base_, nullptr)),
+      size_(std::exchange(other.size_, 0)),
+      registered_(std::exchange(other.registered_, false)),
+      readonly_(std::exchange(other.readonly_, false)),
+      register_seconds_(other.register_seconds_) {}
+
+UnifiedWeightPackPin& UnifiedWeightPackPin::operator=(UnifiedWeightPackPin&& other) noexcept {
+    if (this != &other) {
+        release();
+        owner_            = std::move(other.owner_);
+        host_base_        = std::exchange(other.host_base_, nullptr);
+        device_base_      = std::exchange(other.device_base_, nullptr);
+        size_             = std::exchange(other.size_, 0);
+        registered_       = std::exchange(other.registered_, false);
+        readonly_         = std::exchange(other.readonly_, false);
+        register_seconds_ = other.register_seconds_;
+    }
+    return *this;
+}
+
+bool UnifiedWeightPackPin::pin() {
+    if (registered_ || !host_base_ || size_ == 0) { return registered_; }
+    const auto start = std::chrono::steady_clock::now();
+    void* raw        = const_cast<void*>(host_base_);
+    bool ro          = true;
+    cudaError_t err  = cudaHostRegister(raw, size_, cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        ro  = false;
+        err = cudaHostRegister(raw, size_, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    }
+    register_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        spdlog::warn("UnifiedWeightPackPin(CUDA): cudaHostRegister({:.2f} GiB) failed ({}: {}); falling back to DeviceUploader",
+                     double(size_) / double(1ull << 30), cudaGetErrorName(err), cudaGetErrorString(err));
+        return false;
+    }
+    void* dev = nullptr;
+    err       = cudaHostGetDevicePointer(&dev, raw, 0);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaHostUnregister(raw);
+        spdlog::warn("UnifiedWeightPackPin(CUDA): cudaHostGetDevicePointer failed ({}); falling back to DeviceUploader",
+                     cudaGetErrorString(err));
+        return false;
+    }
+    device_base_ = dev;
+    registered_  = true;
+    readonly_    = ro;
+    return true;
+}
+
+void UnifiedWeightPackPin::unpin() noexcept {
+    if (registered_ && host_base_) {
+        const cudaError_t err = cudaHostUnregister(const_cast<void*>(host_base_));
+        if (err != cudaSuccess) {
+            spdlog::error("UnifiedWeightPackPin(CUDA): cudaHostUnregister failed: {}", cudaGetErrorString(err));
+        }
+        registered_  = false;
+        readonly_    = false;
+        device_base_ = nullptr;
+    }
+}
+
+void UnifiedWeightPackPin::release() noexcept {
+    unpin();
+    host_base_ = nullptr;
+    size_      = 0;
+    owner_.reset();
+}
+
+void* UnifiedWeightPackPin::tensor_device_ptr(std::uint64_t offset, std::uint64_t bytes) const noexcept {
+    if (!registered_ || !device_base_ || offset > size_ || bytes > size_ - offset) { return nullptr; }
+    return static_cast<std::uint8_t*>(device_base_) + offset;
 }
 
 std::uint64_t mem_available_bytes() {

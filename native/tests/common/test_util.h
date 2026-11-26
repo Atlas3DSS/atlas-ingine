@@ -6,10 +6,8 @@
 #include "common/scalar_oracle.h"
 #include "core/act.h"
 
-#if INGINE_BACKEND_CUDA
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#if INGINE_BACKEND_CUDA || INGINE_BACKEND_HIP
+#include "core/gpu_compat.h"
 #endif
 
 namespace ingine::test {
@@ -21,7 +19,7 @@ inline ingine::ActT float_to_bf16(float f) { return ingine::act::host_from_float
 
 inline float round_bf16(float f) { return ingine::act::host_round(f); }
 
-#if INGINE_BACKEND_CUDA
+#if INGINE_BACKEND_CUDA || INGINE_BACKEND_HIP
 
 #define INGINE_TEST_CUDA(expr)                                                            \
   do {                                                                                    \
@@ -74,6 +72,6 @@ struct DeviceArray {
   T* get() const { return ptr; }
 };
 
-#endif  // INGINE_BACKEND_CUDA
+#endif  // INGINE_BACKEND_CUDA || INGINE_BACKEND_HIP
 
 }  // namespace ingine::test

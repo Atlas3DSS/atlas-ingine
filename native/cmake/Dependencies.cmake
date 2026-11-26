@@ -8,6 +8,8 @@ if(INGINE_BACKEND STREQUAL "CUDA")
       message(FATAL_ERROR "CUDAToolkit does not provide ${_cuda_target}")
     endif()
   endforeach()
+  set(INGINE_GPU_RUNTIME_TARGET CUDA::cudart)
+  set(INGINE_GPU_BLAS_TARGETS CUDA::cublasLt)
 endif()
 
 # Internal headers: public API in include/, implementation in src/, vendored headers in third_party/.
@@ -18,9 +20,9 @@ function(ingine_internal_includes target)
     ${PROJECT_SOURCE_DIR}/third_party)
 endfunction()
 
-# CUDA compile settings shared by every target with .cu sources: whole-program compilation (no
-# separable compilation or device linking), line info for profilers, constexpr host functions in
-# device code.
+# Shared GPU compile settings for every target with .cu / .hip kernel sources:
+# - CUDA: whole-program compilation, line info for profilers, relaxed constexpr.
+# - HIP: marks every .cu/.hip source in `target` as LANGUAGE HIP and applies ingine_hip_target().
 function(ingine_cuda_target target)
   if(INGINE_BACKEND STREQUAL "CUDA")
     set_target_properties(${target} PROPERTIES
@@ -28,6 +30,16 @@ function(ingine_cuda_target target)
       CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
     target_compile_options(${target} PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo --expt-relaxed-constexpr>)
+  elseif(INGINE_BACKEND STREQUAL "HIP")
+    get_target_property(_ingine_target_srcs ${target} SOURCES)
+    if(_ingine_target_srcs)
+      foreach(_src IN LISTS _ingine_target_srcs)
+        if(_src MATCHES "\\.(cu|hip)$")
+          set_source_files_properties(${_src} PROPERTIES LANGUAGE HIP)
+        endif()
+      endforeach()
+    endif()
+    ingine_hip_target(${target})
   endif()
 endfunction()
 

@@ -8,7 +8,7 @@
 #include "core/act.h"
 #include "kernels/common/persona_abi.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstdint>
 

@@ -30,7 +30,7 @@ target_link_libraries(ingine_model PUBLIC
   ingine_kernels_attn
   ingine_kernels_head
   nlohmann_json::nlohmann_json
-  CUDA::cudart)
+  ${INGINE_GPU_RUNTIME_TARGET})
 if(INGINE_TP_SIZE GREATER 1)
   find_library(NCCL_LIB nccl REQUIRED)
   target_link_libraries(ingine_model PUBLIC ingine_engine ${NCCL_LIB})

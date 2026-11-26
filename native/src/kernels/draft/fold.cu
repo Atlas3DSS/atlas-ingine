@@ -4,9 +4,7 @@
 #include "kernels/draft/draft_device.cuh"
 
 #include "core/device.h"
-
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include "core/gpu_compat.h"
 
 namespace ingine::kernels::draft {
 namespace {
@@ -19,9 +17,8 @@ static_assert(H % FOLD_K == 0);
 // weights.dequant: BF16 rows as is, FP8 rows -> bf16(float(q) * scale)
 __device__ __forceinline__ double u_at(const void* u, const float* scale, int row, int k) {
   if (scale == nullptr) return double(bf(static_cast<const ActT*>(u)[size_t(row) * H + k]));
-  const __nv_fp8_storage_t q = static_cast<const __nv_fp8_storage_t*>(u)[size_t(row) * H + k];
-  const __half_raw hr = __nv_cvt_fp8_to_halfraw(q, __NV_E4M3);
-  const float f = __half2float(__half(hr));
+  const uint8_t q = static_cast<const uint8_t*>(u)[size_t(row) * H + k];
+  const float f = ingine::gpu::e4m3fn_to_float(q);
   return double(bf_round(__fmul_rn(f, scale[row])));
 }
 

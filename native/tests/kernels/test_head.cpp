@@ -6,7 +6,7 @@
 
 #include "kernels/head/head.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <algorithm>
 #include <numeric>

@@ -200,6 +200,7 @@ __global__ void verify_rollback_kernel(StatePtrs st, VerifyBackup bk, Hist hist,
   }
 }
 
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
 __device__ __forceinline__ unsigned width_index(const Widths& widths, int m) {
   unsigned idx = 0;
   while (int(idx) < widths.n && widths.w[idx] != m) ++idx;
@@ -221,6 +222,7 @@ __global__ void verify_select_kernel(const float* __restrict__ conf, const int* 
     cudaGraphSetConditional(handle, width_index(widths, m));
   }
 }
+#endif
 
 __global__ void verify_select_eager_kernel(const float* __restrict__ conf, const int* __restrict__ drafts,
                                            float threshold, Widths widths, long long* __restrict__ token,
@@ -238,9 +240,11 @@ __global__ void verify_select_eager_kernel(const float* __restrict__ conf, const
   }
 }
 
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
 __global__ void width_select_kernel(const int* __restrict__ m, Widths widths, cudaGraphConditionalHandle handle) {
   cudaGraphSetConditional(handle, width_index(widths, *m));
 }
+#endif
 
 __global__ void verify_publish_kernel(const int* __restrict__ m, const int* __restrict__ accepted,
                                       const int* __restrict__ next, const long long* __restrict__ token,
@@ -364,9 +368,20 @@ void verify_rollback(const StatePtrs& st, const VerifyBackup& bk, const float* c
 cudaError_t verify_select(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
                           std::int64_t* token, std::int32_t* m_out, cudaGraphConditionalHandle handle, cudaStream_t stream) {
   if (widths.n < 1 || widths.n > 3) throw std::invalid_argument("verify_select: 1 to 3 widths");
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
   verify_select_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, reinterpret_cast<long long*>(token),
                                              m_out, handle);
   return cudaGetLastError();
+#else
+  (void)conf;
+  (void)drafts;
+  (void)threshold;
+  (void)token;
+  (void)m_out;
+  (void)handle;
+  (void)stream;
+  return cudaErrorNotSupported;
+#endif
 }
 
 void verify_select_eager(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
@@ -380,8 +395,15 @@ void verify_select_eager(const float* conf, const std::int32_t* drafts, float th
 cudaError_t width_select(const std::int32_t* m, const Widths& widths, cudaGraphConditionalHandle handle,
                          cudaStream_t stream) {
   if (widths.n < 1 || widths.n > 3) throw std::invalid_argument("width_select: 1 to 3 widths");
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
   width_select_kernel<<<1, 1, 0, stream>>>(m, widths, handle);
   return cudaGetLastError();
+#else
+  (void)m;
+  (void)handle;
+  (void)stream;
+  return cudaErrorNotSupported;
+#endif
 }
 
 void verify_publish(const std::int32_t* m, const std::int32_t* accepted, const std::int32_t* next,

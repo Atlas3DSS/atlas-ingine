@@ -3,9 +3,9 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/device.h"
+#include "core/gpu_compat.h"
 #include "core/host_memory.h"
-
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>

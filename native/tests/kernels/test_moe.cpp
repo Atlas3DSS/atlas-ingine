@@ -7,8 +7,7 @@
 
 #include "kernels/moe/moe.h"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <numeric>
 

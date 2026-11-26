@@ -210,15 +210,15 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
   mma::mma_act(c, a0, a1, a2, a3, b0, b1);
 }
 
-// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one instruction on SM120a, hw FP16 convert on SM89, portable helper on SM86.
+// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one instruction on SM120a, hw FP16 convert on SM89, portable helper on SM86 / HIP.
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
 #if INGINE_ACT_FP16
   return act::e4m3x2_to_half2_bits(u);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#elif defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 1200
   uint32_t r;
   asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
   return r;
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#elif defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 890
   uint32_t h2;
   asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(static_cast<unsigned short>(u)));
   const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
@@ -539,7 +539,7 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
 #define HEAD_SPLITK 6
 #endif
 
-__global__ void fp8_rows_kernel(const ActT* __restrict__ w, int rows, int K, __nv_fp8_storage_t* q,
+__global__ void fp8_rows_kernel(const ActT* __restrict__ w, int rows, int K, uint8_t* q,
                                 float* scale) {
   const int lane = threadIdx.x & 31;
   const int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -553,11 +553,11 @@ __global__ void fp8_rows_kernel(const ActT* __restrict__ w, int rows, int K, __n
   if (lane == 0) scale[row] = s;
   for (int k = lane; k < K; k += 32)
     q[size_t(row) * K + k] =
-        s > 0.f ? __nv_cvt_float_to_fp8(act::to_float(wr[k]) / s, __NV_SATFINITE, __NV_E4M3) : 0;
+        s > 0.f ? ingine::gpu::float_to_e4m3fn_sat(act::to_float(wr[k]) / s) : uint8_t(0);
 }
 
 // weights.dequant: bf16(float(q) * scale[row]); one thread per 16 elements (K % 16 == 0).
-__global__ void dequant_rows_kernel(const __nv_fp8_storage_t* __restrict__ q, const float* __restrict__ scale,
+__global__ void dequant_rows_kernel(const uint8_t* __restrict__ q, const float* __restrict__ scale,
                                     int K, long long total16, ActT* __restrict__ out) {
   const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
   if (i >= total16) return;
@@ -627,7 +627,7 @@ void gemv(const ActT* x, int M, int K, Matrix w, float* out, bool pdl, cudaStrea
 void fp8_rows(const ActT* w, int rows, int K, void* q, float* scale, cudaStream_t stream) {
   require(rows >= 0 && K > 0, "fp8_rows: bad shape");
   if (rows > 0)
-    fp8_rows_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(w, rows, K, static_cast<__nv_fp8_storage_t*>(q), scale);
+    fp8_rows_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(w, rows, K, static_cast<uint8_t*>(q), scale);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -667,7 +667,7 @@ void dequant_rows(const void* q, const float* scale, int rows, int K, ActT* out,
   const long long total16 = (long long)rows * K / 16;
   if (total16 > 0)
     dequant_rows_kernel<<<unsigned((total16 + 255) / 256), 256, 0, stream>>>(
-        static_cast<const __nv_fp8_storage_t*>(q), scale, K, total16, out);
+        static_cast<const uint8_t*>(q), scale, K, total16, out);
   CUDA_CHECK(cudaGetLastError());
 }
 

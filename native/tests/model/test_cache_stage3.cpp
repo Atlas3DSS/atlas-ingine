@@ -25,7 +25,7 @@
 #include "model/runtime.h"
 #include "text/chat.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 #include <nlohmann/json.hpp>
 #include <unistd.h>
 

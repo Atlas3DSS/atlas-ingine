@@ -6,7 +6,7 @@
 #include "kernels/common/persona_abi.h"
 #include "model/model_data.h"
 
-#include <cuda_runtime.h>
+#include "core/gpu_compat.h"
 
 #include <cstdint>
 #include <map>

@@ -10,21 +10,28 @@
 
 #include "core/act.h"
 #include "core/device.h"
+#include "core/hal.h"
+#include "core/host_memory.h"
 #include "core/safetensors.h"
+#include "core/vendor_policy.h"
+#include "core/weight_pack.h"
 #include "kernels/dense/dense.h"
 #include "model/kv_checkpoint.h"
 #include "model/model_kernels.h"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ingine::model {
 namespace {
@@ -72,8 +79,9 @@ std::vector<float> host_f32(const SafetensorsModel& m, const std::string& name) 
 
 class Loader {
  public:
-  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage)
-      : m_(m), up_(up), stream_(stream), storage_(storage) {}
+  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage,
+         const UnifiedWeightPackPin* unified_pin = nullptr)
+      : m_(m), up_(up), stream_(stream), storage_(storage), unified_pin_(unified_pin) {}
 
   void* alloc(std::size_t bytes) {
     storage_.emplace_back(bytes);
@@ -143,9 +151,28 @@ class Loader {
     });
   }
 
-  // Raw checkpoint tensor (any dtype) in new device memory, uploaded at flush().
-  Tensor raw(const std::string& name) {
+  // Attempts to alias the prefix `[0, bytes)` of a read-only tensor directly inside a pinned unified-memory
+  // INGPACK1 WeightPack without allocating DeviceBuffer or copying through DeviceUploader, while hashing the exact
+  // consumed bytes in 32 MiB chunks so `content_sha256` stays bit-identical to the upload path.
+  void* try_zero_copy_prefix(const std::string& name, std::uint64_t bytes) {
+    if (!unified_pin_ || !unified_pin_->registered()) return nullptr;
     const SafetensorsRef ref = m_.at(name);
+    if (ref.file->weight_pack() != unified_pin_->pack() || bytes > ref->bytes) return nullptr;
+    void* dev = unified_pin_->tensor_device_ptr(ref->offset, bytes);
+    const std::byte* host_ptr = ref.file->tensor_mapped_ptr(*ref.tensor);
+    if (!dev || !host_ptr) return nullptr;
+    hash_mapped_tensor(name, *ref.tensor, host_ptr, bytes);
+    zero_copy_bytes_ += bytes;
+    return dev;
+  }
+
+  // Raw checkpoint tensor (any dtype) in device memory, zero-copied from a pinned unified INGPACK1 when
+  // `read_only_ok` holds, otherwise allocated and uploaded at flush().
+  Tensor raw(const std::string& name, bool read_only_ok = true) {
+    const SafetensorsRef ref = m_.at(name);
+    if (read_only_ok) {
+      if (void* dev = try_zero_copy_prefix(name, ref->bytes)) return ref->view(dev);
+    }
     void* d = alloc(ref->bytes);
     queue(name, d);
     return ref->view(d);
@@ -185,8 +212,23 @@ class Loader {
   cudaStream_t stream() const { return stream_; }
   const std::map<std::string, std::array<std::uint8_t, 32>>& tensor_shas() const { return tensor_shas_; }
   bool content_changed() const { return content_changed_; }
+  std::uint64_t zero_copy_bytes() const noexcept { return zero_copy_bytes_; }
 
  private:
+  void hash_mapped_tensor(const std::string& key_name, const SafetensorsTensor& t,
+                          const std::byte* data, std::uint64_t bytes) {
+    std::vector<std::array<std::uint8_t, 32>> cshas;
+    if (bytes > 0) {
+      const std::size_t nc = std::size_t((bytes + kSafetensorsHashChunkBytes - 1) / kSafetensorsHashChunkBytes);
+      cshas.reserve(nc);
+      for (std::uint64_t off = 0; off < bytes; off += kSafetensorsHashChunkBytes) {
+        const std::size_t take = std::size_t(std::min<std::uint64_t>(bytes - off, kSafetensorsHashChunkBytes));
+        cshas.push_back(sha256_bytes(data + off, take));
+      }
+    }
+    record_tensor_sha(key_name, sha256_tensor_from_chunk_digests(t.name, t.dtype, t.shape, bytes, cshas));
+  }
+
   void record_tensor_sha(const std::string& name, const std::array<std::uint8_t, 32>& sha) {
     auto [it, inserted] = tensor_shas_.emplace(name, sha);
     if (!inserted && it->second != sha) content_changed_ = true;
@@ -201,6 +243,8 @@ class Loader {
   DeviceUploader& up_;
   cudaStream_t stream_;
   std::vector<DeviceBuffer>& storage_;
+  const UnifiedWeightPackPin* unified_pin_ = nullptr;
+  std::uint64_t zero_copy_bytes_ = 0;
   std::vector<UploadRequest> pending_;
   std::vector<PendingMeta> pending_meta_;
   std::map<std::string, std::array<std::uint8_t, 32>> tensor_shas_;
@@ -509,9 +553,28 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     w.w2_expert_formats[l] = efs[l].w2;
   }
   w.storage.reserve(4096);
-  Loader ld(m, up, stream, w.storage);
-  const int H = HIDDEN;
   const bool tiered = offload.vram_mb > 0;
+  const UnifiedWeightPackPin* unified_pin_ptr = nullptr;
+  if (!tiered && m.is_weight_pack() && m.files().size() == 1) {
+    int dev_id = 0;
+    CUDA_CHECK(cudaGetDevice(&dev_id));
+    const hal::DeviceCaps caps = hal::query_device_caps(dev_id);
+    const char* env_zc = std::getenv("INGINE_UNIFIED_PACK_ZEROCOPY");
+    const std::string_view zc_view = env_zc ? std::string_view(env_zc) : std::string_view{};
+    if (vendor::hip::should_use_zero_copy_weight_pack(caps.unified_memory, true, zc_view)) {
+      auto pin = std::make_shared<UnifiedWeightPackPin>(m.files()[0]->shared_weight_pack());
+      if (pin->pin()) {
+        w.unified_pack_pin = pin;
+        unified_pin_ptr = pin.get();
+        spdlog::info("weights: unified zero-copy INGPACK1 pinned ({:.2f} GiB, readonly={}, {:.3f} s)",
+                     double(pin->mapped_bytes()) / double(1ull << 30), pin->readonly(), pin->register_seconds());
+      } else {
+        spdlog::warn("weights: unified zero-copy INGPACK1 registration unavailable; falling back to DeviceUploader");
+      }
+    }
+  }
+  Loader ld(m, up, stream, w.storage, unified_pin_ptr);
+  const int H = HIDDEN;
   std::array<std::vector<float>, LAYERS> router_biases;
   for (int l = 0; l < LAYERS; ++l) {
     w.layers.push_back(load_layer_into(ld, l, efs[l], dense_fp8, !tiered, &router_biases[l]));
@@ -532,7 +595,8 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     }
     w.message_queries = ld.upload_f32(mq, {n, 4, H});
   }
-  w.embed = ld.raw("model.llm.embed.weight");
+  const bool embed_read_only_ok = !kActIsFP16 || m.at("model.llm.embed.weight")->dtype != "BF16";
+  w.embed = ld.raw("model.llm.embed.weight", embed_read_only_ok);
   const bool embed_bf16 = w.embed.dtype == DType::BF16;
   const bool embed_q4 = w.embed.dtype == DType::U8 && w.embed.ne[0] == EMBED_Q4_ROW_BYTES && w.embed.ne[1] == VOCAB;
   if (!embed_bf16 && !embed_q4)
@@ -550,10 +614,19 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
         throw std::runtime_error("weights: unembed F8_E4M3 shape mismatch");
       if (sref->dtype != "F32" || sref->numel() < UNPADDED_VOCAB)
         throw std::runtime_error("weights: unembed_scale must be F32 [>=UNPADDED_VOCAB]");
-      void* q = ld.alloc(std::size_t(UNPADDED_VOCAB) * H);
-      float* sc = static_cast<float*>(ld.alloc(std::size_t(UNPADDED_VOCAB) * 4));
-      ld.queue(name, q, UNPADDED_VOCAB);
-      ld.queue(name + "_scale", sc, UNPADDED_VOCAB);
+      const std::uint64_t q_bytes = std::uint64_t(UNPADDED_VOCAB) * H;
+      const std::uint64_t sc_bytes = std::uint64_t(UNPADDED_VOCAB) * 4;
+      void* q = ld.try_zero_copy_prefix(name, q_bytes);
+      if (!q) {
+        q = ld.alloc(q_bytes);
+        ld.queue(name, q, UNPADDED_VOCAB);
+      }
+      void* sc_void = ld.try_zero_copy_prefix(name + "_scale", sc_bytes);
+      float* sc = static_cast<float*>(sc_void);
+      if (!sc) {
+        sc = static_cast<float*>(ld.alloc(sc_bytes));
+        ld.queue(name + "_scale", sc, UNPADDED_VOCAB);
+      }
       ld.flush();
       if (embed_bf16) {
         bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream);
@@ -563,8 +636,12 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
       w.dense_fp8 = true;
     } else if (uref->dtype == "BF16") {
       const std::size_t bytes = std::size_t(UNPADDED_VOCAB) * H * 2;
-      void* d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.alloc(bytes);
-      ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]
+      void* d = nullptr;
+      if (!dense_fp8 && !kActIsFP16) d = ld.try_zero_copy_prefix(name, bytes);
+      if (!d) {
+        d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.alloc(bytes);
+        ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]
+      }
       ld.flush();
       if (embed_bf16) {
         bf16_to_act_inplace(w.embed.data, std::size_t(w.embed.numel()), stream);
@@ -581,6 +658,10 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     } else {
       throw std::runtime_error("weights: unembed must be BF16 or F8_E4M3");
     }
+  }
+  if (w.unified_pack_pin && ld.zero_copy_bytes() > 0) {
+    spdlog::info("weights: unified zero-copy INGPACK1 aliased {:.2f} GiB directly (zero H2D copy)",
+                 double(ld.zero_copy_bytes()) / double(1ull << 30));
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
   if (tiered) {
