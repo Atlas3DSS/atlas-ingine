@@ -305,6 +305,57 @@ class EngineGenerator final : public Generator {
     return generate(full_prompt, max_new_tokens, sampling, stop_ids, on_tokens, PrefillCallback{});
   }
 
+  GenerateStats warm_start(const Prompt& full_prompt, const Sampling& sampling) override {
+    if (!options_.prefix_cache) {
+      throw std::invalid_argument("warm_start requires prefix caching to be enabled");
+    }
+    if (full_prompt.ids.empty()) {
+      throw std::invalid_argument("warm_start: prompt is empty");
+    }
+    if (full_prompt.bypass_prefix_cache) {
+      throw std::invalid_argument("warm_start: prefix cache bypass requested");
+    }
+    if (!full_prompt.images.empty()) {
+      throw std::invalid_argument("warm_start: images are not supported in startup warm-start prompts");
+    }
+    if (sampling.persona && sampling.persona->bypasses_prefix_reuse()) {
+      throw std::invalid_argument("warm_start: default persona bypasses prefix cache reuse");
+    }
+    const int reserve = drafter_ ? *std::max_element(rt_.verify_widths().begin(), rt_.verify_widths().end()) : 0;
+    if (int(full_prompt.ids.size()) + reserve >= options_.max_ctx) {
+      throw std::invalid_argument("warm_start: prompt of " + std::to_string(full_prompt.ids.size()) +
+                                  " tokens leaves no generation room within max_ctx " +
+                                  std::to_string(options_.max_ctx));
+    }
+    const GenerateStats stats = generate(full_prompt, /*max_new_tokens=*/0, sampling, {},
+                                         [](std::span<const std::int32_t>) { return false; }, PrefillCallback{});
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const bool active_persona = (sampling.persona && !sampling.persona->is_unhooked());
+      StateIdentity expected_id = base_identity_;
+      if (active_persona) {
+        expected_id.persona_key = sampling.persona->cache_key;
+        expected_id.persona_fingerprint = sampling.persona->fingerprint_sha256;
+      }
+      expected_id.cache_namespace = full_prompt.cache_namespace;
+      const bool live_retained = !live_bypass_reuse_ && live_identity_ == expected_id && live_images_.empty() &&
+                                 tokens_in_state_.size() == full_prompt.ids.size() &&
+                                 std::equal(full_prompt.ids.begin(), full_prompt.ids.end(), tokens_in_state_.begin());
+      if (!live_retained) {
+        throw std::runtime_error(
+            "warm_start: requested prefix/identity could not be retained as reusable in B=1 prefix cache");
+      }
+      const bool ckpt_retained = checkpoint_identity_ == expected_id && checkpoint_images_.empty() &&
+                                 checkpoint_ids_.size() == full_prompt.ids.size() &&
+                                 std::equal(full_prompt.ids.begin(), full_prompt.ids.end(), checkpoint_ids_.begin());
+      if (!ckpt_retained) {
+        save_checkpoint();
+        CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+      }
+    }
+    return stats;
+  }
+
   GenerateStats generate(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
                          std::span<const std::int32_t> stop_ids,
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens,

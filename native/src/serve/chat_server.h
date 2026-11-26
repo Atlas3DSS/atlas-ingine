@@ -34,6 +34,12 @@ struct ServerOptions {
   // When unset (default single trusted scope): requests with Authorization header or JSON "user"/"prompt_cache_key"
   // fail closed (bypass_prefix_cache=true).
   std::string cache_namespace_header;
+  // Optional startup system prompt pre-prefilled into the prefix cache before serving (#887).
+  // When empty (default): zero startup prefill work and /health reports warm_start=false.
+  std::string warm_start_prompt;
+  // Cache namespace for startup warm-start; required when combining warm_start_prompt with cache_namespace_header,
+  // and rejected when cache_namespace_header is unset.
+  std::string warm_start_namespace;
 };
 
 class ChatServer {
@@ -80,6 +86,8 @@ class ChatServer {
   const ImageOptions image_options_;
   const std::shared_ptr<const persona::PersonaCatalog> personas_;
   const std::string cache_namespace_header_;
+  bool warm_start_ = false;
+  int warm_start_tokens_ = 0;
   const int64_t created_;
   engine::Scheduler scheduler_;
   httplib::Server server_;

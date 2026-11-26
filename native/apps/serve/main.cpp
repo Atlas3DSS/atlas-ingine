@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <thread>
@@ -96,6 +97,7 @@ int main(int argc, char** argv) {
   std::string kv_cache_mode = "per_pass";
   std::string loopcd_mode = "off";
   std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
+  std::string warm_start_prompt, warm_start_file, warm_start_namespace;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
   int max_batch = 1, max_kv_tokens = 0, loop_passes = 3;
@@ -175,6 +177,16 @@ int main(int argc, char** argv) {
   ap.option("--cache-namespace-header", "",
             "trusted proxy HTTP header isolating prefix-cache namespaces (absent/empty fails closed to bypass)",
             &cache_namespace_header);
+  ap.option("--warm-start-prompt", "",
+            "system prompt text pre-prefilled into the prefix cache at startup (sets warm_start=true in /health)",
+            &warm_start_prompt);
+  ap.option("--warm-start-file", "",
+            "UTF-8 file containing a system prompt pre-prefilled into the prefix cache at startup",
+            &warm_start_file);
+  ap.option("--warm-start-namespace", "",
+            "prefix-cache namespace for startup warm-start (required when combining warm-start with --cache-namespace-header)",
+            &warm_start_namespace);
+  ap.exclusive({"--warm-start-prompt", "--warm-start-file"}, false);
   ap.flag("--no-vision", "text only: do not load the vision tower (saves 0.6 GB) and reject requests with images",
           &no_vision);
   ap.option("--image-max-tokens", "",
@@ -230,6 +242,42 @@ int main(int argc, char** argv) {
   }
   if (temperature > 2 || top_p == 0 || top_p > 1) {
     std::cerr << "ingine-serve: error: --temperature must be in [0, 2] and --top-p in (0, 1]\n";
+    return 2;
+  }
+  const bool has_warm_start = ap.given("--warm-start-prompt") || ap.given("--warm-start-file");
+  if (has_warm_start) {
+    if (no_prefix_cache) {
+      std::cerr << "ingine-serve: error: --warm-start-prompt/--warm-start-file cannot be combined with --no-prefix-cache\n";
+      return 2;
+    }
+    if (!cache_namespace_header.empty() && warm_start_namespace.empty()) {
+      std::cerr << "ingine-serve: error: --warm-start-prompt/--warm-start-file with --cache-namespace-header requires --warm-start-namespace\n";
+      return 2;
+    }
+    if (cache_namespace_header.empty() && !warm_start_namespace.empty()) {
+      std::cerr << "ingine-serve: error: --warm-start-namespace requires --cache-namespace-header\n";
+      return 2;
+    }
+    if (ap.given("--warm-start-file")) {
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(warm_start_file, ec)) {
+        std::cerr << "ingine-serve: error: --warm-start-file is not a readable regular file: '" << warm_start_file
+                  << "'\n";
+        return 2;
+      }
+      std::ifstream in(warm_start_file, std::ios::binary);
+      if (!in) {
+        std::cerr << "ingine-serve: error: cannot open --warm-start-file '" << warm_start_file << "'\n";
+        return 2;
+      }
+      warm_start_prompt.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    if (warm_start_prompt.find_first_not_of(" \t\r\n") == std::string::npos) {
+      std::cerr << "ingine-serve: error: warm-start system prompt must contain non-whitespace text\n";
+      return 2;
+    }
+  } else if (!warm_start_namespace.empty()) {
+    std::cerr << "ingine-serve: error: --warm-start-namespace requires --warm-start-prompt or --warm-start-file\n";
     return 2;
   }
 
@@ -428,6 +476,8 @@ int main(int argc, char** argv) {
     server_options.images.max_total_tokens = max_image_tokens;
     server_options.personas = personas;
     server_options.cache_namespace_header = cache_namespace_header;
+    server_options.warm_start_prompt = warm_start_prompt;
+    server_options.warm_start_namespace = warm_start_namespace;
     log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
              server_options.sampling.top_p, server_options.sampling.top_k);
     ingine::serve::ChatServer server(*generator, fmt, server_options);

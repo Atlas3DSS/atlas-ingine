@@ -1290,6 +1290,47 @@ class BatchGenerator final : public Generator {
     return avail >= fresh_lifetime + reserved;
   }
 
+  GenerateStats warm_start(const Prompt& full_prompt, const Sampling& sampling) override {
+    if (!options_.prefix_cache || prefix_cache_.vram_budget_bytes() == 0) {
+      throw std::invalid_argument("warm_start requires batched prefix caching to be enabled");
+    }
+    if (options_.enable_persona_hooks || sampling.persona != nullptr) {
+      throw std::invalid_argument("warm_start is not supported with persona hooks in continuous-batch mode");
+    }
+    if (full_prompt.ids.empty()) {
+      throw std::invalid_argument("warm_start: prompt is empty");
+    }
+    if (full_prompt.bypass_prefix_cache) {
+      throw std::invalid_argument("warm_start: prefix cache bypass requested");
+    }
+    if (!full_prompt.images.empty()) {
+      throw std::invalid_argument("warm_start: images are not supported in startup warm-start prompts");
+    }
+    if (int(full_prompt.ids.size()) >= options_.max_ctx) {
+      throw std::invalid_argument("warm_start: prompt of " + std::to_string(full_prompt.ids.size()) +
+                                  " tokens leaves no generation room within max_ctx " +
+                                  std::to_string(options_.max_ctx));
+    }
+    std::int32_t first_tok = 0;
+    GenerateStats stats;
+    const int s = start_slot(full_prompt, 1, sampling, first_tok, stats);
+    if (s < 0) throw std::runtime_error("warm_start: no free batch slot");
+    release_slot(s);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const StateIdentity expected_id = build_identity(full_prompt);
+      const auto* hit = prefix_cache_.find_longest_prefix_const(expected_id, full_prompt.ids);
+      const bool exact_retained = hit != nullptr && hit->tokens.size() == full_prompt.ids.size() &&
+                                  std::equal(full_prompt.ids.begin(), full_prompt.ids.end(), hit->tokens.begin()) &&
+                                  (!drafter_ || hit->payload.has_draft);
+      if (!exact_retained) {
+        throw std::runtime_error(
+            "warm_start: batched prefix cache could not retain exact warmed prefix and identity");
+      }
+    }
+    return stats;
+  }
+
   int start_slot(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
                  std::int32_t& first_token, GenerateStats& stats) override {
     const std::span<const std::int32_t> prompt = full_prompt.ids;

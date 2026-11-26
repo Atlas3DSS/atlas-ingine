@@ -120,6 +120,8 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
                                         std::span<const std::int32_t> stop_ids,
                                         const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
                                         const ingine::model::PrefillCallback& on_prefill = {}) override;
+  ingine::model::GenerateStats warm_start(const ingine::model::Prompt& prompt,
+                                          const ingine::model::Sampling& sampling) override;
 
   // ingine::model::ModelBackend
   const ingine::model::BackendCapabilities& capabilities() const override { return profile_.capabilities; }

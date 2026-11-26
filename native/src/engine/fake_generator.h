@@ -66,6 +66,7 @@ class FakeGenerator final : public model::Generator {
                                 std::span<const int32_t> stop_ids,
                                 const std::function<bool(std::span<const int32_t>)>& on_tokens,
                                 const model::PrefillCallback& on_prefill) override;
+  model::GenerateStats warm_start(const model::Prompt& prompt, const model::Sampling& sampling) override;
   bool supports_images() const override { return supports_images_; }
   bool supports_logit_masker() const override { return supports_logit_masker_; }
   std::string model_family() const override { return model_family_; }
@@ -82,6 +83,7 @@ class FakeGenerator final : public model::Generator {
   void set_prefill_stats_hook(PrefillStatsFn hook);
   std::string echo(std::span<const int32_t> prompt_ids) const;
   std::vector<Call> calls() const;
+  std::vector<Call> warm_start_calls() const;
 
  private:
   const text::Tokenizer& tokenizer_;
@@ -100,6 +102,10 @@ class FakeGenerator final : public model::Generator {
   mutable std::mutex mutex_;
   PrefillStatsFn prefill_stats_hook_;
   std::vector<Call> calls_;
+  std::vector<Call> warm_start_calls_;
+  std::vector<int32_t> warmed_ids_;
+  std::string warmed_namespace_;
+  std::string warmed_persona_fp_;
 };
 
 }  // namespace ingine::engine
