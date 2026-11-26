@@ -102,6 +102,12 @@ struct AttnParams {
   int k_pos_base = 0;              // absolute token position of key row 0 in k/v (0 for full prefix)
   bool kv_fp8 = false;
   bool kv_q4 = false;
+  // Optional TP batch pool paging (full layers): k/v are pool bases laid out [page][visits][64][kKvDim]; key row j
+  // lives in page kv_page_row[j >> 6] at visit kv_page_visit. kv_v4: FP4 (E2M1 of v * 1.5) values, 4 bits each
+  // at half the element offset (needs kv_fp8 and paging).
+  const int* kv_page_row = nullptr;
+  int kv_page_visit = 0, kv_page_visits = 0;
+  bool kv_v4 = false;
   const int* kpos = nullptr;         // positions of the L keys (padded to tiles with -1), or null: key j at k_pos_base + j
   const int4* bounds = nullptr;      // key_tile_bounds of kpos (with kpos)
   int L = 0;

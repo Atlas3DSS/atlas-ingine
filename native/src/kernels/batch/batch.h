@@ -49,6 +49,7 @@ struct BatchedAttnArgs {
   int full_visit_idx = 0;  // 0..7
   int max_ctx = 0;
   bool cache_fp8 = false;
+  bool cache_v4 = false;  // with cache_fp8: V pool holds E2M1 nibbles of v * 1.5 ([pages, 8, 64, 8, 64] bytes), K stays FP8
 
   int window = 0;  // 1024 (sliding) or 0 (full)
   bool log_scaling = false;
@@ -76,12 +77,18 @@ void batched_static_conv_step(const void* x, bool x_fp32, int ld, int B, int C, 
 // contiguous buffer `[8, scratch_max_ctx, 8, 128]` into the paged pool `[num_pages, 8, 64, 8, 128]`.
 void scatter_full_kv(const void* src_k, const void* src_v, int scratch_max_ctx, int pos0, int T, bool kv_fp8,
                      int slot, const std::int32_t* page_table, int max_pages_per_slot,
-                     void* dst_k_pool, void* dst_v_pool, cudaStream_t stream);
+                     void* dst_k_pool, void* dst_v_pool, cudaStream_t stream, bool v4 = false);
+
+// Writes T contiguous rows [T, KV_DIM] (positions pos0..pos0+T) of one full visit into the slot's pool pages
+// (prefill straight into the pool; v4: FP8 rows -> FP4 V pages).
+void write_full_kv_rows(const void* k_rows, const void* v_rows, int pos0, int T, int full_visit, bool kv_fp8, bool v4,
+                        int slot, const std::int32_t* page_table, int max_pages_per_slot, void* dst_k_pool,
+                        void* dst_v_pool, cudaStream_t stream);
 
 // Gathers [0, n) full-attention KV rows of all 8 full visits from the paged pool back into a scratch buffer.
 void gather_full_kv(const void* src_k_pool, const void* src_v_pool, int slot, const std::int32_t* page_table,
                     int max_pages_per_slot, int n, bool kv_fp8, void* dst_k, void* dst_v, int scratch_max_ctx,
-                    cudaStream_t stream);
+                    cudaStream_t stream, bool v4 = false);
 
 // Copies a partial (<64-token) full-attention KV tail [src_pos0, src_pos0 + tail_tokens) across all 8 full visits
 // from scratch `[8, scratch_max_ctx, 8, 128]` into compact checkpoint tail `[8, tail_tokens, 8, 128]`.
@@ -96,8 +103,9 @@ void copy_tail_kv_to_scratch(const void* src_tail_k, const void* src_tail_v, int
 // Copies a compact checkpoint tail `[8, tail_tokens, 8, 128]` into rows `[0, tail_tokens)` of private physical
 // pool page `phys_page` inside `[num_pages, 8, 64, 8, 128]` (used on exact prompt hits with non-64-aligned length).
 void copy_tail_kv_to_pool_page(const void* src_tail_k, const void* src_tail_v, int tail_tokens, bool kv_fp8,
-                               int phys_page, void* dst_k_pool, void* dst_v_pool, cudaStream_t stream);
+                               int phys_page, void* dst_k_pool, void* dst_v_pool, cudaStream_t stream, bool v4 = false);
 
+// (v4: the pools hold FP4 V - KVF 2 - and the scratch / tails FP8 V: converted on the way.)
 // Converts a slice `[v_offset, v_offset + chunk_V)` of ActT raw head matmul outputs `[B, chunk_V]` into
 // softcapped FP32 logits `out[b, v_offset + v] = 30 * tanh(float(in[b, v]) / 30)` (stride total_V).
 void batched_head_softcap(const ActT* in, int B, int chunk_V, int v_offset, int total_V, float* out,

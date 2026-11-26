@@ -54,14 +54,37 @@ static_assert(sizeof(Smem<1>) <= 49152, "single-stage prefill attention must fit
 static_assert(offsetof(Smem<1>, v) == sizeof(Smem<1>::k), "Q staging spans k and v contiguously");
 static_assert(sizeof(Smem<1>::k) + sizeof(Smem<1>::v) >= BR * D * sizeof(uint16_t), "Q staging must fit k+v");
 
-// KV_FMT: 0 = BF16, 1 = FP8 E4M3, 2 = Q4_0 (per-32-element block, 576B/row)
+// KV_FMT: 0 = BF16, 1 = FP8 E4M3, 2 = Q4_0 (per-32-element block, 576B/row), 3 = FP8 K + FP4 V (paged pool)
 template <int KV_FMT>
 struct KvRegs {
-  static constexpr int N = KV_FMT == 1 ? 2 : (KV_FMT == 2 ? 1 : 4);  // 16-byte loads per thread per matrix
+  static constexpr int N = (KV_FMT == 1 || KV_FMT == 3) ? 2 : (KV_FMT == 2 ? 1 : 4);  // 16-byte loads per thread
   uint4 k[N], v[N];
   uint16_t ks, vs;  // Q4_0 FP16 block scales (unused for BF16/FP8)
   int kp;
 };
+
+// element offset of key row j: contiguous rows, or the TP batch pool's 64-token pages
+__device__ __forceinline__ size_t kv_row_off(const AttnParams& p, int j) {
+  if (p.kv_page_row)
+    return ((size_t(__ldg(p.kv_page_row + (j >> 6))) * p.kv_page_visits + p.kv_page_visit) * 64 + (j & 63)) * kKvDim;
+  return size_t(j) * kKvDim;
+}
+
+// E2M1 code (sign bit 8) -> value / 1.5 (the FP4 V pool's code book; same FP32 value as the batch decode)
+__device__ __forceinline__ float fp4v_f(uint32_t c) {
+  const uint32_t m = c & 7u;
+  const float a = m < 2u ? 0.5f * float(m) : float(2u + (m & 1u)) * __int_as_float(int(125u + (m >> 1)) << 23);
+  const float v = a * (1.f / 1.5f);
+  return (c & 8u) ? -v : v;
+}
+__device__ __forceinline__ uint4 fp4x8_to_half8(uint32_t w) {
+  uint4 o;
+  o.x = pack_half2(fp4v_f(w), fp4v_f(w >> 4));
+  o.y = pack_half2(fp4v_f(w >> 8), fp4v_f(w >> 12));
+  o.z = pack_half2(fp4v_f(w >> 16), fp4v_f(w >> 20));
+  o.w = pack_half2(fp4v_f(w >> 24), fp4v_f(w >> 28));
+  return o;
+}
 
 template <int KV_FMT, bool EXPLICIT>
 __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, KvRegs<KV_FMT>& r) {
@@ -89,7 +112,7 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
       r.k[0] = r.v[0] = make_uint4(0, 0, 0, 0);
       r.ks = r.vs = 0;
     }
-  } else if constexpr (KV_FMT == 1) {
+  } else if constexpr (KV_FMT == 1 || KV_FMT == 3) {
     const uint8_t* K = static_cast<const uint8_t*>(p.k);
     const uint8_t* V = static_cast<const uint8_t*>(p.v);
 #pragma unroll
@@ -97,9 +120,14 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
       const int id = tid + i * NT, row = id >> 3, c = id & 7;
       const int j = j0 + row;
       if (j < p.L) {
-        const size_t off = size_t(j) * kKvDim + g * D + c * 16;
+        const size_t off = kv_row_off(p, j) + g * D + c * 16;
         r.k[i] = __ldg(reinterpret_cast<const uint4*>(K + off));
-        r.v[i] = __ldg(reinterpret_cast<const uint4*>(V + off));
+        if constexpr (KV_FMT == 3) {
+          const uint2 v4 = __ldg(reinterpret_cast<const uint2*>(V + off / 2));
+          r.v[i] = make_uint4(v4.x, v4.y, 0u, 0u);
+        } else {
+          r.v[i] = __ldg(reinterpret_cast<const uint4*>(V + off));
+        }
       } else {
         r.k[i] = r.v[i] = make_uint4(0, 0, 0, 0);
       }
@@ -112,7 +140,7 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
       const int id = tid + i * NT, row = id >> 4, c = id & 15;
       const int j = j0 + row;
       if (j < p.L) {
-        const size_t off = size_t(j) * kKvDim + g * D + c * 8;
+        const size_t off = kv_row_off(p, j) + g * D + c * 8;
         r.k[i] = __ldg(reinterpret_cast<const uint4*>(K + off));
         r.v[i] = __ldg(reinterpret_cast<const uint4*>(V + off));
       } else {
@@ -171,6 +199,21 @@ __device__ __forceinline__ void store_tile(Smem<STAGES>& s, int buf, const KvReg
       vout.w = safe_h2(fmaf(float((vu >> 24) & 0xfu), vd, v_neg8d), fmaf(float((vu >> 28) & 0xfu), vd, v_neg8d));
       *reinterpret_cast<uint4*>(&s.k[buf][swz<DCH>(row, 4 * blk + sub)]) = kout;
       *reinterpret_cast<uint4*>(&s.v[buf][swz<DCH>(row, 4 * blk + sub)]) = vout;
+    }
+  } else if constexpr (KV_FMT == 3) {
+#pragma unroll
+    for (int i = 0; i < r.N; ++i) {
+      const int id = tid + i * NT, row = id >> 3, c = id & 7;
+      const uint32_t kw[4] = {r.k[i].x, r.k[i].y, r.k[i].z, r.k[i].w};
+      uint4 k0, k1;
+      k0.x = e4m3x2_to_bf16x2(kw[0] & 0xffff); k0.y = e4m3x2_to_bf16x2(kw[0] >> 16);
+      k0.z = e4m3x2_to_bf16x2(kw[1] & 0xffff); k0.w = e4m3x2_to_bf16x2(kw[1] >> 16);
+      k1.x = e4m3x2_to_bf16x2(kw[2] & 0xffff); k1.y = e4m3x2_to_bf16x2(kw[2] >> 16);
+      k1.z = e4m3x2_to_bf16x2(kw[3] & 0xffff); k1.w = e4m3x2_to_bf16x2(kw[3] >> 16);
+      *reinterpret_cast<uint4*>(&s.k[buf][swz<DCH>(row, 2 * c)]) = k0;
+      *reinterpret_cast<uint4*>(&s.k[buf][swz<DCH>(row, 2 * c + 1)]) = k1;
+      *reinterpret_cast<uint4*>(&s.v[buf][swz<DCH>(row, 2 * c)]) = fp4x8_to_half8(r.v[i].x);
+      *reinterpret_cast<uint4*>(&s.v[buf][swz<DCH>(row, 2 * c + 1)]) = fp4x8_to_half8(r.v[i].y);
     }
   } else if constexpr (KV_FMT == 1) {
 #pragma unroll
@@ -915,7 +958,13 @@ void attention(const AttnParams& p, cudaStream_t stream) {
     throw std::invalid_argument("prefill attention: explicit keys need bounds and at most 64 tiles");
   if (p.kv_fp8 && p.kv_q4)
     throw std::invalid_argument("prefill attention: kv_fp8 and kv_q4 are mutually exclusive");
-  if (p.kv_q4) {
+  if (p.kv_page_row && (expl || p.kv_q4 || p.k_pages || p.kv_page_visits <= p.kv_page_visit || p.kv_page_visit < 0))
+    throw std::invalid_argument("prefill attention: pool paging is for full layers with BF16/FP8 keys");
+  if (p.kv_v4 && !(p.kv_fp8 && p.kv_page_row))
+    throw std::invalid_argument("prefill attention: FP4 values need FP8 keys in the paged pool");
+  if (p.kv_v4) {
+    launch<3, false>(p, stream);
+  } else if (p.kv_q4) {
     if (expl) throw std::invalid_argument("prefill attention: kv_q4 is supported on full layers only");
     if (p.T <= 8 && p.decode_ws && p.decode_splits > 0) {
       launch_decode_q4_split(p, stream);

@@ -164,12 +164,12 @@ int main(int argc, char** argv) {
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   std::string kv_cache_mode = "per_pass";
   std::string concurrency_csv;
-  int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
+  int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, prompt_tokens = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
   int max_batch = 0, max_kv_tokens = 0, park_mb = -1, park_host_mb = 0, loop_passes = 3;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
-  bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
+  bool dense_fp8 = false, kv_fp8 = false, kv_fp4v = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
        ignore_eos = false, staggered = false, no_prefix_cache = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
@@ -187,6 +187,7 @@ int main(int argc, char** argv) {
   ap.flag("--dense-fp8", "", &dense_fp8);
   ap.flag("--vision", "also load the vision tower", &vision);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
+  ap.flag("--kv-fp4v", "FP8 keys + FP4 values in the TP2 batch full-attention pool (implies --kv-fp8)", &kv_fp4v);
   ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok per_pass, 4.5 KiB/tok last_full; SWA stays BF16)", &kv_q4);
   ap.option("--kv-cache-mode", "{per_pass,last_full}",
             "full-attention KV mode: per_pass (default, 8 visit slots) or last_full (opt-in L11/L17 shared, 4 slots; B=1 non-spec)",
@@ -222,6 +223,10 @@ int main(int argc, char** argv) {
           &no_prefix_cache);
   ap.option("--temperature", "", "", &temperature);
   ap.option("--long-prompt", "", "also time prefill of a synthetic prompt of N tokens", &long_prompt);
+  ap.option("--prompt-tokens", "",
+            "with --concurrency: grow every request's prompt to about N tokens with a distinct document (prefill of "
+            "long prompts, decode at depth)",
+            &prompt_tokens);
   ap.option("--forced", "", "teacher-forced replay of the outputs in FILE (JSON lines {name, prompt, output})",
             &forced);
   ap.option("--forced-items", "", "replay at most N items of --forced", &forced_items);
@@ -269,7 +274,8 @@ int main(int argc, char** argv) {
     options.max_ctx = max_ctx;
     options.prefill_chunk = prefill_chunk;
     options.dense_fp8 = dense_fp8;
-    options.kv_fp8 = kv_fp8;
+    options.kv_fp8 = kv_fp8 || kv_fp4v;
+    options.kv_fp4v = kv_fp4v;
     options.kv_q4 = kv_q4;
     options.kv_cache_mode = ingine::model::parse_kv_cache_mode(kv_cache_mode);
     options.kv_paged = kv_paged || kv_vram_mb > 0;
@@ -320,8 +326,36 @@ int main(int argc, char** argv) {
         chat.reasoning_effort = effort;
         const std::string text =
             "[Request #" + std::to_string(i + 1) + "] " + kBatchPrompts[std::size_t(i) % kBatchPrompts.size()];
-        const nlohmann::ordered_json messages = nlohmann::ordered_json::array({{{"role", "user"}, {"content", text}}});
-        prompt_bank.push_back(fmt.render(messages, nlohmann::ordered_json(), chat).ids);
+        auto render = [&](const std::string& content) {
+          const nlohmann::ordered_json messages =
+              nlohmann::ordered_json::array({{{"role", "user"}, {"content", content}}});
+          return fmt.render(messages, nlohmann::ordered_json(), chat).ids;
+        };
+        if (prompt_tokens <= 0) {
+          prompt_bank.push_back(render(text));
+          continue;
+        }
+        // A distinct long document per request (this source file, rotated), then the request: binary search the
+        // document length so that the rendered prompt has at most prompt_tokens tokens.
+        static const std::string source = [] {
+          std::ifstream in(__FILE__, std::ios::binary);
+          std::stringstream ss;
+          ss << in.rdbuf();
+          return ss.str();
+        }();
+        const std::size_t rot = (source.size() / 7) * std::size_t(i % 7);
+        const std::string base = source.substr(rot) + source.substr(0, rot);
+        std::string doc;
+        while (doc.size() < std::size_t(prompt_tokens) * 6) doc += base;
+        std::size_t lo = 0, hi = doc.size();
+        std::vector<int32_t> best = render(text);
+        while (lo < hi) {
+          const std::size_t mid = (lo + hi + 1) / 2;
+          auto ids = render("[Request #" + std::to_string(i + 1) + "]\n" + doc.substr(0, mid) + "\n---\n" + text);
+          if (int(ids.size()) <= prompt_tokens) best = std::move(ids), lo = mid;
+          else hi = mid - 1;
+        }
+        prompt_bank.push_back(std::move(best));
       }
 
       nlohmann::ordered_json report;

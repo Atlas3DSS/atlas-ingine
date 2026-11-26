@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
   int max_batch = 1, max_kv_tokens = 0, loop_passes = 3;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
-  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
+  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_fp4v = false, kv_q4 = false, kv_paged = false, spec = false,
        no_vision = false, atlas_6g = false, persona_probe_mode = false, no_prefix_cache = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
+  ap.flag("--kv-fp4v", "FP8 keys + FP4 values in the TP2 batch full-attention pool (implies --kv-fp8)", &kv_fp4v);
   ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok per_pass, 4.5 KiB/tok last_full; SWA stays BF16)",
           &kv_q4);
   ap.option("--kv-cache-mode", "{per_pass,last_full}",
@@ -271,7 +272,8 @@ int main(int argc, char** argv) {
       options.max_ctx = max_ctx;
       options.prefill_chunk = prefill_chunk;
       options.dense_fp8 = dense_fp8;
-      options.kv_fp8 = kv_fp8;
+      options.kv_fp8 = kv_fp8 || kv_fp4v;
+      options.kv_fp4v = kv_fp4v;
       options.kv_q4 = kv_q4;
       options.kv_cache_mode = ingine::model::parse_kv_cache_mode(kv_cache_mode);
       options.kv_paged = kv_paged || kv_vram_mb > 0;

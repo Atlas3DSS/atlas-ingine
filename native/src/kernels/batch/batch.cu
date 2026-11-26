@@ -112,6 +112,47 @@ __device__ __forceinline__ void unpack8(const uint2 u, float f[8]) {
   f[4] = a.x, f[5] = a.y, f[6] = b.x, f[7] = b.y;
 }
 
+// FP4 V (KVF 2): E2M1 codes of v * kFp4V (unit-RMS values -> [-4, 4]); a code decodes to e2m1 / kFp4V.
+constexpr float kFp4V = 1.5f;
+__device__ __forceinline__ uint32_t e2m1_code(float x) {
+  const uint32_t sgn = x < 0.f ? 8u : 0u;
+  const float a = fabsf(x);
+  return sgn | uint32_t((a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f) + (a >= 1.75f) + (a >= 2.5f) + (a >= 3.5f) +
+                        (a >= 5.0f));
+}
+__device__ __forceinline__ float e2m1_val(uint32_t c) {
+  constexpr float kT[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+  const float v = kT[c & 7u] * (1.f / kFp4V);
+  return (c & 8u) ? -v : v;
+}
+__device__ __forceinline__ float fp4vr(float x) { return e2m1_val(e2m1_code(x * kFp4V)); }
+__device__ __forceinline__ void unpack_fp4x8(uint32_t w, float f[8]) {
+#pragma unroll
+  for (int e = 0; e < 8; ++e) f[e] = e2m1_val((w >> (4 * e)) & 15u);
+}
+__device__ __forceinline__ uint32_t pack_fp4x8(const float f[8]) {
+  uint32_t w = 0;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) w |= e2m1_code(f[e] * kFp4V) << (4 * e);
+  return w;
+}
+// 4 E4M3 values (a scratch word) -> 4 E2M1 codes (16 bits), and back (FP4 V pools)
+__device__ __forceinline__ uint32_t fp8x4_to_fp4x4(uint32_t w) {
+  const float2 a = e4m3x2_f2(w & 0xffffu), b = e4m3x2_f2(w >> 16);
+  return e2m1_code(a.x * kFp4V) | (e2m1_code(a.y * kFp4V) << 4) | (e2m1_code(b.x * kFp4V) << 8) |
+         (e2m1_code(b.y * kFp4V) << 12);
+}
+__device__ __forceinline__ uint32_t pack_e4m3x2(float a, float b);
+__device__ __forceinline__ uint32_t fp4x4_to_fp8x4(uint32_t h) {
+  return pack_e4m3x2(e2m1_val(h & 15u), e2m1_val((h >> 4) & 15u)) |
+         (pack_e4m3x2(e2m1_val((h >> 8) & 15u), e2m1_val((h >> 12) & 15u)) << 16);
+}
+__device__ __forceinline__ uint32_t ld_kv4(const void* ptr) {
+  uint32_t v;
+  asm volatile("ld.global" INGINE_L1_NO_ALLOCATE ".u32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
+  return v;
+}
+
 __device__ __forceinline__ float e4m3r(float x) {
   return __half2float(__half(__nv_cvt_fp8_to_halfraw(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3), __NV_E4M3)));
 }
@@ -222,8 +263,9 @@ struct AttnSmem {
   float nst[3 * 2 * D];
 };
 
-template <bool FULL, bool F8, bool PROJ_FP32, bool SPLIT>
+template <bool FULL, int KVF, bool PROJ_FP32, bool SPLIT>
 __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKernelParams p) {
+  constexpr bool F8 = KVF != 0, V4 = KVF == 2;  // KVF: 0 act, 1 FP8 K + V, 2 FP8 K + FP4 V (v_pool: E2M1 nibbles)
   static_assert(FULL || !F8, "FP8 caches are full-layer only");
   using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
   using KV = std::conditional_t<F8, uint2, uint4>;
@@ -379,7 +421,7 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
       float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
       if constexpr (F8) {
 #pragma unroll
-        for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
+        for (int e = 0; e < 4; ++e) y[e] = (V4 && kv == 1) ? fp4vr(bf16r(y[e])) : e4m3r(bf16r(y[e]));
       }
       reinterpret_cast<uint2*>(&sm.nkv[kv][0])[lane] = make_uint2(act::pack2(y[0], y[1]), act::pack2(y[2], y[3]));
     }
@@ -416,7 +458,10 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
       buf.rp[u] = (j < old_end && buf.dp[u] < EXT) ? __ldg(p.rel_proj + c * EXT + buf.dp[u]) : 0.f;
       if (j < old_end) {
         const std::size_t off = kv_offset(j);
-        if constexpr (F8) {
+        if constexpr (V4) {
+          buf.k[u] = ld_kv8(k_pool + off, kvpol);
+          buf.v[u] = make_uint2(ld_kv4(reinterpret_cast<const uint8_t*>(p.v_full_pool) + off / 2), 0u);
+        } else if constexpr (F8) {
           buf.k[u] = ld_kv8(k_pool + off, kvpol);
           buf.v[u] = ld_kv8(v_pool + off, kvpol);
         } else {
@@ -490,7 +535,8 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
     for (int u = 0; u < U; ++u) {
       float vf[8];
       using V = std::decay_t<decltype(buf.v[0])>;
-      unpack8(valid[u] ? buf.v[u] : V{}, vf);
+      if constexpr (V4 && std::is_same_v<V, uint2>) unpack_fp4x8(valid[u] ? buf.v[u].x : 0u, vf);
+      else unpack8(valid[u] ? buf.v[u] : V{}, vf);
 #pragma unroll
       for (int i = 0; i < GQA; ++i) {
         const float pu = exp2f(s[u][i] - mrun[i]);
@@ -621,7 +667,13 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
         dst_off = (std::size_t(p0 & (WIN - 1)) * HKV + g) * D;
       }
       CT* const dst = (kv ? v_pool : k_pool) + dst_off;
-      if constexpr (F8) {
+      if constexpr (V4) {  // (FP4 V: the row's values are already E2M1-exact)
+        float f[8];
+        unpack8(u, f);
+        if (kv) reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(p.v_full_pool) + dst_off / 2)[c8] = pack_fp4x8(f);
+        else reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
+                                                            pack_e4m3x2(f[4], f[5]) | (pack_e4m3x2(f[6], f[7]) << 16));
+      } else if constexpr (F8) {
         float f[8];
         unpack8(u, f);
         reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
@@ -640,8 +692,9 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
   }
 }
 
-template <bool FULL, bool F8, bool PROJ_FP32>
+template <bool FULL, int KVF, bool PROJ_FP32>
 __global__ void __launch_bounds__(NT) batched_attn_reduce_kernel(const BatchedAttnKernelParams p) {
+  constexpr bool F8 = KVF != 0, V4 = KVF == 2;
   static_assert(FULL || !F8, "FP8 caches are full-layer only");
   using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
 
@@ -701,7 +754,13 @@ __global__ void __launch_bounds__(NT) batched_attn_reduce_kernel(const BatchedAt
       dst_off = (std::size_t(p0 & (WIN - 1)) * HKV + g) * D;
     }
     CT* const dst = (kv ? v_pool : k_pool) + dst_off;
-    if constexpr (F8) {
+    if constexpr (V4) {
+      float f[8];
+      unpack8(u, f);
+      if (kv) reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(p.v_full_pool) + dst_off / 2)[c8] = pack_fp4x8(f);
+      else reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
+                                                          pack_e4m3x2(f[4], f[5]) | (pack_e4m3x2(f[6], f[7]) << 16));
+    } else if constexpr (F8) {
       float f[8];
       unpack8(u, f);
       reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
@@ -752,26 +811,41 @@ __global__ void batched_static_conv_kernel(const void* __restrict__ x, int ld, i
   st[2 * C + c] = e3;
 }
 
-template <bool SCATTER, bool F8>
+template <bool SCATTER, int KVF>
 __global__ void paged_full_kv_transfer_kernel(const void* __restrict__ scratch_k, const void* __restrict__ scratch_v,
                                               void* __restrict__ pool_k, void* __restrict__ pool_v,
                                               int scratch_max_ctx, int pos0, int T, int slot,
-                                              const std::int32_t* __restrict__ page_table, int max_pages_per_slot) {
-  // Grid: (T, NUM_FULL_VISITS); block: 256 threads, each handles 4 channels (4 * 256 = 1024 = KV_DIM).
+                                              const std::int32_t* __restrict__ page_table, int max_pages_per_slot,
+                                              int fi0 = 0, int scratch_pos0 = 0) {
+  // Grid: (T, visits); block: CONV_C / 4 threads, each handles 4 channels. Scratch visit blockIdx.y, row
+  // pos - scratch_pos0 <-> pool visit fi0 + blockIdx.y, row pos.
   const int t = blockIdx.x;
-  const int fi = blockIdx.y;
+  const int fi = fi0 + blockIdx.y;
   if (t >= T) return;
   const int pos = pos0 + t;
   const int phys = page_table[std::size_t(slot) * max_pages_per_slot + (pos >> kPageShift)];
   const int off_in_page = pos & kPageMask;
 
-  constexpr int EPT = 4;  // 4 elements per thread -> 1024 elements per row
+  constexpr int EPT = 4;  // 4 elements per thread
   const int ch = threadIdx.x * EPT;
-  const std::size_t scratch_off = (std::size_t(fi) * scratch_max_ctx + pos) * CONV_C + ch;
+  const std::size_t scratch_off = (std::size_t(blockIdx.y) * scratch_max_ctx + pos - scratch_pos0) * CONV_C + ch;
   const std::size_t pool_off =
       (((std::size_t(phys) * NUM_FULL_VISITS + fi) * kPageSize + off_in_page) * CONV_C) + ch;
+  constexpr bool F8 = KVF != 0;
 
-  if constexpr (F8) {
+  if constexpr (KVF == 2) {  // FP8 K as is; V: FP8 scratch <-> FP4 pool (2 bytes the 4 channels)
+    uint8_t* pk = static_cast<uint8_t*>(pool_k);
+    uint16_t* pv = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(pool_v) + pool_off / 2);
+    uint8_t* sk = static_cast<uint8_t*>(const_cast<void*>(scratch_k));
+    uint8_t* sv = static_cast<uint8_t*>(const_cast<void*>(scratch_v));
+    if constexpr (SCATTER) {
+      *reinterpret_cast<uint32_t*>(pk + pool_off) = *reinterpret_cast<const uint32_t*>(sk + scratch_off);
+      *pv = uint16_t(fp8x4_to_fp4x4(*reinterpret_cast<const uint32_t*>(sv + scratch_off)));
+    } else {
+      *reinterpret_cast<uint32_t*>(sk + scratch_off) = *reinterpret_cast<const uint32_t*>(pk + pool_off);
+      *reinterpret_cast<uint32_t*>(sv + scratch_off) = fp4x4_to_fp8x4(*pv);
+    }
+  } else if constexpr (F8) {
     if constexpr (SCATTER) {
       *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pool_k) + pool_off) =
           *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(scratch_k) + scratch_off);
@@ -835,7 +909,7 @@ __global__ void tail_kv_scratch_kernel(const void* __restrict__ scratch_k, const
   }
 }
 
-template <bool F8>
+template <int KVF>
 __global__ void tail_kv_to_pool_page_kernel(const void* __restrict__ tail_k, const void* __restrict__ tail_v,
                                             int tail_tokens, int phys_page, void* __restrict__ pool_k,
                                             void* __restrict__ pool_v) {
@@ -845,7 +919,12 @@ __global__ void tail_kv_to_pool_page_kernel(const void* __restrict__ tail_k, con
   const int ch = threadIdx.x * 4;
   const std::size_t tail_off = (std::size_t(fi) * tail_tokens + t) * CONV_C + ch;
   const std::size_t pool_off = (((std::size_t(phys_page) * NUM_FULL_VISITS + fi) * kPageSize + t) * CONV_C) + ch;
-  if constexpr (F8) {
+  if constexpr (KVF == 2) {
+    *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pool_k) + pool_off) =
+        *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(tail_k) + tail_off);
+    *reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(pool_v) + pool_off / 2) =
+        uint16_t(fp8x4_to_fp4x4(*reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(tail_v) + tail_off)));
+  } else if constexpr (KVF == 1) {
     *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pool_k) + pool_off) =
         *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(tail_k) + tail_off);
     *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pool_v) + pool_off) =
@@ -875,7 +954,7 @@ __global__ void batched_advance_pos_kernel(const std::int32_t* __restrict__ slot
   if (slot >= 0) slot_pos[slot] += 1;
 }
 
-template <bool FULL, bool F8, bool PROJ_FP32>
+template <bool FULL, int F8, bool PROJ_FP32>
 void dispatch_attn(const BatchedAttnKernelParams& kp, cudaStream_t stream) {
   if (kp.splits == 1) {
     const dim3 grid(1, HKV, kp.B);
@@ -925,6 +1004,7 @@ void batched_attn_decode(const BatchedAttnArgs& a, cudaStream_t stream) {
   require(a.window == 0 || a.window == WIN, "window must be 0 or 1024");
   const bool full = (a.window == 0);
   require(full || !a.cache_fp8, "FP8 caches are full-layer only");
+  require(!a.cache_v4 || a.cache_fp8, "FP4 V caches go with FP8 K");
   require(a.proj && a.slot_ids && a.slot_pos && a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv &&
               a.conv_k_visit && a.conv_v_visit && a.out,
           "null argument");
@@ -975,9 +1055,12 @@ void batched_attn_decode(const BatchedAttnArgs& a, cudaStream_t stream) {
   kp.out = a.out;
 
   if (full) {
-    if (a.cache_fp8) {
-      if (a.proj_fp32) dispatch_attn<true, true, true>(kp, stream);
-      else dispatch_attn<true, true, false>(kp, stream);
+    if (a.cache_fp8 && a.cache_v4) {
+      if (a.proj_fp32) dispatch_attn<true, 2, true>(kp, stream);
+      else dispatch_attn<true, 2, false>(kp, stream);
+    } else if (a.cache_fp8) {
+      if (a.proj_fp32) dispatch_attn<true, 1, true>(kp, stream);
+      else dispatch_attn<true, 1, false>(kp, stream);
     } else {
       if (a.proj_fp32) dispatch_attn<true, false, true>(kp, stream);
       else dispatch_attn<true, false, false>(kp, stream);
@@ -1004,18 +1087,42 @@ void batched_static_conv_step(const void* x, bool x_fp32, int ld, int B, int C, 
   CUDA_CHECK(cudaGetLastError());
 }
 
+void write_full_kv_rows(const void* k_rows, const void* v_rows, int pos0, int T, int full_visit, bool kv_fp8, bool v4,
+                        int slot, const std::int32_t* page_table, int max_pages_per_slot, void* dst_k_pool,
+                        void* dst_v_pool, cudaStream_t stream) {
+  if (T <= 0) return;
+  require(k_rows && v_rows && page_table && dst_k_pool && dst_v_pool && pos0 >= 0 && full_visit >= 0 &&
+              full_visit < NUM_FULL_VISITS && (!v4 || kv_fp8),
+          "write_full_kv_rows: bad args");
+  const dim3 grid(T, 1);
+  if (v4) {
+    paged_full_kv_transfer_kernel<true, 2><<<grid, CONV_C / 4, 0, stream>>>(
+        k_rows, v_rows, dst_k_pool, dst_v_pool, T, pos0, T, slot, page_table, max_pages_per_slot, full_visit, pos0);
+  } else if (kv_fp8) {
+    paged_full_kv_transfer_kernel<true, 1><<<grid, CONV_C / 4, 0, stream>>>(
+        k_rows, v_rows, dst_k_pool, dst_v_pool, T, pos0, T, slot, page_table, max_pages_per_slot, full_visit, pos0);
+  } else {
+    paged_full_kv_transfer_kernel<true, 0><<<grid, CONV_C / 4, 0, stream>>>(
+        k_rows, v_rows, dst_k_pool, dst_v_pool, T, pos0, T, slot, page_table, max_pages_per_slot, full_visit, pos0);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
 void scatter_full_kv(const void* src_k, const void* src_v, int scratch_max_ctx, int pos0, int T, bool kv_fp8,
                      int slot, const std::int32_t* page_table, int max_pages_per_slot, void* dst_k_pool,
-                     void* dst_v_pool, cudaStream_t stream) {
+                     void* dst_v_pool, cudaStream_t stream, bool v4) {
   if (T <= 0) return;
   require(src_k && src_v && page_table && dst_k_pool && dst_v_pool && pos0 >= 0 && pos0 + T <= scratch_max_ctx,
           "scatter_full_kv: bad args");
   const dim3 grid(T, NUM_FULL_VISITS);
-  if (kv_fp8) {
-    paged_full_kv_transfer_kernel<true, true><<<grid, CONV_C / 4, 0, stream>>>(
+  if (kv_fp8 && v4) {
+    paged_full_kv_transfer_kernel<true, 2><<<grid, CONV_C / 4, 0, stream>>>(
+        src_k, src_v, dst_k_pool, dst_v_pool, scratch_max_ctx, pos0, T, slot, page_table, max_pages_per_slot);
+  } else if (kv_fp8) {
+    paged_full_kv_transfer_kernel<true, 1><<<grid, CONV_C / 4, 0, stream>>>(
         src_k, src_v, dst_k_pool, dst_v_pool, scratch_max_ctx, pos0, T, slot, page_table, max_pages_per_slot);
   } else {
-    paged_full_kv_transfer_kernel<true, false><<<grid, CONV_C / 4, 0, stream>>>(
+    paged_full_kv_transfer_kernel<true, 0><<<grid, CONV_C / 4, 0, stream>>>(
         src_k, src_v, dst_k_pool, dst_v_pool, scratch_max_ctx, pos0, T, slot, page_table, max_pages_per_slot);
   }
   CUDA_CHECK(cudaGetLastError());
@@ -1023,17 +1130,21 @@ void scatter_full_kv(const void* src_k, const void* src_v, int scratch_max_ctx, 
 
 void gather_full_kv(const void* src_k_pool, const void* src_v_pool, int slot, const std::int32_t* page_table,
                     int max_pages_per_slot, int n, bool kv_fp8, void* dst_k, void* dst_v, int scratch_max_ctx,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, bool v4) {
   if (n <= 0) return;
   require(src_k_pool && src_v_pool && page_table && dst_k && dst_v && n <= scratch_max_ctx,
           "gather_full_kv: bad args");
   const dim3 grid(n, NUM_FULL_VISITS);
-  if (kv_fp8) {
-    paged_full_kv_transfer_kernel<false, true><<<grid, CONV_C / 4, 0, stream>>>(
+  if (kv_fp8 && v4) {
+    paged_full_kv_transfer_kernel<false, 2><<<grid, CONV_C / 4, 0, stream>>>(
+        dst_k, dst_v, const_cast<void*>(src_k_pool), const_cast<void*>(src_v_pool), scratch_max_ctx, 0, n, slot,
+        page_table, max_pages_per_slot);
+  } else if (kv_fp8) {
+    paged_full_kv_transfer_kernel<false, 1><<<grid, CONV_C / 4, 0, stream>>>(
         dst_k, dst_v, const_cast<void*>(src_k_pool), const_cast<void*>(src_v_pool), scratch_max_ctx, 0, n, slot,
         page_table, max_pages_per_slot);
   } else {
-    paged_full_kv_transfer_kernel<false, false><<<grid, CONV_C / 4, 0, stream>>>(
+    paged_full_kv_transfer_kernel<false, 0><<<grid, CONV_C / 4, 0, stream>>>(
         dst_k, dst_v, const_cast<void*>(src_k_pool), const_cast<void*>(src_v_pool), scratch_max_ctx, 0, n, slot,
         page_table, max_pages_per_slot);
   }
@@ -1077,16 +1188,19 @@ void copy_tail_kv_to_scratch(const void* src_tail_k, const void* src_tail_v, int
 }
 
 void copy_tail_kv_to_pool_page(const void* src_tail_k, const void* src_tail_v, int tail_tokens, bool kv_fp8,
-                               int phys_page, void* dst_k_pool, void* dst_v_pool, cudaStream_t stream) {
+                               int phys_page, void* dst_k_pool, void* dst_v_pool, cudaStream_t stream, bool v4) {
   if (tail_tokens <= 0) return;
   require(src_tail_k && src_tail_v && dst_k_pool && dst_v_pool && tail_tokens < kPageSize && phys_page >= 0,
           "copy_tail_kv_to_pool_page: bad args");
   const dim3 grid(tail_tokens, NUM_FULL_VISITS);
-  if (kv_fp8) {
-    tail_kv_to_pool_page_kernel<true><<<grid, 256, 0, stream>>>(src_tail_k, src_tail_v, tail_tokens, phys_page,
-                                                                dst_k_pool, dst_v_pool);
+  if (kv_fp8 && v4) {
+    tail_kv_to_pool_page_kernel<2><<<grid, 256, 0, stream>>>(src_tail_k, src_tail_v, tail_tokens, phys_page,
+                                                             dst_k_pool, dst_v_pool);
+  } else if (kv_fp8) {
+    tail_kv_to_pool_page_kernel<1><<<grid, 256, 0, stream>>>(src_tail_k, src_tail_v, tail_tokens, phys_page,
+                                                             dst_k_pool, dst_v_pool);
   } else {
-    tail_kv_to_pool_page_kernel<false><<<grid, 256, 0, stream>>>(src_tail_k, src_tail_v, tail_tokens, phys_page,
+    tail_kv_to_pool_page_kernel<0><<<grid, 256, 0, stream>>>(src_tail_k, src_tail_v, tail_tokens, phys_page,
                                                                  dst_k_pool, dst_v_pool);
   }
   CUDA_CHECK(cudaGetLastError());

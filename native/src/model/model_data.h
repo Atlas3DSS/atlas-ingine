@@ -360,6 +360,13 @@ struct State {
   bool kv_last_full = false;
   VisitPlan plan = make_visit_plan(PASSES);
   std::shared_ptr<PagedKvCache> paged_kv;  // non-null when 3-tier paged Q4_0 full-attention KV is enabled
+  // TP batch pool (k_full/v_full unused): full-attention rows live in 64-token pages of k_pool/v_pool, page ids in
+  // pool_page_table[pool_slot * pool_max_pages + j / 64]; kv_v4: FP4 values.
+  void* k_pool = nullptr;
+  void* v_pool = nullptr;
+  const std::int32_t* pool_page_table = nullptr;
+  int pool_slot = -1, pool_max_pages = 0;
+  bool kv_v4 = false;
   Tensor k_ring, v_ring;      // bf16 [plan.num_sliding_visits, 1024, 8, 128] (sliding visits)
   Tensor ring_pos;            // int64 [plan.num_sliding_visits, 1024], absolute position per slot, -1 = empty
   Tensor k_full, v_full;      // bf16/fp8 [num_full_slots, max_ctx, 8, 128] or q4_0 u8 [num_full_slots, max_ctx, 576]
