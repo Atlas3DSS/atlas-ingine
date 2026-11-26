@@ -23,7 +23,8 @@ def start_mock_worker(
     max_batch: int = 1,
     header_override: str | None = None,
     body_mode_override: str | None = None,
-    cached_tokens: int = 0,
+    cached_tokens: object = 0,
+    omit_cached_tokens: bool = False,
 ):
     received: list[dict] = []
 
@@ -90,6 +91,8 @@ def start_mock_worker(
             )
             hdr = header_override if header_override is not None else active_mode
             reported = body_mode_override if body_mode_override is not None else active_mode
+            details = {} if omit_cached_tokens else {"cached_tokens": cached_tokens}
+            ptoks = max(128, cached_tokens) if type(cached_tokens) is int else 128
             self._send(
                 200,
                 {
@@ -105,10 +108,10 @@ def start_mock_worker(
                         }
                     ],
                     "usage": {
-                        "prompt_tokens": max(128, cached_tokens),
+                        "prompt_tokens": ptoks,
                         "completion_tokens": 8,
-                        "total_tokens": max(128, cached_tokens) + 8,
-                        "prompt_tokens_details": {"cached_tokens": cached_tokens},
+                        "total_tokens": ptoks + 8,
+                        "prompt_tokens_details": details,
                     },
                 },
                 mode_hdr=hdr,
@@ -224,7 +227,7 @@ class TestHostCacheModePolicy(unittest.TestCase):
             decode_tok_per_s=50.0,
         )
 
-        # 1. Raw switch without compatible checkpoint or replay -> BLOCKED!
+        # 1. Raw switch without authorized replay -> BLOCKED!
         req_raw = pol.AdmissionRequest(
             task_id="t-sw-raw",
             session_id="s-sw",
@@ -237,33 +240,9 @@ class TestHostCacheModePolicy(unittest.TestCase):
         )
         dec_raw = pol.evaluate_worker_for_mode(w_lf, req_raw, "last_full")
         self.assertFalse(dec_raw.admitted)
-        self.assertIn("mode_switch_blocked_no_checkpoint_or_replay", dec_raw.reason)
+        self.assertIn("mode_switch_blocked_no_authorized_replay", dec_raw.reason)
 
-        # 2. Wrong-mode checkpoint supplied -> BLOCKED!
-        bad_ckpt = pol.CheckpointIdentity(
-            model_id="inkling-2-mini",
-            kv_format="q4_0",
-            kv_cache_mode="per_pass",
-            cache_namespace="ns1:kv_mode=per_pass",
-            prefix_tokens=8192,
-            prefix_sha256="deadbeef",
-            checkpoint_path="/tmp/bad.ckpt",
-        )
-        req_bad_ckpt = pol.AdmissionRequest(
-            task_id="t-sw-badckpt",
-            session_id="s-sw",
-            cache_namespace="ns1",
-            context_tokens=8192,
-            expected_new_tokens=128,
-            prefix_sha256="deadbeef",
-            preferred_mode="last_full",
-            mode_switch=pol.ModeSwitchContext(prior_kv_cache_mode="per_pass", compatible_checkpoint=bad_ckpt),
-        )
-        dec_bad = pol.evaluate_worker_for_mode(w_lf, req_bad_ckpt, "last_full")
-        self.assertFalse(dec_bad.admitted)
-        self.assertIn("mode_switch_checkpoint_mode_mismatch", dec_bad.reason)
-
-        # 3. Compatible last_full checkpoint on an HTTP worker WITHOUT matching loaded_checkpoint_digest -> BLOCKED!
+        # 2. HTTP checkpoint-only transition (no runtime HTTP restore receipt exists) -> BLOCKED!
         good_ckpt = pol.CheckpointIdentity(
             model_id="inkling-2-mini",
             kv_format="q4_0",
@@ -283,30 +262,21 @@ class TestHostCacheModePolicy(unittest.TestCase):
             preferred_mode="last_full",
             mode_switch=pol.ModeSwitchContext(prior_kv_cache_mode="per_pass", compatible_checkpoint=good_ckpt),
         )
-        dec_unloaded = pol.evaluate_worker_for_mode(w_lf, req_good_ckpt, "last_full")
-        self.assertFalse(dec_unloaded.admitted)
-        self.assertIn("mode_switch_checkpoint_restore_unavailable_require_authorized_replay", dec_unloaded.reason)
+        dec_ckpt = pol.evaluate_worker_for_mode(w_lf, req_good_ckpt, "last_full")
+        self.assertFalse(dec_ckpt.admitted)
+        self.assertIn("mode_switch_checkpoint_restore_unavailable_over_http_require_authorized_replay", dec_ckpt.reason)
 
-        # 3b. Compatible last_full checkpoint on a worker holding that exact verified loaded checkpoint -> ADMITTED!
-        w_lf_loaded = pol.WorkerCapability(
-            worker_id="w-lf-loaded",
-            base_url="http://127.0.0.1:9004",
+        # Verify distinct identity digests across modes.
+        pp_ckpt = pol.CheckpointIdentity(
             model_id="inkling-2-mini",
-            active_kv_cache_mode="last_full",
-            supported_kv_cache_modes=("per_pass", "last_full"),
-            max_model_len=131072,
             kv_format="q4_0",
-            available_kv_vram_mib=8192.0,
-            prefill_tok_per_s=2000.0,
-            decode_tok_per_s=50.0,
-            loaded_checkpoint_digest=good_ckpt.identity_digest(),
+            kv_cache_mode="per_pass",
+            cache_namespace="ns1:kv_mode=per_pass",
+            prefix_tokens=8192,
+            prefix_sha256="deadbeef",
+            checkpoint_path="/tmp/good_lf.ckpt",
         )
-        dec_good = pol.evaluate_worker_for_mode(w_lf_loaded, req_good_ckpt, "last_full")
-        self.assertTrue(dec_good.admitted)
-        self.assertEqual(dec_good.mode_switch_action, "compatible_checkpoint")
-        self.assertFalse(dec_good.bypass_prefix_cache)
-        self.assertEqual(dec_good.checkpoint_identity.kv_cache_mode, "last_full")
-        self.assertNotEqual(bad_ckpt.identity_digest(), dec_good.checkpoint_identity.identity_digest())
+        self.assertNotEqual(pp_ckpt.identity_digest(), good_ckpt.identity_digest())
 
         # 4. Authorized replay -> ADMITTED with bypass_prefix_cache=True, deadline checked!
         req_replay = pol.AdmissionRequest(
@@ -462,72 +432,61 @@ class TestHostCacheModePolicy(unittest.TestCase):
                 s.shutdown()
                 s.server_close()
 
-    def test_verified_checkpoint_restore_and_max_tokens_binding(self):
-        good_ckpt = pol.CheckpointIdentity(
-            model_id="inkling-2-mini",
-            kv_format="q4_0",
-            kv_cache_mode="last_full",
-            cache_namespace="acct-7:kv_mode=last_full",
-            prefix_tokens=4096,
-            prefix_sha256="ckpt-hash-1",
-            checkpoint_path="/mnt/nvme/lf.ckpt",
+    def test_replay_requires_observed_int_zero_and_registry_binds_stale_context(self):
+        srv_pp, url_pp, _ = start_mock_worker("per_pass", ["per_pass", "last_full"], cached_tokens=0)
+        srv_lf_ok, url_lf_ok, recv_ok = start_mock_worker("last_full", ["per_pass", "last_full"], cached_tokens=0)
+        srv_lf_null, url_lf_null, _ = start_mock_worker("last_full", ["per_pass", "last_full"], cached_tokens=None)
+        srv_lf_omit, url_lf_omit, _ = start_mock_worker(
+            "last_full", ["per_pass", "last_full"], omit_cached_tokens=True
         )
-        srv_zero, url_zero, recv_zero = start_mock_worker(
-            "last_full", ["per_pass", "last_full"], cached_tokens=0
-        )
-        srv_hit, url_hit, recv_hit = start_mock_worker(
-            "last_full", ["per_pass", "last_full"], cached_tokens=4096
-        )
+        srv_lf_pos, url_lf_pos, _ = start_mock_worker("last_full", ["per_pass", "last_full"], cached_tokens=512)
         try:
-            w_zero = pol.discover_worker_capability(
-                "w-lf-zero",
-                url_zero,
-                available_kv_vram_mib=8192.0,
-                loaded_checkpoint_digest=good_ckpt.identity_digest(),
-            )
-            w_hit = pol.discover_worker_capability(
-                "w-lf-hit",
-                url_hit,
-                available_kv_vram_mib=8192.0,
-                loaded_checkpoint_digest=good_ckpt.identity_digest(),
-            )
+            w_pp = pol.discover_worker_capability("w-pp", url_pp, available_kv_vram_mib=8192.0)
+            w_ok = pol.discover_worker_capability("w-lf-ok", url_lf_ok, available_kv_vram_mib=8192.0)
+            w_null = pol.discover_worker_capability("w-lf-null", url_lf_null, available_kv_vram_mib=8192.0)
+            w_omit = pol.discover_worker_capability("w-lf-omit", url_lf_omit, available_kv_vram_mib=8192.0)
+            w_pos = pol.discover_worker_capability("w-lf-pos", url_lf_pos, available_kv_vram_mib=8192.0)
+
             with tempfile.TemporaryDirectory() as td:
-                db = Path(td) / "ckpt_verify.sqlite"
+                db = Path(td) / "replay_strict.sqlite"
                 with pol.HostCacheModeRegistry(db) as reg:
-                    req_sw = pol.AdmissionRequest(
-                        task_id="task-ckpt-sw",
-                        session_id="sess-ckpt",
+                    # Establish registry-confirmed prior session mode = per_pass.
+                    req_init = pol.AdmissionRequest(
+                        task_id="t-init",
+                        session_id="sess-strict",
+                        cache_namespace="acct-7",
+                        context_tokens=1024,
+                        expected_new_tokens=64,
+                        prefix_sha256="h0",
+                    )
+                    out_init = reg.dispatch_chat_completion([w_pp], req_init, [{"role": "user", "content": "hi"}])
+                    self.assertTrue(out_init["admitted"])
+                    self.assertEqual(reg.get_session_mode("sess-strict"), "per_pass")
+
+                    # Stale caller context claiming prior_kv_cache_mode="last_full" when registry has "per_pass" -> BLOCKED!
+                    req_stale = pol.AdmissionRequest(
+                        task_id="t-stale",
+                        session_id="sess-strict",
                         cache_namespace="acct-7",
                         context_tokens=4096,
                         expected_new_tokens=77,
-                        prefix_sha256="ckpt-hash-1",
+                        prefix_sha256="h1",
                         preferred_mode="last_full",
-                        mode_switch=pol.ModeSwitchContext(
-                            prior_kv_cache_mode="per_pass",
-                            compatible_checkpoint=good_ckpt,
-                        ),
+                        mode_switch=pol.ModeSwitchContext(prior_kv_cache_mode="last_full"),
                     )
-                    # Server returns cached_tokens=0 -> MUST fail closed (never accept as checkpoint transition)!
-                    with self.assertRaisesRegex(RuntimeError, "checkpoint restore unverified"):
-                        reg.dispatch_chat_completion([w_zero], req_sw, [{"role": "user", "content": "hi"}])
-                    self.assertEqual(recv_zero[-1]["body"]["max_tokens"], 77)
-                    self.assertIsNone(reg.get_session_mode("sess-ckpt"))
+                    out_stale = reg.dispatch_chat_completion([w_ok], req_stale, [{"role": "user", "content": "hi"}])
+                    self.assertFalse(out_stale["admitted"])
+                    self.assertIn("stale_session_mode_context", out_stale["decision"]["reason"])
+                    self.assertEqual(reg.get_session_mode("sess-strict"), "per_pass")
 
-                    # Server proves cached_tokens == 4096 >= prefix_tokens -> succeeds and binds max_tokens=77!
-                    out_hit = reg.dispatch_chat_completion([w_hit], req_sw, [{"role": "user", "content": "hi"}])
-                    self.assertTrue(out_hit["admitted"])
-                    self.assertEqual(out_hit["bound_max_tokens"], 77)
-                    self.assertEqual(recv_hit[-1]["body"]["max_tokens"], 77)
-                    self.assertEqual(reg.get_session_mode("sess-ckpt"), "last_full")
-
-                    # Replay path where buggy server returns cached_tokens > 0 -> MUST fail closed!
-                    req_replay_bug = pol.AdmissionRequest(
-                        task_id="task-replay-bug",
-                        session_id="sess-replay-bug",
+                    # Authorized replay against servers returning null, missing, or positive cached_tokens -> ALL FAIL CLOSED!
+                    req_replay = pol.AdmissionRequest(
+                        task_id="t-replay",
+                        session_id="sess-strict",
                         cache_namespace="acct-7",
                         context_tokens=4096,
-                        expected_new_tokens=55,
-                        prefix_sha256="ckpt-hash-2",
+                        expected_new_tokens=77,
+                        prefix_sha256="h1",
                         preferred_mode="last_full",
                         mode_switch=pol.ModeSwitchContext(
                             prior_kv_cache_mode="per_pass",
@@ -535,10 +494,20 @@ class TestHostCacheModePolicy(unittest.TestCase):
                             authorized_replay_tokens=4096,
                         ),
                     )
-                    with self.assertRaisesRegex(RuntimeError, "replay prefix-cache violation"):
-                        reg.dispatch_chat_completion([w_hit], req_replay_bug, [{"role": "user", "content": "hi"}])
+                    for bad_worker in (w_null, w_omit, w_pos):
+                        with self.assertRaisesRegex(RuntimeError, "replay prefix-cache violation"):
+                            reg.dispatch_chat_completion([bad_worker], req_replay, [{"role": "user", "content": "hi"}])
+                        # Session mode MUST NOT advance on failed replay verification.
+                        self.assertEqual(reg.get_session_mode("sess-strict"), "per_pass")
+
+                    # Authorized replay with observed integer cached_tokens == 0 -> SUCCEEDS and binds max_tokens=77!
+                    out_ok = reg.dispatch_chat_completion([w_ok], req_replay, [{"role": "user", "content": "hi"}])
+                    self.assertTrue(out_ok["admitted"])
+                    self.assertEqual(out_ok["bound_max_tokens"], 77)
+                    self.assertEqual(recv_ok[-1]["body"]["max_tokens"], 77)
+                    self.assertEqual(reg.get_session_mode("sess-strict"), "last_full")
         finally:
-            for s in (srv_zero, srv_hit):
+            for s in (srv_pp, srv_lf_ok, srv_lf_null, srv_lf_omit, srv_lf_pos):
                 s.shutdown()
                 s.server_close()
 

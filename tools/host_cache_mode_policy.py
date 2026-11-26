@@ -12,12 +12,15 @@ Implements the host/array control plane specified in #829 Requirement 3 and
      explicitly requested under budget pressure), `last_full` satisfies quality,
      context, memory, and deadline budgets, and the worker advertises `last_full`
      support (`B=1`, non-spec, `TP=1`).
-  3. Fail-closed mode-switch contract: switching a session/task between `per_pass`
-     and `last_full` NEVER reuses raw KV state across modes. A mode change requires
-     either (a) a verified checkpoint whose identity binds the target `kv_cache_mode`,
-     `model_id`, `kv_format`, and `prefix_sha256`, or (b) explicit replay of
-     authorized input with `bypass_prefix_cache=True` and a mode-scoped
-     `cache_namespace`, with replay latency charged to the deadline budget.
+  3. Fail-closed mode-switch contract (HTTP `/v1/chat/completions`): switching a
+     session/task between `per_pass` and `last_full` NEVER reuses raw KV state across
+     modes. Because HTTP `/v1/chat/completions` exposes no runtime checkpoint-restore
+     operation or restore receipt (and `usage.cached_tokens` can reflect ordinary
+     in-memory prefix hits), HTTP mode transitions require explicit `authorized_replay`
+     with `bypass_prefix_cache=True`, a mode-scoped `cache_namespace`, replay latency
+     charged to the deadline budget, and an observed integer `cached_tokens == 0` on
+     the server response. Mode transitions are always bound to the registry-confirmed
+     prior session mode even if a caller supplies stale mode-switch context.
   4. Persistent SQLite (WAL) dispatch/result audit log recording `kv_cache_mode`,
      worker capability view, budgets, mode-switch action, checkpoint/prefix identity,
      and server response mode verification.
@@ -132,11 +135,6 @@ class WorkerCapability:
     decode_tok_per_s: float = 40.0
     measured_last_full_nll_delta: float = 0.01056  # measured #829 reference delta unless overridden
     cache_namespace_header: Optional[str] = None
-    # Digest of a checkpoint already loaded & verified inside this worker runtime (e.g. via
-    # `--kv-ckpt-resume <path>`). None means this HTTP worker has no preloaded checkpoint to
-    # satisfy a `compatible_checkpoint` mode switch (HTTP /v1/chat/completions has no on-demand
-    # disk-checkpoint restore operation, so mode switches must use authorized_replay instead).
-    loaded_checkpoint_digest: Optional[str] = None
 
     def __post_init__(self) -> None:
         validate_kv_cache_mode(self.active_kv_cache_mode)
@@ -276,7 +274,6 @@ def discover_worker_capability(
     decode_tok_per_s: float = 40.0,
     measured_last_full_nll_delta: float = 0.01056,
     cache_namespace_header: Optional[str] = None,
-    loaded_checkpoint_digest: Optional[str] = None,
     timeout: float = 15.0,
 ) -> WorkerCapability:
     """Query GET /health and GET /v1/models and build a verified WorkerCapability."""
@@ -331,7 +328,6 @@ def discover_worker_capability(
         decode_tok_per_s=decode_tok_per_s,
         measured_last_full_nll_delta=measured_last_full_nll_delta,
         cache_namespace_header=cache_namespace_header,
-        loaded_checkpoint_digest=loaded_checkpoint_digest,
     )
 
 
@@ -349,75 +345,10 @@ def _validate_mode_switch(
         return True, "same_or_fresh_mode", "none", False, 0, None
 
     # Mode change requested: raw cross-mode KV reuse is strictly forbidden.
-    ckpt = ms.compatible_checkpoint
-    if ckpt is not None:
-        if ckpt.kv_cache_mode != target_mode:
-            return (
-                False,
-                f"mode_switch_checkpoint_mode_mismatch:ckpt={ckpt.kv_cache_mode}!=target={target_mode}",
-                "none",
-                True,
-                0,
-                None,
-            )
-        if ckpt.model_id != worker.model_id or ckpt.kv_format.lower() != worker.kv_format.lower():
-            return (
-                False,
-                "mode_switch_checkpoint_runtime_mismatch",
-                "none",
-                True,
-                0,
-                None,
-            )
-        if ckpt.prefix_sha256 != req.prefix_sha256:
-            return (
-                False,
-                "mode_switch_checkpoint_prefix_mismatch",
-                "none",
-                True,
-                0,
-                None,
-            )
-        if ckpt.prefix_tokens <= 0:
-            return (
-                False,
-                "mode_switch_checkpoint_empty_prefix",
-                "none",
-                True,
-                0,
-                None,
-            )
-        # HTTP /v1/chat/completions exposes no on-demand disk checkpoint restore operation.
-        # Admit `compatible_checkpoint` ONLY when the target worker already holds that exact
-        # verified checkpoint loaded (e.g. launched with `--kv-ckpt-resume`) and verify
-        # `cached_tokens >= ckpt.prefix_tokens` on the response. Otherwise require authorized_replay.
-        if worker.loaded_checkpoint_digest == ckpt.identity_digest():
-            return (
-                True,
-                "mode_switch_via_verified_loaded_checkpoint",
-                "compatible_checkpoint",
-                False,
-                0,
-                ckpt.checkpoint_path,
-            )
-        if ms.replay_authorized and ms.authorized_replay_tokens > 0:
-            return (
-                True,
-                "mode_switch_via_authorized_replay",
-                "authorized_replay",
-                True,
-                ms.authorized_replay_tokens,
-                None,
-            )
-        return (
-            False,
-            "mode_switch_checkpoint_restore_unavailable_require_authorized_replay",
-            "none",
-            True,
-            0,
-            None,
-        )
-
+    # HTTP /v1/chat/completions has no runtime checkpoint-restore operation or restore receipt
+    # (and `usage.cached_tokens` can come from ordinary in-memory prefix hits), so HTTP mode
+    # switches strictly require explicit authorized replay until a verified runtime restore
+    # receipt exists.
     if ms.replay_authorized and ms.authorized_replay_tokens > 0:
         return (
             True,
@@ -428,9 +359,19 @@ def _validate_mode_switch(
             None,
         )
 
+    if ms.compatible_checkpoint is not None:
+        return (
+            False,
+            "mode_switch_checkpoint_restore_unavailable_over_http_require_authorized_replay",
+            "none",
+            True,
+            0,
+            None,
+        )
+
     return (
         False,
-        f"mode_switch_blocked_no_checkpoint_or_replay:{ms.prior_kv_cache_mode}->{target_mode}",
+        f"mode_switch_blocked_no_authorized_replay:{ms.prior_kv_cache_mode}->{target_mode}",
         "none",
         True,
         0,
@@ -808,9 +749,28 @@ class HostCacheModeRegistry:
         worker_map = {w.worker_id: w for w in workers}
         prior_mode = self.get_session_mode(req.session_id)
         eff_req = req
-        if prior_mode is not None and req.mode_switch is None:
-            # Bind recorded session mode automatically so silent mode switches are blocked.
-            eff_req = dataclasses.replace(req, mode_switch=ModeSwitchContext(prior_kv_cache_mode=prior_mode))
+        if prior_mode is not None:
+            # Always bind mode transitions to the registry-confirmed prior session mode,
+            # even if the caller supplied stale ModeSwitchContext.
+            if req.mode_switch is None:
+                eff_req = dataclasses.replace(req, mode_switch=ModeSwitchContext(prior_kv_cache_mode=prior_mode))
+            elif req.mode_switch.prior_kv_cache_mode != prior_mode:
+                stale_dec = AdmissionDecision(
+                    admitted=False,
+                    worker_id=None,
+                    selected_mode=None,
+                    reason=(
+                        f"stale_session_mode_context:caller_prior={req.mode_switch.prior_kv_cache_mode}"
+                        f"!=registry_prior={prior_mode}"
+                    ),
+                )
+                dispatch_id = self.record_dispatch(eff_req, stale_dec)
+                return {
+                    "dispatch_id": dispatch_id,
+                    "admitted": False,
+                    "decision": stale_dec.to_dict(),
+                    "response": None,
+                }
 
         decision = select_worker_and_mode(worker_map.values(), eff_req)
         dispatch_id = self.record_dispatch(eff_req, decision)
@@ -901,33 +861,10 @@ class HostCacheModeRegistry:
         cached_tokens = details.get("cached_tokens")
 
         # Post-response mode-switch verification:
-        #   - compatible_checkpoint: server MUST prove cached_tokens >= checkpoint.prefix_tokens.
-        #   - authorized_replay: server MUST NOT reuse cached tokens (cached_tokens must be 0 or None).
-        if decision.mode_switch_action == "compatible_checkpoint":
-            want_prefix = (
-                eff_req.mode_switch.compatible_checkpoint.prefix_tokens
-                if (eff_req.mode_switch and eff_req.mode_switch.compatible_checkpoint)
-                else 1
-            )
-            if not isinstance(cached_tokens, int) or cached_tokens < want_prefix:
-                self.record_result(
-                    dispatch_id=dispatch_id,
-                    session_id=eff_req.session_id,
-                    admitted_mode=decision.selected_mode,
-                    server_mode=server_mode,
-                    status="checkpoint_restore_unverified",
-                    prompt_tokens=usage.get("prompt_tokens"),
-                    cached_tokens=cached_tokens if isinstance(cached_tokens, int) else None,
-                    completion_tokens=usage.get("completion_tokens"),
-                    elapsed_seconds=elapsed,
-                    error_detail=f"cached_tokens={cached_tokens!r} < required checkpoint prefix_tokens={want_prefix}",
-                )
-                raise RuntimeError(
-                    f"checkpoint restore unverified on {dispatch_id}: "
-                    f"cached_tokens={cached_tokens!r} < required prefix_tokens={want_prefix}"
-                )
-        elif decision.mode_switch_action == "authorized_replay":
-            if cached_tokens not in (None, 0):
+        #   - authorized_replay: server MUST report an explicit integer cached_tokens == 0
+        #     (missing, null, boolean, or positive counts fail closed).
+        if decision.mode_switch_action == "authorized_replay":
+            if type(cached_tokens) is not int or cached_tokens != 0:
                 self.record_result(
                     dispatch_id=dispatch_id,
                     session_id=eff_req.session_id,
@@ -935,13 +872,16 @@ class HostCacheModeRegistry:
                     server_mode=server_mode,
                     status="replay_prefix_cache_violation",
                     prompt_tokens=usage.get("prompt_tokens"),
-                    cached_tokens=cached_tokens if isinstance(cached_tokens, int) else None,
+                    cached_tokens=cached_tokens if type(cached_tokens) is int else None,
                     completion_tokens=usage.get("completion_tokens"),
                     elapsed_seconds=elapsed,
-                    error_detail=f"authorized_replay observed non-zero cached_tokens={cached_tokens!r}",
+                    error_detail=(
+                        f"authorized_replay requires observed integer cached_tokens==0; got {cached_tokens!r}"
+                    ),
                 )
                 raise RuntimeError(
-                    f"replay prefix-cache violation on {dispatch_id}: cached_tokens={cached_tokens!r} (expected 0)"
+                    f"replay prefix-cache violation on {dispatch_id}: "
+                    f"observed cached_tokens={cached_tokens!r} (expected integer 0)"
                 )
 
         ckpt_digest = decision.checkpoint_identity.identity_digest() if decision.checkpoint_identity else None
