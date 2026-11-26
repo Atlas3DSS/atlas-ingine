@@ -4,10 +4,16 @@ Multi-architecture Apache-2.0 CUDA inference engine for
 [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), forked from
 [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine).
 
-Inkling-2-Mini has been benchmarked on real cards across **six NVIDIA GPU generations (2016 Pascal through 2025 Blackwell)**: **Tesla P100 (`sm_60`), Tesla V100 (`sm_70`), Tesla T4 & Quadro RTX 6000 (`sm_75`), RTX 3090 & A100 (`sm_86`/`sm_80`), RTX 4090 & H100 (`sm_89`/`sm_90`), and RTX PRO 6000 Blackwell (`sm_120a`)**, with upstream results on the RTX 5090. The engine includes **native Elastic sub-4-bit MoE weights (`ATLAS2` / `ATLAS3`)**,
-**DSpark speculative decoding**, **native vision input**, **OpenAI-compatible structured outputs (`response_format`:
-`json_object` / `json_schema`) + automatic tool-ban**, and a standalone **Verified Ledger SDK (`ledger/`)**.
-On the RTX 3090, all 24 BF16 dense output hashes matched between the pre-port build and the FP16 port. Blackwell and V100 runs passed `kernels_bitlock` (`48/48` on Blackwell) and full-model parity; P100 (`sm_60`) and Turing (`sm_75`) passed kernel tests and real-card speed benchmarks (full-model parity ctest was not run on the cloud P100/T4/RTX 6000/A100/H100 instances).
+![Why use atlas-ingine: eight numbered points](docs/media/why_atlas_ingine.png)
+
+1. **Tesla P100 (2016) to RTX PRO 6000 (2025)**, `sm_60` to `sm_120a`: [measured performance](#measured-performance-16k-64k--262k-context-across-6-nvidia-generations)
+2. **9 to 14 GB checkpoints** (`ATLAS2`/`ATLAS3`, EXL3) for 6 to 24 GB cards: [checkpoints](#checkpoints-direct-hugging-face-links)
+3. **1,000,000-token context** on 6 GB to 96 GB cards: [1M table](#1000000-token-context-6-gb-to-96-gb-silicon)
+4. **Continuous batching and multi-GPU** (`TP2`/`TP4`): [fork additions](#what-this-fork-adds-over-upstream-satellitedowningine), [4× V100](#tesla-v100-sm_70-load-multi-gpu-and-other-engines-published-figures)
+5. **Token-level JSON and JSON Schema masking**, automatic tool-ban: [API](#openai-compatible-api)
+6. **KV, loop-depth, and host memory controls**, single-file weight packs: [fork additions](#what-this-fork-adds-over-upstream-satellitedowningine)
+7. **Verified Ledger SDK** and mech-interp hooks: [KernelBench](#kernelbench-level-2-benchmarks-100-tasks-continual-learning--verified-ledger), [ledger](#building-your-own-verified-ledger)
+8. **Hardware auto-tuner (`./atlas-setup`)** for upstream's standalone C++/CUDA server: [setup](#option-b-hardware-aware-auto-tuner--interactive-installer), [requirements](#requirements)
 
 ## Checkpoints (Direct Hugging Face Links)
 
@@ -23,6 +29,10 @@ On the RTX 3090, all 24 BF16 dense output hashes matched between the pre-port bu
 ## Measured performance (16K, 64K & 262K context across 6 NVIDIA generations)
 
 ![10-Year NVIDIA Architecture Lineup and Continuous Batching](docs/media/nvidia_10yr_and_batch.png)
+
+Inkling-2-Mini has been benchmarked on real cards across **six NVIDIA GPU generations (2016 Pascal through 2025 Blackwell)**: **Tesla P100 (`sm_60`), Tesla V100 (`sm_70`), Tesla T4 & Quadro RTX 6000 (`sm_75`), RTX 3090 & A100 (`sm_86`/`sm_80`), RTX 4090 & H100 (`sm_89`/`sm_90`), and RTX PRO 6000 Blackwell (`sm_120a`)**, with upstream results on the RTX 5090.
+
+On the RTX 3090, all 24 BF16 dense output hashes matched between the pre-port build and the FP16 port. Blackwell and V100 runs passed `kernels_bitlock` (`48/48` on Blackwell) and full-model parity; P100 (`sm_60`) and Turing (`sm_75`) passed kernel tests and real-card speed benchmarks (full-model parity ctest was not run on the cloud P100/T4/RTX 6000/A100/H100 instances).
 
 Unless noted, 64K rows use `ingine-bench --max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000` on commit `901d86e` (runtime opt-in SMEM dispatch for `<=64 KiB` Turing and `<=48 KiB` Pascal). 16K rows use `--max-ctx 16384 --long-prompt 16000`. The V100 262K row uses `--effort low --tokens 64 --runs 1` with no long prompt; A100 and H100 262K rows use `--max-ctx 262144 --tokens 512 --runs 2`.
 
