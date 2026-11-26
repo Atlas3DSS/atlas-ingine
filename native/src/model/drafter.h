@@ -48,11 +48,11 @@ class Drafter {
   static constexpr int SHORTLIST_ROWS = 32768;         // ranked tokens in the shortlist head
   static constexpr int CONTEXT_ROWS = 16384;           // context tokens added to it (until reset())
 
-  // Loads mtp.safetensors from model_dir; `w` supplies the embedding, its norm and the unembedding (the
-  // base logits use w.unembed as stored: FP8 rows with dense_fp8). `w` must outlive the drafter.
-  // shortlist_rows: ranked rows of the shortlist head (tests use fewer to leave tokens of a small vocabulary out).
+  // Loads mtp.safetensors or dspark.gguf from model_dir; `w` supplies the embedding, its norm and (when
+  // head_shards is empty) the unembedding. When head_shards.n_shards > 0, the sharded/blocked target head is
+  // read directly (over peer access for remote shards). `w` and any shards must outlive the drafter.
   Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream,
-          int shortlist_rows = SHORTLIST_ROWS);
+          int shortlist_rows = SHORTLIST_ROWS, const kernels::draft::HeadShards& head_shards = {});
   ~Drafter();
   Drafter(const Drafter&) = delete;
   Drafter& operator=(const Drafter&) = delete;
@@ -149,6 +149,8 @@ class Drafter {
 
   void* alloc(std::size_t bytes);
   void load(const std::filesystem::path& model_dir);
+  void load_safetensors(const std::filesystem::path& path);
+  void load_gguf(const std::filesystem::path& path);
   void run_draft(int bucket);
   void run_layers(int bucket);                                                  // a draft after its input rows
   void run_commit(const ActT* feats, int n, int row0, bool last_piece);  // large commits
@@ -176,9 +178,13 @@ class Drafter {
   const ActT *final_norm_ = nullptr, *mask_embed_ = nullptr, *f_norm_ = nullptr;
   const ActT *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;
   ActT *fold_w_ = nullptr, *fold_b_ = nullptr;
-  kernels::dense::Matrix head_{};         // the unembedding
+  kernels::draft::HeadShards head_shards_{};
+  kernels::dense::Matrix head_{};         // the unembedding (shard 0 metadata view)
   // the shortlist head: rows [0, short_K_) = ranked tokens and specials (ascending ids), then context tokens
-  kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS, H] like head_
+  kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS (padded to 16), H] like head_
+  std::int64_t* short_blk_off_ = nullptr;
+  std::int32_t* short_blk_soff_ = nullptr;
+  std::uint16_t* short_q6_scales_ = nullptr;
   std::int32_t* short_map_ = nullptr;     // row -> token id
   std::int32_t* short_ids_ = nullptr;     // staging of ids to gather
   int short_K_ = 0, short_E_ = 0;         // ranked rows, context rows in use

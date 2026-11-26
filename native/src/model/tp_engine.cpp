@@ -26,6 +26,7 @@
 #include "model/drafter.h"
 #include "model/model_kernels.h"
 #include "model/runtime.h"
+#include "model/weights_gguf.h"
 
 #include <algorithm>
 #include <array>
@@ -1837,14 +1838,26 @@ class TpDecoder {
  public:
   TpDecoder(const Weights& w, const Ablation& abl, State& st, int rank, ncclComm_t comm, TpWorkerPool::RankInfo& rinfo)
       : w_(w), abl_(abl), st_(st), rank_(rank), comm_(comm), rinfo_(rinfo),
+        gemm_(std::make_unique<pk::Gemm>()),
         attn_ws_(attn::workspace_bytes(8)),
         wo_f32_(std::size_t(8) * H * sizeof(float)),
         moe_f32_(std::size_t(8) * H * sizeof(float)),
+        router_logits_(std::size_t(8) * EXPERTS * sizeof(float)),
+        counts_(EXPERTS * sizeof(int)),
+        tiles_n_(sizeof(int)),
+        pair_token_(std::size_t(8) * TOP_K * sizeof(int)),
+        pair_dst_(std::size_t(8) * TOP_K * sizeof(int)),
+        tiles_(std::size_t(pk::moe_tiles_capacity(8)) * sizeof(int4)),
+        route_done_(sizeof(unsigned)),
+        down_act_(std::size_t(8) * TOP_K * H * sizeof(ActT)),
         local_logits_(std::size_t(8) * LOCAL_VOCAB_CHUNK * sizeof(float)),
         gathered_logits_(std::size_t(TP_SIZE) * 8 * LOCAL_VOCAB_CHUNK * sizeof(float)) {
     attn_ws_.fill(0);
     wo_f32_.fill(0);
     moe_f32_.fill(0);
+    counts_.fill(0);
+    tiles_n_.fill(0);
+    route_done_.fill(0);
     segments_[0] = upload_ints(proj_layout(false, true));
     segments_[1] = upload_ints(proj_layout(false, false));
     full_segments_ = upload_ints(proj_layout(true, false));
@@ -1992,9 +2005,12 @@ class TpDecoder {
       }
       attn::attn_decode(a, stream);
 
-      // ---- Sharded wo (K=768) + NCCL AllReduce + static_conv_decode
+      // ---- Sharded wo + P2P/NCCL AllReduce + static_conv_decode
       dense::gemv(bf16m(b.attn_out), m, HEADS * HEAD_DIM, matrix(layer.wo), static_cast<float*>(wo_f32_.p), false, stream);
-      NCCL_CHECK(ncclAllReduce(wo_f32_.p, wo_f32_.p, std::size_t(m) * H, ncclFloat32, ncclSum, comm_, stream));
+      if (rinfo_.p2p_ar.active() && m * H <= rinfo_.p2p_ar.cap && 2 * v + 1 < rinfo_.p2p_ar.slots)
+        bk::p2p_allreduce2(static_cast<float*>(wo_f32_.p), m * H, rinfo_.p2p_ar, 2 * v, stream);
+      else
+        NCCL_CHECK(ncclAllReduce(wo_f32_.p, wo_f32_.p, std::size_t(m) * H, ncclFloat32, ncclSum, comm_, stream));
       dense::static_conv_decode(static_cast<const float*>(wo_f32_.p), m, f32p(layer.attn_conv), st.conv_attn_at(v),
                                 f32m(b.y), history ? f32m(b.hist_attn) + std::size_t(v) * m * H : nullptr, stream);
 
@@ -2019,24 +2035,39 @@ class TpDecoder {
                              static_cast<const ActT*>(layer.mlp1_gate_down.data), layer.mlp1_gate_forget16.data,
                              layer.mlp1_gate_gain16.data, false, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr, false, stream);
 
-      dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
-                    static_cast<int*>(b.idx.data), f32m(b.wts), false, stream);
-
-      // ---- EP4 MoE + NCCL AllReduce + static_conv_decode
+      // ---- TP/EP MoE (wgemm / Volta decode_v70) + P2P/NCCL AllReduce + static_conv_decode
+      const pk::MoeWork work{static_cast<int*>(counts_.p), static_cast<int*>(tiles_n_.p),
+                             static_cast<int4*>(tiles_.p), static_cast<int*>(pair_token_.p),
+                             static_cast<int*>(pair_dst_.p)};
+      if (!pk::moe_route_decode(bf16m(b.xm), m, f32p(layer.router), f32p(layer.router_bias),
+                                static_cast<int*>(b.idx.data), f32m(b.wts), static_cast<float*>(router_logits_.p),
+                                static_cast<unsigned*>(route_done_.p), work, stream)) {
+        gemm_->run(bf16m(b.xm), H, static_cast<const ActT*>(layer.router_bf16.data), H,
+                   static_cast<float*>(router_logits_.p), EXPERTS, true, m, EXPERTS, H, stream);
+        CUDA_CHECK(cudaMemsetAsync(counts_.p, 0, EXPERTS * sizeof(int), stream));
+        pk::moe_topk(static_cast<const float*>(router_logits_.p), f32p(layer.router_bias), m,
+                     static_cast<int*>(b.idx.data), f32m(b.wts), static_cast<int*>(counts_.p), stream);
+        pk::moe_route(static_cast<const int*>(b.idx.data), m, work, stream);
+      }
       const Experts& ex = layer.experts;
-      const moe::Format fmt13 = static_cast<moe::Format>(static_cast<int>(ex.w13_fmt));
-      const moe::Format fmt2 = static_cast<moe::Format>(static_cast<int>(ex.w2_fmt));
-      moe::ExpertPtrs eptrs{};
-      eptrs.w13 = static_cast<const std::uint8_t* const*>(ex.w13_ptrs.data);
-      eptrs.w13_scale = static_cast<const std::uint8_t* const*>(ex.w13_scale_ptrs.data);
-      eptrs.w2 = static_cast<const std::uint8_t* const*>(ex.w2_ptrs.data);
-      eptrs.w2_scale = static_cast<const std::uint8_t* const*>(ex.w2_scale_ptrs.data);
-      moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), nullptr, nullptr, f32p(ex.w13_factor),
-                  fmt13, bf16m(b.act), false, stream, nullptr, &eptrs);
-      moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), nullptr, nullptr,
-                    f32p(ex.w2_factor), fmt2, nullptr, nullptr, static_cast<float*>(moe_f32_.p), nullptr, false,
-                    stream, nullptr, nullptr, &eptrs);
-      NCCL_CHECK(ncclAllReduce(moe_f32_.p, moe_f32_.p, std::size_t(m) * H, ncclFloat32, ncclSum, comm_, stream));
+      pk::MoeExperts me;
+      me.fmt = static_cast<int>(ex.w13_fmt);
+      me.w2_fmt = static_cast<int>(ex.w2_fmt);
+      me.w13_factor = f32p(ex.w13_factor);
+      me.w2_factor = f32p(ex.w2_factor);
+      me.w13_ptrs = static_cast<const std::uint8_t* const*>(ex.w13_ptrs.data);
+      me.w13_scale_ptrs = static_cast<const std::uint8_t* const*>(ex.w13_scale_ptrs.data);
+      me.w2_ptrs = static_cast<const std::uint8_t* const*>(ex.w2_ptrs.data);
+      me.w2_scale_ptrs = static_cast<const std::uint8_t* const*>(ex.w2_scale_ptrs.data);
+      me.active_mask = static_cast<const std::uint8_t*>(ex.active_mask.data);
+      pk::moe_gate_up(me, bf16m(b.xm), m, work, bf16m(b.act), stream);
+      pk::moe_down(me, bf16m(b.act), m, work, static_cast<ActT*>(down_act_.p), stream);
+      pk::moe_combine_ep(static_cast<const ActT*>(down_act_.p), f32p(b.wts), static_cast<const int*>(b.idx.data),
+                         me.active_mask, m, static_cast<float*>(moe_f32_.p), stream);
+      if (rinfo_.p2p_ar.active() && m * H <= rinfo_.p2p_ar.cap && 2 * v + 1 < rinfo_.p2p_ar.slots)
+        bk::p2p_allreduce2(static_cast<float*>(moe_f32_.p), m * H, rinfo_.p2p_ar, 2 * v + 1, stream);
+      else
+        NCCL_CHECK(ncclAllReduce(moe_f32_.p, moe_f32_.p, std::size_t(m) * H, ncclFloat32, ncclSum, comm_, stream));
       dense::static_conv_decode(static_cast<const float*>(moe_f32_.p), m, f32p(layer.mlp_conv), st.conv_mlp_at(v),
                                 f32m(b.y2), history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, stream);
       prev_v = v;
@@ -2075,7 +2106,9 @@ class TpDecoder {
   int rank_;
   ncclComm_t comm_;
   TpWorkerPool::RankInfo& rinfo_;
-  DeviceBuffer attn_ws_, wo_f32_, moe_f32_, local_logits_, gathered_logits_;
+  std::unique_ptr<pk::Gemm> gemm_;
+  DeviceBuffer attn_ws_, wo_f32_, moe_f32_, router_logits_, counts_, tiles_n_, pair_token_, pair_dst_, tiles_,
+      route_done_, down_act_, local_logits_, gathered_logits_;
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
   std::array<DeviceBuffer, 2> segments_;
   DeviceBuffer full_segments_;
@@ -2092,10 +2125,11 @@ class TpSpecGenerator final : public Generator {
     prefill_chunk_ = std::min(options.prefill_chunk, options.max_ctx);
     const std::vector<int> widths = options.spec ? std::vector<int>{1, 2, 4, 8} : std::vector<int>{1};
 
+    const bool use_head_shards = is_gguf_model(options_.model_dir);
     pool_.run_all([&](int r) {
       auto& rk = ranks_[r];
       rk.weights = load_weights_sharded(options_.model_dir, options_.dense_fp8, pool_.stream(r), r, TP_SIZE,
-                                        /*keep_full_unembed=*/(r == 0 && options_.spec));
+                                        /*keep_full_unembed=*/(r == 0 && options_.spec && !use_head_shards));
       rk.ablation = load_ablation(options_.ablation);
       rk.state = make_state(options_.max_ctx, options_.kv_fp8, false);
       rk.prefiller = std::make_unique<TpPrefiller>(rk.weights, rk.ablation, prefill_chunk_, pool_.stream(r),
@@ -2196,8 +2230,24 @@ class TpSpecGenerator final : public Generator {
     if (options_.spec) {
       drafter_weights_.embed = ranks_[0].weights.embed;
       drafter_weights_.embed_norm = ranks_[0].weights.embed_norm;
-      drafter_weights_.unembed = ranks_[0].weights.full_unembed;
-      drafter_ = std::make_unique<Drafter>(options_.model_dir, drafter_weights_, options_.max_ctx, pool_.stream(0));
+      kd::HeadShards hs{};
+      if (use_head_shards) {
+        hs.n_shards = TP_SIZE;
+        hs.rows_per_shard = LOCAL_VOCAB_CHUNK;
+        hs.total_rows = UNPADDED_VOCAB;
+        for (int r = 0; r < TP_SIZE; ++r) {
+          const auto& u = ranks_[r].weights.unembed;
+          hs.shard[r] = dense::Matrix{
+              u.w.data, u.fp8() ? static_cast<const float*>(u.scale.data) : nullptr, u.rows(),
+              static_cast<const std::int64_t*>(u.blk_off.data),
+              static_cast<const std::int32_t*>(u.blk_soff.data),
+              static_cast<const std::uint16_t*>(u.q8_scale.data)};
+        }
+      } else {
+        drafter_weights_.unembed = ranks_[0].weights.full_unembed;
+      }
+      drafter_ = std::make_unique<Drafter>(options_.model_dir, drafter_weights_, options_.max_ctx, pool_.stream(0),
+                                           Drafter::SHORTLIST_ROWS, hs);
       drafter_->capture();
       taps_ = DeviceBuffer(std::size_t(prefill_chunk_) * NUM_TAPS * HIDDEN * sizeof(ActT));
       ckpt_drafter_ = DeviceBuffer(drafter_->checkpoint_bytes());

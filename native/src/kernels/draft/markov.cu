@@ -418,6 +418,34 @@ __global__ void gather_head_rows_kernel(const uint4* __restrict__ src, const flo
   }
 }
 
+__global__ void gather_head_rows_shards_kernel(HeadShards hs, int row_chunks, const std::int32_t* __restrict__ ids,
+                                               int dst_row0, uint4* dst_w, float* dst_scale,
+                                               std::uint16_t* dst_q6_scales, std::int32_t* map) {
+  const int i = blockIdx.x, id = ids[i], dst_r = dst_row0 + i;
+  const int s = (hs.n_shards > 1) ? (id / hs.rows_per_shard) : 0;
+  const int lr = id - s * hs.rows_per_shard;
+  const auto& m = hs.shard[s];
+  if (m.blk_off != nullptr) {
+    const int b = lr >> 4, rl = lr & 15;
+    const std::int32_t so = m.blk_soff[b];
+    const uint4* src_q = reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(m.w) + m.blk_off[b] +
+                                                        std::size_t(rl) * H);
+    uint4* dq = dst_w + std::size_t(dst_r) * (H / 16);
+    for (int c = threadIdx.x; c < H / 16; c += blockDim.x) dq[c] = src_q[c];
+    // Q6_K scales: H / 16 = 144 floats = 36 uint4s per row (stored in uint16_t buffer as 2 uint16s per float)
+    const uint4* src_sc = reinterpret_cast<const uint4*>(
+        reinterpret_cast<const float*>(m.q8_scale + (-2 - so)) + std::size_t(rl) * (H / 16));
+    uint4* dsc = reinterpret_cast<uint4*>(reinterpret_cast<float*>(dst_q6_scales) + std::size_t(dst_r) * (H / 16));
+    for (int c = threadIdx.x; c < (H / 16) / 4; c += blockDim.x) dsc[c] = src_sc[c];
+  } else {
+    const uint4* src = static_cast<const uint4*>(m.w) + std::size_t(lr) * row_chunks;
+    uint4* dst = dst_w + std::size_t(dst_r) * row_chunks;
+    for (int c = threadIdx.x; c < row_chunks; c += blockDim.x) dst[c] = src[c];
+    if (threadIdx.x == 0 && m.scale != nullptr) dst_scale[dst_r] = m.scale[lr];
+  }
+  if (threadIdx.x == 0) map[dst_r] = id;
+}
+
 }  // namespace
 
 void gather_head_rows(const void* src, const float* src_scale, std::size_t row_bytes, const std::int32_t* ids, int n,
@@ -426,6 +454,16 @@ void gather_head_rows(const void* src, const float* src_scale, std::size_t row_b
   if (n <= 0) return;
   gather_head_rows_kernel<<<n, 128, 0, stream>>>(static_cast<const uint4*>(src), src_scale, int(row_bytes / 16), ids,
                                                   static_cast<uint4*>(dst), dst_scale, map);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void gather_head_rows_shards(const HeadShards& hs, std::size_t row_bytes, const std::int32_t* ids, int n,
+                             int dst_row0, void* dst_w, float* dst_scale, std::uint16_t* dst_q6_scales,
+                             std::int32_t* map, cudaStream_t stream) {
+  if (row_bytes % 16 != 0) throw std::invalid_argument("gather_head_rows_shards: rows must be 16-byte multiples");
+  if (n <= 0) return;
+  gather_head_rows_shards_kernel<<<n, 128, 0, stream>>>(hs, int(row_bytes / 16), ids, dst_row0,
+                                                        static_cast<uint4*>(dst_w), dst_scale, dst_q6_scales, map);
   CUDA_CHECK(cudaGetLastError());
 }
 

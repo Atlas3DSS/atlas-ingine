@@ -2,6 +2,7 @@
 
 #include "core/act.h"
 #include "core/device.h"
+#include "core/gguf.h"
 #include "core/safetensors.h"
 #include "kernels/draft/shortlist.h"
 #include "model/model_kernels.h"
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -59,16 +61,26 @@ void* Drafter::alloc(std::size_t bytes) {
 }
 
 Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream,
-                 int shortlist_rows)
+                 int shortlist_rows, const kd::HeadShards& head_shards)
     : w_(w), stream_(stream), ctx_(std::min(max_ctx, DRAFT_CTX)) {
-  if (w.embed_q8())
-    throw std::invalid_argument("DSpark drafter: Q8_0 embedding tables are not supported (set INGINE_GGUF_Q8_EMBED=0)");
-  if (w.unembed.blocked())
-    throw std::invalid_argument("DSpark drafter: a block-table (Q6_K) unembedding is not supported (set INGINE_GGUF_Q6K_HEAD=0)");
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("Drafter: max_ctx must hold two blocks");
-  head_ = {w.unembed.w.data, w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
-           w.unembed.rows()};
-  V_ = w.unembed.rows();
+  if (head_shards.n_shards > 0) {
+    head_shards_ = head_shards;
+  } else {
+    head_shards_.n_shards = 1;
+    head_shards_.rows_per_shard = w.unembed.rows();
+    head_shards_.total_rows = w.unembed.rows();
+    head_shards_.shard[0] = kdense::Matrix{
+        w.unembed.w.data,
+        w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
+        w.unembed.rows(),
+        static_cast<const std::int64_t*>(w.unembed.blk_off.data),
+        static_cast<const std::int32_t*>(w.unembed.blk_soff.data),
+        static_cast<const std::uint16_t*>(w.unembed.q8_scale.data)};
+  }
+  head_ = head_shards_.shard[0];
+  head_.rows = head_shards_.total_rows;
+  V_ = head_shards_.total_rows;
   load(model_dir);
 
   auto bf16s = [&](std::size_t n) { return static_cast<ActT*>(alloc(n * 2)); };
@@ -89,7 +101,7 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   qkv_out_ = f32s(BLOCK * kd::QKV_ROWS);
   gu_out_ = f32s(std::size_t(BLOCK) * 2 * inter_);
   // the shortlist head's base logits (rows past the ones in use stay -inf)
-  base_ = f32s(std::size_t(GAMMA) * std::max(V_, shortlist_rows + 256 + CONTEXT_ROWS));
+  base_ = f32s(std::size_t(GAMMA) * std::max(V_, shortlist_rows + 1024 + CONTEXT_ROWS));
   attn_ws_ = f32s(std::max(kd::attention_workspace_floats(LOCAL_SLOTS), kd::attention_workspace_floats(ctx_)));
   topk_ws_ = alloc(kd::topk_workspace_bytes(GAMMA, V_));
   CUDA_CHECK(cudaMemsetAsync(topk_ws_, 0, kd::topk_workspace_bytes(GAMMA, V_), stream_));  // kept zeroed
@@ -141,16 +153,40 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
     for (int t = 0; t < V_; ++t)
       if (short_in_[t]) list.push_back(t);
     short_K_ = int(list.size());
-    const int rows = short_K_ + CONTEXT_ROWS;
-    const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
-    void* q = alloc(std::size_t(rows) * row_bytes);
-    auto* qs = head_.scale ? f32s(rows) : nullptr;
+    const bool blocked_q6 = head_shards_.blocked();
+    const int rows = blocked_q6 ? ((short_K_ + CONTEXT_ROWS + 15) & ~15) : (short_K_ + CONTEXT_ROWS);
     short_map_ = i32s(rows);
     short_ids_ = i32s(rows);
     CUDA_CHECK(cudaMemsetAsync(short_map_, 0, std::size_t(rows) * 4, stream_));
     CUDA_CHECK(cudaMemcpyAsync(short_ids_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
-    kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, short_K_, q, qs, short_map_, stream_);
-    short_head_ = kdense::Matrix{q, qs, rows};
+    if (blocked_q6) {
+      void* q = alloc(std::size_t(rows) * H);
+      const int n_blks = rows / 16;
+      const std::size_t sc_u16_per_row = std::size_t(H / 16) * 2;
+      short_q6_scales_ = static_cast<std::uint16_t*>(alloc(std::size_t(rows) * sc_u16_per_row * 2));
+      CUDA_CHECK(cudaMemsetAsync(q, 0, std::size_t(rows) * H, stream_));
+      CUDA_CHECK(cudaMemsetAsync(short_q6_scales_, 0, std::size_t(rows) * sc_u16_per_row * 2, stream_));
+      std::vector<std::int64_t> bo(n_blks);
+      std::vector<std::int32_t> bso(n_blks);
+      for (int b = 0; b < n_blks; ++b) {
+        bo[b] = std::int64_t(b) * 16 * H;
+        bso[b] = -2 - std::int32_t(b) * 16 * int(sc_u16_per_row);
+      }
+      short_blk_off_ = static_cast<std::int64_t*>(alloc(std::size_t(n_blks) * 8));
+      short_blk_soff_ = static_cast<std::int32_t*>(alloc(std::size_t(n_blks) * 4));
+      CUDA_CHECK(cudaMemcpyAsync(short_blk_off_, bo.data(), std::size_t(n_blks) * 8, cudaMemcpyHostToDevice, stream_));
+      CUDA_CHECK(cudaMemcpyAsync(short_blk_soff_, bso.data(), std::size_t(n_blks) * 4, cudaMemcpyHostToDevice, stream_));
+      kd::gather_head_rows_shards(head_shards_, H, short_ids_, short_K_, 0, q, nullptr, short_q6_scales_, short_map_,
+                                  stream_);
+      short_head_ = kdense::Matrix{q, nullptr, rows, short_blk_off_, short_blk_soff_, short_q6_scales_};
+    } else {
+      const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
+      void* q = alloc(std::size_t(rows) * row_bytes);
+      auto* qs = head_.scale ? f32s(rows) : nullptr;
+      kd::gather_head_rows_shards(head_shards_, row_bytes, short_ids_, short_K_, 0, q, qs, nullptr, short_map_,
+                                  stream_);
+      short_head_ = kdense::Matrix{q, qs, rows};
+    }
     seg_short_ = segments({short_K_});
     kd::fill(base_, std::size_t(GAMMA) * rows, -INFINITY, stream_);
   }
@@ -191,7 +227,15 @@ Drafter::~Drafter() {
 }
 
 void Drafter::load(const std::filesystem::path& model_dir) {
-  SafetensorsFile f(model_dir / "mtp.safetensors");
+  const auto sf = model_dir / "mtp.safetensors";
+  const auto gg = model_dir / "dspark.gguf";
+  if (std::filesystem::exists(sf)) load_safetensors(sf);
+  else if (std::filesystem::exists(gg)) load_gguf(gg);
+  else throw std::runtime_error("Drafter::load: neither mtp.safetensors nor dspark.gguf found in " + model_dir.string());
+}
+
+void Drafter::load_safetensors(const std::filesystem::path& path) {
+  SafetensorsFile f(path);
   // Whole data region on the device, then the persistent (aligned, derived) tensors from it.
   const std::uint64_t base = f.data_offset();
   DeviceBuffer raw(f.file_size() - base);
@@ -309,8 +353,218 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   fold_b_ = static_cast<ActT*>(alloc(std::size_t(V_) * 2));
   const ActT* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
   const ActT* hb = persist({{mh + "hidden_out.bias", {h}}});
-  kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
+  kd::fold_head_shards(head_shards_, hw, hb, fold_w_, fold_b_, stream_);
   CUDA_CHECK(cudaStreamSynchronize(stream_));  // raw and cat are freed on return
+}
+
+void Drafter::load_gguf(const std::filesystem::path& path) {
+  const GgufFile f(path);
+  // Validate GGUF metadata (llama.cpp "dflash" arch for Inkling-2-Mini DSpark)
+  auto req_str = [&](std::string_view key, std::string_view expect) {
+    const auto v = f.get_string(key);
+    if (!v || *v != expect)
+      throw std::runtime_error("dspark.gguf: " + std::string(key) + " is '" + (v ? *v : "?") + "', expected '" +
+                               std::string(expect) + "'");
+  };
+  auto req_i = [&](std::string_view key, std::int64_t expect) {
+    const auto v = f.get_int(key);
+    if (!v || *v != expect)
+      throw std::runtime_error("dspark.gguf: " + std::string(key) + " mismatch (expected " + std::to_string(expect) + ")");
+  };
+  auto req_f = [&](std::string_view key, double expect, double tol) {
+    const auto v = f.get_float(key);
+    if (!v || std::fabs(*v - expect) > tol)
+      throw std::runtime_error("dspark.gguf: " + std::string(key) + " mismatch");
+  };
+  req_str("general.architecture", "dflash");
+  if (!f.find("dspark_hidden_out.weight"))
+    throw std::runtime_error("dspark.gguf: missing dspark_hidden_out.weight (not Inkling-2 DSpark)");
+  req_i("dflash.block_size", BLOCK);
+  req_i("dflash.embedding_length", H);
+  req_i("dflash.block_count", 3);
+  req_i("dflash.attention.head_count", kd::HEADS);
+  req_i("dflash.attention.head_count_kv", kd::KV_HEADS);
+  req_i("dflash.attention.key_length", kd::HEAD_DIM);
+  req_i("dflash.attention.sliding_window", kd::WINDOW);
+  req_f("dflash.rope.freq_base", double(kd::ROPE_THETA), 1.0);
+  req_f("dflash.attention.layer_norm_rms_epsilon", double(kd::EPS), 1e-9);
+  {
+    const auto tl = f.get_int_array("dflash.target_layers");
+    const std::vector<std::int64_t> expect = {5, 23, 41, 48};
+    if (!tl || *tl != expect) throw std::runtime_error("dspark.gguf: unexpected dflash.target_layers");
+  }
+  {
+    const auto pat = f.get_int_array("dflash.attention.sliding_window_pattern");
+    const std::vector<std::int64_t> expect = {1, 0, 1};
+    if (!pat || *pat != expect) throw std::runtime_error("dspark.gguf: unexpected sliding_window_pattern");
+  }
+
+  auto gguf_name = [](const std::string& n) -> std::string {
+    static const std::map<std::string, std::string> top = {
+        {"fuse_weight", "dspark_fuse.weight"},
+        {"mask_embed", "mask_embd.weight"},
+        {"norm.weight", "output_norm.weight"},
+        {"markov_head.dflare_norm.weight", "dspark_norm.weight"},
+        {"markov_head.markov_w1.weight", "markov_w1.weight"},
+        {"markov_head.rnn_proj.weight", "joint_proj.weight"},
+        {"markov_head.rnn_proj.bias", "joint_proj.bias"},
+        {"markov_head.hidden_out.weight", "dspark_hidden_out.weight"},
+        {"markov_head.hidden_out.bias", "dspark_hidden_out.bias"}};
+    static const std::map<std::string, std::string> layer = {
+        {"input_layernorm.weight", "attn_norm.weight"},
+        {"post_attention_layernorm.weight", "ffn_norm.weight"},
+        {"dflare_norm.weight", "dflare_norm.weight"},
+        {"self_attn.q_norm.weight", "attn_q_norm.weight"},
+        {"self_attn.k_norm.weight", "attn_k_norm.weight"},
+        {"self_attn.k_norm_ctx.weight", "attn_k_ctx_norm.weight"},
+        {"self_attn.q_proj.weight", "attn_q.weight"},
+        {"self_attn.k_proj.weight", "attn_k.weight"},
+        {"self_attn.v_proj.weight", "attn_v.weight"},
+        {"self_attn.o_proj.weight", "attn_output.weight"},
+        {"self_attn.k_proj_ctx.weight", "attn_k_ctx.weight"},
+        {"self_attn.v_proj_ctx.weight", "attn_v_ctx.weight"},
+        {"mlp.gate_proj.weight", "ffn_gate.weight"},
+        {"mlp.up_proj.weight", "ffn_up.weight"},
+        {"mlp.down_proj.weight", "ffn_down.weight"}};
+    if (const auto it = top.find(n); it != top.end()) return it->second;
+    if (n.rfind("layers.", 0) == 0) {
+      const std::size_t dot = n.find('.', 7);
+      if (dot != std::string::npos) {
+        if (const auto it = layer.find(n.substr(dot + 1)); it != layer.end())
+          return "blk." + n.substr(7, dot - 7) + "." + it->second;
+      }
+    }
+    throw std::runtime_error("dspark.gguf: no GGUF tensor mapping for " + n);
+  };
+
+  // Validate tensor shape (GGUF ne is reversed vs safetensors row-major shape)
+  auto get_t = [&](const std::string& sf_name, const std::vector<std::int64_t>& sf_shape) -> const GgufTensor& {
+    const std::string gn = gguf_name(sf_name);
+    const GgufTensor& t = f.at(gn);
+    bool ok = t.ne.size() == sf_shape.size();
+    for (std::size_t i = 0; ok && i < sf_shape.size(); ++i) ok = t.ne[sf_shape.size() - 1 - i] == sf_shape[i];
+    if (!ok) throw std::runtime_error("dspark.gguf: unexpected shape for " + gn);
+    return t;
+  };
+
+  // Upload one GGUF tensor into dst as ActT (BF16 uploaded directly + bf16_to_act_inplace; F32/other via host_from_float)
+  auto upload_act = [&](const GgufTensor& t, ActT* dst) {
+    const std::size_t n = std::size_t(t.numel());
+    if (t.type == GgmlType::BF16) {
+      CUDA_CHECK(cudaMemcpyAsync(dst, t.data, n * 2, cudaMemcpyHostToDevice, stream_));
+      bf16_to_act_inplace(dst, n, stream_);
+    } else if (t.type == GgmlType::F32) {
+      std::vector<ActT> host(n);
+      const auto* fp = reinterpret_cast<const float*>(t.data);
+      for (std::size_t i = 0; i < n; ++i) host[i] = act::host_from_float(fp[i]);
+      CUDA_CHECK(cudaMemcpyAsync(dst, host.data(), n * 2, cudaMemcpyHostToDevice, stream_));
+      CUDA_CHECK(cudaStreamSynchronize(stream_));
+    } else {
+      std::vector<float> tmp(n);
+      ggml_dequantize(t.type, t.data, t.numel(), tmp.data());
+      std::vector<ActT> host(n);
+      for (std::size_t i = 0; i < n; ++i) host[i] = act::host_from_float(tmp[i]);
+      CUDA_CHECK(cudaMemcpyAsync(dst, host.data(), n * 2, cudaMemcpyHostToDevice, stream_));
+      CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+  };
+
+  auto persist = [&](std::initializer_list<std::pair<std::string, std::vector<std::int64_t>>> parts) {
+    std::size_t total_elems = 0;
+    for (const auto& [name, shape] : parts) total_elems += std::size_t(get_t(name, shape).numel());
+    auto* dst = static_cast<ActT*>(alloc(total_elems * 2));
+    std::size_t off = 0;
+    for (const auto& [name, shape] : parts) {
+      const GgufTensor& t = get_t(name, shape);
+      upload_act(t, dst + off);
+      off += std::size_t(t.numel());
+    }
+    return dst;
+  };
+
+  const std::int64_t h = H;
+  const GgufTensor& g0 = f.at("blk.0.ffn_gate.weight");
+  if (g0.ne.size() != 2 || g0.ne[0] != h) throw std::runtime_error("dspark.gguf: unexpected blk.0.ffn_gate.weight");
+  inter_ = int(g0.ne[1]);
+  req_i("dflash.feed_forward_length", inter_);
+  const std::int64_t I = inter_;
+
+  // alpha = act(softmax(fuse_weight.float(), -1))
+  {
+    const GgufTensor& t = get_t("fuse_weight", {4, 4});
+    std::vector<float> fw(16);
+    if (t.type == GgmlType::F32) std::memcpy(fw.data(), t.data, 16 * 4);
+    else ggml_dequantize(t.type, t.data, 16, fw.data());
+    ActT host[16];
+    for (int r = 0; r < 4; ++r) {
+      float m = -INFINITY;
+      for (int c = 0; c < 4; ++c) m = std::max(m, fw[r * 4 + c]);
+      float e[4], s = 0.f;
+      for (int c = 0; c < 4; ++c) s += (e[c] = std::exp(fw[r * 4 + c] - m));
+      for (int c = 0; c < 4; ++c) host[r * 4 + c] = act::host_from_float(e[c] / s);
+    }
+    auto* d = static_cast<ActT*>(alloc(sizeof(host)));
+    CUDA_CHECK(cudaMemcpyAsync(d, host, sizeof(host), cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    alpha_ = d;
+  }
+
+  // FP8 rows of concatenated [r, K] tensors
+  DeviceBuffer cat(std::size_t(2) * I * h * 2);
+  auto fp8 = [&](std::initializer_list<std::pair<std::string, std::int64_t>> parts, std::int64_t K = H) {
+    std::int64_t rows = 0;
+    for (const auto& [name, r] : parts) {
+      const GgufTensor& t = get_t(name, {r, K});
+      upload_act(t, static_cast<ActT*>(cat.p) + rows * K);
+      rows += r;
+    }
+    void* q = alloc(std::size_t(rows * K));
+    auto* scale = static_cast<float*>(alloc(std::size_t(rows) * 4));
+    kdense::fp8_rows(static_cast<const ActT*>(cat.p), int(rows), int(K), q, scale, stream_);
+    return kdense::Matrix{q, scale, int(rows)};
+  };
+
+  {
+    auto kv = [](int l, const char* x) { return "layers." + std::to_string(l) + ".self_attn." + x + "_proj_ctx.weight"; };
+    const std::vector<std::int64_t> shape{kd::KV_DIM, h};
+    const ActT* all = persist({{kv(0, "k"), shape}, {kv(0, "v"), shape}, {kv(1, "k"), shape},
+                               {kv(1, "v"), shape}, {kv(2, "k"), shape}, {kv(2, "v"), shape}});
+    for (int l = 0; l < 3; ++l) layers_[l].wkv_ctx = all + std::size_t(l) * 2 * kd::KV_DIM * H;
+    wkv_all_ = fp8({{kv(0, "k"), kd::KV_DIM}, {kv(0, "v"), kd::KV_DIM}, {kv(1, "k"), kd::KV_DIM},
+                    {kv(1, "v"), kd::KV_DIM}, {kv(2, "k"), kd::KV_DIM}, {kv(2, "v"), kd::KV_DIM}});
+  }
+  for (int l = 0; l < 3; ++l) {
+    const std::string p = "layers." + std::to_string(l) + ".";
+    const std::string a = p + "self_attn.";
+    DraftLayer& L = layers_[l];
+    L.in_norm = persist({{p + "input_layernorm.weight", {h}}});
+    L.post_norm = persist({{p + "post_attention_layernorm.weight", {h}}});
+    L.ctx_norm = persist({{p + "dflare_norm.weight", {h}}});
+    L.q_norm = persist({{a + "q_norm.weight", {kd::HEAD_DIM}}});
+    L.k_norm = persist({{a + "k_norm.weight", {kd::HEAD_DIM}}});
+    L.k_norm_ctx = persist({{a + "k_norm_ctx.weight", {kd::HEAD_DIM}}});
+    L.qkv = fp8({{a + "q_proj.weight", kd::Q_DIM}, {a + "k_proj.weight", kd::KV_DIM}, {a + "v_proj.weight", kd::KV_DIM}});
+    L.gate_up = fp8({{p + "mlp.gate_proj.weight", I}, {p + "mlp.up_proj.weight", I}});
+    L.wo = fp8({{a + "o_proj.weight", h}}, kd::Q_DIM);
+    L.w_down = fp8({{p + "mlp.down_proj.weight", h}}, I);
+  }
+  final_norm_ = persist({{"norm.weight", {h}}});
+  mask_embed_ = persist({{"mask_embed", {h}}});
+  const std::string mh = "markov_head.";
+  const std::int64_t w1_rows = f.at("markov_w1.weight").ne.at(1);
+  if (w1_rows < V_) throw std::runtime_error("dspark.gguf: markov_w1 has fewer rows than the vocabulary");
+  w1_ = persist({{mh + "markov_w1.weight", {w1_rows, kd::RANK}}});
+  rnn_w_ = persist({{mh + "rnn_proj.weight", {kd::RNN_OUT, kd::RNN_IN}}});
+  rnn_b_ = persist({{mh + "rnn_proj.bias", {kd::RNN_OUT}}});
+  f_norm_ = persist({{mh + "dflare_norm.weight", {h}}});
+
+  // fold_w / fold_b (FP64, directly from sharded/blocked target unembedding)
+  fold_w_ = static_cast<ActT*>(alloc(std::size_t(V_) * kd::RANK * 2));
+  fold_b_ = static_cast<ActT*>(alloc(std::size_t(V_) * 2));
+  const ActT* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
+  const ActT* hb = persist({{mh + "hidden_out.bias", {h}}});
+  kd::fold_head_shards(head_shards_, hw, hb, fold_w_, fold_b_, stream_);
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
 void Drafter::reset() {
@@ -329,8 +583,8 @@ std::size_t Drafter::set_context_rows(int rows) {
   CUDA_CHECK(cudaMemcpyAsync(seg_short_, seg, sizeof seg, cudaMemcpyHostToDevice, stream_));
   // the dropped rows' base logits back to -inf (the GEMV only writes the rows in use)
   for (int i = 0; i < GAMMA; ++i)
-    kd::fill(base_ + std::size_t(i) * short_head_.rows + short_K_ + rows, std::size_t(CONTEXT_ROWS - rows), -INFINITY,
-             stream_);
+    kd::fill(base_ + std::size_t(i) * short_head_.rows + short_K_ + rows,
+             std::size_t(short_head_.rows - short_K_ - rows), -INFINITY, stream_);
   return sizeof seg;
 }
 
@@ -342,14 +596,14 @@ std::size_t Drafter::note_tokens(std::span<const std::int32_t> ids) {
       add.push_back(t);
     }
   if (add.empty()) return 0;
-  const std::size_t row = std::size_t(short_K_ + short_E_);
-  const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
+  const int row = short_K_ + short_E_;
+  const std::size_t row_bytes = short_head_.blk_off ? std::size_t(H) : (head_.scale ? std::size_t(H) : std::size_t(H) * 2);
   // pageable sources: copied before cudaMemcpyAsync returns; short_ids_ is free once earlier gathers ran
   const std::size_t ids_bytes = add.size() * 4;
   CUDA_CHECK(cudaMemcpyAsync(short_ids_, add.data(), ids_bytes, cudaMemcpyHostToDevice, stream_));
-  kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, int(add.size()),
-                       static_cast<std::uint8_t*>(const_cast<void*>(short_head_.w)) + row * row_bytes,
-                       head_.scale ? const_cast<float*>(short_head_.scale) + row : nullptr, short_map_ + row, stream_);
+  kd::gather_head_rows_shards(head_shards_, row_bytes, short_ids_, int(add.size()), row,
+                              const_cast<void*>(short_head_.w), const_cast<float*>(short_head_.scale),
+                              short_q6_scales_, short_map_, stream_);
   short_extra_.insert(short_extra_.end(), add.begin(), add.end());
   short_E_ += int(add.size());
   const int seg[3] = {0, short_K_ + short_E_, 0};
@@ -499,7 +753,7 @@ void Drafter::run_small_commit() {
 
 void Drafter::run_draft(int bucket) {
   kd::embed_block(static_cast<const ActT*>(w_.embed.data), static_cast<const float*>(w_.embed_norm.data),
-                  mask_embed_, layers_[0].in_norm, params_, res_, xn_, picks_, stream_, w_.embed_q4());
+                  mask_embed_, layers_[0].in_norm, params_, res_, xn_, picks_, stream_, w_.embed_q4(), w_.embed_q8());
   run_layers(bucket);
 }
 
@@ -556,7 +810,7 @@ Drafter::Draft Drafter::draft(int anchor, int P, float temperature) {
 void Drafter::run_advance(int bucket) {
   kd::round_begin(params_, round_, alpha_, ctx_layers_, f_norm_, static_cast<const ActT*>(w_.embed.data),
                   static_cast<const float*>(w_.embed_norm.data), mask_embed_, layers_[0].in_norm, commit_xin_, f_rnn_,
-                  res_, xn_, picks_, stream_, w_.embed_q4());
+                  res_, xn_, picks_, stream_, w_.embed_q4(), w_.embed_q8());
   kdense::proj(commit_xin_, BLOCK, wkv_all_, seg_kv_, 3, commit_kv_, true, stream_);
   kd::commit_store(commit_kv_, params_, ctx_layers_, stream_);
   run_layers(bucket);

@@ -157,11 +157,12 @@ __global__ void __launch_bounds__(HEAD_DIM) ctx_kv_store_kernel(const ActT* kv, 
 struct RowWeights {
   const ActT* alpha;       // [4, 4]
   const ActT* f_norm;      // [H]
-  const ActT* embed;       // [V, H] or q4_0 u8 [V, 1296] when embed_q4
+  const ActT* embed;       // [V, H], q4_0 u8 [V, 1296] when embed_q4, or q8_0 u8 [V, 2448] when embed_q8
   const float* embed_norm; // fp32 [H]
   const ActT* mask_embed;  // [H]
   const ActT* in_norm;     // [H]
   bool embed_q4;
+  bool embed_q8;
 };
 struct RowOutputs {
   ActT *xin, *f_rnn, *res, *xn;
@@ -217,7 +218,14 @@ __global__ void __launch_bounds__(ROW_THREADS) round_rows_kernel(DraftParams* p,
     float x[8];
     if (r == 0) {
       float v[8];
-      if (W.embed_q4) {
+      if (W.embed_q8) {
+        const uint8_t* row = reinterpret_cast<const uint8_t*>(W.embed) + size_t(anchor) * (size_t(H / 32) * 34);
+        const uint8_t* bp = row + 34 * (c >> 5);
+        const float d = __half2float(__ushort_as_half(uint16_t(bp[0] | (bp[1] << 8))));
+        const uint8_t* q = bp + 2 + (c & 31);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = bf_round(float(int8_t(q[j])) * d);
+      } else if (W.embed_q4) {
         const uint8_t* row = reinterpret_cast<const uint8_t*>(W.embed) + size_t(anchor) * 1296;
         const uint32_t nib4 = *reinterpret_cast<const uint32_t*>(row + (c >> 1));
         const float d = __half2float(reinterpret_cast<const __half*>(row + 1152)[c >> 5]);
@@ -384,7 +392,7 @@ void ctx_kv_store(const ActT* kv, int n, const DraftParams* p, int row0, int kee
 
 void commit_mix(const DraftParams* p, const ActT* alpha, const CtxLayers& L, const ActT* f_norm,
                 ActT* xin, ActT* f_rnn, cudaStream_t stream) {
-  const RowWeights W{alpha, f_norm, nullptr, nullptr, nullptr, nullptr, false};
+  const RowWeights W{alpha, f_norm, nullptr, nullptr, nullptr, nullptr, false, false};
   const RowOutputs O{xin, f_rnn, nullptr, nullptr, nullptr};
   launch_pdl(round_rows_kernel<false>, dim3(BLOCK, 4), dim3(ROW_THREADS), stream, const_cast<DraftParams*>(p),
              RoundInputs{}, W, L, O, 0);
@@ -398,9 +406,9 @@ void commit_store(const float* kv, const DraftParams* p, const CtxLayers& L, cud
 
 void embed_block(const ActT* embed, const float* embed_norm, const ActT* mask_embed,
                  const ActT* in_norm, const DraftParams* p, ActT* res, ActT* xn,
-                 unsigned long long* picks, cudaStream_t stream, bool embed_q4) {
+                 unsigned long long* picks, cudaStream_t stream, bool embed_q4, bool embed_q8) {
   require_aligned(embed, "embed_block: embed must be 16-byte aligned");
-  const RowWeights W{nullptr, nullptr, embed, embed_norm, mask_embed, in_norm, embed_q4};
+  const RowWeights W{nullptr, nullptr, embed, embed_norm, mask_embed, in_norm, embed_q4, embed_q8};
   const RowOutputs O{nullptr, nullptr, res, xn, picks};
   launch_pdl(round_rows_kernel<false>, dim3(BLOCK, 1), dim3(ROW_THREADS), stream, const_cast<DraftParams*>(p),
              RoundInputs{}, W, CtxLayers{}, O, 4);
@@ -410,12 +418,12 @@ void round_begin(DraftParams* p, const RoundInputs& in, const ActT* alpha, const
                  const ActT* f_norm, const ActT* embed, const float* embed_norm,
                  const ActT* mask_embed, const ActT* in_norm, ActT* xin,
                  ActT* f_rnn, ActT* res, ActT* xn, unsigned long long* picks,
-                 cudaStream_t stream, bool embed_q4) {
+                 cudaStream_t stream, bool embed_q4, bool embed_q8) {
   if (in.nwidths < 1 || in.nwidths > 3 || !in.m || !in.accepted || !in.next_greedy || !in.next_sampled)
     throw std::invalid_argument("round_begin: incomplete round inputs");
   for (int i = 0; i < in.nwidths; ++i) require_aligned(in.taps[i], "round_begin: taps must be 16-byte aligned");
   require_aligned(embed, "round_begin: embed must be 16-byte aligned");
-  const RowWeights W{alpha, f_norm, embed, embed_norm, mask_embed, in_norm, embed_q4};
+  const RowWeights W{alpha, f_norm, embed, embed_norm, mask_embed, in_norm, embed_q4, embed_q8};
   const RowOutputs O{xin, f_rnn, res, xn, picks};
   launch_pdl(round_rows_kernel<true>, dim3(BLOCK, 5), dim3(ROW_THREADS), stream, p, in, W, L, O, 0);
 }

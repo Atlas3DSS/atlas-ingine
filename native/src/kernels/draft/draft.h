@@ -11,6 +11,7 @@
 #pragma once
 
 #include "core/act.h"
+#include "kernels/dense/dense.h"
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -111,7 +112,7 @@ void commit_store(const float* kv, const DraftParams* p, const CtxLayers& L, cud
 // xn = bf16(rms(res) * in_norm). Also clears the per-step picks (uint64 [GAMMA]).
 void embed_block(const ActT* embed, const float* embed_norm, const ActT* mask_embed,
                  const ActT* in_norm, const DraftParams* p, ActT* res, ActT* xn,
-                 unsigned long long* picks, cudaStream_t stream, bool embed_q4 = false);
+                 unsigned long long* picks, cudaStream_t stream, bool embed_q4 = false, bool embed_q8 = false);
 
 // A round's transition in one launch: sets p (commit_feats, ncommit, start, anchor, P) from the round inputs,
 // and does commit_mix and embed_block for those values (the same arithmetic as the two launches).
@@ -119,7 +120,7 @@ void round_begin(DraftParams* p, const RoundInputs& in, const ActT* alpha, const
                  const ActT* f_norm, const ActT* embed, const float* embed_norm,
                  const ActT* mask_embed, const ActT* in_norm, ActT* xin,
                  ActT* f_rnn, ActT* res, ActT* xn, unsigned long long* picks,
-                 cudaStream_t stream, bool embed_q4 = false);
+                 cudaStream_t stream, bool embed_q4 = false, bool embed_q8 = false);
 
 // q/k/v of the block rows: qkv fp32 [8, 5120] (BF16 values). q, k: bf16(rope(bf16(rms_head * norm))) at
 // positions P + i; v as is. q -> q_out bf16 [8, 24, 128]. Keys/values go to the cache (BF16 or E4M3 rows):
@@ -158,10 +159,26 @@ std::size_t topk_workspace_bytes(int rows, int V);
 void topk_candidates(const float* base, int rows, int V, const std::int32_t* map, float* cand_val,
                      std::int32_t* cand_idx, void* ws, cudaStream_t stream);
 
+// Row-sharded target unembedding reachable from rank 0 (single shard for TP1, peer-accessible shards for TP>1).
+struct HeadShards {
+  static constexpr int MAX_SHARDS = 4;
+  kernels::dense::Matrix shard[MAX_SHARDS]{};
+  int n_shards = 0;
+  int rows_per_shard = 0;
+  int total_rows = 0;
+  bool blocked() const noexcept { return n_shards > 0 && shard[0].blk_off != nullptr; }
+};
+
 // Copies head rows ids[0..n) of src [V, row_bytes] (+ the FP32 row scales of FP8 rows if src_scale) to dst
 // rows 0..n (+ dst_scale) and sets map[i] = ids[i]. row_bytes: a multiple of 16.
 void gather_head_rows(const void* src, const float* src_scale, std::size_t row_bytes, const std::int32_t* ids, int n,
                       void* dst, float* dst_scale, std::int32_t* map, cudaStream_t stream);
+// Sharded / blocked-Q6_K variant: copies rows ids[0..n) from hs into dst starting at row dst_row0.
+// When hs.blocked(), dst_w receives int8 codes [*, H] and dst_q6_scales receives FP32 scales [*, H/16] (stored
+// in a uint16_t buffer as two uint16s per float, matching gemv_blk_v70_kernel FMT 2).
+void gather_head_rows_shards(const HeadShards& hs, std::size_t row_bytes, const std::int32_t* ids, int n,
+                             int dst_row0, void* dst_w, float* dst_scale, std::uint16_t* dst_q6_scales,
+                             std::int32_t* map, cudaStream_t stream);
 
 // part[i, r] = sum_{c >= 512} rnn_w[r, c] z_i[c] in fp32, z_i[512:] = (h[i], f_rnn): the step-independent
 // part of the rnn projection. rnn_w bf16 [768, 5120], h bf16 [GAMMA, H], f_rnn bf16 [H], part fp32 [7, 768].
@@ -200,6 +217,9 @@ void markov_finish(const std::int32_t* cand_idx, const float* cand_logits, const
 // double -> bfloat16 conversion).
 void fold_head(const void* u, const float* u_scale, int rows, const ActT* hw, const ActT* hb,
                ActT* fold_w, ActT* fold_b, cudaStream_t stream);
+// Sharded / blocked-Q6_K variant of fold_head (reads remote shards over CUDA peer access when n_shards > 1).
+void fold_head_shards(const HeadShards& hs, const ActT* hw, const ActT* hb,
+                      ActT* fold_w, ActT* fold_b, cudaStream_t stream);
 
 // Fills n floats with `value`.
 void fill(float* x, std::size_t n, float value, cudaStream_t stream);
