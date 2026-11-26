@@ -29,6 +29,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
@@ -633,9 +634,12 @@ def wait_for_health(base_url: str, proc: subprocess.Popen[str] | None, timeout_s
     deadline = t0 + timeout_s
     while time.monotonic() < deadline:
         if proc is not None and proc.poll() is not None:
-            out = proc.stdout.read() if proc.stdout else ""
-            err = proc.stderr.read() if proc.stderr else ""
-            raise RuntimeError(f"ingine-serve exited prematurely (rc={proc.returncode}): {err[-1000:] or out[-1000:]}")
+            logs = _snapshot_process_logs(getattr(proc, "_ingine_log_capture", None), join_timeout_s=1.0)
+            if not logs:
+                out = proc.stdout.read() if proc.stdout and not proc.stdout.closed else ""
+                err = proc.stderr.read() if proc.stderr and not proc.stderr.closed else ""
+                logs = err[-1000:] or out[-1000:]
+            raise RuntimeError(f"ingine-serve exited prematurely (rc={proc.returncode}): {logs[-1000:]}")
         try:
             status, _ = http_get_json(base_url, "/health", timeout_s=2.0)
             if status == 200:
@@ -646,47 +650,286 @@ def wait_for_health(base_url: str, proc: subprocess.Popen[str] | None, timeout_s
     raise TimeoutError(f"Server at {base_url}/health did not become ready within {timeout_s}s")
 
 
+AUTHORITATIVE_IDENTITY_SOURCES: frozenset[str] = frozenset(
+    {
+        "runtime_http",
+        "managed_process_telemetry",
+        "runtime_http+managed_process_telemetry",
+    }
+)
+KNOWN_BACKENDS: frozenset[str] = frozenset({"hip", "cuda", "cpu", "mlx", "sycl"})
+
+
+def _norm_backend(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lower()
+    return s or None
+
+
+def _norm_arch(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lower().split(":")[0].strip()
+    return s or None
+
+
+def _norm_sha256(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lower()
+    return s if re.fullmatch(r"[0-9a-f]{64}", s) else None
+
+
+def _extract_meta_fields(obj: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "backend": None,
+        "selected_device_arch": None,
+        "content_sha256": None,
+        "model_id": None,
+        "accelerator_conflict": False,
+        "model_identity_conflict": False,
+    }
+    if not isinstance(obj, dict):
+        return out
+
+    be_vals: set[str] = set()
+    for k in ("backend", "selected_backend", "active_backend"):
+        v = _norm_backend(obj.get(k))
+        if v:
+            be_vals.add(v)
+    if len(be_vals) == 1:
+        out["backend"] = next(iter(be_vals))
+    elif len(be_vals) > 1:
+        out["accelerator_conflict"] = True
+
+    arch_vals: set[str] = set()
+    for k in ("selected_device_arch", "device_arch", "arch_name", "gpu_arch"):
+        v = _norm_arch(obj.get(k))
+        if v:
+            arch_vals.add(v)
+    if len(arch_vals) == 1:
+        out["selected_device_arch"] = next(iter(arch_vals))
+    elif len(arch_vals) > 1:
+        out["accelerator_conflict"] = True
+
+    sha_vals: set[str] = set()
+    for k in ("content_sha256", "model_sha256", "pack_content_sha256", "weights_sha256"):
+        v = _norm_sha256(obj.get(k))
+        if v:
+            sha_vals.add(v)
+    if len(sha_vals) == 1:
+        out["content_sha256"] = next(iter(sha_vals))
+    elif len(sha_vals) > 1:
+        out["model_identity_conflict"] = True
+
+    mid = obj.get("model_id") or obj.get("id")
+    if isinstance(mid, str) and mid.strip():
+        out["model_id"] = mid.strip()
+    return out
+
+
+def _merge_authoritative_field(values: list[tuple[str, str | None]]) -> tuple[str | None, str, bool]:
+    """Merge `(source_label, value)` observations; fail closed on any disagreement across sources."""
+    present: list[tuple[str, str]] = [(src, v) for src, v in values if v is not None]
+    if not present:
+        return None, "missing", False
+    distinct = {v for _, v in present}
+    if len(distinct) > 1:
+        return None, "conflict", True
+    sources = sorted({src for src, _ in present})
+    return next(iter(distinct)), "+".join(sources), False
+
+
 def detect_server_runtime_info(base_url: str, model_id_override: str | None) -> dict[str, Any]:
-    model_id = model_id_override or "ingine"
-    backend: str | None = None
-    selected_device_arch: str | None = None
-    model_sha256: str | None = None
-
-    def extract_meta(obj: Any) -> None:
-        nonlocal backend, selected_device_arch, model_sha256
-        if not isinstance(obj, dict):
-            return
-        if backend is None and isinstance(obj.get("backend"), str):
-            backend = obj["backend"].strip().lower()
-        for k in ("selected_device_arch", "device_arch", "arch_name", "gpu_arch"):
-            if selected_device_arch is None and isinstance(obj.get(k), str) and obj[k].strip():
-                selected_device_arch = obj[k].strip().lower().split(":")[0]
-        for k in ("content_sha256", "model_sha256", "pack_content_sha256"):
-            if model_sha256 is None and isinstance(obj.get(k), str) and obj[k].strip():
-                model_sha256 = obj[k].strip().lower()
-
     status_h, data_h = http_get_json(base_url, "/health", timeout_s=10.0)
-    if status_h == 200:
-        extract_meta(data_h)
+    health_meta = _extract_meta_fields(data_h) if status_h == 200 else _extract_meta_fields(None)
+
     status_m, data_m = http_get_json(base_url, "/v1/models", timeout_s=10.0)
-    if status_m == 200 and isinstance(data_m, dict):
-        extract_meta(data_m)
-        items = data_m.get("data")
-        if isinstance(items, list) and items and isinstance(items[0], dict):
-            if not model_id_override and items[0].get("id"):
-                model_id = str(items[0]["id"])
-            extract_meta(items[0])
+    items: list[dict[str, Any]] = []
+    if status_m == 200 and isinstance(data_m, dict) and isinstance(data_m.get("data"), list):
+        items = [it for it in data_m["data"] if isinstance(it, dict)]
+
+    model_count = len(items)
+    matched_item: dict[str, Any] | None = None
+    model_entry_matched: bool | None = None
+    duplicate_model_entry = False
+    if model_id_override:
+        model_id = model_id_override
+        if model_count > 0:
+            matches = [it for it in items if str(it.get("id") or "") == model_id_override]
+            if len(matches) == 1:
+                matched_item = matches[0]
+                model_entry_matched = True
+            elif len(matches) > 1:
+                duplicate_model_entry = True
+                model_entry_matched = False
+            else:
+                model_entry_matched = False
+    elif model_count > 0:
+        first_id = str(items[0].get("id") or "ingine")
+        model_id = first_id
+        same_id = [it for it in items if str(it.get("id") or "") == first_id]
+        if len(same_id) > 1:
+            duplicate_model_entry = True
+            model_entry_matched = False
+        else:
+            matched_item = items[0]
+            model_entry_matched = True
+    else:
+        model_id = str(health_meta.get("model_id") or "ingine")
+
+    entry_meta = _extract_meta_fields(matched_item)
+
+    # Accelerator metadata: require agreement across /health and the matched /v1/models entry.
+    # Never pull metadata from an unmatched model entry.
+    accel_conflict = bool(health_meta["accelerator_conflict"] or entry_meta["accelerator_conflict"])
+    be_candidates: list[tuple[str, str | None]] = [("runtime_http", health_meta["backend"])]
+    arch_candidates: list[tuple[str, str | None]] = [("runtime_http", health_meta["selected_device_arch"])]
+    if matched_item is not None:
+        be_candidates.append(("runtime_http", entry_meta["backend"]))
+        arch_candidates.append(("runtime_http", entry_meta["selected_device_arch"]))
+    backend, be_src, be_conf = _merge_authoritative_field(be_candidates)
+    selected_device_arch, arch_src, arch_conf = _merge_authoritative_field(arch_candidates)
+    accel_conflict = accel_conflict or be_conf or arch_conf
+
+    # Model identity: when /v1/models lists multiple entries, bind strictly to the matched requested entry
+    # and never borrow server-global /health or another model entry's hash.
+    model_conflict = bool(entry_meta["model_identity_conflict"] or duplicate_model_entry)
+    sha_candidates: list[tuple[str, str | None]] = []
+    if model_count > 1:
+        if matched_item is not None:
+            sha_candidates.append(("runtime_http", entry_meta["content_sha256"]))
+    elif model_count == 1:
+        if model_entry_matched is not False:
+            sha_candidates.append(("runtime_http", entry_meta["content_sha256"]))
+            sha_candidates.append(("runtime_http", health_meta["content_sha256"]))
+            model_conflict = model_conflict or bool(health_meta["model_identity_conflict"])
+    else:
+        if not model_id_override or health_meta.get("model_id") in (None, model_id_override):
+            sha_candidates.append(("runtime_http", health_meta["content_sha256"]))
+            model_conflict = model_conflict or bool(health_meta["model_identity_conflict"])
+
+    model_sha256, sha_src, sha_conf = _merge_authoritative_field(sha_candidates)
+    model_conflict = model_conflict or sha_conf
+    if model_conflict:
+        model_sha256 = None
+        sha_src = "conflict"
+
+    if accel_conflict:
+        accel_src = "conflict"
+    elif backend is not None or selected_device_arch is not None:
+        accel_src = "runtime_http"
+    else:
+        accel_src = "missing"
 
     return {
         "model_id": model_id,
+        "models_listed": model_count,
+        "model_entry_matched": model_entry_matched,
         "backend": backend,
         "selected_device_arch": selected_device_arch,
+        "accelerator_source": accel_src,
+        "accelerator_conflict": accel_conflict,
         "content_sha256": model_sha256,
+        "model_identity_source": sha_src,
+        "model_identity_conflict": model_conflict,
     }
 
 
 def detect_model_id(base_url: str, override: str | None) -> str:
     return str(detect_server_runtime_info(base_url, override)["model_id"])
+
+
+def parse_process_telemetry(output_text: str) -> dict[str, Any]:
+    """Parse structured backend/device/model loader telemetry emitted by a locally launched server process."""
+    backends: set[str] = set()
+    arches: set[str] = set()
+    shas: set[str] = set()
+    pack_paths: set[str] = set()
+
+    for m in re.finditer(
+        r"\b(?:selected_backend|active_backend|backend)\s*[:=]\s*['\"]?([A-Za-z0-9_+-]+)['\"]?",
+        output_text,
+        re.IGNORECASE,
+    ):
+        cand = m.group(1).strip().lower()
+        if cand in KNOWN_BACKENDS:
+            backends.add(cand)
+
+    for m in re.finditer(
+        r"\b(?:selected_device_arch|device_arch|arch_name|gpu_arch)\s*[:=]\s*['\"]?([A-Za-z0-9_.:-]+)['\"]?",
+        output_text,
+        re.IGNORECASE,
+    ):
+        cand = _norm_arch(m.group(1))
+        if cand:
+            arches.add(cand)
+
+    for m in re.finditer(
+        r"\b(?:content_sha256|model_sha256|weights_sha256|pack_content_sha256)\s*[:=]\s*['\"]?([0-9a-fA-F]{64})['\"]?",
+        output_text,
+        re.IGNORECASE,
+    ):
+        shas.add(m.group(1).lower())
+
+    for m in re.finditer(
+        r"\b(?:loaded_pack_path|weight_pack_path)\s*[:=]\s*['\"]?([^\s,'\";]+)['\"]?",
+        output_text,
+        re.IGNORECASE,
+    ):
+        raw_p = m.group(1).strip()
+        if raw_p:
+            pack_paths.add(str(Path(raw_p).resolve()))
+
+    accel_conflict = len(backends) > 1 or len(arches) > 1
+    model_conflict = len(shas) > 1 or len(pack_paths) > 1
+    return {
+        "backend": next(iter(backends)) if len(backends) == 1 else None,
+        "selected_device_arch": next(iter(arches)) if len(arches) == 1 else None,
+        "content_sha256": next(iter(shas)) if len(shas) == 1 else None,
+        "loaded_pack_path": next(iter(pack_paths)) if len(pack_paths) == 1 else None,
+        "accelerator_conflict": accel_conflict,
+        "model_identity_conflict": model_conflict,
+    }
+
+
+def _attach_process_log_capture(proc: subprocess.Popen[str]) -> tuple[list[str], threading.Lock, list[threading.Thread]]:
+    chunks: list[str] = []
+    lock = threading.Lock()
+    threads: list[threading.Thread] = []
+
+    def _drain(stream: Any) -> None:
+        if stream is None:
+            return
+        try:
+            for line in iter(stream.readline, ""):
+                with lock:
+                    if sum(len(c) for c in chunks) < 262144:
+                        chunks.append(line)
+        except (OSError, ValueError):
+            pass
+
+    for s in (proc.stdout, proc.stderr):
+        if s is not None:
+            t = threading.Thread(target=_drain, args=(s,), daemon=True)
+            t.start()
+            threads.append(t)
+    return chunks, lock, threads
+
+
+def _snapshot_process_logs(
+    capture: tuple[list[str], threading.Lock, list[threading.Thread]] | None,
+    join_timeout_s: float = 0.0,
+) -> str:
+    if capture is None:
+        return ""
+    chunks, lock, threads = capture
+    if join_timeout_s > 0.0:
+        for t in threads:
+            t.join(timeout=join_timeout_s)
+    with lock:
+        return "".join(chunks)
 
 
 def find_free_port() -> int:
@@ -713,12 +956,14 @@ def launch_serve_process(
         "--fake" if fake_smoke else "--engine",
         *extra_args,
     ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc._ingine_log_capture = _attach_process_log_capture(proc)  # type: ignore[attr-defined]
+    return proc
 
 
-def stop_serve_process(proc: subprocess.Popen[str] | None) -> None:
+def stop_serve_process(proc: subprocess.Popen[str] | None) -> str:
     if proc is None:
-        return
+        return ""
     if proc.poll() is None:
         proc.terminate()
         try:
@@ -726,10 +971,12 @@ def stop_serve_process(proc: subprocess.Popen[str] | None) -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5.0)
+    logs = _snapshot_process_logs(getattr(proc, "_ingine_log_capture", None), join_timeout_s=2.0)
     if proc.stdout:
         proc.stdout.close()
     if proc.stderr:
         proc.stderr.close()
+    return logs
 
 
 # Strict eligibility bounds for the named Strix Halo target workloads.
@@ -988,6 +1235,7 @@ def run_benchmark_suite(
     else:
         wait_for_health(active_url, None, min(startup_timeout_s, 30.0))
 
+    managed_logs = ""
     try:
         runtime_info = detect_server_runtime_info(active_url, model_id_override)
         model_id = str(runtime_info["model_id"])
@@ -1064,10 +1312,12 @@ def run_benchmark_suite(
                 }
             )
     finally:
-        stop_serve_process(managed_proc)
+        managed_logs = stop_serve_process(managed_proc)
         managed_proc = None
 
     cold_run: dict[str, Any]
+    cold_runtime_info: dict[str, Any] | None = None
+    cold_logs = ""
     if base_url is None and serve_bin is not None and model_dir is not None:
         cold_port = find_free_port()
         cold_url = f"http://127.0.0.1:{cold_port}"
@@ -1082,7 +1332,8 @@ def run_benchmark_suite(
         cold_proc = launch_serve_process(serve_bin, model_dir, cold_port, fake_smoke, extra_serve_args)
         try:
             cold_ready_s = wait_for_health(cold_url, cold_proc, startup_timeout_s)
-            cold_model_id = detect_model_id(cold_url, model_id_override)
+            cold_runtime_info = detect_server_runtime_info(cold_url, model_id_override)
+            cold_model_id = str(cold_runtime_info["model_id"])
             cold_req = sse_chat_completion(
                 cold_url,
                 cold_model_id,
@@ -1100,7 +1351,7 @@ def run_benchmark_suite(
                 "request": cold_req,
             }
         finally:
-            stop_serve_process(cold_proc)
+            cold_logs = stop_serve_process(cold_proc)
     else:
         cold_run = {
             "measured": False,
@@ -1140,24 +1391,99 @@ def run_benchmark_suite(
         },
     }
 
+    server_origin = "managed_local" if base_url is None else "external"
     pack_prov = collect_model_provenance(model_dir, hash_packs=False) if model_dir is not None else {}
-    observed_sha = runtime_info.get("content_sha256") or pack_prov.get("pack_content_sha256")
-    resolved_arch = (selected_device_arch or runtime_info.get("selected_device_arch") or "").strip().lower().split(":")[0] or None
-    resolved_backend = (selected_backend or runtime_info.get("backend") or "").strip().lower() or None
+    local_dir_resolved = str(model_dir.resolve()) if model_dir is not None and model_dir.exists() else None
+
+    be_obs: list[tuple[str, str | None]] = [("runtime_http", runtime_info.get("backend"))]
+    arch_obs: list[tuple[str, str | None]] = [("runtime_http", runtime_info.get("selected_device_arch"))]
+    sha_obs: list[tuple[str, str | None]] = [("runtime_http", runtime_info.get("content_sha256"))]
+    accel_conflict = bool(runtime_info.get("accelerator_conflict"))
+    model_conflict = bool(runtime_info.get("model_identity_conflict"))
+
+    if server_origin == "managed_local" and not fake_smoke:
+        # Verified launch/loader telemetry from the measured local process(es) only.
+        def _resolve_telemetry_sha(tel: dict[str, Any]) -> tuple[str | None, bool]:
+            if tel["content_sha256"] is not None:
+                return str(tel["content_sha256"]), False
+            lpp = tel.get("loaded_pack_path")
+            if isinstance(lpp, str) and lpp:
+                p = Path(lpp)
+                if local_dir_resolved is not None and str(p.parent.resolve()) != local_dir_resolved:
+                    return None, True
+                ident = read_ingpack_header_identities(p)
+                if ident and _is_sha256_hex(ident.get("pack_content_sha256")):
+                    return str(ident["pack_content_sha256"]).lower(), False
+            return None, False
+
+        managed_tel = parse_process_telemetry(managed_logs)
+        accel_conflict = accel_conflict or bool(managed_tel["accelerator_conflict"])
+        model_conflict = model_conflict or bool(managed_tel["model_identity_conflict"])
+        be_obs.append(("managed_process_telemetry", managed_tel["backend"]))
+        arch_obs.append(("managed_process_telemetry", managed_tel["selected_device_arch"]))
+        m_sha, m_pack_conf = _resolve_telemetry_sha(managed_tel)
+        if m_pack_conf:
+            model_conflict = True
+        sha_obs.append(("managed_process_telemetry", m_sha))
+
+        if cold_runtime_info is not None:
+            accel_conflict = accel_conflict or bool(cold_runtime_info.get("accelerator_conflict"))
+            model_conflict = model_conflict or bool(cold_runtime_info.get("model_identity_conflict"))
+            be_obs.append(("runtime_http", cold_runtime_info.get("backend")))
+            arch_obs.append(("runtime_http", cold_runtime_info.get("selected_device_arch")))
+            sha_obs.append(("runtime_http", cold_runtime_info.get("content_sha256")))
+        if cold_logs:
+            cold_tel = parse_process_telemetry(cold_logs)
+            accel_conflict = accel_conflict or bool(cold_tel["accelerator_conflict"])
+            model_conflict = model_conflict or bool(cold_tel["model_identity_conflict"])
+            be_obs.append(("managed_process_telemetry", cold_tel["backend"]))
+            arch_obs.append(("managed_process_telemetry", cold_tel["selected_device_arch"]))
+            c_sha, c_pack_conf = _resolve_telemetry_sha(cold_tel)
+            if c_pack_conf:
+                model_conflict = True
+            sha_obs.append(("managed_process_telemetry", c_sha))
+
+    resolved_backend, be_src, be_conf = _merge_authoritative_field(be_obs)
+    resolved_arch, arch_src, arch_conf = _merge_authoritative_field(arch_obs)
+    observed_sha, sha_src, sha_conf = _merge_authoritative_field(sha_obs)
+    accel_conflict = accel_conflict or be_conf or arch_conf
+    model_conflict = model_conflict or sha_conf
+
+    if accel_conflict:
+        accel_source = "conflict"
+    else:
+        accel_srcs = {s for s in (be_src, arch_src) if s not in ("missing", "conflict")}
+        accel_source = "+".join(sorted(accel_srcs)) if accel_srcs else "missing"
+
+    if model_conflict:
+        observed_sha = None
+        model_source = "conflict"
+    else:
+        model_source = sha_src
 
     bench_payload: dict[str, Any] = {
         "mode": "smoke_fake_only" if fake_smoke else "live_engine",
         "fake_smoke": fake_smoke,
+        "server_origin": server_origin,
         "model_id": model_id,
         "accelerator": {
             "backend": resolved_backend,
             "selected_device_arch": resolved_arch,
+            "source": accel_source,
+            "conflict": accel_conflict,
+            "expected_backend": _norm_backend(selected_backend),
+            "expected_device_arch": _norm_arch(selected_device_arch),
         },
         "model_identity": {
             "model_id": model_id,
-            "content_sha256": observed_sha.lower() if isinstance(observed_sha, str) else None,
+            "models_listed": runtime_info.get("models_listed", 0),
+            "model_entry_matched": runtime_info.get("model_entry_matched"),
+            "content_sha256": observed_sha,
+            "source": model_source,
+            "conflict": model_conflict,
+            "local_model_dir_pack_sha256": pack_prov.get("pack_content_sha256"),
             "pack_header_sha256": pack_prov.get("pack_header_sha256"),
-            "expected_model_sha256": expected_model_sha256.strip().lower() if expected_model_sha256 else None,
+            "expected_model_sha256": _norm_sha256(expected_model_sha256),
         },
         "startup_ready_s": round(startup_ready_s, 4) if startup_ready_s is not None else None,
         "words_per_token_calibrated": round(words_per_tok, 4),
@@ -1181,30 +1507,61 @@ def evaluate_metric(rule: MetricRule, value: float | None) -> str:
     return "PASS" if (value > 0.0 and value < rule.threshold) else "FAIL"
 
 
-def score_report(report: dict[str, Any], expected_model_sha256: str | None = None) -> dict[str, Any]:
+def score_report(
+    report: dict[str, Any],
+    expected_model_sha256: str | None = None,
+    expected_backend: str | None = None,
+    expected_device_arch: str | None = None,
+) -> dict[str, Any]:
     preflight = report.get("preflight") or {}
     bench = report.get("bench") or {}
-    mode = bench.get("mode", "unmeasured")
-    fake_smoke = bool(bench.get("fake_smoke", mode == "smoke_fake_only"))
+    mode = str(bench.get("mode") or "unmeasured")
+    fake_smoke = bool(bench.get("fake_smoke", False)) or (mode == "smoke_fake_only")
+    is_live_engine = (mode == "live_engine") and (not fake_smoke)
     gfx1151 = bool((preflight.get("rocm") or {}).get("gfx1151_detected", False))
 
     accel = bench.get("accelerator") if isinstance(bench.get("accelerator"), dict) else {}
-    selected_backend = str(accel.get("backend") or "").strip().lower() or None
-    selected_arch_raw = str(accel.get("selected_device_arch") or "").strip().lower()
-    selected_arch = selected_arch_raw.split(":")[0] if selected_arch_raw else None
-    selected_accelerator_verified = (selected_backend == "hip" and selected_arch == "gfx1151")
+    accel_source = str(accel.get("source") or "missing").strip().lower()
+    accel_conflict = bool(accel.get("conflict", False)) or (accel_source == "conflict")
+    accel_authoritative = (accel_source in AUTHORITATIVE_IDENTITY_SOURCES) and (not accel_conflict)
+    selected_backend = _norm_backend(accel.get("backend"))
+    selected_arch = _norm_arch(accel.get("selected_device_arch"))
+    exp_backend = _norm_backend(expected_backend if expected_backend is not None else accel.get("expected_backend"))
+    exp_arch = _norm_arch(expected_device_arch if expected_device_arch is not None else accel.get("expected_device_arch"))
+
+    accelerator_assertion_mismatch = (
+        (exp_backend is not None and selected_backend is not None and selected_backend != exp_backend)
+        or (exp_arch is not None and selected_arch is not None and selected_arch != exp_arch)
+    )
+    selected_accelerator_verified = (
+        accel_authoritative
+        and selected_backend == "hip"
+        and selected_arch == "gfx1151"
+        and not accelerator_assertion_mismatch
+    )
 
     model_ident = bench.get("model_identity") if isinstance(bench.get("model_identity"), dict) else {}
-    preflight_model = preflight.get("model") if isinstance(preflight.get("model"), dict) else {}
-    observed_sha_raw = model_ident.get("content_sha256") or preflight_model.get("pack_content_sha256")
-    observed_model_sha = str(observed_sha_raw).strip().lower() if _is_sha256_hex(observed_sha_raw) else None
-    expected_sha_raw = expected_model_sha256 or model_ident.get("expected_model_sha256")
-    expected_model_sha = str(expected_sha_raw).strip().lower() if _is_sha256_hex(expected_sha_raw) else None
+    model_source = str(model_ident.get("source") or "missing").strip().lower()
+    model_conflict = bool(model_ident.get("conflict", False)) or (model_source == "conflict")
+    model_entry_matched = model_ident.get("model_entry_matched")
+    model_authoritative = (
+        (model_source in AUTHORITATIVE_IDENTITY_SOURCES)
+        and (not model_conflict)
+        and (model_entry_matched is not False)
+    )
+    # Never fall back to preflight/local file hashes for served model identity.
+    observed_model_sha = _norm_sha256(model_ident.get("content_sha256")) if model_authoritative else None
+    expected_sha_raw = expected_model_sha256 if expected_model_sha256 is not None else model_ident.get("expected_model_sha256")
+    expected_model_sha = _norm_sha256(expected_sha_raw)
     model_identity_mismatch = (
-        expected_model_sha is not None and observed_model_sha is not None and observed_model_sha != expected_model_sha
+        model_conflict
+        or (expected_model_sha is not None and observed_model_sha is not None and observed_model_sha != expected_model_sha)
     )
     model_identity_verified = (
-        expected_model_sha is not None and observed_model_sha is not None and observed_model_sha == expected_model_sha
+        model_authoritative
+        and expected_model_sha is not None
+        and observed_model_sha is not None
+        and observed_model_sha == expected_model_sha
     )
 
     # Always recompute eligible metrics from raw run evidence so bare/short labels cannot spoof floors.
@@ -1243,8 +1600,8 @@ def score_report(report: dict[str, Any], expected_model_sha256: str | None = Non
 
     all_metrics_pass = (not fake_smoke) and (passed_count == len(STRIX_HALO_TARGET_FLOOR))
     hardware_verified = (
-        all_metrics_pass
-        and mode == "live_engine"
+        is_live_engine
+        and all_metrics_pass
         and gfx1151
         and selected_accelerator_verified
         and model_identity_verified
@@ -1252,11 +1609,19 @@ def score_report(report: dict[str, Any], expected_model_sha256: str | None = Non
 
     if fake_smoke:
         verdict = "UNMEASURED_FAKE_MODE"
+    elif not is_live_engine:
+        verdict = "UNMEASURED_NON_LIVE_MODE"
     elif unmeasured_count > 0:
         verdict = "INCOMPLETE_UNMEASURED"
     elif not all_metrics_pass:
         verdict = "FAIL_STRIX_HALO_FLOOR"
-    elif not gfx1151 or (selected_arch is not None and selected_arch != "gfx1151") or (selected_backend is not None and selected_backend != "hip"):
+    elif accel_conflict or accelerator_assertion_mismatch:
+        verdict = "PASS_FLOOR_ACCELERATOR_MISMATCH"
+    elif (
+        not gfx1151
+        or (selected_arch is not None and selected_arch != "gfx1151")
+        or (selected_backend is not None and selected_backend != "hip")
+    ):
         verdict = "PASS_FLOOR_NON_GFX1151"
     elif model_identity_mismatch:
         verdict = "PASS_FLOOR_MODEL_IDENTITY_MISMATCH"
@@ -1272,9 +1637,17 @@ def score_report(report: dict[str, Any], expected_model_sha256: str | None = Non
         "gfx1151_detected": gfx1151,
         "selected_backend": selected_backend,
         "selected_device_arch": selected_arch,
+        "expected_backend": exp_backend,
+        "expected_device_arch": exp_arch,
+        "accelerator_source": accel_source,
+        "accelerator_conflict": accel_conflict,
+        "accelerator_assertion_mismatch": accelerator_assertion_mismatch,
         "selected_accelerator_verified": selected_accelerator_verified,
         "observed_model_sha256": observed_model_sha,
         "expected_model_sha256": expected_model_sha,
+        "model_identity_source": model_source,
+        "model_identity_conflict": model_conflict,
+        "model_entry_matched": model_entry_matched,
         "model_identity_verified": model_identity_verified,
         "mode": mode,
         "passed": passed_count,
@@ -1373,6 +1746,8 @@ def build_parser() -> argparse.ArgumentParser:
     sc = sub.add_parser("score", help="Score a saved verification report JSON against the Strix Halo floor.")
     sc.add_argument("report_json", type=Path)
     sc.add_argument("--expected-model-sha256", default=None)
+    sc.add_argument("--selected-device-arch", default=None)
+    sc.add_argument("--selected-backend", default=None)
     sc.add_argument("--markdown-out", type=Path, default=None)
     sc.add_argument("--allow-unmeasured", action="store_true")
 
@@ -1452,7 +1827,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "score":
         report = json.loads(args.report_json.read_text(encoding="utf-8"))
-        score = score_report(report, expected_model_sha256=args.expected_model_sha256)
+        score = score_report(
+            report,
+            expected_model_sha256=args.expected_model_sha256,
+            expected_backend=args.selected_backend,
+            expected_device_arch=args.selected_device_arch,
+        )
         md = render_scorecard_markdown(report, score)
         if args.markdown_out is not None:
             args.markdown_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1463,6 +1843,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.allow_unmeasured and score["verdict"] in (
             "UNMEASURED_FAKE_MODE",
+            "UNMEASURED_NON_LIVE_MODE",
             "INCOMPLETE_UNMEASURED",
             "PASS_FLOOR_NON_GFX1151",
             "PASS_FLOOR_UNBOUND_IDENTITY",
@@ -1508,7 +1889,12 @@ def main(argv: list[str] | None = None) -> int:
             selected_backend=args.selected_backend,
         )
         report["bench"] = bench
-        score = score_report(report, expected_model_sha256=args.expected_model_sha256)
+        score = score_report(
+            report,
+            expected_model_sha256=args.expected_model_sha256,
+            expected_backend=args.selected_backend,
+            expected_device_arch=args.selected_device_arch,
+        )
         report["score"] = score
 
         write_json(args.out_dir / "strix_halo_report.json", report)
@@ -1519,6 +1905,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.allow_unmeasured and score["verdict"] in (
             "UNMEASURED_FAKE_MODE",
+            "UNMEASURED_NON_LIVE_MODE",
             "INCOMPLETE_UNMEASURED",
             "PASS_FLOOR_NON_GFX1151",
             "PASS_FLOOR_UNBOUND_IDENTITY",

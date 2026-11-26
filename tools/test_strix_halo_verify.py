@@ -230,13 +230,20 @@ def _make_qualifying_bench() -> dict[str, Any]:
     bench: dict[str, Any] = {
         "mode": "live_engine",
         "fake_smoke": False,
+        "server_origin": "managed_local",
         "accelerator": {
             "backend": "hip",
             "selected_device_arch": "gfx1151",
+            "source": "runtime_http",
+            "conflict": False,
         },
         "model_identity": {
             "model_id": "Qwen3.8-Flash-Next",
+            "models_listed": 1,
+            "model_entry_matched": True,
             "content_sha256": "a" * 64,
+            "source": "runtime_http",
+            "conflict": False,
             "expected_model_sha256": "a" * 64,
         },
         "decode_runs": decode_runs,
@@ -345,31 +352,76 @@ class TestStrixHaloVerify(unittest.TestCase):
 
         # Even if rocminfo lists gfx1151, running on another backend/arch (e.g. cuda or gfx1100) must not verify.
         b_wrong_arch = copy.deepcopy(bench)
-        b_wrong_arch["accelerator"] = {"backend": "hip", "selected_device_arch": "gfx1100"}
+        b_wrong_arch["accelerator"] = {"backend": "hip", "selected_device_arch": "gfx1100", "source": "runtime_http"}
         s_wa = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_wrong_arch})
         self.assertEqual(s_wa["verdict"], "PASS_FLOOR_NON_GFX1151")
         self.assertFalse(s_wa["hardware_verified"])
         self.assertEqual(s_wa["passed"], 11)
 
         b_wrong_be = copy.deepcopy(bench)
-        b_wrong_be["accelerator"] = {"backend": "cpu", "selected_device_arch": "cpu"}
+        b_wrong_be["accelerator"] = {"backend": "cpu", "selected_device_arch": "cpu", "source": "runtime_http"}
         s_wb = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_wrong_be})
         self.assertEqual(s_wb["verdict"], "PASS_FLOOR_NON_GFX1151")
         self.assertFalse(s_wb["hardware_verified"])
 
+        # Non-live_engine mode MUST block BOTH PASS_STRIX_HALO_FLOOR verdict AND hardware_verified while keeping all 11 rows.
+        b_nonlive = copy.deepcopy(bench)
+        b_nonlive["mode"] = "custom_non_live"
+        b_nonlive["fake_smoke"] = False
+        s_nl = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_nonlive})
+        self.assertEqual(s_nl["verdict"], "UNMEASURED_NON_LIVE_MODE")
+        self.assertFalse(s_nl["hardware_verified"])
+        self.assertEqual(s_nl["passed"], 11)
+        self.assertEqual(len(s_nl["rows"]), 11)
+        self.assertTrue(all(r["measured"] is not None for r in s_nl["rows"]))
+
         # Unbound model identity or unbound selected accelerator preserves observations but blocks PASS_STRIX_HALO_FLOOR.
         b_unbound_model = copy.deepcopy(bench)
-        b_unbound_model["model_identity"] = {"model_id": "Qwen3.8-Flash-Next", "content_sha256": None, "expected_model_sha256": None}
-        s_um = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_unbound_model})
+        b_unbound_model["model_identity"] = {
+            "model_id": "Qwen3.8-Flash-Next",
+            "content_sha256": None,
+            "source": "missing",
+            "expected_model_sha256": None,
+        }
+        # Even if preflight scanned a local INGPACK1 file with a matching hash, score_report MUST NOT accept it!
+        s_um = shv.score_report(
+            {
+                "preflight": {"rocm": {"gfx1151_detected": True}, "model": {"pack_content_sha256": "a" * 64}},
+                "bench": b_unbound_model,
+            },
+            expected_model_sha256="a" * 64,
+        )
         self.assertEqual(s_um["verdict"], "PASS_FLOOR_UNBOUND_IDENTITY")
         self.assertFalse(s_um["hardware_verified"])
+        self.assertIsNone(s_um["observed_model_sha256"])
         self.assertEqual(s_um["passed"], 11)
 
         b_unbound_dev = copy.deepcopy(bench)
-        b_unbound_dev["accelerator"] = {"backend": None, "selected_device_arch": None}
+        b_unbound_dev["accelerator"] = {
+            "backend": None,
+            "selected_device_arch": None,
+            "source": "missing",
+            "expected_backend": "hip",
+            "expected_device_arch": "gfx1151",
+        }
         s_ud = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_unbound_dev})
         self.assertEqual(s_ud["verdict"], "PASS_FLOOR_UNBOUND_IDENTITY")
         self.assertFalse(s_ud["hardware_verified"])
+        self.assertEqual(s_ud["passed"], 11)
+
+        # Non-authoritative source tags (e.g. "cli" or "local_file") cannot produce PASS_STRIX_HALO_FLOOR.
+        b_cli_src = copy.deepcopy(bench)
+        b_cli_src["accelerator"]["source"] = "cli"
+        s_cli = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_cli_src})
+        self.assertEqual(s_cli["verdict"], "PASS_FLOOR_UNBOUND_IDENTITY")
+        self.assertFalse(s_cli["hardware_verified"])
+
+        b_local_src = copy.deepcopy(bench)
+        b_local_src["model_identity"]["source"] = "local_file"
+        s_loc = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_local_src})
+        self.assertEqual(s_loc["verdict"], "PASS_FLOOR_UNBOUND_IDENTITY")
+        self.assertFalse(s_loc["hardware_verified"])
+        self.assertIsNone(s_loc["observed_model_sha256"])
 
         # Model pack SHA-256 mismatch is caught explicitly while preserving all 11 observed rows.
         s_mm = shv.score_report(
@@ -643,6 +695,283 @@ class TestStrixHaloVerify(unittest.TestCase):
             self.assertEqual(shv.main(["score", str(rpt_path), "--markdown-out", str(md_path)]), 2)
             self.assertEqual(shv.main(["score", str(rpt_path), "--markdown-out", str(md_path), "--allow-unmeasured"]), 0)
             self.assertTrue(md_path.exists())
+
+    def test_false_identity_cli_override_external_pack_and_multimodel_binding(self) -> None:
+        """Verify false-identity attacks are rejected while preserving all 11 raw observations."""
+        sha_a = "a" * 64
+        sha_b = "b" * 64
+
+        def _make_handler(health_payload: dict[str, Any], models_payload: dict[str, Any]) -> type[_MockIngineHandler]:
+            class _CustomHandler(_MockIngineHandler):
+                def do_GET(self) -> None:  # noqa: N802
+                    if self.path == "/health":
+                        body = json.dumps(health_payload).encode("utf-8")
+                    elif self.path == "/v1/models":
+                        body = json.dumps(models_payload).encode("utf-8")
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            return _CustomHandler
+
+        def _write_fake_ingpack(model_dir: Path, content_sha_hex: str) -> None:
+            hdr = bytearray(256)
+            hdr[0:8] = b"INGPACK1"
+            hdr[8:12] = (1).to_bytes(4, "little")
+            hdr[12:16] = (1).to_bytes(4, "little")
+            hdr[96:128] = bytes.fromhex("11" * 32)
+            hdr[128:160] = bytes.fromhex(content_sha_hex)
+            (model_dir / "model.ingpack").write_bytes(bytes(hdr))
+
+        # 1. CLI --selected-backend hip --selected-device-arch gfx1151 MUST NOT override contrary runtime metadata,
+        #    and an external --base-url MUST NOT inherit a local --model-dir INGPACK1 hash.
+        h1 = _make_handler(
+            {"status": "ok", "backend": "cpu", "selected_device_arch": "zen5"},
+            {"object": "list", "data": [{"id": "Qwen3.8-Flash-Next"}]},
+        )
+        server = _ThreadedHTTPServer(("127.0.0.1", 0), h1)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                mdir = Path(td) / "local_pack"
+                mdir.mkdir()
+                _write_fake_ingpack(mdir, sha_a)
+                res = shv.run_benchmark_suite(
+                    base_url=f"http://127.0.0.1:{port}",
+                    serve_bin=None,
+                    model_dir=mdir,
+                    model_id_override=None,
+                    fake_smoke=False,
+                    extra_serve_args=[],
+                    decode_max_tokens=4,
+                    prefill_lengths=[64],
+                    agent_lengths=[64],
+                    cold_tokens=64,
+                    startup_timeout_s=10.0,
+                    expected_model_sha256=sha_a,
+                    selected_device_arch="gfx1151",
+                    selected_backend="hip",
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # Runtime metadata stays authoritative ("cpu"/"zen5"); CLI flags remain expected assertions.
+        self.assertEqual(res["accelerator"]["backend"], "cpu")
+        self.assertEqual(res["accelerator"]["selected_device_arch"], "zen5")
+        self.assertEqual(res["accelerator"]["expected_backend"], "hip")
+        self.assertEqual(res["accelerator"]["expected_device_arch"], "gfx1151")
+        # External server gave no runtime SHA -> observed content_sha256 stays None despite local INGPACK1 file!
+        self.assertIsNone(res["model_identity"]["content_sha256"])
+        self.assertEqual(res["model_identity"]["local_model_dir_pack_sha256"], sha_a)
+
+        # Graft passing raw 11 metrics onto this captured identity to verify verdict rejects false CLI + local pack.
+        q = _make_qualifying_bench()
+        res["decode_runs"] = q["decode_runs"]
+        res["prefill_runs"] = q["prefill_runs"]
+        res["agent_runs"] = q["agent_runs"]
+        res["cold_run"] = q["cold_run"]
+        score_cli_conflict = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": res})
+        self.assertEqual(score_cli_conflict["verdict"], "PASS_FLOOR_ACCELERATOR_MISMATCH")
+        self.assertFalse(score_cli_conflict["hardware_verified"])
+        self.assertEqual(score_cli_conflict["passed"], 11)
+
+        # 2. External server reporting HIP gfx1151 but NO model hash + matching local INGPACK1 -> UNBOUND.
+        h2 = _make_handler(
+            {"status": "ok", "backend": "hip", "selected_device_arch": "gfx1151"},
+            {"object": "list", "data": [{"id": "Qwen3.8-Flash-Next"}]},
+        )
+        server2 = _ThreadedHTTPServer(("127.0.0.1", 0), h2)
+        port2 = server2.server_address[1]
+        thread2 = threading.Thread(target=server2.serve_forever, daemon=True)
+        thread2.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                mdir = Path(td) / "local_pack"
+                mdir.mkdir()
+                _write_fake_ingpack(mdir, sha_a)
+                res2 = shv.run_benchmark_suite(
+                    base_url=f"http://127.0.0.1:{port2}",
+                    serve_bin=None,
+                    model_dir=mdir,
+                    model_id_override=None,
+                    fake_smoke=False,
+                    extra_serve_args=[],
+                    decode_max_tokens=4,
+                    prefill_lengths=[64],
+                    agent_lengths=[64],
+                    cold_tokens=64,
+                    startup_timeout_s=10.0,
+                    expected_model_sha256=sha_a,
+                )
+        finally:
+            server2.shutdown()
+            server2.server_close()
+
+        self.assertIsNone(res2["model_identity"]["content_sha256"])
+        res2["decode_runs"] = q["decode_runs"]
+        res2["prefill_runs"] = q["prefill_runs"]
+        res2["agent_runs"] = q["agent_runs"]
+        res2["cold_run"] = q["cold_run"]
+        score_ext_unbound = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": res2})
+        self.assertEqual(score_ext_unbound["verdict"], "PASS_FLOOR_UNBOUND_IDENTITY")
+        self.assertFalse(score_ext_unbound["hardware_verified"])
+        self.assertEqual(score_ext_unbound["passed"], 11)
+
+        # 3. Multi-model /v1/models binds metadata strictly to the requested model entry.
+        h3 = _make_handler(
+            {"status": "ok", "backend": "hip", "selected_device_arch": "gfx1151", "content_sha256": sha_a},
+            {
+                "object": "list",
+                "data": [
+                    {"id": "Model-A", "backend": "hip", "selected_device_arch": "gfx1151", "content_sha256": sha_a},
+                    {"id": "Model-B", "backend": "hip", "selected_device_arch": "gfx1151", "content_sha256": sha_b},
+                    {"id": "Model-NoHash", "backend": "hip", "selected_device_arch": "gfx1151"},
+                ],
+            },
+        )
+        server3 = _ThreadedHTTPServer(("127.0.0.1", 0), h3)
+        port3 = server3.server_address[1]
+        thread3 = threading.Thread(target=server3.serve_forever, daemon=True)
+        thread3.start()
+        try:
+            url3 = f"http://127.0.0.1:{port3}"
+            info_b = shv.detect_server_runtime_info(url3, "Model-B")
+            self.assertTrue(info_b["model_entry_matched"])
+            self.assertEqual(info_b["content_sha256"], sha_b)
+
+            info_nohash = shv.detect_server_runtime_info(url3, "Model-NoHash")
+            self.assertTrue(info_nohash["model_entry_matched"])
+            # Must NOT inherit global /health hash sha_a when /v1/models lists multiple models.
+            self.assertIsNone(info_nohash["content_sha256"])
+
+            info_missing = shv.detect_server_runtime_info(url3, "Model-Missing")
+            self.assertFalse(info_missing["model_entry_matched"])
+            self.assertIsNone(info_missing["content_sha256"])
+        finally:
+            server3.shutdown()
+            server3.server_close()
+
+        # 4. Locally launched server: verified launch/loader telemetry binds identity; absent or conflicting telemetry fails closed.
+        with tempfile.TemporaryDirectory() as td:
+            mdir = Path(td) / "model"
+            mdir.mkdir()
+            _write_fake_ingpack(mdir, sha_a)
+
+            # 4a. Managed launcher emitting verified loader telemetry -> passes when metrics pass.
+            tel_bin = Path(td) / "mock_serve_telemetry.py"
+            _write_mock_serve_launcher(tel_bin)
+            src = tel_bin.read_text(encoding="utf-8")
+            inject = (
+                f'sys.stderr.write("loader: backend=hip selected_device_arch=gfx1151 '
+                f'content_sha256={sha_a} loaded_model_dir=" + str(a.model_dir) + "\\n"); sys.stderr.flush()\n'
+            )
+            tel_bin.write_text(src.replace("S((a.host, a.port), H).serve_forever()", inject + "S((a.host, a.port), H).serve_forever()"), encoding="utf-8")
+            res_local_ok = shv.run_benchmark_suite(
+                base_url=None,
+                serve_bin=tel_bin,
+                model_dir=mdir,
+                model_id_override=None,
+                fake_smoke=False,
+                extra_serve_args=[],
+                decode_max_tokens=4,
+                prefill_lengths=[64],
+                agent_lengths=[64],
+                cold_tokens=64,
+                startup_timeout_s=10.0,
+                expected_model_sha256=sha_a,
+                selected_backend="hip",
+                selected_device_arch="gfx1151",
+            )
+            self.assertEqual(res_local_ok["accelerator"]["source"], "managed_process_telemetry")
+            self.assertEqual(res_local_ok["model_identity"]["source"], "managed_process_telemetry")
+            self.assertEqual(res_local_ok["model_identity"]["content_sha256"], sha_a)
+            res_local_ok["decode_runs"] = q["decode_runs"]
+            res_local_ok["prefill_runs"] = q["prefill_runs"]
+            res_local_ok["agent_runs"] = q["agent_runs"]
+            res_local_ok["cold_run"] = q["cold_run"]
+            s_ok = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": res_local_ok})
+            self.assertEqual(s_ok["verdict"], "PASS_STRIX_HALO_FLOOR")
+            self.assertTrue(s_ok["hardware_verified"])
+
+            # 4c. Managed launcher with conflicting HTTP vs stderr telemetry -> fails closed as mismatch!
+            conflict_bin = Path(td) / "mock_serve_conflict.py"
+            _write_mock_serve_launcher(conflict_bin)
+            csrc = conflict_bin.read_text(encoding="utf-8")
+            csrc = csrc.replace(
+                'b = b\'{"status":"ok"}\'',
+                'b = b\'{"status":"ok","backend":"cpu","selected_device_arch":"zen5"}\'',
+            )
+            cinj = (
+                f'sys.stderr.write("loader: backend=hip selected_device_arch=gfx1151 '
+                f'content_sha256={sha_a}\\n"); sys.stderr.flush()\n'
+            )
+            conflict_bin.write_text(
+                csrc.replace("S((a.host, a.port), H).serve_forever()", cinj + "S((a.host, a.port), H).serve_forever()"),
+                encoding="utf-8",
+            )
+            res_conf = shv.run_benchmark_suite(
+                base_url=None,
+                serve_bin=conflict_bin,
+                model_dir=mdir,
+                model_id_override=None,
+                fake_smoke=False,
+                extra_serve_args=[],
+                decode_max_tokens=4,
+                prefill_lengths=[64],
+                agent_lengths=[64],
+                cold_tokens=64,
+                startup_timeout_s=10.0,
+                expected_model_sha256=sha_a,
+            )
+            self.assertTrue(res_conf["accelerator"]["conflict"])
+            self.assertEqual(res_conf["accelerator"]["source"], "conflict")
+            res_conf["decode_runs"] = q["decode_runs"]
+            res_conf["prefill_runs"] = q["prefill_runs"]
+            res_conf["agent_runs"] = q["agent_runs"]
+            res_conf["cold_run"] = q["cold_run"]
+            s_conf = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": res_conf})
+            self.assertEqual(s_conf["verdict"], "PASS_FLOOR_ACCELERATOR_MISMATCH")
+            self.assertFalse(s_conf["hardware_verified"])
+            self.assertEqual(s_conf["passed"], 11)
+
+            # 4b. Managed launcher emitting NO telemetry -> stays unbound despite local INGPACK1 + CLI flags!
+            silent_bin = Path(td) / "mock_serve_silent.py"
+            _write_mock_serve_launcher(silent_bin)
+            res_local_silent = shv.run_benchmark_suite(
+                base_url=None,
+                serve_bin=silent_bin,
+                model_dir=mdir,
+                model_id_override=None,
+                fake_smoke=False,
+                extra_serve_args=[],
+                decode_max_tokens=4,
+                prefill_lengths=[64],
+                agent_lengths=[64],
+                cold_tokens=64,
+                startup_timeout_s=10.0,
+                expected_model_sha256=sha_a,
+                selected_backend="hip",
+                selected_device_arch="gfx1151",
+            )
+            self.assertIsNone(res_local_silent["model_identity"]["content_sha256"])
+            self.assertIsNone(res_local_silent["accelerator"]["backend"])
+            res_local_silent["decode_runs"] = q["decode_runs"]
+            res_local_silent["prefill_runs"] = q["prefill_runs"]
+            res_local_silent["agent_runs"] = q["agent_runs"]
+            res_local_silent["cold_run"] = q["cold_run"]
+            s_sil = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": res_local_silent})
+            self.assertEqual(s_sil["verdict"], "PASS_FLOOR_UNBOUND_IDENTITY")
+            self.assertFalse(s_sil["hardware_verified"])
+            self.assertEqual(s_sil["passed"], 11)
 
 
 if __name__ == "__main__":
