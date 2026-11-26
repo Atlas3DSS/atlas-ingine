@@ -978,6 +978,785 @@ __global__ void batched_advance_pos_kernel(const std::int32_t* __restrict__ slot
   if (slot >= 0) slot_pos[slot] += 1;
 }
 
+__global__ void batched_advance_pos_by_kernel(const std::int32_t* __restrict__ slot_ids,
+                                              const std::int32_t* __restrict__ deltas, int S,
+                                              std::int64_t* __restrict__ slot_pos) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= S) return;
+  const int slot = slot_ids[i];
+  if (slot >= 0) slot_pos[slot] += deltas[i];
+}
+
+template <bool X_FP32>
+__global__ void batched_static_conv_rows_kernel(const void* __restrict__ x, int ld, int C,
+                                                const std::int32_t* __restrict__ active_slots,
+                                                const std::int32_t* __restrict__ slot_row0,
+                                                const std::int32_t* __restrict__ slot_m,
+                                                const float* __restrict__ conv_w, float* __restrict__ conv_state_visit,
+                                                std::size_t conv_slot_stride, float* __restrict__ out,
+                                                float* __restrict__ hist) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int i = blockIdx.y;
+  if (c >= C) return;
+  const int slot = active_slots[i];
+  if (slot < 0) return;
+  const int m = slot_m[i];
+  if (m <= 0) return;
+  const int r0 = slot_row0[i];
+
+  float* const st = conv_state_visit + std::size_t(slot) * conv_slot_stride;
+  float ext[11];
+  ext[0] = st[0 * C + c];
+  ext[1] = st[1 * C + c];
+  ext[2] = st[2 * C + c];
+  for (int j = 0; j < m; ++j) {
+    if constexpr (X_FP32) {
+      ext[3 + j] = bf16r(static_cast<const float*>(x)[std::size_t(r0 + j) * ld + c]);
+    } else {
+      ext[3 + j] = act::to_float(static_cast<const ActT*>(x)[std::size_t(r0 + j) * ld + c]);
+    }
+  }
+  const float4 w4 = reinterpret_cast<const float4*>(conv_w)[c];
+  for (int j = 0; j < m; ++j) {
+    float acc = __fmul_rn(w4.x, ext[j]);
+    acc = __fadd_rn(acc, __fmul_rn(w4.y, ext[j + 1]));
+    acc = __fadd_rn(acc, __fmul_rn(w4.z, ext[j + 2]));
+    acc = __fadd_rn(acc, __fmul_rn(w4.w, ext[j + 3]));
+    out[std::size_t(r0 + j) * C + c] = __fmul_rn(__fadd_rn(acc, ext[j + 3]), INV_SQRT5);
+    if (hist) hist[std::size_t(r0 + j) * C + c] = ext[j + 3];
+  }
+  st[0 * C + c] = ext[m];
+  st[1 * C + c] = ext[m + 1];
+  st[2 * C + c] = ext[m + 2];
+}
+
+struct BatchedAttnRowsKernelParams {
+  const void* proj;
+  int proj_R;
+  int R;
+  int S;
+  int splits;
+  const std::int32_t* active_slots;
+  const std::int32_t* slot_row0;
+  const std::int32_t* slot_m;
+  const std::int32_t* row_slot;
+  const std::int32_t* row_off;
+  const std::int32_t* row_base;
+  const std::int64_t* slot_pos;
+  const float* q_scale;
+  const float* r_scale;
+  const float* rel_proj;
+  const float* k_conv;
+  const float* v_conv;
+  float* conv_k_visit;
+  float* conv_v_visit;
+  std::size_t conv_slot_stride;
+  ActT* k_ring_visit;
+  ActT* v_ring_visit;
+  std::int64_t* ring_pos_visit;
+  std::size_t ring_slot_stride;
+  std::size_t ring_pos_slot_stride;
+  void* k_full_pool;
+  void* v_full_pool;
+  const std::int32_t* page_table;
+  int max_pages_per_slot;
+  int full_visit_idx;
+  int max_ctx;
+  int log_scaling;
+  ActT* step_kv;
+  float* hist_k_visit;
+  float* hist_v_visit;
+  float* part;
+  unsigned* cnt;
+  ActT* out;
+};
+
+// Pre-pass: per (kv_head g, active slot i), walk m_s consecutive rows through K/V conv, normalize/quantize
+// into step_kv[r, 2, CONV_C], record optional hist_k/v, shift conv_k/v state, and (FULL only) write paged pool.
+template <bool FULL, int KVF, bool PROJ_FP32>
+__global__ void __launch_bounds__(64) attn_new_kv_rows_kernel(const BatchedAttnRowsKernelParams p) {
+  constexpr bool F8 = KVF != 0, V4 = KVF == 2;
+  static_assert(FULL || !F8, "FP8 caches are full-layer only");
+  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
+
+  const int g = blockIdx.x;
+  const int i = blockIdx.y;
+  const int slot = p.active_slots[i];
+  if (slot < 0) return;
+  const int m = p.slot_m[i];
+  if (m <= 0) return;
+  const int r0 = p.slot_row0[i];
+  const int p0 = int(p.slot_pos[slot]);
+
+  const int kv = threadIdx.x >> 5;  // 0 = K, 1 = V
+  const int lane = threadIdx.x & 31;
+  const int ch0 = lane * 4;
+
+  float* const conv_slot = (kv ? p.conv_v_visit : p.conv_k_visit) + std::size_t(slot) * p.conv_slot_stride;
+  const float* const wptr = kv ? p.v_conv : p.k_conv;
+  float* const hist_v = kv ? p.hist_v_visit : p.hist_k_visit;
+  const std::int32_t* const pt_slot = FULL ? (p.page_table + std::size_t(slot) * p.max_pages_per_slot) : nullptr;
+  CT* const pool = FULL ? static_cast<CT*>(kv ? p.v_full_pool : p.k_full_pool) : nullptr;
+
+  float st0[4], st1[4], st2[4];
+  float w[4][4];  // [channel e][lag/tap]
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    const int ch = ch0 + e;
+    st0[e] = conv_slot[0 * CONV_C + g * D + ch];
+    st1[e] = conv_slot[1 * CONV_C + g * D + ch];
+    st2[e] = conv_slot[2 * CONV_C + g * D + ch];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      if constexpr (FULL) w[e][t] = wptr[t * CONV_C + g * D + ch];  // t = lag
+      else w[e][t] = wptr[(g * D + ch) * 4 + t];                    // t = tap
+    }
+  }
+
+  for (int j = 0; j < m; ++j) {
+    const int r = r0 + j;
+    const int pos = p0 + j;
+    const std::size_t proj_base = std::size_t(r) * p.proj_R;
+    float dyn[4];
+    if constexpr (FULL) {
+#pragma unroll
+      for (int lag = 0; lag < 4; ++lag)
+        dyn[lag] = load_proj_val<PROJ_FP32>(p.proj, proj_base + (kv ? OFF_VDYN : OFF_KDYN) + g * 4 + lag);
+    }
+    float nkf[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const int ch = ch0 + e;
+      const float e3 = bf16r(load_proj_val<PROJ_FP32>(p.proj, proj_base + (kv ? OFF_V : OFF_K) + g * D + ch));
+      if (hist_v) hist_v[std::size_t(r) * CONV_C + g * D + ch] = e3;
+      float y;
+      if constexpr (FULL) {
+        const float ev[4] = {e3, st2[e], st1[e], st0[e]};
+        float o = 0.f;
+#pragma unroll
+        for (int lag = 0; lag < 4; ++lag) {
+          const float ww = __fadd_rn(w[e][lag], dyn[lag]);
+          o = __fadd_rn(o, __fmul_rn(ww, ev[lag]));
+        }
+        y = __fmul_rn(__fadd_rn(o, e3), INV_3);
+      } else {
+        float o = __fmul_rn(w[e][0], st0[e]);
+        o = __fadd_rn(o, __fmul_rn(w[e][1], st1[e]));
+        o = __fadd_rn(o, __fmul_rn(w[e][2], st2[e]));
+        o = __fadd_rn(o, __fmul_rn(w[e][3], e3));
+        y = __fmul_rn(__fadd_rn(o, e3), INV_SQRT5);
+      }
+      nkf[e] = bf16r(y);
+      st0[e] = st1[e];
+      st1[e] = st2[e];
+      st2[e] = e3;
+    }
+
+    const float ss = wsum(nkf[0] * nkf[0] + nkf[1] * nkf[1] + nkf[2] * nkf[2] + nkf[3] * nkf[3]);
+    const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
+    float y[4] = {nkf[0] * f, nkf[1] * f, nkf[2] * f, nkf[3] * f};
+    if constexpr (F8) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) y[e] = (V4 && kv == 1) ? fp4vr(bf16r(y[e])) : e4m3r(bf16r(y[e]));
+    }
+    const uint2 packed = make_uint2(act::pack2(y[0], y[1]), act::pack2(y[2], y[3]));
+    ActT* dst_step = p.step_kv + (std::size_t(r) * 2 + kv) * CONV_C + g * D + ch0;
+    *reinterpret_cast<uint2*>(dst_step) = packed;
+
+    if constexpr (FULL) {
+      if (pos < p.max_ctx) {
+        const int phys = pt_slot[pos >> kPageShift];
+        const std::size_t dst_off =
+            ((((std::size_t(phys) * NUM_FULL_VISITS + p.full_visit_idx) * kPageSize + (pos & kPageMask)) * HKV + g) *
+             D) +
+            ch0;
+        if constexpr (V4) {
+          if (kv) {
+            const uint16_t nib4 =
+                static_cast<uint16_t>(e2m1_code(y[0] * kFp4V) | (e2m1_code(y[1] * kFp4V) << 4) |
+                                      (e2m1_code(y[2] * kFp4V) << 8) | (e2m1_code(y[3] * kFp4V) << 12));
+            *reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(p.v_full_pool) + dst_off / 2) = nib4;
+          } else {
+            const uint32_t k4 = pack_e4m3x2(y[0], y[1]) | (pack_e4m3x2(y[2], y[3]) << 16);
+            *reinterpret_cast<uint32_t*>(pool + dst_off) = k4;
+          }
+        } else if constexpr (F8) {
+          const uint32_t kv4 = pack_e4m3x2(y[0], y[1]) | (pack_e4m3x2(y[2], y[3]) << 16);
+          *reinterpret_cast<uint32_t*>(pool + dst_off) = kv4;
+        } else {
+          *reinterpret_cast<uint2*>(pool + dst_off) = packed;
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    const int ch = ch0 + e;
+    conv_slot[0 * CONV_C + g * D + ch] = st0[e];
+    conv_slot[1 * CONV_C + g * D + ch] = st1[e];
+    conv_slot[2 * CONV_C + g * D + ch] = st2[e];
+  }
+}
+
+// Post-commit for sliding layers: write all m_s rows from step_kv into the sliding ring and ring_pos.
+__global__ void __launch_bounds__(64) attn_commit_sliding_rows_kernel(const BatchedAttnRowsKernelParams p) {
+  const int g = blockIdx.x;
+  const int i = blockIdx.y;
+  const int slot = p.active_slots[i];
+  if (slot < 0) return;
+  const int m = p.slot_m[i];
+  if (m <= 0) return;
+  const int r0 = p.slot_row0[i];
+  const int p0 = int(p.slot_pos[slot]);
+
+  const int kv = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int ch0 = lane * 4;
+  ActT* const ring_slot = (kv ? p.v_ring_visit : p.k_ring_visit) + std::size_t(slot) * p.ring_slot_stride;
+  std::int64_t* const kpos_slot = p.ring_pos_visit + std::size_t(slot) * p.ring_pos_slot_stride;
+
+  for (int j = 0; j < m; ++j) {
+    const int r = r0 + j;
+    const int rs = (p0 + j) & (WIN - 1);
+    const ActT* src = p.step_kv + (std::size_t(r) * 2 + kv) * CONV_C + g * D + ch0;
+    ActT* dst = ring_slot + (std::size_t(rs) * HKV + g) * D + ch0;
+    *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(src);
+    if (g == 0 && threadIdx.x == 0) kpos_slot[rs] = p0 + j;
+  }
+}
+
+template <bool PROJ_FP32>
+__device__ __forceinline__ void attn_reduce_rows_body(const BatchedAttnRowsKernelParams& p, int g, int r) {
+  const int slot = p.row_slot[r];
+  if (slot < 0) return;
+  const int tid = threadIdx.x;
+  const std::size_t proj_base = std::size_t(r) * p.proj_R;
+  const float* base_part = p.part + std::size_t((r * HKV + g) * p.splits) * GQA * PSTR;
+
+  for (int idx = tid; idx < GQA * D; idx += NT) {
+    const int row = idx / D, dim = idx % D;
+    const float sink = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_SINK + g * GQA + row) * LOG2E;
+    float mx = sink;
+    for (int q = 0; q < p.splits; ++q) {
+      const float2 ml = __ldcg(reinterpret_cast<const float2*>(base_part + (q * GQA + row) * PSTR + D));
+      mx = fmaxf(mx, ml.x);
+    }
+    float l = exp2f(sink - mx), a = 0.f;
+    for (int q = 0; q < p.splits; ++q) {
+      const float* pr = base_part + (q * GQA + row) * PSTR;
+      const float2 ml = __ldcg(reinterpret_cast<const float2*>(pr + D));
+      const float f = exp2f(ml.x - mx);
+      l += ml.y * f;
+      a += __ldcg(pr + dim) * f;
+    }
+    const float gate_in = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_GATE + (g * GQA + row) * D + dim);
+    const float gate = 1.f / (1.f + expf(-gate_in));
+    p.out[std::size_t(r) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
+  }
+}
+
+template <bool FULL, int KVF, bool PROJ_FP32, bool SPLIT>
+__global__ void __launch_bounds__(NT, 2) batched_attn_rows_kernel(const BatchedAttnRowsKernelParams p) {
+  constexpr bool F8 = KVF != 0, V4 = KVF == 2;
+  static_assert(FULL || !F8, "FP8 caches are full-layer only");
+  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
+  using KV = std::conditional_t<F8, uint2, uint4>;
+
+  const int rank = blockIdx.x;
+  const int g = blockIdx.y;
+  const int r = blockIdx.z;
+  const int slot = p.row_slot[r];
+  if (slot < 0) return;
+
+  const int off = p.row_off[r];
+  const int base_r = p.row_base[r];
+  const int p_start = int(p.slot_pos[slot]);
+  const int p_r = p_start + off;
+  if (FULL && p_r >= p.max_ctx) return;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int half = lane >> 4;
+  const int c = lane & 15;
+  const bool owner = (rank == 0);
+  const std::size_t proj_base = std::size_t(r) * p.proj_R;
+
+  __shared__ AttnSmem sm;
+
+  ActT* const k_ring_slot = FULL ? nullptr : (p.k_ring_visit + std::size_t(slot) * p.ring_slot_stride);
+  ActT* const v_ring_slot = FULL ? nullptr : (p.v_ring_visit + std::size_t(slot) * p.ring_slot_stride);
+  std::int64_t* const kpos_slot = FULL ? nullptr : (p.ring_pos_visit + std::size_t(slot) * p.ring_pos_slot_stride);
+  const std::int32_t* const pt_slot = FULL ? (p.page_table + std::size_t(slot) * p.max_pages_per_slot) : nullptr;
+  CT* const k_pool = FULL ? static_cast<CT*>(p.k_full_pool) : reinterpret_cast<CT*>(k_ring_slot);
+  CT* const v_pool = FULL ? static_cast<CT*>(p.v_full_pool) : reinterpret_cast<CT*>(v_ring_slot);
+
+  for (int i = tid; i < GQA * D; i += NT) {
+    sm.u.stage.q[i] = load_proj_val<PROJ_FP32>(p.proj, proj_base + g * GQA * D + i);
+    sm.u.stage.qs[i] = p.q_scale[g * GQA * D + i];
+  }
+  for (int i = tid; i < GQA * DREL; i += NT) {
+    sm.u.stage.rel[i] = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_REL + g * GQA * DREL + i);
+    sm.u.stage.rs[i] = p.r_scale[g * GQA * DREL + i];
+  }
+  if (tid < GQA) sm.sink[tid] = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_SINK + g * GQA + tid);
+  if (owner && tid < DREL) sm.relp0[tid] = p.rel_proj[tid * EXT];
+  __syncthreads();
+
+  const float tau = p.log_scaling ? 1.f + 0.1f * logf(fmaxf(float(p_r + 1) * (1.f / 8192.f), 1.f)) : 1.f;
+  if (warp < 2 * GQA) {
+    const int i = warp % GQA;
+    if (warp < GQA) {
+      float4* qa = reinterpret_cast<float4*>(sm.u.stage.q + i * D) + lane;
+      const float4 a = *qa;
+      const float4 s = reinterpret_cast<const float4*>(sm.u.stage.qs + i * D)[lane];
+      float x[4] = {a.x * s.x, a.y * s.y, a.z * s.z, a.w * s.w};
+      const float f = clip_factor(wsum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]), CLIP_QK);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        x[e] = bf16r(x[e] * f);
+        if (p.log_scaling) x[e] = bf16r(x[e] * tau);
+      }
+      *qa = make_float4(x[0] * QSCALE, x[1] * QSCALE, x[2] * QSCALE, x[3] * QSCALE);
+    } else {
+      float* ra = sm.u.stage.rel + i * DREL + c;
+      const float rv = *ra * sm.u.stage.rs[i * DREL + c];
+      float y = bf16r(rv * clip_factor(hsum16(rv * rv), CLIP_REL));
+      if (p.log_scaling) y = bf16r(y * tau);
+      __syncwarp();
+      if (half == 0) *ra = y;
+    }
+  }
+  __syncthreads();
+
+  float qv[GQA][8], relv[GQA];
+#pragma unroll
+  for (int i = 0; i < GQA; ++i) {
+    const float4* qa = reinterpret_cast<const float4*>(sm.u.stage.q + i * D + c * 8);
+    const float4 a0 = qa[0], a1 = qa[1];
+    qv[i][0] = a0.x, qv[i][1] = a0.y, qv[i][2] = a0.z, qv[i][3] = a0.w;
+    qv[i][4] = a1.x, qv[i][5] = a1.y, qv[i][6] = a1.z, qv[i][7] = a1.w;
+    relv[i] = sm.u.stage.rel[i * DREL + c];
+  }
+
+  const int old_end = FULL ? p_r : (p_start < WIN ? p_start : WIN);
+  const int p_limit = FULL ? p_r : p_start;
+  constexpr int STEP = KW * 2 * U;
+  constexpr int TILE = 2 * STEP;
+  const int stride = p.splits * TILE;
+  const int c0 = rank * TILE;
+  const std::uint64_t kvpol = l2::policy<KV_L2>();
+
+  auto kv_offset = [&](int j) -> std::size_t {
+    if constexpr (FULL) {
+      const int phys = pt_slot[j >> kPageShift];
+      return ((((std::size_t(phys) * NUM_FULL_VISITS + p.full_visit_idx) * kPageSize + (j & kPageMask)) * HKV + g) * D) +
+             c * 8;
+    } else {
+      return (std::size_t(j) * HKV + g) * D + c * 8;
+    }
+  };
+
+  auto load_buf = [&](KeyBuf<KV>& buf, int base) {
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int j = base + (warp * U + u) * 2 + half;
+      buf.k[u] = buf.v[u] = KV{};
+      buf.kp[u] = -1;
+      buf.dp[u] = FULL ? (p_r - j) : (1 + off + ((p_start - 1 - j) & (WIN - 1)));
+      buf.rp[u] = (j < old_end && buf.dp[u] < EXT) ? __ldg(p.rel_proj + c * EXT + buf.dp[u]) : 0.f;
+      if (j < old_end) {
+        const std::size_t off_kv = kv_offset(j);
+        if constexpr (V4) {
+          buf.k[u] = ld_kv8(k_pool + off_kv, kvpol);
+          buf.v[u] = make_uint2(ld_kv4(reinterpret_cast<const uint8_t*>(p.v_full_pool) + off_kv / 2), 0u);
+        } else if constexpr (F8) {
+          buf.k[u] = ld_kv8(k_pool + off_kv, kvpol);
+          buf.v[u] = ld_kv8(v_pool + off_kv, kvpol);
+        } else {
+          buf.k[u] = ld_kv(k_pool + off_kv, kvpol);
+          buf.v[u] = ld_kv(v_pool + off_kv, kvpol);
+        }
+        buf.kp[u] = FULL ? j : int(kpos_slot[j]);
+      }
+    }
+  };
+
+  float mrun[GQA], lrun[GQA], acc[GQA][8];
+#pragma unroll
+  for (int i = 0; i < GQA; ++i) {
+    mrun[i] = NEG_INIT;
+    lrun[i] = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) acc[i][e] = 0.f;
+  }
+
+  auto compute = [&](const auto& buf, bool is_new) {
+    float s[U][GQA];
+    bool valid[U], need[U];
+    int dist[U];
+    bool any_need = false;
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int kp = buf.kp[u], d = p_r - kp;
+      const bool ok = kp >= 0 && d >= 0 && (is_new || (kp < p_limit && (FULL || d < WIN)));
+      valid[u] = ok;
+      need[u] = ok && d < EXT;
+      dist[u] = d;
+      any_need |= need[u];
+      float kf[8];
+      unpack8(buf.k[u], kf);
+#pragma unroll
+      for (int i = 0; i < GQA; ++i) {
+        float t = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) t = fmaf(qv[i][e], kf[e], t);
+        s[u][i] = hsum16(t);
+      }
+    }
+    if (__any_sync(0xffffffffu, any_need)) {
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        float rp = buf.rp[u];
+        if (need[u] && dist[u] != buf.dp[u]) rp = (dist[u] == 0) ? sm.relp0[c] : __ldg(p.rel_proj + c * EXT + dist[u]);
+#pragma unroll
+        for (int i = 0; i < GQA; ++i) {
+          const float bias = hsum16(relv[i] * rp);
+          if (need[u]) s[u][i] = fmaf(bf16r(bias), LOG2E, s[u][i]);
+        }
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < GQA; ++i) {
+      float mx = mrun[i];
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        if (!valid[u]) s[u][i] = -INFINITY;
+        mx = fmaxf(mx, s[u][i]);
+      }
+      const float sc = exp2f(mrun[i] - mx);
+      mrun[i] = mx;
+      lrun[i] *= sc;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[i][e] *= sc;
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      float vf[8];
+      using V = std::decay_t<decltype(buf.v[0])>;
+      if constexpr (V4 && std::is_same_v<V, uint2>) unpack_fp4x8(valid[u] ? buf.v[u].x : 0u, vf);
+      else unpack8(valid[u] ? buf.v[u] : V{}, vf);
+#pragma unroll
+      for (int i = 0; i < GQA; ++i) {
+        const float pu = exp2f(s[u][i] - mrun[i]);
+        lrun[i] += pu;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[i][e] = fmaf(pu, vf[e], acc[i][e]);
+      }
+    }
+  };
+
+  KeyBuf<KV> A, B;
+  if (c0 < old_end) load_buf(A, c0);
+  if (c0 + STEP < old_end) load_buf(B, c0 + STEP);
+
+  if (owner) {
+    KeyBuf<uint4> N;
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int m2 = (warp * U + u) * 2 + half;
+      N.k[u] = N.v[u] = make_uint4(0u, 0u, 0u, 0u);
+      N.kp[u] = -1, N.dp[u] = -1, N.rp[u] = 0.f;
+      if constexpr (FULL) {
+        if (m2 == 0) {
+          const ActT* sk = p.step_kv + (std::size_t(r) * 2 + 0) * CONV_C + g * D + c * 8;
+          const ActT* sv = p.step_kv + (std::size_t(r) * 2 + 1) * CONV_C + g * D + c * 8;
+          N.k[u] = *reinterpret_cast<const uint4*>(sk);
+          N.v[u] = *reinterpret_cast<const uint4*>(sv);
+          N.kp[u] = p_r;
+          N.dp[u] = 0;
+          N.rp[u] = sm.relp0[c];
+        }
+      } else {
+        if (m2 <= off) {
+          const int sr = base_r + m2;
+          const ActT* sk = p.step_kv + (std::size_t(sr) * 2 + 0) * CONV_C + g * D + c * 8;
+          const ActT* sv = p.step_kv + (std::size_t(sr) * 2 + 1) * CONV_C + g * D + c * 8;
+          N.k[u] = *reinterpret_cast<const uint4*>(sk);
+          N.v[u] = *reinterpret_cast<const uint4*>(sv);
+          N.kp[u] = p_start + m2;
+          const int d = off - m2;
+          N.dp[u] = d;
+          N.rp[u] = (d == 0) ? sm.relp0[c] : __ldg(p.rel_proj + c * EXT + d);
+        }
+      }
+    }
+    compute(N, true);
+  }
+
+  for (int base = c0; base < old_end; base += stride) {
+    compute(A, false);
+    if (base + stride < old_end) load_buf(A, base + stride);
+    if (base + STEP < old_end) {
+      compute(B, false);
+      if (base + stride + STEP < old_end) load_buf(B, base + stride + STEP);
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < GQA; ++i) {
+    const float mo = __shfl_xor_sync(0xffffffffu, mrun[i], 16);
+    const float lo = __shfl_xor_sync(0xffffffffu, lrun[i], 16);
+    const float mx = fmaxf(mrun[i], mo);
+    const float f1 = exp2f(mrun[i] - mx), f2 = exp2f(mo - mx);
+    lrun[i] = lrun[i] * f1 + lo * f2;
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+      acc[i][e] = acc[i][e] * f1 + __shfl_xor_sync(0xffffffffu, acc[i][e], 16) * f2;
+    mrun[i] = mx;
+  }
+  __syncthreads();
+  if (half == 0) {
+#pragma unroll
+    for (int i = 0; i < GQA; ++i) {
+      float4* dst = reinterpret_cast<float4*>(sm.u.red.o + (warp * GQA + i) * D + c * 8);
+      dst[0] = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+      dst[1] = make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]);
+      if (c == 0) {
+        sm.u.red.ml[(warp * GQA + i) * 2] = mrun[i];
+        sm.u.red.ml[(warp * GQA + i) * 2 + 1] = lrun[i];
+      }
+    }
+  }
+  __syncthreads();
+
+  if constexpr (SPLIT) {
+    float* part = p.part + std::size_t((r * HKV + g) * p.splits + rank) * GQA * PSTR;
+    for (int idx = tid; idx < GQA * (D / 4); idx += NT) {
+      const int row = idx / (D / 4), d4 = idx % (D / 4);
+      float mx = NEG_INIT;
+#pragma unroll
+      for (int k = 0; k < KW; ++k) mx = fmaxf(mx, sm.u.red.ml[(k * GQA + row) * 2]);
+      float l = 0.f;
+      float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+      for (int k = 0; k < KW; ++k) {
+        const int w = k * GQA + row;
+        const float f = exp2f(sm.u.red.ml[w * 2] - mx);
+        l += sm.u.red.ml[w * 2 + 1] * f;
+        const float4 a = reinterpret_cast<const float4*>(sm.u.red.o + w * D)[d4];
+        o.x += a.x * f, o.y += a.y * f, o.z += a.z * f, o.w += a.w * f;
+      }
+      reinterpret_cast<float4*>(part + row * PSTR)[d4] = o;
+      if (d4 == 0) *reinterpret_cast<float2*>(part + row * PSTR + D) = make_float2(mx, l);
+    }
+    if (p.cnt) {
+      __shared__ unsigned last_split;
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) {
+        unsigned* cp = p.cnt + r * HKV + g;
+        const unsigned t = atomicAdd(cp, 1u);
+        last_split = t + 1 == unsigned(p.splits);
+        if (last_split) *cp = 0u;
+      }
+      __syncthreads();
+      if (last_split) {
+        __threadfence();
+        attn_reduce_rows_body<PROJ_FP32>(p, g, r);
+      }
+    }
+  } else {
+    for (int idx = tid; idx < GQA * D; idx += NT) {
+      const int row = idx / D, dim = idx % D;
+      const float sink = sm.sink[row] * LOG2E;
+      float mx = sink;
+#pragma unroll
+      for (int k = 0; k < KW; ++k) mx = fmaxf(mx, sm.u.red.ml[(k * GQA + row) * 2]);
+      float l = exp2f(sink - mx), a = 0.f;
+#pragma unroll
+      for (int k = 0; k < KW; ++k) {
+        const int w = k * GQA + row;
+        const float f = exp2f(sm.u.red.ml[w * 2] - mx);
+        l += sm.u.red.ml[w * 2 + 1] * f;
+        a += sm.u.red.o[w * D + dim] * f;
+      }
+      const float gate_in = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_GATE + (g * GQA + row) * D + dim);
+      const float gate = 1.f / (1.f + expf(-gate_in));
+      p.out[std::size_t(r) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
+    }
+  }
+}
+
+template <bool PROJ_FP32>
+__global__ void __launch_bounds__(NT) batched_attn_reduce_rows_kernel(const BatchedAttnRowsKernelParams p) {
+  attn_reduce_rows_body<PROJ_FP32>(p, blockIdx.y, blockIdx.z);
+}
+
+template <bool FULL, int KVF, bool PROJ_FP32>
+void dispatch_attn_rows(const BatchedAttnRowsKernelParams& kp, cudaStream_t stream) {
+  attn_new_kv_rows_kernel<FULL, KVF, PROJ_FP32><<<dim3(HKV, kp.S), 64, 0, stream>>>(kp);
+  if (kp.splits == 1) {
+    batched_attn_rows_kernel<FULL, KVF, PROJ_FP32, false><<<dim3(1, HKV, kp.R), NT, 0, stream>>>(kp);
+  } else {
+    batched_attn_rows_kernel<FULL, KVF, PROJ_FP32, true><<<dim3(kp.splits, HKV, kp.R), NT, 0, stream>>>(kp);
+    if (!kp.cnt) {
+      batched_attn_reduce_rows_kernel<PROJ_FP32><<<dim3(1, HKV, kp.R), NT, 0, stream>>>(kp);
+    }
+  }
+  if constexpr (!FULL) {
+    attn_commit_sliding_rows_kernel<<<dim3(HKV, kp.S), 64, 0, stream>>>(kp);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// Per-slot verify backup & rollback kernels
+constexpr int kHiddenH = 2304;
+constexpr int kConvVec[4] = {CONV_C / 4, CONV_C / 4, kHiddenH / 4, kHiddenH / 4};
+constexpr int kConvRowVecTotal = kConvVec[0] + kConvVec[1] + kConvVec[2] + kConvVec[3];
+constexpr int kRingVec = CONV_C / 8;  // uint4s per ring row (8 ActTs each)
+
+struct BatchConvAt {
+  int t, v, c, cols;
+};
+__device__ __forceinline__ BatchConvAt batch_conv_at(int i) {
+  constexpr int cols[4] = {CONV_C / 4, CONV_C / 4, kHiddenH / 4, kHiddenH / 4};
+  const int v = i / kConvRowVecTotal;
+  int r = i - v * kConvRowVecTotal;
+  for (int t = 0; t < 4; ++t) {
+    if (r < cols[t]) return {t, v, r, cols[t]};
+    r -= cols[t];
+  }
+  return {3, v, 0, cols[3]};
+}
+
+__global__ void __launch_bounds__(256) batch_verify_save_kernel(BatchStatePoolPtrs st, BatchVerifyBackup bk,
+                                                                const std::int32_t* __restrict__ active_slots,
+                                                                const std::int32_t* __restrict__ slot_m,
+                                                                const std::int64_t* __restrict__ slot_pos) {
+  const int si = blockIdx.y;
+  const int slot = active_slots[si];
+  if (slot < 0) return;
+  const int m = slot_m[si];
+  if (m <= 0) return;
+
+  const int i = blockIdx.x * 256 + threadIdx.x;
+  const int conv_vecs = st.num_visits * kConvRowVecTotal;
+  const int num_sliding = st.num_sliding_visits;
+
+  if (i < 2 * conv_vecs) {
+    const int row = 1 + i / conv_vecs;  // rows 1 and 2 of the 3-row conv state
+    const BatchConvAt a = batch_conv_at(i % conv_vecs);
+    const float* src_base = st.conv[a.t] + std::size_t(slot) * st.conv_slot_stride[a.t];
+    float* dst_base = bk.conv[a.t] + std::size_t(slot) * bk.conv_slot_stride[a.t];
+    const float4 val = reinterpret_cast<const float4*>(src_base)[(std::size_t(a.v) * 3 + row) * a.cols + a.c];
+    reinterpret_cast<float4*>(dst_base)[(std::size_t(a.v) * 2 + (row - 1)) * a.cols + a.c] = val;
+    return;
+  }
+
+  const int P = int(slot_pos[slot]);
+  int j = i - 2 * conv_vecs;
+  const int per_ring = kMaxVerifyRows * 2 * kRingVec;
+  if (j < num_sliding * per_ring) {
+    const int r = j / per_ring, k = j % per_ring;
+    const int row = k / (2 * kRingVec), c = k % (2 * kRingVec);
+    if (row >= m) return;
+    const int rs = (P + row) & (WIN - 1);
+    const std::size_t b = (std::size_t(r) * kMaxVerifyRows + row) * kRingVec + c;
+    const std::size_t s_off = (std::size_t(r) * WIN + rs) * kRingVec;
+    if (c < kRingVec) {
+      const ActT* src_k = st.k_ring + std::size_t(slot) * st.ring_slot_stride;
+      ActT* dst_k = bk.k + std::size_t(slot) * bk.kv_slot_stride;
+      reinterpret_cast<uint4*>(dst_k)[b] = reinterpret_cast<const uint4*>(src_k)[s_off + c];
+    } else {
+      const ActT* src_v = st.v_ring + std::size_t(slot) * st.ring_slot_stride;
+      ActT* dst_v = bk.v + std::size_t(slot) * bk.kv_slot_stride;
+      reinterpret_cast<uint4*>(dst_v)[b - kRingVec] = reinterpret_cast<const uint4*>(src_v)[s_off + (c - kRingVec)];
+    }
+    return;
+  }
+  j -= num_sliding * per_ring;
+  if (j < num_sliding * kMaxVerifyRows) {
+    const int r = j / kMaxVerifyRows, row = j % kMaxVerifyRows;
+    if (row >= m) return;
+    const std::int64_t* src_p = st.ring_pos + std::size_t(slot) * st.ring_pos_slot_stride;
+    std::int64_t* dst_p = bk.pos + std::size_t(slot) * bk.pos_slot_stride;
+    dst_p[r * kMaxVerifyRows + row] = src_p[std::size_t(r) * WIN + ((P + row) & (WIN - 1))];
+  }
+}
+
+struct BatchHistPtrs {
+  const float* p[4];
+};
+
+__global__ void __launch_bounds__(256) batch_verify_rollback_kernel(BatchStatePoolPtrs st, BatchVerifyBackup bk,
+                                                                    BatchHistPtrs hist, int hist_row_stride,
+                                                                    const std::int32_t* __restrict__ active_slots,
+                                                                    const std::int32_t* __restrict__ slot_row0,
+                                                                    const std::int32_t* __restrict__ slot_m,
+                                                                    const std::int32_t* __restrict__ slot_commit,
+                                                                    const std::int64_t* __restrict__ slot_pos) {
+  const int si = blockIdx.y;
+  const int slot = active_slots[si];
+  if (slot < 0) return;
+  const int m = slot_m[si];
+  const int commit = slot_commit[si];
+  if (commit >= m) return;
+  const int r0 = slot_row0[si];
+
+  const int i = blockIdx.x * 256 + threadIdx.x;
+  const int conv_vecs = st.num_visits * kConvRowVecTotal;
+  const int num_sliding = st.num_sliding_visits;
+
+  if (i < 3 * conv_vecs) {
+    const int row = i / conv_vecs;
+    const int src = commit + row;
+    const BatchConvAt a = batch_conv_at(i % conv_vecs);
+    float4 x;
+    if (src < 3) {
+      const float* bk_base = bk.conv[a.t] + std::size_t(slot) * bk.conv_slot_stride[a.t];
+      x = reinterpret_cast<const float4*>(bk_base)[(std::size_t(a.v) * 2 + (src - 1)) * a.cols + a.c];
+    } else {
+      x = reinterpret_cast<const float4*>(hist.p[a.t])[(std::size_t(a.v) * hist_row_stride + (r0 + src - 3)) * a.cols +
+                                                       a.c];
+    }
+    float* dst_base = st.conv[a.t] + std::size_t(slot) * st.conv_slot_stride[a.t];
+    reinterpret_cast<float4*>(dst_base)[(std::size_t(a.v) * 3 + row) * a.cols + a.c] = x;
+    return;
+  }
+
+  const int P = int(slot_pos[slot]);
+  int j = i - 3 * conv_vecs;
+  const int per_ring = kMaxVerifyRows * 2 * kRingVec;
+  if (j < num_sliding * per_ring) {
+    const int r = j / per_ring, k = j % per_ring;
+    const int row = k / (2 * kRingVec), c = k % (2 * kRingVec);
+    if (row < commit || row >= m) return;
+    const int rs = (P + row) & (WIN - 1);
+    const std::size_t b = (std::size_t(r) * kMaxVerifyRows + row) * kRingVec + c;
+    const std::size_t d_off = (std::size_t(r) * WIN + rs) * kRingVec;
+    if (c < kRingVec) {
+      const ActT* src_k = bk.k + std::size_t(slot) * bk.kv_slot_stride;
+      ActT* dst_k = st.k_ring + std::size_t(slot) * st.ring_slot_stride;
+      reinterpret_cast<uint4*>(dst_k)[d_off + c] = reinterpret_cast<const uint4*>(src_k)[b];
+    } else {
+      const ActT* src_v = bk.v + std::size_t(slot) * bk.kv_slot_stride;
+      ActT* dst_v = st.v_ring + std::size_t(slot) * st.ring_slot_stride;
+      reinterpret_cast<uint4*>(dst_v)[d_off + (c - kRingVec)] = reinterpret_cast<const uint4*>(src_v)[b - kRingVec];
+    }
+    return;
+  }
+  j -= num_sliding * per_ring;
+  if (j < num_sliding * kMaxVerifyRows) {
+    const int r = j / kMaxVerifyRows, row = j % kMaxVerifyRows;
+    if (row < commit || row >= m) return;
+    const std::int64_t* src_p = bk.pos + std::size_t(slot) * bk.pos_slot_stride;
+    std::int64_t* dst_p = st.ring_pos + std::size_t(slot) * st.ring_pos_slot_stride;
+    dst_p[std::size_t(r) * WIN + ((P + row) & (WIN - 1))] = src_p[r * kMaxVerifyRows + row];
+  }
+}
+
 template <bool FULL, int F8, bool PROJ_FP32>
 void dispatch_attn(const BatchedAttnKernelParams& kp, cudaStream_t stream) {
   if (kp.splits == 1) {
@@ -1345,6 +2124,148 @@ void batched_advance_pos(const std::int32_t* slot_ids, int B, std::int64_t* slot
   if (B <= 0) return;
   require(slot_ids && slot_pos, "batched_advance_pos: null arg");
   batched_advance_pos_kernel<<<(B + 63) / 64, 64, 0, stream>>>(slot_ids, B, slot_pos);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void batched_advance_pos_by(const std::int32_t* slot_ids, const std::int32_t* deltas, int S, std::int64_t* slot_pos,
+                            cudaStream_t stream) {
+  if (S <= 0) return;
+  require(slot_ids && deltas && slot_pos, "batched_advance_pos_by: null arg");
+  batched_advance_pos_by_kernel<<<(S + 63) / 64, 64, 0, stream>>>(slot_ids, deltas, S, slot_pos);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void batched_static_conv_rows(const void* x, bool x_fp32, int ld, int S, int C, const std::int32_t* active_slots,
+                              const std::int32_t* slot_row0, const std::int32_t* slot_m, const float* conv_w,
+                              float* conv_state_visit, std::size_t conv_slot_stride, float* out, float* hist,
+                              cudaStream_t stream) {
+  require(x && active_slots && slot_row0 && slot_m && conv_w && conv_state_visit && out && S >= 1 && C >= 1 && ld >= C,
+          "batched_static_conv_rows: bad args");
+  const dim3 grid((C + 255) / 256, S);
+  if (x_fp32) {
+    batched_static_conv_rows_kernel<true><<<grid, 256, 0, stream>>>(
+        x, ld, C, active_slots, slot_row0, slot_m, conv_w, conv_state_visit, conv_slot_stride, out, hist);
+  } else {
+    batched_static_conv_rows_kernel<false><<<grid, 256, 0, stream>>>(
+        x, ld, C, active_slots, slot_row0, slot_m, conv_w, conv_state_visit, conv_slot_stride, out, hist);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void batched_attn_decode_rows(const BatchedAttnRowsArgs& a, cudaStream_t stream) {
+  require(a.R >= 1 && a.S >= 1, "batched_attn_decode_rows: R and S must be >= 1");
+  require(a.window == 0 || a.window == WIN, "batched_attn_decode_rows: window must be 0 or 1024");
+  const bool full = (a.window == 0);
+  require(full || !a.cache_fp8, "batched_attn_decode_rows: FP8 caches are full-layer only");
+  require(!a.cache_v4 || a.cache_fp8, "batched_attn_decode_rows: FP4 V caches go with FP8 K");
+  require(a.proj && a.active_slots && a.slot_row0 && a.slot_m && a.row_slot && a.row_off && a.row_base && a.slot_pos &&
+              a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv && a.conv_k_visit && a.conv_v_visit &&
+              a.step_kv && a.out,
+          "batched_attn_decode_rows: null argument");
+  if (full) {
+    require(a.k_full_pool && a.v_full_pool && a.page_table && a.max_pages_per_slot > 0 && a.max_ctx > 0,
+            "batched_attn_decode_rows: full layer needs paged pool");
+  } else {
+    require(a.k_ring_visit && a.v_ring_visit && a.ring_pos_visit, "batched_attn_decode_rows: sliding layer needs rings");
+  }
+  const int splits = choose_splits(a.R);
+  if (splits > 1) {
+    require(a.workspace && a.workspace_size >= ws_total_bytes(a.R), "batched_attn_decode_rows: workspace too small");
+  }
+
+  BatchedAttnRowsKernelParams kp{};
+  kp.proj = a.proj;
+  kp.proj_R = full ? R_FULL : R_SLIDING;
+  kp.R = a.R;
+  kp.S = a.S;
+  kp.splits = splits;
+  kp.active_slots = a.active_slots;
+  kp.slot_row0 = a.slot_row0;
+  kp.slot_m = a.slot_m;
+  kp.row_slot = a.row_slot;
+  kp.row_off = a.row_off;
+  kp.row_base = a.row_base;
+  kp.slot_pos = a.slot_pos;
+  kp.q_scale = a.q_scale;
+  kp.r_scale = a.r_scale;
+  kp.rel_proj = a.rel_proj;
+  kp.k_conv = a.k_conv;
+  kp.v_conv = a.v_conv;
+  kp.conv_k_visit = a.conv_k_visit;
+  kp.conv_v_visit = a.conv_v_visit;
+  kp.conv_slot_stride = a.conv_slot_stride;
+  kp.k_ring_visit = a.k_ring_visit;
+  kp.v_ring_visit = a.v_ring_visit;
+  kp.ring_pos_visit = a.ring_pos_visit;
+  kp.ring_slot_stride = a.ring_slot_stride;
+  kp.ring_pos_slot_stride = a.ring_pos_slot_stride;
+  kp.k_full_pool = a.k_full_pool;
+  kp.v_full_pool = a.v_full_pool;
+  kp.page_table = a.page_table;
+  kp.max_pages_per_slot = a.max_pages_per_slot;
+  kp.full_visit_idx = a.full_visit_idx;
+  kp.max_ctx = a.max_ctx;
+  kp.log_scaling = a.log_scaling ? 1 : 0;
+  kp.step_kv = a.step_kv;
+  kp.hist_k_visit = a.hist_k_visit;
+  kp.hist_v_visit = a.hist_v_visit;
+  if (a.workspace) {
+    char* ws = static_cast<char*>(a.workspace);
+    kp.part = reinterpret_cast<float*>(ws);
+    static const bool fused = [] {
+      const char* e = std::getenv("INGINE_ATTN_FUSED_REDUCE");
+      return !(e && e[0] == '0');
+    }();
+    kp.cnt = fused ? reinterpret_cast<unsigned*>(ws + ws_cnt_off(a.R)) : nullptr;
+  }
+  kp.out = a.out;
+
+  if (full) {
+    if (a.cache_fp8 && a.cache_v4) {
+      if (a.proj_fp32) dispatch_attn_rows<true, 2, true>(kp, stream);
+      else dispatch_attn_rows<true, 2, false>(kp, stream);
+    } else if (a.cache_fp8) {
+      if (a.proj_fp32) dispatch_attn_rows<true, 1, true>(kp, stream);
+      else dispatch_attn_rows<true, 1, false>(kp, stream);
+    } else {
+      if (a.proj_fp32) dispatch_attn_rows<true, 0, true>(kp, stream);
+      else dispatch_attn_rows<true, 0, false>(kp, stream);
+    }
+  } else {
+    if (a.proj_fp32) dispatch_attn_rows<false, 0, true>(kp, stream);
+    else dispatch_attn_rows<false, 0, false>(kp, stream);
+  }
+}
+
+void batch_verify_save(const BatchStatePoolPtrs& st, const BatchVerifyBackup& bk, const std::int32_t* active_slots,
+                       const std::int32_t* slot_m, int S, const std::int64_t* slot_pos, cudaStream_t stream) {
+  if (S <= 0) return;
+  require(active_slots && slot_m && slot_pos && st.k_ring && st.v_ring && st.ring_pos && bk.k && bk.v && bk.pos,
+          "batch_verify_save: null arg");
+  for (int t = 0; t < 4; ++t) require(st.conv[t] && bk.conv[t], "batch_verify_save: null conv");
+  const int conv_vecs = st.num_visits * kConvRowVecTotal;
+  const int items = 2 * conv_vecs + st.num_sliding_visits * kMaxVerifyRows * (2 * kRingVec + 1);
+  batch_verify_save_kernel<<<dim3((items + 255) / 256, S), 256, 0, stream>>>(st, bk, active_slots, slot_m, slot_pos);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void batch_verify_rollback(const BatchStatePoolPtrs& st, const BatchVerifyBackup& bk, const float* const hist[4],
+                           int hist_row_stride, const std::int32_t* active_slots, const std::int32_t* slot_row0,
+                           const std::int32_t* slot_m, const std::int32_t* slot_commit, int S,
+                           const std::int64_t* slot_pos, cudaStream_t stream) {
+  if (S <= 0) return;
+  require(hist && hist_row_stride >= 1 && active_slots && slot_row0 && slot_m && slot_commit && slot_pos &&
+              st.k_ring && st.v_ring && st.ring_pos && bk.k && bk.v && bk.pos,
+          "batch_verify_rollback: null arg");
+  BatchHistPtrs hp{};
+  for (int t = 0; t < 4; ++t) {
+    require(st.conv[t] && bk.conv[t] && hist[t], "batch_verify_rollback: null conv/hist");
+    hp.p[t] = hist[t];
+  }
+  const int conv_vecs = st.num_visits * kConvRowVecTotal;
+  const int items = 3 * conv_vecs + st.num_sliding_visits * kMaxVerifyRows * (2 * kRingVec + 1);
+  batch_verify_rollback_kernel<<<dim3((items + 255) / 256, S), 256, 0, stream>>>(
+      st, bk, hp, hist_row_stride, active_slots, slot_row0, slot_m, slot_commit, slot_pos);
   CUDA_CHECK(cudaGetLastError());
 }
 
