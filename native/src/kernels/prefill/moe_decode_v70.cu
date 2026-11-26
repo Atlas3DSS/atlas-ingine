@@ -19,7 +19,7 @@
 namespace ingine::kernels::prefill {
 namespace {
 
-constexpr int FMT_NVFP4 = 0, FMT_GQ5 = 6, FMT_GQI4 = 7;
+constexpr int FMT_NVFP4 = 0, FMT_GQ5 = 6, FMT_GQI4 = 7, FMT_GQ4 = 8;
 
 __device__ __forceinline__ void mma884(float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -78,7 +78,8 @@ __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArg
   constexpr int K = UP ? kHidden : kInter;
   constexpr int NE = UP ? 2 * kInter : kHidden;   // expert rows
   constexpr int CODE_ROW = K / 2;
-  constexpr int SCALE_ROW = FMT == FMT_NVFP4 ? K / 16 : (FMT == FMT_GQ5 ? (K / 32) * 12 : (K / 32) * 4);
+  constexpr int SCALE_ROW =
+      FMT == FMT_NVFP4 ? K / 16 : (FMT == FMT_GQ5 ? (K / 32) * 8 : (K / 32) * 4);
   constexpr int NK = K / 64;
   __shared__ float part[SPLIT][8][16];
   __shared__ float lut[16];
@@ -117,8 +118,8 @@ __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArg
     if constexpr (FMT == FMT_NVFP4) {
       r.s0 = __ldg(reinterpret_cast<const uint32_t*>(s + 4 * k));  // the block's four sub-block scales
     } else if constexpr (FMT == FMT_GQ5) {
-      const uint32_t* g = reinterpret_cast<const uint32_t*>(s + 12 * (2 * k + (qp >> 1)));
-      r.s0 = __ldg(g), r.s1 = __ldg(g + 1), r.s2 = __ldg(g + 2);  // scale, min, fifth bits of the group
+      const uint2 g = __ldg(reinterpret_cast<const uint2*>(s + 8 * (2 * k + (qp >> 1))));
+      r.s0 = g.x, r.s1 = g.y;  // half2(scale, min) and fifth bits of the group
     } else {
       r.s0 = __ldg(reinterpret_cast<const uint32_t*>(s + 4 * (2 * k + (qp >> 1))));
     }
@@ -130,24 +131,29 @@ __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArg
       const uint32_t sc = e4m3_h2((r.s0 >> (8 * qp)) & 0xffu);
 #pragma unroll
       for (int b = 0; b < 8; ++b) ah[b] = hmul2(e2m1x2_h2(((b < 4 ? r.c.x : r.c.y) >> (8 * (b & 3))) & 0xffu), sc);
-    } else {
-      const float sc = __uint_as_float(r.s0);
-      const float mn = FMT == FMT_GQ5 ? __uint_as_float(r.s1) : 0.f;
-      const uint32_t hb = FMT == FMT_GQ5 ? (r.s2 >> ((qp & 1) * 16)) : 0u;  // fifth bits of the sub-block
+    } else if constexpr (FMT == FMT_GQ5 || FMT == FMT_GQ4) {
+      const float2 sm = __half22float2(*reinterpret_cast<const __half2*>(&r.s0));
+      const float sc = sm.x, mn = sm.y;
+      const uint32_t hb = FMT == FMT_GQ5 ? (r.s1 >> ((qp & 1) * 16)) : 0u;  // fifth bits of the sub-block
 #pragma unroll
       for (int b = 0; b < 8; ++b) {
         const uint32_t byte = ((b < 4 ? r.c.x : r.c.y) >> (8 * (b & 3))) & 0xffu;
         uint32_t lo = byte & 15u, hi4 = byte >> 4;
-        float vl, vh;
         if constexpr (FMT == FMT_GQ5) {
           lo |= ((hb >> (2 * b)) & 1u) << 4;
           hi4 |= ((hb >> (2 * b + 1)) & 1u) << 4;
-          vl = __fadd_rn(__fmul_rn(sc, float(lo)), mn);
-          vh = __fadd_rn(__fmul_rn(sc, float(hi4)), mn);
-        } else {
-          vl = __fmul_rn(sc, lut[lo]);
-          vh = __fmul_rn(sc, lut[hi4]);
         }
+        const float vl = __fadd_rn(__fmul_rn(sc, float(lo)), mn);
+        const float vh = __fadd_rn(__fmul_rn(sc, float(hi4)), mn);
+        ah[b] = f2h2(vl, vh);
+      }
+    } else {
+      const float sc = __uint_as_float(r.s0);
+#pragma unroll
+      for (int b = 0; b < 8; ++b) {
+        const uint32_t byte = ((b < 4 ? r.c.x : r.c.y) >> (8 * (b & 3))) & 0xffu;
+        const float vl = __fmul_rn(sc, lut[byte & 15u]);
+        const float vh = __fmul_rn(sc, lut[byte >> 4]);
         ah[b] = f2h2(vl, vh);
       }
     }
@@ -407,7 +413,7 @@ bool decode_enabled(int T, int fmt) {
     return e ? std::atoi(e) : 1;
   }();
   if (!mode || T < 1 || T > 16) return false;
-  if (fmt != FMT_NVFP4 && fmt != FMT_GQ5 && fmt != FMT_GQI4) return false;
+  if (fmt != FMT_NVFP4 && fmt != FMT_GQ5 && fmt != FMT_GQI4 && fmt != FMT_GQ4) return false;
   static const bool volta = [] {
     int dev = 0, major = 0, minor = 0;
     cudaGetDevice(&dev);
@@ -425,10 +431,12 @@ void launch_dec(int fmt, const DecArgs& d, int T, cudaStream_t stream) {
   if (T <= 8) {
     if (fmt == FMT_NVFP4) moe_decode_v70_kernel<FMT_NVFP4, UP, SPLIT, 8><<<grid, SPLIT * 32, 0, stream>>>(d);
     else if (fmt == FMT_GQ5) moe_decode_v70_kernel<FMT_GQ5, UP, SPLIT, 8><<<grid, SPLIT * 32, 0, stream>>>(d);
+    else if (fmt == FMT_GQ4) moe_decode_v70_kernel<FMT_GQ4, UP, SPLIT, 8><<<grid, SPLIT * 32, 0, stream>>>(d);
     else moe_decode_v70_kernel<FMT_GQI4, UP, SPLIT, 8><<<grid, SPLIT * 32, 0, stream>>>(d);
   } else {
     if (fmt == FMT_NVFP4) moe_decode_v70_kernel<FMT_NVFP4, UP, SPLIT, 16><<<grid, SPLIT * 32, 0, stream>>>(d);
     else if (fmt == FMT_GQ5) moe_decode_v70_kernel<FMT_GQ5, UP, SPLIT, 16><<<grid, SPLIT * 32, 0, stream>>>(d);
+    else if (fmt == FMT_GQ4) moe_decode_v70_kernel<FMT_GQ4, UP, SPLIT, 16><<<grid, SPLIT * 32, 0, stream>>>(d);
     else moe_decode_v70_kernel<FMT_GQI4, UP, SPLIT, 16><<<grid, SPLIT * 32, 0, stream>>>(d);
   }
 }

@@ -158,7 +158,8 @@ void check_metadata(const GgufFile& f) {
 ExpertFormat gguf_expert_format(GgmlType t) {
   switch (t) {
     case GgmlType::NVFP4: return ExpertFormat::NVFP4;
-    case GgmlType::Q5_K: case GgmlType::Q4_K: case GgmlType::Q5_0: return ExpertFormat::GGUF_Q5L;
+    case GgmlType::Q5_K: case GgmlType::Q5_0: return ExpertFormat::GGUF_Q5L;
+    case GgmlType::Q4_K: return ExpertFormat::GGUF_Q4L;
     case GgmlType::IQ4_XS: case GgmlType::IQ4_NL: return ExpertFormat::GGUF_IQ4;
     default:
       throw std::runtime_error(std::string("weights_gguf: expert type ") + ggml_type_name(t) + " is not supported");
@@ -166,10 +167,12 @@ ExpertFormat gguf_expert_format(GgmlType t) {
 }
 
 // Codes / scales bytes of one row of K values in an ingine expert format (gguf_expert_row_bytes in the header).
+// Compact K-quant scales: Q5L = (__half2(s, m), u32 hb) = 8 B/group; Q4L = __half2(s, m) = 4 B/group; IQ4 = fp32 s = 4 B/group.
 void row_bytes(ExpertFormat fmt, int K, std::size_t& code, std::size_t& scale) {
   switch (fmt) {
     case ExpertFormat::NVFP4: code = K / 2, scale = K / 16; return;
-    case ExpertFormat::GGUF_Q5L: code = K / 2, scale = std::size_t(K / 32) * 12; return;
+    case ExpertFormat::GGUF_Q5L: code = K / 2, scale = std::size_t(K / 32) * 8; return;
+    case ExpertFormat::GGUF_Q4L: code = K / 2, scale = std::size_t(K / 32) * 4; return;
     case ExpertFormat::GGUF_IQ4: code = K / 2, scale = std::size_t(K / 32) * 4; return;
     default: throw std::runtime_error("weights_gguf: format has no GGUF row layout");
   }
@@ -184,19 +187,22 @@ void repack_row(GgmlType t, const std::uint8_t* src, int K, std::uint8_t* code, 
     std::memcpy(&x, &h, 2);
     return __half2float(x);
   };
-  // a group of 32 values: nibbles (value 2i low, 2i + 1 high), 5th bits, scale and min
+  // a group of 32 values: nibbles (value 2i low, 2i + 1 high), optional 5th bits, scale and min
   auto put_group = [&](int g, const std::uint8_t (&q)[32], float s, float m, bool five, bool has_min) {
-    std::uint32_t hb = 0;
     for (int i = 0; i < 16; ++i) code[16 * g + i] = std::uint8_t((q[2 * i] & 15) | ((q[2 * i + 1] & 15) << 4));
-    for (int i = 0; i < 32; ++i) hb |= std::uint32_t((q[i] >> 4) & 1) << i;
     if (has_min) {
-      std::memcpy(scale + 12 * g, &s, 4);
-      std::memcpy(scale + 12 * g + 4, &m, 4);
-      std::memcpy(scale + 12 * g + 8, &hb, 4);
+      const __half2 sm = __floats2half2_rn(s, m);
+      if (five) {
+        std::uint32_t hb = 0;
+        for (int i = 0; i < 32; ++i) hb |= std::uint32_t((q[i] >> 4) & 1) << i;
+        std::memcpy(scale + 8 * g, &sm, 4);
+        std::memcpy(scale + 8 * g + 4, &hb, 4);
+      } else {
+        std::memcpy(scale + 4 * g, &sm, 4);
+      }
     } else {
       std::memcpy(scale + 4 * g, &s, 4);
     }
-    (void) five;
   };
   switch (t) {
     case GgmlType::NVFP4:
@@ -683,7 +689,7 @@ std::array<ExpertFormat, LAYERS> gguf_expert_formats(const fs::path& model_dir, 
 }
 
 Weights load_weights_gguf(const fs::path& model_dir, cudaStream_t stream, int tp_rank, int tp_size,
-                          bool keep_full_unembed) {
+                          bool keep_full_unembed, bool skip_embed) {
   if (tp_size != TP_SIZE || tp_rank < 0 || tp_rank >= tp_size)
     throw std::invalid_argument("load_weights_gguf: invalid tp_rank/tp_size");
   if (keep_full_unembed && tp_size > 1)
@@ -713,7 +719,7 @@ Weights load_weights_gguf(const fs::path& model_dir, cudaStream_t stream, int tp
     }
     w.message_queries = ld.f32(mq, {LOOP_END - LOOP_START, 4, H});
   }
-  {
+  if (!skip_embed) {
     const GgufTensor& e = f.at("token_embd.weight");
     if (e.row_len() != H || e.rows() != VOCAB) throw std::runtime_error("weights_gguf: token_embd shape");
     const char* q8e = std::getenv("INGINE_GGUF_Q8_EMBED");

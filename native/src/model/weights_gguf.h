@@ -19,6 +19,6 @@ bool is_gguf_model(const std::filesystem::path& model_dir);
 std::array<ExpertFormat, LAYERS> gguf_expert_formats(const std::filesystem::path& model_dir, bool w2);
 // The model for one tensor/expert-parallel rank (tp_size 1: everything), dense in the activation type.
 Weights load_weights_gguf(const std::filesystem::path& model_dir, cudaStream_t stream, int tp_rank, int tp_size,
-                          bool keep_full_unembed = false);
+                          bool keep_full_unembed = false, bool skip_embed = false);
 
 }  // namespace ingine::model

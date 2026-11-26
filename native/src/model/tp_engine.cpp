@@ -558,36 +558,106 @@ class TpPrefiller {
     for (int p = 0; p < PASSES; ++p) B2_[p] = f32(C * H), E_[p] = f32(C * H);
     hid_ = f32(C * H), part_ = f32(C * H), y_ = f32(C * H), y2_ = f32(C * H);
     msgs_ = f32(4 * C * H);
-    mixf_ = f32(3 * C * H), xin_ = bf16(3 * C * H);
-    mixm_ = f32(C * H), xm_ = bf16(C * H), xf_ = bf16(C * H);
-    rel_ = bf16(C * HEADS * REL_EXTENT);
-    proj_ = bf16(C * PROJ_ROWS_FULL);
-    q_ = bf16(C * HEADS * HEAD_DIM);
-    rel16_ = bf16(C * HEADS * D_REL);
-    attn_out_ = bf16(C * HEADS * HEAD_DIM);
-    wo_f32_ = f32(C * H);
+    local_logits_ = f32(LOCAL_VOCAB_CHUNK);
+    gathered_logits_ = f32(std::size_t(TP_SIZE) * LOCAL_VOCAB_CHUNK);
+    ids_ = static_cast<std::int64_t*>(alloc(C * 8));
+    // Sliding-attention key/value gather buffers stay persistent (zero-initialized): pk::attention
+    // loads full key tiles up to L = ceil_64(WINDOW + T), so padded rows [WINDOW + T, L) must never
+    // contain FP32 bytes aliased from other phases that decode as FP16 NaN/Inf.
     krows_ = bf16(std::size_t(kpos_rows_) * KV_DIM);
     vrows_ = bf16(std::size_t(kpos_rows_) * KV_DIM);
     kpos_ = i32(kpos_rows_);
     bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
-    gin_ = bf16(3 * C * 2 * H);
-    g16_ = bf16(C * GATE_RANK);
-    fpre_ = f32(C * H), gpre_ = f32(C * H);
-    router_logits_ = f32(C * EXPERTS);
-    wts_ = f32(C * TOP_K);
-    idx_ = i32(C * TOP_K);
-    counts_ = i32(EXPERTS);
-    tiles_n_ = i32(1);
-    pair_tok_ = i32(C * TOP_K);
-    pair_dst_ = i32(C * TOP_K);
-    tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4)));
-    act_ = bf16(C * TOP_K * INTER);
-    down_ = bf16(C * TOP_K * H);
-    moe_f32_ = f32(C * H);
-    local_logits_ = f32(LOCAL_VOCAB_CHUNK);
-    gathered_logits_ = f32(std::size_t(TP_SIZE) * LOCAL_VOCAB_CHUNK);
-    wscratch_ = (w.dense_fp8 || w.dense_q8) ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
-    ids_ = static_cast<std::int64_t*>(alloc(C * 8));
+
+    // Phase-aliased scratch arena for non-overlapping prefill temporaries:
+    //   Prefix [0..phase_a_off): xin_ (Phase A) aliased with {xm_/xf_, mixm_} (Phase B / Final).
+    //   Phase A1 [phase_a_off..): mixf_, gin_, g16_, fpre_, gpre_ (also used in Phase B1 while xm_/mixm_ are live).
+    //   Phase A2 [phase_a_off..): proj_, q_, rel16_, rel_, attn_out_, wo_f32_, wscratch_.
+    //   Phase B2 [end_xm..):      router_logits_, wts_, idx_, counts_, tiles_n_, pair_tok_, pair_dst_, tiles_, act_, down_, moe_f32_.
+    auto align256 = [](std::size_t n) { return (n + 255) & ~std::size_t(255); };
+    std::size_t off = 0;
+    auto reserve = [&](std::size_t bytes) {
+      const std::size_t cur = off;
+      off = align256(off + bytes);
+      return cur;
+    };
+
+    const std::size_t off_xin = reserve(3 * C * H * sizeof(ActT));
+    const std::size_t end_xin = off;
+
+    off = 0;
+    const std::size_t off_xm = reserve(C * H * sizeof(ActT));
+    const std::size_t end_xm = off;
+    const std::size_t off_mixm = reserve(C * H * sizeof(float));
+    const std::size_t phase_a_off = std::max(end_xin, off);
+
+    off = phase_a_off;
+    const std::size_t off_mixf = reserve(3 * C * H * sizeof(float));
+    const std::size_t off_gin = reserve(3 * C * 2 * H * sizeof(ActT));
+    const std::size_t off_g16 = reserve(C * GATE_RANK * sizeof(ActT));
+    const std::size_t off_fpre = reserve(C * H * sizeof(float));
+    const std::size_t off_gpre = reserve(C * H * sizeof(float));
+    const std::size_t end_a1 = off;
+
+    off = phase_a_off;
+    const std::size_t off_proj = reserve(C * PROJ_ROWS_FULL * sizeof(ActT));
+    const std::size_t off_q = reserve(C * HEADS * HEAD_DIM * sizeof(ActT));
+    const std::size_t off_rel16 = reserve(C * HEADS * D_REL * sizeof(ActT));
+    const std::size_t off_rel = reserve(C * HEADS * REL_EXTENT * sizeof(ActT));
+    const std::size_t off_attn_out = reserve(C * HEADS * HEAD_DIM * sizeof(ActT));
+    const std::size_t off_wo_f32 = reserve(C * H * sizeof(float));
+    const bool need_wscratch = (w.dense_fp8 || w.dense_q8);
+    const std::size_t off_wscratch =
+        need_wscratch ? reserve(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM) * sizeof(ActT))
+                      : 0;
+    const std::size_t end_a2 = off;
+
+    off = end_xm;
+    const std::size_t off_router_logits = reserve(C * EXPERTS * sizeof(float));
+    const std::size_t off_wts = reserve(C * TOP_K * sizeof(float));
+    const std::size_t off_idx = reserve(C * TOP_K * sizeof(int));
+    const std::size_t off_counts = reserve(EXPERTS * sizeof(int));
+    const std::size_t off_tiles_n = reserve(sizeof(int));
+    const std::size_t off_pair_tok = reserve(C * TOP_K * sizeof(int));
+    const std::size_t off_pair_dst = reserve(C * TOP_K * sizeof(int));
+    const std::size_t off_tiles = reserve(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4));
+    const std::size_t off_act = reserve(C * TOP_K * INTER_LOCAL * sizeof(ActT));
+    const std::size_t off_down = reserve(C * TOP_K * H * sizeof(ActT));
+    const std::size_t off_moe_f32 = reserve(C * H * sizeof(float));
+    const std::size_t end_b2 = off;
+
+    auto* scratch = static_cast<std::uint8_t*>(alloc(std::max({end_a1, end_a2, end_b2})));
+    auto at_f32 = [&](std::size_t o) { return reinterpret_cast<float*>(scratch + o); };
+    auto at_bf16 = [&](std::size_t o) { return reinterpret_cast<ActT*>(scratch + o); };
+    auto at_i32 = [&](std::size_t o) { return reinterpret_cast<int*>(scratch + o); };
+
+    xin_ = at_bf16(off_xin);
+    xm_ = at_bf16(off_xm);
+    xf_ = xm_;
+    mixm_ = at_f32(off_mixm);
+    mixf_ = at_f32(off_mixf);
+    gin_ = at_bf16(off_gin);
+    g16_ = at_bf16(off_g16);
+    fpre_ = at_f32(off_fpre);
+    gpre_ = at_f32(off_gpre);
+    proj_ = at_bf16(off_proj);
+    q_ = at_bf16(off_q);
+    rel16_ = at_bf16(off_rel16);
+    rel_ = at_bf16(off_rel);
+    attn_out_ = at_bf16(off_attn_out);
+    wo_f32_ = at_f32(off_wo_f32);
+    wscratch_ = need_wscratch ? at_bf16(off_wscratch) : nullptr;
+    router_logits_ = at_f32(off_router_logits);
+    wts_ = at_f32(off_wts);
+    idx_ = at_i32(off_idx);
+    counts_ = at_i32(off_counts);
+    tiles_n_ = at_i32(off_tiles_n);
+    pair_tok_ = at_i32(off_pair_tok);
+    pair_dst_ = at_i32(off_pair_dst);
+    tiles_ = reinterpret_cast<int4*>(scratch + off_tiles);
+    act_ = at_bf16(off_act);
+    down_ = at_bf16(off_down);
+    moe_f32_ = at_f32(off_moe_f32);
   }
 
   void run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits_out, Tensor* taps) {
@@ -1015,7 +1085,6 @@ class TpBatchDecoder {
         spec_max_m_(spec_enabled ? spec_max_m : 1),
         max_rows_(spec_enabled ? max_batch * spec_max_m : max_batch),
         rank_(rank), comm_(comm), rinfo_(rinfo),
-        gemm_(std::make_unique<pk::Gemm>()),
         tokens_host_(std::size_t(max_rows_) * sizeof(std::int64_t)),
         slots_host_(std::size_t(max_rows_) * sizeof(std::int32_t)),
         banned_host_(std::size_t(max_rows_) * sizeof(bk::BannedList)),
@@ -1060,7 +1129,7 @@ class TpBatchDecoder {
     tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_rows_)) * sizeof(int4)));
     route_done_ = static_cast<unsigned*>(alloc(sizeof(unsigned)));
     CUDA_CHECK(cudaMemset(route_done_, 0, sizeof(unsigned)));
-    act_ = bf16(B * TOP_K * INTER);
+    act_ = bf16(B * TOP_K * INTER_LOCAL);
     down_ = bf16(B * TOP_K * H);
     moe_f32_ = f32(B * H);
     local_logits_ = f32(B * LOCAL_VOCAB_CHUNK);
@@ -1386,9 +1455,9 @@ class TpBatchDecoder {
       pk::gate_inputs(rows, G, B, gin_, stream);
       for (int g = 0; g < G; ++g) {
         const ActT* gd = bf16p(down) + std::size_t(g) * GATE_RANK * 2 * H;
-        gemm_->run(gin_ + std::size_t(g) * B * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, B, GATE_RANK, 2 * H, stream);
-        gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, B, H, GATE_RANK, stream);
-        gemm_->run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gpre_, H, true, B, H, GATE_RANK, stream);
+        gemm().run(gin_ + std::size_t(g) * B * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, B, GATE_RANK, 2 * H, stream);
+        gemm().run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, B, H, GATE_RANK, stream);
+        gemm().run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gpre_, H, true, B, H, GATE_RANK, stream);
         pk::gate_apply(rows.h[g], rows.msg[g], fpre_, gpre_, norm_w + std::size_t(g) * H, B, out + std::size_t(g) * slab, stream);
       }
     };
@@ -1475,7 +1544,7 @@ class TpBatchDecoder {
       } else {
         const ActT* wp = bf16_rows(layer.wproj);
         if (single) {
-          gemm_->run(xin_, H, wp, H, proj_act_, R, false, B, R, H, stream);
+          gemm().run(xin_, H, wp, H, proj_act_, R, false, B, R, H, stream);
         } else {
           struct Part { int begin, end, input; };
           const Part parts[] = {{SEG_BEGIN[SEG_Q], SEG_BEGIN[SEG_K], 0},
@@ -1485,7 +1554,7 @@ class TpBatchDecoder {
                                 {SEG_BEGIN[SEG_V_DYN], SEG_BEGIN[NUM_SEGS], 2}};
           for (const Part& part : parts) {
             if (part.begin >= R) break;
-            gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H,
+            gemm().run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H,
                        proj_act_ + part.begin, R, false, B, part.end - part.begin, H, stream);
           }
         }
@@ -1546,7 +1615,7 @@ class TpBatchDecoder {
         }
       } else {
         const ActT* wo = bf16_rows(layer.wo);
-        gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_fp32_, H, true, B, H, HEADS * HEAD_DIM, stream);
+        gemm().run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_fp32_, H, true, B, H, HEADS * HEAD_DIM, stream);
       }
       if (rinfo_.p2p_ar.active() && B * H <= rinfo_.p2p_ar.cap && 2 * v + 1 < rinfo_.p2p_ar.slots)
         bk::p2p_allreduce2(wo_fp32_, B * H, rinfo_.p2p_ar, 2 * v, stream);
@@ -1582,7 +1651,7 @@ class TpBatchDecoder {
       const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
       if (!pk::moe_route_decode(xm_, B, f32p(layer.router), f32p(layer.router_bias), idx_, wts_, router_logits_,
                                 route_done_, work, stream)) {
-        gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, B, EXPERTS, H, stream);
+        gemm().run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, B, EXPERTS, H, stream);
         CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), stream));
         pk::moe_topk(router_logits_, f32p(layer.router_bias), B, idx_, wts_, counts_, stream);
         pk::moe_route(idx_, B, work, stream);
@@ -1633,7 +1702,7 @@ class TpBatchDecoder {
         } else {
           wchunk = bf16p(w.unembed.w) + std::size_t(v0) * H;
         }
-        gemm_->run(xf_, H, wchunk, H, head_act_, cv, false, B, cv, H, stream);
+        gemm().run(xf_, H, wchunk, H, head_act_, cv, false, B, cv, H, stream);
         bk::batched_head_softcap(head_act_, B, cv, v0, LOCAL_VOCAB_CHUNK, local_logits_, stream);
       }
     }
@@ -1883,7 +1952,7 @@ class TpBatchDecoder {
       const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
       if (!pk::moe_route_decode(xm_, B, f32p(layer.router), f32p(layer.router_bias), idx_, wts_, router_logits_,
                                 route_done_, work, stream)) {
-        gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, B, EXPERTS, H, stream);
+        gemm().run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, B, EXPERTS, H, stream);
         CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), stream));
         pk::moe_topk(router_logits_, f32p(layer.router_bias), B, idx_, wts_, counts_, stream);
         pk::moe_route(idx_, B, work, stream);
@@ -1928,6 +1997,11 @@ class TpBatchDecoder {
     bk::p2p_argmax2(local_logits_, B, local_V, LOCAL_VOCAB_CHUNK, v0, banned_dev_, argmax_ws_, rinfo_.p2p_ar,
                     2 * NUM_VISITS, argmax_out_dev_, stream);
     (void)use_gemv;
+  }
+
+  pk::Gemm& gemm() {
+    if (!gemm_) gemm_ = std::make_unique<pk::Gemm>();
+    return *gemm_;
   }
 
   const Weights& w_;
@@ -1999,11 +2073,17 @@ class TpBatchGenerator final : public Generator {
     prefill_chunk_ = std::min(options.prefill_chunk, options.max_ctx);
     max_pages_per_slot_ = (options.max_ctx + bk::kPageSize - 1) / bk::kPageSize;
 
-    // Step 1: load sharded weights + ablation + prefiller on all 4 ranks in parallel
+    // Step 1: load sharded weights + ablation + prefiller on all ranks in parallel.
+    // In TP2 batched spec mode with verified CUDA P2P, rank 0 shares rank 1's token_embd.weight
+    // (-469 MiB on rank 0) to leave comfortable VRAM headroom for BatchDrafter alongside a 4x256K KV pool.
+    const char* share_emb_env = std::getenv("INGINE_TP_SHARE_EMBED");
+    const bool share_embed =
+        (TP_SIZE == 2 && pool_.info(0).p2p_ar.active() && spec_active_ && !(share_emb_env && share_emb_env[0] == '0'));
     std::array<int, TP_SIZE> rank_fit_pages{};
     pool_.run_all([&](int r) {
       auto& rk = ranks_[r];
-      rk.weights = load_weights_sharded(options_.model_dir, options_.dense_fp8, pool_.stream(r), r, TP_SIZE, false);
+      rk.weights = load_weights_sharded(options_.model_dir, options_.dense_fp8, pool_.stream(r), r, TP_SIZE, false,
+                                        share_embed && r == 0);
       MEMLOG(r, "weights");
       rk.ablation = load_ablation(options_.ablation);
       rk.prefiller = std::make_unique<TpPrefiller>(rk.weights, rk.ablation, prefill_chunk_, pool_.stream(r),
@@ -2032,6 +2112,10 @@ class TpBatchGenerator final : public Generator {
         rank_fit_pages[r] = std::min(max_possible, std::max(std::min(max_possible, max_pages_per_slot_), int(avail / bytes_per_page)));
       }
     });
+    if (share_embed) {
+      ranks_[0].weights.embed = ranks_[1].weights.embed;
+      ingine::engine::server_log().info("TP2 rank 0 sharing rank 1 token_embd.weight over CUDA P2P (-469 MiB)");
+    }
 
     num_pages_ = *std::min_element(rank_fit_pages.begin(), rank_fit_pages.end());
     if (num_pages_ < 1) throw std::runtime_error("TP BatchStatePool: insufficient VRAM for paged full-KV pool");

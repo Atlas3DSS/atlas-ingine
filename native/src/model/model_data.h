@@ -229,10 +229,11 @@ struct Dense {
   int cols() const { return w.ne[0]; }
 };
 
-// GGUF_Q5L / GGUF_IQ4: experts of GGUF files (weights_gguf.cpp), 32-value groups. Codes: 4 bits a value (value 2i in
-// the low nibble of byte i, as NVFP4); scales per group: Q5L 12 B = FP32 scale, FP32 min, 32 fifth bits (value =
-// scale * code + min, code 0..31: Q5_K, Q4_K, Q5_0), IQ4 4 B = FP32 scale (value = scale * iq4nl[code]: IQ4_XS, IQ4_NL).
-enum class ExpertFormat : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5, GGUF_Q5L = 6, GGUF_IQ4 = 7 };
+// GGUF_Q5L / GGUF_Q4L / GGUF_IQ4: experts of GGUF files (weights_gguf.cpp), 32-value groups. Codes: 4 bits a value
+// (value 2i in the low nibble of byte i, as NVFP4); scales per group: Q5L 8 B = FP16 (scale, min) + u32 fifth bits
+// (value = scale * code + min, code 0..31: Q5_K, Q5_0), Q4L 4 B = FP16 (scale, min) (code 0..15: Q4_K), IQ4 4 B = FP32
+// scale (value = scale * iq4nl[code]: IQ4_XS, IQ4_NL).
+enum class ExpertFormat : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5, GGUF_Q5L = 6, GGUF_IQ4 = 7, GGUF_Q4L = 8 };
 
 inline constexpr bool is_exl3(ExpertFormat f) { return f == ExpertFormat::EXL3_2 || f == ExpertFormat::EXL3_3; }
 

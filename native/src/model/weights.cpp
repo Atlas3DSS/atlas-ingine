@@ -884,14 +884,15 @@ Layer load_layer_sharded(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp
 }
 
 Weights load_weights_sharded(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream,
-                             int tp_rank, int tp_size, bool keep_full_unembed) {
+                             int tp_rank, int tp_size, bool keep_full_unembed, bool skip_embed) {
   if (tp_size == 1) return load_weights(model_dir, dense_fp8, stream);
   if (tp_size != TP_SIZE || tp_rank < 0 || tp_rank >= tp_size)
     throw std::invalid_argument("load_weights_sharded: invalid tp_rank/tp_size");
   if (is_gguf_model(model_dir)) {
     if (dense_fp8) throw std::invalid_argument("--dense-fp8 would re-quantize the GGUF dense weights; drop it");
-    return load_weights_gguf(model_dir, stream, tp_rank, tp_size, keep_full_unembed);
+    return load_weights_gguf(model_dir, stream, tp_rank, tp_size, keep_full_unembed, skip_embed);
   }
+  (void)skip_embed;
 #if INGINE_TP_ETP
   throw std::invalid_argument("expert tensor parallel builds (INGINE_TP_ETP) load GGUF models only");
 #endif

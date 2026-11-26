@@ -29,10 +29,10 @@ namespace {
 
 enum class Mode { Up, Down };
 constexpr int FMT_NVFP4 = 0, FMT_MXFP8 = 1, FMT_ATLAS2 = 2, FMT_ATLAS3 = 3, FMT_EXL3_2 = 4, FMT_EXL3_3 = 5;
-// GGUF experts (model/weights_gguf.cpp): codes as NVFP4's nibbles; per 32-value group Q5L 12 B (FP32 scale, FP32
-// min, the 32 fifth bits: value = scale * code + min), IQ4 4 B (FP32 scale: value = scale * iq4nl[code]).
-constexpr int FMT_GQ5 = 6, FMT_GQI4 = 7;
-constexpr bool is_gguf_fmt(int f) { return f == FMT_GQ5 || f == FMT_GQI4; }
+// GGUF experts (model/weights_gguf.cpp): codes as NVFP4's nibbles; per 32-value group Q5L 8 B (FP16 half2(scale, min)
+// + u32 fifth bits: value = scale * code + min), Q4L 4 B (FP16 half2(scale, min)), IQ4 4 B (FP32 scale * iq4nl[code]).
+constexpr int FMT_GQ5 = 6, FMT_GQI4 = 7, FMT_GQ4 = 8;
+constexpr bool is_gguf_fmt(int f) { return f == FMT_GQ5 || f == FMT_GQI4 || f == FMT_GQ4; }
 
 constexpr int TN = 128, BK = 64;
 constexpr int AS = INGINE_ACT_FP16 ? 2 : 3;  // activation stages (2 fits Volta 96 KiB shared memory)
@@ -48,7 +48,8 @@ __constant__ float kIq4nl[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22
 template <int FMT, int K, int TM, bool LOW_SMEM = false>
 struct Cfg {
   static constexpr int CODE_ROW = (FMT == FMT_NVFP4 || is_gguf_fmt(FMT)) ? K / 2 : (FMT == FMT_MXFP8 ? K : (FMT == FMT_ATLAS2 ? K / 4 : (K * 3) / 8));
-  static constexpr int SCALE_ROW = FMT == FMT_GQ5 ? (K / 32) * 12 : (FMT == FMT_GQI4 ? (K / 32) * 4 : (FMT == FMT_MXFP8 ? K / 32 : K / 16));
+  static constexpr int SCALE_ROW =
+      FMT == FMT_GQ5 ? (K / 32) * 8 : ((FMT == FMT_GQI4 || FMT == FMT_GQ4) ? (K / 32) * 4 : (FMT == FMT_MXFP8 ? K / 32 : K / 16));
   // weight chunk: 128 elements for NVFP4/ATLAS2/ATLAS3 (64/32/48 code bytes per row, all multiples of 16), 64 for MXFP8
   static constexpr int WK = (FMT == FMT_MXFP8 || K % 128 != 0) ? 64 : 128;  // (K = 576: expert TP down)
   static constexpr int R = WK / BK;  // activation steps per weight chunk
@@ -440,7 +441,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
     // Direct __ldg Volta path for the GGUF expert formats: the NVFP4 path's code stream (32 B a row a step), the
     // step's two 32-value groups' scales (Q5L: scale, min, fifth bits each; IQ4: scale), each value formed in FP32
     // (scale * code + min, or scale * iq4nl[code]) and rounded once to FP16.
-    constexpr int SB = FMT == FMT_GQ5 ? 24 : 8;  // scale bytes a step (two groups)
+    constexpr int SB = FMT == FMT_GQ5 ? 16 : 8;  // scale bytes a step (two groups)
     const uint8_t* wrow[2] = {
         code_tile + int64_t(warp * 16 + v_idx) * C::CODE_ROW,
         code_tile + int64_t(warp * 16 + 8 + v_idx) * C::CODE_ROW,
@@ -450,15 +451,15 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
         scale_tile + int64_t(warp * 16 + 8 + v_idx) * C::SCALE_ROW,
     };
     uint4 w0_cur[2], w1_cur[2];
-    uint2 s_cur[2][3];
-    auto load_step = [&](int ks, uint4 (&w0)[2], uint4 (&w1)[2], uint2 (&sv)[2][3]) {
+    uint2 s_cur[2][2];
+    auto load_step = [&](int ks, uint4 (&w0)[2], uint4 (&w1)[2], uint2 (&sv)[2][2]) {
 #pragma unroll
       for (int nt = 0; nt < 2; ++nt) {
         w0[nt] = __ldg(reinterpret_cast<const uint4*>(wrow[nt] + ks * 32));
         w1[nt] = __ldg(reinterpret_cast<const uint4*>(wrow[nt] + ks * 32 + 16));
         const uint2* sp = reinterpret_cast<const uint2*>(srow[nt] + ks * SB);
         sv[nt][0] = __ldg(sp);
-        if constexpr (FMT == FMT_GQ5) sv[nt][1] = __ldg(sp + 1), sv[nt][2] = __ldg(sp + 2);
+        if constexpr (FMT == FMT_GQ5) sv[nt][1] = __ldg(sp + 1);
       }
     };
     load_step(0, w0_cur, w1_cur, s_cur);
@@ -468,7 +469,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
       issue(ks + C::AS_STG - 1);
       const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
       uint4 w0_nxt[2], w1_nxt[2];
-      uint2 s_nxt[2][3];
+      uint2 s_nxt[2][2];
       if (ks + 1 < KS) load_step(ks + 1, w0_nxt, w1_nxt, s_nxt);
       auto decode_v = [&](int kk, unsigned (&b)[2][4]) {
         const int grp = kk >> 1, base = (kk & 1) * 16 + v_kh;  // the group and the lane's first value in it
@@ -480,10 +481,13 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
           float sc, mn = 0.f;
           uint32_t hb = 0;
           if constexpr (FMT == FMT_GQ5) {
-            // step layout: s0 m0 h0 | s1 m1 h1 as three 8-byte words
-            sc = __uint_as_float(grp ? s_cur[nt][1].y : s_cur[nt][0].x);
-            mn = __uint_as_float(grp ? s_cur[nt][2].x : s_cur[nt][0].y);
-            hb = grp ? s_cur[nt][2].y : s_cur[nt][1].x;
+            const uint2 gw = grp ? s_cur[nt][1] : s_cur[nt][0];
+            const float2 sm = __half22float2(*reinterpret_cast<const __half2*>(&gw.x));
+            sc = sm.x, mn = sm.y, hb = gw.y;
+          } else if constexpr (FMT == FMT_GQ4) {
+            const uint32_t gw = grp ? s_cur[nt][0].y : s_cur[nt][0].x;
+            const float2 sm = __half22float2(*reinterpret_cast<const __half2*>(&gw));
+            sc = sm.x, mn = sm.y;
           } else {
             sc = __uint_as_float(grp ? s_cur[nt][0].y : s_cur[nt][0].x);
           }
@@ -495,6 +499,9 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
               const uint32_t a5 = qa | (((hb >> (base + j)) & 1u) << 4), b5 = qb | (((hb >> (base + 8 + j)) & 1u) << 4);
               v[j] = __fadd_rn(__fmul_rn(sc, float(a5)), mn);
               v[4 + j] = __fadd_rn(__fmul_rn(sc, float(b5)), mn);
+            } else if constexpr (FMT == FMT_GQ4) {
+              v[j] = __fadd_rn(__fmul_rn(sc, float(qa)), mn);
+              v[4 + j] = __fadd_rn(__fmul_rn(sc, float(qb)), mn);
             } else {
               v[j] = __fmul_rn(sc, lut[qa]);
               v[4 + j] = __fmul_rn(sc, lut[qb]);
@@ -521,7 +528,8 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
           w0_cur[nt] = w0_nxt[nt], w1_cur[nt] = w1_nxt[nt];
-          s_cur[nt][0] = s_nxt[nt][0], s_cur[nt][1] = s_nxt[nt][1], s_cur[nt][2] = s_nxt[nt][2];
+          s_cur[nt][0] = s_nxt[nt][0];
+          if constexpr (FMT == FMT_GQ5) s_cur[nt][1] = s_nxt[nt][1];
         }
       }
     }
@@ -1162,6 +1170,7 @@ void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, Ac
   else if (e.fmt == FMT_ATLAS2) launch_rows<FMT_ATLAS2, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
 #if INGINE_ACT_FP16
   else if (e.fmt == FMT_GQ5) launch_rows<FMT_GQ5, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+  else if (e.fmt == FMT_GQ4) launch_rows<FMT_GQ4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
   else if (e.fmt == FMT_GQI4) launch_rows<FMT_GQI4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
 #endif
   else launch_rows<FMT_ATLAS3, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
@@ -1199,6 +1208,7 @@ void moe_down(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, Act
   else if (w2_fmt == FMT_ATLAS2) launch_rows<FMT_ATLAS2, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
 #if INGINE_ACT_FP16
   else if (w2_fmt == FMT_GQ5) launch_rows<FMT_GQ5, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+  else if (w2_fmt == FMT_GQ4) launch_rows<FMT_GQ4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
   else if (w2_fmt == FMT_GQI4) launch_rows<FMT_GQI4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
 #endif
   else launch_rows<FMT_ATLAS3, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
