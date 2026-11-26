@@ -15,9 +15,8 @@ Tiered profiles for Qwen3.8-27B (64 layers: 48 Gated DeltaNet + 16 Full Attentio
       Boundary (L00..03, L60..63) MLP=nvfp4, Core MLP=atlas3, Attn/GDN=fp8, embed/lm_head=nvfp4
   * atlas-14g (~12.8 GiB text-only, fits 16 GB GPUs all-in-VRAM with room for KV):
       Boundary (L00..03, L60..63) MLP=nvfp4, Core MLP=atlas3, Boundary Attn=fp8, Core Attn=nvfp4, embed/lm_head=nvfp4
-  * atlas-11g (~11.2 GiB text-only, fits 12 GB GPUs all-in-VRAM):
-      Boundary (L00..01, L62..63) MLP=atlas3, Core MLP gate/up=atlas2 & down_proj=atlas3,
-      Boundary Attn=fp8, Core Attn=nvfp4, embed/lm_head=nvfp4
+  * atlas-11g (~11.3 GiB text-only, fits 12 GB GPUs all-in-VRAM, zero 2.5-bit atlas2 collapse):
+      Boundary (L00..01, L62..63) Attn=nvfp4, Core Attn/GDN=atlas3, All MLP=atlas3, embed/lm_head=nvfp4
 """
 from __future__ import annotations
 
@@ -66,10 +65,10 @@ PROFILES: dict[str, dict[str, str | int]] = {
     "atlas-11g": {
         "boundary_n": 2,
         "boundary_mlp": "atlas3",
-        "core_mlp": "atlas2",
+        "core_mlp": "atlas3",
         "core_mlp_down": "atlas3",
-        "boundary_attn": "fp8",
-        "core_attn": "nvfp4",
+        "boundary_attn": "nvfp4",
+        "core_attn": "atlas3",
         "embed": "nvfp4",
         "lm_head": "nvfp4",
     },
