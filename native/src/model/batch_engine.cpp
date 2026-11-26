@@ -423,9 +423,11 @@ class BatchDecoder {
     bytes += M * (HEADS * HEAD_DIM + TOP_K * (INTER + H) + H) * sizeof(ActT);
     bytes += M * (PROJ_ROWS_FULL + H + 3 * 16) * sizeof(float);
     bytes += M * (3 * 2 * H + 3 * GATE_RANK) * sizeof(ActT);
+    if (M >= 2) {
+      bytes += std::size_t(3) * 8 * H * sizeof(ActT);
+    }
     if (M > 8) {
       bytes += M * std::size_t(kHeadChunk) * sizeof(float);
-      bytes += std::size_t(3) * 8 * H * sizeof(ActT);
     }
     if (dense_fp8 && M > 32) bytes += std::size_t(kHeadChunk) * H * sizeof(ActT);
     if (spec_enabled) {
@@ -479,7 +481,7 @@ class BatchDecoder {
     for (int p = 0; p < PASSES; ++p) B2_[p] = f32(M * H), E_[p] = f32(M * H);
     hid_ = f32(M * H), part_ = f32(M * H), y_ = f32(M * H), y2_ = f32(M * H);
     xin_ = bf16(3 * M * H), xm_ = bf16(M * H), xf_ = bf16(M * H);
-    xin_chunk_ = M > 8 ? bf16(3 * 8 * H) : nullptr;
+    xin_chunk_ = M >= 2 ? bf16(3 * 8 * H) : nullptr;
     mixf_ = f32(3 * M * H), msgs_ = f32(4 * M * H), mixm_ = f32(M * H);
     proj_fp32_ = f32(M * PROJ_ROWS_FULL);
     attn_out_ = bf16(M * HEADS * HEAD_DIM);
@@ -590,11 +592,13 @@ class BatchDecoder {
       ht[i] = inputs[i].token;
       hs[i] = inputs[i].slot;
     }
+    const int tok_copy = (B_cap < 8 && max_rows_ >= 8) ? 8 : B_cap;
     for (int i = B_active; i < B_cap; ++i) {
       ht[i] = 0;
       hs[i] = -1;
     }
-    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(B_cap) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+    for (int i = B_cap; i < tok_copy; ++i) ht[i] = 0;
+    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(tok_copy) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev_, hs, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
 
     if (it != graphs_.end()) {
@@ -637,12 +641,15 @@ class BatchDecoder {
       hw[b] = slot_w_limit_host[b];
       for (int w = 0; w < W; ++w) ht[b * W + w] = tokens_host_bw[b * W + w];
     }
+    const int n_rows = B_cap * W;
+    const int tok_copy = (n_rows < 8 && max_rows_ >= 8) ? 8 : n_rows;
     for (int b = B_active; b < B_cap; ++b) {
       hs[b] = -1;
       hw[b] = 1;
       for (int w = 0; w < W; ++w) ht[b * W + w] = 0;
     }
-    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(B_cap) * W * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+    for (int i = n_rows; i < tok_copy; ++i) ht[i] = 0;
+    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(tok_copy) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev_, hs, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(slot_w_limit_dev_, hw, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
 
@@ -699,12 +706,13 @@ class BatchDecoder {
     auto* ht = static_cast<std::int64_t*>(tokens_host_.data());
     auto* hs = static_cast<std::int32_t*>(slots_host_.data());
     auto* hw = static_cast<std::int32_t*>(wlim_host_.data());
-    std::memset(ht, 0, std::size_t(B_cap) * W * sizeof(std::int64_t));
+    const int n_tok = (B_cap * W < 8 && max_rows_ >= 8) ? 8 : (B_cap * W);
+    std::memset(ht, 0, std::size_t(n_tok) * sizeof(std::int64_t));
     for (int b = 0; b < B_cap; ++b) {
       hs[b] = -1;
       hw[b] = W;
     }
-    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(B_cap) * W * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(n_tok) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev_, hs, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(slot_w_limit_dev_, hw, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
     decode_verify_eager(B_cap, W, stream);
@@ -795,13 +803,15 @@ class BatchDecoder {
       return 8;
     };
 
+    // Keep embed RMSNorm on fixed BW=64 (M >= 8) whenever buffer capacity permits so M=1..7 matches M>=8 bit-for-bit.
+    const int M_embed = (M < 8 && max_rows_ >= 8) ? 8 : M;
     if (w.embed_q4()) {
-      auto desc = ops::make_inkling_embed_q4_desc(M, VOCAB, /*allow_pdl=*/false);
+      auto desc = ops::make_inkling_embed_q4_desc(M_embed, VOCAB, /*allow_pdl=*/false);
       desc.token_bounds = ops::TokenBoundsMode::PreValidated;
       const ops::EmbedQ4RmsNormArgs args{tokens_dev_, w.embed.data, f32p(w.embed_norm), B0_};
       ops::run_embed_q4_rmsnorm(desc, args, stream, /*allow_fallback=*/false, /*force_fallback=*/false);
     } else {
-      dense::embed(tokens_dev_, M, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
+      dense::embed(tokens_dev_, M_embed, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
     }
 
     int prev_v = -1;
@@ -857,12 +867,27 @@ class BatchDecoder {
       }
 
       // ---- Attention projections over M = B * W rows
-      // Always use chunked dense::proj (chunks in {2..8} for M >= 2) so wproj is 0-ULP M-invariant across
-      // decode and verify batch sizes and cannot trigger cuBLASLt heuristic-dependent MoE router flips.
+      // Always use chunked dense::proj on gemv_mma_kernel (chunks in {2..8}, padding M=1 -> 2 when max_rows_ >= 2)
+      // so wproj is 0-ULP M-invariant across all M = 1..96 and cannot trigger cuBLASLt or M=1/M>=2 MoE router flips.
       const int R = proj_rows(layer.full);
       const bool single = !layer.full && !msgs;
       const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
-      if (M <= 8) {
+      if (M == 1 && max_rows_ >= 2) {
+        const ActT* xptr = xin_;
+        if (!single) {
+          for (int g = 0; g < 3; ++g) {
+            CUDA_CHECK(cudaMemcpyAsync(xin_chunk_ + std::size_t(g) * 2 * H, xin_ + std::size_t(g) * slab,
+                                       std::size_t(H) * sizeof(ActT), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemsetAsync(xin_chunk_ + std::size_t(g) * 2 * H + H, 0,
+                                       std::size_t(H) * sizeof(ActT), stream));
+          }
+          xptr = xin_chunk_;
+        } else {
+          CUDA_CHECK(cudaMemsetAsync(xin_ + H, 0, std::size_t(H) * sizeof(ActT), stream));
+        }
+        dense::proj(xptr, 2, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_,
+                    false, stream);
+      } else if (M <= 8) {
         dense::proj(xin_, M, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_,
                     false, stream);
       } else {
@@ -976,14 +1001,19 @@ class BatchDecoder {
       }
 
       // ---- Output projection + per-slot post-attention 4-tap conv
-      // Always use chunked dense::gemv (chunks in {2..8} for M >= 2) so wo is 0-ULP M-invariant before MoE routers.
+      // Always use chunked dense::gemv on gemv_mma_kernel (padding M=1 -> 2 when max_rows_ >= 2) so wo is 0-ULP M-invariant.
       float* conv_attn_v = static_cast<float*>(pool_.conv_attn.p) + std::size_t(v) * (CONV_K - 1) * H;
       float* hist_attn_v = save_hist ? (hist_attn_ + std::size_t(v) * hist_h_visit_stride_) : nullptr;
-      for (int m0 = 0; m0 < M;) {
-        const int cm = next_gemv_chunk(M - m0);
-        dense::gemv(attn_out_ + std::size_t(m0) * HEADS * HEAD_DIM, cm, HEADS * HEAD_DIM, matrix(layer.wo),
-                    wo_fp32_ + std::size_t(m0) * H, false, stream);
-        m0 += cm;
+      if (M == 1 && max_rows_ >= 2) {
+        CUDA_CHECK(cudaMemsetAsync(attn_out_ + HEADS * HEAD_DIM, 0, std::size_t(HEADS * HEAD_DIM) * sizeof(ActT), stream));
+        dense::gemv(attn_out_, 2, HEADS * HEAD_DIM, matrix(layer.wo), wo_fp32_, false, stream);
+      } else {
+        for (int m0 = 0; m0 < M;) {
+          const int cm = next_gemv_chunk(M - m0);
+          dense::gemv(attn_out_ + std::size_t(m0) * HEADS * HEAD_DIM, cm, HEADS * HEAD_DIM, matrix(layer.wo),
+                      wo_fp32_ + std::size_t(m0) * H, false, stream);
+          m0 += cm;
+        }
       }
       if (!use_verify_kernels) {
         bk::batched_static_conv_step(wo_fp32_, true, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
@@ -1041,11 +1071,16 @@ class BatchDecoder {
             nullptr, final_tap);
     const bool head_gemv = use_gemv || (w.unembed.fp8() && M <= 32);
     if (head_gemv) {
-      for (int m0 = 0; m0 < M;) {
-        const int cm = next_gemv_chunk(M - m0);
-        dense::head(xf_ + std::size_t(m0) * H, cm, matrix(w.unembed), logits_ + std::size_t(m0) * UNPADDED_VOCAB,
-                    false, stream);
-        m0 += cm;
+      if (M == 1 && max_rows_ >= 2) {
+        CUDA_CHECK(cudaMemsetAsync(xf_ + H, 0, std::size_t(H) * sizeof(ActT), stream));
+        dense::head(xf_, 2, matrix(w.unembed), logits_, false, stream);
+      } else {
+        for (int m0 = 0; m0 < M;) {
+          const int cm = next_gemv_chunk(M - m0);
+          dense::head(xf_ + std::size_t(m0) * H, cm, matrix(w.unembed), logits_ + std::size_t(m0) * UNPADDED_VOCAB,
+                      false, stream);
+          m0 += cm;
+        }
       }
     } else {
       const float* hscale = w.unembed.fp8() ? f32p(w.unembed.scale) : nullptr;
