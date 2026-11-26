@@ -1232,25 +1232,34 @@ class TpBatchDecoder {
   }
 
   bool capture_verify_bucket(int R_cap, cudaStream_t stream) {
+    static const bool dbg = std::getenv("INGINE_GRAPH_DBG") && std::atoi(std::getenv("INGINE_GRAPH_DBG"));
     cudaGraph_t graph = nullptr;
     const cudaError_t berr = cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
-    if (berr != cudaSuccess) return false;
+    if (berr != cudaSuccess) {
+      if (dbg) std::fprintf(stderr, "graph R=%d: begin capture: %s\n", R_cap, cudaGetErrorString(berr));
+      return false;
+    }
     try {
       decode_verify_eager(R_cap, stream);
-    } catch (...) {
+    } catch (const std::exception& e) {
+      if (dbg) std::fprintf(stderr, "graph R=%d: threw: %s\n", R_cap, e.what());
       cudaStreamEndCapture(stream, &graph);
       if (graph) cudaGraphDestroy(graph);
       return false;
     }
     const cudaError_t eerr = cudaStreamEndCapture(stream, &graph);
     if (eerr != cudaSuccess || !graph) {
+      if (dbg) std::fprintf(stderr, "graph R=%d: end capture: %s\n", R_cap, cudaGetErrorString(eerr));
       if (graph) cudaGraphDestroy(graph);
       return false;
     }
     cudaGraphExec_t exec = nullptr;
     const cudaError_t ierr = cudaGraphInstantiate(&exec, graph, 0);
     cudaGraphDestroy(graph);
-    if (ierr != cudaSuccess || !exec) return false;
+    if (ierr != cudaSuccess || !exec) {
+      if (dbg) std::fprintf(stderr, "graph R=%d: instantiate: %s\n", R_cap, cudaGetErrorString(ierr));
+      return false;
+    }
     CUDA_CHECK(cudaGraphUpload(exec, stream));
     auto old = graphs_verify_.find(R_cap);
     if (old != graphs_verify_.end() && old->second) cudaGraphExecDestroy(old->second);
@@ -2259,6 +2268,7 @@ class TpBatchGenerator final : public Generator {
                     tok_per_verify, v_ms, d_ms, options_.max_batch, steady_agg, steady_req,
                     static_cast<long long>(spec_m_hist_[1]), static_cast<long long>(spec_m_hist_[2]),
                     static_cast<long long>(spec_m_hist_[3]), static_cast<long long>(spec_m_hist_[4]));
+      if (graphs_fell_back_) std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " EAGER");
     } else {
       std::snprintf(buf, sizeof buf,
                     "spec: %.2f tok/verify, verify=%.2fms, draft=%.2fms, m=[1:%lld,2:%lld,3:%lld,4:%lld]",
@@ -2511,6 +2521,14 @@ class TpBatchGenerator final : public Generator {
     }
 
     std::lock_guard<std::mutex> lk(mu_);
+    // INGINE_STEP_PROF=1: split the spec cycle into host (entry -> launches) / GPU wait / tail.
+    static const bool sprof = [] {
+      const char* e = std::getenv("INGINE_STEP_PROF");
+      return e && e[0] != '0';
+    }();
+    using SClock = std::chrono::steady_clock;
+    SClock::time_point sp0, sp1, sp2;
+    if (sprof) sp0 = SClock::now();
     const int dlen = batch_drafter_->draft_len();
     std::array<int, kd::kMaxBatchSlots> active_slots{};
     std::array<int, kd::kMaxBatchSlots> m_slot{};
@@ -2730,6 +2748,7 @@ class TpBatchGenerator final : public Generator {
     });
 
     // 5) Overlap rank 1 rollback behind rank 0's BatchDrafter (wakes right after batch_greedy_accept)
+    if (sprof) sp1 = SClock::now();
     CUDA_CHECK(cudaSetDevice(0));
     CUDA_CHECK(cudaEventSynchronize(accept_ready_ev_));
     CUDA_CHECK(cudaSetDevice(1));
@@ -2740,6 +2759,7 @@ class TpBatchGenerator final : public Generator {
     CUDA_CHECK(cudaSetDevice(1));
     CUDA_CHECK(cudaStreamSynchronize(pool_.stream(1)));
     CUDA_CHECK(cudaSetDevice(0));
+    if (sprof) sp2 = SClock::now();
 
     float v_ms = 0.f, d_ms = 0.f;
     CUDA_CHECK(cudaEventElapsedTime(&v_ms, ev_v0_, ev_v1_));
@@ -2800,6 +2820,21 @@ class TpBatchGenerator final : public Generator {
     if (predicted_acc_sum >= 0.5f) {
       const float ratio = std::clamp(float(step_acc_sum) / predicted_acc_sum, 0.6f, 1.25f);
       spec_alpha_cal_ = std::clamp(0.95f * spec_alpha_cal_ + 0.05f * (spec_alpha_cal_ * ratio), 0.75f, 1.05f);
+    }
+    if (sprof) {
+      const auto sp3 = SClock::now();
+      static int sn3 = 0;
+      static double t0 = 0, t1 = 0, t2 = 0;
+      auto dms = [](auto x, auto y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
+      t0 += dms(sp0, sp1);
+      t1 += dms(sp1, sp2);
+      t2 += dms(sp2, sp3);
+      if (++sn3 % 8 == 0) {
+        std::printf("spec_prof: host_to_launch %.2f  gpu_wait %.2f  tail %.2f ms  (R_cap %d)\n", t0 / sn3, t1 / sn3,
+                    t2 / sn3, R_cap);
+        std::fflush(stdout);
+        t0 = t1 = t2 = 0, sn3 = 0;
+      }
     }
   }
 
@@ -2912,10 +2947,23 @@ class TpBatchGenerator final : public Generator {
         });
         const bool all_ok = std::all_of(ok.begin(), ok.end(), [](bool v) { return v; });
         if (!all_ok) {
-          ingine::engine::server_log().warn("TP{}/EP{} verify CUDA graph capture failed for R={} — falling back to eager",
-                                            TP_SIZE, TP_SIZE, R_cap);
+          // A capture/instantiate failure used to be a WARN plus a silent eager fallback, which costs 1-5% and
+          // went unnoticed for this engine's whole 1M-pool campaign. It is a hard error now: the usual cause is
+          // cudaGraphInstantiate running out of VRAM (the KV pool leaves ~0 free), so leave room (-draft-ctx 8192
+          // frees 72 MiB). INGINE_TP_EAGER_OK=1 restores the old warn-and-continue behaviour.
+          static const bool eager_ok = [] {
+            const char* e = std::getenv("INGINE_TP_EAGER_OK");
+            return e && e[0] != '0';
+          }();
+          const std::string why = std::string("TP") + std::to_string(TP_SIZE) + "/EP" + std::to_string(TP_SIZE) +
+                                  " verify CUDA graph capture failed for R=" + std::to_string(R_cap) +
+                                  " (run with INGINE_GRAPH_DBG=1 for the failing stage; the usual cause is"
+                                  " cudaGraphInstantiate out of memory - leave ~100 MiB free, e.g. --draft-ctx 8192)";
+          if (!eager_ok) throw std::runtime_error(why);
+          ingine::engine::server_log().warn("{}, falling back to eager (INGINE_TP_EAGER_OK=1)", why);
           pool_.run_all([&](int r) { ranks_[r].decoder->clear_graphs(); });
           enable_graphs_ = false;
+          graphs_fell_back_ = true;
           break;
         }
       }
@@ -2970,6 +3018,7 @@ class TpBatchGenerator final : public Generator {
   std::array<std::int64_t, 5> spec_m_hist_{};
   double spec_verify_ms_tot_ = 0.0, spec_draft_ms_tot_ = 0.0, spec_sfull_ms_ = 0.0;
   std::map<int, float> bucket_ms_ema_;
+  bool graphs_fell_back_ = false;  // verify ran eager (surfaced as EAGER in the metrics line)
   float spec_alpha_cal_ = 0.98f;
   std::vector<int> free_pages_;
   std::vector<std::vector<int>> slot_pages_;

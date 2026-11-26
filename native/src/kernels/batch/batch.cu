@@ -54,12 +54,14 @@ int choose_splits(int B) {
 
 constexpr std::size_t align256(std::size_t n) { return (n + 255) & ~std::size_t(255); }
 
-// Workspace layout for up to max_b sequences (splits * B <= max(16, max_b)):
+// Workspace layout for up to max_b sequences (splits * B <= max_total_splits):
 //   part:      fp32 [max_total_splits, HKV, GQA, PSTR]
 //   saved_nkv: ActT [max_b, HKV, 2, D]
 //   saved_nst: fp32 [max_b, HKV, 3, 2, D]
+// A verify call indexes part[] by (row * HKV + kv_head) * splits, so the rows of a multi-row verify need
+// up to max_b * kMaxVerifyRows * splits entries - not max_b.
 std::size_t ws_nkv_off(int max_b) {
-  const int max_ts = std::max(16 * INGINE_TP_SIZE + 16, max_b);
+  const int max_ts = std::max(16 * INGINE_TP_SIZE + 16, max_b * 4);
   return align256(std::size_t(max_ts) * HKV * GQA * PSTR * sizeof(float));
 }
 std::size_t ws_nst_off(int max_b) {
@@ -2168,7 +2170,21 @@ void batched_attn_decode_rows(const BatchedAttnRowsArgs& a, cudaStream_t stream)
   } else {
     require(a.k_ring_visit && a.v_ring_visit && a.ring_pos_visit, "batched_attn_decode_rows: sliding layer needs rings");
   }
-  const int splits = choose_splits(a.R);
+  // Split-K for the verify rows. choose_splits() is sized for decode (B sequences, one row each); at
+  // R = slots * m verify rows it collapses to 1 split (R >= 16), so every CTA streams its slot's whole KV
+  // serially. Measured on 2x V100 (4 slots): 2 splits beat 1 by 1.5 ms at 4K and 11.4 ms at 32K, and 4 splits
+  // are worse than 2 - so keep the decode policy but never let the verify path collapse below 2.
+  // INGINE_ATTN_ROWS_SPLITS overrides it for A/B (clamped so row * splits still fits the workspace).
+  int splits = std::max(2, choose_splits(a.R));
+  {
+    static const int rows_splits = [] {
+      const char* e = std::getenv("INGINE_ATTN_ROWS_SPLITS");
+      return e ? std::atoi(e) : 0;
+    }();
+    if (rows_splits > 0) {
+      splits = std::min(rows_splits, std::max(1, (16 * INGINE_TP_SIZE + 16) / std::max(1, a.R)));
+    }
+  }
   if (splits > 1) {
     require(a.workspace && a.workspace_size >= ws_total_bytes(a.R), "batched_attn_decode_rows: workspace too small");
   }

@@ -339,9 +339,11 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
     for (int i = 0; i < DCH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (i * 32 + lane) * 8, wpol);
   }
 
-#pragma unroll
-  for (int m0 = 0; m0 < M; m0 += XG) {
-    if (m0 > 0) __syncthreads();
+  // One m-block per CTA (blockIdx.y): the grid is G*CL, independent of M, so at M=16 every CTA walked 4
+  // staging rounds with only 16 CTAs on 80 SMs - latency-bound (6.9 us at M=4 vs 38 us at M=16). Splitting M
+  // across CTAs keeps the same total work but restores parallelism. At M <= XMAX this is one block and identical.
+  const int m0 = int(blockIdx.y) * XG;
+  {
     float xh[XG][XPT], xm[XG][XPT], ss[2 * XG];
 #pragma unroll
     for (int j = 0; j < XG; ++j) {
@@ -393,10 +395,11 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
     }
   }
   __syncthreads();
-  if (t < M) {
-    const float4 p0 = *reinterpret_cast<const float4*>(&part[t][0][0]);
-    const float4 p1 = *reinterpret_cast<const float4*>(&part[t][1][0]);
-    float* dst = gall_out + (size_t(g) * M + t) * RANK + rank * C::RPC;
+  if (t < XG && m0 + t < M) {
+    const int mm = m0 + t;
+    const float4 p0 = *reinterpret_cast<const float4*>(&part[mm][0][0]);
+    const float4 p1 = *reinterpret_cast<const float4*>(&part[mm][1][0]);
+    float* dst = gall_out + (size_t(g) * M + mm) * RANK + rank * C::RPC;
     dst[0] = round_bf16(p0.x + p1.x);
     dst[1] = round_bf16(p0.y + p1.y);
     dst[2] = round_bf16(p0.z + p1.z);
@@ -526,7 +529,8 @@ void launch_gates_sm8x(int G, int M, const GateArgs& a, cudaStream_t stream) {
   const bool stage_fg = !FG32 || current_max_smem_optin() >= C::SMEM + 4096;
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
-    gates_sm8x_down_kernel<CL, FG32, MM><<<G * CL, C::NT, 0, stream>>>(a, sc.gall);
+    const int mb = (MM + C::XMAX - 1) / C::XMAX;
+    gates_sm8x_down_kernel<CL, FG32, MM><<<dim3(G * CL, mb), C::NT, 0, stream>>>(a, sc.gall);
     CUDA_CHECK(cudaGetLastError());
     if (stage_fg) {
       if constexpr (C::SMEM > 49152) {
