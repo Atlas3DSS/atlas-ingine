@@ -96,4 +96,13 @@ if(INGINE_BACKEND STREQUAL "CUDA")
     ORACLE
     TIMEOUT 600
   )
+
+  ingine_add_test(
+    NAME qwen38_gpu_883_bench
+    SOURCES test_qwen38_gpu_883_bench.cpp
+    LIBS ingine_qwen38_cuda ingine_qwen38_cpu ingine_core ingine_text nlohmann_json::nlohmann_json
+    LABELS backend qwen38
+    GPU
+    TIMEOUT 600
+  )
 endif()

@@ -1,6 +1,7 @@
 #include "backends/qwen38/qwen38_backend.h"
 
 #include <algorithm>
+#include <initializer_list>
 #include <stdexcept>
 
 namespace ingine::backends::qwen38 {
@@ -206,6 +207,55 @@ Qwen38RuntimeDispatchPlan resolve_qwen38_runtime_options(const ingine::model::Ru
   plan.use_calibrated_fp8 = (config.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4);
   plan.prefix_cache = normalized.prefix_cache;
   return plan;
+}
+
+std::size_t find_qwen35_pre_suffix_checkpoint(std::span<const std::int32_t> prompt_ids) noexcept {
+  // Pinned Qwen3.5 / Qwen3.8 BPE + special token IDs (verified from tokenizer.json):
+  //   <|im_start|>=248045, <|im_end|>=248046, assistant=74455, \n=198, \n\n=271,
+  //   <think>=248068, </think>=248069.
+  constexpr std::int32_t kImStart = 248045;
+  constexpr std::int32_t kImEnd = 248046;
+  constexpr std::int32_t kAssistant = 74455;
+  constexpr std::int32_t kNewline = 198;
+  constexpr std::int32_t kDoubleNewline = 271;
+  constexpr std::int32_t kThink = 248068;
+  constexpr std::int32_t kEndThink = 248069;
+
+  auto match_tail = [&](std::initializer_list<std::int32_t> suffix) -> std::size_t {
+    const std::size_t slen = suffix.size();
+    if (prompt_ids.size() <= slen) return 0;
+    const std::size_t start = prompt_ids.size() - slen;
+    std::size_t idx = start;
+    for (std::int32_t expected : suffix) {
+      if (prompt_ids[idx++] != expected) return 0;
+    }
+    // Require a completed prior turn boundary (`<|im_end|>\n` or `<|im_end|>`) directly before
+    // `<|im_start|>assistant...` so synthetic non-chat prompts never trigger unintended checkpoints.
+    if (start >= 2 && prompt_ids[start - 1] == kNewline && prompt_ids[start - 2] == kImEnd) {
+      return start;
+    }
+    if (start >= 1 && prompt_ids[start - 1] == kImEnd) {
+      return start;
+    }
+    return 0;
+  };
+
+  // Check longest suffixes first:
+  // 1. enable_thinking=false: <|im_start|>assistant\n<think>\n\n</think>\n\n (7 tokens)
+  if (const std::size_t p =
+          match_tail({kImStart, kAssistant, kNewline, kThink, kDoubleNewline, kEndThink, kDoubleNewline});
+      p > 0) {
+    return p;
+  }
+  // 2. enable_thinking=true: <|im_start|>assistant\n<think>\n (5 tokens)
+  if (const std::size_t p = match_tail({kImStart, kAssistant, kNewline, kThink, kNewline}); p > 0) {
+    return p;
+  }
+  // 3. Bare assistant generation prompt: <|im_start|>assistant\n (3 tokens)
+  if (const std::size_t p = match_tail({kImStart, kAssistant, kNewline}); p > 0) {
+    return p;
+  }
+  return 0;
 }
 
 }  // namespace ingine::backends::qwen38

@@ -4,7 +4,10 @@
 #include "backends/qwen38/qwen38_manifest.h"
 #include "ingine/model_backend.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -45,5 +48,12 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
 // fail-closed, and returns the exact Qwen3.8 load parameters.
 Qwen38RuntimeDispatchPlan resolve_qwen38_runtime_options(const ingine::model::RuntimeOptions& options,
                                                          bool allow_unpinned = false);
+
+// Returns the token index immediately before a trailing Qwen3.5/3.8 assistant generation suffix
+// (`<|im_end|>[\n]` followed by `<|im_start|>assistant\n[<think>\n | <think>\n\n</think>\n\n]`),
+// or 0 if `prompt_ids` does not end with a recognized Qwen3.5 chat generation suffix.
+// Used to checkpoint GDN recurrent+conv state before the mutable assistant turn-open tokens so
+// multi-turn chat/tool follow-ups reuse the prior conversation prefix instead of falling back to reuse=none.
+std::size_t find_qwen35_pre_suffix_checkpoint(std::span<const std::int32_t> prompt_ids) noexcept;
 
 }  // namespace ingine::backends::qwen38

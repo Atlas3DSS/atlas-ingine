@@ -703,6 +703,326 @@ __global__ void causal_gqa_gated_attn_kernel(const ActIO* __restrict__ q, const 
   }
 }
 
+// Fast canonical-64 GQA gated attention for head_dim=256 with BF16 KV cache (#883).
+// Both decode (split-KV across 64-key blocks + combine) and prefill (SMEM-tiled across 16-key
+// sub-tiles grouped into identical 64-key blocks) execute the exact same per-block FP32 reduction
+// and ascending block combine, guaranteeing bit-exact (0 ULP) invariance across M=1 and M>1.
+constexpr int kQwenAttnBlockK = 64;
+constexpr int kQwenAttnHeadDim = 256;
+constexpr int kQwenAttnPartStride = kQwenAttnHeadDim + 4;  // o[256], m, l, pad[2] (16-byte aligned for float4)
+
+__device__ __forceinline__ void unpack_bf16x8_u4(uint4 raw, float (&dst)[8]) {
+  dst[0] = dev_bf16_to_f32(static_cast<std::uint16_t>(raw.x & 0xffffu));
+  dst[1] = dev_bf16_to_f32(static_cast<std::uint16_t>(raw.x >> 16));
+  dst[2] = dev_bf16_to_f32(static_cast<std::uint16_t>(raw.y & 0xffffu));
+  dst[3] = dev_bf16_to_f32(static_cast<std::uint16_t>(raw.y >> 16));
+  dst[4] = dev_bf16_to_f32(static_cast<std::uint16_t>(raw.z & 0xffffu));
+  dst[5] = dev_bf16_to_f32(static_cast<std::uint16_t>(raw.z >> 16));
+  dst[6] = dev_bf16_to_f32(static_cast<std::uint16_t>(raw.w & 0xffffu));
+  dst[7] = dev_bf16_to_f32(static_cast<std::uint16_t>(raw.w >> 16));
+}
+
+__device__ __forceinline__ void load_f32x8(const float* ptr, float (&dst)[8]) {
+  const float4 a = *reinterpret_cast<const float4*>(ptr);
+  const float4 b = *reinterpret_cast<const float4*>(ptr + 4);
+  dst[0] = a.x;
+  dst[1] = a.y;
+  dst[2] = a.z;
+  dst[3] = a.w;
+  dst[4] = b.x;
+  dst[5] = b.y;
+  dst[6] = b.z;
+  dst[7] = b.w;
+}
+
+__device__ __forceinline__ void store_f32x8(float* ptr, const float (&src)[8]) {
+  *reinterpret_cast<float4*>(ptr) = make_float4(src[0], src[1], src[2], src[3]);
+  *reinterpret_cast<float4*>(ptr + 4) = make_float4(src[4], src[5], src[6], src[7]);
+}
+
+__device__ __forceinline__ float warp_dot_8_scaled(const float (&q)[8], const float (&k)[8], float scale) {
+  float acc = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) acc = fmaf(q[j], k[j], acc);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+  return acc * scale;
+}
+
+template <int G_PER_WARP, int WARPS_PER_KV>
+__global__ void qwen38_gqa_attn_decode_blk64_kernel(const float* __restrict__ q_row,
+                                                    const float* __restrict__ gate_row,
+                                                    const std::uint16_t* __restrict__ k_cache,
+                                                    const std::uint16_t* __restrict__ v_cache, int kv_len,
+                                                    int num_blocks, int num_kv_heads,
+                                                    float* __restrict__ split_scratch,
+                                                    float* __restrict__ out_row) {
+  const int blk = blockIdx.x;
+  const int kvh = blockIdx.y;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  if (blk >= num_blocks || kvh >= num_kv_heads || warp >= WARPS_PER_KV) return;
+
+  constexpr int kGroup = G_PER_WARP * WARPS_PER_KV;
+  const int h_base = kvh * kGroup + warp * G_PER_WARP;
+  const int d0 = lane * 8;
+  const std::size_t kv_stride = static_cast<std::size_t>(num_kv_heads) * kQwenAttnHeadDim;
+  const std::size_t kvh_off = static_cast<std::size_t>(kvh) * kQwenAttnHeadDim + d0;
+  const float scale = rsqrtf(static_cast<float>(kQwenAttnHeadDim));
+
+  float q_reg[G_PER_WARP][8];
+  float o_blk[G_PER_WARP][8];
+  float m_blk[G_PER_WARP];
+  float l_blk[G_PER_WARP];
+#pragma unroll
+  for (int g = 0; g < G_PER_WARP; ++g) {
+    load_f32x8(q_row + static_cast<std::size_t>(h_base + g) * kQwenAttnHeadDim + d0, q_reg[g]);
+    m_blk[g] = -1e38f;
+    l_blk[g] = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) o_blk[g][j] = 0.0f;
+  }
+
+  const int t_start = blk * kQwenAttnBlockK;
+  const int t_end = min(t_start + kQwenAttnBlockK, kv_len);
+
+  for (int t = t_start; t < t_end; ++t) {
+    const std::size_t off = static_cast<std::size_t>(t) * kv_stride + kvh_off;
+    const uint4 k_u4 = __ldg(reinterpret_cast<const uint4*>(k_cache + off));
+    const uint4 v_u4 = __ldg(reinterpret_cast<const uint4*>(v_cache + off));
+    float kf[8], vf[8];
+    unpack_bf16x8_u4(k_u4, kf);
+    unpack_bf16x8_u4(v_u4, vf);
+
+#pragma unroll
+    for (int g = 0; g < G_PER_WARP; ++g) {
+      const float score = warp_dot_8_scaled(q_reg[g], kf, scale);
+      const float m_new = fmaxf(m_blk[g], score);
+      const float alpha = (t == t_start) ? 0.0f : expf(m_blk[g] - m_new);
+      const float p = expf(score - m_new);
+      l_blk[g] = fmaf(l_blk[g], alpha, p);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        o_blk[g][j] = fmaf(p, vf[j], o_blk[g][j] * alpha);
+      }
+      m_blk[g] = m_new;
+    }
+  }
+
+  if (num_blocks == 1) {
+#pragma unroll
+    for (int g = 0; g < G_PER_WARP; ++g) {
+      const std::size_t h_off = static_cast<std::size_t>(h_base + g) * kQwenAttnHeadDim + d0;
+      float gate_v[8], out_v[8];
+      load_f32x8(gate_row + h_off, gate_v);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float gv = 1.0f / (1.0f + expf(-gate_v[j]));
+        out_v[j] = (o_blk[g][j] / l_blk[g]) * gv;
+      }
+      store_f32x8(out_row + h_off, out_v);
+    }
+  } else {
+#pragma unroll
+    for (int g = 0; g < G_PER_WARP; ++g) {
+      float* dst = split_scratch +
+                   (static_cast<std::size_t>(h_base + g) * static_cast<std::size_t>(num_blocks) +
+                    static_cast<std::size_t>(blk)) *
+                       kQwenAttnPartStride;
+      store_f32x8(dst + d0, o_blk[g]);
+      if (lane == 0) {
+        dst[kQwenAttnHeadDim] = m_blk[g];
+        dst[kQwenAttnHeadDim + 1] = l_blk[g];
+      }
+    }
+  }
+}
+
+__global__ void qwen38_gqa_attn_decode_combine_kernel(const float* __restrict__ split_scratch,
+                                                      const float* __restrict__ gate_row, int num_heads,
+                                                      int num_blocks, float* __restrict__ out_row) {
+  const int h = blockIdx.x;
+  const int d = threadIdx.x;
+  if (h >= num_heads || d >= kQwenAttnHeadDim) return;
+
+  const float* base =
+      split_scratch + static_cast<std::size_t>(h) * static_cast<std::size_t>(num_blocks) * kQwenAttnPartStride;
+  float m_acc = base[kQwenAttnHeadDim];
+  float l_acc = base[kQwenAttnHeadDim + 1];
+  float o_acc = base[d];
+
+  for (int b = 1; b < num_blocks; ++b) {
+    const float* p = base + static_cast<std::size_t>(b) * kQwenAttnPartStride;
+    const float m_b = p[kQwenAttnHeadDim];
+    const float l_b = p[kQwenAttnHeadDim + 1];
+    const float o_b = p[d];
+    const float m_new = fmaxf(m_acc, m_b);
+    const float alpha = expf(m_acc - m_new);
+    const float beta = expf(m_b - m_new);
+    l_acc = fmaf(l_b, beta, l_acc * alpha);
+    o_acc = fmaf(o_b, beta, o_acc * alpha);
+    m_acc = m_new;
+  }
+
+  const std::size_t off = static_cast<std::size_t>(h) * kQwenAttnHeadDim + d;
+  const float gv = 1.0f / (1.0f + expf(-gate_row[off]));
+  out_row[off] = (o_acc / l_acc) * gv;
+}
+
+template <int G_PER_WARP, int WARPS_PER_TOK, int TOK_PER_CTA>
+__global__ void qwen38_gqa_attn_prefill_blk64_kernel(const float* __restrict__ q, const float* __restrict__ gate,
+                                                     const std::uint16_t* __restrict__ k_cache,
+                                                     const std::uint16_t* __restrict__ v_cache, int seq_len,
+                                                     int pos_offset, int num_heads, int num_kv_heads,
+                                                     float* __restrict__ out_attn) {
+  constexpr int kSubTile = 16;
+  constexpr int kGroup = G_PER_WARP * WARPS_PER_TOK;
+  constexpr int kThreads = TOK_PER_CTA * WARPS_PER_TOK * 32;
+
+  __shared__ __align__(16) std::uint16_t s_k[kSubTile][kQwenAttnHeadDim];
+  __shared__ __align__(16) std::uint16_t s_v[kSubTile][kQwenAttnHeadDim];
+
+  const int row_base = blockIdx.x * TOK_PER_CTA;
+  const int kvh = blockIdx.y;
+  if (row_base >= seq_len || kvh >= num_kv_heads) return;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int tok_in_cta = warp / WARPS_PER_TOK;
+  const int sub_warp = warp % WARPS_PER_TOK;
+  const int row = row_base + tok_in_cta;
+  const bool valid_row = (row < seq_len);
+  const int query_pos = pos_offset + row;
+  const int h_base = kvh * kGroup + sub_warp * G_PER_WARP;
+  const int d0 = lane * 8;
+
+  const int max_row_in_cta = min(row_base + TOK_PER_CTA, seq_len) - 1;
+  const int max_pos_in_cta = pos_offset + max_row_in_cta;
+  const int num_cta_blocks = (max_pos_in_cta + 1 + kQwenAttnBlockK - 1) / kQwenAttnBlockK;
+
+  const std::size_t kv_stride = static_cast<std::size_t>(num_kv_heads) * kQwenAttnHeadDim;
+  const std::size_t kvh_base = static_cast<std::size_t>(kvh) * kQwenAttnHeadDim;
+  const float scale = rsqrtf(static_cast<float>(kQwenAttnHeadDim));
+
+  float q_reg[G_PER_WARP][8];
+  float o_acc[G_PER_WARP][8];
+  float m_acc[G_PER_WARP];
+  float l_acc[G_PER_WARP];
+  if (valid_row) {
+#pragma unroll
+    for (int g = 0; g < G_PER_WARP; ++g) {
+      const std::size_t q_off =
+          (static_cast<std::size_t>(row) * static_cast<std::size_t>(num_heads) + (h_base + g)) * kQwenAttnHeadDim + d0;
+      load_f32x8(q + q_off, q_reg[g]);
+      m_acc[g] = -1e38f;
+      l_acc[g] = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) o_acc[g][j] = 0.0f;
+    }
+  }
+
+  for (int b = 0; b < num_cta_blocks; ++b) {
+    const int b_start = b * kQwenAttnBlockK;
+    float o_blk[G_PER_WARP][8];
+    float m_blk[G_PER_WARP];
+    float l_blk[G_PER_WARP];
+#pragma unroll
+    for (int g = 0; g < G_PER_WARP; ++g) {
+      m_blk[g] = -1e38f;
+      l_blk[g] = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) o_blk[g][j] = 0.0f;
+    }
+    bool blk_has_any = false;
+
+    for (int sub = 0; sub < kQwenAttnBlockK / kSubTile; ++sub) {
+      const int tile_t0 = b_start + sub * kSubTile;
+      if (tile_t0 > max_pos_in_cta) break;
+
+      // Cooperatively load kSubTile x 256 BF16 K and V rows (512 uint4 total) into SMEM.
+      for (int idx = tid; idx < kSubTile * 32; idx += kThreads) {
+        const int kr = idx >> 5;
+        const int kc = idx & 31;
+        const int t_load = tile_t0 + kr;
+        if (t_load <= max_pos_in_cta) {
+          const std::size_t g_off = static_cast<std::size_t>(t_load) * kv_stride + kvh_base + kc * 8;
+          *reinterpret_cast<uint4*>(&s_k[kr][kc * 8]) = __ldg(reinterpret_cast<const uint4*>(k_cache + g_off));
+          *reinterpret_cast<uint4*>(&s_v[kr][kc * 8]) = __ldg(reinterpret_cast<const uint4*>(v_cache + g_off));
+        }
+      }
+      __syncthreads();
+
+      if (valid_row && tile_t0 <= query_pos) {
+        const int k_lim = min(kSubTile, query_pos - tile_t0 + 1);
+        for (int k = 0; k < k_lim; ++k) {
+          const int t = tile_t0 + k;
+          float kf[8], vf[8];
+          unpack_bf16x8_u4(*reinterpret_cast<const uint4*>(&s_k[k][d0]), kf);
+          unpack_bf16x8_u4(*reinterpret_cast<const uint4*>(&s_v[k][d0]), vf);
+
+#pragma unroll
+          for (int g = 0; g < G_PER_WARP; ++g) {
+            const float score = warp_dot_8_scaled(q_reg[g], kf, scale);
+            const float m_new = fmaxf(m_blk[g], score);
+            const float alpha = (t == b_start) ? 0.0f : expf(m_blk[g] - m_new);
+            const float p = expf(score - m_new);
+            l_blk[g] = fmaf(l_blk[g], alpha, p);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              o_blk[g][j] = fmaf(p, vf[j], o_blk[g][j] * alpha);
+            }
+            m_blk[g] = m_new;
+          }
+        }
+        blk_has_any = true;
+      }
+      __syncthreads();
+    }
+
+    if (valid_row && blk_has_any) {
+      if (b == 0) {
+#pragma unroll
+        for (int g = 0; g < G_PER_WARP; ++g) {
+          m_acc[g] = m_blk[g];
+          l_acc[g] = l_blk[g];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) o_acc[g][j] = o_blk[g][j];
+        }
+      } else {
+#pragma unroll
+        for (int g = 0; g < G_PER_WARP; ++g) {
+          const float m_new = fmaxf(m_acc[g], m_blk[g]);
+          const float alpha = expf(m_acc[g] - m_new);
+          const float beta = expf(m_blk[g] - m_new);
+          l_acc[g] = fmaf(l_blk[g], beta, l_acc[g] * alpha);
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            o_acc[g][j] = fmaf(o_blk[g][j], beta, o_acc[g][j] * alpha);
+          }
+          m_acc[g] = m_new;
+        }
+      }
+    }
+  }
+
+  if (valid_row) {
+#pragma unroll
+    for (int g = 0; g < G_PER_WARP; ++g) {
+      const std::size_t off =
+          (static_cast<std::size_t>(row) * static_cast<std::size_t>(num_heads) + (h_base + g)) * kQwenAttnHeadDim + d0;
+      float gate_v[8], out_v[8];
+      load_f32x8(gate + off, gate_v);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float gv = 1.0f / (1.0f + expf(-gate_v[j]));
+        out_v[j] = (o_acc[g][j] / l_acc[g]) * gv;
+      }
+      store_f32x8(out_attn + off, out_v);
+    }
+  }
+}
+
 __global__ void swiglu_mul_bf16_kernel(const std::uint16_t* gate, const std::uint16_t* up, std::uint16_t* out,
                                        std::size_t n) {
   const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1895,13 +2215,21 @@ void qwen38_cuda_split_qkv_sep_f32(const float* mixed, float* q_sep, float* k_se
   CUDA_CHECK(cudaGetLastError());
 }
 
+std::size_t qwen38_cuda_full_attn_split_scratch_floats(int num_heads, int max_cache_len, int head_dim) noexcept {
+  if (num_heads <= 0 || max_cache_len <= 0 || head_dim <= 0) return 0;
+  const std::size_t max_blocks = static_cast<std::size_t>((max_cache_len + kQwenAttnBlockK - 1) / kQwenAttnBlockK);
+  const std::size_t stride = (static_cast<std::size_t>(head_dim) + 2 + 3) & ~static_cast<std::size_t>(3);
+  return static_cast<std::size_t>(num_heads) * max_blocks * stride;
+}
+
 void qwen38_cuda_full_attn_gated_f32_kvbf16(const float* q_with_gate, float* k_raw_inout, const float* v_in,
                                             const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
                                             float rms_eps, float rope_theta, int seq_len, int pos_offset,
                                             int num_heads, int num_kv_heads, int head_dim, int rotary_dim,
                                             __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int max_cache_len,
                                             float* q_scratch, float* gate_scratch, float* out_attn,
-                                            cudaStream_t stream) {
+                                            cudaStream_t stream, float* split_scratch,
+                                            std::size_t split_scratch_floats, bool use_fast_attn) {
   if (seq_len < 1 || pos_offset + seq_len > max_cache_len || head_dim > 256 || num_heads % num_kv_heads != 0) {
     throw std::invalid_argument("qwen38_cuda_full_attn_gated_f32_kvbf16 invalid dimensions or cache bounds");
   }
@@ -1938,10 +2266,83 @@ void qwen38_cuda_full_attn_gated_f32_kvbf16(const float* q_with_gate, float* k_r
       v_in, reinterpret_cast<std::uint16_t*>(v_cache) + cache_off, kv_elems);
   CUDA_CHECK(cudaGetLastError());
 
+  const auto* k_u16 = reinterpret_cast<const std::uint16_t*>(k_cache);
+  const auto* v_u16 = reinterpret_cast<const std::uint16_t*>(v_cache);
+  const int group = num_heads / num_kv_heads;
+  const bool fast_shape = use_fast_attn && (head_dim == kQwenAttnHeadDim) &&
+                          (group == 6 || group == 4 || group == 2 || group == 1);
+
+  if (fast_shape) {
+    const int max_kv_len = pos_offset + seq_len;
+    const int max_num_blocks = (max_kv_len + kQwenAttnBlockK - 1) / kQwenAttnBlockK;
+    const std::size_t need_scratch =
+        static_cast<std::size_t>(num_heads) * static_cast<std::size_t>(max_num_blocks) * kQwenAttnPartStride;
+    const bool have_split_scratch = (max_num_blocks == 1) ||
+                                    (split_scratch != nullptr && split_scratch_floats >= need_scratch);
+    const bool use_split_decode =
+        have_split_scratch && (seq_len == 1 || (seq_len <= 8 && max_kv_len > 256));
+
+    auto launch_decode_row = [&](int r) {
+      const int kv_len = pos_offset + r + 1;
+      const int num_blocks = (kv_len + kQwenAttnBlockK - 1) / kQwenAttnBlockK;
+      const std::size_t row_off = static_cast<std::size_t>(r) * static_cast<std::size_t>(q_total);
+      const float* qr = q_scratch + row_off;
+      const float* gr = gate_scratch + row_off;
+      float* out_r = out_attn + row_off;
+      if (group == 6) {
+        qwen38_gqa_attn_decode_blk64_kernel<3, 2><<<dim3(num_blocks, num_kv_heads), 64, 0, stream>>>(
+            qr, gr, k_u16, v_u16, kv_len, num_blocks, num_kv_heads, split_scratch, out_r);
+      } else if (group == 4) {
+        qwen38_gqa_attn_decode_blk64_kernel<4, 1><<<dim3(num_blocks, num_kv_heads), 32, 0, stream>>>(
+            qr, gr, k_u16, v_u16, kv_len, num_blocks, num_kv_heads, split_scratch, out_r);
+      } else if (group == 2) {
+        qwen38_gqa_attn_decode_blk64_kernel<2, 1><<<dim3(num_blocks, num_kv_heads), 32, 0, stream>>>(
+            qr, gr, k_u16, v_u16, kv_len, num_blocks, num_kv_heads, split_scratch, out_r);
+      } else {
+        qwen38_gqa_attn_decode_blk64_kernel<1, 1><<<dim3(num_blocks, num_kv_heads), 32, 0, stream>>>(
+            qr, gr, k_u16, v_u16, kv_len, num_blocks, num_kv_heads, split_scratch, out_r);
+      }
+      CUDA_CHECK(cudaGetLastError());
+      if (num_blocks > 1) {
+        qwen38_gqa_attn_decode_combine_kernel<<<num_heads, kQwenAttnHeadDim, 0, stream>>>(
+            split_scratch, gr, num_heads, num_blocks, out_r);
+        CUDA_CHECK(cudaGetLastError());
+      }
+    };
+
+    if (use_split_decode) {
+      for (int r = 0; r < seq_len; ++r) {
+        launch_decode_row(r);
+      }
+    } else {
+      if (group == 6) {
+        constexpr int kTokPerCta = 4;
+        qwen38_gqa_attn_prefill_blk64_kernel<3, 2, kTokPerCta>
+            <<<dim3((seq_len + kTokPerCta - 1) / kTokPerCta, num_kv_heads), 256, 0, stream>>>(
+                q_scratch, gate_scratch, k_u16, v_u16, seq_len, pos_offset, num_heads, num_kv_heads, out_attn);
+      } else if (group == 4) {
+        constexpr int kTokPerCta = 8;
+        qwen38_gqa_attn_prefill_blk64_kernel<4, 1, kTokPerCta>
+            <<<dim3((seq_len + kTokPerCta - 1) / kTokPerCta, num_kv_heads), 256, 0, stream>>>(
+                q_scratch, gate_scratch, k_u16, v_u16, seq_len, pos_offset, num_heads, num_kv_heads, out_attn);
+      } else if (group == 2) {
+        constexpr int kTokPerCta = 8;
+        qwen38_gqa_attn_prefill_blk64_kernel<2, 1, kTokPerCta>
+            <<<dim3((seq_len + kTokPerCta - 1) / kTokPerCta, num_kv_heads), 256, 0, stream>>>(
+                q_scratch, gate_scratch, k_u16, v_u16, seq_len, pos_offset, num_heads, num_kv_heads, out_attn);
+      } else {
+        constexpr int kTokPerCta = 8;
+        qwen38_gqa_attn_prefill_blk64_kernel<1, 1, kTokPerCta>
+            <<<dim3((seq_len + kTokPerCta - 1) / kTokPerCta, num_kv_heads), 256, 0, stream>>>(
+                q_scratch, gate_scratch, k_u16, v_u16, seq_len, pos_offset, num_heads, num_kv_heads, out_attn);
+      }
+      CUDA_CHECK(cudaGetLastError());
+    }
+    return;
+  }
+
   causal_gqa_gated_attn_kernel<float, std::uint16_t><<<dim3(num_heads, seq_len), 256, 0, stream>>>(
-      q_scratch, gate_scratch, reinterpret_cast<const std::uint16_t*>(k_cache),
-      reinterpret_cast<const std::uint16_t*>(v_cache), seq_len, pos_offset, num_heads, num_kv_heads, head_dim,
-      out_attn);
+      q_scratch, gate_scratch, k_u16, v_u16, seq_len, pos_offset, num_heads, num_kv_heads, head_dim, out_attn);
   CUDA_CHECK(cudaGetLastError());
 }
 

@@ -23,6 +23,8 @@ struct Qwen38DenseLoadOptions {
   bool verify_pins = true;
   bool use_calibrated_fp8 = true;
   bool prefix_cache = true;
+  bool pre_suffix_checkpoint = true;
+  bool use_fast_attn = true;
   std::string revision = "482ca0f";
   int device_id = 0;
   std::optional<ingine::model::CheckpointPinSpec> expected_pins;
@@ -46,6 +48,8 @@ struct Qwen38GemmParityReport {
   float batch_invariance_max_abs = 0.0f;
   float gdn_prefill_vs_step_max_abs = 0.0f;
   float gdn_batch_invariance_max_abs = 0.0f;
+  float attn_fast_vs_ref_max_abs = 0.0f;
+  float attn_batch_invariance_max_abs = 0.0f;
   bool passed = false;
 };
 
@@ -158,6 +162,9 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
   [[nodiscard]] const ingine::model::SessionLookupResult& last_lookup() const noexcept;
   [[nodiscard]] double last_lookup_ms() const noexcept;
   [[nodiscard]] double last_reset_ms() const noexcept;
+
+  // Test/benchmark-only A/B toggle for #883 (resets default session and updates numeric_abi fail-closed).
+  void configure_883_ablation(bool pre_suffix_checkpoint, bool use_fast_attn);
 
   // Explicit mode entry points for Gate 2 chunked-vs-stepwise parity & telemetry.
   void evaluate_teacher_forced_mode(std::span<const std::int32_t> token_ids, std::span<const int> capture_positions,

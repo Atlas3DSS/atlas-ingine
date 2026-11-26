@@ -156,13 +156,17 @@ void qwen38_cuda_add_residual_f32(float* hidden, const float* residual, std::siz
                                   cudaStream_t stream = nullptr);
 void qwen38_cuda_split_qkv_sep_f32(const float* mixed, float* q_sep, float* k_sep, float* v_sep, int seq_len,
                                    int kd, int vd, cudaStream_t stream = nullptr);
+// Required scratch floats for fast split-KV decode in qwen38_cuda_full_attn_gated_f32_kvbf16.
+std::size_t qwen38_cuda_full_attn_split_scratch_floats(int num_heads, int max_cache_len, int head_dim) noexcept;
+
 void qwen38_cuda_full_attn_gated_f32_kvbf16(const float* q_with_gate, float* k_raw_inout, const float* v_in,
                                             const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
                                             float rms_eps, float rope_theta, int seq_len, int pos_offset,
                                             int num_heads, int num_kv_heads, int head_dim, int rotary_dim,
                                             __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int max_cache_len,
                                             float* q_scratch, float* gate_scratch, float* out_attn,
-                                            cudaStream_t stream = nullptr);
+                                            cudaStream_t stream = nullptr, float* split_scratch = nullptr,
+                                            std::size_t split_scratch_floats = 0, bool use_fast_attn = true);
 
 // Batch-size-invariant exact recurrent GDN prefill over packed conv_out [seq_len, 2*kd + vd].
 // Executes identical FP32 recurrence order for seq_len == 1 and seq_len > 1 (0 ULP diff).

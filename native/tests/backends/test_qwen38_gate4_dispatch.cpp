@@ -1,6 +1,7 @@
 #include "backends/qwen38/qwen38_backend.h"
 #include "engine/fake_generator.h"
 #include "ingine/model_backend.h"
+#include "qwen38_883_bench_checks.h"
 #include "serve/chat_server.h"
 #include "text/chat.h"
 
@@ -13,6 +14,8 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -21,17 +24,20 @@
 namespace {
 
 using Json = nlohmann::ordered_json;
+using ingine::backends::qwen38::find_qwen35_pre_suffix_checkpoint;
 using ingine::backends::qwen38::resolve_qwen38_runtime_options;
 using ingine::engine::FakeGenerator;
 using ingine::model::KvCacheMode;
 using ingine::model::ModelFamily;
 using ingine::model::RuntimeOptions;
 using ingine::model::detect_model_family;
+using ingine::model::prefix_matches_exact;
 using ingine::serve::ChatServer;
 using ingine::serve::ServerOptions;
 using ingine::text::ChatFormat;
 using ingine::text::ChatFormatKind;
 using ingine::text::ChatOptions;
+using ingine::text::RenderedPrompt;
 
 #define CHECK(cond)                                                                         \
   do {                                                                                      \
@@ -457,8 +463,9 @@ void test_qwen_fake_http_server(const std::filesystem::path& qwen_dir) {
     ns_cli.set_read_timeout(20, 0);
     const Json body{{"messages", Json::array({{{"role", "user"}, {"content", "tenant test"}}})}};
 
-    const auto r_with =
-        ns_cli.Post("/v1/chat/completions", httplib::Headers{{"X-Tenant", "team-a"}}, body.dump(), "application/json");
+    const auto r_with = ns_cli.Post("/v1/chat/completions",
+                                    httplib::Headers{{"X-Tenant", "team-a"}, {"Authorization", "Bearer none"}},
+                                    body.dump(), "application/json");
     CHECK(r_with && r_with->status == 200);
     CHECK(ns_gen.calls().back().cache_namespace == "team-a");
     CHECK(!ns_gen.calls().back().bypass_prefix_cache);
@@ -470,11 +477,120 @@ void test_qwen_fake_http_server(const std::filesystem::path& qwen_dir) {
   }
 }
 
+void test_qwen35_pre_suffix_checkpoint(const std::filesystem::path& qwen_dir) {
+  // Synthetic non-chat prompts must never trigger a pre-suffix checkpoint.
+  {
+    const std::vector<std::int32_t> synthetic = {10, 20, 30, 40, 50, 60, 70, 80};
+    CHECK(find_qwen35_pre_suffix_checkpoint(synthetic) == 0);
+    // Suffix without leading <|im_end|> boundary must also return 0.
+    const std::vector<std::int32_t> no_im_end = {10, 20, 248045, 74455, 198, 248068, 198};
+    CHECK(find_qwen35_pre_suffix_checkpoint(no_im_end) == 0);
+  }
+
+  const ChatFormat fmt = ChatFormat::load(qwen_dir);
+  const Json tools = Json::array({{{"type", "function"},
+                                   {"function",
+                                    {{"name", "get_weather"},
+                                     {"description", "Get weather"},
+                                     {"parameters",
+                                      {{"type", "object"},
+                                       {"properties", {{"city", {{"type", "string"}}}}},
+                                       {"required", Json::array({"city"})}}}}}}});
+
+  // 1. enable_thinking=true (BFCL default): Turn 1 ends with <|im_end|>\n<|im_start|>assistant\n<think>\n (5 tok).
+  ChatOptions think_opts;
+  think_opts.enable_thinking = true;
+  think_opts.reasoning_effort = "medium";
+  const Json m1 = Json::array({{{"role", "user"}, {"content", "Check Tokyo weather with get_weather."}}});
+  const RenderedPrompt p1 = fmt.render(m1, tools, think_opts);
+  const std::size_t pre1 = find_qwen35_pre_suffix_checkpoint(p1.ids);
+  CHECK(pre1 > 0 && pre1 + 5 == p1.ids.size());
+  CHECK(p1.ids[pre1] == 248045);  // <|im_start|>
+
+  // Turn 2: OpenAI BFCL client omits reasoning_content -> template renders <think>\n\n</think>\n\n,
+  // diverging at p1.ids.size() - 1 (1 token before Turn 1's end), while matching all tokens up to pre1!
+  const Json m2 = Json::array({
+      {{"role", "user"}, {"content", "Check Tokyo weather with get_weather."}},
+      {{"role", "assistant"},
+       {"content", nullptr},
+       {"tool_calls",
+        Json::array({{{"id", "call_1"},
+                      {"type", "function"},
+                      {"function", {{"name", "get_weather"}, {"arguments", "{\"city\":\"Tokyo\"}"}}}}})}},
+      {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "{\"temp_c\":19}"}},
+  });
+  const RenderedPrompt p2 = fmt.render(m2, tools, think_opts);
+  const std::size_t pre2 = find_qwen35_pre_suffix_checkpoint(p2.ids);
+  CHECK(pre2 > pre1 && pre2 + 5 == p2.ids.size());
+  // Verify Turn 1 and Turn 2 diverge strictly before p1.ids.size(), and match 100% through pre1!
+  std::size_t lcp = 0;
+  while (lcp < p1.ids.size() && lcp < p2.ids.size() && p1.ids[lcp] == p2.ids[lcp]) ++lcp;
+  CHECK(lcp < p1.ids.size());
+  CHECK(lcp >= pre1);
+  CHECK(prefix_matches_exact(p1.ids, p2.ids, pre1));
+
+  // 2. enable_thinking=false: Turn 1 ends with <|im_start|>assistant\n<think>\n\n</think>\n\n (7 tok).
+  ChatOptions nothink_opts;
+  nothink_opts.enable_thinking = false;
+  const RenderedPrompt p1_nt = fmt.render(m1, tools, nothink_opts);
+  const std::size_t pre1_nt = find_qwen35_pre_suffix_checkpoint(p1_nt.ids);
+  CHECK(pre1_nt == pre1 && pre1_nt + 7 == p1_nt.ids.size());
+  CHECK(prefix_matches_exact(p1.ids, p1_nt.ids, pre1));
+}
+
+void test_883_followup_restore_predicate() {
+  using ingine::backends::qwen38::test_883::check_multiturn_presuffix_restores;
+  using ingine::backends::qwen38::test_883::check_presuffix_followup_restore;
+  using ingine::model::GenerateStats;
+  using ingine::model::Reuse;
+
+  auto mk = [](Reuse r, int reused, std::optional<std::uint64_t> bytes) {
+    GenerateStats st;
+    st.reuse = r;
+    st.reused_tokens = reused;
+    st.restored_bytes = bytes;
+    return st;
+  };
+
+  // Positive: every follow-up turn restores the prior turn's exact pre-suffix boundary via Checkpoint + nonzero bytes.
+  const std::vector<std::size_t> bounds = {4204, 4281, 4369, 4416};
+  const std::vector<GenerateStats> good = {
+      mk(Reuse::None, 0, 0ull),
+      mk(Reuse::Checkpoint, 4204, 158859264ull),
+      mk(Reuse::Checkpoint, 4281, 158859264ull),
+      mk(Reuse::Checkpoint, 4369, 158859264ull),
+  };
+  CHECK(check_multiturn_presuffix_restores(bounds, good));
+  CHECK(check_presuffix_followup_restore(4204, good[1]).passed);
+
+  // Negative 1: silent reuse=none recompute on any follow-up must fail.
+  auto bad_none = good;
+  bad_none[1] = mk(Reuse::None, 0, 0ull);
+  CHECK(!check_multiturn_presuffix_restores(bounds, bad_none));
+
+  // Negative 2: Reuse::Extend instead of Reuse::Checkpoint must fail.
+  CHECK(!check_presuffix_followup_restore(4204, mk(Reuse::Extend, 4204, 158859264ull)).passed);
+
+  // Negative 3: wrong reused token count (off by 1) must fail.
+  CHECK(!check_presuffix_followup_restore(4204, mk(Reuse::Checkpoint, 4203, 158859264ull)).passed);
+  CHECK(!check_presuffix_followup_restore(4204, mk(Reuse::Checkpoint, 4209, 158859264ull)).passed);
+
+  // Negative 4: zero or missing restored_bytes must fail.
+  CHECK(!check_presuffix_followup_restore(4204, mk(Reuse::Checkpoint, 4204, 0ull)).passed);
+  CHECK(!check_presuffix_followup_restore(4204, mk(Reuse::Checkpoint, 4204, std::nullopt)).passed);
+
+  // Negative 5: missing prior pre-suffix boundary or < 2 turns must fail.
+  CHECK(!check_presuffix_followup_restore(0, mk(Reuse::Checkpoint, 0, 158859264ull)).passed);
+  CHECK(!check_multiturn_presuffix_restores(std::span<const std::size_t>(bounds.data(), 1),
+                                            std::span<const GenerateStats>(good.data(), 1)));
+}
+
 }  // namespace
 
 int main() {
   test_inkling_loop_and_qwen_detection();
   test_resolve_qwen38_runtime_options();
+  test_883_followup_restore_predicate();
 
   const std::filesystem::path qwen_real("/home/orwel/dev_genius/models/Qwen3.8-27B-NVFP4-482ca0f");
   if (!std::filesystem::is_directory(qwen_real)) {
@@ -482,6 +598,7 @@ int main() {
     return 77;
   }
   test_root_prefix_tokens_safety(qwen_real);
+  test_qwen35_pre_suffix_checkpoint(qwen_real);
   test_qwen_fake_http_server(qwen_real);
 
   std::printf("qwen38_gate4_dispatch: PASS\n");

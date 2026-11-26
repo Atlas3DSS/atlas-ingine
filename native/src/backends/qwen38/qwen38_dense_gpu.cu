@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
@@ -302,6 +303,7 @@ struct Qwen38DenseBackend::Impl {
   DevBuf<float> q_tmp;
   DevBuf<float> gate_tmp;
   DevBuf<float> attn_out;
+  DevBuf<float> attn_split_scratch;
 
   DevBuf<float> mlp_gate;
   DevBuf<float> mlp_up;
@@ -426,7 +428,8 @@ struct Qwen38DenseBackend::Impl {
               q_gate.ptr, k_raw.ptr, v_raw.ptr, l.q_norm, l.k_norm, c.rms_norm_eps, c.rope_theta, M, global_pos,
               c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.rotary_dim,
               sess.state_->k_caches[full_idx].ptr, sess.state_->v_caches[full_idx].ptr, opts.max_ctx, q_tmp.ptr,
-              gate_tmp.ptr, attn_out.ptr, ctx.stream);
+              gate_tmp.ptr, attn_out.ptr, ctx.stream, attn_split_scratch.ptr, attn_split_scratch.count,
+              opts.use_fast_attn);
           proj_forward_f32(l.o_proj, attn_out.ptr, M, residual.ptr);
           ++full_idx;
         }
@@ -942,9 +945,99 @@ Qwen38GemmParityReport Qwen38DenseBackend::self_check_gemm_parity(int device_id)
   rep.gdn_batch_invariance_max_abs = gdn_bi;
   rep.gdn_prefill_vs_step_max_abs = std::max(dev_max_abs(d_gdn_out_whole.ptr, d_gdn_out_gate1.ptr, h_gdn_z.size()),
                                              dev_max_abs(d_gdn_st_whole.ptr, d_gdn_st_gate1.ptr, kGdnStateElems));
+
+  // 5. Fast canonical-64 GQA attention parity vs reference and 0-ULP invariance across M=1/M=5/M=273 (#883).
+  {
+    constexpr int kAttnSeq = 273, kNh = 24, kNkvh = 4, kHd = 256, kRd = 64;
+    constexpr int kQgDim = kNh * kHd * 2;
+    constexpr int kKvDim = kNkvh * kHd;
+    constexpr int kOutDim = kNh * kHd;
+    std::vector<float> h_qg(static_cast<std::size_t>(kAttnSeq * kQgDim));
+    std::vector<float> h_kr(static_cast<std::size_t>(kAttnSeq * kKvDim));
+    std::vector<float> h_vr(static_cast<std::size_t>(kAttnSeq * kKvDim));
+    std::vector<std::uint16_t> h_qnw(kHd), h_knw(kHd);
+    for (float& v : h_qg) v = dist(rng);
+    for (float& v : h_kr) v = dist(rng);
+    for (float& v : h_vr) v = dist(rng);
+    for (int i = 0; i < kHd; ++i) {
+      h_qnw[static_cast<std::size_t>(i)] = f32_to_bf16(dist(rng) * 0.1f);
+      h_knw[static_cast<std::size_t>(i)] = f32_to_bf16(dist(rng) * 0.1f);
+    }
+
+    DevBuf<float> d_qg(h_qg.size()), d_kr_orig(h_kr.size()), d_kr_tmp(h_kr.size()), d_vr(h_vr.size());
+    DevBuf<std::uint16_t> d_qnw(kHd), d_knw(kHd);
+    DevBuf<__nv_bfloat16> d_kc(static_cast<std::size_t>(kAttnSeq * kKvDim)),
+        d_vc(static_cast<std::size_t>(kAttnSeq * kKvDim));
+    DevBuf<float> d_qt(static_cast<std::size_t>(kAttnSeq * kOutDim)),
+        d_gt(static_cast<std::size_t>(kAttnSeq * kOutDim)),
+        d_out_ref(static_cast<std::size_t>(kAttnSeq * kOutDim)),
+        d_out_fast_whole(static_cast<std::size_t>(kAttnSeq * kOutDim)),
+        d_out_fast_split(static_cast<std::size_t>(kAttnSeq * kOutDim)),
+        d_out_fast_seq1(static_cast<std::size_t>(kAttnSeq * kOutDim));
+    const std::size_t sp_floats = qwen38_cuda_full_attn_split_scratch_floats(kNh, kAttnSeq, kHd);
+    DevBuf<float> d_sp(sp_floats);
+
+    CUDA_CHECK(cudaMemcpy(d_qg.ptr, h_qg.data(), h_qg.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kr_orig.ptr, h_kr.data(), h_kr.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vr.ptr, h_vr.data(), h_vr.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_qnw.ptr, h_qnw.data(), kHd * sizeof(std::uint16_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_knw.ptr, h_knw.data(), kHd * sizeof(std::uint16_t), cudaMemcpyHostToDevice));
+    const auto* qnw_bf = reinterpret_cast<const __nv_bfloat16*>(d_qnw.ptr);
+    const auto* knw_bf = reinterpret_cast<const __nv_bfloat16*>(d_knw.ptr);
+
+    // Reference whole sequence.
+    CUDA_CHECK(cudaMemcpyAsync(d_kr_tmp.ptr, d_kr_orig.ptr, h_kr.size() * sizeof(float), cudaMemcpyDeviceToDevice,
+                               ctx.stream));
+    qwen38_cuda_full_attn_gated_f32_kvbf16(d_qg.ptr, d_kr_tmp.ptr, d_vr.ptr, qnw_bf, knw_bf, 1e-6f, 10000000.0f,
+                                           kAttnSeq, 0, kNh, kNkvh, kHd, kRd, d_kc.ptr, d_vc.ptr, kAttnSeq, d_qt.ptr,
+                                           d_gt.ptr, d_out_ref.ptr, ctx.stream, nullptr, 0, false);
+
+    // Fast whole sequence (tiled prefill).
+    CUDA_CHECK(cudaMemcpyAsync(d_kr_tmp.ptr, d_kr_orig.ptr, h_kr.size() * sizeof(float), cudaMemcpyDeviceToDevice,
+                               ctx.stream));
+    qwen38_cuda_full_attn_gated_f32_kvbf16(d_qg.ptr, d_kr_tmp.ptr, d_vr.ptr, qnw_bf, knw_bf, 1e-6f, 10000000.0f,
+                                           kAttnSeq, 0, kNh, kNkvh, kHd, kRd, d_kc.ptr, d_vc.ptr, kAttnSeq, d_qt.ptr,
+                                           d_gt.ptr, d_out_fast_whole.ptr, ctx.stream, d_sp.ptr, sp_floats, true);
+
+    // Fast ragged splits {17, 47, 5, 192, 12} covering 64/128/256 boundaries and short-tail split-KV.
+    CUDA_CHECK(cudaMemcpyAsync(d_kr_tmp.ptr, d_kr_orig.ptr, h_kr.size() * sizeof(float), cudaMemcpyDeviceToDevice,
+                               ctx.stream));
+    {
+      int off = 0;
+      for (int slen : {17, 47, 5, 192, 12}) {
+        qwen38_cuda_full_attn_gated_f32_kvbf16(
+            d_qg.ptr + static_cast<std::size_t>(off * kQgDim), d_kr_tmp.ptr + static_cast<std::size_t>(off * kKvDim),
+            d_vr.ptr + static_cast<std::size_t>(off * kKvDim), qnw_bf, knw_bf, 1e-6f, 10000000.0f, slen, off, kNh,
+            kNkvh, kHd, kRd, d_kc.ptr, d_vc.ptr, kAttnSeq, d_qt.ptr, d_gt.ptr,
+            d_out_fast_split.ptr + static_cast<std::size_t>(off * kOutDim), ctx.stream, d_sp.ptr, sp_floats, true);
+        off += slen;
+      }
+    }
+
+    // Fast 273x M=1 split-KV decode.
+    CUDA_CHECK(cudaMemcpyAsync(d_kr_tmp.ptr, d_kr_orig.ptr, h_kr.size() * sizeof(float), cudaMemcpyDeviceToDevice,
+                               ctx.stream));
+    for (int t = 0; t < kAttnSeq; ++t) {
+      qwen38_cuda_full_attn_gated_f32_kvbf16(
+          d_qg.ptr + static_cast<std::size_t>(t * kQgDim), d_kr_tmp.ptr + static_cast<std::size_t>(t * kKvDim),
+          d_vr.ptr + static_cast<std::size_t>(t * kKvDim), qnw_bf, knw_bf, 1e-6f, 10000000.0f, 1, t, kNh, kNkvh, kHd,
+          kRd, d_kc.ptr, d_vc.ptr, kAttnSeq, d_qt.ptr, d_gt.ptr,
+          d_out_fast_seq1.ptr + static_cast<std::size_t>(t * kOutDim), ctx.stream, d_sp.ptr, sp_floats, true);
+    }
+    ctx.synchronize();
+
+    const std::size_t tot_out = static_cast<std::size_t>(kAttnSeq * kOutDim);
+    rep.attn_fast_vs_ref_max_abs = dev_max_abs(d_out_ref.ptr, d_out_fast_whole.ptr, tot_out);
+    float attn_bi = 0.0f;
+    attn_bi = std::max(attn_bi, dev_max_abs(d_out_fast_whole.ptr, d_out_fast_seq1.ptr, tot_out));
+    attn_bi = std::max(attn_bi, dev_max_abs(d_out_fast_split.ptr, d_out_fast_seq1.ptr, tot_out));
+    rep.attn_batch_invariance_max_abs = attn_bi;
+  }
+
   rep.passed = (rep.nvfp4_max_abs <= 1e-4f && rep.fp8_cal_max_abs <= 1e-4f && rep.bf16_max_abs <= 1e-4f &&
                 rep.batch_invariance_max_abs == 0.0f && rep.gdn_prefill_vs_step_max_abs <= 1e-6f &&
-                rep.gdn_batch_invariance_max_abs == 0.0f);
+                rep.gdn_batch_invariance_max_abs == 0.0f && rep.attn_fast_vs_ref_max_abs <= 1e-4f &&
+                rep.attn_batch_invariance_max_abs == 0.0f);
   return rep;
 }
 
@@ -981,9 +1074,10 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   profile_ = make_qwen38_worker_profile(m, ropt, "dense_bf16", "dense");
   profile_.state_identity.act_dtype = ingine::model::ActivationDtype::Fp32;
   profile_.state_identity.numeric_abi =
-      (c.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4)
-          ? "act=f32;attn=fp8_e4m3_cal;mlp=nvfp4_w4a32;gdn=f32;kv=bf16"
-          : "act=f32;attn=bf16;mlp=bf16;gdn=f32;kv=bf16";
+      std::string((c.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4)
+                      ? "act=f32;attn=fp8_e4m3_cal;mlp=nvfp4_w4a32;gdn=f32;kv=bf16"
+                      : "act=f32;attn=bf16;mlp=bf16;gdn=f32;kv=bf16") +
+      (options.use_fast_attn ? ";attn_kernel=gqa64" : ";attn_kernel=ref");
   profile_.state_identity.kv_format = "gdn_f32_conv_f32_kv_bf16";
 
   load_stats_.pins_verified =
@@ -1266,6 +1360,8 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   impl_->q_tmp.allocate(static_cast<std::size_t>(P * attn_dim));
   impl_->gate_tmp.allocate(static_cast<std::size_t>(P * attn_dim));
   impl_->attn_out.allocate(static_cast<std::size_t>(P * attn_dim));
+  impl_->attn_split_scratch.allocate(
+      qwen38_cuda_full_attn_split_scratch_floats(c.num_attention_heads, options.max_ctx, c.head_dim));
   impl_->mlp_gate.allocate(static_cast<std::size_t>(P * I));
   impl_->mlp_up.allocate(static_cast<std::size_t>(P * I));
   impl_->cap_hidden.allocate(static_cast<std::size_t>(Impl::kLogitBatchMax * H));
@@ -1278,8 +1374,9 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
       (impl_->act_quant_scratch.count + impl_->hidden.count + impl_->normed.count + impl_->residual.count +
        impl_->qkv.count + impl_->conv_out.count + impl_->z_buf.count + impl_->a_buf.count + impl_->b_buf.count +
        impl_->core_out.count + impl_->q_gate.count + impl_->k_raw.count + impl_->v_raw.count + impl_->q_tmp.count +
-       impl_->gate_tmp.count + impl_->attn_out.count + impl_->mlp_gate.count + impl_->mlp_up.count +
-       impl_->cap_hidden.count + impl_->cap_normed.count + impl_->gdn_scratch.count + impl_->logits_f32.count) *
+       impl_->gate_tmp.count + impl_->attn_out.count + impl_->attn_split_scratch.count + impl_->mlp_gate.count +
+       impl_->mlp_up.count + impl_->cap_hidden.count + impl_->cap_normed.count + impl_->gdn_scratch.count +
+       impl_->logits_f32.count) *
           sizeof(float) +
       (impl_->token_ids_dev.count + impl_->gather_rows_dev.count) * sizeof(std::int32_t);
 
@@ -1357,6 +1454,20 @@ const ingine::model::SessionLookupResult& Qwen38DenseBackend::last_lookup() cons
 double Qwen38DenseBackend::last_lookup_ms() const noexcept { return impl_->last_lookup_ms; }
 
 double Qwen38DenseBackend::last_reset_ms() const noexcept { return impl_->last_reset_ms; }
+
+void Qwen38DenseBackend::configure_883_ablation(bool pre_suffix_checkpoint, bool use_fast_attn) {
+  impl_->opts.pre_suffix_checkpoint = pre_suffix_checkpoint;
+  impl_->opts.use_fast_attn = use_fast_attn;
+  const auto& c = manifest().config;
+  profile_.state_identity.numeric_abi =
+      std::string((c.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4)
+                      ? "act=f32;attn=fp8_e4m3_cal;mlp=nvfp4_w4a32;gdn=f32;kv=bf16"
+                      : "act=f32;attn=bf16;mlp=bf16;gdn=f32;kv=bf16") +
+      (use_fast_attn ? ";attn_kernel=gqa64" : ";attn_kernel=ref");
+  if (impl_->default_session) {
+    impl_->default_session->reset();
+  }
+}
 
 ingine::model::AdmissionEstimate Qwen38DenseBackend::admission_estimate(int max_ctx, int max_batch) const {
   ingine::model::AdmissionEstimate est;
@@ -1698,8 +1809,31 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate_request_on_session(
 
   std::int32_t next_tok = 0;
   double pf_ms = 0.0;
+  int evictions = 0;
+  const bool can_save_ckpt = allow_reuse && req_id.is_reusable_with(req_id);
+  const std::size_t pre_suffix_pos =
+      (can_save_ckpt && impl_->opts.pre_suffix_checkpoint) ? find_qwen35_pre_suffix_checkpoint(req.prompt.ids) : 0;
+
   if (lookup.reused_tokens == S) {
     next_tok = select_token(sess.state_->tip_logits);
+  } else if (pre_suffix_pos > lookup.reused_tokens && pre_suffix_pos < S) {
+    // Checkpoint GDN recurrent+conv state immediately before the trailing Qwen3.5 assistant
+    // generation suffix so multi-turn follow-ups that alter thinking/tool formatting reuse
+    // the entire prior conversation prefix with zero extra lm_head GEMM (#883).
+    const std::size_t pre_len = pre_suffix_pos - lookup.reused_tokens;
+    const std::span<const std::int32_t> pre_ids = req.prompt.ids.subspan(lookup.reused_tokens, pre_len);
+    const std::span<const std::uint8_t> pre_mask =
+        req.token_mask.empty() ? std::span<const std::uint8_t>{} : req.token_mask.subspan(lookup.reused_tokens, pre_len);
+    impl_->forward_range(sess, pre_ids, {}, true, {}, &pf_ms, pre_mask, false);
+    evictions += sess.save_checkpoint();
+
+    const std::span<const std::int32_t> tail_ids = req.prompt.ids.subspan(pre_suffix_pos);
+    const std::span<const std::uint8_t> tail_mask =
+        req.token_mask.empty() ? std::span<const std::uint8_t>{} : req.token_mask.subspan(pre_suffix_pos);
+    const std::array<int, 1> last_cap = {static_cast<int>(S) - 1};
+    impl_->forward_range(sess, tail_ids, last_cap, true,
+                         [&](const ingine::model::LogitStep& st) { next_tok = select_token(st.logits); }, &pf_ms,
+                         tail_mask, true);
   } else {
     const std::span<const std::int32_t> suffix_ids = req.prompt.ids.subspan(lookup.reused_tokens);
     const std::span<const std::uint8_t> suffix_mask =
@@ -1710,8 +1844,7 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate_request_on_session(
                          suffix_mask);
   }
 
-  int evictions = 0;
-  if (allow_reuse && req_id.is_reusable_with(req_id)) {
+  if (can_save_ckpt) {
     evictions += sess.save_checkpoint();
   }
   stats.cache_evictions = evictions;
@@ -1792,6 +1925,12 @@ void register_qwen38_cuda_backend() {
           load_opts.verify_pins = plan.verify_pins;
           load_opts.use_calibrated_fp8 = plan.use_calibrated_fp8;
           load_opts.prefix_cache = plan.prefix_cache;
+          if (const char* env_ps = std::getenv("INGINE_QWEN38_PRE_SUFFIX_CKPT"); env_ps && env_ps[0] == '0') {
+            load_opts.pre_suffix_checkpoint = false;
+          }
+          if (const char* env_fa = std::getenv("INGINE_QWEN38_FAST_ATTN"); env_fa && env_fa[0] == '0') {
+            load_opts.use_fast_attn = false;
+          }
           load_opts.revision = plan.revision;
           return std::make_unique<Qwen38DenseBackend>(load_opts);
         },
