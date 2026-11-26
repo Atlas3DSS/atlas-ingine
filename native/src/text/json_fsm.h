@@ -8,9 +8,12 @@
 
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ingine::text {
@@ -23,8 +26,14 @@ enum class JsonFormatMode : std::uint8_t {
 
 struct JsonFormatSpec {
   JsonFormatMode mode = JsonFormatMode::None;
-  nlohmann::ordered_json schema;  // populated when mode == JsonSchema
+  nlohmann::ordered_json schema;  // populated when mode == JsonSchema (optional if raw_schema_json is set)
+  std::string raw_schema_json;    // verbatim wire JSON bytes for exact decimal precision without binary64 rounding
 };
+
+// Extracts the verbatim JSON substring at `path` (e.g. {"response_format", "json_schema", "schema"}) from raw wire
+// JSON bytes without parsing numbers through binary64 double.
+std::optional<std::string> extract_raw_json_field_path(std::string_view raw_json,
+                                                       std::initializer_list<std::string_view> path);
 
 // Precomputed per-tokenizer byte index shared across all constrained requests (thread-safe immutable).
 class VocabByteIndex {

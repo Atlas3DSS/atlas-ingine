@@ -358,7 +358,7 @@ struct ParsedResponseFormat {
 
 // Parses OpenAI response_format ("text", "json_object", "json_schema") into both a prompt-guided formatting
 // instruction and a token-level JSON/JSON-Schema FSM spec (None for default/text -> zero overhead).
-ParsedResponseFormat parse_response_format(const Json& body) {
+ParsedResponseFormat parse_response_format(const Json& body, std::string_view raw_body) {
   ParsedResponseFormat out;
   const Json* rf = get(body, "response_format");
   if (!rf) return out;
@@ -393,6 +393,11 @@ ParsedResponseFormat parse_response_format(const Json& body) {
     }
     out.spec.mode = text::JsonFormatMode::JsonSchema;
     out.spec.schema = *schema_it;
+    if (!raw_body.empty()) {
+      if (auto raw_schema = text::extract_raw_json_field_path(raw_body, {"response_format", "json_schema", "schema"})) {
+        out.spec.raw_schema_json = std::move(*raw_schema);
+      }
+    }
     return out;
   }
   throw BadRequest("'response_format.type' must be 'text', 'json_object', or 'json_schema'", "response_format");
@@ -439,7 +444,8 @@ bool truthy(const Json& value) {
 }
 
 ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
-                          const model::Sampling& defaults, const ImageOptions& image_options) {
+                          const model::Sampling& defaults, const ImageOptions& image_options,
+                          std::string_view raw_body) {
   if (num_int(body, "n", Bound{1, "1"}, Bound{1, "1"}).value_or(1) != 1) {
     throw BadRequest("only n=1 is supported", "n");
   }
@@ -476,7 +482,7 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   const auto messages = body.find("messages");
   const auto tools = body.find("tools");
   static const Json kAbsent;  // null: no messages/tools key (passed by reference, not a deep copy of the body)
-  const ParsedResponseFormat parsed_rf = parse_response_format(body);
+  const ParsedResponseFormat parsed_rf = parse_response_format(body, raw_body);
   const std::string& rf_suffix = parsed_rf.instruction;
   const Json& raw_messages = messages == body.end() ? kAbsent : *messages;
   const Json augmented_messages = rf_suffix.empty() ? Json() : append_format_instruction(raw_messages, rf_suffix);

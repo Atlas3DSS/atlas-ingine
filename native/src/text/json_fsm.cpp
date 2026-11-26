@@ -25,7 +25,6 @@ constexpr int kMaxStackDepth = 64;
 constexpr std::size_t kMaxUnionBranches = 16;
 constexpr std::size_t kMaxNumLen = 128;
 constexpr std::size_t kMaxOneOfBuf = 1024 * 1024;
-constexpr double kMaxExactDoubleInt = 9007199254740992.0;  // 2^53
 
 inline bool is_json_ws(std::uint8_t c) noexcept {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r';
@@ -49,7 +48,6 @@ inline void set_bit(std::uint32_t* words, std::size_t word_count, std::int32_t i
   if (w < word_count) words[w] |= (std::uint32_t(1u) << (std::uint32_t(id) & 31u));
 }
 
-// Encode a Unicode scalar value (not a surrogate, <= 0x10FFFF) as UTF-8.
 void append_utf8(std::string& out, std::uint32_t cp) {
   if (cp <= 0x7Fu) {
     out.push_back(char(cp));
@@ -68,7 +66,6 @@ void append_utf8(std::string& out, std::uint32_t cp) {
   }
 }
 
-// Count Unicode scalar values in a valid UTF-8 string (for JSON Schema minLength / maxLength).
 std::size_t utf8_codepoint_length(std::string_view s) noexcept {
   std::size_t count = 0;
   for (char ch : s) {
@@ -77,7 +74,6 @@ std::size_t utf8_codepoint_length(std::string_view s) noexcept {
   return count;
 }
 
-// Decode raw JSON string content (between quotes) to canonical UTF-8; rejects invalid escapes or lone surrogates.
 bool unescape_json_string(std::string_view raw, std::string& out) {
   out.clear();
   out.reserve(raw.size());
@@ -131,7 +127,6 @@ bool unescape_json_string(std::string_view raw, std::string& out) {
   return true;
 }
 
-// Check whether `b` is a non-empty, complete, valid UTF-8 sequence containing no JSON control chars, '"', or '\\'.
 bool is_complete_string_safe_utf8(std::string_view b) noexcept {
   if (b.empty()) return false;
   std::uint8_t rem = 0;
@@ -183,14 +178,15 @@ bool is_complete_string_safe_utf8(std::string_view b) noexcept {
   return rem == 0;
 }
 
-// ---- Exact Arbitrary-Precision Decimal Comparison & JSON Schema 4.2.2 Equality ----------------
+// ---- Exact Arbitrary-Precision Decimal & Exact-Decimal JSON DOM -------------------------------
 
-// Normalized decimal: value == (-1)^neg * sig * 10^scale10 (sig has no leading or trailing zeros).
 struct ParsedDecimal {
   bool neg = false;
   bool is_zero = false;
-  std::string sig;
+  std::string sig;  // digits with no leading or trailing zeros (when !is_zero)
   std::int64_t scale10 = 0;
+
+  bool is_integral() const noexcept { return is_zero || scale10 >= 0; }
 };
 
 bool parse_json_decimal(std::string_view s, ParsedDecimal& out) noexcept {
@@ -251,7 +247,6 @@ bool parse_json_decimal(std::string_view s, ParsedDecimal& out) noexcept {
   return true;
 }
 
-// Exact comparison of two normalized decimals (-1, 0, +1): zero floating-point rounding!
 int compare_decimals(const ParsedDecimal& a, const ParsedDecimal& b) noexcept {
   if (a.is_zero && b.is_zero) return 0;
   if (a.is_zero) return b.neg ? 1 : -1;
@@ -270,14 +265,6 @@ int compare_decimals(const ParsedDecimal& a, const ParsedDecimal& b) noexcept {
   return a.neg ? -mag_cmp : mag_cmp;
 }
 
-// Per JSON Schema 2020-12 section 4.2.2: 3, 3.0, 3e0, 30e-1, -0.0 are all mathematically integers.
-bool json_decimal_is_integral(std::string_view s) noexcept {
-  ParsedDecimal dec;
-  if (!parse_json_decimal(s, dec)) return false;
-  return dec.is_zero || dec.scale10 >= 0;
-}
-
-// Parse pure integer text (no '.' or 'e') into Int128; sets overflow_dir (-1 or +1) if outside Int128.
 bool parse_pure_int128(std::string_view buf, Int128& val_out, int& overflow_dir) noexcept {
   overflow_dir = 0;
   if (buf.empty()) return false;
@@ -305,12 +292,10 @@ bool parse_pure_int128(std::string_view buf, Int128& val_out, int& overflow_dir)
   return true;
 }
 
-// Exact floor(d) or ceil(d) of a ParsedDecimal into Int128 (returns nullopt if outside Int128 range).
 std::optional<Int128> decimal_to_int128_round(const ParsedDecimal& dec, bool round_up) noexcept {
   if (dec.is_zero) return Int128(0);
   const std::int64_t int_digits = std::int64_t(dec.sig.size()) + dec.scale10;
   if (int_digits <= 0) {
-    // 0 < |dec| < 1
     if (dec.neg) return round_up ? Int128(0) : Int128(-1);
     return round_up ? Int128(1) : Int128(0);
   }
@@ -340,41 +325,379 @@ bool compare_num_text_to_bound(std::string_view buf, const ParsedDecimal& b, int
   return true;
 }
 
-bool json_to_decimal(const Json& j, ParsedDecimal& out) noexcept {
-  if (j.is_boolean() || !j.is_number()) return false;
-  return parse_json_decimal(j.dump(), out);
-}
+// Lossless exact-decimal JSON value (never normalizes numbers through binary64 double).
+struct ExactJson {
+  enum class Kind : std::uint8_t { Null, Bool, Number, String, Array, Object };
+  Kind kind = Kind::Null;
+  bool b = false;
+  std::string str;  // decoded UTF-8 for String; verbatim raw JSON number text for Number
+  ParsedDecimal dec;
+  std::vector<ExactJson> arr;
+  std::vector<std::pair<std::string, ExactJson>> obj;
 
-bool json_numbers_equal(const Json& a, const Json& b) noexcept {
-  ParsedDecimal da, db;
-  return json_to_decimal(a, da) && json_to_decimal(b, db) && compare_decimals(da, db) == 0;
-}
+  bool is_null() const noexcept { return kind == Kind::Null; }
+  bool is_bool() const noexcept { return kind == Kind::Bool; }
+  bool is_number() const noexcept { return kind == Kind::Number; }
+  bool is_string() const noexcept { return kind == Kind::String; }
+  bool is_array() const noexcept { return kind == Kind::Array; }
+  bool is_object() const noexcept { return kind == Kind::Object; }
 
-// JSON Schema 2020-12 section 4.2.2 mathematical / structural equality (key-order-independent objects,
-// unescaped strings, mathematical number equality, distinct bool vs number).
-bool json_schema_equal(const Json& a, const Json& b) noexcept {
-  if (a.is_null() || b.is_null()) return a.is_null() && b.is_null();
-  if (a.is_boolean() || b.is_boolean()) return a.is_boolean() && b.is_boolean() && a.get<bool>() == b.get<bool>();
-  if (a.is_number() || b.is_number()) return a.is_number() && b.is_number() && json_numbers_equal(a, b);
-  if (a.is_string() || b.is_string()) {
-    return a.is_string() && b.is_string() && a.get_ref<const std::string&>() == b.get_ref<const std::string&>();
-  }
-  if (a.is_array() || b.is_array()) {
-    if (!a.is_array() || !b.is_array() || a.size() != b.size()) return false;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-      if (!json_schema_equal(a[i], b[i])) return false;
+  const ExactJson* find(std::string_view key) const noexcept {
+    if (!is_object()) return nullptr;
+    for (const auto& [k, v] : obj) {
+      if (k == key) return &v;
     }
+    return nullptr;
+  }
+  bool contains(std::string_view key) const noexcept { return find(key) != nullptr; }
+};
+
+struct ExactJsonParser {
+  std::string_view s;
+  std::size_t pos = 0;
+
+  void skip_ws() noexcept {
+    while (pos < s.size() && is_json_ws(static_cast<std::uint8_t>(s[pos]))) ++pos;
+  }
+
+  bool scan_raw_string(std::string_view& raw_inner) noexcept {
+    if (pos >= s.size() || s[pos] != '"') return false;
+    ++pos;
+    const std::size_t start = pos;
+    while (pos < s.size()) {
+      const auto c = static_cast<std::uint8_t>(s[pos]);
+      if (c == '"') {
+        raw_inner = s.substr(start, pos - start);
+        ++pos;
+        return true;
+      }
+      if (c == '\\') {
+        if (pos + 1 >= s.size()) return false;
+        pos += 2;
+        continue;
+      }
+      if (c < 0x20) return false;
+      ++pos;
+    }
+    return false;
+  }
+
+  bool scan_number(std::string_view& raw_num) noexcept {
+    const std::size_t start = pos;
+    if (pos < s.size() && s[pos] == '-') ++pos;
+    if (pos >= s.size()) return false;
+    if (s[pos] == '0') {
+      ++pos;
+    } else if (s[pos] >= '1' && s[pos] <= '9') {
+      while (pos < s.size() && is_digit(static_cast<std::uint8_t>(s[pos]))) ++pos;
+    } else {
+      return false;
+    }
+    if (pos < s.size() && s[pos] == '.') {
+      ++pos;
+      if (pos >= s.size() || !is_digit(static_cast<std::uint8_t>(s[pos]))) return false;
+      while (pos < s.size() && is_digit(static_cast<std::uint8_t>(s[pos]))) ++pos;
+    }
+    if (pos < s.size() && (s[pos] == 'e' || s[pos] == 'E')) {
+      ++pos;
+      if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) ++pos;
+      if (pos >= s.size() || !is_digit(static_cast<std::uint8_t>(s[pos]))) return false;
+      while (pos < s.size() && is_digit(static_cast<std::uint8_t>(s[pos]))) ++pos;
+    }
+    raw_num = s.substr(start, pos - start);
     return true;
   }
-  if (a.is_object() || b.is_object()) {
-    if (!a.is_object() || !b.is_object() || a.size() != b.size()) return false;
-    for (auto it = a.begin(); it != a.end(); ++it) {
-      auto bit = b.find(it.key());
-      if (bit == b.end() || !json_schema_equal(it.value(), bit.value())) return false;
+
+  bool skip_value(int depth = 0) noexcept {
+    if (depth > 64) return false;
+    skip_ws();
+    if (pos >= s.size()) return false;
+    const char c = s[pos];
+    if (c == '"') {
+      std::string_view tmp;
+      return scan_raw_string(tmp);
     }
-    return true;
+    if (c == '{') {
+      ++pos;
+      skip_ws();
+      if (pos < s.size() && s[pos] == '}') {
+        ++pos;
+        return true;
+      }
+      while (true) {
+        skip_ws();
+        std::string_view key;
+        if (!scan_raw_string(key)) return false;
+        skip_ws();
+        if (pos >= s.size() || s[pos] != ':') return false;
+        ++pos;
+        if (!skip_value(depth + 1)) return false;
+        skip_ws();
+        if (pos >= s.size()) return false;
+        if (s[pos] == '}') {
+          ++pos;
+          return true;
+        }
+        if (s[pos] != ',') return false;
+        ++pos;
+      }
+    }
+    if (c == '[') {
+      ++pos;
+      skip_ws();
+      if (pos < s.size() && s[pos] == ']') {
+        ++pos;
+        return true;
+      }
+      while (true) {
+        if (!skip_value(depth + 1)) return false;
+        skip_ws();
+        if (pos >= s.size()) return false;
+        if (s[pos] == ']') {
+          ++pos;
+          return true;
+        }
+        if (s[pos] != ',') return false;
+        ++pos;
+      }
+    }
+    if (c == 't') {
+      if (s.substr(pos, 4) != "true") return false;
+      pos += 4;
+      return true;
+    }
+    if (c == 'f') {
+      if (s.substr(pos, 5) != "false") return false;
+      pos += 5;
+      return true;
+    }
+    if (c == 'n') {
+      if (s.substr(pos, 4) != "null") return false;
+      pos += 4;
+      return true;
+    }
+    std::string_view tmp;
+    return scan_number(tmp);
+  }
+
+  bool parse_value(ExactJson& out, int depth = 0) {
+    if (depth > 64) return false;
+    skip_ws();
+    if (pos >= s.size()) return false;
+    const char c = s[pos];
+    if (c == 'n') {
+      if (s.substr(pos, 4) != "null") return false;
+      pos += 4;
+      out = ExactJson{};
+      out.kind = ExactJson::Kind::Null;
+      return true;
+    }
+    if (c == 't') {
+      if (s.substr(pos, 4) != "true") return false;
+      pos += 4;
+      out = ExactJson{};
+      out.kind = ExactJson::Kind::Bool;
+      out.b = true;
+      return true;
+    }
+    if (c == 'f') {
+      if (s.substr(pos, 5) != "false") return false;
+      pos += 5;
+      out = ExactJson{};
+      out.kind = ExactJson::Kind::Bool;
+      out.b = false;
+      return true;
+    }
+    if (c == '"') {
+      std::string_view raw_inner;
+      if (!scan_raw_string(raw_inner)) return false;
+      out = ExactJson{};
+      out.kind = ExactJson::Kind::String;
+      return unescape_json_string(raw_inner, out.str);
+    }
+    if (c == '[') {
+      ++pos;
+      out = ExactJson{};
+      out.kind = ExactJson::Kind::Array;
+      skip_ws();
+      if (pos < s.size() && s[pos] == ']') {
+        ++pos;
+        return true;
+      }
+      while (true) {
+        ExactJson elem;
+        if (!parse_value(elem, depth + 1)) return false;
+        out.arr.push_back(std::move(elem));
+        skip_ws();
+        if (pos >= s.size()) return false;
+        if (s[pos] == ']') {
+          ++pos;
+          return true;
+        }
+        if (s[pos] != ',') return false;
+        ++pos;
+      }
+    }
+    if (c == '{') {
+      ++pos;
+      out = ExactJson{};
+      out.kind = ExactJson::Kind::Object;
+      skip_ws();
+      if (pos < s.size() && s[pos] == '}') {
+        ++pos;
+        return true;
+      }
+      while (true) {
+        skip_ws();
+        std::string_view raw_key;
+        if (!scan_raw_string(raw_key)) return false;
+        std::string key;
+        if (!unescape_json_string(raw_key, key)) return false;
+        skip_ws();
+        if (pos >= s.size() || s[pos] != ':') return false;
+        ++pos;
+        ExactJson val;
+        if (!parse_value(val, depth + 1)) return false;
+        // Last key wins (matches nlohmann::json behavior).
+        bool replaced = false;
+        for (auto& kv : out.obj) {
+          if (kv.first == key) {
+            kv.second = std::move(val);
+            replaced = true;
+            break;
+          }
+        }
+        if (!replaced) out.obj.emplace_back(std::move(key), std::move(val));
+        skip_ws();
+        if (pos >= s.size()) return false;
+        if (s[pos] == '}') {
+          ++pos;
+          return true;
+        }
+        if (s[pos] != ',') return false;
+        ++pos;
+      }
+    }
+    std::string_view raw_num;
+    if (!scan_number(raw_num)) return false;
+    out = ExactJson{};
+    out.kind = ExactJson::Kind::Number;
+    out.str = std::string(raw_num);
+    return parse_json_decimal(raw_num, out.dec);
+  }
+};
+
+bool parse_exact_json(std::string_view raw, ExactJson& out) {
+  ExactJsonParser p{raw, 0};
+  if (!p.parse_value(out, 0)) return false;
+  p.skip_ws();
+  return p.pos == raw.size();
+}
+
+// Compact lossless dump of an ExactJson (preserves exact decimal spellings without double rounding).
+std::string exact_json_dump(const ExactJson& v) {
+  switch (v.kind) {
+    case ExactJson::Kind::Null: return "null";
+    case ExactJson::Kind::Bool: return v.b ? "true" : "false";
+    case ExactJson::Kind::Number: return v.str;
+    case ExactJson::Kind::String: return Json(v.str).dump();
+    case ExactJson::Kind::Array: {
+      std::string out = "[";
+      for (std::size_t i = 0; i < v.arr.size(); ++i) {
+        if (i > 0) out.push_back(',');
+        out += exact_json_dump(v.arr[i]);
+      }
+      out.push_back(']');
+      return out;
+    }
+    case ExactJson::Kind::Object: {
+      std::string out = "{";
+      for (std::size_t i = 0; i < v.obj.size(); ++i) {
+        if (i > 0) out.push_back(',');
+        out += Json(v.obj[i].first).dump();
+        out.push_back(':');
+        out += exact_json_dump(v.obj[i].second);
+      }
+      out.push_back('}');
+      return out;
+    }
+  }
+  return "null";
+}
+
+// JSON Schema 2020-12 section 4.2.2 mathematical/structural equality on ExactJson.
+bool exact_json_equal(const ExactJson& a, const ExactJson& b) noexcept {
+  if (a.kind != b.kind) return false;
+  switch (a.kind) {
+    case ExactJson::Kind::Null: return true;
+    case ExactJson::Kind::Bool: return a.b == b.b;
+    case ExactJson::Kind::Number: return compare_decimals(a.dec, b.dec) == 0;
+    case ExactJson::Kind::String: return a.str == b.str;
+    case ExactJson::Kind::Array: {
+      if (a.arr.size() != b.arr.size()) return false;
+      for (std::size_t i = 0; i < a.arr.size(); ++i) {
+        if (!exact_json_equal(a.arr[i], b.arr[i])) return false;
+      }
+      return true;
+    }
+    case ExactJson::Kind::Object: {
+      if (a.obj.size() != b.obj.size()) return false;
+      for (const auto& [k, av] : a.obj) {
+        const ExactJson* bv = b.find(k);
+        if (!bv || !exact_json_equal(av, *bv)) return false;
+      }
+      return true;
+    }
   }
   return false;
+}
+
+// Rejects any binary64-rounded float inside numeric bounds or const/enum when raw wire JSON was not supplied.
+bool contains_json_float(const Json& j) noexcept {
+  if (j.is_number_float()) return true;
+  if (j.is_array()) {
+    for (const Json& e : j) {
+      if (contains_json_float(e)) return true;
+    }
+  } else if (j.is_object()) {
+    for (auto it = j.begin(); it != j.end(); ++it) {
+      if (contains_json_float(it.value())) return true;
+    }
+  }
+  return false;
+}
+
+void reject_binary64_rounded_constraints(const Json& schema, int depth = 0) {
+  if (depth > 32 || !schema.is_object()) return;
+  for (const char* kw : {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}) {
+    if (auto it = schema.find(kw); it != schema.end() && it->is_number_float()) {
+      throw std::invalid_argument(std::string("JSON schema decimal '") + kw +
+                                  "' requires raw_schema_json (wire JSON) to preserve exact decimal precision");
+    }
+  }
+  for (const char* kw : {"const", "enum"}) {
+    if (auto it = schema.find(kw); it != schema.end() && contains_json_float(*it)) {
+      throw std::invalid_argument(std::string("JSON schema decimal '") + kw +
+                                  "' requires raw_schema_json (wire JSON) to preserve exact decimal precision");
+    }
+  }
+  for (const char* map_kw : {"properties", "$defs", "definitions"}) {
+    if (auto it = schema.find(map_kw); it != schema.end() && it->is_object()) {
+      for (auto pit = it->begin(); pit != it->end(); ++pit) {
+        reject_binary64_rounded_constraints(pit.value(), depth + 1);
+      }
+    }
+  }
+  for (const char* sub_kw : {"additionalProperties", "items"}) {
+    if (auto it = schema.find(sub_kw); it != schema.end() && it->is_object()) {
+      reject_binary64_rounded_constraints(*it, depth + 1);
+    }
+  }
+  for (const char* arr_kw : {"anyOf", "oneOf"}) {
+    if (auto it = schema.find(arr_kw); it != schema.end() && it->is_array()) {
+      for (const Json& elem : *it) reject_binary64_rounded_constraints(elem, depth + 1);
+    }
+  }
 }
 
 // ---- Compiled JSON Schema graph ---------------------------------------------------------------
@@ -394,35 +717,29 @@ enum class NodeKind : std::uint8_t {
 
 struct PropDef {
   std::string name;
-  std::string json_escaped;  // content between quotes when JSON-escaped (without outer quotes)
+  std::string json_escaped;
   int node_id = 0;
   bool required = false;
 };
 
 struct SchemaNode {
   NodeKind kind = NodeKind::Any;
-  // Object
   std::vector<PropDef> props;
   bool additional_properties = true;
-  int additional_node_id = 0;  // Any
+  int additional_node_id = 0;
   int min_properties = 0;
-  int max_properties = -1;  // -1 = unbounded
-  // Array
-  int item_node_id = 0;  // Any
+  int max_properties = -1;
+  int item_node_id = 0;
   int min_items = 0;
-  int max_items = -1;  // -1 = unbounded
-  // String
+  int max_items = -1;
   int min_length = 0;
-  int max_length = -1;  // -1 = unbounded
-  // Integer / Number (exact arbitrary-precision decimal bounds — zero double rounding)
+  int max_length = -1;
   std::optional<ParsedDecimal> minimum;
   std::optional<ParsedDecimal> maximum;
   std::optional<ParsedDecimal> exclusive_minimum;
   std::optional<ParsedDecimal> exclusive_maximum;
-  // Enum / Const (compact encodings for PDA + exact parsed JSON values for semantic equality)
   std::vector<std::string> enum_literals;
-  std::vector<Json> enum_values;
-  // Union (anyOf / oneOf / type array)
+  std::vector<ExactJson> enum_values;
   std::vector<int> union_nodes;
   bool is_one_of = false;
 };
@@ -435,10 +752,10 @@ std::string json_escape_inner(const std::string& raw) {
   return dumped;
 }
 
-const Json* resolve_json_pointer(const Json& root, const std::string& ref) {
+const ExactJson* resolve_json_pointer(const ExactJson& root, const std::string& ref) {
   if (ref == "#") return &root;
   if (ref.size() < 2 || ref[0] != '#' || ref[1] != '/') return nullptr;
-  const Json* cur = &root;
+  const ExactJson* cur = &root;
   std::size_t pos = 2;
   while (pos <= ref.size()) {
     std::size_t slash = ref.find('/', pos);
@@ -460,10 +777,8 @@ const Json* resolve_json_pointer(const Json& root, const std::string& ref) {
       }
       unescaped.push_back(seg[i]);
     }
-    if (!cur->is_object()) return nullptr;
-    auto it = cur->find(unescaped);
-    if (it == cur->end()) return nullptr;
-    cur = &(*it);
+    cur = cur->find(unescaped);
+    if (!cur) return nullptr;
     if (slash == std::string::npos) break;
     pos = slash + 1;
   }
@@ -489,70 +804,37 @@ bool is_valid_json_type_name(std::string_view t) noexcept {
          t == "null";
 }
 
-bool json_matches_type_name(const Json& v, std::string_view t) noexcept {
+bool exact_json_matches_type_name(const ExactJson& v, std::string_view t) noexcept {
   if (t == "null") return v.is_null();
-  if (t == "boolean") return v.is_boolean();
+  if (t == "boolean") return v.is_bool();
   if (t == "string") return v.is_string();
   if (t == "array") return v.is_array();
   if (t == "object") return v.is_object();
-  if (t == "number") return !v.is_boolean() && v.is_number();
-  if (t == "integer") {
-    if (v.is_boolean() || !v.is_number()) return false;
-    if (v.is_number_integer() || v.is_number_unsigned()) return true;
-    const double d = v.get<double>();
-    return std::isfinite(d) && std::trunc(d) == d;
-  }
+  if (t == "number") return v.is_number();
+  if (t == "integer") return v.is_number() && v.dec.is_integral();
   return false;
 }
 
-int parse_nonneg_int_kw(const Json& obj, const char* key, int default_val) {
-  auto it = obj.find(key);
-  if (it == obj.end()) return default_val;
-  if (it->is_boolean() || !it->is_number()) {
+int parse_nonneg_int_kw(const ExactJson& obj, const char* key, int default_val) {
+  const ExactJson* v = obj.find(key);
+  if (!v) return default_val;
+  if (!v->is_number() || !v->dec.is_integral()) {
     throw std::invalid_argument(std::string("JSON schema '") + key + "' must be a non-negative integer");
   }
-  if (it->is_number_unsigned()) {
-    const std::uint64_t v = it->get<std::uint64_t>();
-    if (v > std::uint64_t(std::numeric_limits<int>::max())) {
-      throw std::invalid_argument(std::string("JSON schema '") + key + "' out of supported integer range");
-    }
-    return int(v);
+  const auto iv = decimal_to_int128_round(v->dec, false);
+  if (!iv || *iv < 0 || *iv > Int128(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument(std::string("JSON schema '") + key + "' out of supported integer range");
   }
-  if (it->is_number_integer()) {
-    const std::int64_t v = it->get<std::int64_t>();
-    if (v < 0 || v > std::numeric_limits<int>::max()) {
-      throw std::invalid_argument(std::string("JSON schema '") + key + "' out of supported integer range");
-    }
-    return int(v);
-  }
-  const double dv = it->get<double>();
-  if (!std::isfinite(dv) || std::trunc(dv) != dv || dv < 0.0 || dv > double(std::numeric_limits<int>::max())) {
-    throw std::invalid_argument(std::string("JSON schema '") + key + "' must be a non-negative integer");
-  }
-  return int(dv);
+  return int(*iv);
 }
 
-std::optional<ParsedDecimal> parse_exact_bound_kw(const Json& obj, const char* key) {
-  auto it = obj.find(key);
-  if (it == obj.end()) return std::nullopt;
-  if (it->is_boolean() || !it->is_number()) {
+std::optional<ParsedDecimal> parse_exact_bound_kw(const ExactJson& obj, const char* key) {
+  const ExactJson* v = obj.find(key);
+  if (!v) return std::nullopt;
+  if (!v->is_number()) {
     throw std::invalid_argument(std::string("JSON schema '") + key + "' must be a number");
   }
-  if (it->is_number_float()) {
-    const double d = it->get<double>();
-    if (!std::isfinite(d)) {
-      throw std::invalid_argument(std::string("JSON schema '") + key + "' must be finite");
-    }
-    if (std::abs(d) >= kMaxExactDoubleInt) {
-      throw std::invalid_argument(std::string("JSON schema '") + key +
-                                  "' floating-point bound exceeds exact IEEE-754 integer precision (>= 2^53)");
-    }
-  }
-  ParsedDecimal dec;
-  if (!json_to_decimal(*it, dec)) {
-    throw std::invalid_argument(std::string("JSON schema '") + key + "' could not be parsed as an exact decimal");
-  }
-  return dec;
+  return v->dec;
 }
 
 struct NumBounds {
@@ -562,7 +844,7 @@ struct NumBounds {
   std::optional<ParsedDecimal> exclusive_maximum;
 };
 
-NumBounds parse_num_bounds(const Json& obj) {
+NumBounds parse_num_bounds(const ExactJson& obj) {
   NumBounds b;
   b.minimum = parse_exact_bound_kw(obj, "minimum");
   b.maximum = parse_exact_bound_kw(obj, "maximum");
@@ -571,7 +853,6 @@ NumBounds parse_num_bounds(const Json& obj) {
   return b;
 }
 
-// Compute exact tight Int128 [lo, hi] bounds for integer values (or nullopt if unbounded on that side).
 void compute_integer_bounds(const std::optional<ParsedDecimal>& minimum, const std::optional<ParsedDecimal>& maximum,
                             const std::optional<ParsedDecimal>& exclusive_minimum,
                             const std::optional<ParsedDecimal>& exclusive_maximum, std::optional<Int128>& eff_lo,
@@ -579,23 +860,19 @@ void compute_integer_bounds(const std::optional<ParsedDecimal>& minimum, const s
   eff_lo.reset();
   eff_hi.reset();
   if (minimum) {
-    if (auto v = decimal_to_int128_round(*minimum, /*round_up=*/true)) {
-      eff_lo = eff_lo ? std::max(*eff_lo, *v) : *v;
-    }
+    if (auto v = decimal_to_int128_round(*minimum, true)) eff_lo = eff_lo ? std::max(*eff_lo, *v) : *v;
   }
   if (exclusive_minimum) {
-    if (auto f = decimal_to_int128_round(*exclusive_minimum, /*round_up=*/false)) {
+    if (auto f = decimal_to_int128_round(*exclusive_minimum, false)) {
       const Int128 v = *f + 1;
       eff_lo = eff_lo ? std::max(*eff_lo, v) : v;
     }
   }
   if (maximum) {
-    if (auto v = decimal_to_int128_round(*maximum, /*round_up=*/false)) {
-      eff_hi = eff_hi ? std::min(*eff_hi, *v) : *v;
-    }
+    if (auto v = decimal_to_int128_round(*maximum, false)) eff_hi = eff_hi ? std::min(*eff_hi, *v) : *v;
   }
   if (exclusive_maximum) {
-    if (auto c = decimal_to_int128_round(*exclusive_maximum, /*round_up=*/true)) {
+    if (auto c = decimal_to_int128_round(*exclusive_maximum, true)) {
       const Int128 v = *c - 1;
       eff_hi = eff_hi ? std::min(*eff_hi, v) : v;
     }
@@ -642,37 +919,25 @@ void validate_num_bounds_satisfiable(const NumBounds& b, bool integer_only) {
   }
 }
 
+bool decimal_satisfies_bounds(const ParsedDecimal& val, const SchemaNode& node) noexcept {
+  if (node.minimum && compare_decimals(val, *node.minimum) < 0) return false;
+  if (node.exclusive_minimum && compare_decimals(val, *node.exclusive_minimum) <= 0) return false;
+  if (node.maximum && compare_decimals(val, *node.maximum) > 0) return false;
+  if (node.exclusive_maximum && compare_decimals(val, *node.exclusive_maximum) >= 0) return false;
+  return true;
+}
+
 bool num_value_satisfies(const SchemaNode& node, std::string_view buf) noexcept {
   if (!node.minimum && !node.maximum && !node.exclusive_minimum && !node.exclusive_maximum) return true;
   if (buf.empty()) return false;
   int cmp = 0;
-  if (node.minimum) {
-    if (!compare_num_text_to_bound(buf, *node.minimum, cmp) || cmp < 0) return false;
-  }
-  if (node.exclusive_minimum) {
-    if (!compare_num_text_to_bound(buf, *node.exclusive_minimum, cmp) || cmp <= 0) return false;
-  }
-  if (node.maximum) {
-    if (!compare_num_text_to_bound(buf, *node.maximum, cmp) || cmp > 0) return false;
-  }
-  if (node.exclusive_maximum) {
-    if (!compare_num_text_to_bound(buf, *node.exclusive_maximum, cmp) || cmp >= 0) return false;
-  }
+  if (node.minimum && (!compare_num_text_to_bound(buf, *node.minimum, cmp) || cmp < 0)) return false;
+  if (node.exclusive_minimum && (!compare_num_text_to_bound(buf, *node.exclusive_minimum, cmp) || cmp <= 0)) return false;
+  if (node.maximum && (!compare_num_text_to_bound(buf, *node.maximum, cmp) || cmp > 0)) return false;
+  if (node.exclusive_maximum && (!compare_num_text_to_bound(buf, *node.exclusive_maximum, cmp) || cmp >= 0)) return false;
   return true;
 }
 
-bool json_number_satisfies_bounds(const Json& v, const SchemaNode& node) noexcept {
-  if (!node.minimum && !node.maximum && !node.exclusive_minimum && !node.exclusive_maximum) return true;
-  ParsedDecimal vb;
-  if (!json_to_decimal(v, vb)) return false;
-  if (node.minimum && compare_decimals(vb, *node.minimum) < 0) return false;
-  if (node.exclusive_minimum && compare_decimals(vb, *node.exclusive_minimum) <= 0) return false;
-  if (node.maximum && compare_decimals(vb, *node.maximum) > 0) return false;
-  if (node.exclusive_maximum && compare_decimals(vb, *node.exclusive_maximum) >= 0) return false;
-  return true;
-}
-
-// Sound prefix check for numbers/integers: never rejects a prefix with any valid completion.
 bool num_prefix_can_satisfy(const SchemaNode& node, const std::string& buf) noexcept {
   if (!node.minimum && !node.maximum && !node.exclusive_minimum && !node.exclusive_maximum) return true;
   if (buf.empty()) return true;
@@ -719,7 +984,6 @@ bool num_prefix_can_satisfy(const SchemaNode& node, const std::string& buf) noex
     }
   }
 
-  // Floating-point Number: sign feasibility check.
   ParsedDecimal zero;
   zero.is_zero = true;
   if (buf[0] == '-') {
@@ -742,9 +1006,7 @@ struct SchemaGraph {
   std::vector<SchemaNode> nodes;
   int root_id = 0;
 
-  SchemaGraph() {
-    nodes.push_back(SchemaNode{NodeKind::Any});
-  }
+  SchemaGraph() { nodes.push_back(SchemaNode{NodeKind::Any}); }
 
   int add_node(SchemaNode n) {
     const int id = int(nodes.size());
@@ -752,7 +1014,7 @@ struct SchemaGraph {
     return id;
   }
 
-  int compile_type_name(const std::string& t, const Json& obj, const Json& root, int depth) {
+  int compile_type_name(const std::string& t, const ExactJson& obj, const ExactJson& root, int depth) {
     if (t == "object") {
       SchemaNode n;
       n.kind = NodeKind::Object;
@@ -763,31 +1025,31 @@ struct SchemaGraph {
       }
 
       std::unordered_set<std::string> req_set;
-      if (auto it = obj.find("required"); it != obj.end()) {
-        if (!it->is_array()) throw std::invalid_argument("JSON schema 'required' must be an array");
-        for (const Json& r : *it) {
+      if (const ExactJson* req = obj.find("required")) {
+        if (!req->is_array()) throw std::invalid_argument("JSON schema 'required' must be an array");
+        for (const ExactJson& r : req->arr) {
           if (!r.is_string()) throw std::invalid_argument("JSON schema 'required' entries must be strings");
-          req_set.insert(r.get<std::string>());
+          req_set.insert(r.str);
         }
       }
-      if (auto it = obj.find("additionalProperties"); it != obj.end()) {
-        if (it->is_boolean()) {
-          n.additional_properties = it->get<bool>();
+      if (const ExactJson* ap = obj.find("additionalProperties")) {
+        if (ap->is_bool()) {
+          n.additional_properties = ap->b;
           n.additional_node_id = 0;
-        } else if (it->is_object()) {
+        } else if (ap->is_object()) {
           n.additional_properties = true;
-          n.additional_node_id = compile(*it, root, depth + 1);
+          n.additional_node_id = compile(*ap, root, depth + 1);
         } else {
           throw std::invalid_argument("JSON schema 'additionalProperties' must be a boolean or object");
         }
       }
-      if (auto it = obj.find("properties"); it != obj.end()) {
-        if (!it->is_object()) throw std::invalid_argument("JSON schema 'properties' must be an object");
-        for (auto pit = it->begin(); pit != it->end(); ++pit) {
+      if (const ExactJson* props = obj.find("properties")) {
+        if (!props->is_object()) throw std::invalid_argument("JSON schema 'properties' must be an object");
+        for (const auto& [pname, pschema] : props->obj) {
           PropDef pd;
-          pd.name = pit.key();
+          pd.name = pname;
           pd.json_escaped = json_escape_inner(pd.name);
-          pd.node_id = compile(pit.value(), root, depth + 1);
+          pd.node_id = compile(pschema, root, depth + 1);
           pd.required = req_set.count(pd.name) > 0;
           n.props.push_back(std::move(pd));
         }
@@ -821,11 +1083,11 @@ struct SchemaGraph {
       n.kind = NodeKind::Array;
       n.min_items = parse_nonneg_int_kw(obj, "minItems", 0);
       n.max_items = parse_nonneg_int_kw(obj, "maxItems", -1);
-      if (auto it = obj.find("items"); it != obj.end()) {
-        if (it->is_object()) {
-          n.item_node_id = compile(*it, root, depth + 1);
-        } else if (it->is_boolean()) {
-          if (it->get<bool>()) {
+      if (const ExactJson* items = obj.find("items")) {
+        if (items->is_object()) {
+          n.item_node_id = compile(*items, root, depth + 1);
+        } else if (items->is_bool()) {
+          if (items->b) {
             n.item_node_id = 0;
           } else {
             n.item_node_id = 0;
@@ -868,12 +1130,12 @@ struct SchemaGraph {
     throw std::invalid_argument("unsupported JSON schema type: '" + t + "'");
   }
 
-  int compile(const Json& schema, const Json& root, int depth = 0) {
+  int compile(const ExactJson& schema, const ExactJson& root, int depth = 0) {
     if (depth > 24) {
       throw std::invalid_argument("JSON schema exceeds maximum nesting/recursion depth");
     }
-    if (schema.is_boolean()) {
-      if (schema.get<bool>()) return 0;
+    if (schema.is_bool()) {
+      if (schema.b) return 0;
       throw std::invalid_argument("unsatisfiable boolean false JSON schema");
     }
     if (!schema.is_object()) {
@@ -881,8 +1143,7 @@ struct SchemaGraph {
     }
 
     int validation_kw_count = 0;
-    for (auto it = schema.begin(); it != schema.end(); ++it) {
-      const std::string& k = it.key();
+    for (const auto& [k, _] : schema.obj) {
       if (is_annotation_keyword(k)) continue;
       if (!is_supported_validation_keyword(k)) {
         throw std::invalid_argument("unsupported JSON schema keyword: '" + k + "'");
@@ -890,39 +1151,38 @@ struct SchemaGraph {
       ++validation_kw_count;
     }
 
-    if (auto it = schema.find("$ref"); it != schema.end()) {
+    if (const ExactJson* ref = schema.find("$ref")) {
       if (validation_kw_count > 1) {
         throw std::invalid_argument("JSON schema '$ref' with sibling validation keywords is not supported");
       }
-      if (!it->is_string()) {
+      if (!ref->is_string()) {
         throw std::invalid_argument("JSON schema '$ref' must be a string");
       }
-      const std::string ref = it->get<std::string>();
-      const Json* target = resolve_json_pointer(root, ref);
+      const ExactJson* target = resolve_json_pointer(root, ref->str);
       if (!target) {
-        throw std::invalid_argument("unresolved or external JSON schema $ref: '" + ref + "'");
+        throw std::invalid_argument("unresolved or external JSON schema $ref: '" + ref->str + "'");
       }
       return compile(*target, root, depth + 1);
     }
 
-    const bool has_any_of = schema.contains("anyOf");
-    const bool has_one_of = schema.contains("oneOf");
-    if (has_any_of || has_one_of) {
-      if (has_any_of && has_one_of) {
+    const ExactJson* any_of = schema.find("anyOf");
+    const ExactJson* one_of = schema.find("oneOf");
+    if (any_of || one_of) {
+      if (any_of && one_of) {
         throw std::invalid_argument("combining 'anyOf' and 'oneOf' in one schema node is not supported");
       }
       if (validation_kw_count > 1) {
         throw std::invalid_argument("combining 'anyOf'/'oneOf' with sibling validation keywords is not supported");
       }
-      const char* ukey = has_one_of ? "oneOf" : "anyOf";
-      const Json& arr = schema.at(ukey);
-      if (!arr.is_array() || arr.empty()) {
+      const char* ukey = one_of ? "oneOf" : "anyOf";
+      const ExactJson* arr = one_of ? one_of : any_of;
+      if (!arr->is_array() || arr->arr.empty()) {
         throw std::invalid_argument(std::string("JSON schema '") + ukey + "' must be a non-empty array");
       }
       SchemaNode n;
       n.kind = NodeKind::Union;
-      n.is_one_of = has_one_of;
-      for (const Json& sub : arr) {
+      n.is_one_of = (one_of != nullptr);
+      for (const ExactJson& sub : arr->arr) {
         n.union_nodes.push_back(compile(sub, root, depth + 1));
       }
       if (n.union_nodes.size() == 1) return n.union_nodes[0];
@@ -930,52 +1190,48 @@ struct SchemaGraph {
     }
 
     std::vector<std::string> allowed_types;
-    if (auto it = schema.find("type"); it != schema.end()) {
-      if (it->is_string()) {
-        const std::string t = it->get<std::string>();
-        if (!is_valid_json_type_name(t)) {
-          throw std::invalid_argument("unsupported JSON schema type: '" + t + "'");
+    if (const ExactJson* ty = schema.find("type")) {
+      if (ty->is_string()) {
+        if (!is_valid_json_type_name(ty->str)) {
+          throw std::invalid_argument("unsupported JSON schema type: '" + ty->str + "'");
         }
-        allowed_types.push_back(t);
-      } else if (it->is_array() && !it->empty()) {
-        for (const Json& t : *it) {
-          if (!t.is_string() || !is_valid_json_type_name(t.get<std::string>())) {
+        allowed_types.push_back(ty->str);
+      } else if (ty->is_array() && !ty->arr.empty()) {
+        for (const ExactJson& t : ty->arr) {
+          if (!t.is_string() || !is_valid_json_type_name(t.str)) {
             throw std::invalid_argument("JSON schema 'type' array contains invalid type name");
           }
-          allowed_types.push_back(t.get<std::string>());
+          allowed_types.push_back(t.str);
         }
       } else {
         throw std::invalid_argument("JSON schema 'type' must be a valid type string or non-empty array");
       }
     }
 
-    const bool has_const = schema.contains("const");
-    const bool has_enum = schema.contains("enum");
-    if (has_const || has_enum) {
+    const ExactJson* c_kw = schema.find("const");
+    const ExactJson* e_kw = schema.find("enum");
+    if (c_kw || e_kw) {
       if (schema.contains("properties") || schema.contains("required") || schema.contains("additionalProperties") ||
           schema.contains("items")) {
         throw std::invalid_argument("combining 'const'/'enum' with 'properties'/'required'/'items' is not supported");
       }
-      std::vector<Json> candidates;
-      if (has_const) {
-        candidates.push_back(schema.at("const"));
-      }
-      if (has_enum) {
-        const Json& earr = schema.at("enum");
-        if (!earr.is_array() || earr.empty()) {
+      std::vector<ExactJson> candidates;
+      if (c_kw) candidates.push_back(*c_kw);
+      if (e_kw) {
+        if (!e_kw->is_array() || e_kw->arr.empty()) {
           throw std::invalid_argument("JSON schema 'enum' must be a non-empty array");
         }
-        if (has_const) {
+        if (c_kw) {
           bool found = false;
-          for (const Json& ev : earr) {
-            if (json_schema_equal(ev, candidates[0])) {
+          for (const ExactJson& ev : e_kw->arr) {
+            if (exact_json_equal(ev, candidates[0])) {
               found = true;
               break;
             }
           }
           if (!found) candidates.clear();
         } else {
-          for (const Json& ev : earr) candidates.push_back(ev);
+          for (const ExactJson& ev : e_kw->arr) candidates.push_back(ev);
         }
       }
 
@@ -995,32 +1251,32 @@ struct SchemaGraph {
       SchemaNode n;
       n.kind = NodeKind::Enum;
       std::unordered_set<std::string> dedup;
-      for (const Json& v : candidates) {
+      for (const ExactJson& v : candidates) {
         if (!allowed_types.empty()) {
           bool ok_type = false;
           for (const std::string& t : allowed_types) {
-            if (json_matches_type_name(v, t)) {
+            if (exact_json_matches_type_name(v, t)) {
               ok_type = true;
               break;
             }
           }
           if (!ok_type) continue;
         }
-        if (!v.is_boolean() && v.is_number() && !json_number_satisfies_bounds(v, bound_probe)) continue;
+        if (v.is_number() && !decimal_satisfies_bounds(v.dec, bound_probe)) continue;
         if (v.is_string()) {
-          const std::size_t cp_len = utf8_codepoint_length(v.get_ref<const std::string&>());
+          const std::size_t cp_len = utf8_codepoint_length(v.str);
           if (cp_len < std::size_t(min_len)) continue;
           if (max_len >= 0 && cp_len > std::size_t(max_len)) continue;
         }
         if (v.is_array()) {
-          if (int(v.size()) < min_items) continue;
-          if (max_items >= 0 && int(v.size()) > max_items) continue;
+          if (int(v.arr.size()) < min_items) continue;
+          if (max_items >= 0 && int(v.arr.size()) > max_items) continue;
         }
         if (v.is_object()) {
-          if (int(v.size()) < min_props) continue;
-          if (max_props >= 0 && int(v.size()) > max_props) continue;
+          if (int(v.obj.size()) < min_props) continue;
+          if (max_props >= 0 && int(v.obj.size()) > max_props) continue;
         }
-        std::string dumped = v.dump();
+        std::string dumped = exact_json_dump(v);
         if (dedup.insert(dumped).second) {
           n.enum_literals.push_back(std::move(dumped));
           n.enum_values.push_back(v);
@@ -1070,9 +1326,8 @@ struct SchemaGraph {
   }
 };
 
-// Exact JSON Schema 2020-12 semantic validator used at OneOf completion boundaries so value-equality
-// cases (3.0 / 3e0 integral, "\u0061" == "a", {"b":2,"a":1} == {"a":1,"b":2}) match exact oneOf semantics.
-bool json_value_matches_node(const SchemaGraph& g, int node_id, const Json& val, std::string_view raw_text = {}) {
+// Exact JSON Schema 2020-12 semantic validator on ExactJson (preserves nested arbitrary-precision decimals).
+bool exact_json_matches_node(const SchemaGraph& g, int node_id, const ExactJson& val) {
   const SchemaNode& node = g.nodes[std::size_t(node_id)];
   switch (node.kind) {
     case NodeKind::Any:
@@ -1080,70 +1335,60 @@ bool json_value_matches_node(const SchemaGraph& g, int node_id, const Json& val,
     case NodeKind::Null:
       return val.is_null();
     case NodeKind::Boolean:
-      return val.is_boolean();
+      return val.is_bool();
     case NodeKind::String: {
       if (!val.is_string()) return false;
-      const std::size_t len = utf8_codepoint_length(val.get_ref<const std::string&>());
+      const std::size_t len = utf8_codepoint_length(val.str);
       if (len < std::size_t(node.min_length)) return false;
       if (node.max_length >= 0 && len > std::size_t(node.max_length)) return false;
       return true;
     }
-    case NodeKind::Integer: {
-      if (val.is_boolean() || !val.is_number()) return false;
-      if (!raw_text.empty()) {
-        if (!json_decimal_is_integral(raw_text)) return false;
-        return num_value_satisfies(node, raw_text);
-      }
-      if (!json_matches_type_name(val, "integer")) return false;
-      return json_number_satisfies_bounds(val, node);
-    }
-    case NodeKind::Number: {
-      if (val.is_boolean() || !val.is_number()) return false;
-      if (!raw_text.empty()) return num_value_satisfies(node, raw_text);
-      return json_number_satisfies_bounds(val, node);
-    }
+    case NodeKind::Integer:
+      return val.is_number() && val.dec.is_integral() && decimal_satisfies_bounds(val.dec, node);
+    case NodeKind::Number:
+      return val.is_number() && decimal_satisfies_bounds(val.dec, node);
     case NodeKind::Array: {
       if (!val.is_array()) return false;
-      if (int(val.size()) < node.min_items) return false;
-      if (node.max_items >= 0 && int(val.size()) > node.max_items) return false;
-      for (const Json& elem : val) {
-        if (!json_value_matches_node(g, node.item_node_id, elem)) return false;
+      if (int(val.arr.size()) < node.min_items) return false;
+      if (node.max_items >= 0 && int(val.arr.size()) > node.max_items) return false;
+      for (const ExactJson& elem : val.arr) {
+        if (!exact_json_matches_node(g, node.item_node_id, elem)) return false;
       }
       return true;
     }
     case NodeKind::Object: {
       if (!val.is_object()) return false;
-      if (int(val.size()) < node.min_properties) return false;
-      if (node.max_properties >= 0 && int(val.size()) > node.max_properties) return false;
+      if (int(val.obj.size()) < node.min_properties) return false;
+      if (node.max_properties >= 0 && int(val.obj.size()) > node.max_properties) return false;
       for (const PropDef& pd : node.props) {
         if (pd.required && !val.contains(pd.name)) return false;
       }
-      for (auto it = val.begin(); it != val.end(); ++it) {
+      for (const auto& [k, v] : val.obj) {
         bool matched_prop = false;
         for (const PropDef& pd : node.props) {
-          if (pd.name == it.key()) {
+          if (pd.name == k) {
             matched_prop = true;
-            if (!json_value_matches_node(g, pd.node_id, it.value())) return false;
+            if (!exact_json_matches_node(g, pd.node_id, v)) return false;
             break;
           }
         }
         if (!matched_prop) {
           if (!node.additional_properties) return false;
-          if (!json_value_matches_node(g, node.additional_node_id, it.value())) return false;
+          if (!exact_json_matches_node(g, node.additional_node_id, v)) return false;
         }
       }
       return true;
     }
     case NodeKind::Enum: {
-      for (const Json& ev : node.enum_values) {
-        if (json_schema_equal(val, ev)) return true;
+      for (const ExactJson& ev : node.enum_values) {
+        if (exact_json_equal(val, ev)) return true;
       }
       return false;
     }
     case NodeKind::Union: {
       int matched = 0;
       for (int sub_id : node.union_nodes) {
-        if (json_value_matches_node(g, sub_id, val, raw_text)) ++matched;
+        if (exact_json_matches_node(g, sub_id, val)) ++matched;
       }
       return node.is_one_of ? (matched == 1) : (matched >= 1);
     }
@@ -1154,12 +1399,12 @@ bool json_value_matches_node(const SchemaGraph& g, int node_id, const Json& val,
 bool oneof_raw_matches_exactly_one(const SchemaGraph& g, int oneof_node_id, std::string_view raw_text) noexcept {
   if (raw_text.empty()) return false;
   try {
-    const Json parsed = Json::parse(raw_text.begin(), raw_text.end());
+    ExactJson parsed;
+    if (!parse_exact_json(raw_text, parsed)) return false;
     const SchemaNode& node = g.nodes[std::size_t(oneof_node_id)];
-    const std::string_view num_raw = (!parsed.is_boolean() && parsed.is_number()) ? raw_text : std::string_view{};
     int matched = 0;
     for (int sub_id : node.union_nodes) {
-      if (json_value_matches_node(g, sub_id, parsed, num_raw)) {
+      if (exact_json_matches_node(g, sub_id, parsed)) {
         if (++matched > 1) return false;
       }
     }
@@ -1172,31 +1417,31 @@ bool oneof_raw_matches_exactly_one(const SchemaGraph& g, int oneof_node_id, std:
 // ---- Byte-level Pushdown Automaton ------------------------------------------------------------
 
 enum class FrameKind : std::uint8_t {
-  Value,          // expecting start of value for node_id
-  ObjFirstOrEnd,  // just saw '{'
-  ObjNextKey,     // just saw ',' inside object; must see '"' (no trailing comma)
-  ObjKeyStr,      // reading object key string content (after opening '"')
-  ObjColon,       // expecting ':' then Value(val_node_id)
-  ObjCommaOrEnd,  // after object value; expecting ',' or '}'
-  ArrFirstOrEnd,  // just saw '['
-  ArrNextVal,     // just saw ',' inside array; must see value
-  ArrCommaOrEnd,  // after array value; expecting ',' or ']'
-  StrBody,        // inside JSON string value
-  Num,            // inside JSON number (integer_only flag + exact bounds)
-  Literal,        // matching fixed ASCII literal ("true", "false", "null")
-  EnumLit,        // matching one of node.enum_literals
-  OneOf,          // parallel exact-one evaluation of oneOf alternatives
+  Value,
+  ObjFirstOrEnd,
+  ObjNextKey,
+  ObjKeyStr,
+  ObjColon,
+  ObjCommaOrEnd,
+  ArrFirstOrEnd,
+  ArrNextVal,
+  ArrCommaOrEnd,
+  StrBody,
+  Num,
+  Literal,
+  EnumLit,
+  OneOf,
 };
 
 enum class NumPhase : std::uint8_t {
-  AfterMinus,  // saw '-', need '0' or '1'..'9'
-  Zero,        // saw '0', can end or '.' or 'e'/'E'
-  IntDigits,   // saw [1-9][0-9]*, can digit, '.', 'e'/'E', or end
-  AfterDot,    // saw '.', need [0-9]
-  FracDigits,  // saw .[0-9]+, can digit, 'e'/'E', or end
-  AfterExp,    // saw 'e'/'E', need '+', '-', or [0-9]
-  AfterExpSign,// saw 'e[+-]', need [0-9]
-  ExpDigits,   // saw e[+-]?[0-9]+, can digit or end
+  AfterMinus,
+  Zero,
+  IntDigits,
+  AfterDot,
+  FracDigits,
+  AfterExp,
+  AfterExpSign,
+  ExpDigits,
 };
 
 struct OneOfState;
@@ -1205,14 +1450,11 @@ struct Frame {
   FrameKind kind = FrameKind::Value;
   int node_id = 0;
   int val_node_id = 0;
-  // Object tracking: arbitrary-width bitset for declared properties + canonical sorted key list for open objects
   std::vector<std::uint64_t> seen_prop_words;
   std::vector<std::string> seen_keys;
   int seen_prop_count = 0;
   std::string key_buf;
-  // Array tracking
   int arr_count = 0;
-  // String / Escape / UTF-8 / Surrogate tracking
   bool in_escape = false;
   bool expect_low_surrogate = false;
   std::uint8_t uni_rem = 0;
@@ -1221,22 +1463,18 @@ struct Frame {
   std::uint8_t utf8_min_next = 0x80;
   std::uint8_t utf8_max_next = 0xBF;
   std::size_t str_len = 0;
-  // Number tracking
   bool integer_only = false;
   NumPhase num_phase = NumPhase::IntDigits;
   std::string num_buf;
-  // Literal / Enum tracking
   const char* lit_ptr = nullptr;
   std::uint16_t lit_pos = 0;
   std::string enum_buf;
-  // OneOf tracking (immutable shared sub-automaton vector + raw JSON bytes for exact semantic check)
   std::shared_ptr<const OneOfState> oneof;
   std::string oneof_raw;
 };
 
 struct PdaState {
   std::vector<Frame> stack;
-
   bool is_done() const noexcept { return stack.empty(); }
 };
 
@@ -1420,7 +1658,7 @@ bool start_value_on_byte(const SchemaGraph& g, PdaState& st, int node_id, std::u
         vf.kind = FrameKind::Value;
         vf.node_id = node.union_nodes[j];
         sub.stack.push_back(std::move(vf));
-        start_value_on_byte(g, sub, node.union_nodes[j], c, next_oneof->alts[j], /*allow_empty_ws=*/false);
+        start_value_on_byte(g, sub, node.union_nodes[j], c, next_oneof->alts[j], false);
         if (!next_oneof->alts[j].empty()) {
           ++alive_alts;
           for (const PdaState& s : next_oneof->alts[j]) {
@@ -1450,9 +1688,7 @@ bool start_value_on_byte(const SchemaGraph& g, PdaState& st, int node_id, std::u
     for (int sub_id : node.union_nodes) {
       if (out_branches.size() >= kMaxUnionBranches) break;
       PdaState copy = st;
-      if (start_value_on_byte(g, copy, sub_id, c, out_branches, allow_empty_ws)) {
-        any_ok = true;
-      }
+      if (start_value_on_byte(g, copy, sub_id, c, out_branches, allow_empty_ws)) any_ok = true;
     }
     return any_ok;
   }
@@ -1613,7 +1849,7 @@ bool step_byte_single(const SchemaGraph& g, PdaState& st, std::uint8_t c, std::v
         for (const PdaState& sub : cur.alts[j]) {
           if (sub.is_done()) continue;
           PdaState copy = sub;
-          step_byte_single(g, copy, c, next_oneof->alts[j], /*allow_empty_ws=*/false);
+          step_byte_single(g, copy, c, next_oneof->alts[j], false);
           if (next_oneof->alts[j].size() >= kMaxUnionBranches) break;
         }
         if (!next_oneof->alts[j].empty()) {
@@ -1647,9 +1883,7 @@ bool step_byte_single(const SchemaGraph& g, PdaState& st, std::uint8_t c, std::v
       if (cur_any_accepting && oneof_raw_matches_exactly_one(g, oneof_node_id, top.oneof_raw)) {
         PdaState exit_st = st;
         exit_st.stack.pop_back();
-        if (step_byte_single(g, exit_st, c, out_branches, allow_empty_ws)) {
-          any_ok = true;
-        }
+        if (step_byte_single(g, exit_st, c, out_branches, allow_empty_ws)) any_ok = true;
       }
       return any_ok;
     }
@@ -1738,7 +1972,7 @@ bool step_byte_single(const SchemaGraph& g, PdaState& st, std::uint8_t c, std::v
 
       bool completed_char = false;
       bool closed_quote = false;
-      if (!step_string_byte(top, c, /*max_len=*/-1, completed_char, closed_quote)) return false;
+      if (!step_string_byte(top, c, -1, completed_char, closed_quote)) return false;
       if (closed_quote) {
         std::string decoded_key;
         if (!unescape_json_string(top.key_buf, decoded_key)) return false;
@@ -2061,9 +2295,9 @@ std::bitset<256> allowed_first_bytes(const SchemaGraph& g, const std::vector<Pda
 class JsonFsmImpl final : public model::TokenMasker {
  public:
   enum class Channel : std::uint8_t {
-    PreContent,      // thinking / header before <|content_text|>; unconstrained!
-    InContent,       // actively constraining JSON / JSON-Schema bytes
-    AfterEndMessage, // saw <|end_message|> after valid JSON; allow only EOS/stop tokens
+    PreContent,
+    InContent,
+    AfterEndMessage,
   };
 
   JsonFsmImpl(std::shared_ptr<const VocabByteIndex> vocab, std::shared_ptr<const SchemaGraph> graph,
@@ -2090,7 +2324,6 @@ class JsonFsmImpl final : public model::TokenMasker {
   }
 
   int vocab_size() const override { return vocab_->vocab_size(); }
-
   bool is_active() const override { return channel_ != Channel::PreContent; }
 
   bool fill_mask(std::uint32_t* words, std::size_t word_count) const override {
@@ -2124,7 +2357,6 @@ class JsonFsmImpl final : public model::TokenMasker {
       return true;
     }
 
-    // Fast path: single branch inside unbounded JSON string value with clean UTF-8/escape state.
     if (branches_.size() == 1 && !branches_[0].stack.empty()) {
       const Frame& top = branches_[0].stack.back();
       if (top.kind == FrameKind::StrBody && !top.in_escape && !top.expect_low_surrogate && top.uni_rem == 0 &&
@@ -2134,9 +2366,7 @@ class JsonFsmImpl final : public model::TokenMasker {
           const auto& safe = vocab_->string_safe_mask();
           std::memcpy(words, safe.data(), std::min(nwords, safe.size()) * sizeof(std::uint32_t));
           for (std::int32_t id : vocab_->string_special_candidates()) {
-            if (can_advance_any(*graph_, branches_, vocab_->token_bytes(id))) {
-              set_bit(words, nwords, id);
-            }
+            if (can_advance_any(*graph_, branches_, vocab_->token_bytes(id))) set_bit(words, nwords, id);
           }
           return true;
         }
@@ -2147,9 +2377,7 @@ class JsonFsmImpl final : public model::TokenMasker {
     for (int b = 0; b < 256; ++b) {
       if (!first.test(std::size_t(b))) continue;
       for (std::int32_t id : vocab_->bucket(std::uint8_t(b))) {
-        if (can_advance_any(*graph_, branches_, vocab_->token_bytes(id))) {
-          set_bit(words, nwords, id);
-        }
+        if (can_advance_any(*graph_, branches_, vocab_->token_bytes(id))) set_bit(words, nwords, id);
       }
     }
 
@@ -2166,14 +2394,10 @@ class JsonFsmImpl final : public model::TokenMasker {
     const std::int32_t em_id = vocab_->end_message_id();
 
     if (channel_ == Channel::PreContent) {
-      if (ct_id >= 0 && token_id == ct_id) {
-        channel_ = Channel::InContent;
-      }
+      if (ct_id >= 0 && token_id == ct_id) channel_ = Channel::InContent;
       return;
     }
-
     if (channel_ == Channel::AfterEndMessage) return;
-
     if (em_id >= 0 && token_id == em_id) {
       channel_ = Channel::AfterEndMessage;
       return;
@@ -2194,6 +2418,46 @@ class JsonFsmImpl final : public model::TokenMasker {
 };
 
 }  // namespace
+
+std::optional<std::string> extract_raw_json_field_path(std::string_view raw_json,
+                                                       std::initializer_list<std::string_view> path) {
+  std::string_view cur = raw_json;
+  for (std::string_view target_key : path) {
+    ExactJsonParser p{cur, 0};
+    p.skip_ws();
+    if (p.pos >= cur.size() || cur[p.pos] != '{') return std::nullopt;
+    ++p.pos;
+    p.skip_ws();
+    if (p.pos < cur.size() && cur[p.pos] == '}') return std::nullopt;
+    std::optional<std::string_view> found;
+    while (true) {
+      p.skip_ws();
+      std::string_view raw_key;
+      if (!p.scan_raw_string(raw_key)) return std::nullopt;
+      std::string decoded_key;
+      if (!unescape_json_string(raw_key, decoded_key)) return std::nullopt;
+      p.skip_ws();
+      if (p.pos >= cur.size() || cur[p.pos] != ':') return std::nullopt;
+      ++p.pos;
+      p.skip_ws();
+      const std::size_t val_start = p.pos;
+      if (!p.skip_value(0)) return std::nullopt;
+      const std::size_t val_end = p.pos;
+      if (decoded_key == target_key) found = cur.substr(val_start, val_end - val_start);
+      p.skip_ws();
+      if (p.pos >= cur.size()) return std::nullopt;
+      if (cur[p.pos] == '}') {
+        ++p.pos;
+        break;
+      }
+      if (cur[p.pos] != ',') return std::nullopt;
+      ++p.pos;
+    }
+    if (!found) return std::nullopt;
+    cur = *found;
+  }
+  return std::string(cur);
+}
 
 std::shared_ptr<const VocabByteIndex> VocabByteIndex::build(const Tokenizer& tokenizer,
                                                             std::span<const std::int32_t> stop_ids) {
@@ -2250,7 +2514,19 @@ std::shared_ptr<model::TokenMasker> make_json_fsm(std::shared_ptr<const VocabByt
     root.additional_node_id = 0;
     graph->root_id = graph->add_node(std::move(root));
   } else {
-    graph->root_id = graph->compile(spec.schema, spec.schema, 0);
+    ExactJson exact_root;
+    if (!spec.raw_schema_json.empty()) {
+      if (!parse_exact_json(spec.raw_schema_json, exact_root)) {
+        throw std::invalid_argument("invalid raw JSON schema syntax");
+      }
+    } else {
+      reject_binary64_rounded_constraints(spec.schema);
+      const std::string dumped = spec.schema.dump();
+      if (!parse_exact_json(dumped, exact_root)) {
+        throw std::invalid_argument("invalid JSON schema syntax");
+      }
+    }
+    graph->root_id = graph->compile(exact_root, exact_root, 0);
   }
   return std::make_shared<JsonFsmImpl>(std::move(vocab), std::move(graph), prefill_ids);
 }

@@ -959,6 +959,38 @@ void test_response_format_and_tool_ban() {
                            {"json_schema",
                             {{"name", "unsat"}, {"schema", {{"type", "integer"}, {"minimum", 10}, {"maximum", 5}}}}}}}})
             .status == 400);
+
+  // Literal wire-byte HTTP regressions: prove exact decimal spellings survive HTTP transport without binary64 rounding!
+  auto run_wire_http = [&](const std::string& schema_raw, const std::string& candidate_reply) -> std::string {
+    // enable_thinking=false prefills <|message_model|><|content_text|>, so completion begins directly in content.
+    const std::string forced = candidate_reply + "<|end_message|><|content_model_end_sampling|>";
+    auto ws = serve(forced);
+    const std::string raw_req =
+        R"({"model":"inkling-test","enable_thinking":false,"max_tokens":32,"messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"wire","schema":)" +
+        schema_raw + R"(}}})";
+    Response resp = request(ws->port(), "POST", "/v1/chat/completions", raw_req);
+    CHECK(resp.status == 200);
+    return Json::parse(resp.body)["choices"][0]["message"]["content"].get<std::string>();
+  };
+  // minimum 0.50000000000000001 must NOT admit 0.5, and MUST admit 0.50000000000000001
+  CHECK(run_wire_http(R"({"type":"number","minimum":0.50000000000000001})", "0.5") != "0.5");
+  CHECK(run_wire_http(R"({"type":"number","minimum":0.50000000000000001})", "0.50000000000000001") ==
+        "0.50000000000000001");
+  // maximum 0.49999999999999999 must NOT admit 0.5, and MUST admit 0.49999999999999999
+  CHECK(run_wire_http(R"({"type":"number","maximum":0.49999999999999999})", "0.5") != "0.5");
+  CHECK(run_wire_http(R"({"type":"number","maximum":0.49999999999999999})", "0.49999999999999999") ==
+        "0.49999999999999999");
+  // const 0.50000000000000001 must NOT admit 0.5, and MUST admit 0.50000000000000001
+  CHECK(run_wire_http(R"({"const":0.50000000000000001})", "0.5") != "0.5");
+  CHECK(run_wire_http(R"({"const":0.50000000000000001})", "0.50000000000000001") == "0.50000000000000001");
+  // minimum 9007199254740993.0 (would round to 2^53 in double) must NOT admit 9007199254740992
+  CHECK(run_wire_http(R"({"type":"number","minimum":9007199254740993.0})", "9007199254740992") != "9007199254740992");
+  CHECK(run_wire_http(R"({"type":"number","minimum":9007199254740993.0})", "9007199254740993") == "9007199254740993");
+  // nested oneOf with exclusiveMinimum 0.5 must NOT admit {"x":0.50000000000000001}, MUST admit {"x":0.5}
+  const std::string nested_schema_raw =
+      R"({"oneOf":[{"type":"object"},{"type":"object","required":["x"],"properties":{"x":{"type":"number","exclusiveMinimum":0.5}}}]})";
+  CHECK(run_wire_http(nested_schema_raw, R"({"x":0.50000000000000001})") != R"({"x":0.50000000000000001})");
+  CHECK(run_wire_http(nested_schema_raw, R"({"x":0.5})") == R"({"x":0.5})");
 }
 
 void test_persona_control_plane() {

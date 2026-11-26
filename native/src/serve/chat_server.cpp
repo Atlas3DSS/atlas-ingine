@@ -281,7 +281,7 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
       return;
     }
     if (!body.is_object()) throw BadRequest("request body must be a JSON object");
-    request = parse_request(body, fmt_, max_model_len_, sampling_defaults_, image_options_);
+    request = parse_request(body, fmt_, max_model_len_, sampling_defaults_, image_options_, req.body);
     if (personas_) {
       try {
         request.sampling.persona = personas_->resolve(request.persona_name);

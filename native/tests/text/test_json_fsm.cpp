@@ -136,6 +136,21 @@ bool accepts_byte_payload(const Tokenizer& tok, const std::shared_ptr<const Voca
   return is_allowed(*masker, end_id);
 }
 
+bool accepts_raw_schema_payload(const Tokenizer& tok, const std::shared_ptr<const VocabByteIndex>& vocab,
+                                const std::vector<std::int32_t>& prompt, std::int32_t end_id,
+                                std::string_view raw_schema, std::string_view payload) {
+  JsonFormatSpec spec;
+  spec.mode = JsonFormatMode::JsonSchema;
+  spec.raw_schema_json = std::string(raw_schema);
+  auto masker = make_json_fsm(vocab, spec, prompt);
+  for (char byte : payload) {
+    const std::int32_t id = tok_id(tok, std::string_view(&byte, 1));
+    if (!is_allowed(*masker, id)) return false;
+    masker->advance(id);
+  }
+  return is_allowed(*masker, end_id);
+}
+
 bool schema_is_rejected(const std::shared_ptr<const VocabByteIndex>& vocab, const std::vector<std::int32_t>& prompt,
                         const Json& schema) {
   try {
@@ -386,11 +401,11 @@ void test_assertions_conjunctions_and_rejections() {
   CHECK(accepts_byte_payload(tok, vocab, prompt, end, min2, "2"));
   CHECK(accepts_byte_payload(tok, vocab, prompt, end, min2, "10"));
 
-  const Json range_num = Json::parse(R"({"type":"number","minimum":0.0,"maximum":50.0})");
-  CHECK(accepts_byte_payload(tok, vocab, prompt, end, range_num, "0"));
-  CHECK(accepts_byte_payload(tok, vocab, prompt, end, range_num, "49.5"));
-  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, range_num, "-1"));
-  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, range_num, "50.5"));
+  const std::string_view range_num = R"({"type":"number","minimum":0.0,"maximum":50.0})";
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, range_num, "0"));
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, range_num, "49.5"));
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, range_num, "-1"));
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, range_num, "50.5"));
 
   // String length (in Unicode codepoints) & Array item bounds
   const Json str_len = Json::parse(R"({"type":"string","minLength":2,"maxLength":3})");
@@ -426,30 +441,45 @@ void test_assertions_conjunctions_and_rejections() {
   CHECK(accepts_byte_payload(tok, vocab, prompt, end, max_uint, "9223372036854775808"));
   CHECK(!accepts_byte_payload(tok, vocab, prompt, end, max_uint, "9223372036854775809"));
 
-  const Json lower_half = Json::parse(R"({"type":"number","minimum":0.5})");
-  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, lower_half, "0.49999999999999999"));
-  CHECK(accepts_byte_payload(tok, vocab, prompt, end, lower_half, "0.5"));
+  // Exact arbitrary-precision wire-decimal bounds, const, and nested oneOf (via raw_schema_json)
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","minimum":0.5})", "0.49999999999999999"));
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","minimum":0.5})", "0.5"));
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","maximum":0.5})", "0.50000000000000001"));
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","maximum":0.5})", "0.5"));
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","exclusiveMinimum":0.5})", "0.5"));
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","exclusiveMinimum":0.5})", "0.50000000000000001"));
 
-  const Json upper_half = Json::parse(R"({"type":"number","maximum":0.5})");
-  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, upper_half, "0.50000000000000001"));
-  CHECK(accepts_byte_payload(tok, vocab, prompt, end, upper_half, "0.5"));
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","minimum":0.50000000000000001})", "0.5"));
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","minimum":0.50000000000000001})", "0.50000000000000001"));
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","maximum":0.49999999999999999})", "0.5"));
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","maximum":0.49999999999999999})", "0.49999999999999999"));
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"const":0.50000000000000001})", "0.5"));
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"const":0.50000000000000001})", "0.50000000000000001"));
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","minimum":9007199254740993.0})", "9007199254740992"));
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, R"({"type":"number","minimum":9007199254740993.0})", "9007199254740993"));
 
-  const Json strict_half = Json::parse(R"({"type":"number","exclusiveMinimum":0.5})");
-  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, strict_half, "0.5"));
-  CHECK(accepts_byte_payload(tok, vocab, prompt, end, strict_half, "0.50000000000000001"));
+  const std::string_view nested_oneof =
+      R"({"oneOf":[{"type":"object"},{"type":"object","required":["x"],"properties":{"x":{"type":"number","exclusiveMinimum":0.5}}}]})";
+  CHECK(!accepts_raw_schema_payload(tok, vocab, prompt, end, nested_oneof, R"({"x":0.50000000000000001})"));
+  CHECK(accepts_raw_schema_payload(tok, vocab, prompt, end, nested_oneof, R"({"x":0.5})"));
 
   const Json typed_oneof = Json::parse(R"({"oneOf":[{"type":"integer"},{"type":"number"}]})");
   CHECK(accepts_byte_payload(tok, vocab, prompt, end, typed_oneof, "1.0000000000000000001"));
 
-  // Explicit rejection of unresolved $ref, unsupported keywords, unrepresentable float bounds (>=2^53), and unsatisfiable schemas
+  // Pre-parsed binary64 float constraints WITHOUT raw_schema_json must be explicitly rejected (no silent rounding!)
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"number","minimum":0.50000000000000001})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"number","maximum":0.49999999999999999})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"const":0.50000000000000001})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"number","minimum":9007199254740993.0})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"integer","minimum":1e30})")));
+
+  // Explicit rejection of unresolved $ref, unsupported keywords, and unsatisfiable schemas
   CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"$ref":"#/$defs/absent"})")));
   CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"string","pattern":"^[a-z]+$"})")));
   CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"allOf":[{"type":"string"}]})")));
   CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"integer","minimum":10,"maximum":5})")));
   CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"string","enum":[42]})")));
   CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"integer","const":-1,"enum":[18446744073709551615]})")));
-  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"integer","minimum":1e30})")));
-  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"number","minimum":9007199254740993.0})")));
   std::cout << "[PASS] test_assertions_conjunctions_and_rejections\n";
 }
 
