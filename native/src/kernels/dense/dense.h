@@ -36,6 +36,23 @@ void proj_conv(const ActT* x, int M, Matrix w, const float* conv_w, float* conv_
 // head: out[m, v] = 30 tanh(bf16(w_v . x[m]) / 30), x bf16 [M, H], out fp32 [M, V], V = w.rows.
 void head(const ActT* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream);
 
+// Fused single-pass dual-vector lm_head GEMV + adaptive contrastive logits (Apple LoopCD, arXiv:2610.02185 Eq. 3-4).
+// Reads each [V, H] weight row ONCE into registers to compute both z_s = head(x_strong) and z_w = head(x_weak),
+// computes per-row adaptive strength omega = omega_max * (1 - (p_{s,(1)} - p_{s,(2)})) from softmax(z_s),
+// and writes out[m, v] = z_s[m, v] + omega[m] * (z_s[m, v] - z_w[m, v]).
+// ws_weak: fp32 [M, V] scratch; ws_reduce: fp32 [M * kLoopCdReduceFloatsPerRow] scratch.
+inline constexpr int kLoopCdReduceBlocks = 128;
+inline constexpr int kLoopCdReduceFloatsPerRow = kLoopCdReduceBlocks * 3;
+void head_loopcd(const ActT* x_strong, const ActT* x_weak, int M, Matrix w, float omega_max, float* out,
+                 float* ws_weak, float* ws_reduce, bool pdl, cudaStream_t stream);
+
+// Hidden-space LoopCD extrapolation (arXiv:2610.02185 Eq. 2):
+//   loopcd_hidden_blend:         h_strong[m, c] += omega * (h_strong[m, c] - h_weak[m, c])   ([M, H] FP32)
+//   loopcd_hidden_from_residual: dst[m, c] = (base + write) + omega * ((base + write) - h_weak) ([M, H] FP32)
+void loopcd_hidden_blend(float* h_strong, const float* h_weak, int M, float omega, bool pdl, cudaStream_t stream);
+void loopcd_hidden_from_residual(float* dst, const float* base, const float* write, const float* h_weak, int M,
+                                 float omega, bool pdl, cudaStream_t stream);
+
 // gemv: plain GEMV (drafter o_proj / down_proj, and TP2/TP4 sharded wo). x bf16 [M, K] (row stride K),
 // out fp32 [M, R] = bf16(w[r] . x[m]), R = w.rows; K = 768 (TP4), 1536 (TP2), 3072 or 9216; same PDL contract as proj.
 void gemv(const ActT* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream);
