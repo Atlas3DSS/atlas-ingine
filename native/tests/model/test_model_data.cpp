@@ -243,6 +243,117 @@ int main() {
     expect(!kv_checkpoint_auto_resume_eligible(ckpt_fp16, id_fp16_spec, prod_fp16, 256, 2048, false),
            "same-FP16 declines when spec_enabled");
 
+    // #829 + #827 combined kv_cache_mode & INGCKPT1 byte-144/byte-192 disambiguation checks:
+    StateIdentity id_bf16_lf = id_bf16;
+    id_bf16_lf.kv_cache_mode = 1u;
+    const auto prod_bf16_lf = compute_disk_producer_sha256(id_bf16_lf);
+    expect(prod_bf16_lf != prod_bf16, "producer SHA distinguishes per_pass vs last_full");
+
+    KvCheckpointInfo ckpt_bf16_lf = ckpt_bf16;
+    ckpt_bf16_lf.kv_cache_mode = KvCacheMode::LastFull;
+    ckpt_bf16_lf.num_full_slots = NUM_FULL_SLOTS_LAST_FULL;
+    ckpt_bf16_lf.producer_sha256 = prod_bf16_lf;
+    expect(kv_checkpoint_runtime_matches(ckpt_bf16_lf, id_bf16_lf), "runtime match same-last_full");
+    expect(!kv_checkpoint_runtime_matches(ckpt_bf16_lf, id_bf16), "runtime reject per_pass engine vs last_full ckpt");
+    expect(!kv_checkpoint_runtime_matches(ckpt_bf16, id_bf16_lf), "runtime reject last_full engine vs per_pass ckpt");
+    expect(kv_checkpoint_auto_resume_eligible(ckpt_bf16_lf, id_bf16_lf, prod_bf16_lf, 256, 2048, false),
+           "auto-resume eligible same-last_full");
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_bf16_lf, id_bf16, prod_bf16, 256, 2048, false),
+           "auto-resume declines per_pass engine vs last_full ckpt");
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_bf16, id_bf16_lf, prod_bf16_lf, 256, 2048, false),
+           "auto-resume declines last_full engine vs per_pass ckpt");
+
+    // Binary header parser tests covering all 4 INGCKPT1 header layouts + corrupt cases:
+    {
+      const std::filesystem::path hdr_dir = std::filesystem::temp_directory_path() / "ingine_test_ckpt_hdr_layouts";
+      std::error_code hec;
+      std::filesystem::remove_all(hdr_dir, hec);
+      std::filesystem::create_directories(hdr_dir);
+      auto write_hdr_file = [&](const std::string& fname, std::int32_t nfull, std::uint32_t b144,
+                                bool fill_producer_tail, std::uint32_t b192, std::uint32_t b196) {
+        const std::filesystem::path p = hdr_dir / fname;
+        std::vector<std::uint8_t> page(4096, 0);
+        std::memcpy(page.data(), "INGCKPT1", 8);
+        const std::uint32_t ver = 1u, hbytes = 4096u, adt = kDiskBf16, kvf = 1u, has_log = 0u;
+        const std::int32_t mctx = 2048, pos = 4, nsl = NUM_SLIDING_VISITS, win = WINDOW, nv = NUM_VISITS, ck = CONV_K;
+        const std::uint64_t row_b = 1024u, swa_b = 16u;
+        const std::uint64_t full_b = 2u * std::uint64_t(nfull) * std::uint64_t(pos) * row_b;
+        std::memcpy(page.data() + 8, &ver, 4);
+        std::memcpy(page.data() + 12, &hbytes, 4);
+        std::memcpy(page.data() + 16, &adt, 4);
+        std::memcpy(page.data() + 20, &kvf, 4);
+        std::memcpy(page.data() + 24, &mctx, 4);
+        std::memcpy(page.data() + 28, &pos, 4);
+        std::memcpy(page.data() + 32, &nfull, 4);
+        std::memcpy(page.data() + 36, &nsl, 4);
+        std::memcpy(page.data() + 40, &win, 4);
+        std::memcpy(page.data() + 44, &nv, 4);
+        std::memcpy(page.data() + 48, &ck, 4);
+        std::memcpy(page.data() + 52, &has_log, 4);
+        std::memcpy(page.data() + 56, &row_b, 8);
+        std::memcpy(page.data() + 64, &swa_b, 8);
+        std::memcpy(page.data() + 72, &full_b, 8);
+        std::memcpy(page.data() + 144, &b144, 4);
+        if (fill_producer_tail) {
+          const std::uint32_t dfp8 = 1u;
+          const std::int32_t chunk = 3072;
+          std::memcpy(page.data() + 148, &dfp8, 4);
+          std::memcpy(page.data() + 152, &chunk, 4);
+          std::memcpy(page.data() + 160, prod_bf16.data(), 32);
+        }
+        std::memcpy(page.data() + 192, &b192, 4);
+        std::memcpy(page.data() + 196, &b196, 4);
+        std::vector<std::uint8_t> payload(std::size_t(swa_b + full_b), 0);
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(page.data()), std::streamsize(page.size()));
+        out.write(reinterpret_cast<const char*>(payload.data()), std::streamsize(payload.size()));
+        return p;
+      };
+      // (A) Legacy per_pass (8 slots, bytes 144..4095 zeroed)
+      const auto info_leg = inspect_kv_checkpoint(write_hdr_file("legacy_pp.bin", 8, 0u, false, 0u, 0u));
+      expect(info_leg.kv_cache_mode == KvCacheMode::PerPass && info_leg.num_full_slots == 8 &&
+                 !info_leg.has_producer_identity,
+             "INGCKPT1 legacy per_pass parsed without producer identity");
+      // (B) #827 producer-tagged per_pass (8 slots, byte 144=1 + trailer, bytes 192..199 zeroed)
+      const auto info_827 = inspect_kv_checkpoint(write_hdr_file("prod_827_pp.bin", 8, 1u, true, 0u, 0u));
+      expect(info_827.kv_cache_mode == KvCacheMode::PerPass && info_827.num_full_slots == 8 &&
+                 info_827.has_producer_identity && info_827.producer_sha256 == prod_bf16,
+             "INGCKPT1 #827 producer-tagged per_pass retains producer identity");
+      // (C) Fresh combined #827+#829 per_pass & last_full (byte 192=1, byte 196=0|1, producer trailer at 144..191)
+      const auto info_c_pp = inspect_kv_checkpoint(write_hdr_file("comb_pp.bin", 8, 1u, true, 1u, 0u));
+      const auto info_c_lf = inspect_kv_checkpoint(write_hdr_file("comb_lf.bin", 4, 1u, true, 1u, 1u));
+      expect(info_c_pp.kv_cache_mode == KvCacheMode::PerPass && info_c_pp.num_full_slots == 8 &&
+                 info_c_pp.has_producer_identity,
+             "INGCKPT1 fresh combined per_pass parsed with producer identity");
+      expect(info_c_lf.kv_cache_mode == KvCacheMode::LastFull && info_c_lf.num_full_slots == 4 &&
+                 info_c_lf.has_producer_identity,
+             "INGCKPT1 fresh combined last_full parsed with producer identity");
+      // (D) Standalone #829 4-slot file (4 slots, byte 144=1, bytes 148..199 zeroed) MUST NOT get producer identity!
+      const auto info_s829 = inspect_kv_checkpoint(write_hdr_file("standalone_829_4slot.bin", 4, 1u, false, 0u, 0u));
+      expect(info_s829.kv_cache_mode == KvCacheMode::LastFull && info_s829.num_full_slots == 4 &&
+                 !info_s829.has_producer_identity,
+             "INGCKPT1 standalone #829 4-slot file never acquires producer identity from byte 144");
+      // Fail-closed corrupt/ambiguous combinations:
+      auto expect_inspect_throws = [&](const std::filesystem::path& p, const char* msg) {
+        bool threw = false;
+        try {
+          (void)inspect_kv_checkpoint(p);
+        } catch (const std::runtime_error&) {
+          threw = true;
+        }
+        expect(threw, msg);
+      };
+      expect_inspect_throws(write_hdr_file("bad_4slot_zero144.bin", 4, 0u, false, 0u, 0u),
+                            "rejects ambiguous 4-slot legacy header with byte 144 == 0");
+      expect_inspect_throws(write_hdr_file("bad_4slot_tail.bin", 4, 1u, true, 0u, 0u),
+                            "rejects ambiguous 4-slot header with byte 192 == 0 and non-zero producer tail");
+      expect_inspect_throws(write_hdr_file("bad_8slot_emptytail.bin", 8, 1u, false, 0u, 0u),
+                            "rejects 8-slot header with producer_flags=1 and empty producer tail");
+      expect_inspect_throws(write_hdr_file("bad_comb_mismatch.bin", 8, 0u, false, 1u, 1u),
+                            "rejects combined header with last_full(1) and num_full_visits=8");
+      std::filesystem::remove_all(hdr_dir, hec);
+    }
+
     // Model-package fingerprint binds 100% of actual weight bytes (no reliance on optional SHA256SUMS text):
     // two valid same-layout safetensors with identical config.json/index/headers and weights 1.0 vs 2.0 MUST differ,
     // and empty/weightless directories fail closed to std::nullopt (unverified).

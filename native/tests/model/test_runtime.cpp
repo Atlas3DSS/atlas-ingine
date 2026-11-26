@@ -1836,6 +1836,102 @@ bool run_disk_checkpoint_dtype() {
                  std::string(label) + " disk checkpoint rejected on explicit resume & declined on auto resume" + tag);
   }
 
+  // 7. #829 + #827 combined kv_cache_mode checkpoint isolation (fresh per_pass/last_full + standalone 4-slot file):
+  {
+    const std::filesystem::path ckpt_lf = tmp_dir / "fresh_last_full.bin";
+    const std::filesystem::path ckpt_lf_standalone = tmp_dir / "standalone_829_last_full.bin";
+    std::filesystem::remove(ckpt_lf);
+    std::filesystem::remove(ckpt_lf_standalone);
+
+    RuntimeOptions lf_base = base;
+    lf_base.kv_cache_mode = KvCacheMode::LastFull;
+
+    std::vector<std::int32_t> lf_ref_tokens;
+    {
+      auto gen = make_synth_gen(lf_base);
+      const auto [toks, st] = run_once(*gen, prompt);
+      lf_ref_tokens = toks;
+    }
+    {
+      RuntimeOptions opt = lf_base;
+      opt.kv_ckpt_path = ckpt_lf;
+      opt.kv_ckpt_every = 64;
+      auto gen = make_synth_gen(opt);
+      (void)run_once(*gen, prompt100);
+    }
+    const KvCheckpointInfo lf_info = inspect_kv_checkpoint(ckpt_lf);
+    bool lf_same_ok = (lf_info.pos == 64 && lf_info.kv_cache_mode == KvCacheMode::LastFull &&
+                       lf_info.num_full_slots == NUM_FULL_SLOTS_LAST_FULL && !lf_info.has_producer_identity);
+    {
+      RuntimeOptions opt = lf_base;
+      opt.kv_ckpt_resume = ckpt_lf;
+      auto gen = make_synth_gen(opt);
+      const auto [toks, st] = run_once(*gen, prompt);
+      lf_same_ok &= (st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && toks == lf_ref_tokens);
+    }
+    // Cross-mode explicit resume MUST throw in BOTH directions (last_full -> per_pass and per_pass -> last_full).
+    bool cross_lf_to_pp_threw = false;
+    {
+      RuntimeOptions opt = base;
+      opt.kv_ckpt_resume = ckpt_lf;
+      auto gen = make_synth_gen(opt);
+      try {
+        (void)run_once(*gen, prompt);
+      } catch (const std::runtime_error&) {
+        cross_lf_to_pp_threw = true;
+      }
+    }
+    bool cross_pp_to_lf_threw = false;
+    {
+      RuntimeOptions opt = lf_base;
+      opt.kv_ckpt_resume = ckpt_same;
+      auto gen = make_synth_gen(opt);
+      try {
+        (void)run_once(*gen, prompt);
+      } catch (const std::runtime_error&) {
+        cross_pp_to_lf_threw = true;
+      }
+    }
+    // Convert fresh last_full checkpoint into standalone #829 4-slot layout (byte 144=1, bytes 148..199=0):
+    // MUST parse as LastFull with has_producer_identity==false, isolate from root/parked, and reject per_pass!
+    {
+      std::ifstream in(ckpt_lf, std::ios::binary);
+      std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      const std::uint32_t old_mode_lf = 1u;
+      std::memset(bytes.data() + 144, 0, 4096 - 144);
+      std::memcpy(bytes.data() + 144, &old_mode_lf, 4);
+      std::ofstream out(ckpt_lf_standalone, std::ios::binary | std::ios::trunc);
+      out.write(bytes.data(), std::streamsize(bytes.size()));
+    }
+    const KvCheckpointInfo s829_info = inspect_kv_checkpoint(ckpt_lf_standalone);
+    bool s829_ok = (s829_info.kv_cache_mode == KvCacheMode::LastFull &&
+                    s829_info.num_full_slots == NUM_FULL_SLOTS_LAST_FULL && !s829_info.has_producer_identity);
+    {
+      RuntimeOptions opt = lf_base;
+      opt.park_mb = 128;
+      opt.kv_ckpt_resume = ckpt_lf_standalone;
+      auto gen = make_synth_gen(opt);
+      const auto [toks, st] = run_once(*gen, prompt);
+      const PrefixCacheStats cs = gen->cache_stats();
+      s829_ok &= (st.reuse == Reuse::Checkpoint && st.reused_tokens == 64 && toks == lf_ref_tokens &&
+                  cs.root_entries == 0 && cs.vram_entries == 0 && cs.host_entries == 0);
+    }
+    bool s829_pp_threw = false;
+    {
+      RuntimeOptions opt = base;
+      opt.kv_ckpt_resume = ckpt_lf_standalone;
+      auto gen = make_synth_gen(opt);
+      try {
+        (void)run_once(*gen, prompt);
+      } catch (const std::runtime_error&) {
+        s829_pp_threw = true;
+      }
+    }
+    ok &= report(lf_same_ok && cross_lf_to_pp_threw && cross_pp_to_lf_threw && s829_ok && s829_pp_threw,
+                 "combined #829+#827 last_full same-mode parity, cross-mode rejection, and standalone 4-slot isolation" +
+                     tag);
+  }
+
   std::error_code ec;
   std::filesystem::remove_all(tmp_dir, ec);
   return ok;

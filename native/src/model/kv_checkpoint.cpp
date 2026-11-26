@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
