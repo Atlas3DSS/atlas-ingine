@@ -67,6 +67,14 @@ ReleaseHooks& release_hooks() {
 }
 
 std::atomic<int> g_fail_next{0};
+std::atomic<int> g_fail_next_pinned{0};
+
+bool consume_fail_pinned() noexcept {
+  for (int left = g_fail_next_pinned.load(); left > 0;) {
+    if (g_fail_next_pinned.compare_exchange_weak(left, left - 1)) return true;
+  }
+  return false;
+}
 
 hipError_t try_malloc(void** ptr, std::size_t bytes) {
   for (int left = g_fail_next.load(); left > 0;) {
@@ -91,6 +99,7 @@ void remove_release_hook(int id) {
 }
 
 void fail_next_allocations(int n) { g_fail_next = n; }
+void fail_next_pinned_allocations(int n) { g_fail_next_pinned = n; }
 
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
   if (bytes == 0) return;
@@ -247,6 +256,9 @@ void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) : size_(size_bytes) {
   if (size_bytes == 0) throw std::invalid_argument("PinnedHostBuffer size must be nonzero");
+  if (consume_fail_pinned()) {
+    throw std::runtime_error("PinnedHostBuffer(HIP): injected pinned allocation failure");
+  }
   void* ptr = nullptr;
   const hipError_t err = hipHostMalloc(&ptr, size_bytes, hipHostMallocPortable);
   if (err != hipSuccess) throw std::runtime_error(hip_error_message("hipHostMalloc failed", err));

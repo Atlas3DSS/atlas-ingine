@@ -10,6 +10,7 @@ add_executable(core_mlx_uploader_host
   test_mlx_uploader_host.cpp
   ${PROJECT_SOURCE_DIR}/src/core/safetensors_upload_mlx.cpp
   ${PROJECT_SOURCE_DIR}/src/core/safetensors_io.cpp
+  ${PROJECT_SOURCE_DIR}/src/core/weight_pack.cpp
   ${PROJECT_SOURCE_DIR}/src/core/dtype.cpp
   ${PROJECT_SOURCE_DIR}/src/core/tensor.cpp
 )

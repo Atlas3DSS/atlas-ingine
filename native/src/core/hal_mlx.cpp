@@ -162,6 +162,10 @@ void remove_release_hook(int id) {
 
 void fail_next_allocations(int n) { g_fail_next = n; }
 
+std::atomic<int> g_fail_next_pinned{0};
+
+void fail_next_pinned_allocations(int n) { g_fail_next_pinned = n; }
+
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
   if (bytes == 0) return;
   void* ptr = alloc_metal_shared(bytes);
@@ -306,6 +310,11 @@ void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) : size_(size_bytes) {
   if (size_bytes == 0) throw std::invalid_argument("PinnedHostBuffer size must be nonzero");
+  for (int left = g_fail_next_pinned.load(); left > 0;) {
+    if (g_fail_next_pinned.compare_exchange_weak(left, left - 1)) {
+      throw std::runtime_error("HAL(MLX/Metal): injected pinned allocation failure");
+    }
+  }
   void* ptr = alloc_metal_shared(size_bytes);
   if (!ptr) throw std::runtime_error("HAL(MLX/Metal): PinnedHostBuffer allocation failed");
   data_ = ptr;

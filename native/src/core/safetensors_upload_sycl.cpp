@@ -34,6 +34,8 @@ struct DeviceUploader::Impl {
     std::uint64_t offset;
     std::uint64_t bytes;
     void* dst;
+    std::size_t req_idx = 0;
+    std::size_t chunk_idx = 0;
   };
   struct Slot {
     std::byte* host = nullptr;
@@ -94,12 +96,14 @@ struct DeviceUploader::Impl {
     if (pinned_ && queue_ != nullptr) sycl::free(pinned_, *queue_);
   }
 
-  UploadStats upload(std::span<const UploadRequest> requests, hal::StreamHandle stream) {
+  UploadStats upload(std::span<const UploadRequest> requests, hal::StreamHandle stream,
+                     UploadChunkObserver observer = {}) {
     const auto start = std::chrono::steady_clock::now();
     sycl::queue* target_q = stream.native ? static_cast<sycl::queue*>(stream.native) : sycl_queue_for_stream(stream);
     std::vector<Chunk> chunks;
     UploadStats stats;
-    for (const UploadRequest& r : requests) {
+    for (std::size_t ri = 0; ri < requests.size(); ++ri) {
+      const UploadRequest& r = requests[ri];
       if (r.bytes == 0) continue;
       if (r.file == nullptr || r.dst == nullptr) {
         throw std::invalid_argument("DeviceUploader::upload(SYCL): request without file or destination");
@@ -107,9 +111,10 @@ struct DeviceUploader::Impl {
       if (r.offset > r.file->file_size() || r.bytes > r.file->file_size() - r.offset) {
         throw std::out_of_range("DeviceUploader::upload(SYCL): range exceeds " + r.file->path().string());
       }
-      for (std::uint64_t done = 0; done < r.bytes;) {
+      std::size_t ci = 0;
+      for (std::uint64_t done = 0; done < r.bytes; ++ci) {
         const std::uint64_t n = std::min<std::uint64_t>(r.bytes - done, options_.chunk_bytes);
-        chunks.push_back(Chunk{r.file, r.offset + done, n, static_cast<std::byte*>(r.dst) + done});
+        chunks.push_back(Chunk{r.file, r.offset + done, n, static_cast<std::byte*>(r.dst) + done, ri, ci});
         done += n;
       }
       stats.bytes += r.bytes;
@@ -121,12 +126,14 @@ struct DeviceUploader::Impl {
       chunks_ = std::move(chunks);
       next_chunk_ = 0;
       active_queue_ = target_q;
+      observer_ = std::move(observer);
       error_ = nullptr;
       active_workers_ = static_cast<int>(workers_.size());
       ++generation_;
       work_cv_.notify_all();
       done_cv_.wait(lock, [this] { return active_workers_ == 0; });
       chunks_.clear();
+      observer_ = {};
     }
 
     for (Slot& s : slots_) {
@@ -165,6 +172,9 @@ struct DeviceUploader::Impl {
               slot.copy_inflight = false;
             }
             chunk.file->read_range(chunk.offset, chunk.bytes, slot.host);
+            if (observer_) {
+              observer_(chunk.req_idx, chunk.chunk_idx, slot.host, static_cast<std::size_t>(chunk.bytes));
+            }
             {
               std::lock_guard lock(stream_mutex_);
               slot.done = active_queue_->memcpy(chunk.dst, slot.host, chunk.bytes);
@@ -224,6 +234,7 @@ struct DeviceUploader::Impl {
   int active_workers_ = 0;
   std::vector<Chunk> chunks_;
   std::size_t next_chunk_ = 0;
+  UploadChunkObserver observer_;
   std::exception_ptr error_;
 };
 
@@ -232,8 +243,9 @@ DeviceUploader::DeviceUploader(UploadOptions options)
 
 DeviceUploader::~DeviceUploader() = default;
 
-UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, hal::StreamHandle stream) {
-  return impl_->upload(requests, stream);
+UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, hal::StreamHandle stream,
+                                   UploadChunkObserver observer) {
+  return impl_->upload(requests, stream, std::move(observer));
 }
 
 void fail_next_uploader_worker_start(int worker_index) noexcept {

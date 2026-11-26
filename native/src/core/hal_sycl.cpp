@@ -140,6 +140,10 @@ void remove_release_hook(int id) {
 
 void fail_next_allocations(int n) { g_fail_next = n; }
 
+std::atomic<int> g_fail_next_pinned{0};
+
+void fail_next_pinned_allocations(int n) { g_fail_next_pinned = n; }
+
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
   if (bytes == 0) return;
   void* ptr = try_usm_device(bytes);
@@ -281,6 +285,11 @@ void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) : size_(size_bytes) {
   if (size_bytes == 0) throw std::invalid_argument("PinnedHostBuffer size must be nonzero");
+  for (int left = g_fail_next_pinned.load(); left > 0;) {
+    if (g_fail_next_pinned.compare_exchange_weak(left, left - 1)) {
+      throw std::runtime_error("HAL(SYCL): injected pinned allocation failure");
+    }
+  }
   void* ptr = sycl::aligned_alloc_host(4096, size_bytes, default_device_queue(0));
   if (!ptr) throw std::runtime_error("HAL(SYCL): aligned_alloc_host failed");
   data_ = ptr;
