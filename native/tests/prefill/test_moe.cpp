@@ -140,7 +140,13 @@ struct Mat {  // one expert-stacked matrix [kAlloc, rows, cols] in checkpoint en
           if (fmt == 0) {
             const uint8_t b = codes[(size_t(e) * rows + r) * (cols / 2) + k / 2];
             const float s = e4[scales[(size_t(e) * rows + r) * (cols / 16) + k / 16]];
+#if INGINE_ACT_FP16
+            // Volta (FP16): code x block scale is exact in FP16 and the factor scales the FP32 sums (moe_decode_v70,
+            // wgemm's Volta path); rounding scale x factor to FP16 underflowed for small block scales.
+            v = double(kE2M1[(k & 1) ? b >> 4 : b & 0xf] * s) * double(factor[e]);
+#else
             v = rbf((kE2M1[(k & 1) ? b >> 4 : b & 0xf] * s) * factor[e]);
+#endif
           } else if (fmt == 1) {
             const float c = e4[codes[(size_t(e) * rows + r) * cols + k]];
             const int s = scales[(size_t(e) * rows + r) * (cols / 32) + k / 32];
