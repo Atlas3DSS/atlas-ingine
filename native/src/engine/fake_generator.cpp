@@ -176,6 +176,49 @@ void FakeGenerator::set_prefill_stats_hook(PrefillStatsFn hook) {
   prefill_stats_hook_ = std::move(hook);
 }
 
+model::GenerateStats FakeGenerator::warm_start(const model::Prompt& full_prompt, const model::Sampling& sampling) {
+  if (full_prompt.ids.empty()) {
+    throw std::invalid_argument("warm_start: prompt is empty");
+  }
+  if (full_prompt.bypass_prefix_cache) {
+    throw std::invalid_argument("warm_start: prefix cache bypass requested");
+  }
+  if (!full_prompt.images.empty()) {
+    throw std::invalid_argument("warm_start: images are not supported in startup warm-start prompts");
+  }
+  if (int(full_prompt.ids.size()) >= max_model_len_) {
+    throw std::invalid_argument("warm_start: prompt of " + std::to_string(full_prompt.ids.size()) +
+                                " tokens leaves no generation room within max_ctx " +
+                                std::to_string(max_model_len_));
+  }
+  if (sampling.persona && sampling.persona->bypasses_prefix_reuse()) {
+    throw std::invalid_argument("warm_start: default persona bypasses prefix cache reuse");
+  }
+  const std::string persona_fp =
+      (sampling.persona && !sampling.persona->is_unhooked()) ? sampling.persona->fingerprint_sha256 : std::string{};
+  {
+    std::lock_guard lock(mutex_);
+    warmed_ids_.assign(full_prompt.ids.begin(), full_prompt.ids.end());
+    warmed_namespace_ = full_prompt.cache_namespace;
+    warmed_persona_fp_ = persona_fp;
+    Call c;
+    c.prompt_ids = warmed_ids_;
+    c.max_new_tokens = 0;
+    c.sampling = sampling;
+    c.root_prefix_tokens = full_prompt.root_prefix_tokens;
+    c.cache_namespace = full_prompt.cache_namespace;
+    c.bypass_prefix_cache = full_prompt.bypass_prefix_cache;
+    c.done = true;
+    warm_start_calls_.push_back(std::move(c));
+  }
+  model::GenerateStats stats;
+  stats.prompt_tokens = int(full_prompt.ids.size());
+  stats.reuse = model::Reuse::None;
+  stats.reused_tokens = 0;
+  stats.restored_bytes = 0ull;
+  return stats;
+}
+
 model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, int max_new_tokens,
                                              const model::Sampling& sampling, std::span<const int32_t> stop_ids,
                                              const std::function<bool(std::span<const int32_t>)>& on_tokens,
@@ -192,6 +235,9 @@ model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, i
                                  : std::get<std::vector<int32_t>>(std::move(reply));
   size_t index;
   PrefillStatsFn hook;
+  std::vector<int32_t> warmed_ids;
+  std::string warmed_ns;
+  std::string warmed_persona_fp;
   {
     std::lock_guard lock(mutex_);
     index = calls_.size();
@@ -199,11 +245,28 @@ model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, i
                           int(full_prompt.images.size()), image_tokens, full_prompt.root_prefix_tokens,
                           full_prompt.cache_namespace, full_prompt.bypass_prefix_cache});
     hook = prefill_stats_hook_;
+    warmed_ids = warmed_ids_;
+    warmed_ns = warmed_namespace_;
+    warmed_persona_fp = warmed_persona_fp_;
   }
   model::GenerateStats stats;
   stats.prompt_tokens = int(prompt.size());
   stats.image_tokens = image_tokens;
-  if (hook) hook(prompt, stats);
+  if (hook) {
+    hook(prompt, stats);
+  } else if (!warmed_ids.empty() && !full_prompt.bypass_prefix_cache &&
+             !(sampling.persona && sampling.persona->bypasses_prefix_reuse())) {
+    const std::string req_persona_fp =
+        (sampling.persona && !sampling.persona->is_unhooked()) ? sampling.persona->fingerprint_sha256 : std::string{};
+    if (full_prompt.cache_namespace == warmed_ns && req_persona_fp == warmed_persona_fp &&
+        prompt.size() >= warmed_ids.size() &&
+        std::equal(warmed_ids.begin(), warmed_ids.end(), prompt.begin())) {
+      stats.reuse = (index == 0 && prompt.size() > warmed_ids.size()) ? model::Reuse::Extend
+                                                                      : model::Reuse::RootCheckpoint;
+      stats.reused_tokens = int(warmed_ids.size());
+      stats.restored_bytes = 0ull;
+    }
+  }
   if (on_prefill) on_prefill(stats);
 
   const std::unordered_set<int32_t> stops(stop_ids.begin(), stop_ids.end());
@@ -318,6 +381,11 @@ model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, i
 std::vector<FakeGenerator::Call> FakeGenerator::calls() const {
   std::lock_guard lock(mutex_);
   return calls_;
+}
+
+std::vector<FakeGenerator::Call> FakeGenerator::warm_start_calls() const {
+  std::lock_guard lock(mutex_);
+  return warm_start_calls_;
 }
 
 }  // namespace ingine::engine

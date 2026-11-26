@@ -160,6 +160,31 @@ int main() {
     const RenderedPrompt pm = fmt.render(mid_sys, tools, ChatOptions{});
     c.expect(pm.root_prefix_tokens == pa.root_prefix_tokens,
              "root_prefix: mid-conversation system message does not move root boundary");
+
+    // Startup warm-start system prefix (#887): matches Turn-1 regardless of reasoning_effort or enable_thinking.
+    const std::string sys_text = "You are a precise coding assistant.";
+    const RenderedPrompt ws = fmt.render_system_prefix(sys_text);
+    c.expect(!ws.ids.empty() && ws.root_prefix_tokens == int(ws.ids.size()),
+             "warm_start_prefix: non-empty with exact root_prefix_tokens");
+    c.expect(ws.ids.front() == sys_id && ws.ids.back() == end_id,
+             "warm_start_prefix: spans <|message_system|> ... <|end_message|>");
+    const Json turn1 = Json::array(
+        {{{"role", "system"}, {"content", sys_text}}, {{"role", "user"}, {"content", "Write a binary search."}}});
+    ChatOptions opt_default, opt_med, opt_nothink;
+    opt_med.reasoning_effort = "medium";
+    opt_nothink.enable_thinking = false;
+    for (const ChatOptions& o : {opt_default, opt_med, opt_nothink}) {
+      const RenderedPrompt p = fmt.render(turn1, nullptr, o);
+      c.expect(p.ids.size() > ws.ids.size() && std::equal(ws.ids.begin(), ws.ids.end(), p.ids.begin()),
+               "warm_start_prefix: exact token prefix of Turn-1 across effort/thinking options");
+    }
+    bool rejected_ws = false;
+    try {
+      (void)fmt.render_system_prefix("   \n\t  ");
+    } catch (const ChatError&) {
+      rejected_ws = true;
+    }
+    c.expect(rejected_ws, "warm_start_prefix: whitespace-only prompt rejected fail-closed");
   }
   return c.finish("text_chat");
 }

@@ -191,6 +191,34 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       cache_namespace_header_(std::move(options.cache_namespace_header)),
       created_(std::time(nullptr)),
       scheduler_(generator, fmt.stop_ids(), options.max_queue) {
+  if (!options.warm_start_prompt.empty()) {
+    if (!cache_namespace_header_.empty() && options.warm_start_namespace.empty()) {
+      throw std::invalid_argument(
+          "warm_start_prompt with cache_namespace_header requires a non-empty warm_start_namespace");
+    }
+    if (cache_namespace_header_.empty() && !options.warm_start_namespace.empty()) {
+      throw std::invalid_argument("warm_start_namespace requires cache_namespace_header to be configured");
+    }
+    const text::RenderedPrompt rendered = fmt_.render_system_prefix(options.warm_start_prompt);
+    if (int(rendered.ids.size()) >= max_model_len_) {
+      throw std::invalid_argument("warm-start system prompt has " + std::to_string(rendered.ids.size()) +
+                                  " tokens; leaves no generation room within max_model_len " +
+                                  std::to_string(max_model_len_));
+    }
+    model::Sampling ws_sampling = sampling_defaults_;
+    if (personas_) {
+      ws_sampling.persona = personas_->resolve("");
+    }
+    const model::Prompt ws_prompt{rendered.ids, {}, rendered.root_prefix_tokens, options.warm_start_namespace,
+                                  /*bypass_prefix_cache=*/false};
+    const model::GenerateStats ws_stats = generator.warm_start(ws_prompt, ws_sampling);
+    warm_start_ = true;
+    warm_start_tokens_ = int(rendered.ids.size());
+    engine::server_log().info("warm-start prefilled {} system-prompt tokens in {:.3f}s (namespace='{}')",
+                              warm_start_tokens_, ws_stats.prefill_seconds, options.warm_start_namespace);
+  } else if (!options.warm_start_namespace.empty()) {
+    throw std::invalid_argument("warm_start_namespace requires warm_start_prompt");
+  }
   // Size the HTTP pool for concurrent active slots + waiting requests + /health probes (never starve at B=64).
   const int http_threads = std::max(16, generator.max_batch_size() + options.max_queue + 16);
   server_.new_task_queue = [http_threads] { return new httplib::ThreadPool(std::size_t(http_threads), 1024); };
@@ -280,6 +308,8 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                    {"loop_passes", loop_passes_},
                    {"loopcd", model::to_string(loopcd_mode_)},
                    {"supports_structured_output", supports_logit_masker_},
+                   {"warm_start", warm_start_},
+                   {"warm_start_tokens", warm_start_tokens_},
                    {"waiting", st.waiting},
                    {"running", st.running},
                    {"active", st.active},

@@ -118,6 +118,20 @@ std::string make_synthetic_qwen_config(bool mixed_fp8_nvfp4) {
   return root.dump();
 }
 
+std::filesystem::path resolve_qwen_model_dir() {
+  if (const char* env = std::getenv("INGINE_QWEN38_MODEL_DIR"); env && *env) {
+    return std::filesystem::path(env);
+  }
+  return std::filesystem::path("/home/orwel/dev_genius/models/Qwen3.8-27B-NVFP4-482ca0f");
+}
+
+std::filesystem::path resolve_inkling_model_dir() {
+  if (const char* env = std::getenv("INGINE_MODEL_DIR"); env && *env) {
+    return std::filesystem::path(env);
+  }
+  return std::filesystem::path("/mnt/storage/models/Inkling-2-Mini-ingine");
+}
+
 void test_inkling_loop_and_qwen_detection() {
   TempDir ink_loop("ink_loop");
   write_text_file(ink_loop.path / "config.json", R"({
@@ -127,11 +141,11 @@ void test_inkling_loop_and_qwen_detection() {
   })");
   CHECK(detect_model_family(ink_loop.path) == ModelFamily::Inkling2);
 
-  const std::filesystem::path ink_real("/mnt/storage/models/Inkling-2-Mini-ingine");
+  const std::filesystem::path ink_real = resolve_inkling_model_dir();
   if (std::filesystem::is_directory(ink_real)) {
     CHECK(detect_model_family(ink_real) == ModelFamily::Inkling2);
   }
-  const std::filesystem::path qwen_real("/home/orwel/dev_genius/models/Qwen3.8-27B-NVFP4-482ca0f");
+  const std::filesystem::path qwen_real = resolve_qwen_model_dir();
   if (std::filesystem::is_directory(qwen_real)) {
     CHECK(detect_model_family(qwen_real) == ModelFamily::Qwen3_5);
   }
@@ -141,7 +155,7 @@ void test_resolve_qwen38_runtime_options() {
   TempDir nvfp4_synth("nvfp4");
   write_text_file(nvfp4_synth.path / "config.json", make_synthetic_qwen_config(/*mixed_fp8_nvfp4=*/true));
 
-  const std::filesystem::path qwen_real("/home/orwel/dev_genius/models/Qwen3.8-27B-NVFP4-482ca0f");
+  const std::filesystem::path qwen_real = resolve_qwen_model_dir();
   const std::filesystem::path nvfp4_dir = std::filesystem::is_directory(qwen_real) ? qwen_real : nvfp4_synth.path;
 
   // Defaults (dense_fp8 omitted / false, park_mb = -1, vision = false, kv_cache_mode = PerPass) normalize cleanly.
@@ -249,7 +263,7 @@ void test_root_prefix_tokens_safety(const std::filesystem::path& qwen_dir) {
   const auto r2 = qfmt.render(msgs, tools, opts);
   CHECK(r2.root_prefix_tokens == 0 && !r2.ids.empty());
 
-  const std::filesystem::path ink_dir("/mnt/storage/models/Inkling-2-Mini-ingine");
+  const std::filesystem::path ink_dir = resolve_inkling_model_dir();
   if (std::filesystem::is_regular_file(ink_dir / "tokenizer.json") &&
       std::filesystem::is_regular_file(ink_dir / "chat_template.jinja")) {
     const ChatFormat ifmt = ChatFormat::load(ink_dir);
@@ -303,6 +317,8 @@ void test_qwen_fake_http_server(const std::filesystem::path& qwen_dir) {
     CHECK(jh["supported_kv_cache_modes"] == Json::array({"per_pass"}));
     CHECK(jh["loop_passes"] == 1);
     CHECK(jh["supports_structured_output"] == false);
+    CHECK(jh["warm_start"] == false);
+    CHECK(jh["warm_start_tokens"] == 0);
     CHECK(r_health->get_header_value("X-Ingine-Loop-Passes") == "1");
 
     const auto r_models = cli.Get("/v1/models");
@@ -475,6 +491,55 @@ void test_qwen_fake_http_server(const std::filesystem::path& qwen_dir) {
     CHECK(ns_gen.calls().back().bypass_prefix_cache);
     ns_srv.stop();
   }
+
+  // 8. Qwen3.5 startup warm-start (#887): /health warm_start=true and Turn-1 prefix reuse hit.
+  {
+    const std::string sys_prompt = "You are a coding agent working on atlas-ingine.";
+    const RenderedPrompt ws_prefix = fmt.render_system_prefix(sys_prompt);
+    CHECK(!ws_prefix.ids.empty() && ws_prefix.ids.front() == 248045);
+    const Json turn1_msgs = Json::array(
+        {{{"role", "system"}, {"content", sys_prompt}}, {{"role", "user"}, {"content", "Inspect CMakeLists.txt"}}});
+    const RenderedPrompt turn1_full = fmt.render(turn1_msgs, nullptr, ChatOptions{});
+    CHECK(turn1_full.ids.size() > ws_prefix.ids.size());
+    CHECK(prefix_matches_exact(ws_prefix.ids, turn1_full.ids, ws_prefix.ids.size()));
+
+    FakeGenerator ws_gen(fmt.tokenizer(), "Qwen3.8-27B-NVFP4-fake", 262144, {}, 0.0, /*loop_passes=*/1,
+                         KvCacheMode::PerPass, /*allow_last_full=*/false);
+    ws_gen.set_model_family("qwen3_5");
+    ws_gen.set_supports_logit_masker(false);
+    ws_gen.set_supports_images(false);
+    ServerOptions ws_so;
+    ws_so.images.enabled = false;
+    ws_so.cache_namespace_header = "X-Ingine-Cache-Namespace";
+    ws_so.warm_start_prompt = sys_prompt;
+    ws_so.warm_start_namespace = "coding-agent";
+    ChatServer ws_srv(ws_gen, fmt, ws_so);
+    CHECK(ws_srv.bind("127.0.0.1", 0));
+    ws_srv.start();
+
+    httplib::Client ws_cli("127.0.0.1", ws_srv.port());
+    ws_cli.set_read_timeout(20, 0);
+    const auto rh = ws_cli.Get("/health");
+    CHECK(rh && rh->status == 200);
+    const Json jh = Json::parse(rh->body);
+    CHECK(jh["warm_start"] == true);
+    CHECK(jh["warm_start_tokens"] == int(ws_prefix.ids.size()));
+
+    const Json req_hit{{"messages", turn1_msgs}, {"max_tokens", 16}};
+    const auto r_hit = ws_cli.Post(
+        "/v1/chat/completions",
+        httplib::Headers{{"X-Ingine-Cache-Namespace", "coding-agent"}, {"Authorization", "Bearer none"}},
+        req_hit.dump(), "application/json");
+    CHECK(r_hit && r_hit->status == 200);
+    CHECK(Json::parse(r_hit->body)["usage"]["prompt_tokens_details"]["cached_tokens"] == int(ws_prefix.ids.size()));
+
+    const auto r_miss_ns = ws_cli.Post("/v1/chat/completions",
+                                       httplib::Headers{{"X-Ingine-Cache-Namespace", "other-agent"}}, req_hit.dump(),
+                                       "application/json");
+    CHECK(r_miss_ns && r_miss_ns->status == 200);
+    CHECK(Json::parse(r_miss_ns->body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+    ws_srv.stop();
+  }
 }
 
 void test_qwen35_pre_suffix_checkpoint(const std::filesystem::path& qwen_dir) {
@@ -592,9 +657,9 @@ int main() {
   test_resolve_qwen38_runtime_options();
   test_883_followup_restore_predicate();
 
-  const std::filesystem::path qwen_real("/home/orwel/dev_genius/models/Qwen3.8-27B-NVFP4-482ca0f");
+  const std::filesystem::path qwen_real = resolve_qwen_model_dir();
   if (!std::filesystem::is_directory(qwen_real)) {
-    std::printf("skip: Qwen3.8-27B-NVFP4-482ca0f not found at %s\n", qwen_real.c_str());
+    std::printf("skip: Qwen3.8-27B-NVFP4 not found at %s\n", qwen_real.c_str());
     return 77;
   }
   test_root_prefix_tokens_safety(qwen_real);

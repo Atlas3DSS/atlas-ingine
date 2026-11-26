@@ -1908,6 +1908,55 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate(
   return generate(p, max_new_tokens, sampling, stop_ids, on_tokens, nullptr);
 }
 
+ingine::model::GenerateStats Qwen38DenseBackend::warm_start(const ingine::model::Prompt& prompt,
+                                                            const ingine::model::Sampling& sampling) {
+  if (!impl_->opts.prefix_cache) {
+    throw std::invalid_argument("warm_start requires prefix caching to be enabled");
+  }
+  if (prompt.ids.empty()) {
+    throw std::invalid_argument("warm_start: prompt is empty");
+  }
+  if (prompt.bypass_prefix_cache) {
+    throw std::invalid_argument("warm_start: prefix cache bypass requested");
+  }
+  if (!prompt.images.empty()) {
+    throw std::invalid_argument("warm_start: images are not supported in startup warm-start prompts");
+  }
+  if (static_cast<int>(prompt.ids.size()) >= profile_.max_ctx) {
+    throw std::invalid_argument("warm_start: prompt of " + std::to_string(prompt.ids.size()) +
+                                " tokens leaves no generation room within max_ctx " +
+                                std::to_string(profile_.max_ctx));
+  }
+  ingine::model::validate_request_against_capabilities(profile_.capabilities, profile_.max_ctx, prompt, 1, sampling);
+  ingine::model::BackendStateIdentity req_id = profile_.state_identity;
+  if (!prompt.cache_namespace.empty()) req_id.cache_namespace = prompt.cache_namespace;
+  if (!req_id.is_reusable_with(req_id)) {
+    throw std::invalid_argument("warm_start requires verified reusable checkpoint identity");
+  }
+  ingine::model::BackendRequest req;
+  req.prompt = prompt;
+  req.cache_namespace = prompt.cache_namespace;
+  req.use_prefix_cache = true;
+  double pf_ms = 0.0;
+  evaluate_teacher_forced_on_session(*impl_->default_session, req, {}, nullptr, &pf_ms);
+  const auto& sess = *impl_->default_session;
+  const auto committed = sess.committed_tokens();
+  const bool exact_retained = sess.identity().is_reusable_with(req_id) && committed.size() == prompt.ids.size() &&
+                              ingine::model::prefix_matches_exact(committed, prompt.ids, prompt.ids.size()) &&
+                              sess.restorable_prefix_len(prompt.ids.size()) == prompt.ids.size();
+  if (!exact_retained) {
+    throw std::runtime_error("warm_start: Qwen38 session could not retain exact reusable prefix and checkpoint");
+  }
+  ingine::model::GenerateStats stats;
+  stats.prompt_tokens = static_cast<int>(prompt.ids.size());
+  stats.reused_tokens = static_cast<int>(impl_->last_lookup.reused_tokens);
+  stats.reuse = impl_->last_lookup.reuse;
+  stats.prefill_seconds = pf_ms / 1000.0;
+  stats.restored_bytes = 0ull;
+  stats.restore_seconds = 0.0;
+  return stats;
+}
+
 void register_qwen38_cuda_backend() {
   static std::once_flag once;
   std::call_once(once, []() {

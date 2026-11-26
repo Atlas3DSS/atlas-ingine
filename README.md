@@ -471,7 +471,10 @@ Environment overrides (`~/.config/ingine/env` or shell environment):
 
 Use **`http://127.0.0.1:8003/v1`**, model **`inkling-2-mini`** (or `inkling-2-mini-abliterated` when `--ablation` is set).
 No API key is required and there is no authentication; keep the server bound to loopback. `GET /health` and
-`GET /v1/models` report server status, including `kv_cache_mode`, `supported_kv_cache_modes`, and `loop_passes`. Responses carry
+`GET /v1/models` report server status, including `kv_cache_mode`, `supported_kv_cache_modes`, `loop_passes`, and
+startup prefix warm-start state (`warm_start`, `warm_start_tokens`). Pass `--warm-start-prompt TEXT` or
+`--warm-start-file PATH` (with `--warm-start-namespace NAME` when `--cache-namespace-header` is set) to pre-prefill a
+system prompt into the prefix cache before serving. Responses carry
 `X-Ingine-Kv-Cache-Mode` and `X-Ingine-Loop-Passes`; a request may send `X-Ingine-Expected-Loop-Passes: N` to get HTTP 409
 instead of a generation when the server runs a different depth.
 
