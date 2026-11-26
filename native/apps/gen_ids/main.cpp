@@ -25,6 +25,7 @@ int main(int argc, char** argv) {
     else if (a == "--tokens") tokens = std::stoi(next());
     else if (a == "--concurrency") concurrency = std::stoi(next());
     else if (a == "--kv-fp8") o.kv_fp8 = true;
+    else if (a == "--kv-fp4v") o.kv_fp8 = o.kv_fp4v = true;
     else if (a == "--prefill-chunk") o.prefill_chunk = std::stoi(next());
     else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
   }

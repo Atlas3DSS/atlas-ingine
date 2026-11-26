@@ -186,6 +186,9 @@ void validate_tp_runtime_options(const RuntimeOptions& options, int tp_size) {
   if (options.kv_cache_mode != KvCacheMode::PerPass) {
     throw std::invalid_argument(tag + " mode supports only --kv-cache-mode per_pass (not last_full)");
   }
+  if (options.kv_fp4v && !options.kv_fp8) throw std::invalid_argument(tag + ": --kv-fp4v needs --kv-fp8");
+  if (options.kv_fp4v && options.max_batch == 1 && options.spec)
+    throw std::invalid_argument(tag + ": --kv-fp4v is for the batch generator (not --spec with --max-batch 1)");
   if (options.vision) {
     throw std::invalid_argument(tag + " mode does not support --vision");
   }
@@ -710,7 +713,20 @@ class TpPrefiller {
       ap.q = q_, ap.rel = rel16_;
       pk::AttnParams at;
       at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
-      if (layer.full) {
+      if (layer.full && st.k_pool) {
+        // TP batch pool: the chunk's rows go straight into the slot's pages, attention reads the pages
+        const int fi = FULL_INDEX[v];
+        ap.k_out = krows_, ap.v_out = vrows_, ap.out_fp8 = st.kv_fp8;
+        pk::attn_prep(ap, s);
+        bk::write_full_kv_rows(krows_, vrows_, pos0, T, fi, st.kv_fp8, st.kv_v4, st.pool_slot, st.pool_page_table,
+                               st.pool_max_pages, st.k_pool, st.v_pool, s);
+        pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
+        at.k = st.k_pool, at.v = st.v_pool, at.kv_fp8 = st.kv_fp8, at.kv_v4 = st.kv_v4;
+        at.kv_page_row = st.pool_page_table + std::size_t(st.pool_slot) * st.pool_max_pages;
+        at.kv_page_visit = fi, at.kv_page_visits = NUM_FULL_VISITS;
+        at.L = pos0 + T, at.window = 0;
+        pk::attention(at, s);
+      } else if (layer.full) {
         const int fi = FULL_INDEX[v];
         const std::size_t es = st.kv_fp8 ? 1 : 2;
         void* kc = st.k_full_at(fi).data;
@@ -874,12 +890,20 @@ struct TpBatchStatePool {
   DeviceBuffer conv_k, conv_v, conv_attn, conv_mlp;
   DeviceBuffer slot_pos;
   DeviceBuffer k_full_pool, v_full_pool, page_table;
-  DeviceBuffer scratch_k_full, scratch_v_full;
+  bool kv_v4 = false;  // FP4 V pages (FP8 K)
 
-  void init_buffers(int max_b, int ctx, bool fp8, int pages) {
+  // Bytes of one 64-token page across the full visits: K (FP8 or 16-bit) + V (FP4, FP8 or 16-bit).
+  static std::size_t page_bytes(bool fp8, bool v4) {
+    const std::size_t rows = std::size_t(NUM_FULL_VISITS) * bk::kPageSize * KV_DIM;
+    const std::size_t es = fp8 ? 1 : 2;
+    return rows * es + (v4 ? rows / 2 : rows * es);
+  }
+
+  void init_buffers(int max_b, int ctx, bool fp8, bool v4, int pages) {
     max_batch = max_b;
     max_ctx = ctx;
     kv_fp8 = fp8;
+    kv_v4 = v4;
     max_pages_per_slot = (ctx + bk::kPageSize - 1) / bk::kPageSize;
     num_pages = pages;
 
@@ -895,15 +919,11 @@ struct TpBatchStatePool {
     k_ring.fill(0); v_ring.fill(0); ring_pos.fill(0xff);
     conv_k.fill(0); conv_v.fill(0); conv_attn.fill(0); conv_mlp.fill(0); slot_pos.fill(0);
 
+    // No max_ctx prefill scratch: prefill writes its rows straight into the slot's pages.
     const std::size_t es = fp8 ? 1 : 2;
-    const std::size_t scratch_bytes = std::size_t(NUM_FULL_VISITS) * ctx * KV_DIM * es;
-    scratch_k_full = DeviceBuffer(scratch_bytes);
-    scratch_v_full = DeviceBuffer(scratch_bytes);
-    scratch_k_full.fill(0); scratch_v_full.fill(0);
-
     const std::size_t page_kv_bytes = std::size_t(NUM_FULL_VISITS) * bk::kPageSize * KV_DIM * es;
     k_full_pool = DeviceBuffer(std::size_t(num_pages) * page_kv_bytes);
-    v_full_pool = DeviceBuffer(std::size_t(num_pages) * page_kv_bytes);
+    v_full_pool = DeviceBuffer(std::size_t(num_pages) * (v4 ? page_kv_bytes / 2 : page_kv_bytes));
     k_full_pool.fill(0); v_full_pool.fill(0);
 
     page_table = DeviceBuffer(std::size_t(max_b) * max_pages_per_slot * sizeof(std::int32_t));
@@ -913,8 +933,7 @@ struct TpBatchStatePool {
   static int compute_fit_pages(int max_b, int ctx, bool fp8, int max_kv_tokens) {
     const int max_pages_per_slot = (ctx + bk::kPageSize - 1) / bk::kPageSize;
     const int max_possible_pages = max_b * max_pages_per_slot;
-    const std::size_t es = fp8 ? 1 : 2;
-    const std::size_t bytes_per_page = 2 * std::size_t(NUM_FULL_VISITS) * bk::kPageSize * KV_DIM * es;
+    const std::size_t bytes_per_page = page_bytes(fp8, false);
     if (max_kv_tokens > 0) {
       return std::min(max_possible_pages, std::max(max_pages_per_slot, (max_kv_tokens + bk::kPageSize - 1) / bk::kPageSize));
     }
@@ -938,8 +957,10 @@ struct TpBatchStatePool {
                    {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
     st.ring_pos = rm(static_cast<std::int64_t*>(ring_pos.p) + std::size_t(s) * ring_pos_slot_stride, DType::I64,
                      {NUM_SLIDING_VISITS, WINDOW});
-    st.k_full = rm(scratch_k_full.p, full_dt, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
-    st.v_full = rm(scratch_v_full.p, full_dt, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
+    (void)full_dt;
+    st.k_pool = k_full_pool.p, st.v_pool = v_full_pool.p, st.kv_v4 = kv_v4;
+    st.pool_page_table = static_cast<const std::int32_t*>(page_table.p);
+    st.pool_slot = s, st.pool_max_pages = max_pages_per_slot;
     st.conv_k = rm(static_cast<float*>(conv_k.p) + std::size_t(s) * conv_kv_slot_stride, DType::FP32,
                    {NUM_VISITS, CONV_K - 1, KV_DIM});
     st.conv_v = rm(static_cast<float*>(conv_v.p) + std::size_t(s) * conv_kv_slot_stride, DType::FP32,
@@ -1276,6 +1297,7 @@ class TpBatchDecoder {
         a.full_visit_idx = FULL_INDEX[v];
         a.max_ctx = pool_.max_ctx;
         a.cache_fp8 = pool_.kv_fp8;
+        a.cache_v4 = pool_.kv_v4;
         a.window = 0;
         a.log_scaling = true;
       } else {
@@ -1430,6 +1452,18 @@ class TpBatchDecoder {
 
 // ----------------------------------------------------------------------------- TpBatchGenerator (continuous batching TP4/EP4)
 
+// INGINE_MEM_LOG=1: log free device memory after each start-up stage (fitting long-context pools)
+#define MEMLOG(r, what)                                                                                    \
+  do {                                                                                                     \
+    static const bool on_ = [] { const char* e = std::getenv("INGINE_MEM_LOG"); return e && e[0] == '1'; }(); \
+    if (on_) {                                                                                             \
+      std::size_t f_ = 0, t_ = 0;                                                                          \
+      CUDA_CHECK(cudaDeviceSynchronize());                                                                 \
+      CUDA_CHECK(cudaMemGetInfo(&f_, &t_));                                                                \
+      ingine::engine::server_log().info("TP rank {} after {}: {} MiB free", r, what, f_ >> 20);            \
+    }                                                                                                      \
+  } while (0)
+
 class TpBatchGenerator final : public Generator {
  public:
   explicit TpBatchGenerator(const RuntimeOptions& options)
@@ -1443,27 +1477,27 @@ class TpBatchGenerator final : public Generator {
     pool_.run_all([&](int r) {
       auto& rk = ranks_[r];
       rk.weights = load_weights_sharded(options_.model_dir, options_.dense_fp8, pool_.stream(r), r, TP_SIZE, false);
+      MEMLOG(r, "weights");
       rk.ablation = load_ablation(options_.ablation);
       rk.prefiller = std::make_unique<TpPrefiller>(rk.weights, rk.ablation, prefill_chunk_, pool_.stream(r),
                                                    pool_.comm(r), pool_.info(r));
+      MEMLOG(r, "prefiller");
       rk.chunk_tokens = DeviceBuffer(std::size_t(prefill_chunk_) * sizeof(std::int32_t));
       if (r == 0) {
         prefill_logits_ = DeviceBuffer(std::size_t(UNPADDED_VOCAB) * sizeof(float));
         sampled_dev_ = DeviceBuffer(std::size_t(options_.max_batch) * sizeof(std::int32_t));
       }
       // Compute how many pages fit after accounting for sliding rings + scratch full KV
-      const std::size_t es = options_.kv_fp8 ? 1 : 2;
       const std::size_t fixed_kv =
           std::size_t(options_.max_batch) *
               (2 * std::size_t(NUM_SLIDING_VISITS) * WINDOW * KV_DIM * sizeof(ActT) +
                std::size_t(NUM_SLIDING_VISITS) * WINDOW * sizeof(std::int64_t) +
-               2 * std::size_t(NUM_VISITS) * (CONV_K - 1) * (KV_DIM + HIDDEN) * sizeof(float)) +
-          2 * std::size_t(NUM_FULL_VISITS) * options_.max_ctx * KV_DIM * es;
+               2 * std::size_t(NUM_VISITS) * (CONV_K - 1) * (KV_DIM + HIDDEN) * sizeof(float));
       std::size_t free_b = 0, tot_b = 0;
       CUDA_CHECK(cudaMemGetInfo(&free_b, &tot_b));
       const std::size_t reserve = std::size_t(2560) << 20;
       const std::size_t avail = free_b > (fixed_kv + reserve) ? (free_b - fixed_kv - reserve) : 0;
-      const std::size_t bytes_per_page = 2 * std::size_t(NUM_FULL_VISITS) * bk::kPageSize * KV_DIM * es;
+      const std::size_t bytes_per_page = TpBatchStatePool::page_bytes(options_.kv_fp8, options_.kv_fp4v);
       const int max_possible = options_.max_batch * max_pages_per_slot_;
       if (options_.max_kv_tokens > 0) {
         rank_fit_pages[r] = std::min(max_possible, std::max(max_pages_per_slot_, (options_.max_kv_tokens + bk::kPageSize - 1) / bk::kPageSize));
@@ -1476,7 +1510,7 @@ class TpBatchGenerator final : public Generator {
     if (num_pages_ < 1) throw std::runtime_error("TP BatchStatePool: insufficient VRAM for paged full-KV pool");
     ingine::engine::server_log().info("TP{}/EP{} paged full-KV pool: {} pages ({} tokens, max_batch={}, max_ctx={}, kv={})",
                                       TP_SIZE, TP_SIZE, num_pages_, num_pages_ * bk::kPageSize, options_.max_batch, options_.max_ctx,
-                                      options_.kv_fp8 ? "fp8" : "fp16");
+                                      options_.kv_fp4v ? "fp8k+fp4v" : (options_.kv_fp8 ? "fp8" : "fp16"));
 
     free_pages_.resize(num_pages_);
     for (int i = 0; i < num_pages_; ++i) free_pages_[i] = num_pages_ - 1 - i;
@@ -1488,9 +1522,11 @@ class TpBatchGenerator final : public Generator {
     // Step 2: allocate uniform paged pools + batch decoders on all 4 ranks
     pool_.run_all([&](int r) {
       auto& rk = ranks_[r];
-      rk.kv_pool.init_buffers(options_.max_batch, options_.max_ctx, options_.kv_fp8, num_pages_);
+      rk.kv_pool.init_buffers(options_.max_batch, options_.max_ctx, options_.kv_fp8, options_.kv_fp4v, num_pages_);
+      MEMLOG(r, "kv_pool");
       rk.decoder = std::make_unique<TpBatchDecoder>(rk.weights, rk.ablation, rk.kv_pool, options_.max_batch, r,
                                                     pool_.comm(r), pool_.info(r));
+      MEMLOG(r, "decoder");
       CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
     });
 
@@ -1525,6 +1561,7 @@ class TpBatchGenerator final : public Generator {
         }
       }
     }
+    pool_.run_all([&](int r) { MEMLOG(r, "graphs"); });
     ingine::engine::server_log().info("{}", offload_summary());
   }
 
@@ -1587,10 +1624,6 @@ class TpBatchGenerator final : public Generator {
           float* out_l = (r == 0) ? static_cast<float*>(prefill_logits_.p) : nullptr;
           rk.prefiller->run(st, static_cast<const std::int32_t*>(rk.chunk_tokens.p), T, int(start), out_l, nullptr);
         }
-        bk::scatter_full_kv(rk.kv_pool.scratch_k_full.p, rk.kv_pool.scratch_v_full.p, rk.kv_pool.max_ctx, 0, n,
-                            rk.kv_pool.kv_fp8, s, static_cast<const std::int32_t*>(rk.kv_pool.page_table.p),
-                            rk.kv_pool.max_pages_per_slot, rk.kv_pool.k_full_pool.p, rk.kv_pool.v_full_pool.p,
-                            pool_.stream(r));
         const std::int64_t pos64 = n;
         CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int64_t*>(rk.kv_pool.slot_pos.p) + s, &pos64, sizeof(pos64),
                                    cudaMemcpyHostToDevice, pool_.stream(r)));

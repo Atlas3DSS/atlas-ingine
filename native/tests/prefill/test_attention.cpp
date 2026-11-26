@@ -1,6 +1,7 @@
 // Prefill attention against an FP64 oracle of model.Model._attend (+ flex's sink factor and the output gate):
 // full-attention caches (BF16 and FP8 E4M3, keys past the relative extent), sliding rings (partially filled,
-// wrapped, a stale slot, chunks longer than the window), ring_gather / key_tile_bounds / ring_update.
+// wrapped, a stale slot, chunks longer than the window), ring_gather / key_tile_bounds / ring_update, and full
+// visits read through a TP batch pool's page table (FP8 K with FP8 or FP4 V).
 #include "kernels/prefill/prefill.h"
 #include "prefill/prefill_test.h"
 
@@ -165,6 +166,73 @@ bool full_case(Rng& rng, bool fp8, bool q4, int pos0, int T) {
   return run_attention(name, in, kd.get(), vd.get(), fp8, q4, nullptr, nullptr, L, 0, K, V, kpos, 1);
 }
 
+// Full visit read from a TP batch pool: 64-token pages in shuffled physical order, `visits` visits a page, FP8 K
+// and FP8 or FP4 V (E2M1 code of v * 1.5, two codes a byte, low nibble first).
+uint32_t e2m1_code(float x) {
+  const uint32_t sgn = x < 0.f ? 8u : 0u;
+  const float a = std::fabs(x);
+  return sgn | uint32_t((a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f) + (a >= 1.75f) + (a >= 2.5f) + (a >= 3.5f) +
+                        (a >= 5.0f));
+}
+float e2m1_val(uint32_t c) {
+  static const float kT[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+  const float v = kT[c & 7u] * (1.f / 1.5f);
+  return (c & 8u) ? -v : v;
+}
+
+bool paged_case(Rng& rng, bool v4, int pos0, int T) {
+  constexpr int PAGE = 64, VISITS = 3, VISIT = 1, RD = HK * D;
+  const int L = pos0 + T, npages = (L + PAGE - 1) / PAGE, phys_pages = npages + 3;
+  std::vector<int> table(npages);
+  for (int i = 0; i < npages; ++i) table[i] = (i * 5 + 2) % phys_pages;  // distinct (phys_pages coprime to 5 here)
+  std::vector<float> K(size_t(L) * RD), V(K.size());
+  for (int j = 0; j < L; ++j) make_kv_row(rng, &K[size_t(j) * RD], &V[size_t(j) * RD]);
+  const size_t pool_elems = size_t(phys_pages) * VISITS * PAGE * RD;
+  std::vector<uint8_t> kb(pool_elems, 0), vb(v4 ? pool_elems / 2 : pool_elems, 0);
+  for (int j = 0; j < L; ++j) {
+    const size_t row = ((size_t(table[j / PAGE]) * VISITS + VISIT) * PAGE + j % PAGE) * RD;
+    for (int c = 0; c < RD; ++c) {
+      float& k = K[size_t(j) * RD + c];
+      float& v = V[size_t(j) * RD + c];
+      kb[row + c] = e4m3_bits(k);
+      k = e4m3_to_float(kb[row + c]);
+      if (v4) {
+        const uint32_t code = e2m1_code(v * 1.5f);
+        vb[(row + c) / 2] |= uint8_t(code << (4 * ((row + c) & 1)));
+        v = __half2float(__float2half_rn(e2m1_val(code)));  // the kernel stages values as FP16
+      } else {
+        vb[row + c] = e4m3_bits(v);
+        v = e4m3_to_float(vb[row + c]);
+      }
+    }
+  }
+  DeviceArray<uint8_t> kd(kb.size()), vd(vb.size());
+  kd.upload(kb), vd.upload(vb);
+  DeviceArray<int> td(table);
+  std::vector<int> kpos(L);
+  for (int j = 0; j < L; ++j) kpos[j] = j;
+  const Inputs in = make_inputs(rng, T, pos0);
+  DeviceArray<uint16_t> q(in.q), rel(in.rel), proj(in.proj), out(size_t(T) * HQ * D);
+  pk::AttnParams p;
+  p.q = reinterpret_cast<const ingine::ActT*>(q.get());
+  p.k = kd.get(), p.v = vd.get(), p.kv_fp8 = true, p.kv_v4 = v4;
+  p.kv_page_row = td.get(), p.kv_page_visit = VISIT, p.kv_page_visits = VISITS;
+  p.L = L, p.T = T, p.pos0 = pos0, p.window = 0;
+  p.rel = reinterpret_cast<const ingine::ActT*>(rel.get());
+  p.proj = reinterpret_cast<const ingine::ActT*>(proj.get()), p.ld = PROJ_LD;
+  p.out = reinterpret_cast<ingine::ActT*>(out.get());
+  pk::attention(p, nullptr);
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+  const auto got_bits = out.download();
+  std::vector<size_t> index;
+  const auto ref = oracle(in, K, V, kpos, 0, 1, index);
+  std::vector<float> got(index.size());
+  for (size_t i = 0; i < index.size(); ++i) got[i] = bf16_val(got_bits[index[i]]);
+  char name[96];
+  std::snprintf(name, sizeof name, "paged fp8k+%s pos0=%d T=%d", v4 ? "fp4v" : "fp8v", pos0, T);
+  return check_close(name, got, ref, 1.2e-2, 2e-4);
+}
+
 // Sliding visit: ring state before the chunk (ring_pos per slot), chunk keys, gathered rows.
 bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
   std::vector<float> ringK(size_t(W) * HK * D), ringV(ringK.size());
@@ -312,6 +380,9 @@ int main() {
   ok &= full_case(rng, false, false, 1200, 77);
   ok &= full_case(rng, true, false, 1200, 77);
   ok &= full_case(rng, true, false, 3, 130);
+  ok &= paged_case(rng, false, 1200, 77);
+  ok &= paged_case(rng, true, 1200, 77);
+  ok &= paged_case(rng, true, 3, 130);
   ok &= full_case(rng, false, true, 0, 45);
   ok &= full_case(rng, false, true, 1200, 77);
   ok &= full_case(rng, false, true, 3, 130);

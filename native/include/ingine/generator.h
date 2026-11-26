@@ -192,6 +192,8 @@ struct RuntimeOptions {
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, kv_q4 = false, spec = false;
+  // FP4 (E2M1) full-attention values with FP8 keys in the TP batch pool (needs kv_fp8): 0.75 of the FP8 pool.
+  bool kv_fp4v = false;
   std::filesystem::path dflash2_dir;  // optional DFlash2DraftModel dir (implies native DFlash2 drafter when spec=true)
   KvCacheMode kv_cache_mode = KvCacheMode::PerPass;
   float spec_threshold = 0.8f;
