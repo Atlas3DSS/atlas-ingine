@@ -317,13 +317,13 @@ int main(int argc, char** argv) {
       }
       if (loop_bf16) {
         throw std::invalid_argument(
-            "qwen38-dense is a non-looped dense architecture and does not support --loop-bf16");
+            "qwen38/qwen4exp is a non-looped architecture and does not support --loop-bf16");
       }
       if (parsed_attn_requant != ingine::model::AttnRequantMode::Off) {
-        throw std::invalid_argument("qwen38-dense does not support --attn-requant");
+        throw std::invalid_argument("qwen38/qwen4exp does not support --attn-requant");
       }
       if (expert_swaps != 0) {
-        throw std::invalid_argument("qwen38-dense has no MoE experts and does not support --expert-swaps");
+        throw std::invalid_argument("qwen38/qwen4exp does not support --expert-swaps");
       }
       if (!ap.given("--max-ctx")) max_ctx = 8192;
       if (!ap.given("--prefill-chunk")) prefill_chunk = 256;

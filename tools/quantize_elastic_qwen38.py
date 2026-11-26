@@ -9,13 +9,15 @@ and native/src/kernels/moe/dequant.cu / native/src/backends/qwen4exp/qwen4exp_cu
   - fp8    (8.00 b/w): E4M3FN + per-tensor FP32 weight_scale
 
 Tiered profiles for Qwen3.8-27B (64 layers: 48 Gated DeltaNet + 16 Full Attention, text-only):
-  - Boundary layers: L00..03, L60..63 (8 layers -> higher precision tier)
-  - Core layers:     L04..59          (56 layers)
+  - Boundary layers: first/last N layers -> higher precision tier
 
-  * atlas-14g (~13.5 GB text-only, fits 16 GB GPUs all-in-VRAM with room for KV):
-      Boundary MLP=nvfp4, Core MLP=atlas3, Attn/GDN=fp8, embed_tokens=fp8, lm_head=nvfp4
-  * atlas-11g (~10.8 GB text-only, fits 12 GB GPUs all-in-VRAM):
-      Boundary MLP=atlas3, Core MLP=atlas2, Boundary Attn=fp8, Core Attn=nvfp4, embed/lm_head=nvfp4
+  * atlas-17g (~15.2 GiB text-only, high-precision tier for 16-24 GB GPUs):
+      Boundary (L00..03, L60..63) MLP=nvfp4, Core MLP=atlas3, Attn/GDN=fp8, embed/lm_head=nvfp4
+  * atlas-14g (~12.8 GiB text-only, fits 16 GB GPUs all-in-VRAM with room for KV):
+      Boundary (L00..03, L60..63) MLP=nvfp4, Core MLP=atlas3, Boundary Attn=fp8, Core Attn=nvfp4, embed/lm_head=nvfp4
+  * atlas-11g (~11.2 GiB text-only, fits 12 GB GPUs all-in-VRAM):
+      Boundary (L00..01, L62..63) MLP=atlas3, Core MLP gate/up=atlas2 & down_proj=atlas3,
+      Boundary Attn=fp8, Core Attn=nvfp4, embed/lm_head=nvfp4
 """
 from __future__ import annotations
 
@@ -40,26 +42,32 @@ K_ATLAS3 = torch.tensor(
     dtype=torch.float32,
 )
 
-PROFILES: dict[str, dict[str, str]] = {
+PROFILES: dict[str, dict[str, str | int]] = {
     "atlas-17g": {
+        "boundary_n": 4,
         "boundary_mlp": "nvfp4",
         "core_mlp": "atlas3",
+        "core_mlp_down": "atlas3",
         "boundary_attn": "fp8",
         "core_attn": "fp8",
-        "embed": "fp8",
+        "embed": "nvfp4",
         "lm_head": "nvfp4",
     },
     "atlas-14g": {
+        "boundary_n": 4,
         "boundary_mlp": "nvfp4",
         "core_mlp": "atlas3",
+        "core_mlp_down": "atlas3",
         "boundary_attn": "fp8",
         "core_attn": "nvfp4",
         "embed": "nvfp4",
         "lm_head": "nvfp4",
     },
     "atlas-11g": {
+        "boundary_n": 2,
         "boundary_mlp": "atlas3",
         "core_mlp": "atlas2",
+        "core_mlp_down": "atlas3",
         "boundary_attn": "fp8",
         "core_attn": "nvfp4",
         "embed": "nvfp4",
@@ -68,8 +76,8 @@ PROFILES: dict[str, dict[str, str]] = {
 }
 
 
-def is_boundary_layer(layer_idx: int, num_layers: int = 64) -> bool:
-    return layer_idx < 4 or layer_idx >= num_layers - 4
+def is_boundary_layer(layer_idx: int, num_layers: int = 64, boundary_n: int = 4) -> bool:
+    return layer_idx < boundary_n or layer_idx >= num_layers - boundary_n
 
 
 def decode_nvfp4_2d(codes_u8: torch.Tensor, scales_fp8: torch.Tensor, scale2: torch.Tensor) -> torch.Tensor:
@@ -183,15 +191,19 @@ def main() -> None:
     ap.add_argument("--dst", required=True, help="Destination Elastic atlas-ingine directory")
     ap.add_argument("--profile", choices=sorted(PROFILES), default="atlas-14g")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--threads", type=int, default=0, help="CPU torch threads (0 = default)")
     ap.add_argument("--max-shard-gb", type=float, default=4.5, help="Target safetensors shard size in GB")
     ap.add_argument("--keep-vision", action="store_true", help="Keep model.visual.* tensors")
     ap.add_argument("--keep-mtp", action="store_true", help="Keep mtp.* tensors")
     args = ap.parse_args()
 
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
+
     src = Path(args.src).resolve()
     dst = Path(args.dst).resolve()
     dst.mkdir(parents=True, exist_ok=True)
-    dev = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    dev = torch.device(args.device if (args.device.startswith("cuda") and torch.cuda.is_available()) else "cpu")
     prof = PROFILES[args.profile]
     print(f"Qwen3.8-27B Elastic Quant: profile={args.profile} spec={prof} device={dev}", flush=True)
 
@@ -236,20 +248,26 @@ def main() -> None:
         out_shards[-1].update(tensors)
         out_shard_bytes += sz
 
+    boundary_n = int(prof.get("boundary_n", 4))
+
     def target_fmt_for(prefix: str) -> str | None:
         if prefix == "model.language_model.embed_tokens":
-            return prof["embed"]
+            return str(prof["embed"])
         if prefix == "lm_head":
-            return prof["lm_head"]
+            return str(prof["lm_head"])
         if ".layers." in prefix:
             parts = prefix.split(".")
             l_idx = int(parts[parts.index("layers") + 1])
-            bnd = is_boundary_layer(l_idx)
+            bnd = is_boundary_layer(l_idx, boundary_n=boundary_n)
             if ".mlp." in prefix:
-                return prof["boundary_mlp"] if bnd else prof["core_mlp"]
+                if bnd:
+                    return str(prof["boundary_mlp"])
+                if prefix.endswith(".down_proj") and "core_mlp_down" in prof:
+                    return str(prof["core_mlp_down"])
+                return str(prof["core_mlp"])
             if ".self_attn." in prefix or ".linear_attn." in prefix:
                 if prefix in src_qlayers:
-                    return prof["boundary_attn"] if bnd else prof["core_attn"]
+                    return str(prof["boundary_attn"] if bnd else prof["core_attn"])
         return None
 
     for k in all_keys:
