@@ -400,11 +400,11 @@ void Scheduler::loop_batched() {
 
     // 4. Execute ONE batched decode step across all live slots and stream tokens immediately.
     std::vector<model::BatchSlotStep> inputs(live.size());
-    std::vector<int32_t> next_tokens(live.size(), 0);
+    std::vector<model::BatchSlotOutput> outputs(live.size());
     for (std::size_t i = 0; i < live.size(); ++i) inputs[i] = {live[i].slot, live[i].last_token};
 
     try {
-      generator_.step_slots(inputs, next_tokens);
+      generator_.step_slots_multi(inputs, outputs);
     } catch (const std::exception& e) {
       server_log().error("batched step failed: {}: {}", type_name(e), e.what());
       const std::string msg = "generation failed: " + type_name(e) + ": " + e.what();
@@ -432,11 +432,18 @@ void Scheduler::loop_batched() {
         retire(e);
         continue;
       }
-      const int32_t tok = next_tokens[i];
-      e.job->push({tok});
-      e.last_token = tok;
-      ++e.generated;
-      if (stop_ids_.contains(tok) || e.generated >= e.max_new_tokens || e.job->cancelled()) {
+      bool done = false;
+      for (int k = 0; k < outputs[i].count; ++k) {
+        const int32_t tok = outputs[i].tokens[k];
+        e.job->push({tok});
+        e.last_token = tok;
+        ++e.generated;
+        if (stop_ids_.contains(tok) || e.generated >= e.max_new_tokens || e.job->cancelled()) {
+          done = true;
+          break;
+        }
+      }
+      if (done) {
         retire(e);
       } else {
         kept.push_back(std::move(e));

@@ -167,6 +167,7 @@ int main(int argc, char** argv) {
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, prompt_tokens = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
   int max_batch = 0, max_kv_tokens = 0, park_mb = -1, park_host_mb = 0, loop_passes = 3;
+  int draft_ctx = 16384, spec_max_m = 4, spec_shortlist = 32768;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool dense_fp8 = false, kv_fp8 = false, kv_fp4v = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
@@ -214,8 +215,11 @@ int main(int argc, char** argv) {
             {"auto", "dma-lru", "uva"});
   ap.option("--expert-ranking", "", "optional JSON with per-layer [24][128] homology/frequency scores", &expert_ranking);
   ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
-  ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
+  ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all)",
             &spec_threshold);
+  ap.option("--draft-ctx", "", "batched DSpark global ring slots per stream (default 16384; 0 = 65536)", &draft_ctx);
+  ap.option("--spec-max-m", "", "max verify width per slot in batched spec (2..4, default 4)", &spec_max_m);
+  ap.option("--spec-shortlist", "", "ranked shortlist rows for batched DSpark head (default 32768)", &spec_shortlist);
   ap.option("--park-mb", "", "VRAM cap (MiB) for Tier-0 parked checkpoints (-1 = auto, 0 = off)", &park_mb);
   ap.option("--park-host-mb", "", "pinned host RAM cap (MiB) for Tier-1 parked checkpoints (default 0 = off)",
             &park_host_mb);
@@ -285,8 +289,11 @@ int main(int argc, char** argv) {
     options.kv_ckpt_path = kv_ckpt_path;
     options.kv_ckpt_every = kv_ckpt_every;
     options.kv_ckpt_resume = kv_ckpt_resume;
-    options.spec = (resolved_max_batch > 1) ? false : spec;
+    options.spec = spec;
     options.spec_threshold = float(spec_threshold);
+    options.draft_ctx = draft_ctx;
+    options.spec_max_m = spec_max_m;
+    options.spec_shortlist = spec_shortlist;
     options.park_mb = park_mb;
     options.park_host_mb = park_host_mb;
     options.prefix_cache = !no_prefix_cache;
@@ -414,24 +421,32 @@ int main(int argc, char** argv) {
           }
           const double prefill_s = std::chrono::duration<double>(Clock::now() - tp0).count();
 
+          gen->reset_spec_metrics();
           const auto td0 = Clock::now();
           int decode_tokens = 0;
           std::vector<ingine::model::BatchSlotStep> steps;
-          std::vector<int32_t> next_toks;
+          std::vector<ingine::model::BatchSlotOutput> outs;
           while (!live.empty()) {
             steps.resize(live.size());
-            next_toks.resize(live.size());
+            outs.resize(live.size());
             for (std::size_t i = 0; i < live.size(); ++i) steps[i] = {live[i].slot, live[i].last_tok};
-            gen->step_slots(steps, next_toks);
+            gen->step_slots_multi(steps, outs);
             std::vector<Active> kept;
             kept.reserve(live.size());
             for (std::size_t i = 0; i < live.size(); ++i) {
-              live[i].last_tok = next_toks[i];
-              ++live[i].generated;
-              ++total_gen;
-              ++decode_tokens;
-              const bool done = (live[i].generated >= tokens) ||
-                                (!ignore_eos && std::find(stop.begin(), stop.end(), next_toks[i]) != stop.end());
+              bool done = false;
+              for (int k = 0; k < outs[i].count; ++k) {
+                const int32_t tok = outs[i].tokens[k];
+                live[i].last_tok = tok;
+                ++live[i].generated;
+                ++total_gen;
+                ++decode_tokens;
+                if (live[i].generated >= tokens ||
+                    (!ignore_eos && std::find(stop.begin(), stop.end(), tok) != stop.end())) {
+                  done = true;
+                  break;
+                }
+              }
               if (done) gen->release_slot(live[i].slot);
               else kept.push_back(live[i]);
             }
@@ -448,8 +463,10 @@ int main(int argc, char** argv) {
         const double med_agg = median(agg_rates);
         const double per_req = med_agg / double(C);
         const double prefill_tok_s = double(last_prompt_toks) / std::max(last_prefill_s, 1e-9);
-        std::printf("B=%-2d: aggregate decode %7.1f tok/s (%6.1f tok/s/req) | prefill %6.0f tok/s (%d prompt, %d gen, %.2fs decode)\n",
-                    C, med_agg, per_req, prefill_tok_s, last_prompt_toks, last_gen_toks, last_decode_s);
+        const std::string spec_sum = gen->spec_metrics_summary();
+        std::printf("B=%-2d: aggregate decode %7.1f tok/s (%6.1f tok/s/req) | prefill %6.0f tok/s (%d prompt, %d gen, %.2fs decode)%s%s\n",
+                    C, med_agg, per_req, prefill_tok_s, last_prompt_toks, last_gen_toks, last_decode_s,
+                    spec_sum.empty() ? "" : " | ", spec_sum.c_str());
         std::fflush(stdout);
         report["results"].push_back({{"concurrency", C},
                                      {"aggregate_decode_tok_s", med_agg},
@@ -459,6 +476,7 @@ int main(int argc, char** argv) {
                                      {"generated_tokens", last_gen_toks},
                                      {"prefill_seconds", last_prefill_s},
                                      {"decode_seconds", last_decode_s},
+                                     {"spec_summary", spec_sum},
                                      {"runs", agg_rates}});
       }
 
@@ -488,28 +506,36 @@ int main(int argc, char** argv) {
             }
           }
         };
+        gen->reset_spec_metrics();
         const auto ts0 = Clock::now();
         admit(half);
         std::vector<ingine::model::BatchSlotStep> steps;
-        std::vector<int32_t> next_toks;
+        std::vector<ingine::model::BatchSlotOutput> outs;
         while (!live.empty() || next_idx < C) {
-          if (step_n == join_step && next_idx < C) admit(C - next_idx);
+          if (step_n >= join_step && next_idx < C) admit(C - next_idx);
           if (live.empty()) {
             admit(C - next_idx);
             continue;
           }
           steps.resize(live.size());
-          next_toks.resize(live.size());
+          outs.resize(live.size());
           for (std::size_t i = 0; i < live.size(); ++i) steps[i] = {live[i].slot, live[i].last_tok};
-          gen->step_slots(steps, next_toks);
+          gen->step_slots_multi(steps, outs);
           ++step_n;
           std::vector<Active> kept;
           for (std::size_t i = 0; i < live.size(); ++i) {
-            live[i].last_tok = next_toks[i];
-            ++live[i].generated;
-            ++total_gen;
-            const bool done = (live[i].generated >= tokens) ||
-                              (!ignore_eos && std::find(stop.begin(), stop.end(), next_toks[i]) != stop.end());
+            bool done = false;
+            for (int k = 0; k < outs[i].count; ++k) {
+              const int32_t tok = outs[i].tokens[k];
+              live[i].last_tok = tok;
+              ++live[i].generated;
+              ++total_gen;
+              if (live[i].generated >= tokens ||
+                  (!ignore_eos && std::find(stop.begin(), stop.end(), tok) != stop.end())) {
+                done = true;
+                break;
+              }
+            }
             if (done) gen->release_slot(live[i].slot);
             else kept.push_back(live[i]);
           }
@@ -517,10 +543,11 @@ int main(int argc, char** argv) {
         }
         const double wall_s = std::chrono::duration<double>(Clock::now() - ts0).count();
         const double eff_tok_s = double(total_gen) / std::max(wall_s, 1e-9);
-        std::printf("staggered (C=%d, join@%d): %d tokens in %.2fs = %.1f tok/s effective\n", C, join_step, total_gen,
-                    wall_s, eff_tok_s);
+        const std::string stag_spec = gen->spec_metrics_summary();
+        std::printf("staggered (C=%d, join@%d): %d tokens in %.2fs = %.1f tok/s effective%s%s\n", C, join_step, total_gen,
+                    wall_s, eff_tok_s, stag_spec.empty() ? "" : " | ", stag_spec.c_str());
         report["staggered"] = {{"concurrency", C}, {"join_step", join_step}, {"generated_tokens", total_gen},
-                               {"wall_seconds", wall_s}, {"effective_tok_s", eff_tok_s}};
+                               {"wall_seconds", wall_s}, {"effective_tok_s", eff_tok_s}, {"spec_summary", stag_spec}};
       }
 
       std::printf("%s\n", report.dump().c_str());

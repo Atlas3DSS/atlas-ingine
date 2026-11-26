@@ -157,6 +157,13 @@ struct RuntimeOptions {
   bool kv_fp4v = false;
   KvCacheMode kv_cache_mode = KvCacheMode::PerPass;
   float spec_threshold = 0.8f;
+  // Batched DSpark drafter options (used when spec && max_batch > 1):
+  //   draft_ctx:      global-layer E4M3 ring slots per concurrent stream (default 16384; 0 = full 65536).
+  //   spec_max_m:     maximum verify width per slot in a batched step (2..4, default 4).
+  //   spec_shortlist: ranked shortlist rows in the shared drafter head (default 32768).
+  int draft_ctx = 16384;
+  int spec_max_m = 4;
+  int spec_shortlist = 32768;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
   // min(3072, free memory after start-up - 4096), at least 0.
@@ -207,6 +214,15 @@ struct RuntimeOptions {
 struct BatchSlotStep {
   int slot = -1;
   int32_t token = 0;
+};
+
+// Output of one active sequence from a multi-token batched step (batched speculative decoding).
+struct BatchSlotOutput {
+  static constexpr int kMaxTokens = 8;
+  int32_t tokens[kMaxTokens] = {};
+  int count = 0;         // emitted tokens in this step (1..kMaxTokens)
+  int verify_width = 1;  // target verify width m used for this slot
+  int accepted = 0;      // accepted draft tokens (count - 1)
 };
 
 class Generator {
@@ -266,6 +282,23 @@ class Generator {
   virtual void step_slots(std::span<const BatchSlotStep> /*inputs*/, std::span<int32_t> /*out_tokens*/) {
     throw std::logic_error("this generator does not support batched decoding");
   }
+  // Multi-token variant for batched speculative decoding: emits 1..kMaxTokens tokens per active slot.
+  // Default falls back to single-token step_slots().
+  virtual bool supports_spec_batch() const { return false; }
+  virtual void step_slots_multi(std::span<const BatchSlotStep> inputs, std::span<BatchSlotOutput> outputs) {
+    std::vector<int32_t> next(inputs.size(), 0);
+    step_slots(inputs, next);
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      outputs[i] = BatchSlotOutput{};
+      outputs[i].tokens[0] = next[i];
+      outputs[i].count = 1;
+      outputs[i].verify_width = 1;
+      outputs[i].accepted = 0;
+    }
+  }
+  // Optional diagnostic summary of batched speculative decoding counters (tok/verify, m histogram, timings).
+  virtual void reset_spec_metrics() {}
+  virtual std::string spec_metrics_summary() const { return {}; }
   // Releases `slot` and returns its KV pages immediately. Safe to call on any active slot.
   virtual void release_slot(int /*slot*/) {}
 
@@ -294,15 +327,33 @@ class Generator {
     const auto t0 = std::chrono::steady_clock::now();
     try {
       if (on_prefill) on_prefill(stats);
-      for (int i = 0; i < max_new_tokens; ++i) {
-        stats.generated_tokens = i + 1;
-        const std::int32_t out[1] = {token};
+      int emitted = 0;
+      auto emit_one = [&](std::int32_t tok) -> bool {
+        ++emitted;
+        stats.generated_tokens = emitted;
+        const std::int32_t out[1] = {tok};
         const bool go_on = on_tokens(out);
-        if (i + 1 == max_new_tokens || is_stop(token) || !go_on) break;
-        const BatchSlotStep step[1] = {{s, token}};
-        std::int32_t next[1] = {0};
-        step_slots(step, next);
-        token = next[0];
+        return emitted < max_new_tokens && !is_stop(tok) && go_on;
+      };
+      if (emit_one(token)) {
+        for (;;) {
+          const BatchSlotStep step[1] = {{s, token}};
+          BatchSlotOutput out[1];
+          step_slots_multi(step, out);
+          if (out[0].verify_width > 1 || supports_spec_batch()) {
+            stats.spec_rounds += 1;
+            stats.spec_accepted += out[0].accepted;
+          }
+          bool cont = true;
+          for (int k = 0; k < out[0].count; ++k) {
+            token = out[0].tokens[k];
+            if (!emit_one(token)) {
+              cont = false;
+              break;
+            }
+          }
+          if (!cont) break;
+        }
       }
     } catch (...) {
       release_slot(s);
