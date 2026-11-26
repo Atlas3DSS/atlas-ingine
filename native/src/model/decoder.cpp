@@ -350,8 +350,9 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   else dense::mix(fp, pdl, stream);
   if (loopcd_mode_ == LoopCdMode::LogitsAdaptive && last_pass > 0) {
     const int ref_pass = last_pass - 1;
-    // Earlier-pass reference state h_{L-1} at the same trained 5-term final_query/final_norm interface:
-    // substitutes loop-pass blocks (B2[ref_pass], E[ref_pass]) for (B2[last_pass], E[last_pass]) alongside coda.
+    // Shared-coda approximation for ~0% decode overhead: substitutes earlier loop-pass blocks
+    // (B2[ref_pass], E[ref_pass]) for (B2[last_pass], E[last_pass]) alongside the shared coda residual (part+y2)
+    // at final_read rather than running a second full pass through coda layers 18..23 (arXiv:2610.02185 Eq. 3).
     dense::MixParams fp_weak =
         mix_params({f32p(b.B0), f32p(b.B1), f32p(b.B2[ref_pass]), f32p(b.E[ref_pass])}, f32p(b.part), f32p(b.y2),
                    r_last, w_last, nullptr, &w.final_query, f32p(final_norm1), bf16m(b.xf_weak), nullptr);

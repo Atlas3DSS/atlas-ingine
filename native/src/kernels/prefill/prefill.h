@@ -235,6 +235,9 @@ void store_tap(const float* x, int T, ActT* out, int64_t out_stride, cudaStream_
 // model.logits for one row: out[v] = 30 tanh(bf16(w_v . x) / 30), w bf16 [V, H] or FP8 rows dequantized
 // as weights.dequant (bf16(fp8 * scale[v])); x bf16 [H].
 void head_logits(const ActT* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream);
+// Single-pass dual-vector prefill head matching head_logits bit-for-bit on both x_strong and x_weak.
+void head_logits_dual(const ActT* x_strong, const ActT* x_weak, const void* w, const float* scale, int V,
+                      float* out_strong, float* out_weak, cudaStream_t stream);
 // Round FP32 buffer to ActT (BF16/FP16) elementwise (used by paged KV Tier-2 NVMe decode fallback).
 void f32_to_act(const float* src, ActT* dst, std::size_t n, cudaStream_t stream);
 

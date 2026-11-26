@@ -11,12 +11,19 @@
 //   4. Optional `--eval-jsonl <out.jsonl>` mode dumps full greedy responses for a built-in deterministic
 //      reasoning + Python coding benchmark across (L=3 plain, L=3 logits-adaptive, L=3 hidden,
 //      L=2 plain, L=2 logits-adaptive, L=2 hidden) for automated accuracy verification.
+#include "core/arena.h"
+#include "core/device.h"
 #include "ingine/generator.h"
 #include "ingine/prefix_cache.h"
+#include "model/prefill.h"
+#include "model/runtime.h"
 #include "text/chat.h"
 
+#include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
+#include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -62,8 +69,28 @@ void expect_throws(const char* name, const std::function<void()>& fn) {
   CHECK(threw);
 }
 
+struct ScopedTempDir {
+  fs::path path;
+  explicit ScopedTempDir(const std::string& prefix) {
+    std::string tmpl = (fs::temp_directory_path() / (prefix + "_XXXXXX")).string();
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    char* created = ::mkdtemp(buf.data());
+    if (!created) throw std::runtime_error("mkdtemp failed for " + tmpl);
+    path = created;
+  }
+  ~ScopedTempDir() {
+    if (!path.empty()) {
+      std::error_code ec;
+      fs::remove_all(path, ec);
+    }
+  }
+  ScopedTempDir(const ScopedTempDir&) = delete;
+  ScopedTempDir& operator=(const ScopedTempDir&) = delete;
+};
+
 void test_fail_closed_rejections(const fs::path& model_dir) {
-  std::printf("[1/4] Fail-closed pre-load rejections...\n");
+  std::printf("[1/5] Fail-closed pre-load rejections...\n");
   RuntimeOptions base;
   base.model_dir = model_dir;
   base.max_ctx = 4096;
@@ -114,18 +141,17 @@ void test_fail_closed_rejections(const fs::path& model_dir) {
     (void)ingine::model::make_generator(o);
   });
 
-  // Synthetic Qwen3.8 config dir must reject --loopcd fail-closed before load (specifically citing --loopcd).
-  const fs::path tmp_qwen = fs::temp_directory_path() / "ingine_loopcd_qwen_test";
-  fs::create_directories(tmp_qwen);
+  // Synthetic Qwen3.8 config dir (per-run mkdtemp-owned) must reject --loopcd fail-closed before config parse.
   {
-    std::ofstream out(tmp_qwen / "config.json");
-    out << R"({"model_type":"qwen3_5","architectures":["Qwen3_5ForCausalLM"]})";
-  }
-  {
+    ScopedTempDir tmp_qwen("ingine_loopcd_qwen");
+    {
+      std::ofstream out(tmp_qwen.path / "config.json");
+      out << R"({"model_type":"qwen3_5","architectures":["Qwen3_5ForCausalLM"]})";
+    }
     bool threw_loopcd = false;
     try {
       auto o = base;
-      o.model_dir = tmp_qwen;
+      o.model_dir = tmp_qwen.path;
       o.loopcd_mode = LoopCdMode::LogitsAdaptive;
       (void)ingine::model::make_generator(o);
     } catch (const std::invalid_argument& e) {
@@ -134,7 +160,6 @@ void test_fail_closed_rejections(const fs::path& model_dir) {
     }
     CHECK(threw_loopcd);
   }
-  fs::remove_all(tmp_qwen);
 
   // Prefix cache StateIdentity hashing must distinguish off vs logits-adaptive vs hidden and distinct omegas.
   ingine::model::StateIdentity id_off{};
@@ -157,6 +182,121 @@ void test_fail_closed_rejections(const fs::path& model_dir) {
   CHECK(ingine::model::hash_state_identity(id_la) != ingine::model::hash_state_identity(id_la2));
   CHECK(ingine::model::hash_state_identity(id_la) != ingine::model::hash_state_identity(id_hid));
   std::printf("  PASS fail-closed rejections & StateIdentity isolation.\n");
+}
+
+// Direct full-vocab (200,058 FP32) prefill-logit verification on real Inkling-2-Mini weights:
+//   (a) Prefiller(logits-adaptive, omega=0) is 0-ULP bit-identical to Prefiller(off) on all 200,058 logits.
+//   (b) Prefiller(logits-adaptive, omega=0.5) matches exact FP64 Eq. 3-4 scaling from (omega=0, omega=1.0)
+//       across all 200,058 logits and genuinely differs from off.
+//   (c) Compares the recovered shared-coda weak logits against an independent L=2 full-coda Prefiller readout
+//       on the identical prompt prefix to quantify the shared-coda approximation vs Eq. 3's separate coda.
+void test_direct_prefill_logits(const fs::path& model_dir, const ingine::text::ChatFormat& fmt) {
+  using namespace ingine::model;
+  std::printf("[2/5] Direct Prefiller logit parity (0-ULP at omega=0, FP64 Eq. 4 at omega>0, shared vs indep L=2 coda)...\n");
+  cudaStream_t stream = nullptr;
+  CUDA_CHECK(cudaStreamCreate(&stream));
+  const Weights w = load_weights(model_dir, /*dense_fp8=*/true, stream);
+  const Ablation abl = load_ablation({});
+
+  ingine::text::ChatOptions chat;
+  chat.reasoning_effort = "low";
+  const nlohmann::ordered_json msgs = nlohmann::ordered_json::array(
+      {{{"role", "user"}, {"content", "Explain how a hash map handles collisions and give a concise Python example."}}});
+  std::vector<std::int32_t> prompt_ids = fmt.render(msgs, nlohmann::ordered_json(), chat).ids;
+  // Append a real mid-sentence assistant prefix so the next-token distribution has non-trivial entropy (alpha > 0).
+  const std::vector<std::int32_t> mid_prefix = fmt.tokenizer().encode(
+      "<|message_model|><|content_text|>A hash map handles collisions using", /*special=*/true);
+  prompt_ids.insert(prompt_ids.end(), mid_prefix.begin(), mid_prefix.end());
+  const int T = int(prompt_ids.size());
+  CHECK(T > 0 && T <= 1024);
+
+  ingine::DeviceBuffer d_tok(std::size_t(T) * sizeof(std::int32_t));
+  d_tok.copy_from_host(prompt_ids.data(), std::size_t(T) * sizeof(std::int32_t));
+  ingine::DeviceBuffer d_logits(std::size_t(UNPADDED_VOCAB) * sizeof(float));
+
+  auto run_prefill = [&](int passes, LoopCdMode mode, float omega) -> std::vector<float> {
+    State st = make_state(/*max_ctx=*/2048, /*kv_fp8=*/true, /*kv_q4=*/false, {}, /*kv_last_full=*/false, passes);
+    reset_state(st, stream);
+    Prefiller pf(w, abl, /*max_chunk=*/1024, stream, passes, mode, omega);
+    pf.run(st, static_cast<const std::int32_t*>(d_tok.p), T, 0, static_cast<float*>(d_logits.p), nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<float> host(UNPADDED_VOCAB);
+    CUDA_CHECK(cudaMemcpy(host.data(), d_logits.p, std::size_t(UNPADDED_VOCAB) * sizeof(float), cudaMemcpyDeviceToHost));
+    return host;
+  };
+
+  const std::vector<float> z_off = run_prefill(3, LoopCdMode::Off, 0.0f);
+  const std::vector<float> z_la0 = run_prefill(3, LoopCdMode::LogitsAdaptive, 0.0f);
+  const std::vector<float> z_la05 = run_prefill(3, LoopCdMode::LogitsAdaptive, 0.5f);
+  const std::vector<float> z_la10 = run_prefill(3, LoopCdMode::LogitsAdaptive, 1.0f);
+  const std::vector<float> z_l2_indep = run_prefill(2, LoopCdMode::Off, 0.0f);
+
+  // (a) Exact 0-ULP bit identity at omega=0 vs off across all 200,058 prefill logits.
+  std::uint64_t zero_bit_diffs = 0;
+  for (int v = 0; v < UNPADDED_VOCAB; ++v) {
+    std::uint32_t a = 0, b = 0;
+    std::memcpy(&a, &z_off[v], 4);
+    std::memcpy(&b, &z_la0[v], 4);
+    if (a != b) ++zero_bit_diffs;
+  }
+  std::printf("  prefill(omega=0) vs prefill(off): bit_diffs=%llu / %d\n",
+              static_cast<unsigned long long>(zero_bit_diffs), UNPADDED_VOCAB);
+  CHECK(zero_bit_diffs == 0);
+
+  // (b) Exact FP64 Eq. 4 adaptive strength + linear consistency between omega=0.5 and omega=1.0.
+  double m1 = -std::numeric_limits<double>::infinity();
+  double m2 = -std::numeric_limits<double>::infinity();
+  int top1_off = 0, top1_l2 = 0;
+  for (int v = 0; v < UNPADDED_VOCAB; ++v) {
+    const double x = z_off[v];
+    if (x > m1) {
+      m2 = m1;
+      m1 = x;
+      top1_off = v;
+    } else if (x > m2) {
+      m2 = x;
+    }
+    if (z_l2_indep[v] > z_l2_indep[top1_l2]) top1_l2 = v;
+  }
+  double sum_exp = 0.0;
+  for (int v = 0; v < UNPADDED_VOCAB; ++v) sum_exp += std::exp(double(z_off[v]) - m1);
+  const double p1 = 1.0 / sum_exp;
+  const double p2 = std::exp(m2 - m1) / sum_exp;
+  const double alpha = std::clamp(1.0 - (p1 - p2), 0.0, 1.0);
+  CHECK(alpha > 1e-4);
+
+  double max_lin_err = 0.0;
+  double max_delta_from_off = 0.0;
+  double dot = 0.0, n_sh = 0.0, n_l2 = 0.0, mean_abs_sh_l2 = 0.0;
+  int top1_sh = 0;
+  double max_sh = -std::numeric_limits<double>::infinity();
+  for (int v = 0; v < UNPADDED_VOCAB; ++v) {
+    CHECK(std::isfinite(z_la05[v]) && std::isfinite(z_la10[v]));
+    const double zs = z_off[v];
+    const double zw_shared = zs - (double(z_la10[v]) - zs) / alpha;
+    const double expected_05 = zs + 0.5 * alpha * (zs - zw_shared);
+    max_lin_err = std::max(max_lin_err, std::fabs(double(z_la05[v]) - expected_05));
+    max_delta_from_off = std::max(max_delta_from_off, std::fabs(double(z_la05[v]) - zs));
+    if (zw_shared > max_sh) {
+      max_sh = zw_shared;
+      top1_sh = v;
+    }
+    const double zl2 = z_l2_indep[v];
+    dot += zw_shared * zl2;
+    n_sh += zw_shared * zw_shared;
+    n_l2 += zl2 * zl2;
+    mean_abs_sh_l2 += std::fabs(zw_shared - zl2);
+  }
+  const double cos_sim = dot / (std::sqrt(n_sh) * std::sqrt(n_l2) + 1e-12);
+  mean_abs_sh_l2 /= double(UNPADDED_VOCAB);
+  std::printf("  prefill(omega=0.5 vs 1.0) FP64 Eq.4: alpha=%.4f max_lin_err=%.3e max_delta_vs_off=%.4f\n",
+              alpha, max_lin_err, max_delta_from_off);
+  std::printf("  weak-readout comparison (shared-coda vs independent L=2 full-coda): cos=%.4f mean_abs=%.3f top1(off=%d, shared_weak=%d, indep_L2=%d)\n",
+              cos_sim, mean_abs_sh_l2, top1_off, top1_sh, top1_l2);
+  CHECK(max_lin_err < 1e-4);
+  CHECK(max_delta_from_off > 1e-3);
+  CUDA_CHECK(cudaStreamDestroy(stream));
+  std::printf("  PASS direct Prefiller logit parity.\n");
 }
 
 struct GenResult {
@@ -311,6 +451,8 @@ int main(int argc, char** argv) {
   test_fail_closed_rejections(model_dir);
 
   const auto fmt = ingine::text::ChatFormat::load(model_dir);
+  test_direct_prefill_logits(model_dir, fmt);
+
   const std::string p_chat = "Explain how a hash map handles collisions in 3 concise sentences.";
   const std::string p_math = "What is 17 * 23 + 45? Show brief steps and give the final integer.";
 
@@ -328,7 +470,7 @@ int main(int argc, char** argv) {
     return o;
   };
 
-  std::printf("[2/4] Bit-identical zero-strength control (omega=0 vs off) on real Inkling-2-Mini (L=3)...\n");
+  std::printf("[3/5] Bit-identical zero-strength control (omega=0 vs off) on real Inkling-2-Mini (L=3)...\n");
   GenResult base_chat, base_math;
   {
     auto g = ingine::model::make_generator(make_opt(3, LoopCdMode::Off, -1.0f));
@@ -363,7 +505,7 @@ int main(int argc, char** argv) {
                 r_chat.tokens.size(), r_math.tokens.size());
   }
 
-  std::printf("[3/4] Active LoopCD (default omega) on real Inkling-2-Mini (L=3) + prefix-cache repeat check...\n");
+  std::printf("[4/5] Active LoopCD (default omega) on real Inkling-2-Mini (L=3) + prefix-cache repeat check...\n");
   {
     auto g = ingine::model::make_generator(make_opt(3, LoopCdMode::LogitsAdaptive, -1.0f));
     const GenResult r1 = run_greedy(*g, fmt, p_math, "low", 96);
@@ -386,7 +528,7 @@ int main(int argc, char** argv) {
     CHECK(r2.stats.reuse == ingine::model::Reuse::Checkpoint);
   }
 
-  std::printf("[4/4] Active LoopCD on 2-pass Inkling-2-Mini (L=2)...\n");
+  std::printf("[5/5] Active LoopCD on 2-pass Inkling-2-Mini (L=2)...\n");
   {
     auto g = ingine::model::make_generator(make_opt(2, LoopCdMode::LogitsAdaptive, -1.0f));
     const GenResult r1 = run_greedy(*g, fmt, p_math, "low", 96);

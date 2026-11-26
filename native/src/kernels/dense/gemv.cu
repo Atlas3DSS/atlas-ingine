@@ -1232,9 +1232,17 @@ void head_loopcd(const ActT* x_strong, const ActT* x_weak, int M, Matrix w, floa
     case 7: go(std::integral_constant<int, 7>{}); break;
     case 8: go(std::integral_constant<int, 8>{}); break;
   }
-  loopcd_stats_blocks_kernel<<<dim3(kLoopCdReduceBlocks, M), 256, 0, stream>>>(out, rows, ws_reduce);
+  loopcd_adaptive_combine(out, ws_weak, M, rows, omega_max, ws_reduce, stream);
+}
+
+void loopcd_adaptive_combine(float* out_strong, const float* z_weak, int M, int V, float omega_max, float* ws_reduce,
+                             cudaStream_t stream) {
+  require(out_strong && z_weak && ws_reduce && M >= 1 && M <= 8 && V > 0 && omega_max >= 0.f,
+          "loopcd_adaptive_combine: bad args");
+  if (omega_max == 0.f) return;
+  loopcd_stats_blocks_kernel<<<dim3(kLoopCdReduceBlocks, M), 256, 0, stream>>>(out_strong, V, ws_reduce);
   loopcd_stats_final_kernel<<<M, kLoopCdReduceBlocks, 0, stream>>>(ws_reduce, omega_max);
-  loopcd_combine_logits_kernel<<<dim3((rows + 1023) / 1024, M), 256, 0, stream>>>(out, ws_weak, ws_reduce, rows);
+  loopcd_combine_logits_kernel<<<dim3((V + 1023) / 1024, M), 256, 0, stream>>>(out_strong, z_weak, ws_reduce, V);
   CUDA_CHECK(cudaGetLastError());
 }
 

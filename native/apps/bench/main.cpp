@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
   ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity (0 = auto)", &max_kv_tokens);
   ap.option("--loop-passes", "", "recurrent loop passes over layers 6..17 (1..8, default 3 = 48 visits)", &loop_passes);
   ap.option("--loopcd", "{off,logits-adaptive,hidden}",
-            "LoopCD loop-contrastive decoding (arXiv:2610.02185): off (default), logits-adaptive, or hidden",
+            "LoopCD loop-contrastive decoding (arXiv:2610.02185): off (default), logits-adaptive (shared-coda approximation + fused single-pass lm_head), or hidden (pre-coda Eq. 2)",
             &loopcd_mode, {"off", "logits-adaptive", "hidden"});
   ap.option("--loopcd-omega", "",
             "LoopCD contrast strength in [0, 4] (default: 0.5 for logits-adaptive, 0.3 for hidden; 0 = exact no-op control)",

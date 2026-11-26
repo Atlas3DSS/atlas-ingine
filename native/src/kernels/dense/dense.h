@@ -45,6 +45,10 @@ inline constexpr int kLoopCdReduceBlocks = 128;
 inline constexpr int kLoopCdReduceFloatsPerRow = kLoopCdReduceBlocks * 3;
 void head_loopcd(const ActT* x_strong, const ActT* x_weak, int M, Matrix w, float omega_max, float* out,
                  float* ws_weak, float* ws_reduce, bool pdl, cudaStream_t stream);
+// Standalone adaptive LoopCD logit combiner over precomputed (out_strong, z_weak) FP32 [M, V] (used by Prefiller
+// after pk::head_logits_dual so prefill keeps exact 0-ULP FP8 rounding parity with pk::head_logits).
+void loopcd_adaptive_combine(float* out_strong, const float* z_weak, int M, int V, float omega_max, float* ws_reduce,
+                             cudaStream_t stream);
 
 // Hidden-space LoopCD extrapolation (arXiv:2610.02185 Eq. 2):
 //   loopcd_hidden_blend:         h_strong[m, c] += omega * (h_strong[m, c] - h_weak[m, c])   ([M, H] FP32)

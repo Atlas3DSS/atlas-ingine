@@ -514,12 +514,14 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
   if (loopcd_mode_ == LoopCdMode::LogitsAdaptive && last_pass > 0) {
     const int ref_pass = last_pass - 1;
-    // Reuse dead xm_ [C, H] scratch for the weak final_read so block_table keeps constant base pointers.
+    // Shared-coda approximation (reuses final coda residual part+y2 while substituting earlier loop blocks
+    // B2[ref_pass], E[ref_pass] for B2[last_pass], E[last_pass]; unlike arXiv:2610.02185 Eq. 3, avoids running
+    // coda layers 18..23 twice). Uses pk::head_logits_dual so prefill FP8 rounding matches pk::head_logits bit-for-bit.
     mix({B0_, B1_, B2_[ref_pass], E_[ref_pass]}, part_, y2_, r_last, w_last, nullptr, f32p(w.final_query), 1,
         f32p(w.final_norm), xm_, nullptr, nullptr);
-    const dense::Matrix unembed{w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB};
-    dense::head_loopcd(xf_ + std::size_t(T - 1) * H, xm_ + std::size_t(T - 1) * H, 1, unembed, loopcd_omega_, logits,
-                       logits_weak_, loopcd_reduce_, false, s);
+    pk::head_logits_dual(xf_ + std::size_t(T - 1) * H, xm_ + std::size_t(T - 1) * H, w.unembed.w.data,
+                         f32p(w.unembed.scale), UNPADDED_VOCAB, logits, logits_weak_, s);
+    dense::loopcd_adaptive_combine(logits, logits_weak_, 1, UNPADDED_VOCAB, loopcd_omega_, loopcd_reduce_, s);
   } else {
     pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
   }

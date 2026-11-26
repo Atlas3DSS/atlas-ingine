@@ -385,6 +385,68 @@ __global__ void __launch_bounds__(256) head_kernel(const uint16_t* __restrict__ 
   if (lane == 0) out[v] = tanhf(round_bf16(acc) * (1.f / 30.f)) * 30.f;
 }
 
+// Single-pass dual-vector prefill head: reads each [V, H] weight row once and reproduces head_kernel's exact
+// per-element ActT rounding & FMA order for both x_strong and x_weak (0-ULP parity with head_logits).
+template <bool FP8>
+__global__ void __launch_bounds__(256) head_dual_kernel(const uint16_t* __restrict__ x_strong,
+                                                        const uint16_t* __restrict__ x_weak,
+                                                        const void* __restrict__ w, const float* __restrict__ scale,
+                                                        int V, float* __restrict__ out_strong,
+                                                        float* __restrict__ out_weak) {
+  __shared__ float xs[H];
+  __shared__ float xw[H];
+  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+    xs[i] = bf2f(x_strong[i]);
+    xw[i] = bf2f(x_weak[i]);
+  }
+  __syncthreads();
+  const int v = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (v >= V) return;
+  float acc_s = 0.f, acc_w = 0.f;
+  if constexpr (FP8) {
+    const uint8_t* row = static_cast<const uint8_t*>(w) + size_t(v) * H;
+    const float s = scale[v];
+    for (int k = lane * 8; k < H; k += 256) {
+      const uint2 u = __ldg(reinterpret_cast<const uint2*>(row + k));
+      const uint32_t ws[2] = {u.x, u.y};
+#pragma unroll
+      for (int q = 0; q < 2; ++q) {
+        const float2 a = e4m3x2_to_float2(ws[q] & 0xffff), b = e4m3x2_to_float2(ws[q] >> 16);
+        const float w0 = round_bf16(a.x * s), w1 = round_bf16(a.y * s);
+        const float w2 = round_bf16(b.x * s), w3 = round_bf16(b.y * s);
+        acc_s = fmaf(w0, xs[k + 4 * q], acc_s);
+        acc_s = fmaf(w1, xs[k + 4 * q + 1], acc_s);
+        acc_s = fmaf(w2, xs[k + 4 * q + 2], acc_s);
+        acc_s = fmaf(w3, xs[k + 4 * q + 3], acc_s);
+        acc_w = fmaf(w0, xw[k + 4 * q], acc_w);
+        acc_w = fmaf(w1, xw[k + 4 * q + 1], acc_w);
+        acc_w = fmaf(w2, xw[k + 4 * q + 2], acc_w);
+        acc_w = fmaf(w3, xw[k + 4 * q + 3], acc_w);
+      }
+    }
+  } else {
+    const uint16_t* row = static_cast<const uint16_t*>(w) + size_t(v) * H;
+    for (int k = lane * 8; k < H; k += 256) {
+      const uint4 u = __ldg(reinterpret_cast<const uint4*>(row + k));
+      const uint32_t ws[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const float w0 = bf_lo(ws[q]), w1 = bf_hi(ws[q]);
+        acc_s = fmaf(w0, xs[k + 2 * q], acc_s);
+        acc_s = fmaf(w1, xs[k + 2 * q + 1], acc_s);
+        acc_w = fmaf(w0, xw[k + 2 * q], acc_w);
+        acc_w = fmaf(w1, xw[k + 2 * q + 1], acc_w);
+      }
+    }
+  }
+  acc_s = warp_sum(acc_s);
+  acc_w = warp_sum(acc_w);
+  if (lane == 0) {
+    out_strong[v] = tanhf(round_bf16(acc_s) * (1.f / 30.f)) * 30.f;
+    out_weak[v] = tanhf(round_bf16(acc_w) * (1.f / 30.f)) * 30.f;
+  }
+}
+
 __global__ void f32_to_act_kernel(const float* __restrict__ src, uint16_t* __restrict__ dst, size_t n) {
   const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n) dst[i] = f2bf_bits(src[i]);
@@ -448,6 +510,14 @@ void head_logits(const ActT* x, const void* w, const float* scale, int V, float*
   const auto* xs = reinterpret_cast<const uint16_t*>(x);
   if (scale) head_kernel<true><<<(V + 7) / 8, 256, 0, stream>>>(xs, w, scale, V, out);
   else head_kernel<false><<<(V + 7) / 8, 256, 0, stream>>>(xs, w, scale, V, out);
+}
+
+void head_logits_dual(const ActT* x_strong, const ActT* x_weak, const void* w, const float* scale, int V,
+                      float* out_strong, float* out_weak, cudaStream_t stream) {
+  const auto* xs = reinterpret_cast<const uint16_t*>(x_strong);
+  const auto* xw = reinterpret_cast<const uint16_t*>(x_weak);
+  if (scale) head_dual_kernel<true><<<(V + 7) / 8, 256, 0, stream>>>(xs, xw, w, scale, V, out_strong, out_weak);
+  else head_dual_kernel<false><<<(V + 7) / 8, 256, 0, stream>>>(xs, xw, w, scale, V, out_strong, out_weak);
 }
 
 void f32_to_act(const float* src, ActT* dst, std::size_t n, cudaStream_t stream) {

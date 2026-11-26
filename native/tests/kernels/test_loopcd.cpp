@@ -6,6 +6,7 @@
 // 3. Hidden-space extrapolation kernels (loopcd_hidden_blend, loopcd_hidden_from_residual) vs FP64 reference.
 // 4. Microbenchmark of single-pass head_loopcd vs plain dense::head vs naive 2-pass (2x dense::head) at V=200058, H=2304.
 #include "kernels/dense/dense.h"
+#include "kernels/prefill/prefill.h"
 #include "kernels/oracle.h"
 
 #include <cuda_runtime.h>
@@ -16,15 +17,18 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 using namespace ingine::test;
 namespace dense = ingine::kernels::dense;
+namespace pk = ingine::kernels::prefill;
 
 namespace {
 
 constexpr int H = 2304;
 constexpr int V_FULL = 200058;
+const char* act16_name() { return ingine::kActIsFP16 ? "fp16" : "bf16"; }
 cudaStream_t g_stream = nullptr;
 
 void sync() { INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream)); }
@@ -70,14 +74,28 @@ SynthWeights make_weights(Rng& rng, int rows, bool fp8, double sd) {
   } else {
     const std::vector<float> lut_f = randn_bf16(rng, 4096, sd);
     const auto lut_b = to_bf16(lut_f);
+    // Copy raw 16-bit ActT bit patterns (never numeric static_cast<uint16_t>, which truncates |x|<1 to 0!).
+    uint16_t lut_bits[4096];
+    for (int i = 0; i < 4096; ++i) std::memcpy(&lut_bits[i], &lut_b[i], sizeof(uint16_t));
     std::vector<uint8_t> bytes(size_t(rows) * H * 2);
     auto* dst = reinterpret_cast<uint16_t*>(bytes.data());
+    size_t nonzero = 0;
     for (size_t i = 0; i < size_t(rows) * H; i += 4) {
       const uint64_t u = next_u64();
-      dst[i + 0] = static_cast<uint16_t>(lut_b[(u >> 0) & 4095u]);
-      dst[i + 1] = static_cast<uint16_t>(lut_b[(u >> 12) & 4095u]);
-      dst[i + 2] = static_cast<uint16_t>(lut_b[(u >> 24) & 4095u]);
-      dst[i + 3] = static_cast<uint16_t>(lut_b[(u >> 36) & 4095u]);
+      const uint16_t v0 = lut_bits[(u >> 0) & 4095u];
+      const uint16_t v1 = lut_bits[(u >> 12) & 4095u];
+      const uint16_t v2 = lut_bits[(u >> 24) & 4095u];
+      const uint16_t v3 = lut_bits[(u >> 36) & 4095u];
+      dst[i + 0] = v0;
+      dst[i + 1] = v1;
+      dst[i + 2] = v2;
+      dst[i + 3] = v3;
+      nonzero += ((v0 & 0x7fffu) != 0) + ((v1 & 0x7fffu) != 0) + ((v2 & 0x7fffu) != 0) + ((v3 & 0x7fffu) != 0);
+    }
+    if (nonzero < (size_t(rows) * H * 9) / 10) {
+      std::fprintf(stderr, "FATAL make_weights(%s): degenerate zero weights (%zu/%zu nonzero)\n",
+                   act16_name(), nonzero, size_t(rows) * H);
+      std::exit(1);
     }
     w.dev.emplace(bytes);
   }
@@ -158,6 +176,25 @@ bool check_head_loopcd(Rng& rng, const SynthWeights& w, int M, float omega_max, 
   const auto h_got = out_fused.download();
   const auto h_got_w = ws_weak.download();
 
+  // 0) Guard against degenerate zero/constant reference logits.
+  float max_abs_zs = 0.f, max_abs_zw = 0.f;
+  size_t s_vs_w_diffs = 0;
+  std::unordered_set<uint32_t> uniq_zs;
+  uniq_zs.reserve(size_t(V));
+  for (int v = 0; v < V; ++v) {
+    uint32_t bs = 0, bw = 0;
+    std::memcpy(&bs, &h_zs[v], 4);
+    std::memcpy(&bw, &h_zw[v], 4);
+    uniq_zs.insert(bs);
+    if (bs != bw) ++s_vs_w_diffs;
+    max_abs_zs = std::max(max_abs_zs, std::fabs(h_zs[v]));
+    max_abs_zw = std::max(max_abs_zw, std::fabs(h_zw[v]));
+  }
+  // Note: ActT rounding before softcap quantizes [-10, 10] to ~17K representable FP16 values (~1K for BF16),
+  // so require >500 distinct logits and >50% strong-vs-weak differences to catch degenerate zero/constant weights.
+  const bool non_degenerate = (max_abs_zs > 0.1f) && (max_abs_zw > 0.1f) &&
+                              (uniq_zs.size() > 500u) && (s_vs_w_diffs > size_t(V) / 2);
+
   // 1) ws_weak must be bit-identical (0 ULP) to naive dense::head(x_weak)!
   uint64_t weak_bit_diffs = 0;
   float weak_max_abs = 0.f;
@@ -192,11 +229,95 @@ bool check_head_loopcd(Rng& rng, const SynthWeights& w, int M, float omega_max, 
     }
   }
   const float tol = omega_max == 0.f ? 0.f : 1e-4f;
-  const bool ok = (non_finite == 0) && (weak_bit_diffs == 0) && (max_abs <= tol) && (zero_bit_diffs == 0);
-  std::printf("%s head_loopcd %s V=%d M=%d omega_max=%.2f graph=%d: weak_bit_diffs=%llu non_finite=%llu max_abs=%.3e (omega0=%.4f)\n",
-              ok ? "PASS" : "FAIL", w.fp8 ? "fp8" : "bf16", V, M, omega_max, test_graph ? 1 : 0,
+  const bool ok = non_degenerate && (non_finite == 0) && (weak_bit_diffs == 0) && (max_abs <= tol) &&
+                  (zero_bit_diffs == 0);
+  std::printf("%s head_loopcd %s V=%d M=%d omega_max=%.2f graph=%d: weak_bit_diffs=%llu non_finite=%llu max_abs=%.3e (omega0=%.4f, max|zs|=%.2f, uniq=%zu)\n",
+              ok ? "PASS" : "FAIL", w.fp8 ? "fp8" : act16_name(), V, M, omega_max, test_graph ? 1 : 0,
               static_cast<unsigned long long>(weak_bit_diffs), static_cast<unsigned long long>(non_finite),
-              max_abs, omegas[0]);
+              max_abs, omegas[0], max_abs_zs, uniq_zs.size());
+  return ok;
+}
+
+// Verify prefill single-pass head_logits_dual + loopcd_adaptive_combine against pk::head_logits, including
+// the exact FP8 per-element rounding case (E4M3 [1,1], x=[1,2], scale=0.1f) where decode-style post-dot
+// scaling differs from prefill per-weight ActT rounding.
+bool test_prefill_head_dual(Rng& rng, const SynthWeights& w) {
+  const int V = w.rows;
+  bool ok = true;
+
+  if (w.fp8) {
+    std::vector<uint8_t> w1(H, 0u);
+    w1[0] = float_to_e4m3(1.0f);
+    w1[1] = float_to_e4m3(1.0f);
+    std::vector<float> s1 = {0.1f};
+    std::vector<float> xs1(H, 0.f), xw1(H, 0.f);
+    xs1[0] = 1.0f;
+    xs1[1] = 2.0f;
+    xw1[0] = 2.0f;
+    xw1[1] = 1.0f;
+    DeviceArray<uint8_t> dw(w1);
+    DeviceArray<float> ds(s1), ref_s(1), ref_w(1), got_s(1), got_w(1), ws_red(dense::kLoopCdReduceFloatsPerRow);
+    DeviceArray<ingine::ActT> dxs(to_bf16(xs1)), dxw(to_bf16(xw1));
+    pk::head_logits(dxs.get(), dw.get(), ds.get(), 1, ref_s.get(), g_stream);
+    pk::head_logits(dxw.get(), dw.get(), ds.get(), 1, ref_w.get(), g_stream);
+    pk::head_logits_dual(dxs.get(), dxw.get(), dw.get(), ds.get(), 1, got_s.get(), got_w.get(), g_stream);
+    dense::loopcd_adaptive_combine(got_s.get(), got_w.get(), 1, 1, 0.0f, ws_red.get(), g_stream);
+    sync();
+    const auto hrs = ref_s.download(), hrw = ref_w.download(), hgs = got_s.download(), hgw = got_w.download();
+    uint32_t a1, b1, a2, b2;
+    std::memcpy(&a1, &hrs[0], 4);
+    std::memcpy(&b1, &hgs[0], 4);
+    std::memcpy(&a2, &hrw[0], 4);
+    std::memcpy(&b2, &hgw[0], 4);
+    const bool edge_ok = (a1 == b1) && (a2 == b2);
+    ok &= edge_ok;
+    std::printf("%s prefill_head_dual fp8_rounding_edge: ref_s=%.9f got_s=%.9f bit_eq=%d\n",
+                edge_ok ? "PASS" : "FAIL", hrs[0], hgs[0], edge_ok ? 1 : 0);
+  }
+
+  const auto xs_f = randn_bf16(rng, H, 1.0);
+  const auto xw_f = randn_bf16(rng, H, 1.0);
+  DeviceArray<ingine::ActT> dxs(to_bf16(xs_f)), dxw(to_bf16(xw_f));
+  DeviceArray<float> ref_s(V), ref_w(V), got_s(V), got_w(V), ws_red(dense::kLoopCdReduceFloatsPerRow);
+  const float* sc = w.fp8 ? w.dev_scale->get() : nullptr;
+  pk::head_logits(dxs.get(), w.dev->get(), sc, V, ref_s.get(), g_stream);
+  pk::head_logits(dxw.get(), w.dev->get(), sc, V, ref_w.get(), g_stream);
+  sync();
+  const auto h_zs = ref_s.download();
+  const auto h_zw = ref_w.download();
+
+  for (float omega_max : {0.0f, 0.5f}) {
+    pk::head_logits_dual(dxs.get(), dxw.get(), w.dev->get(), sc, V, got_s.get(), got_w.get(), g_stream);
+    dense::loopcd_adaptive_combine(got_s.get(), got_w.get(), 1, V, omega_max, ws_red.get(), g_stream);
+    sync();
+    const auto h_got = got_s.download();
+    const auto h_got_w = got_w.download();
+    uint64_t weak_diffs = 0, zero_diffs = 0, non_fin = 0;
+    for (int v = 0; v < V; ++v) {
+      uint32_t a, b;
+      std::memcpy(&a, &h_zw[v], 4);
+      std::memcpy(&b, &h_got_w[v], 4);
+      if (a != b) ++weak_diffs;
+      if (omega_max == 0.f) {
+        std::memcpy(&a, &h_zs[v], 4);
+        std::memcpy(&b, &h_got[v], 4);
+        if (a != b) ++zero_diffs;
+      }
+      if (!std::isfinite(h_got[v])) ++non_fin;
+    }
+    std::vector<float> h_ref;
+    std::vector<double> omegas;
+    reference_loopcd_adaptive(h_zs, h_zw, 1, V, omega_max, h_ref, omegas);
+    float max_abs = 0.f;
+    for (int v = 0; v < V; ++v) max_abs = std::max(max_abs, std::fabs(h_got[v] - h_ref[v]));
+    const float tol = omega_max == 0.f ? 0.f : 1e-4f;
+    const bool case_ok = (non_fin == 0) && (weak_diffs == 0) && (zero_diffs == 0) && (max_abs <= tol);
+    ok &= case_ok;
+    std::printf("%s prefill_head_dual %s V=%d omega_max=%.2f: weak_diffs=%llu zero_diffs=%llu max_abs=%.3e (omega=%.4f)\n",
+                case_ok ? "PASS" : "FAIL", w.fp8 ? "fp8" : act16_name(), V, omega_max,
+                static_cast<unsigned long long>(weak_diffs), static_cast<unsigned long long>(zero_diffs),
+                max_abs, omegas[0]);
+  }
   return ok;
 }
 
@@ -263,7 +384,7 @@ void bench_head_full_vocab(Rng& rng, const SynthWeights& w) {
   });
   const double overhead_pct = 100.0 * (us_fused - us_plain) / us_plain;
   std::printf("BENCH head_%s V=%d M=1: plain=%.1f us | naive_2pass=%.1f us (%.2fx) | fused_loopcd=%.1f us (%+.2f%% vs plain, %.2fx faster than 2-pass)\n",
-              w.fp8 ? "fp8" : "bf16", V, us_plain, us_2pass, us_2pass / us_plain, us_fused, overhead_pct,
+              w.fp8 ? "fp8" : act16_name(), V, us_plain, us_2pass, us_2pass / us_plain, us_fused, overhead_pct,
               us_2pass / us_fused);
 }
 
@@ -277,9 +398,10 @@ int main() {
   bool ok = true;
   ok &= test_hidden_kernels(rng);
 
-  // Full Inkling-2-Mini vocabulary V=200058 for both FP8 and BF16 across M=1,2,4,8 + graph capture.
+  // Full Inkling-2-Mini vocabulary V=200058 for both FP8 and native ActT (FP16 on sm_70, BF16 on sm_80+).
   for (bool fp8 : {true, false}) {
     const SynthWeights w_full = make_weights(rng, V_FULL, fp8, 0.03);
+    ok &= test_prefill_head_dual(rng, w_full);
     ok &= check_head_loopcd(rng, w_full, 1, 0.0f, false);
     ok &= check_head_loopcd(rng, w_full, 1, 0.5f, false);
     ok &= check_head_loopcd(rng, w_full, 1, 1.0f, true);  // CUDA graph capture + replay
