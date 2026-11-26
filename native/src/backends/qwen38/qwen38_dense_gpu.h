@@ -22,6 +22,7 @@ struct Qwen38DenseLoadOptions {
   int prefill_chunk = 256;
   bool verify_pins = true;
   bool use_calibrated_fp8 = true;
+  bool prefix_cache = true;
   std::string revision = "482ca0f";
   int device_id = 0;
   std::optional<ingine::model::CheckpointPinSpec> expected_pins;
@@ -98,6 +99,7 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
   // ingine::model::Generator
   std::string model_id() const override;
   int max_model_len() const override;
+  ingine::model::PrefixCacheStats cache_stats() const override;
   using ingine::model::ModelBackend::generate;
   ingine::model::GenerateStats generate(std::span<const std::int32_t> prompt, int max_new_tokens,
                                         const ingine::model::Sampling& sampling,
@@ -170,5 +172,8 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
   ingine::model::WorkerProfile profile_;
   Qwen38DenseLoadStats load_stats_;
 };
+
+// Idempotent registration of ModelFamily::Qwen3_5 into ingine::model::BackendRegistry.
+void register_qwen38_cuda_backend();
 
 }  // namespace ingine::backends::qwen38

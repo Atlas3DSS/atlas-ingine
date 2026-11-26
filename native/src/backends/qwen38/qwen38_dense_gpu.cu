@@ -16,6 +16,7 @@
 #include <deque>
 #include <fcntl.h>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -975,6 +976,7 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   ropt.max_ctx = options.max_ctx;
   ropt.prefill_chunk = options.prefill_chunk;
   ropt.dense_fp8 = (c.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4);
+  ropt.prefix_cache = options.prefix_cache;
   ropt.max_batch = 1;
   profile_ = make_qwen38_worker_profile(m, ropt, "dense_bf16", "dense");
   profile_.state_identity.act_dtype = ingine::model::ActivationDtype::Fp32;
@@ -1307,6 +1309,16 @@ std::string Qwen38DenseBackend::model_id() const { return profile_.model_id; }
 
 int Qwen38DenseBackend::max_model_len() const { return profile_.max_ctx; }
 
+ingine::model::PrefixCacheStats Qwen38DenseBackend::cache_stats() const {
+  ingine::model::PrefixCacheStats cs;
+  if (impl_->opts.prefix_cache && impl_->default_session) {
+    cs.host_entries =
+        static_cast<std::uint64_t>(impl_->default_session->checkpoint_index().saved_checkpoint_lengths().size());
+    cs.host_used_bytes = static_cast<std::size_t>(impl_->default_session->saved_checkpoint_bytes());
+  }
+  return cs;
+}
+
 void Qwen38DenseBackend::reset_session() { impl_->default_session->reset(); }
 
 std::unique_ptr<ingine::model::BackendSession> Qwen38DenseBackend::create_session() {
@@ -1417,10 +1429,10 @@ void Qwen38DenseBackend::evaluate_teacher_forced_on_session(Qwen38DenseSession& 
   if (!req.cache_namespace.empty()) req_id.cache_namespace = req.cache_namespace;
   req_id.media_sha256 = ingine::model::hash_prompt_media(req.prompt.images);
 
+  const bool allow_reuse = impl_->opts.prefix_cache && req.use_prefix_cache;
   const auto tl0 = std::chrono::steady_clock::now();
   ingine::model::SessionLookupResult lk = ingine::model::restore_session_prefix(
-      sess, ingine::model::SessionLookupQuery{req_id, req.prompt.ids, req.token_mask, req.prompt.images,
-                                              req.use_prefix_cache});
+      sess, ingine::model::SessionLookupQuery{req_id, req.prompt.ids, req.token_mask, req.prompt.images, allow_reuse});
   impl_->last_lookup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl0).count();
 
   const int V = manifest().config.vocab_size;
@@ -1448,7 +1460,12 @@ void Qwen38DenseBackend::evaluate_teacher_forced_on_session(Qwen38DenseSession& 
   impl_->last_lookup = lk;
   if (!lk.hit) {
     sess.reset();
-    sess.state_->index.set_identity(req_id);
+    ingine::model::BackendStateIdentity sess_id = req_id;
+    if (!allow_reuse) {
+      // Isolate bypassed requests so subsequent prefix-cached requests cannot reuse or extend this session.
+      sess_id.checkpoint.verification_level = ingine::model::VerificationLevel::Unverified;
+    }
+    sess.state_->index.set_identity(std::move(sess_id));
   }
 
   std::vector<int> rem_caps;
@@ -1470,7 +1487,7 @@ void Qwen38DenseBackend::evaluate_teacher_forced_on_session(Qwen38DenseSession& 
         req.token_mask.empty() ? std::span<const std::uint8_t>{} : req.token_mask.subspan(lk.reused_tokens);
     impl_->forward_range(sess, suffix_ids, rem_caps, true, on_logits, prefill_ms_out, suffix_mask);
   }
-  if (req_id.is_reusable_with(req_id)) {
+  if (allow_reuse && req_id.is_reusable_with(req_id)) {
     (void)sess.save_checkpoint();
   }
 }
@@ -1550,10 +1567,14 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate_request_on_session(
     throw std::invalid_argument("BackendRequest token_mask length must equal prompt.ids length");
   }
 
-  const int eff_max_new =
+  int eff_max_new =
       sampling.forced.empty() ? max_new_tokens : std::min<int>(max_new_tokens, static_cast<int>(sampling.forced.size()));
+  const int n_prompt = static_cast<int>(req.prompt.ids.size());
+  if (n_prompt + std::int64_t(eff_max_new) > profile_.max_ctx) {
+    eff_max_new = std::max(0, profile_.max_ctx - n_prompt);
+  }
   ingine::model::GenerateStats stats;
-  stats.prompt_tokens = static_cast<int>(req.prompt.ids.size());
+  stats.prompt_tokens = n_prompt;
   if (eff_max_new <= 0) return stats;
 
   const int V = manifest().config.vocab_size;
@@ -1628,10 +1649,10 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate_request_on_session(
   if (!req.cache_namespace.empty()) req_id.cache_namespace = req.cache_namespace;
   req_id.media_sha256 = ingine::model::hash_prompt_media(req.prompt.images);
 
+  const bool allow_reuse = impl_->opts.prefix_cache && req.use_prefix_cache;
   const auto tl0 = std::chrono::steady_clock::now();
   ingine::model::SessionLookupResult lookup = ingine::model::restore_session_prefix(
-      sess, ingine::model::SessionLookupQuery{req_id, req.prompt.ids, req.token_mask, req.prompt.images,
-                                              req.use_prefix_cache});
+      sess, ingine::model::SessionLookupQuery{req_id, req.prompt.ids, req.token_mask, req.prompt.images, allow_reuse});
   impl_->last_lookup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl0).count();
 
   const std::size_t S = req.prompt.ids.size();
@@ -1654,7 +1675,11 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate_request_on_session(
   impl_->last_lookup = lookup;
   if (!lookup.hit) {
     sess.reset();
-    sess.state_->index.set_identity(req_id);
+    ingine::model::BackendStateIdentity sess_id = req_id;
+    if (!allow_reuse) {
+      sess_id.checkpoint.verification_level = ingine::model::VerificationLevel::Unverified;
+    }
+    sess.state_->index.set_identity(std::move(sess_id));
     stats.restored_bytes = 0ull;
     stats.restore_seconds = 0.0;
   } else if (lookup.reuse == ingine::model::Reuse::Checkpoint) {
@@ -1683,7 +1708,7 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate_request_on_session(
   }
 
   int evictions = 0;
-  if (req_id.is_reusable_with(req_id)) {
+  if (allow_reuse && req_id.is_reusable_with(req_id)) {
     evictions += sess.save_checkpoint();
   }
   stats.cache_evictions = evictions;
@@ -1733,7 +1758,8 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate(
     const ingine::model::PrefillCallback& on_prefill) {
   ingine::model::BackendRequest req;
   req.prompt = prompt;
-  req.use_prefix_cache = true;
+  req.cache_namespace = prompt.cache_namespace;
+  req.use_prefix_cache = impl_->opts.prefix_cache && !prompt.bypass_prefix_cache;
   return generate_request_on_session(*impl_->default_session, req, max_new_tokens, sampling, stop_ids, on_tokens,
                                      on_prefill);
 }
@@ -1744,6 +1770,30 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate(
   ingine::model::Prompt p;
   p.ids = prompt;
   return generate(p, max_new_tokens, sampling, stop_ids, on_tokens, nullptr);
+}
+
+void register_qwen38_cuda_backend() {
+  static std::once_flag once;
+  std::call_once(once, []() {
+    auto& reg = ingine::model::BackendRegistry::instance();
+    if (reg.find(ingine::model::ModelFamily::Qwen3_5).has_value()) return;
+    reg.register_backend(ingine::model::BackendRegistration{
+        ingine::model::ModelFamily::Qwen3_5,
+        "qwen38-dense",
+        [](const ingine::model::RuntimeOptions& options) -> std::unique_ptr<ingine::model::ModelBackend> {
+          const Qwen38RuntimeDispatchPlan plan = resolve_qwen38_runtime_options(options);
+          Qwen38DenseLoadOptions load_opts;
+          load_opts.model_dir = plan.normalized_options.model_dir;
+          load_opts.max_ctx = plan.max_ctx;
+          load_opts.prefill_chunk = plan.prefill_chunk;
+          load_opts.verify_pins = plan.verify_pins;
+          load_opts.use_calibrated_fp8 = plan.use_calibrated_fp8;
+          load_opts.prefix_cache = plan.prefix_cache;
+          load_opts.revision = plan.revision;
+          return std::make_unique<Qwen38DenseBackend>(load_opts);
+        },
+    });
+  });
 }
 
 }  // namespace ingine::backends::qwen38

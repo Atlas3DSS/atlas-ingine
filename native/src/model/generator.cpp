@@ -14,10 +14,12 @@
 //   4. Optional disk KV checkpoint resume (`kv_ckpt_resume` / `kv_ckpt_path`).
 #include "ingine/generator.h"
 
+#include "backends/qwen38/qwen38_dense_gpu.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/ops.h"
+#include "ingine/model_backend.h"
 #include "kernels/head/head.h"
 #include "model/batch_engine.h"
 #include "model/tp_engine.h"
@@ -35,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -1408,7 +1411,44 @@ class EngineGenerator final : public Generator {
 
 }  // namespace
 
+namespace {
+
+bool has_detectable_model_metadata(const std::filesystem::path& model_dir) {
+  if (model_dir.empty()) return false;
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(model_dir, ec)) {
+    return model_dir.extension() == ".gguf";
+  }
+  if (!std::filesystem::is_directory(model_dir, ec)) return false;
+  if (std::filesystem::is_regular_file(model_dir / "config.json", ec) ||
+      std::filesystem::is_regular_file(model_dir / "tokenizer.json", ec)) {
+    return true;
+  }
+  for (const auto& entry : std::filesystem::directory_iterator(model_dir, ec)) {
+    if (ec) break;
+    if (entry.is_regular_file(ec) && entry.path().extension() == ".gguf") return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
+  if (has_detectable_model_metadata(options.model_dir)) {
+    const ModelFamily family = detect_model_family(options.model_dir);
+    if (family == ModelFamily::Qwen3_5) {
+#if INGINE_TP_SIZE > 1
+      throw std::invalid_argument("qwen38-dense does not support INGINE_TP_SIZE > 1");
+#else
+      backends::qwen38::register_qwen38_cuda_backend();
+      return BackendRegistry::instance().create(ModelFamily::Qwen3_5, options);
+#endif
+    }
+    if (family != ModelFamily::Inkling2) {
+      throw std::invalid_argument(std::string("make_generator: model family '") + to_string(family) +
+                                  "' has no enabled CUDA generator backend");
+    }
+  }
   if (options.loop_passes < 1 || options.loop_passes > MAX_PASSES) {
     throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
   }

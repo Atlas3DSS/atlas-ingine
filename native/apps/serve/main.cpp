@@ -221,6 +221,13 @@ int main(int argc, char** argv) {
     }
 
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
+    const bool is_qwen35 = (fmt.kind() == ingine::text::ChatFormatKind::Qwen3_5);
+    if (is_qwen35) {
+      if (!ap.given("--max-ctx")) max_ctx = 8192;
+      if (!ap.given("--prefill-chunk")) prefill_chunk = 256;
+      // Phase 1 Qwen3.8 backend is text-only (ingine-serve defaults vision enabled for Inkling).
+      no_vision = true;
+    }
     std::unique_ptr<ingine::model::Generator> generator;
     if (fake) {
       const auto parsed_kv_mode = ingine::model::parse_kv_cache_mode(kv_cache_mode);
@@ -251,8 +258,9 @@ int main(int argc, char** argv) {
       }
       const bool fake_allow_last_full = (loop_passes == 3) && !spec && (max_batch <= 1);
       generator = std::make_unique<ingine::engine::FakeGenerator>(
-          fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir),
-          ingine::engine::FakeGenerator::Responder{}, fake_delay, loop_passes, parsed_kv_mode, fake_allow_last_full);
+          fmt.tokenizer(), is_qwen35 ? "Qwen3.8-27B-NVFP4-fake" : "Inkling-2-Mini-fake",
+          tokenizer_max_length(model_dir), ingine::engine::FakeGenerator::Responder{}, fake_delay, loop_passes,
+          parsed_kv_mode, fake_allow_last_full);
     } else {
 #ifdef INGINE_WITH_MODEL
       ingine::model::RuntimeOptions options;

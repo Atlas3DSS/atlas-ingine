@@ -170,8 +170,9 @@ bool is_auxiliary_gguf_arch(std::string_view tag) {
 // Exact supported HF config / Safetensors family tags ONLY (never fuzzy prefix matches that could alias V3/GLM-4).
 ModelFamily classify_safetensors_tag(std::string_view tag) {
   const std::string lower = to_lower_ascii(tag);
-  if (lower == "inkling2" || lower == "inkling_2" || lower == "inkling2forconditionalgeneration" ||
-      lower == "inkling2forcausallm") {
+  if (lower == "inkling2" || lower == "inkling_2" || lower == "inkling2_loop" || lower == "inkling2_loop_text" ||
+      lower == "inkling2forconditionalgeneration" || lower == "inkling2forcausallm" ||
+      lower == "inkling2loopforconditionalgeneration" || lower == "inkling2loopforcausallm") {
     return ModelFamily::Inkling2;
   }
   if (lower == "qwen3_5" || lower == "qwen3_5_text" || lower == "qwen3_5forconditionalgeneration" ||

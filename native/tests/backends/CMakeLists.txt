@@ -49,25 +49,27 @@ ingine_add_test(
   LABELS backend qwen38 cpu
 )
 
-ingine_add_test(
-  NAME qwen38_gpu_gate1
-  SOURCES test_qwen38_gpu_gate1.cpp
-  LIBS ingine_qwen38_cuda ingine_qwen38_cpu ingine_core nlohmann_json::nlohmann_json
-  LABELS backend qwen38 phase1a
-  GPU
-  ORACLE
-  TIMEOUT 600
-)
+if(INGINE_BACKEND STREQUAL "CUDA")
+  ingine_add_test(
+    NAME qwen38_gpu_gate1
+    SOURCES test_qwen38_gpu_gate1.cpp
+    LIBS ingine_qwen38_cuda ingine_qwen38_cpu ingine_core nlohmann_json::nlohmann_json
+    LABELS backend qwen38 phase1a
+    GPU
+    ORACLE
+    TIMEOUT 600
+  )
 
-ingine_add_test(
-  NAME qwen38_gpu_gate2
-  SOURCES test_qwen38_gpu_gate2.cpp
-  LIBS ingine_qwen38_cuda ingine_qwen38_cpu ingine_core nlohmann_json::nlohmann_json
-  LABELS backend qwen38 phase1b
-  GPU
-  ORACLE
-  TIMEOUT 900
-)
+  ingine_add_test(
+    NAME qwen38_gpu_gate2
+    SOURCES test_qwen38_gpu_gate2.cpp
+    LIBS ingine_qwen38_cuda ingine_qwen38_cpu ingine_core nlohmann_json::nlohmann_json
+    LABELS backend qwen38 phase1b
+    GPU
+    ORACLE
+    TIMEOUT 900
+  )
+endif()
 
 ingine_add_test(
   NAME qwen38_phase1c_cpu_prep
@@ -77,11 +79,21 @@ ingine_add_test(
 )
 
 ingine_add_test(
-  NAME qwen38_gpu_gate3
-  SOURCES test_qwen38_gpu_gate3.cpp
-  LIBS ingine_qwen38_cuda ingine_qwen38_cpu ingine_core nlohmann_json::nlohmann_json
-  LABELS backend qwen38 phase1c
-  GPU
-  ORACLE
-  TIMEOUT 600
+  NAME qwen38_gate4_dispatch
+  SOURCES test_qwen38_gate4_dispatch.cpp
+  LIBS ingine_qwen38_cpu ingine_serve ingine_engine ingine_text nlohmann_json::nlohmann_json
+  LABELS backend qwen38 serve cpu
+  TIMEOUT 120
 )
+
+if(INGINE_BACKEND STREQUAL "CUDA")
+  ingine_add_test(
+    NAME qwen38_gpu_gate3
+    SOURCES test_qwen38_gpu_gate3.cpp
+    LIBS ingine_qwen38_cuda ingine_qwen38_cpu ingine_core nlohmann_json::nlohmann_json
+    LABELS backend qwen38 phase1c
+    GPU
+    ORACLE
+    TIMEOUT 600
+  )
+endif()

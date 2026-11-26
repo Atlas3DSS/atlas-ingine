@@ -95,6 +95,50 @@ void FakeGenerator::set_kv_cache_mode(model::KvCacheMode mode) {
 
 std::string FakeGenerator::echo(std::span<const int32_t> prompt_ids) const {
   const std::string text = tokenizer_.decode(prompt_ids);
+  if (!tokenizer_.token_id(kMessageModel).has_value() && tokenizer_.token_id("<|im_start|>").has_value() &&
+      tokenizer_.token_id("<|im_end|>").has_value() && tokenizer_.token_id("<think>").has_value() &&
+      tokenizer_.token_id("</think>").has_value() && tokenizer_.token_id("<tool_call>").has_value() &&
+      tokenizer_.token_id("</tool_call>").has_value()) {
+    const std::string qwen_open = "<|im_start|>user\n";
+    const std::string qwen_end = "<|im_end|>";
+    std::string last;
+    for (size_t pos = 0;;) {
+      const size_t a = text.find(qwen_open, pos);
+      if (a == std::string::npos) break;
+      const size_t b = text.find(qwen_end, a + qwen_open.size());
+      if (b == std::string::npos) break;
+      last = text.substr(a + qwen_open.size(), b - a - qwen_open.size());
+      pos = b + qwen_end.size();
+    }
+    const bool no_thinking = text.ends_with("</think>\n\n");
+    const bool prefilled_think = text.ends_with("<think>\n");
+    std::string out;
+    if (auto call = match_call(last)) {
+      auto& [name, args_text] = *call;
+      const nlohmann::ordered_json args = nlohmann::ordered_json::parse(args_text.empty() ? "{}" : args_text);
+      if (!no_thinking) {
+        if (!prefilled_think) out += "<think>\n";
+        out += "Calling " + name + ".</think>\n";
+      }
+      out += "<tool_call>\n<function=" + name + ">\n";
+      if (args.is_object()) {
+        for (const auto& [k, v] : args.items()) {
+          const std::string vs = v.is_string()
+                                     ? v.get<std::string>()
+                                     : v.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
+          out += "<parameter=" + k + ">\n" + vs + "\n</parameter>\n";
+        }
+      }
+      out += "</function>\n</tool_call>" + qwen_end;
+      return out;
+    }
+    if (!no_thinking) {
+      if (!prefilled_think) out += "<think>\n";
+      out += "The user wrote " + std::to_string(code_points(last)) + " characters.</think>\n\n";
+    }
+    out += "You said: " + last + qwen_end;
+    return out;
+  }
   // re.findall(r"<\|message_user\|><\|content_text\|>(.*?)<\|end_message\|>", text, re.S)[-1]
   std::string open = std::string(kMessageUser) + std::string(kContentText);
   std::string last;

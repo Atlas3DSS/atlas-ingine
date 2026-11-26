@@ -136,6 +136,11 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
   if (config.weight_precision == Qwen38WeightPrecision::Bf16 && options.dense_fp8) {
     throw std::invalid_argument("qwen38-dense BF16 checkpoint rejects dense_fp8=true (effective numeric ABI mismatch)");
   }
+  if (options.kv_cache_mode != ingine::model::KvCacheMode::PerPass) {
+    throw std::invalid_argument("qwen38-dense does not support kv_cache_mode '" +
+                                std::string(ingine::model::to_string(options.kv_cache_mode)) +
+                                "' (only per_pass/dense_bf16 is supported)");
+  }
   if (options.kv_fp8) {
     throw std::invalid_argument("qwen38-dense does not yet support kv_fp8");
   }
@@ -154,6 +159,9 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
   if (options.park_mb > 0) {
     throw std::invalid_argument("qwen38-dense does not support host/VRAM conversation parking yet");
   }
+  if (options.park_host_mb > 0) {
+    throw std::invalid_argument("qwen38-dense does not support host conversation parking (park_host_mb)");
+  }
   if (options.max_kv_tokens != 0) {
     throw std::invalid_argument("qwen38-dense does not support shared paged pool max_kv_tokens in Phase 1");
   }
@@ -163,6 +171,29 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
   if (!options.refusal_map.empty()) {
     throw std::invalid_argument("qwen38-dense does not support refusal_map hooks");
   }
+}
+
+Qwen38RuntimeDispatchPlan resolve_qwen38_runtime_options(const ingine::model::RuntimeOptions& options,
+                                                         bool allow_unpinned) {
+  if (options.model_dir.empty()) {
+    throw std::invalid_argument("qwen38-dense dispatch requires a non-empty model_dir");
+  }
+  const Qwen38Config config = Qwen38Config::load(options.model_dir / "config.json");
+  ingine::model::RuntimeOptions normalized = options;
+  // MixedFp8Nvfp4 checkpoints use calibrated FP8 attention natively even when the CLI omits --dense-fp8.
+  if (config.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4) {
+    normalized.dense_fp8 = true;
+  }
+  validate_qwen38_runtime_options(config, normalized);
+
+  Qwen38RuntimeDispatchPlan plan;
+  plan.normalized_options = normalized;
+  plan.max_ctx = normalized.max_ctx;
+  plan.prefill_chunk = normalized.prefill_chunk;
+  plan.verify_pins = !allow_unpinned;
+  plan.use_calibrated_fp8 = (config.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4);
+  plan.prefix_cache = normalized.prefix_cache;
+  return plan;
 }
 
 }  // namespace ingine::backends::qwen38

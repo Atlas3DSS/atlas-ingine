@@ -9,6 +9,7 @@
 #include "forced.h"
 #include "ingine/batch_spec_plan.h"
 #include "ingine/generator.h"
+#include "ingine/model_backend.h"
 #include "serve/cli.h"
 #include "text/chat.h"
 
@@ -275,6 +276,11 @@ int main(int argc, char** argv) {
       resolved_max_batch = 1;
     }
 
+    if (ingine::model::detect_model_family(model_dir) == ingine::model::ModelFamily::Qwen3_5) {
+      if (!ap.given("--max-ctx")) max_ctx = 8192;
+      if (!ap.given("--prefill-chunk")) prefill_chunk = 256;
+    }
+
     cudaFree(nullptr);  // create the context before measuring the model's memory
     struct VramTracker {
       size_t total = 0;
@@ -354,7 +360,10 @@ int main(int argc, char** argv) {
 
     const auto fmt = ingine::text::ChatFormat::load(model_dir);
     const auto& tok = fmt.tokenizer();
-    const std::vector<int32_t> stop = {*tok.token_id("<|content_model_end_sampling|>")};
+    const std::vector<int32_t> stop =
+        (fmt.kind() == ingine::text::ChatFormatKind::Inkling2)
+            ? std::vector<int32_t>{*tok.token_id("<|content_model_end_sampling|>")}
+            : fmt.stop_ids();
 
     if (!concurrencies.empty()) {
       // Build distinct rendered prompts for up to resolved_max_batch concurrent sequences.

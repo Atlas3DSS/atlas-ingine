@@ -557,23 +557,26 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
   // Verified stable root-prefix boundary directly on the actual rendered token IDs:
   // leading <|message_system|> ... <|end_message|> blocks (tool_declare + leading system messages +
   // "Thinking effort level: ..." block emitted before the first non-system turn).
+  // Inkling-specific token tags must only be scanned on Inkling2 prompts (Qwen3_5 sets them to -1).
   std::size_t root_end = 0;
-  std::size_t pos = 0;
-  while (pos < prompt.ids.size() && prompt.ids[pos] == data_->message_system) {
-    ++pos;
-    while (pos < prompt.ids.size() && prompt.ids[pos] != data_->end_message) {
-      if (prompt.ids[pos] == data_->message_user || prompt.ids[pos] == data_->message_model ||
-          prompt.ids[pos] == data_->message_tool || prompt.ids[pos] == data_->message_system) {
-        pos = prompt.ids.size();
+  if (data_->kind == ChatFormatKind::Inkling2) {
+    std::size_t pos = 0;
+    while (pos < prompt.ids.size() && prompt.ids[pos] == data_->message_system) {
+      ++pos;
+      while (pos < prompt.ids.size() && prompt.ids[pos] != data_->end_message) {
+        if (prompt.ids[pos] == data_->message_user || prompt.ids[pos] == data_->message_model ||
+            prompt.ids[pos] == data_->message_tool || prompt.ids[pos] == data_->message_system) {
+          pos = prompt.ids.size();
+          break;
+        }
+        ++pos;
+      }
+      if (pos < prompt.ids.size() && prompt.ids[pos] == data_->end_message) {
+        ++pos;
+        root_end = pos;
+      } else {
         break;
       }
-      ++pos;
-    }
-    if (pos < prompt.ids.size() && prompt.ids[pos] == data_->end_message) {
-      ++pos;
-      root_end = pos;
-    } else {
-      break;
     }
   }
   prompt.root_prefix_tokens = int(root_end);

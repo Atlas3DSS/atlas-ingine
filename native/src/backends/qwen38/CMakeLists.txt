@@ -17,14 +17,16 @@ target_link_libraries(ingine_qwen38_cpu PUBLIC
 ingine_internal_includes(ingine_qwen38_cpu)
 target_compile_options(ingine_qwen38_cpu PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(ingine_qwen38_cuda STATIC
-  qwen38_cuda_ops.cu
-  qwen38_dense_gpu.cu
-)
-ingine_cuda_target(ingine_qwen38_cuda)
-ingine_internal_includes(ingine_qwen38_cuda)
-target_link_libraries(ingine_qwen38_cuda PUBLIC
-  ingine_qwen38_cpu
-  ingine_core
-  CUDA::cudart
-)
+if(INGINE_BACKEND STREQUAL "CUDA")
+  add_library(ingine_qwen38_cuda STATIC
+    qwen38_cuda_ops.cu
+    qwen38_dense_gpu.cu
+  )
+  ingine_cuda_target(ingine_qwen38_cuda)
+  ingine_internal_includes(ingine_qwen38_cuda)
+  target_link_libraries(ingine_qwen38_cuda PUBLIC
+    ingine_qwen38_cpu
+    ingine_core
+    CUDA::cudart
+  )
+endif()

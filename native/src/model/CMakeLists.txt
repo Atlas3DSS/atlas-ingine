@@ -24,7 +24,9 @@ target_include_directories(ingine_model PUBLIC ${PROJECT_SOURCE_DIR}/src ${PROJE
 target_link_libraries(ingine_model PUBLIC
   ingine_core
   ingine_ops
+  ingine_engine
   ingine_persona
+  ingine_qwen38_cuda
   ingine_kernels_dense
   ingine_kernels_moe
   ingine_kernels_attn
@@ -33,7 +35,7 @@ target_link_libraries(ingine_model PUBLIC
   CUDA::cudart)
 if(INGINE_TP_SIZE GREATER 1)
   find_library(NCCL_LIB nccl REQUIRED)
-  target_link_libraries(ingine_model PUBLIC ingine_engine ${NCCL_LIB})
+  target_link_libraries(ingine_model PUBLIC ${NCCL_LIB})
 endif()
 foreach(area prefill draft batch)
   if(TARGET ingine_kernels_${area})
