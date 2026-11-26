@@ -1,19 +1,19 @@
 # atlas-ingine
 
 Multi-architecture Apache-2.0 CUDA inference engine for
-[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), forked from
+[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), with a Qwen3.8-27B-NVFP4 backend, forked from
 [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine).
 
 ![Why use atlas-ingine: eight numbered points](docs/media/why_atlas_ingine.png)
 
-1. **Tesla P100 (2016) to RTX PRO 6000 (2025)**, `sm_60` to `sm_120a`: [measured performance](#measured-performance-16k-64k--262k-context-across-6-nvidia-generations)
-2. **9 to 14 GB checkpoints** (`ATLAS2`/`ATLAS3`, EXL3) for 6 to 24 GB cards: [checkpoints](#checkpoints-direct-hugging-face-links)
-3. **1,000,000-token context** on 6 GB to 96 GB cards: [1M table](#1000000-token-context-6-gb-to-96-gb-silicon)
-4. **Continuous batching and multi-GPU** (`TP2`/`TP4`): [fork additions](#what-this-fork-adds-over-upstream-satellitedowningine), [4× V100](#tesla-v100-sm_70-load-multi-gpu-and-other-engines-published-figures)
-5. **Token-level JSON and JSON Schema masking**, automatic tool-ban: [API](#openai-compatible-api)
-6. **KV, loop-depth, and host memory controls**, single-file weight packs: [fork additions](#what-this-fork-adds-over-upstream-satellitedowningine)
-7. **Verified Ledger SDK** and mech-interp hooks: [KernelBench](#kernelbench-level-2-benchmarks-100-tasks-continual-learning--verified-ledger), [ledger](#building-your-own-verified-ledger)
-8. **Hardware auto-tuner (`./atlas-setup`)** for upstream's standalone C++/CUDA server: [setup](#option-b-hardware-aware-auto-tuner--interactive-installer), [requirements](#requirements)
+1. **Tesla P100 (2016) to RTX PRO 6000 (2025)**, `sm_60` to `sm_120a`, on `main`: [measured performance](#measured-performance-16k-64k--262k-context-across-6-nvidia-generations). An AMD ROCm 7.2.4 HIP port for `gfx1151` is on branch [`feat/hip-full-port`](https://github.com/Atlas3DSS/atlas-ingine/tree/feat/hip-full-port) (`2a1fa4f`, 297 of 297 targets compile; not yet run on a Strix Halo).
+2. **Two models in native C++/CUDA**: Inkling-2-Mini as 9 to 20 GB files (`NVFP4+MXFP8`, `ATLAS2`/`ATLAS3`, EXL3) for 6 to 96 GB cards, and a Qwen3.8-27B-NVFP4 backend (`75577dd`; no speed table yet): [checkpoints](#checkpoints-direct-hugging-face-links), [Qwen3.8 plan](docs/QWEN38_BACKEND_PLAN.md)
+3. **1,000,000-token context** on 6 GB to 96 GB cards, with KV checkpoints that save to disk and resume: [1M table](#1000000-token-context-6-gb-to-96-gb-silicon)
+4. **Continuous batching and multi-GPU** (`TP2`/`TP4`): `463` against `259 tok/s` at 64 requests in a matched Tesla V100 test with StrataEngine SQ-20, which leads for one request without drafting: [matched test](#tesla-v100-sm_70-matched-test-load-multi-gpu-and-other-engines-published-figures), [fork additions](#what-this-fork-adds-over-upstream-satellitedowningine)
+5. **Tesla V100 single-request decode** of `100.4 tok/s` without drafting, `123.3` chat and `156.9` code with `--spec` (`56493c3`, short bench prompts), and drafting for several requests at once (`5f01889`): [measured performance](#measured-performance-16k-64k--262k-context-across-6-nvidia-generations)
+6. **Token-level JSON and JSON Schema masking**, automatic tool-ban, and KV, loop-depth, and host memory controls: [API](#openai-compatible-api), [fork additions](#what-this-fork-adds-over-upstream-satellitedowningine)
+7. **Verified Ledger SDK** and mech-interp hooks; with the same weights, 68 of 128 Loktar web tasks passed on the first attempt and 117 after verifier-guided repair with the ledger: [KernelBench and other evaluations](#kernelbench-level-2-benchmarks-100-tasks-continual-learning--verified-ledger), [ledger](#building-your-own-verified-ledger)
+8. **Hardware auto-tuner (`./atlas-setup`)** for upstream's standalone C++/CUDA server, Apache-2.0: [setup](#option-b-hardware-aware-auto-tuner--interactive-installer), [requirements](#requirements)
 
 ## Checkpoints (Direct Hugging Face Links)
 
@@ -34,7 +34,7 @@ Inkling-2-Mini has been benchmarked on real cards across **six NVIDIA GPU genera
 
 On the RTX 3090, all 24 BF16 dense output hashes matched between the pre-port build and the FP16 port. Blackwell and V100 runs passed `kernels_bitlock` (`48/48` on Blackwell) and full-model parity; P100 (`sm_60`) and Turing (`sm_75`) passed kernel tests and real-card speed benchmarks (full-model parity ctest was not run on the cloud P100/T4/RTX 6000/A100/H100 instances).
 
-Unless noted, 64K rows use `ingine-bench --max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000` on commit `901d86e` (runtime opt-in SMEM dispatch for `<=64 KiB` Turing and `<=48 KiB` Pascal). 16K rows use `--max-ctx 16384 --long-prompt 16000`. The V100 262K row uses `--effort low --tokens 64 --runs 1` with no long prompt; A100 and H100 262K rows use `--max-ctx 262144 --tokens 512 --runs 2`.
+Unless noted, 64K rows use `ingine-bench --max-ctx 65536 --dense-fp8 --kv-fp8 --spec --spec-threshold 0.8 --effort medium --tokens 512 --runs 2 --long-prompt 64000` on commit `901d86e` (runtime opt-in SMEM dispatch for `<=64 KiB` Turing and `<=48 KiB` Pascal). 16K rows use `--max-ctx 16384 --long-prompt 16000`. The V100 262K row uses `--effort low --tokens 64 --runs 1` with no long prompt; A100 and H100 262K rows use `--max-ctx 262144 --tokens 512 --runs 2`. The two V100 `main` rows after the Volta decode change (`66ef369` / `56493c3`) are `ingine-bench` on its short built-in prompts with one slot and three runs, not the 64K-prompt setting, so they are not comparable with the other rows.
 
 | GPU | Arch | Year | Checkpoint / Mode | VRAM | Chat decode | Code decode | Prefill |
 |---|---|---:|---|---:|---:|---:|---:|
@@ -43,6 +43,8 @@ Unless noted, 64K rows use `ingine-bench --max-ctx 65536 --dense-fp8 --kv-fp8 --
 | Tesla P100-PCIE 16 GB | `sm_60` (FP16) | 2016 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (64K, no-spec) | `13.17 GB` | `7.9 tok/s` | `7.5 tok/s` | `70.1 tok/s` (64K) |
 | Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (64K, `901d86e`) | `21.82 GB` | `59.8 tok/s` | `72.2 tok/s` | `717.7 tok/s` (64K) |
 | Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (64K, `feat/sm60-sm70-victory @ 2545a22`) | `21.82 GB` | **`81.0 tok/s`** | **`100.7 tok/s`** | **`2,052 tok/s`** (64K) |
+| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (short prompts, `--spec`, `main @ 56493c3`) | `21.57 GB` | `123.3 tok/s` | `156.9 tok/s` | — |
+| Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (short prompts, no-spec, `66ef369`) | `20.41 GB` | `100.4 tok/s` | `100.4 tok/s` | — |
 | Tesla V100-PCIE 32 GB | `sm_70` (FP16) | 2017 | [Native `NVFP4+MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (262K) | `25.04 GB` | `46.0 tok/s` | `54.9 tok/s` | — |
 | Tesla T4 16 GB | `sm_75` (FP16) | 2018 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (16K, `--spec`) | `13.33 GB` | `23.5 tok/s` | `25.2 tok/s` | `303 tok/s` (16K) |
 | Tesla T4 16 GB | `sm_75` (FP16) | 2018 | [Elastic `atlas-10g`](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-10g-ingine) (64K, `--spec`) | `14.34 GB` | `22.1 tok/s` | `23.9 tok/s` | `237 tok/s` (64K) |
@@ -70,11 +72,22 @@ External baseline reference points (different hardware, quants, or settings — 
 - **Project Maya** (AMD ROCm/HIP & multi-GPU Inkling-2-Mini serving) and **`llama.cpp` / `Atlas3DSS/atlas-engine`** (GGUF serving; see [Atlas3DSS/atlas-engine](https://github.com/Atlas3DSS/atlas-engine)).
 - **Like-for-like 6-engine RTX 3090 24 GB bare multi-turn Blender authoring showdown** (identical prompts, 6 sequences / 24 shots, no Verified Ledger, Blender 4.5.14 LTS verifier): `atlas-ingine` Native **`220.15 tok/s`** (`21.23 GiB`, `25.0%` bare pass / `43.93%` compliance — **`1.86×`** Project Maya `118.26 tok/s`, **`2.11×`** `llama.cpp v7+DSpark` `104.16 tok/s`, **`3.48×`** `Kintsugi-12G` `63.22 tok/s`), while `atlas-12g` ran **`163.73 tok/s`** (**`2.59×`** `Kintsugi-12G` with vision included; upstream `satellitedown/ingine` fails startup on `sm_86`). Adding Verified Ledger lifts `atlas-ingine` Native from `25%` bare to `100%` (`28/28` shots).
 
-### Tesla V100 (`sm_70`): load, multi-GPU, and other engines' published figures
+### Tesla V100 (`sm_70`): matched test, load, multi-GPU, and other engines' published figures
 
-![Inkling-2-Mini on the Tesla V100: atlas-ingine beside NInfer, StrataEngine, Lapilli, llama.cpp, DGX Spark and a P100 reference](docs/media/v100_inkling2mini_all_engines.png)
+![Inkling-2-Mini on the Tesla V100: a matched test against StrataEngine, and atlas-ingine beside published figures from NInfer, StrataEngine, Lapilli, llama.cpp, DGX Spark and a P100 reference](docs/media/v100_inkling2mini_all_engines.png)
 
 Measured 2026-11-25 on Tesla V100-PCIE-32GB cards with [knapcio/speedbench](https://github.com/knapcio/speedbench) at `e95a638` (native `NVFP4+MXFP8`, `--dense-fp8 --kv-fp8`, built-in DSpark for single-stream speedbench and cold prefill, no drafting for the concurrent prose runs). These runs used a pre-merge build of the Volta prefill/batch kernels and have not been repeated on current `main`.
+
+**Matched test against StrataEngine** (2026-11-26; the same Tesla V100-PCIE-32GB, speedbench-v1 prose prompts over HTTP, 256 output tokens, thinking off, two rounds, 0 failed requests in every arm). StrataEngine is release `v0.2.22` (engine `0.1.69`) with its SQ-20 pack from the [card at `04996a1e`](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata/blob/04996a1e2c45009b6a04f2af126cb6bdb2ba3587/README.md), `--parallel 64 --kv fp8`. atlas-ingine is the same pre-merge build as above (native `NVFP4+MXFP8`), not `main` after the Volta decode change.
+
+| Arm | `c=1` | `c=8` | `c=16` | `c=64` | First token at `c=64`, median / p95 | Cold 10,131-token prompt |
+|---|---:|---:|---:|---:|---:|---:|
+| atlas-ingine, no drafting, `--max-batch 64` | `44.65` | `142.36` | `204.18` | `463.37` | `6.73 s` / `6.77 s` | — |
+| atlas-ingine, `--spec`, one slot | `59.17` | — | — | — | — | `2,648 tok/s` (`3.83 s`) |
+| StrataEngine SQ-20, `--draft off` | `55.62` | `138.14` | `170.34` | `258.18` | `1.30 s` / `16.85 s` | `1,259 tok/s` (`8.05 s`) |
+| StrataEngine SQ-20, drafting on | `45.09` | `138.93` | `169.34` | `258.59` | `1.16 s` / `16.72 s` | `651 tok/s` (`15.57 s`) |
+
+Throughput is aggregate `tok/s`. atlas-ingine is ahead at 16 and 64 requests (`1.20×` and `1.79×`) and on the cold prompt (`2.1×` with Strata's drafting off); the two are level at 8. StrataEngine is ahead for one request without drafting (`55.62` against `44.65`) and starts most replies sooner at 64 (median first token `1.2–1.3 s` against `6.7 s`), while its slowest requests wait longer (p95 `16.7 s` against `6.8 s`). The cold-prompt figure is one request per arm, timed end to end including 32 output tokens. StrataEngine's SQ-10 pack with drafting failed 3 of 3 starts on this card (`CUDA error 9`), so it has no row.
 
 | Setup | speedbench full, `c=1` (geomean) | Prose, 16 concurrent | Highest load measured (prose, 0 failed) | Cold prefill, 8K |
 |---|---:|---:|---:|---:|
@@ -86,8 +99,8 @@ On one card, 64 concurrent high-effort requests of 4,096 tokens exceeded the KV 
 
 Published V100 and P100 figures from other projects, on their hardware, quants, and prompts (not re-measured here):
 
-- **[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090)** ([`docs/tesla-v100.md` at `8ea67ce`](https://github.com/ashalliants/ninfer-3090/blob/8ea67ce616c481592d3016291043ed5143c9065b/docs/tesla-v100.md); Tesla V100 32 GB at 200 W, byte-exact repack of Unsloth `UD-Q8_K_XL`, INT8 KV): `78.0 tok/s` plain and `94.3 tok/s` with DSpark (12-chat average, 262,144 max context with vision), `198.2 tok/s` aggregate at 8 concurrent (the highest it publishes), prefill `2,727 tok/s` at 8K with `--prefill-chunk 8192` at 131,072 max context (`2,170` at its default chunk). **NInfer is ahead for 1–8 users:** ours are `81.0 tok/s` chat with `--spec`, `44.7 tok/s` plain at `c=1`, and `142.2 tok/s` at `c=8`. atlas-ingine's 8K prefill is `2,900 tok/s` against `2,727`; NInfer publishes no four-card or 1,048,576-token figures.
-- **[StrataEngine Hugging Face card at `04996a1e`](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata/blob/04996a1e2c45009b6a04f2af126cb6bdb2ba3587/README.md)** (Tesla V100 32 GB, its SQ-20 and SQ-10 packs, thinking off, draft decoding on for single requests; prompts, output length, and context not stated): `70.5 tok/s` for one request, `2,287 tok/s` prefill on SQ-20, and **`990.1 tok/s` (SQ-20) and `676.0 tok/s` (SQ-10) across 64 simultaneous requests**. Our `463.4 tok/s` at `c=64` is on a different workload (speedbench prose, native `NVFP4`, no drafting), so the two are not like for like; Strata's published 64-request figure is the higher one.
+- **[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090)** ([`docs/tesla-v100.md` at `8ea67ce`](https://github.com/ashalliants/ninfer-3090/blob/8ea67ce616c481592d3016291043ed5143c9065b/docs/tesla-v100.md); Tesla V100 32 GB at 200 W, byte-exact repack of Unsloth `UD-Q8_K_XL`, INT8 KV): `78.0 tok/s` plain and `94.3 tok/s` with DSpark (12-chat average, 262,144 max context with vision), `198.2 tok/s` aggregate at 8 concurrent (the highest it publishes), prefill `2,727 tok/s` at 8K with `--prefill-chunk 8192` at 131,072 max context (`2,170` at its default chunk). **NInfer's published figures are higher at 8 users:** ours is `142.2 tok/s` at `c=8` on the pre-merge build. For one request, `main` after the Volta decode change measures `100.4 tok/s` plain and `123.3 tok/s` chat with `--spec` on `ingine-bench`'s short prompts (the earlier build: `81.0` chat at 64K, `44.7` plain over HTTP); prompts and context differ from NInfer's, so this is not a matched result. atlas-ingine's 8K prefill is `2,900 tok/s` against `2,727`; NInfer publishes no four-card or 1,048,576-token figures.
+- **[StrataEngine Hugging Face card at `04996a1e`](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata/blob/04996a1e2c45009b6a04f2af126cb6bdb2ba3587/README.md)** (Tesla V100 32 GB, its SQ-20 and SQ-10 packs, thinking off, draft decoding on for single requests; prompts, output length, and context not stated): `70.5 tok/s` for one request, `2,287 tok/s` prefill on SQ-20, and **`990.1 tok/s` (SQ-20) and `676.0 tok/s` (SQ-10) across 64 simultaneous requests**. Our `463.4 tok/s` at `c=64` is on a different workload (speedbench prose, native `NVFP4`, no drafting). On that workload the same SQ-20 pack measured `258.6 tok/s` at `c=64` in the matched test above; we did not reproduce its published workload.
 - **[Lapilli Inkling port](https://github.com/chris83-dev/lapilli-v100/blob/f9b7dd093a9ff018bc68f177f81a1d27d3ffec91/docs/community/inkling2-mini.md)** (`f9b7dd0`; V100 PCIe 32 GB, official NVFP4 experts, no drafting): `69 tok/s` decode, `850 tok/s` on a short prompt.
 - **[`llama.cpp`, realugbun `inkling2-speed` fork README](https://github.com/realugbun/llama.cpp/blob/2eb2530ec4da/README.md)** (`2eb2530`; V100 32 GB, Unsloth `UD-Q4_K_XL`): `50.7 tok/s` and `1,185 tok/s` (`pp512`) on the fork, `32.0` and `725` on mainline as measured there.
 - **[knapcio DGX Spark recipe](https://github.com/knapcio/Inkling-2-Mini-4x-DGX-Spark-TP4)** (`c0f5f1c`; GB10 `sm_121`, SGLang, DFlash2 draft model, BF16 KV; same speedbench): speedbench full `40.6` (1 Spark, stock), `73.34` (1 Spark, tuned), `152.97` (4 Sparks, tuned); prose at 16 concurrent `186.2` / `288.3` / `572.6 tok/s`. One V100 matches a tuned Spark at `c=1`; four tuned Sparks are ahead of four V100s at equal load.
@@ -130,6 +143,12 @@ All 100 Stanford KernelBench Level-2 tasks (`423217d9`, fixed deterministic perm
 
 - **300-Agent Parallel Swarm over Shared Verified Ledger (`4× RTX 5090`, `feat/continuous-batching @ fa4ecb9`, 3 archetypes × 100 tasks):** Running 300 concurrent agents (`minimal_launch`, `warp_vectorized`, `tile_fusion`) over a single shared SQLite Verified Ledger across 4 batched `ingine-serve` workers (`568` committed turns = `300` R1 + `268` R2 before the 3.5 h cap, `1.39M` completion tokens) solved **`45/100`** (`44%` `fast_1`, `2.24×` eager / `1.66×` compile) in Round 1 alone and **`55/100`** (`54%` `fast_1`, `25%` `fast_2`, `47%` `fast_1_compile`, **`2.36×` eager / `1.65×` compile geomean**, peak `14.28×`, **`0 / 159` precomputation flags**) cumulatively through Round 2 — producing **`159` verified winners**, **`62` verified failure-to-winner repairs** (`34` cross-agent + `28` same-agent), and speeding up `20` Round-1 winners in Round 2.
 - **Exploratory A100 DEV Paired Repair-Transfer (`#805`, NVIDIA A100-SXM4-40GB, `TORCH_CUDA_ARCH_LIST=8.0`, 0 infra errors):** Across 89 disjoint Level-2 targets (`58` Attempt-1 passes, `31` eligible failures forked symmetrically under `grade1` + independent `regrade`), Treatment recovered **`21 / 31`** (`67.74%`, Wilson 95% CI `[50.14%, 81.43%]`) vs Control **`19 / 31`** (`61.29%`, `[43.82%, 76.27%]`), with `4` Treatment-only wins vs `2` Control-only wins (exact two-sided McNemar `p = 0.6875`, exploratory; `14/17` vs `12/17` on retrieval hits; all `14` no-hit pairs produced identical code including `4` empty pairs).
+
+Other Verified Ledger evaluations with unchanged weights:
+
+- **Loktar web tasks** (128 canvas and front-end tasks, deterministic browser verifier; [showcase](https://monkeyalignment.com/inkling/self-repair/#loktar-testing)): `68/128` passed on the first attempt (mean score `56.91`) and `117/128` after verifier-guided repair with the Verified Ledger (mean `84.68`, 370 iterations in total). The first-attempt arm has no retries, so the difference includes the retries as well as the ledger.
+- **BenchFlow Robo Use** (local fleet, in progress; rollup of 2026-11-26 10:46 UTC): over 69 matched task/seed/host pairs, stock passed `32` (`46.4%`) and Verified Ledger `37` (`53.6%`); 11 ledger-only wins, 6 stock-only wins, 52 ties. The difference is not statistically significant at this size.
+- **BFCL v3 multi-turn** (unmodified `gorilla@6ea57973`, 800 of 800 entries, `--spec`, 2× Tesla V100): stock Inkling-2-Mini scores `42.75%` (`342/800`; base `53.5%`, missing function `30.5%`, missing parameter `43.0%`, long context `44.0%`). The Verified Ledger arm has not finished.
 
 ## Autonomous Multimodal Video Examples
 
@@ -291,6 +310,7 @@ Additional verified architecture, branch, and live-serving details:
 ## What this fork adds over upstream `satellitedown/ingine`
 
 1. **10-year NVIDIA multi-architecture support (`sm_60`/`61`, `sm_70`, `sm_75`, `sm_80`/`86`, `sm_89`, `sm_90`, `sm_120a`):**
+   - Volta (`sm_70`) single-request decode kernels (NVFP4 `dp4a` MoE, zero-SMEM FP8 GEMV, fused epilogues) and, in the batch engine, speculative drafting for more than one request at a time.
    - Native **Ampere (`sm_80`/`86`)**, **Ada (`sm_89`)**, **Hopper (`sm_90`)**, and **Blackwell (`sm_120a`)** BF16 codepaths on CUDA 12.8+ / CUDA 13.x.
    - Compile-time **FP16 activation mode (`-DINGINE_ACT_FP16=ON`)** for **Volta (`sm_70`)**, **Turing (`sm_75`)**, and **Pascal (`sm_60`/`61`)** on CUDA 12.9 uses FP16 Tensor Core instructions for `sm_70`/`75` and FP32 SIMT for `sm_60`/`61`.
    - Software fallbacks for Hopper/Blackwell-only primitives (PDL, DSMEM/cluster reductions, hardware FP4/FP8 conversions), branchless FP8/E2M1/ATLAS2/ATLAS3 unpackers, and a CTA-wide synchronization fix in `native/src/kernels/head/head.cu` (`finish_part`) preventing multi-block top-p publication races under independent thread scheduling.
