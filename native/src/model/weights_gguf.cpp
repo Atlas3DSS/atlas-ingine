@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -103,6 +104,7 @@ class GgufLoader {
     return rm(upload(h.data(), h.size() * 2), kActDType, shape);
   }
   const GgufFile& file() const { return f_; }
+  void note_q8(bool q8) { w_.dense_q8 = w_.dense_q8 || q8; }
 
  private:
   const GgufFile& f_;
@@ -324,6 +326,66 @@ void load_experts(GgufLoader& ld, const std::string& b, const char* proj, int e_
   fac = ld.f32(factor, {EXPERTS});
 }
 
+
+// ---- block-table dense matrices (Volta): Q8_0 16-row blocks kept as int8 + FP16 scales, other blocks expanded -----
+bool q8_dense_enabled() {
+#if INGINE_ACT_FP16
+  static const bool on = [] {
+    const char* e = std::getenv("INGINE_GGUF_Q8_DENSE");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+#else
+  return false;
+#endif
+}
+
+struct BlockedBuilder {
+  int K = 0;
+  std::vector<std::uint8_t> bytes;
+  std::vector<std::uint16_t> scales;
+  std::vector<std::int64_t> off;
+  std::vector<std::int32_t> soff;
+  bool any_q8 = false;
+  // 16 rows of a Q8_0 tensor, columns [32 cb0, 32 (cb0 + nb)) of rows r0 .. r0 + 15
+  void q8(const GgufTensor& t, std::int64_t r0, int cb0, int nb) {
+    if (nb * 32 != K) throw std::runtime_error("weights_gguf: Q8_0 block width");
+    off.push_back(std::int64_t(bytes.size()));
+    soff.push_back(std::int32_t(scales.size()));
+    for (int r = 0; r < 16; ++r) {
+      const std::uint8_t* row = reinterpret_cast<const std::uint8_t*>(t.row(r0 + r));
+      for (int b = 0; b < nb; ++b) {
+        const std::uint8_t* blk = row + 34 * std::size_t(cb0 + b);
+        std::uint16_t d;
+        std::memcpy(&d, blk, 2);
+        scales.push_back(d);
+        bytes.insert(bytes.end(), blk + 2, blk + 34);
+      }
+    }
+    any_q8 = true;
+  }
+  // 16 rows of FP32 values (zeros for padding) as activation-type rows
+  void act(const float* v) {
+    off.push_back(std::int64_t(bytes.size()));
+    soff.push_back(-1);
+    for (int i = 0; i < 16 * K; ++i) {
+      const std::uint16_t h = act_bits(v[i]);
+      bytes.push_back(std::uint8_t(h & 0xff));
+      bytes.push_back(std::uint8_t(h >> 8));
+    }
+  }
+  Dense upload(GgufLoader& ld, int rows) {
+    while (bytes.size() % 16) bytes.push_back(0);
+    Dense d;
+    d.w = rm(ld.upload(bytes.data(), bytes.size()), DType::U8, {rows, K});
+    d.blk_off = rm(ld.upload(off.data(), off.size() * 8), DType::I64, {std::int32_t(off.size())});
+    d.blk_soff = rm(ld.upload(soff.data(), soff.size() * 4), DType::I32, {std::int32_t(soff.size())});
+    if (scales.empty()) scales.push_back(0);
+    d.q8_scale = rm(ld.upload(scales.data(), scales.size() * 2), DType::FP16, {std::int32_t(scales.size())});
+    return d;
+  }
+};
+
 // --------------------------------------------------------------------------------------------- layers
 
 Layer load_layer_gguf(GgufLoader& ld, int l, int tp_rank, int tp_size) {
@@ -353,15 +415,39 @@ Layer load_layer_gguf(GgufLoader& ld, int l, int tp_rank, int tp_size) {
                                {"attn_rel.weight", HEADS * D_REL},        {"attn_sink_proj.weight", HEADS},
                                {"attn_k.weight", KV_DIM},                  {"attn_v.weight", KV_DIM},
                                {"attn_k_conv_proj.weight", KV_HEADS * CONV_K}, {"attn_v_conv_proj.weight", KV_HEADS * CONV_K}};
-    for (int s = 0; s < num_segs(layer.full); ++s) {
-      const std::vector<float> v = ld.rows_f32(b + src[s].name, std::int64_t(tp_rank) * src[s].rows, src[s].rows);
-      std::copy(v.begin(), v.end(), wp.begin() + std::size_t(SEG_BEGIN[s]) * H);
+    if (q8_dense_enabled()) {  // a format per 16-row block: Q8_0 tensors' blocks raw, everything else expanded
+      BlockedBuilder bb;
+      bb.K = H;
+      for (int r0 = 0; r0 < R; r0 += 16) {
+        int sg = 0;
+        while (SEG_BEGIN[sg + 1] <= r0) ++sg;
+        const int lr = r0 - SEG_BEGIN[sg];
+        const GgufTensor& t = f.at(b + src[sg].name);
+        if (t.type == GgmlType::Q8_0 && lr + 16 <= src[sg].rows) {
+          bb.q8(t, std::int64_t(tp_rank) * src[sg].rows + lr, 0, H / 32);
+        } else {
+          std::vector<float> v(std::size_t(16) * H, 0.0f);
+          const int n = std::max(0, std::min(16, src[sg].rows - lr));
+          if (n > 0) {
+            const std::vector<float> rr = ld.rows_f32(b + src[sg].name, std::int64_t(tp_rank) * src[sg].rows + lr, n);
+            std::copy(rr.begin(), rr.end(), v.begin());
+          }
+          bb.act(v.data());
+        }
+      }
+      layer.wproj = bb.upload(ld, R);
+      ld.note_q8(bb.any_q8);
+    } else {
+      for (int s = 0; s < num_segs(layer.full); ++s) {
+        const std::vector<float> v = ld.rows_f32(b + src[s].name, std::int64_t(tp_rank) * src[s].rows, src[s].rows);
+        std::copy(v.begin(), v.end(), wp.begin() + std::size_t(SEG_BEGIN[s]) * H);
+      }
+      layer.wproj = Dense{ld.act(wp, {R, H}), {}};
     }
-    layer.wproj = Dense{ld.act(wp, {R, H}), {}};
     Dense* views[NUM_SEGS] = {&layer.wq, &layer.wgate, &layer.wr, &layer.wsink,
                               &layer.wk, &layer.wv,    &layer.wk_dyn, &layer.wv_dyn};
     const std::size_t es = 2;
-    for (int s = 0; s < num_segs(layer.full); ++s) {
+    for (int s = 0; s < num_segs(layer.full) && !layer.wproj.blocked(); ++s) {  // (no row views of a block table)
       const int r0 = SEG_BEGIN[s], r1 = SEG_BEGIN[s + 1];
       views[s]->w = rm(static_cast<char*>(layer.wproj.w.data) + std::size_t(r0) * H * es, kActDType, {r1 - r0, H});
     }
@@ -369,13 +455,25 @@ Layer load_layer_gguf(GgufLoader& ld, int l, int tp_rank, int tp_size) {
   // wo [H, 3072] column-sharded to this rank's heads
   {
     const int full_cols = TOTAL_HEADS * HEAD_DIM, local = HEADS * HEAD_DIM, c0 = tp_rank * local;
+    const GgufTensor& wot = f.at(b + "attn_output.weight");
+    if (wot.row_len() != full_cols) throw std::runtime_error("weights_gguf: attn_output shape");
+    if (q8_dense_enabled() && wot.type == GgmlType::Q8_0) {  // this rank's columns are whole Q8_0 blocks
+      BlockedBuilder bb;
+      bb.K = local;
+      for (int r0 = 0; r0 < H; r0 += 16) bb.q8(wot, r0, c0 / 32, local / 32);
+      layer.wo = bb.upload(ld, H);
+      ld.note_q8(true);
+      goto wo_done;
+    }
+    {
     const std::vector<float> wo = ld.rows_f32(b + "attn_output.weight", 0, H);
-    if (f.at(b + "attn_output.weight").row_len() != full_cols) throw std::runtime_error("weights_gguf: attn_output shape");
     std::vector<float> sl(std::size_t(H) * local);
     for (int r = 0; r < H; ++r)
       std::copy(wo.begin() + std::size_t(r) * full_cols + c0, wo.begin() + std::size_t(r) * full_cols + c0 + local,
                 sl.begin() + std::size_t(r) * local);
     layer.wo = Dense{ld.act(sl, {H, local}), {}};
+    }
+  wo_done:;
   }
   {  // clip scales of this rank's heads: file [24][128] and [24][16]
     layer.q_scale = ld.f32(ld.rows_f32(b + "attn_q_clip.weight", std::int64_t(tp_rank) * HEADS, HEADS), {HEADS, HEAD_DIM});

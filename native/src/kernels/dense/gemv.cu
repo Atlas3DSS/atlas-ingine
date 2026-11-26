@@ -524,6 +524,167 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
   }
 }
 
+// ---- Volta block-table GEMV (Matrix::blk_off: GGUF dense weights) --------------------------------------
+// gemv_mma_kernel's sm_70 HMMA.884 structure (lane (qp, idx) owns one row and two contiguous chunks a step,
+// SPLITK warps over K, the same epilogues) with the format chosen per 16-row block: Q8_0 rows decode int8 -> FP16
+// exactly and multiply by the block's FP16 scale (one rounding of q * d, the value an activation-type expansion
+// stores), activation-type rows are fed as they are.
+__device__ __forceinline__ void q8x4_h2(uint32_t w, __half2 d, uint32_t& lo, uint32_t& hi) {
+  const uint32_t t = w ^ 0x80808080u;                         // q + 128 in each byte
+  uint32_t a = __byte_perm(t, 0x64646464u, 0x7170), b = __byte_perm(t, 0x64646464u, 0x7372);  // 1024 + q + 128
+  const __half2 k = __float2half2_rn(1152.f);
+  const __half2 ha = __hmul2(__hsub2(*reinterpret_cast<__half2*>(&a), k), d);
+  const __half2 hb = __hmul2(__hsub2(*reinterpret_cast<__half2*>(&b), k), d);
+  lo = *reinterpret_cast<const uint32_t*>(&ha), hi = *reinterpret_cast<const uint32_t*>(&hb);
+}
+
+template <int K, int M, int SPLITK, class Epi>
+__global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t* __restrict__ w, int rows,
+                                                                  const std::int64_t* __restrict__ blk_off,
+                                                                  const std::int32_t* __restrict__ blk_soff,
+                                                                  const uint16_t* __restrict__ q8s, uint32_t zero,
+                                                                  Epi epi) {
+  constexpr int KS = K / SPLITK;
+  __shared__ float cs[SPLITK][16][8];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int r0 = blockIdx.x * 16;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  const int qp = (lane >> 2) & 3, idx = (lane & 3) | ((lane & 16) >> 2);
+  const int rl = (qp >= 2 ? 8 : 0) + idx, rv = r0 + rl;
+  const int iv = rv < rows ? epi.input_of(rv) : -1;
+  const std::int32_t soff = blk_soff[blockIdx.x];
+  const uint8_t* base = w + blk_off[blockIdx.x];
+  float c8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+  bool waited = false;
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+  auto pass = [&](int cur, auto q8tag) {
+    constexpr bool Q8 = decltype(q8tag)::value;
+    // (Q8 rows: as many bytes in flight a warp as the activation-type rows - 6 steps of 1 KB - where the K slice
+    //  allows it; 3 steps measured half the bandwidth: the stream is bound by the bytes in flight)
+    constexpr int CPL = Q8 ? 16 : 8, SPAN = 4 * CPL;
+    constexpr int U = Q8 ? (KS % (SPAN * 6) == 0 ? 6 : MMA_U_FP8) : MMA_U_BF16, NJ = KS / SPAN;
+    static_assert(KS % (SPAN * U) == 0, "K slice must split into unrolled steps");
+    constexpr size_t ROW_BYTES = size_t(K) * (Q8 ? 1 : 2);
+    const int c0_v = warp * KS + (qp & 1) * (2 * CPL);
+    const bool lv = iv == cur, lx = idx < M;
+    const uint8_t* wv = base + size_t(lv ? rl : 0) * ROW_BYTES;
+    const uint16_t* sv = q8s + (Q8 ? soff + (lv ? rl : 0) * (K / 32) : 0);
+    const ActT* xg = epi.x_of(cur) + size_t(lx ? idx : 0) * K;
+#pragma unroll 1
+    for (int jb = 0; jb < NJ; jb += U) {
+      uint4 W0[U], W1[U];
+      uint16_t S[U];
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int col0 = c0_v + (jb + u) * SPAN;
+        const size_t off0 = size_t(col0) * (Q8 ? 1 : 2);
+        W0[u] = lv ? l2::ld_stream<WEIGHT_L2>(wv + off0, wpol) : make_uint4(0, 0, 0, 0);
+        W1[u] = lv ? l2::ld_stream<WEIGHT_L2>(wv + off0 + 16, wpol) : make_uint4(0, 0, 0, 0);
+        if constexpr (Q8) S[u] = lv ? __ldg(sv + col0 / 32) : uint16_t(0);
+      }
+      if (!waited) {
+        pdl_wait_fenced(zero);
+        pdl_trigger();
+        waited = true;
+      }
+      uint32_t dep = 0;
+#pragma unroll
+      for (int u = 0; u < U; ++u) dep ^= W0[u].x ^ W0[u].w ^ W1[u].x ^ W1[u].w;
+      dep &= zero;
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int col0 = c0_v + (jb + u) * SPAN;
+        if constexpr (Q8) {
+          const __half2 d = __halves2half2(__ushort_as_half(S[u]), __ushort_as_half(S[u]));
+          const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
+          const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
+          const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
+          const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
+          const uint32_t ww[8] = {W0[u].x, W0[u].y, W0[u].z, W0[u].w, W1[u].x, W1[u].y, W1[u].z, W1[u].w};
+          const uint4 xx[4] = {x0, x1, x2, x3};
+#pragma unroll
+          for (int s = 0; s < 4; ++s) {
+            uint32_t a0, a1, a2, a3;
+            q8x4_h2(ww[2 * s], d, a0, a1);
+            q8x4_h2(ww[2 * s + 1], d, a2, a3);
+            mma::sm70_mma_f16_direct(c8, a0, a1, a2, a3, xx[s].x ^ (s == 0 ? dep : 0u), xx[s].y, xx[s].z, xx[s].w);
+          }
+        } else {
+          const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
+          const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
+          mma::sm70_mma_f16_direct(c8, W0[u].x, W0[u].y, W0[u].z, W0[u].w, x0.x ^ dep, x0.y, x0.z, x0.w);
+          mma::sm70_mma_f16_direct(c8, W1[u].x, W1[u].y, W1[u].z, W1[u].w, x1.x, x1.y, x1.z, x1.w);
+        }
+      }
+    }
+  };
+  auto run = [&](int cur) {
+    if (soff >= 0) pass(cur, std::true_type{});
+    else pass(cur, std::false_type{});
+  };
+  if constexpr (Epi::kInputs == 1) {
+    run(0);
+  } else {
+#pragma unroll 1
+    for (int i = 0; i < Epi::kInputs; ++i)
+      if (__any_sync(0xffffffffu, iv == i)) run(i);
+  }
+  if (!waited) {
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+  }
+  mma::sm70_reduce_acc8_to_d4(c8, c);
+  cs[warp][g][2 * t] = c[0];
+  cs[warp][g][2 * t + 1] = c[1];
+  cs[warp][g + 8][2 * t] = c[2];
+  cs[warp][g + 8][2 * t + 1] = c[3];
+  __syncthreads();
+  auto total = [&](int r, int m) {
+    float s = 0.f;
+#pragma unroll
+    for (int k = 0; k < SPLITK; ++k) s += cs[k][r][m];
+    return s;
+  };
+  if constexpr (Epi::kScatter) {
+    for (int k = threadIdx.x; k < 16 * M; k += 32 * SPLITK) {
+      const int r = k / M, m = k % M, row = r0 + r;
+      if (row < rows && epi.input_of(row) >= 0) epi.store1(row, m, total(r, m));
+    }
+  } else {
+    const int r = threadIdx.x, row = r0 + r;
+    if (r < 16 && row < rows) {
+      float y[M];
+#pragma unroll
+      for (int m = 0; m < M; ++m) y[m] = total(r, m);
+      epi.store_row(row, y);
+    }
+  }
+#else
+  (void) w, (void) rows, (void) blk_off, (void) blk_soff, (void) q8s, (void) zero, (void) epi, (void) cs, (void) warp,
+      (void) lane, (void) g, (void) t, (void) r0;
+  __trap();  // (block-table matrices are built for sm_70 only: weights_gguf)
+#endif
+}
+
+__global__ void dequant_blocked_kernel(const uint8_t* __restrict__ w, const std::int64_t* __restrict__ blk_off,
+                                       const std::int32_t* __restrict__ blk_soff, const uint16_t* __restrict__ q8s,
+                                       int rows, int K, ActT* __restrict__ out) {
+  const int r = blockIdx.x, b = r / 16, rl = r % 16;
+  if (r >= rows) return;
+  const std::int32_t so = blk_soff[b];
+  const uint8_t* base = w + blk_off[b];
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    if (so >= 0) {
+      const __half d = __ushort_as_half(q8s[so + rl * (K / 32) + k / 32]);
+      const __half q = __int2half_rn(int(static_cast<int8_t>(base[size_t(rl) * K + k])));
+      out[size_t(r) * K + k] = act::from_float(__half2float(__hmul(q, d)));
+    } else {
+      out[size_t(r) * K + k] = reinterpret_cast<const ActT*>(base)[size_t(rl) * K + k];
+    }
+  }
+}
+
 // ---- launch helpers -----------------------------------------------------------------------------------
 
 // BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
@@ -540,6 +701,11 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     constexpr int MM = decltype(mc)::value;
     auto epi = make(std::integral_constant<int, MM>{});
     using E = decltype(epi);
+    if (w.blk_off) {  // block-table matrix (GGUF dense on Volta): every M on the HMMA.884 kernel
+      launch_ex(gemv_blk_v70_kernel<K, MM, SPLITK, E>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, rows,
+                w.blk_off, w.blk_soff, w.q8_scale, 0u, epi);
+      return;
+    }
     if constexpr (MM == 1 && (BLOCK > 0 || kActIsFP16)) {
       constexpr int B = BLOCK > 0 ? BLOCK : 32;  // (the branch is discarded for BLOCK = 0)
       if (fp8) {
@@ -1327,6 +1493,12 @@ void dequant_rows(const void* q, const float* scale, int rows, int K, ActT* out,
     dequant_rows_kernel<<<unsigned((total16 + 255) / 256), 256, 0, stream>>>(
         static_cast<const __nv_fp8_storage_t*>(q), scale, K, total16, out);
   CUDA_CHECK(cudaGetLastError());
+}
+
+void dequant_blocked(const Matrix& w, int K, ActT* out, cudaStream_t stream) {
+  require(w.blk_off && w.blk_soff && out, "dequant_blocked: not a block-table matrix");
+  dequant_blocked_kernel<<<w.rows, 256, 0, stream>>>(static_cast<const uint8_t*>(w.w), w.blk_off, w.blk_soff, w.q8_scale,
+                                                     w.rows, K, out);
 }
 
 }  // namespace ingine::kernels::dense

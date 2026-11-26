@@ -20,6 +20,11 @@ struct Matrix {
   const void* w = nullptr;
   const float* scale = nullptr;
   int rows = 0;
+  // Optional 16-row-block table (GGUF dense weights, Volta): block b's rows start at w + blk_off[b]; blk_soff[b] >= 0:
+  // Q8_0 rows (int8 [16, K] + FP16 scales q8_scale[blk_soff[b] + r (K / 32) + k / 32]), -1: activation-type rows.
+  const std::int64_t* blk_off = nullptr;
+  const std::int32_t* blk_soff = nullptr;
+  const std::uint16_t* q8_scale = nullptr;
 };
 
 // proj: multi-segment GEMV. xin bf16 [3, M, H]; segments int32 device [nseg, 3] = (row_begin, row_end,
@@ -69,6 +74,8 @@ void fp8_rows(const ActT* w, int rows, int K, void* q, float* scale, cudaStream_
 
 // dequant_rows: weights.dequant: out = bf16(float(q) * scale[row]) for FP8 rows [rows, K].
 void dequant_rows(const void* q, const float* scale, int rows, int K, ActT* out, cudaStream_t stream);
+// dequant_blocked: a block-table matrix (Matrix::blk_off) as activation-type rows [rows, K] (Q8_0: act(q * d)).
+void dequant_blocked(const Matrix& w, int K, ActT* out, cudaStream_t stream);
 
 // router: x bf16 [M, H]; w [128, H] fp32 (w_fp32) or bf16 holding BF16 values; bias fp32 [128];
 // idx int32 [M, 8] (descending score), wts fp32 [M, 8] = 8 s / (sum s + 1e-20).
