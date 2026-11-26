@@ -1,19 +1,15 @@
-# atlas-ingine
+# Ingine by Atlas
 
 Multi-architecture Apache-2.0 CUDA inference engine for
 [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), with a Qwen3.8-27B-NVFP4 backend, forked from
 [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine).
 
-![Why use atlas-ingine: eight numbered points](docs/media/why_atlas_ingine.png)
+![Why use Ingine by Atlas: GPU coverage, 1,000,000-token context, speed, and agent reliability](docs/media/why_atlas_ingine.png)
 
-1. **Tesla P100 (2016) to RTX PRO 6000 (2025)**, `sm_60` to `sm_120a`, on `main`: [measured performance](#measured-performance-16k-64k--262k-context-across-6-nvidia-generations). An AMD ROCm 7.2.4 HIP port for `gfx1151` is on branch [`feat/hip-full-port`](https://github.com/Atlas3DSS/atlas-ingine/tree/feat/hip-full-port) (`2a1fa4f`, 297 of 297 targets compile; not yet run on a Strix Halo).
-2. **Two models in native C++/CUDA**: Inkling-2-Mini as 9 to 20 GB files (`NVFP4+MXFP8`, `ATLAS2`/`ATLAS3`, EXL3) for 6 to 96 GB cards, and a Qwen3.8-27B-NVFP4 backend (`75577dd`; no speed table yet): [checkpoints](#checkpoints-direct-hugging-face-links), [Qwen3.8 plan](docs/QWEN38_BACKEND_PLAN.md)
-3. **1,000,000-token context** on 6 GB to 96 GB cards, with KV checkpoints that save to disk and resume: [1M table](#1000000-token-context-6-gb-to-96-gb-silicon)
-4. **Continuous batching and multi-GPU** (`TP2`/`TP4`): `463` against `259 tok/s` at 64 requests in a matched Tesla V100 test with StrataEngine SQ-20, which leads for one request without drafting: [matched test](#tesla-v100-sm_70-matched-test-load-multi-gpu-and-other-engines-published-figures), [fork additions](#what-this-fork-adds-over-upstream-satellitedowningine)
-5. **Tesla V100 single-request decode** of `100.4 tok/s` without drafting, `123.3` chat and `156.9` code with `--spec` (`56493c3`, short bench prompts), and drafting for several requests at once (`5f01889`): [measured performance](#measured-performance-16k-64k--262k-context-across-6-nvidia-generations)
-6. **Token-level JSON and JSON Schema masking**, automatic tool-ban, and KV, loop-depth, and host memory controls: [API](#openai-compatible-api), [fork additions](#what-this-fork-adds-over-upstream-satellitedowningine)
-7. **Verified Ledger SDK** and mech-interp hooks; with the same weights, 68 of 128 Loktar web tasks passed on the first attempt and 117 after verifier-guided repair with the ledger: [KernelBench and other evaluations](#kernelbench-level-2-benchmarks-100-tasks-continual-learning--verified-ledger), [ledger](#building-your-own-verified-ledger)
-8. **Hardware auto-tuner (`./atlas-setup`)** for upstream's standalone C++/CUDA server, Apache-2.0: [setup](#option-b-hardware-aware-auto-tuner--interactive-installer), [requirements](#requirements)
+1. **Ten years of NVIDIA GPUs.** Measured on real cards from the Tesla P100 (2016) to the RTX PRO 6000 (2025), 6 GB to 96 GB. Model files of 20, 14, 12 and 9 GB, and `./atlas-setup` picks the build and flags for your card: [measured performance](#measured-performance-16k-64k--262k-context-across-6-nvidia-generations), [checkpoints](#checkpoints-direct-hugging-face-links), [setup](#option-b-hardware-aware-auto-tuner--interactive-installer)
+2. **A 1,000,000-token context on one card.** Held entirely on a 24 GB card (`29 tok/s` on an RTX 3090, `53 tok/s` on an RTX 4090), paged to host RAM on 6 GB cards with 3 of 3 needles found, and saved to disk and resumed bit-identical: [1M table](#1000000-token-context-6-gb-to-96-gb-silicon)
+3. **Fast for one user and for many.** `220 tok/s` on an RTX 3090 on the same job where Project Maya ran `118`, `llama.cpp` with DSpark `104` and Kintsugi-12G `63`. On one Tesla V100, `100.4 tok/s` for a single request without drafting, `123.3` chat and `156.9` code with `--spec`, and `463 tok/s` across 64 requests (StrataEngine SQ-20 on the same card and prompts: `259`; with drafting for one request, `59.2` against `45.1`). `2,200 tok/s` across 64 streams and `460.6` chat, `586.1` code for one request on an RTX PRO 6000 (upstream `satellitedown/ingine` on an RTX 5090: `487` chat, ahead of ours, and `554` code): [engine comparison](#measured-performance-16k-64k--262k-context-across-6-nvidia-generations), [Tesla V100](#tesla-v100-sm_70-matched-test-load-multi-gpu-and-other-engines-published-figures)
+4. **Built for agents that have to be right.** Token-level JSON Schema output, image input through the model's vision tower, and the Verified Ledger SDK, which raised KernelBench Level 2 from `38%` to `86%` and browser-verified web tasks from `68` to `117` of 128 with unchanged weights: [API](#openai-compatible-api), [evaluations](#kernelbench-level-2-benchmarks-100-tasks-continual-learning--verified-ledger), [ledger](#building-your-own-verified-ledger)
 
 ## Checkpoints (Direct Hugging Face Links)
 
