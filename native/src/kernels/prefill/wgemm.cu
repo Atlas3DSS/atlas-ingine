@@ -1123,6 +1123,7 @@ void launch_exl3_rows(const Exl3GemmArgs& g, int tm, int grid_per_row_tile, int 
 
 void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, ActT* act,
                  cudaStream_t stream) {
+  if (moe_gate_up_decode(e, x, T, w, act, stream)) return;
   if (e.fmt == FMT_EXL3_2 || e.fmt == FMT_EXL3_3) {
     if (!e.exl3_scratch || (!e.w13_rout && !e.w13_rout_ptrs))
       throw std::invalid_argument("prefill moe_gate_up(EXL3): exl3_scratch and w13_rout required");
@@ -1167,6 +1168,7 @@ void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, Ac
 
 void moe_down(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, ActT* down,
               cudaStream_t stream) {
+  if (moe_down_decode(e, act, T, w, down, stream)) return;
   const int w2_fmt = e.w2_fmt >= 0 ? e.w2_fmt : e.fmt;
   if (w2_fmt == FMT_EXL3_2 || w2_fmt == FMT_EXL3_3) {
     if (!e.w2_rout && !e.w2_rout_ptrs) throw std::invalid_argument("prefill moe_down(EXL3): w2_rout required");

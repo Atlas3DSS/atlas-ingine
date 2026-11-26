@@ -212,6 +212,10 @@ struct MoeExperts {
 };
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
 // exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.
+// Decode-width (T <= 8) experts on Volta (moe_decode_v70.cu): NVFP4 / GGUF_Q5L / GGUF_IQ4. false: not taken (another
+// width, format or architecture); moe_gate_up / moe_down try these first (INGINE_MOE_DECODE=0 disables them).
+bool moe_gate_up_decode(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, ActT* act, cudaStream_t stream);
+bool moe_down_decode(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, ActT* down, cudaStream_t stream);
 void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, ActT* act,
                  cudaStream_t stream);
 // down[t * 8 + slot] = bf16(W2_e . act[pair]), bf16 [T * 8, H].

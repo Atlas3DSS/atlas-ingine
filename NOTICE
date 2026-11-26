@@ -130,3 +130,8 @@ Modifications by Atlas3DSS:
     escha-mlx and Kintsugi-Inkling-2-Mini (Apache License 2.0).
 - Native OpenAI response_format (text, json_object, json_schema) and automatic
   tool-invocation token suppression when tools are omitted.
+- Volta decode-width routed experts (src/kernels/prefill/moe_decode_v70.cu): the
+  mma.m8n8k4 expert layout (weights as A, a tile's pairs as B, a quad pair per
+  16-value sub-block, split-K warps, fused SwiGLU epilogue) follows the Volta
+  decode experts of Project Maya's ik2 engine (MIT License, Copyright (c) 2026
+  Peasant Smith and the Project Maya contributors).

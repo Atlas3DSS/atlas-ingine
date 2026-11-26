@@ -2,6 +2,7 @@ add_library(ingine_kernels_prefill STATIC
   attention.cu
   moe.cu
   wgemm.cu
+  moe_decode_v70.cu
   rows.cu
   gemm.cpp
 )
