@@ -265,12 +265,18 @@ def dequantize_rows_numpy(type_id: int, raw: bytes, n_rows: int, in_f: int) -> n
         out = np.concatenate([lo, hi], axis=1) * d + m
         return out.reshape(n_rows, in_f)
 
-    if type_id == 8:  # Q8_0: 34B / 32
+    if type_id == 8:  # Q8_0: 34B / 32 (chunked for low peak RAM on large PLE tables)
         nb = (n_rows * in_f) // 32
         blk = buf.reshape(nb, 34)
-        d = blk[:, 0:2].copy().view("<f2").astype(np.float32)
-        qs = blk[:, 2:34].view(np.int8).astype(np.float32)
-        return (qs * d).reshape(n_rows, in_f)
+        out = np.empty((nb, 32), dtype=np.float32)
+        step = 524288
+        for b0 in range(0, nb, step):
+            b1 = min(nb, b0 + step)
+            ch = blk[b0:b1]
+            d = ch[:, 0:2].copy().view("<f2").astype(np.float32)
+            qs = ch[:, 2:34].view(np.int8).astype(np.float32)
+            out[b0:b1] = qs * d
+        return out.reshape(n_rows, in_f)
 
     if type_id == 12:  # Q4_K: 144B / 256
         nb = (n_rows * in_f) // 256
@@ -328,28 +334,32 @@ def dequantize_rows_numpy(type_id: int, raw: bytes, n_rows: int, in_f: int) -> n
             u2 <<= 2
         return out.reshape(n_rows, in_f)
 
-    if type_id == 14:  # Q6_K: 210B / 256
+    if type_id == 14:  # Q6_K: 210B / 256 (chunked to keep peak temp RAM < 150 MB on CPU)
         nb = (n_rows * in_f) // 256
         blk = buf.reshape(nb, 210)
-        ql = blk[:, 0:128]
-        qh = blk[:, 128:192]
-        sc = blk[:, 192:208].view(np.int8).astype(np.float32)
-        d = blk[:, 208:210].copy().view("<f2").astype(np.float32)[:, 0]
         out = np.empty((nb, 256), dtype=np.float32)
         is_idx = np.arange(32) // 16  # 0..0 (16x), 1..1 (16x)
-        for h in range(2):
-            ql_h = ql[:, h * 64 : (h + 1) * 64]
-            qh_h = qh[:, h * 32 : (h + 1) * 32]
-            sc_h = sc[:, h * 8 : (h + 1) * 8]
-            q1 = ((ql_h[:, 0:32] & 0x0F) | (((qh_h >> 0) & 3) << 4)).astype(np.float32) - 32.0
-            q2 = ((ql_h[:, 32:64] & 0x0F) | (((qh_h >> 2) & 3) << 4)).astype(np.float32) - 32.0
-            q3 = ((ql_h[:, 0:32] >> 4) | (((qh_h >> 4) & 3) << 4)).astype(np.float32) - 32.0
-            q4 = ((ql_h[:, 32:64] >> 4) | (((qh_h >> 6) & 3) << 4)).astype(np.float32) - 32.0
-            base = h * 128
-            out[:, base + 0 : base + 32] = d[:, None] * sc_h[:, is_idx + 0] * q1
-            out[:, base + 32 : base + 64] = d[:, None] * sc_h[:, is_idx + 2] * q2
-            out[:, base + 64 : base + 96] = d[:, None] * sc_h[:, is_idx + 4] * q3
-            out[:, base + 96 : base + 128] = d[:, None] * sc_h[:, is_idx + 6] * q4
+        step = 65536
+        for b0 in range(0, nb, step):
+            b1 = min(nb, b0 + step)
+            ch = blk[b0:b1]
+            ql = ch[:, 0:128]
+            qh = ch[:, 128:192]
+            sc = ch[:, 192:208].view(np.int8).astype(np.float32)
+            d = ch[:, 208:210].copy().view("<f2").astype(np.float32)[:, 0]
+            for h in range(2):
+                ql_h = ql[:, h * 64 : (h + 1) * 64]
+                qh_h = qh[:, h * 32 : (h + 1) * 32]
+                sc_h = sc[:, h * 8 : (h + 1) * 8]
+                q1 = ((ql_h[:, 0:32] & 0x0F) | (((qh_h >> 0) & 3) << 4)).astype(np.float32) - 32.0
+                q2 = ((ql_h[:, 32:64] & 0x0F) | (((qh_h >> 2) & 3) << 4)).astype(np.float32) - 32.0
+                q3 = ((ql_h[:, 0:32] >> 4) | (((qh_h >> 4) & 3) << 4)).astype(np.float32) - 32.0
+                q4 = ((ql_h[:, 32:64] >> 4) | (((qh_h >> 6) & 3) << 4)).astype(np.float32) - 32.0
+                base = h * 128
+                out[b0:b1, base + 0 : base + 32] = d[:, None] * sc_h[:, is_idx + 0] * q1
+                out[b0:b1, base + 32 : base + 64] = d[:, None] * sc_h[:, is_idx + 2] * q2
+                out[b0:b1, base + 64 : base + 96] = d[:, None] * sc_h[:, is_idx + 4] * q3
+                out[b0:b1, base + 96 : base + 128] = d[:, None] * sc_h[:, is_idx + 6] * q4
         return out.reshape(n_rows, in_f)
 
     raise ValueError(f"Unsupported GGML type_id={type_id}")
@@ -526,17 +536,26 @@ def quantize_codebook_nd(
         pos_cb = cb[:8]
         pos_mids = 0.5 * (pos_cb[:-1] + pos_cb[1:])
 
-    q_all = torch.empty((E, R, K // 16, 16), dtype=torch.uint8, device=dev)
+    if fmt == "nvfp4":
+        packed_k = K // 2
+    elif fmt == "atlas2":
+        packed_k = K // 4
+    else:
+        packed_k = (K * 3) // 8
+        shifts = torch.arange(8, dtype=torch.int32, device=dev)
+
+    codes = torch.empty((E, R, packed_k), dtype=torch.uint8, device=dev)
     sc_all = torch.empty((E, R, K // 16), dtype=torch.float8_e4m3fn, device=dev)
 
-    chunk_e = 64 if E > 1 else 1
-    chunk_r = 2048 if K >= 1024 else 131072
+    chunk_e = 16 if E > 1 else 1
+    chunk_r = 1024 if K >= 1024 else 65536
     for e0 in range(0, E, chunk_e):
         e1 = min(E, e0 + chunk_e)
         fac = scale2[e0:e1].view(e1 - e0, 1, 1, 1)
         for r0 in range(0, R, chunk_r):
             r1 = min(R, r0 + chunk_r)
-            wb = (w_f32[e0:e1, r0:r1].view(e1 - e0, r1 - r0, K // 16, 16)) / fac
+            de, dr = e1 - e0, r1 - r0
+            wb = (w_f32[e0:e1, r0:r1].view(de, dr, K // 16, 16)) / fac
             sb = (wb.abs().amax(dim=-1).clamp(min=1e-12) / max_c).clamp(max=448.0)
             for _ in range(2):
                 scaled = wb / sb.unsqueeze(-1).clamp(min=1e-12)
@@ -554,31 +573,38 @@ def quantize_codebook_nd(
             else:
                 mag_idx = torch.bucketize(scaled.abs(), pos_mids).to(torch.uint8)
                 idx = mag_idx | ((scaled < 0).to(torch.uint8) * 8)
-            q_all[e0:e1, r0:r1] = idx
             sc_all[e0:e1, r0:r1] = sb_fp8
-
-    q_flat = q_all.reshape(E, R, K)
-    if fmt == "nvfp4":
-        q2 = q_flat.view(E, R, K // 2, 2)
-        codes = (q2[..., 0] | (q2[..., 1] << 4)).contiguous()
-    elif fmt == "atlas2":
-        q4 = q_flat.view(E, R, K // 4, 4)
-        codes = (q4[..., 0] | (q4[..., 1] << 2) | (q4[..., 2] << 4) | (q4[..., 3] << 6)).contiguous()
-    else:
-        q32 = q_flat.view(E, R, K // 32, 32)
-        lo_b = (q32 & 3).view(E, R, K // 32, 8, 4)
-        lo_bytes = lo_b[..., 0] | (lo_b[..., 1] << 2) | (lo_b[..., 2] << 4) | (lo_b[..., 3] << 6)
-        hi_b = ((q32 >> 2) & 1).view(E, R, K // 32, 4, 8).to(torch.int32)
-        shifts = torch.arange(8, dtype=torch.int32, device=dev)
-        hi_bytes = (hi_b << shifts).sum(dim=-1).to(torch.uint8)
-        codes = torch.cat([lo_bytes, hi_bytes], dim=-1).reshape(E, R, (K * 3) // 8).contiguous()
+            qf = idx.reshape(de, dr, K)
+            if fmt == "nvfp4":
+                q2 = qf.view(de, dr, K // 2, 2)
+                codes[e0:e1, r0:r1] = q2[..., 0] | (q2[..., 1] << 4)
+            elif fmt == "atlas2":
+                q4 = qf.view(de, dr, K // 4, 4)
+                codes[e0:e1, r0:r1] = q4[..., 0] | (q4[..., 1] << 2) | (q4[..., 2] << 4) | (q4[..., 3] << 6)
+            else:
+                q32 = qf.view(de, dr, K // 32, 32)
+                lo_b = (q32 & 3).view(de, dr, K // 32, 8, 4)
+                lo_bytes = lo_b[..., 0] | (lo_b[..., 1] << 2) | (lo_b[..., 2] << 4) | (lo_b[..., 3] << 6)
+                hi_b = ((q32 >> 2) & 1).view(de, dr, K // 32, 4, 8).to(torch.int32)
+                hi_bytes = (hi_b << shifts).sum(dim=-1).to(torch.uint8)
+                codes[e0:e1, r0:r1] = torch.cat([lo_bytes, hi_bytes], dim=-1).reshape(de, dr, packed_k)
 
     if not per_expert:
-        return codes.squeeze(0), sc_all.squeeze(0).contiguous(), scale2.squeeze(0).reshape(())
-    return codes, sc_all.contiguous(), scale2.contiguous()
+        return codes.squeeze(0).contiguous(), sc_all.squeeze(0).contiguous(), scale2.squeeze(0).reshape(())
+    return codes.contiguous(), sc_all.contiguous(), scale2.contiguous()
 
 
 def sha256_file(path: Path) -> str:
+    """Compute SHA-256 with a tiny per-shard .sha256 sidecar cache (size+mtime_ns validated)."""
+    st = path.stat()
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    if sidecar.is_file():
+        try:
+            meta = json.loads(sidecar.read_text(encoding="utf-8"))
+            if meta.get("size") == st.st_size and meta.get("mtime_ns") == st.st_mtime_ns and len(meta.get("sha256", "")) == 64:
+                return str(meta["sha256"])
+        except Exception:
+            pass
     h = hashlib.sha256()
     with path.open("rb") as f:
         while True:
@@ -586,7 +612,12 @@ def sha256_file(path: Path) -> str:
             if not chunk:
                 break
             h.update(chunk)
-    return h.hexdigest()
+    dig = h.hexdigest()
+    try:
+        sidecar.write_text(json.dumps({"size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": dig}) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return dig
 
 
 def link_or_copy(src_file: Path, dst_file: Path) -> None:
