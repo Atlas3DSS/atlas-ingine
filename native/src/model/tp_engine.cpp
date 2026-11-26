@@ -14,6 +14,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/host_memory.h"
+#include "core/ops.h"
 #include "engine/log.h"
 #include "kernels/attn/attn.h"
 #include "kernels/batch/batch.h"
@@ -219,6 +220,14 @@ namespace pk = kernels::prefill;
 
 constexpr int H = HIDDEN;
 constexpr int kHeadChunk = 32768;
+
+void validate_tp_request(const Prompt& prompt, const Sampling& sampling) {
+  if (!prompt.images.empty()) throw std::invalid_argument("TP mode does not support vision inputs");
+  if (sampling.persona) throw std::invalid_argument("TP mode does not support persona profiles");
+  if (prompt.ids.empty()) throw std::invalid_argument("prompt is empty");
+  ops::validate_token_ids_i32(prompt.ids.data(), int(prompt.ids.size()), VOCAB);
+  ops::validate_token_ids_i32(sampling.forced.data(), int(sampling.forced.size()), VOCAB);
+}
 
 #define NCCL_CHECK(expr)                                                                                      \
   do {                                                                                                        \
@@ -1493,10 +1502,8 @@ class TpBatchGenerator final : public Generator {
 
   int start_slot(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
                  std::int32_t& first_token, GenerateStats& stats) override {
-    if (!full_prompt.images.empty()) throw std::invalid_argument("TP mode does not support vision inputs");
-    if (sampling.persona) throw std::invalid_argument("TP mode does not support persona profiles");
+    validate_tp_request(full_prompt, sampling);
     const std::span<const std::int32_t> prompt = full_prompt.ids;
-    if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     const int n = int(prompt.size());
     if (n >= options_.max_ctx) throw std::invalid_argument("prompt exceeds max_ctx");
 
@@ -1569,13 +1576,26 @@ class TpBatchGenerator final : public Generator {
   void step_slots(std::span<const BatchSlotStep> inputs, std::span<std::int32_t> out_tokens) override {
     const int B = int(inputs.size());
     if (B == 0) return;
+    if (B > options_.max_batch || out_tokens.size() < inputs.size())
+      throw std::invalid_argument("step_slots: invalid batch size or output size");
     std::lock_guard<std::mutex> lk(mu_);
-    for (int i = 0; i < B; ++i) {
-      const int s = inputs[i].slot;
+    std::vector<bool> seen(slot_in_use_.size(), false);
+    int extra_pages = 0;
+    for (const auto& input : inputs) {
+      const int s = input.slot;
       if (s < 0 || s >= options_.max_batch || !slot_in_use_[s]) throw std::invalid_argument("step_slots: bad slot");
+      if (seen[s]) throw std::invalid_argument("step_slots: duplicate slot in batch");
+      seen[s] = true;
+      ops::validate_token_ids_i32(&input.token, 1, VOCAB);
       const int pos = slot_pos_host_[s];
       if (pos >= options_.max_ctx) throw std::runtime_error("step_slots: slot reached max_ctx");
-      if (!ensure_pages_all_unlocked(s, pos + 1)) throw std::runtime_error("step_slots: paged KV pool exhausted");
+      const int needed = (pos + 1 + bk::kPageSize - 1) / bk::kPageSize;
+      if (needed > max_pages_per_slot_) throw std::runtime_error("step_slots: paged KV pool exhausted");
+      extra_pages += std::max(0, needed - int(slot_pages_[s].size()));
+    }
+    if (extra_pages > int(free_pages_.size())) throw std::runtime_error("step_slots: paged KV pool exhausted");
+    for (const auto& input : inputs) {
+      ensure_pages_all_unlocked(input.slot, slot_pos_host_[input.slot] + 1);
     }
 
     const float* logits = nullptr;
@@ -2125,10 +2145,8 @@ class TpSpecGenerator final : public Generator {
                          std::span<const std::int32_t> stop_ids,
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
                          const PrefillCallback& on_prefill) override {
-    if (!full_prompt.images.empty()) throw std::invalid_argument("TP mode does not support vision inputs");
-    if (sampling.persona) throw std::invalid_argument("TP mode does not support persona profiles");
+    validate_tp_request(full_prompt, sampling);
     const std::span<const std::int32_t> prompt = full_prompt.ids;
-    if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     if (!sampling.forced.empty()) max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
     const int n = int(prompt.size());
     const int reserve = drafter_ ? 8 : 0;
@@ -2144,7 +2162,7 @@ class TpSpecGenerator final : public Generator {
 
     auto t0 = std::chrono::steady_clock::now();
     try {
-      prefill_all(prompt, stats);
+      prefill_all(full_prompt, stats);
       stats.prompt_tokens = n;
       std::int32_t first = sample_r0(static_cast<const float*>(logits_.p), sampling, rng);
       if (!sampling.forced.empty()) first = sampling.forced[0];
@@ -2214,14 +2232,18 @@ class TpSpecGenerator final : public Generator {
     return tot;
   }
 
-  void prefill_all(std::span<const std::int32_t> prompt, GenerateStats& stats) {
+  void prefill_all(const Prompt& request, GenerateStats& stats) {
+    const auto prompt = request.ids;
+    const bool cache_enabled = options_.prefix_cache && !request.bypass_prefix_cache;
+    // The full KV prefix lives in the active rank states. A cold prefill overwrites it.
+    if (!cache_enabled || request.cache_namespace != ckpt_namespace_) ckpt_ids_.clear();
     const int n = int(prompt.size());
     auto is_prefix = [&](const std::vector<std::int32_t>& cached) {
       return !cached.empty() && int(cached.size()) <= n &&
              std::equal(cached.begin(), cached.end(), prompt.begin());
     };
     int start = 0;
-    if (options_.prefix_cache && is_prefix(ckpt_ids_) && int(ckpt_ids_.size()) == n) {
+    if (is_prefix(ckpt_ids_) && int(ckpt_ids_.size()) == n) {
       // Exact prompt checkpoint hit!
       std::size_t restored = 0;
       pool_.run_all([&](int r) {
@@ -2240,7 +2262,7 @@ class TpSpecGenerator final : public Generator {
       stats.restored_bytes = restored;
       return;
     }
-    if (options_.prefix_cache && is_prefix(ckpt_ids_)) {
+    if (is_prefix(ckpt_ids_)) {
       std::size_t restored = 0;
       pool_.run_all([&](int r) {
         const std::size_t b = restore_state_ckpt(ranks_[r].state, ranks_[r].ckpt.p, pool_.stream(r));
@@ -2293,8 +2315,7 @@ class TpSpecGenerator final : public Generator {
       CUDA_CHECK(cudaSetDevice(0));
       drafter_->note_tokens(prompt);
     }
-    // Save checkpoint at end of prompt for fast subsequent reuse when prefix caching is enabled
-    if (options_.prefix_cache) {
+    if (cache_enabled) {
       pool_.run_all([&](int r) {
         save_state_ckpt(ranks_[r].state, ranks_[r].ckpt.p, pool_.stream(r));
         if (r == 0) {
@@ -2303,8 +2324,7 @@ class TpSpecGenerator final : public Generator {
         }
       });
       ckpt_ids_ = tokens_in_state_;
-    } else {
-      ckpt_ids_.clear();
+      ckpt_namespace_ = request.cache_namespace;
     }
   }
 
@@ -2515,6 +2535,7 @@ class TpSpecGenerator final : public Generator {
   MappedHostBuffer host_m_;
   PinnedHostBuffer host_drafts_, host_accept_;
   std::vector<std::int32_t> tokens_in_state_, ckpt_ids_;
+  std::string ckpt_namespace_;
   std::mutex mu_;
 };
 

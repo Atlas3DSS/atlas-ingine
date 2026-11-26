@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -38,6 +39,56 @@ model::GenerateStats run(model::Generator& gen, int tokens, const model::Samplin
     return true;
   });
 }
+
+#if INGINE_TP_SIZE > 1
+void check_tp_checkpoint_scope(model::Generator& gen, const model::Sampling& sampling) {
+  auto prefill = [&](const model::Prompt& prompt) {
+    return gen.generate(prompt, 1, sampling, {}, [](auto) { return true; }).reused_tokens;
+  };
+  model::Prompt a{kPrompt, {}, 0, "a"};
+  model::Prompt b{kPrompt, {}, 0, "b"};
+  const int n = int(kPrompt.size());
+  expect(prefill(a) == 0 && prefill(a) == n, "TP checkpoint warms within one namespace");
+  expect(prefill(b) == 0 && prefill(b) == n, "same text starts cold in a second namespace");
+  auto extended = kPrompt;
+  extended.push_back(42);
+  a.ids = extended;
+  expect(prefill(a) == 0, "extended prompt starts cold across namespaces");
+  a.bypass_prefix_cache = true;
+  expect(prefill(a) == 0 && prefill(a) == 0, "bypassed requests always prefill");
+  a.bypass_prefix_cache = false;
+  expect(prefill(a) == 0 && prefill(a) == int(extended.size()), "bypassed prefill leaves no reusable checkpoint");
+}
+
+void check_tp_token_bounds(model::Generator& gen, bool batch) {
+  const auto rejected = [](auto&& call) {
+    try { call(); } catch (const std::out_of_range&) { return true; }
+    return false;
+  };
+  const std::int32_t outside[] = {std::numeric_limits<std::int32_t>::max()};
+  const std::int32_t negative[] = {-1};
+  model::Sampling sampling;
+  auto generate = [&](std::span<const std::int32_t> ids) {
+    gen.generate(ids, 1, sampling, {}, [](auto) { return true; });
+  };
+  expect(rejected([&] { generate(outside); }), "TP validates prompt token bounds on the host");
+  sampling.forced = negative;
+  expect(rejected([&] { generate(kPrompt); }), "TP validates forced token bounds on the host");
+  if (!batch) return;
+  model::GenerateStats stats;
+  std::int32_t first;
+  sampling.forced = {};
+  const int slot = gen.start_slot(model::Prompt{kPrompt, {}}, 2, sampling, first, stats);
+  expect(slot >= 0, "TP batch slot available after rejected inputs");
+  if (slot < 0) return;
+  const model::BatchSlotStep invalid[] = {{slot, outside[0]}};
+  const model::BatchSlotStep valid[] = {{slot, first}};
+  std::int32_t out[1]{};
+  expect(rejected([&] { gen.step_slots(invalid, out); }), "TP validates batch step token bounds before advancing");
+  gen.step_slots(valid, out);
+  gen.release_slot(slot);
+}
+#endif
 
 }  // namespace
 
@@ -91,6 +142,10 @@ int main() {
     expect(out == short_forced && cap_st.generated_tokens == int(short_forced.size()) &&
                cap_st.spec_trace.size() == std::size_t(cap_st.spec_rounds),
            "speculative forced replay caps max_new_tokens at forced.size()");
+#if INGINE_TP_SIZE > 1
+    check_tp_checkpoint_scope(*gen, greedy);
+    check_tp_token_bounds(*gen, false);
+#endif
   }
   {
     o.spec = false;
@@ -106,6 +161,9 @@ int main() {
     const model::GenerateStats cap_st = run(*gen, tokens, forced, out);
     expect(out == short_forced && cap_st.generated_tokens == int(short_forced.size()) && cap_st.spec_trace.empty(),
            "plain forced replay caps max_new_tokens at forced.size()");
+#if INGINE_TP_SIZE > 1
+    check_tp_token_bounds(*gen, true);
+#endif
   }
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
   return g_failures ? 1 : 0;
