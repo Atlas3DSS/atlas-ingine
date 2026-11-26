@@ -15,11 +15,13 @@
 
 namespace ingine::kernels::dense {
 
-// A weight matrix [rows, K]: BF16 rows (scale == nullptr) or float8_e4m3fn rows with fp32 per-row scales.
+// A weight matrix [rows, K]: BF16/FP16 rows (scale == nullptr && !q5_k), float8_e4m3fn rows with fp32 per-row
+// scales (scale != nullptr), or packed GGML Q5_K super-blocks (q5_k == true, 176 B / 256 elems, scale == nullptr).
 struct Matrix {
   const void* w = nullptr;
   const float* scale = nullptr;
   int rows = 0;
+  bool q5_k = false;
 };
 
 // proj: multi-segment GEMV. xin bf16 [3, M, H]; segments int32 device [nseg, 3] = (row_begin, row_end,
@@ -69,6 +71,11 @@ void fp8_rows(const ActT* w, int rows, int K, void* q, float* scale, cudaStream_
 
 // dequant_rows: weights.dequant: out = bf16(float(q) * scale[row]) for FP8 rows [rows, K].
 void dequant_rows(const void* q, const float* scale, int rows, int K, ActT* out, cudaStream_t stream);
+
+// quantize_q5_k_rows / dequant_q5_k_rows: GGML Q5_K super-block (176 B / 256 elems, K % 256 == 0)
+// load-time requantization and prefill dequantization into ActT scratch.
+void quantize_q5_k_rows(const ActT* w, int rows, int K, void* q, cudaStream_t stream);
+void dequant_q5_k_rows(const void* q, int rows, int K, ActT* out, cudaStream_t stream);
 
 // router: x bf16 [M, H]; w [128, H] fp32 (w_fp32) or bf16 holding BF16 values; bias fp32 [128];
 // idx int32 [M, 8] (descending score), wts fp32 [M, 8] = 8 s / (sum s + 1e-20).

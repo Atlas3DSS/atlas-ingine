@@ -65,13 +65,21 @@ struct Args {
   double max_kl = 0.25;
   double max_mean_kl = 0.01;
   double min_top1 = 0.95;
+  bool loop_bf16 = false;
+  std::string attn_requant = "off";
+  int offload_vram_mb = 0;
+  int offload_ram_mb = 12288;
+  std::string offload_mode = "auto";
+  int expert_swaps = 0;
+  bool force_no_dense_fp8 = false;
 };
 
 void usage() {
   std::printf(
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec]]\n"
       "                       [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
-      "                       [--min-top1 F]\n"
+      "                       [--min-top1 F] [--loop-bf16] [--attn-requant off|q5_k] [--offload-vram-mb N]\n"
+      "                       [--offload-ram-mb N] [--offload-mode auto|dma-lru|uva] [--expert-swaps N] [--no-dense-fp8]\n"
       "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
       "plain-projection file the goldens of the abliterated model were made with\n");
 }
@@ -297,6 +305,13 @@ int main(int argc, char** argv) {
     else if (k == "--max-kl") a.max_kl = std::stod(val());
     else if (k == "--max-mean-kl") a.max_mean_kl = std::stod(val());
     else if (k == "--min-top1") a.min_top1 = std::stod(val());
+    else if (k == "--loop-bf16") a.loop_bf16 = true;
+    else if (k == "--attn-requant") a.attn_requant = val();
+    else if (k == "--offload-vram-mb") a.offload_vram_mb = std::stoi(val());
+    else if (k == "--offload-ram-mb") a.offload_ram_mb = std::stoi(val());
+    else if (k == "--offload-mode") a.offload_mode = val();
+    else if (k == "--expert-swaps") a.expert_swaps = std::stoi(val());
+    else if (k == "--no-dense-fp8") a.force_no_dense_fp8 = true;
     else {
       usage();
       return k == "--help" || k == "-h" ? 0 : 2;
@@ -332,10 +347,16 @@ int main(int argc, char** argv) {
       opt.model_dir = a.model_dir;
       opt.ablation = key.first ? a.ablation : fs::path();
       opt.kv_fp8 = key.second;
-      opt.dense_fp8 = manifest.value("dense_fp8", true);
+      opt.dense_fp8 = a.force_no_dense_fp8 ? false : manifest.value("dense_fp8", true);
       opt.max_ctx = manifest.value("max_ctx", 8192);
       opt.prefill_chunk = manifest.value("prefill_chunk", 2048);
       opt.spec = a.generate && a.spec;
+      opt.loop_bf16 = a.loop_bf16;
+      opt.attn_requant = parse_attn_requant_mode(a.attn_requant);
+      opt.offload_vram_mb = a.offload_vram_mb;
+      opt.offload_ram_mb = a.offload_ram_mb;
+      opt.offload_mode = a.offload_mode;
+      opt.expert_swaps = a.expert_swaps;
       std::printf("== %s model, %s full-attention KV\n", key.first ? "abliterated" : "original",
                   key.second ? "FP8" : "BF16");
       if (a.path_tokens > 0) run_path(opt, cases, a, tot, gaps);

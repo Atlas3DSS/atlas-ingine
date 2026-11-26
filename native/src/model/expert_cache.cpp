@@ -148,9 +148,14 @@ ExpertCache::ExpertLayout ExpertCache::layout_for(ExpertFormat w13_fmt, ExpertFo
 }
 
 ExpertCache::~ExpertCache() {
+  dma_.synchronize();
   dump_router_stats_if_configured();
   if (idx_ready_) cudaEventDestroy(idx_ready_);
   if (pass0_done_) cudaEventDestroy(pass0_done_);
+  if (victim_release_ev_) cudaEventDestroy(victim_release_ev_);
+  for (auto& inf : inflight_) {
+    if (inf.done) cudaEventDestroy(inf.done);
+  }
 }
 
 std::shared_ptr<ExpertCache> ExpertCache::create(
@@ -162,10 +167,14 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
     std::size_t warm_ram_budget,
     const OffloadConfig& cfg,
     cudaStream_t stream) {
+  if (cfg.expert_swaps < 0) {
+    throw std::invalid_argument("expert_cache: expert_swaps must be >= 0");
+  }
   auto cache = std::shared_ptr<ExpertCache>(new ExpertCache());
   cache->w13_formats_ = w13_formats;
   cache->w2_formats_ = w2_formats;
   cache->dump_router_stats_ = cfg.dump_router_stats;
+  cache->swap_queue_ = BoundedSwapQueue(cfg.expert_swaps);
 
   // Group layers by distinct ExpertLayout::record_bytes so mixed (w13_fmt, w2_fmt) models
   // (e.g. EXL3_2/EXL3_3) share exact-sized VramLruSlab buckets with zero wasted padding.
@@ -190,6 +199,10 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
 
   CUDA_CHECK(cudaEventCreateWithFlags(&cache->idx_ready_, cudaEventDisableTiming));
   CUDA_CHECK(cudaEventCreateWithFlags(&cache->pass0_done_, cudaEventDisableTiming));
+  CUDA_CHECK(cudaEventCreateWithFlags(&cache->victim_release_ev_, cudaEventDisableTiming));
+  for (auto& inf : cache->inflight_) {
+    CUDA_CHECK(cudaEventCreateWithFlags(&inf.done, cudaEventDisableTiming));
+  }
   cache->host_idx_ = MappedHostBuffer(8 * TOP_K * sizeof(int));
   cache->host_counts_ = MappedHostBuffer(EXPERTS * sizeof(int));
   for (int i = 0; i < 2; ++i) {
@@ -223,6 +236,10 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
   if (cfg.mode == "uva") desired = OffloadMode::Uva;
   else if (cfg.mode != "auto" && cfg.mode != "dma-lru") {
     throw std::invalid_argument("expert_cache: unknown offload_mode '" + cfg.mode + "' (expected auto|dma-lru|uva)");
+  }
+  if (cfg.expert_swaps > 0 && desired == OffloadMode::Uva) {
+    throw std::invalid_argument(
+        "expert_cache: --expert-swaps > 0 is not supported with --offload-mode uva (use auto or dma-lru)");
   }
 
   // Decide LRU slab sizes and tier assignments.
@@ -264,6 +281,11 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
     n_hot = n_warm = n_cold = 0;
     for (const Item& it : items) {
       ExpertMeta& em = cache->meta_[it.l][it.e];
+      em.has_warm_backing = false;
+      em.has_cold_backing = false;
+      em.evictable_hot = false;
+      em.hot_slot = -1;
+      em.inflight_slot = -1;
       if (hot_used + it.bytes <= hot_budget) {
         em.tier = Tier::HotVram;
         hot_used += it.bytes;
@@ -271,12 +293,27 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
       } else if (warm_used + it.bytes <= warm_ram_budget) {
         em.tier = Tier::WarmRam;
         em.warm_offset = warm_used;
+        em.has_warm_backing = true;
         warm_used += it.bytes;
         ++n_warm;
       } else {
         em.tier = Tier::ColdNvme;
+        em.has_cold_backing = true;
         cold_used += it.bytes;
         ++n_cold;
+      }
+    }
+    // When bounded async HOT swapping is enabled (--expert-swaps > 0), mirror as many HOT experts as fit in
+    // remaining warm_ram_budget into immutable pinned RAM so HOT->WARM eviction is 0-byte D2H and instant re-fetch.
+    // Remaining HOT experts still receive verified ColdNvme FileSlices in Pass A below.
+    if (cfg.expert_swaps > 0) {
+      for (const Item& it : items) {
+        ExpertMeta& em = cache->meta_[it.l][it.e];
+        if (em.tier == Tier::HotVram && warm_used + it.bytes <= warm_ram_budget) {
+          em.warm_offset = warm_used;
+          em.has_warm_backing = true;
+          warm_used += it.bytes;
+        }
       }
     }
     // Trim any bucket slab that has zero non-HOT experts (nothing will ever miss into it).
@@ -309,6 +346,8 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
 
   // Allocate Tier 0 HOT VRAM and Dynamic LRU slabs.
   if (hot_used > 0) cache->hot_vram_ = DeviceBuffer(hot_used);
+  cache->hot_slots_.resize(std::size_t(num_buckets));
+  cache->hot_slot_ptrs_.resize(std::size_t(num_buckets));
   cache->slabs_.resize(std::size_t(num_buckets));
   std::size_t lru_vram_bytes = 0;
   int lru_slots_total = 0;
@@ -397,6 +436,29 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
                                " expert tensor byte sizes do not match format " + format_name(w13_formats[l]) + "/" +
                                format_name(w2_formats[l]));
     }
+    auto assign_cold_slices = [&](int e, ExpertMeta& em) {
+      em.cold_w13 = FileSlice{ensure_mmap(lrefs[l].w13.file),
+                              lrefs[l].w13->offset + std::uint64_t(e) * lo.w13_bytes, lo.w13_bytes};
+      em.cold_w13_s = FileSlice{ensure_mmap(lrefs[l].w13_s.file),
+                                lrefs[l].w13_s->offset + std::uint64_t(e) * lo.w13_scale_bytes, lo.w13_scale_bytes};
+      if (exl13) {
+        em.cold_w13_rout = FileSlice{ensure_mmap(lrefs[l].w13_rout.file),
+                                     lrefs[l].w13_rout->offset + std::uint64_t(e) * lo.w13_rout_bytes,
+                                     lo.w13_rout_bytes};
+      }
+      em.cold_w2 = FileSlice{ensure_mmap(lrefs[l].w2.file),
+                             lrefs[l].w2->offset + std::uint64_t(e) * lo.w2_bytes, lo.w2_bytes};
+      em.cold_w2_s = FileSlice{ensure_mmap(lrefs[l].w2_s.file),
+                               lrefs[l].w2_s->offset + std::uint64_t(e) * lo.w2_scale_bytes, lo.w2_scale_bytes};
+      if (exl2) {
+        em.cold_w2_rout = FileSlice{ensure_mmap(lrefs[l].w2_rout.file),
+                                    lrefs[l].w2_rout->offset + std::uint64_t(e) * lo.w2_rout_bytes,
+                                    lo.w2_rout_bytes};
+      }
+      em.has_cold_backing = true;
+      max_cold_rec = std::max(max_cold_rec, lo.record_bytes);
+    };
+    const int b = cache->layer_slab_[l];
     for (int e = 0; e < EXPERTS; ++e) {
       ExpertMeta& em = cache->meta_[l][e];
       if (em.tier == Tier::HotVram) {
@@ -404,26 +466,19 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
         hot_cursor += lo.record_bytes;
         em.hot_ptr = dst_gpu;
         cache->set_host_ptrs(l, e, dst_gpu);
+        if (cfg.expert_swaps > 0) {
+          // Give every evictable HOT record verified immutable backing (WARM mirror when RAM permits, plus
+          // verified COLD FileSlices so eviction can never lose expert weights).
+          assign_cold_slices(e, em);
+          em.evictable_hot = (em.has_warm_backing || em.has_cold_backing);
+          const int sidx = int(cache->hot_slots_[std::size_t(b)].size());
+          em.hot_slot = sidx;
+          cache->hot_slots_[std::size_t(b)].push_back(
+              BoundedSwapQueue::HotSlotState{l, e, em.evictable_hot, false, 0, 0});
+          cache->hot_slot_ptrs_[std::size_t(b)].push_back(dst_gpu);
+        }
       } else if (em.tier == Tier::ColdNvme) {
-        em.cold_w13 = FileSlice{ensure_mmap(lrefs[l].w13.file),
-                                lrefs[l].w13->offset + std::uint64_t(e) * lo.w13_bytes, lo.w13_bytes};
-        em.cold_w13_s = FileSlice{ensure_mmap(lrefs[l].w13_s.file),
-                                  lrefs[l].w13_s->offset + std::uint64_t(e) * lo.w13_scale_bytes, lo.w13_scale_bytes};
-        if (exl13) {
-          em.cold_w13_rout = FileSlice{ensure_mmap(lrefs[l].w13_rout.file),
-                                       lrefs[l].w13_rout->offset + std::uint64_t(e) * lo.w13_rout_bytes,
-                                       lo.w13_rout_bytes};
-        }
-        em.cold_w2 = FileSlice{ensure_mmap(lrefs[l].w2.file),
-                               lrefs[l].w2->offset + std::uint64_t(e) * lo.w2_bytes, lo.w2_bytes};
-        em.cold_w2_s = FileSlice{ensure_mmap(lrefs[l].w2_s.file),
-                                 lrefs[l].w2_s->offset + std::uint64_t(e) * lo.w2_scale_bytes, lo.w2_scale_bytes};
-        if (exl2) {
-          em.cold_w2_rout = FileSlice{ensure_mmap(lrefs[l].w2_rout.file),
-                                      lrefs[l].w2_rout->offset + std::uint64_t(e) * lo.w2_rout_bytes,
-                                      lo.w2_rout_bytes};
-        }
-        max_cold_rec = std::max(max_cold_rec, lo.record_bytes);
+        assign_cold_slices(e, em);
       }
     }
   }
@@ -472,6 +527,10 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
             } else if (em.tier == Tier::HotVram) {
               const auto bslot = thread_stage.acquire();
               read_record_into(e, bslot.ptr);
+              if (em.has_warm_backing) {
+                auto* dst_host = reinterpret_cast<std::uint8_t*>(cache->warm_ram_.data()) + em.warm_offset;
+                std::memcpy(dst_host, bslot.ptr, lo.record_bytes);
+              }
               std::lock_guard<std::mutex> lk(stream_mu);
               CUDA_CHECK(cudaMemcpyAsync(em.hot_ptr, bslot.ptr, lo.record_bytes, cudaMemcpyHostToDevice, stream));
               thread_stage.mark_submitted(bslot.index, stream);
@@ -509,8 +568,8 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
     }
   }
 
-  // Allocate pinned bounce ring for COLD NVMe mmap reads (only when cold experts exist).
-  if (n_cold > 0) {
+  // Allocate pinned bounce ring for COLD NVMe mmap reads whenever cold experts or cold-backed HOT swaps exist.
+  if (max_cold_rec > 0) {
     cache->cold_bounce_ = PinnedBounceRing(16, max_cold_rec);
   }
 
@@ -525,6 +584,7 @@ std::shared_ptr<ExpertCache> ExpertCache::create(
   cache->stats_.warm_experts = n_warm;
   cache->stats_.cold_experts = n_cold;
   cache->stats_.lru_slots_total = lru_slots_total;
+  cache->stats_.expert_swaps_cap = cfg.expert_swaps;
   cache->stats_.hot_vram_bytes = hot_used;
   cache->stats_.lru_vram_bytes = lru_vram_bytes;
   cache->stats_.warm_ram_bytes = warm_used;
@@ -602,7 +662,11 @@ bool ExpertCache::stage_expert(int l, int e, std::uint64_t pin_gen) {
     return false;
   }
   if (res.evicted) {
-    clear_host_ptrs(key_layer(res.evicted_key), key_expert(res.evicted_key));
+    const int el = key_layer(res.evicted_key);
+    const int ee = key_expert(res.evicted_key);
+    if (meta_[el][ee].tier != Tier::HotVram) {
+      clear_host_ptrs(el, ee);
+    }
   }
   if (em.tier == Tier::WarmRam) {
     const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(warm_ram_.data()) + em.warm_offset;
@@ -620,8 +684,133 @@ bool ExpertCache::stage_expert(int l, int e, std::uint64_t pin_gen) {
   return true;
 }
 
+void ExpertCache::complete_inflight_swap(int inf_idx) {
+  InflightSwap& inf = inflight_[std::size_t(inf_idx)];
+  if (!inf.active) return;
+  const int nl = inf.new_layer;
+  const int ne = inf.new_expert;
+  const int b = inf.bucket;
+  const int hs = inf.hot_slot;
+  ExpertMeta& nem = meta_[nl][ne];
+  nem.tier = Tier::HotVram;
+  nem.hot_ptr = inf.dst_vram;
+  nem.hot_slot = hs;
+  nem.inflight_slot = -1;
+  nem.evictable_hot = (nem.has_warm_backing || nem.has_cold_backing);
+  set_host_ptrs(nl, ne, inf.dst_vram);
+  auto& hslot = hot_slots_[std::size_t(b)][std::size_t(hs)];
+  hslot.layer = nl;
+  hslot.expert = ne;
+  hslot.evictable = nem.evictable_hot;
+  hslot.swap_inflight = false;
+  hslot.last_use = ++swap_tick_;
+  swap_queue_.mark_inflight(nl, ne, false);
+  inf.active = false;
+  ++stats_.async_swaps_completed;
+}
+
+void ExpertCache::poll_inflight_swaps() {
+  for (int i = 0; i < kMaxInflightSwaps; ++i) {
+    if (!inflight_[std::size_t(i)].active) continue;
+    const cudaError_t st = cudaEventQuery(inflight_[std::size_t(i)].done);
+    if (st == cudaSuccess) {
+      complete_inflight_swap(i);
+    } else if (st != cudaErrorNotReady) {
+      CUDA_CHECK(st);
+    }
+  }
+}
+
+void ExpertCache::finalize_all_inflight_swaps(cudaStream_t compute_stream) {
+  if (!swap_queue_.enabled()) return;
+  bool any = false;
+  for (int i = 0; i < kMaxInflightSwaps; ++i) {
+    if (!inflight_[std::size_t(i)].active) continue;
+    complete_inflight_swap(i);
+    any = true;
+  }
+  if (any) {
+    for (int l = 0; l < LAYERS; ++l) flush_layer_table(l);
+    dma_.record_and_wait_on(compute_stream);
+  }
+}
+
+void ExpertCache::drain_swap_queue_async(int current_layer, std::uint64_t cur_pin_gen, cudaStream_t compute_stream) {
+  if (!swap_queue_.enabled() || mode_ != OffloadMode::DmaLru) return;
+  poll_inflight_swaps();
+  int free_inf = -1;
+  for (int i = 0; i < kMaxInflightSwaps; ++i) {
+    if (!inflight_[std::size_t(i)].active) {
+      free_inf = i;
+      break;
+    }
+  }
+  if (free_inf < 0) return;
+
+  BoundedSwapQueue::Entry cand{};
+  while (swap_queue_.pop(cand)) {
+    const int nl = cand.layer;
+    const int ne = cand.expert;
+    ExpertMeta& nem = meta_[nl][ne];
+    if (nem.tier == Tier::HotVram || nem.inflight_slot >= 0) continue;
+    if (!nem.has_warm_backing && !nem.has_cold_backing) continue;
+    const int b = layer_slab_[nl];
+    if (hot_slots_[std::size_t(b)].empty()) continue;
+    const int victim = swap_queue_.select_victim(hot_slots_[std::size_t(b)], current_layer, cur_pin_gen,
+                                                 swap_queue_.live_hits(nl, ne));
+    if (victim < 0) continue;
+
+    auto& vslot = hot_slots_[std::size_t(b)][std::size_t(victim)];
+    const int ol = vslot.layer;
+    const int oe = vslot.expert;
+    ExpertMeta& oem = meta_[ol][oe];
+    if (!oem.has_warm_backing && !oem.has_cold_backing) {
+      throw std::logic_error("expert_cache: evictable HOT expert lacks immutable backing");
+    }
+    // Demote victim back to its immutable WARM/COLD tier (0 bytes D2H).
+    oem.tier = oem.has_warm_backing ? Tier::WarmRam : Tier::ColdNvme;
+    oem.hot_ptr = nullptr;
+    oem.hot_slot = -1;
+    oem.evictable_hot = false;
+    clear_host_ptrs(ol, oe);
+    ++stats_.hot_evictions;
+
+    std::uint8_t* dst_vram = hot_slot_ptrs_[std::size_t(b)][std::size_t(victim)];
+    vslot.swap_inflight = true;
+    nem.inflight_slot = free_inf;
+    swap_queue_.mark_inflight(nl, ne, true);
+
+    // Ensure prior compute kernels on compute_stream finish reading the victim slot before dma_.stream() overwrites it.
+    CUDA_CHECK(cudaEventRecord(victim_release_ev_, compute_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(dma_.stream(), victim_release_ev_, 0));
+
+    const ExpertLayout& lo = layouts_[nl];
+    if (nem.has_warm_backing) {
+      const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(warm_ram_.data()) + nem.warm_offset;
+      dma_.copy_h2d_async(dst_vram, src, lo.record_bytes);
+    } else {
+      const auto bslot = cold_bounce_.acquire();
+      read_cold_to_host(nl, ne, bslot.ptr);
+      dma_.copy_h2d_async(dst_vram, bslot.ptr, lo.record_bytes);
+      cold_bounce_.mark_submitted(bslot.index, dma_.stream());
+    }
+    stats_.pcie_h2d_bytes += lo.record_bytes;
+
+    InflightSwap& inf = inflight_[std::size_t(free_inf)];
+    inf.active = true;
+    inf.bucket = b;
+    inf.hot_slot = victim;
+    inf.new_layer = nl;
+    inf.new_expert = ne;
+    inf.dst_vram = dst_vram;
+    CUDA_CHECK(cudaEventRecord(inf.done, dma_.stream()));
+    break;
+  }
+}
+
 void ExpertCache::prepare_decode(int l, const int* d_idx, int m, cudaStream_t compute_stream) {
   if (mode_ == OffloadMode::Uva && dump_router_stats_.empty()) return;
+  finalize_all_inflight_swaps(compute_stream);
 
   const int nslots = m * TOP_K;
   CUDA_CHECK(cudaMemcpyAsync(host_idx_.data(), d_idx, std::size_t(nslots) * sizeof(int), cudaMemcpyDeviceToHost,
@@ -744,16 +933,22 @@ void ExpertCache::run_decode_layer(
     return;
   }
 
+  const bool swaps_on = swap_queue_.enabled();
+  if (swaps_on) poll_inflight_swaps();
+
   int t0 = 0;
   while (t0 < m) {
     if (t0 > 0) CUDA_CHECK(cudaStreamSynchronize(compute_stream));
     std::uint64_t seen_lo = 0, seen_hi = 0;
+    std::array<int, 8 * TOP_K> slice_hot{};
     std::array<int, 8 * TOP_K> slice_non_hot{};
     int n_non_hot = 0;
     int n_hot = 0;
+    bool need_wait = false;
     int t1 = t0;
     while (t1 < m) {
       std::uint64_t cand_lo = seen_lo, cand_hi = seen_hi;
+      std::array<int, TOP_K> add_hot{};
       std::array<int, TOP_K> add_non_hot{};
       int n_add_non_hot = 0;
       int n_add_hot = 0;
@@ -764,8 +959,13 @@ void ExpertCache::run_decode_layer(
         std::uint64_t& word = (e < 64) ? cand_lo : cand_hi;
         if (word & bit) continue;
         word |= bit;
-        if (meta_[l][e].tier == Tier::HotVram) {
-          ++n_add_hot;
+        ExpertMeta& em = meta_[l][e];
+        if (swaps_on && em.inflight_slot >= 0) {
+          complete_inflight_swap(em.inflight_slot);
+          need_wait = true;
+        }
+        if (em.tier == Tier::HotVram) {
+          add_hot[n_add_hot++] = e;
         } else {
           add_non_hot[n_add_non_hot++] = e;
         }
@@ -773,13 +973,29 @@ void ExpertCache::run_decode_layer(
       if (t1 > t0 && n_non_hot + n_add_non_hot > cap) break;
       seen_lo = cand_lo;
       seen_hi = cand_hi;
-      n_hot += n_add_hot;
+      for (int i = 0; i < n_add_hot; ++i) slice_hot[n_hot++] = add_hot[i];
       for (int i = 0; i < n_add_non_hot; ++i) slice_non_hot[n_non_hot++] = add_non_hot[i];
       ++t1;
     }
 
     stats_.hot_hits += std::uint64_t(n_hot);
     const std::uint64_t gen = ++pin_gen_;
+    if (swaps_on) {
+      for (int i = 0; i < n_hot; ++i) {
+        const int e = slice_hot[i];
+        const int hs = meta_[l][e].hot_slot;
+        if (hs >= 0 && hs < int(hot_slots_[std::size_t(b)].size())) {
+          hot_slots_[std::size_t(b)][std::size_t(hs)].pin_gen = gen;
+          hot_slots_[std::size_t(b)][std::size_t(hs)].last_use = ++swap_tick_;
+        }
+        (void)swap_queue_.record_access(l, e, true);
+      }
+      for (int i = 0; i < n_non_hot; ++i) {
+        (void)swap_queue_.record_access(l, slice_non_hot[i], false);
+      }
+      stats_.async_swaps_queued = swap_queue_.queued_total();
+      stats_.async_swaps_dropped_bound = swap_queue_.dropped_bound();
+    }
     std::array<int, 8 * TOP_K> misses{};
     int nmiss = 0;
     for (int i = 0; i < n_non_hot; ++i) {
@@ -790,7 +1006,6 @@ void ExpertCache::run_decode_layer(
         misses[nmiss++] = e;
       }
     }
-    bool need_wait = false;
     for (int i = 0; i < nmiss; ++i) {
       need_wait |= stage_expert(l, misses[i], gen);
     }
@@ -802,6 +1017,9 @@ void ExpertCache::run_decode_layer(
       dma_.record_and_wait_on(compute_stream);
     }
     launch_moe_slice(t0, t1 - t0);
+    if (swaps_on) {
+      drain_swap_queue_async(l, gen, compute_stream);
+    }
     t0 = t1;
   }
 }
@@ -813,6 +1031,7 @@ void ExpertCache::run_prefill_layer(
     launch_moe_pair(nullptr);
     return;
   }
+  finalize_all_inflight_swaps(compute_stream);
 
   CUDA_CHECK(cudaMemcpyAsync(host_counts_.data(), d_counts, EXPERTS * sizeof(int), cudaMemcpyDeviceToHost,
                              compute_stream));
@@ -982,6 +1201,12 @@ void ExpertCache::reset_runtime_stats() noexcept {
   stats_.cold_fetches = 0;
   stats_.pcie_h2d_bytes = 0;
   stats_.nvme_read_bytes = 0;
+  stats_.hot_evictions = 0;
+  stats_.async_swaps_queued = 0;
+  stats_.async_swaps_completed = 0;
+  stats_.async_swaps_dropped_bound = 0;
+  stats_.experts_dropped = 0;
+  swap_queue_.reset_stats();
 }
 
 void ExpertCache::dump_router_stats_if_configured() const {
@@ -1016,7 +1241,7 @@ std::string ExpertCache::summary() const {
   const double hit_pct =
       total_lookups > 0 ? 100.0 * double(stats_.hot_hits + stats_.lru_hits) / double(total_lookups) : 0.0;
   const double rss_gb = double(process_rss_bytes()) / 1e9;
-  char buf[512];
+  char buf[768];
   const char* warm_tag = warm_ram_.registered()
                            ? (warm_ram_.hugepage_advised() ? " pinned+hp" : " pinned")
                            : (warm_ram_.hugepage_advised() ? " pageable+hp" : " pageable");
@@ -1024,14 +1249,19 @@ std::string ExpertCache::summary() const {
       buf, sizeof(buf),
       "[atlas-6g] mode=%s | experts: HOT=%d (%.2f GB VRAM) + LRU=%d slots (%.2f GB VRAM) | WARM=%d (%.2f GB RAM%s) | "
       "COLD=%d (%.2f GB NVMe mmap) | RSS=%.2f GB | lookups=%llu hit=%.1f%% (hot=%llu lru=%llu warm=%llu cold=%llu "
-      "h2d=%.2f GB nvme=%.2f GB)",
+      "h2d=%.2f GB nvme=%.2f GB) | swaps(cap=%d done=%llu q=%llu evict=%llu qdrop=%llu edrop=%llu)",
       mode_ == OffloadMode::DmaLru ? "dma-lru" : "uva", stats_.hot_experts, double(stats_.hot_vram_bytes) / 1e9,
       stats_.lru_slots_total, double(stats_.lru_vram_bytes) / 1e9, stats_.warm_experts,
       double(stats_.warm_ram_bytes) / 1e9, warm_tag, stats_.cold_experts,
       double(stats_.cold_nvme_bytes) / 1e9, rss_gb, static_cast<unsigned long long>(total_lookups), hit_pct,
       static_cast<unsigned long long>(stats_.hot_hits), static_cast<unsigned long long>(stats_.lru_hits),
       static_cast<unsigned long long>(stats_.warm_fetches), static_cast<unsigned long long>(stats_.cold_fetches),
-      double(stats_.pcie_h2d_bytes) / 1e9, double(stats_.nvme_read_bytes) / 1e9);
+      double(stats_.pcie_h2d_bytes) / 1e9, double(stats_.nvme_read_bytes) / 1e9, stats_.expert_swaps_cap,
+      static_cast<unsigned long long>(stats_.async_swaps_completed),
+      static_cast<unsigned long long>(stats_.async_swaps_queued),
+      static_cast<unsigned long long>(stats_.hot_evictions),
+      static_cast<unsigned long long>(stats_.async_swaps_dropped_bound),
+      static_cast<unsigned long long>(stats_.experts_dropped));
   return std::string(buf);
 }
 

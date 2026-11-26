@@ -180,15 +180,16 @@ int main(int argc, char** argv) {
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   std::string kv_cache_mode = "per_pass";
   std::string loopcd_mode = "off";
+  std::string attn_requant = "off";
   std::string concurrency_csv, arrival_trace_csv;
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
   int max_batch = 0, max_kv_tokens = 0, vram_limit_mb = 0, stagger_join_tokens = 0, park_mb = -1, park_host_mb = 0,
       loop_passes = 3;
-  int offload_vram_mb = 0, offload_ram_mb = 12288;
+  int offload_vram_mb = 0, offload_ram_mb = 12288, expert_swaps = 0;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
-       ignore_eos = false, staggered = false, no_prefix_cache = false;
+       loop_bf16 = false, ignore_eos = false, staggered = false, no_prefix_cache = false;
   double spec_threshold = 0.8, temperature = 0.0, loopcd_omega = -1.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -233,6 +234,15 @@ int main(int argc, char** argv) {
             {"auto", "dma-lru", "uva"});
   ap.option("--expert-ranking", "", "optional JSON with per-layer [24][128] homology/frequency scores", &expert_ranking);
   ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
+  ap.flag("--loop-bf16",
+          "opt-in small-card knob: elide unused FP32 controller & router duplicates (-81.0 MiB VRAM, 0-ULP parity)",
+          &loop_bf16);
+  ap.option("--attn-requant", "{off,q5_k}",
+            "opt-in small-card attention requantization for wproj+wo: off (default) or q5_k (GGML Q5_K 5.5 b/w)",
+            &attn_requant, {"off", "q5_k"});
+  ap.option("--expert-swaps", "",
+            "opt-in bounded async GPU<->RAM HOT-promotion swap queue capacity (default 0 = static HOT + LRU; >0 requires offload and non-uva; NO expert dropping)",
+            &expert_swaps);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--park-mb", "", "VRAM cap (MiB) for Tier-0 parked checkpoints (-1 = auto, 0 = off)", &park_mb);
@@ -287,6 +297,10 @@ int main(int argc, char** argv) {
 
     const bool loop_passes_explicit = ap.given("--loop-passes");
     const auto parsed_loopcd_mode = ingine::model::parse_loopcd_mode(loopcd_mode);
+    const auto parsed_attn_requant = ingine::model::parse_attn_requant_mode(attn_requant);
+    if (expert_swaps < 0) {
+      throw std::invalid_argument("--expert-swaps must be >= 0");
+    }
     if (ap.given("--loopcd-omega") && (!std::isfinite(loopcd_omega) || loopcd_omega < 0.0 || loopcd_omega > 4.0)) {
       throw std::invalid_argument("--loopcd-omega must be finite and in [0, 4]");
     }
@@ -298,6 +312,16 @@ int main(int argc, char** argv) {
       if (parsed_loopcd_mode != ingine::model::LoopCdMode::Off) {
         throw std::invalid_argument(
             "qwen38-dense is a non-looped dense architecture and does not support --loopcd");
+      }
+      if (loop_bf16) {
+        throw std::invalid_argument(
+            "qwen38-dense is a non-looped dense architecture and does not support --loop-bf16");
+      }
+      if (parsed_attn_requant != ingine::model::AttnRequantMode::Off) {
+        throw std::invalid_argument("qwen38-dense does not support --attn-requant");
+      }
+      if (expert_swaps != 0) {
+        throw std::invalid_argument("qwen38-dense has no MoE experts and does not support --expert-swaps");
       }
       if (!ap.given("--max-ctx")) max_ctx = 8192;
       if (!ap.given("--prefill-chunk")) prefill_chunk = 256;
@@ -375,13 +399,19 @@ int main(int argc, char** argv) {
     options.loop_passes_explicit = loop_passes_explicit;
     options.loopcd_mode = parsed_loopcd_mode;
     options.loopcd_omega = ap.given("--loopcd-omega") ? float(loopcd_omega) : -1.0f;
+    options.loop_bf16 = loop_bf16;
+    options.attn_requant = parsed_attn_requant;
+    options.expert_swaps = expert_swaps;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     vram.mark_after_load();
     const double vram_gb = vram.load_delta_gb();
-    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s, loop_passes=%d, loopcd=%s, vram_limit_mb=%d)\n",
-                load_s, vram_gb, gen->max_batch_size(), ingine::model::to_string(gen->kv_cache_mode()),
-                gen->loop_passes(), ingine::model::to_string(gen->loopcd_mode()), vram_limit_mb);
+    std::printf(
+        "load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s, loop_passes=%d, loopcd=%s, loop_bf16=%s, "
+        "attn_requant=%s, expert_swaps=%d, vram_limit_mb=%d)\n",
+        load_s, vram_gb, gen->max_batch_size(), ingine::model::to_string(gen->kv_cache_mode()), gen->loop_passes(),
+        ingine::model::to_string(gen->loopcd_mode()), loop_bf16 ? "on" : "off",
+        ingine::model::to_string(gen->attn_requant_mode()), expert_swaps, vram_limit_mb);
     std::fflush(stdout);
     if (!forced.empty()) {
       std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace, forced_free).c_str());

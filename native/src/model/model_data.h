@@ -213,14 +213,17 @@ inline T* ptr(const Tensor& t) {
 
 // ----------------------------------------------------------------------------------------------- weights
 
-// A dense matrix as the decoder stores it: BF16 rows, or float8_e4m3fn rows with FP32 per-row scales
-// (`scale.data != nullptr`; value = fp8 * scale, see weights.dequant / dense fp8_rows).
+// A dense matrix as the decoder stores it: BF16/FP16 rows, float8_e4m3fn rows with FP32 per-row scales
+// (`scale.data != nullptr`; value = fp8 * scale), or packed GGML Q5_K super-blocks (`is_q5_k == true`,
+// 176 bytes per 256 elements; w is U8 [rows, (cols / 256) * 176]).
 struct Dense {
-  Tensor w;      // [rows, cols] bf16 or fp8
-  Tensor scale;  // [rows] fp32, or empty (data == nullptr) for BF16
+  Tensor w;      // [rows, cols] bf16/fp8, or [rows, (cols/256)*176] u8 for Q5_K
+  Tensor scale;  // [rows] fp32, or empty (data == nullptr) for BF16/Q5_K
+  bool is_q5_k = false;
   bool fp8() const { return scale.data != nullptr; }
+  bool q5_k() const { return is_q5_k; }
   int rows() const { return w.ne[1]; }
-  int cols() const { return w.ne[0]; }
+  int cols() const { return is_q5_k ? (w.ne[0] / 176) * 256 : w.ne[0]; }
 };
 
 enum class ExpertFormat : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5 };
@@ -315,6 +318,8 @@ struct Weights {
   int tp_rank = 0, tp_size = 1;
   int vocab_begin = 0, vocab_rows = UNPADDED_VOCAB;
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
+  bool attn_q5_k = false;     // wproj (+ views) and wo are GGML Q5_K super-blocks (--attn-requant q5_k)
+  bool loop_bf16 = false;     // unused FP32 controller & router duplicates elided (--loop-bf16)
   bool embed_q4() const { return embed.dtype == DType::U8; }
   std::shared_ptr<ExpertCache> expert_cache;  // non-null when tiered MoE offloading is enabled
   // Verified cryptographic digest over model metadata + 100% of weight tensor contents, populated only by
