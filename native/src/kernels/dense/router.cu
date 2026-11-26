@@ -27,6 +27,7 @@
 #include "kernels/dense/dense.h"
 #include "kernels/dense/dsmem.cuh"
 
+#include <atomic>
 #include <type_traits>
 
 namespace cg = cooperative_groups;
@@ -296,18 +297,146 @@ __global__ void __launch_bounds__(NT) router_sm8x_select_kernel(const float* __r
 }
 
 __device__ float g_router_sm8x_scratch[8 * EXPERTS];
+__device__ int g_router_sm8x_done = 0;
+
+// Single-launch fused dot + select for non-cluster GPUs (sm_70 / sm_8x): eliminates the second launch (-48
+// launches/step) via an L2-coherent atomic completion counter while preserving bit-identical FP32/top-8 order.
+template <int CL, bool WF32, int M>
+__global__ void __launch_bounds__(32 * EXPERTS / CL) router_sm8x_fused_kernel(
+    const ActT* __restrict__ x, const void* __restrict__ w, const float* __restrict__ bias,
+    int* __restrict__ idx, float* __restrict__ wts, float* __restrict__ logits_buf, int* __restrict__ done_counter) {
+  constexpr int RPC = EXPERTS / CL, NT = 32 * RPC;
+  constexpr int EPC = WF32 ? 4 : 8;
+  constexpr int CH = H / (EPC * 32);
+  __shared__ __align__(16) ActT xs[M][H];
+  __shared__ unsigned long long keys[EXPERTS];
+  __shared__ int cnt[NT];
+  __shared__ float sel_s[TOPK];
+  __shared__ int sel_e[TOPK];
+  __shared__ int s_last;
+
+  const int rank = blockIdx.x;
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  const int row = rank * RPC + warp;
+
+  const uint8_t* wr = reinterpret_cast<const uint8_t*>(w) + size_t(row) * H * (WF32 ? 4 : 2);
+  uint4 wv[CH];
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+#pragma unroll
+  for (int i = 0; i < CH; ++i) wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (size_t(i) * 32 + lane) * 16, wpol);
+  for (int k = t; k < M * H / 8; k += NT) cp_async16(&xs[0][0] + k * 8, x + size_t(k) * 8);
+  copy::commit();
+  copy::wait_all();
+  __syncthreads();
+
+  float acc[M];
+#pragma unroll
+  for (int m = 0; m < M; ++m) acc[m] = 0.f;
+#pragma unroll
+  for (int i = 0; i < CH; ++i) {
+    const int col = (i * 32 + lane) * EPC;
+    float wf[EPC], xf[EPC];
+    if constexpr (WF32) {
+      wf[0] = __uint_as_float(wv[i].x); wf[1] = __uint_as_float(wv[i].y);
+      wf[2] = __uint_as_float(wv[i].z); wf[3] = __uint_as_float(wv[i].w);
+    } else {
+      unpack_bf16x8(wv[i], wf);
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      if constexpr (WF32) {
+        const uint2 u = *reinterpret_cast<const uint2*>(&xs[m][col]);
+        xf[0] = bf_lo(u.x); xf[1] = bf_hi(u.x); xf[2] = bf_lo(u.y); xf[3] = bf_hi(u.y);
+      } else {
+        unpack_bf16x8(*reinterpret_cast<const uint4*>(&xs[m][col]), xf);
+      }
+      float a = acc[m];
+#pragma unroll
+      for (int j = 0; j < EPC; ++j) a = fmaf(wf[j], xf[j], a);
+      acc[m] = a;
+    }
+  }
+  const float logit = reduce_scatter<32, M>(acc);
+  if (lane < M) __stcg(&logits_buf[lane * EXPERTS + row], logit);
+  __threadfence();
+  __syncthreads();
+  if (t == 0) s_last = (atomicAdd(done_counter, 1) == CL - 1) ? 1 : 0;
+  __syncthreads();
+  if (!s_last) return;
+  if (t == 0) *done_counter = 0;
+
+  const float b = t < EXPERTS ? __ldg(bias + t) : 0.f;
+  for (int m = 0; m < M; ++m) {
+    float s = 0.f;
+    if (t < EXPERTS) {
+      s = 1.f / (1.f + expf(-__ldcg(&logits_buf[m * EXPERTS + t])));
+      const uint32_t u = __float_as_uint(s + b + 0.f);
+      const uint32_t o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+      keys[t] = (static_cast<unsigned long long>(o) << 7) | static_cast<unsigned>(EXPERTS - 1 - t);
+    }
+    __syncthreads();
+    {
+      constexpr int PARTS = NT / EXPERTS, W = EXPERTS / PARTS;
+      const int e = t % EXPERTS, part = t / EXPERTS;
+      const unsigned long long mine = keys[e];
+      int c[4] = {0, 0, 0, 0};
+#pragma unroll
+      for (int j = 0; j < W; j += 4)
+#pragma unroll
+        for (int k = 0; k < 4; ++k) c[k] += keys[part * W + j + k] > mine;
+      cnt[t] = c[0] + c[1] + c[2] + c[3];
+    }
+    __syncthreads();
+    if (t < EXPERTS) {
+      int r = 0;
+#pragma unroll
+      for (int p = 0; p < NT / EXPERTS; ++p) r += cnt[p * EXPERTS + t];
+      if (r < TOPK) {
+        sel_e[r] = t;
+        sel_s[r] = s;
+      }
+    }
+    __syncthreads();
+    if (t < TOPK) {
+      const float my_s = sel_s[t];
+      float sum = my_s;
+#pragma unroll
+      for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffu, sum, o);
+      idx[m * TOPK + t] = sel_e[t];
+      wts[m * TOPK + t] = my_s / (sum + 1e-20f) * 8.f;
+    }
+    if constexpr (M > 1) __syncthreads();
+  }
+}
 
 template <bool WF32>
 void launch_router_sm8x(int M, const ActT* x, const void* w, const float* bias, int* idx, float* wts,
                         cudaStream_t stream) {
   float* scratch = nullptr;
+  int* done_ptr = nullptr;
   CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&scratch), g_router_sm8x_scratch));
+  CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&done_ptr), g_router_sm8x_done));
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
-    router_sm8x_dot_kernel<16, WF32, MM><<<16, 32 * EXPERTS / 16, 0, stream>>>(x, w, scratch);
-    CUDA_CHECK(cudaGetLastError());
-    router_sm8x_select_kernel<256><<<MM, 256, 0, stream>>>(scratch, bias, idx, wts);
-    CUDA_CHECK(cudaGetLastError());
+    if constexpr (MM == 1) {
+      router_sm8x_fused_kernel<16, WF32, 1><<<16, 32 * EXPERTS / 16, 0, stream>>>(x, w, bias, idx, wts, scratch, done_ptr);
+      CUDA_CHECK(cudaGetLastError());
+    } else {
+      static std::atomic<uint32_t> dot_attr{0};
+      int dev = 0;
+      if (cudaGetDevice(&dev) == cudaSuccess) {
+        const uint32_t bit = 1u << (dev & 31);
+        if (!(dot_attr.load(std::memory_order_acquire) & bit)) {
+          (void)cudaFuncSetAttribute(router_sm8x_dot_kernel<16, WF32, MM>,
+                                     cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+          dot_attr.fetch_or(bit, std::memory_order_release);
+        }
+      }
+      router_sm8x_dot_kernel<16, WF32, MM><<<16, 32 * EXPERTS / 16, 0, stream>>>(x, w, scratch);
+      CUDA_CHECK(cudaGetLastError());
+      router_sm8x_select_kernel<256><<<MM, 256, 0, stream>>>(scratch, bias, idx, wts);
+      CUDA_CHECK(cudaGetLastError());
+    }
   };
   switch (M) {
     case 1: go(std::integral_constant<int, 1>{}); break;

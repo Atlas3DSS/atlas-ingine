@@ -35,6 +35,23 @@ inline int current_sm_major() {
     return cached[dev];
 }
 
+// Cached compute capability version as major * 10 + minor (e.g. 60, 61, 70, 75, 86, 90, 120).
+inline int current_sm_version() {
+    static std::array<int, 16> cached{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 80;
+    if (cached[dev] == 0) {
+        int maj = 0, min = 0;
+        if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess && maj > 0) {
+            cached[dev] = maj * 10 + min;
+        } else {
+            return 80;
+        }
+    }
+    return cached[dev];
+}
+
 // Cached maximum opt-in dynamic shared memory per block in bytes (safe inside CUDA graph capture).
 // Pascal sm_60/61: 49,152 B; Turing sm_75: 65,536 B; Volta sm_70: 98,304 B; Ampere+: >= 101,376 B.
 // Honors INGINE_TEST_MAX_SMEM (cap in bytes) for exercising lower-SMEM paths on larger-SMEM GPUs.

@@ -1462,17 +1462,110 @@ __global__ void __launch_bounds__(MAXWARPS * 32, LOW_SMEM ? 1 : 2) attn_decode_k
                 uint32_t* dst_q4 = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(p.saved_nkv) +
                                                                size_t(g) * 2 * M * Q4_HEAD_B);
                 const uint32_t* src_q4 = reinterpret_cast<const uint32_t*>(sm + L::NKV_Q4);
-                for (int idx = tid; idx < 2 * M * (Q4_HEAD_B / 4); idx += NT) dst_q4[idx] = src_q4[idx];
+                for (int idx = tid; idx < 2 * M * (Q4_HEAD_B / 4); idx += NT) __stcg(dst_q4 + idx, src_q4[idx]);
             } else {
-                ActT* dst_nkv = p.saved_nkv + size_t(g) * 2 * M * D;
+                uint32_t* dst_nkv = reinterpret_cast<uint32_t*>(p.saved_nkv + size_t(g) * 2 * M * D);
                 for (int idx = tid; idx < 2 * M * 16; idx += NT) {
                     const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
-                    reinterpret_cast<uint4*>(dst_nkv + (kv * M + m) * D)[c8] =
-                        reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+                    const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+                    uint32_t* d4 = dst_nkv + ((kv * M + m) * D / 2) + 4 * c8;
+                    __stcg(d4 + 0, u.x);
+                    __stcg(d4 + 1, u.y);
+                    __stcg(d4 + 2, u.z);
+                    __stcg(d4 + 3, u.w);
                 }
             }
             float* dst_nst = p.saved_nst + size_t(g) * 3 * 2 * D;
-            for (int idx = tid; idx < 3 * 2 * D; idx += NT) dst_nst[idx] = sm[L::NST + idx];
+            for (int idx = tid; idx < 3 * 2 * D; idx += NT) __stcg(dst_nst + idx, sm[L::NST + idx]);
+        }
+        // Single-launch fused stage 2 for M == 1 on non-cluster GPUs (sm_70 / sm_8x): eliminates
+        // attn_decode_stage2_kernel (-48 launches/step). For M > 1, keep the 128-CTA parallel stage 2 kernel so
+        // ROWS * D (up to 3072) combine outputs do not serialize onto 8 CTAs.
+        if constexpr (M == 1) {
+            __shared__ int s_head_last;
+            __threadfence();
+            __syncthreads();
+            if (tid == 0) {
+                s_head_last = (atomicAdd(p.counter + 1 + g, 1) == CS - 1) ? 1 : 0;
+            }
+            __syncthreads();
+            if (!s_head_last) return;
+            if (tid == 0) p.counter[1 + g] = 0;
+
+            for (int idx = tid; idx < ROWS * D; idx += NT) {
+                const int row = idx / D, dim = idx % D;
+                const float* src = p.part + size_t(g * CS) * ROWS * PSTR + row * PSTR;
+                float2 ml[CS];
+                float o[CS];
+#pragma unroll
+                for (int q = 0; q < CS; ++q) {
+                    ml[q] = __ldcg(reinterpret_cast<const float2*>(src + q * ROWS * PSTR + D));
+                    o[q] = __ldcg(src + q * ROWS * PSTR + dim);
+                }
+                const float sink = p.proj[size_t(row / GQA) * R + OFF_SINK + g * GQA + row % GQA] * LOG2E;
+                float mx = sink;
+#pragma unroll
+                for (int q = 0; q < CS; ++q) mx = fmaxf(mx, ml[q].x);
+                float l = exp2f(sink - mx), a = 0.f;
+#pragma unroll
+                for (int q = 0; q < CS; ++q) {
+                    const float f = exp2f(ml[q].x - mx);
+                    l += ml[q].y * f;
+                    a += o[q] * f;
+                }
+                const float gate_raw = p.proj[size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + dim];
+                const float gate = 1.f / (1.f + expf(-gate_raw));
+                p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = act::from_float(bf16r(a / l) * gate);
+            }
+
+            if constexpr (Q4) {
+                const uint32_t* src_q4 = reinterpret_cast<const uint32_t*>(
+                    reinterpret_cast<const uint8_t*>(p.saved_nkv) + size_t(g) * 2 * M * Q4_HEAD_B);
+                for (int idx = tid; idx < 2 * M * 18; idx += NT) {
+                    const int kv = idx / (M * 18), m = (idx / 18) % M, w = idx % 18;
+                    const int row = p0 + m;
+                    uint8_t* row_dst = p.k_pages
+                        ? (static_cast<uint8_t*>((kv ? p.v_pages : p.k_pages)[row >> p.page_shift]) +
+                           size_t(row & ((1 << p.page_shift) - 1)) * Q4_ROW_B)
+                        : (static_cast<uint8_t*>(kv ? p.v_cache : p.k_cache) + size_t(row) * Q4_ROW_B);
+                    const uint32_t val = __ldcg(src_q4 + (kv * M + m) * 18 + w);
+                    if (w < 16)
+                        reinterpret_cast<uint32_t*>(row_dst + g * 64)[w] = val;
+                    else
+                        reinterpret_cast<uint32_t*>(row_dst + Q4_NIB_B + g * 8)[w - 16] = val;
+                }
+            } else {
+                const uint32_t* src_nkv = reinterpret_cast<const uint32_t*>(p.saved_nkv + size_t(g) * 2 * M * D);
+                for (int idx = tid; idx < 2 * M * 16; idx += NT) {
+                    const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+                    const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
+                    const uint32_t* s4 = src_nkv + ((kv * M + m) * D / 2) + 4 * c8;
+                    const uint4 u = make_uint4(__ldcg(s4 + 0), __ldcg(s4 + 1), __ldcg(s4 + 2), __ldcg(s4 + 3));
+                    CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
+                    if constexpr (F8) {
+                        float f[8];
+                        unpack8(u, f);
+                        reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
+                                                                       pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
+                    } else {
+                        reinterpret_cast<uint4*>(dst)[c8] = u;
+                    }
+                }
+            }
+            const float* src_nst = p.saved_nst + size_t(g) * 3 * 2 * D;
+            for (int idx = tid; idx < 3 * 2 * D; idx += NT) {
+                const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
+                (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = __ldcg(src_nst + idx);
+            }
+            if constexpr (!FULL) {
+                // kpos is shared by all HKV heads: update only once all HKV heads have finished reading kpos.
+                __threadfence();
+                __syncthreads();
+                if (tid == 0 && atomicAdd(p.counter, 1) == HKV - 1) {
+                    for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
+                    *p.counter = 0;
+                }
+            }
         }
         return;
     }
@@ -1670,7 +1763,7 @@ Kernel kernel_of() {
         return Kernel{f, nullptr, M, Smem<M, F8, Q4>::BYTES};
     } else {
         const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true, Q4>;
-        const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8, Q4>;
+        const KernelFn f2 = (M == 1) ? nullptr : attn_decode_stage2_kernel<M, FULL, F8, Q4>;
         if constexpr (Smem<M, F8, Q4>::BYTES > 49152) {
             if (!(attr_done.load(std::memory_order_acquire) & bit)) {
                 CUDA_CHECK(cudaFuncSetAttribute(f1, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, Q4>::BYTES)));
@@ -1685,7 +1778,7 @@ template <int M, bool FULL, bool F8, bool Q4 = false>
 Kernel kernel_of_low_smem() {
     static const Kernel k = [] {
         const KernelFn f1 = attn_decode_kernel<M, FULL, F8, true, Q4, true>;
-        const KernelFn f2 = attn_decode_stage2_kernel<M, FULL, F8, Q4>;
+        const KernelFn f2 = (M == 1) ? nullptr : attn_decode_stage2_kernel<M, FULL, F8, Q4>;
         return Kernel{f1, f2, M, Smem<M, F8, Q4, true>::BYTES};
     }();
     return k;
@@ -1833,11 +1926,13 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
         cfg1.dynamicSmemBytes = k.smem;
         cfg1.stream = stream;
         CUDA_CHECK(cudaLaunchKernelEx(&cfg1, k.fn, p));
-        cudaLaunchConfig_t cfg2{};
-        cfg2.gridDim = dim3(CS, HKV);
-        cfg2.blockDim = dim3(NT);
-        cfg2.stream = stream;
-        CUDA_CHECK(cudaLaunchKernelEx(&cfg2, k.fn_stage2, p));
+        if (k.fn_stage2) {
+            cudaLaunchConfig_t cfg2{};
+            cfg2.gridDim = dim3(CS, HKV);
+            cfg2.blockDim = dim3(NT);
+            cfg2.stream = stream;
+            CUDA_CHECK(cudaLaunchKernelEx(&cfg2, k.fn_stage2, p));
+        }
         return;
     }
     const Kernel k = full ? (a.cache_q4 ? select<true, false, true>(M)

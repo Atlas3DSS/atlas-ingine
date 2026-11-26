@@ -39,6 +39,7 @@
 #include "kernels/dense/dsmem.cuh"
 #include "kernels/dense/reduce.cuh"
 
+#include <atomic>
 #include <type_traits>
 
 namespace cg = cooperative_groups;
@@ -299,11 +300,13 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
 __device__ float g_gates_sm8x_gall[3 * 8 * RANK];
 __device__ float g_gates_sm8x_gated[3 * 8 * H];
 __device__ float g_gates_sm8x_ssall[3 * 16 * 8];
+__device__ int g_gates_sm8x_done[3] = {0, 0, 0};
 
 struct GatesSm8xScratch {
   float* gall;   // [3][8][RANK]
   float* gated;  // [3][8][H]
   float* ssall;  // [3][16][8]
+  int* done;     // [3]
 };
 
 GatesSm8xScratch gates_sm8x_scratch() {
@@ -311,6 +314,7 @@ GatesSm8xScratch gates_sm8x_scratch() {
   CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&s.gall), g_gates_sm8x_gall));
   CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&s.gated), g_gates_sm8x_gated));
   CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&s.ssall), g_gates_sm8x_ssall));
+  CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&s.done), g_gates_sm8x_done));
   return s;
 }
 
@@ -319,8 +323,10 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
   using C = GateCfg<CL, FG32>;
   constexpr int DCH = H / (8 * 32);
   constexpr int XPT = H / C::NT;
-  constexpr int XG = M < C::XMAX ? M : C::XMAX;
-  __shared__ __align__(16) ActT xs[M == 1 && C::XMAX > 1 ? 2 : XG][2 * H];
+  // fg is not staged in this kernel, so 4 tokens of ActT xs (36 KiB) always fit in 48 KiB SMEM even when FG32=true.
+  constexpr int DOWN_XMAX = 4;
+  constexpr int XG = M < DOWN_XMAX ? M : DOWN_XMAX;
+  __shared__ __align__(16) ActT xs[M == 1 ? 1 : XG][2 * H];
   __shared__ __align__(16) float part[M][2][C::RPC];
   __shared__ float red2[C::NW * 32];
 
@@ -373,22 +379,32 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
       }
     }
     __syncthreads();
+    // Unpack each wv[i] ONCE across all XG staged tokens (identical FP32 FMA order per token).
+    float acc[XG];
+#pragma unroll
+    for (int j = 0; j < XG; ++j) acc[j] = 0.f;
+#pragma unroll
+    for (int i = 0; i < DCH; ++i) {
+      float wf[8];
+      unpack_bf16x8(wv[i], wf);
+#pragma unroll
+      for (int j = 0; j < XG; ++j) {
+        if (m0 + j < M) {
+          float xf[8];
+          unpack_bf16x8(*reinterpret_cast<const uint4*>(&xs[j][half * H + (i * 32 + lane) * 8]), xf);
+          float a_acc = acc[j];
+#pragma unroll
+          for (int e = 0; e < 8; ++e) a_acc = fmaf(wf[e], xf[e], a_acc);
+          acc[j] = a_acc;
+        }
+      }
+    }
 #pragma unroll
     for (int j = 0; j < XG; ++j) {
       const int m = m0 + j;
       if (m < M) {
-        const ActT* xb = xs[j];
-        float acc = 0.f;
-#pragma unroll
-        for (int i = 0; i < DCH; ++i) {
-          float wf[8], xf[8];
-          unpack_bf16x8(wv[i], wf);
-          unpack_bf16x8(*reinterpret_cast<const uint4*>(&xb[half * H + (i * 32 + lane) * 8]), xf);
-#pragma unroll
-          for (int e = 0; e < 8; ++e) acc = fmaf(wf[e], xf[e], acc);
-        }
-        acc = group_sum<32>(acc);
-        if (lane == 0) part[m][half][rl] = acc;
+        const float s = group_sum<32>(acc[j]);
+        if (lane == 0) part[m][half][rl] = s;
       }
     }
   }
@@ -404,15 +420,15 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
   }
 }
 
-template <int CL, bool FG32, int M, bool STAGE_FG = true>
-__global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(GateArgs a,
-                                                                               const float* __restrict__ gall_in,
-                                                                               float* __restrict__ gated_out,
-                                                                               float* __restrict__ ssall_out) {
+template <int CL, bool FG32, int M, bool STAGE_FG = true, bool FUSE_NORM = (M == 1)>
+__global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_norm_kernel(
+    GateArgs a, const float* __restrict__ gall_in, float* __restrict__ gated_buf, float* __restrict__ ssall_buf,
+    int* __restrict__ done_counter) {
   using C = GateCfg<CL, FG32>;
   extern __shared__ __align__(16) uint8_t fg[];
   __shared__ __align__(16) float gall[M][RANK];
   __shared__ float red[C::NW * 32];
+  __shared__ int s_last;
 
   const int rank = blockIdx.x % CL;
   const int g = blockIdx.x / CL;
@@ -487,12 +503,37 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(Ga
       hv[m] = (1.f - tanhf(df[m])) * hv[m] + tanhf(dg[m]) * mv[m];
       sq[m] = hv[m] * hv[m];
       const size_t idx_out = (size_t(g) * M + m) * H + c;
-      gated_out[idx_out] = hv[m];
+      __stcg(&gated_buf[idx_out], hv[m]);
       if (a.out_f32) a.out_f32[idx_out] = hv[m];
     }
   }
   block_sum_bcast<M, C::NW>(sq, red);
-  if (t < M) ssall_out[(size_t(g) * CL + rank) * M + t] = sq[t];
+  if (t < M) __stcg(&ssall_buf[(size_t(g) * CL + rank) * M + t], sq[t]);
+  if constexpr (!FUSE_NORM) return;
+  __threadfence();
+  __syncthreads();
+  if (t == 0) s_last = (atomicAdd(done_counter + g, 1) == CL - 1) ? 1 : 0;
+  __syncthreads();
+  if (!s_last) return;
+  if (t == 0) done_counter[g] = 0;
+
+  // Last block of gate g normalizes all H channels in exact d=0..CL-1 order (-48 launches/step at M = 1).
+  float rinv[M];
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+    float ss = 0.f;
+#pragma unroll
+    for (int d = 0; d < CL; ++d) ss += __ldcg(&ssall_buf[(size_t(g) * CL + d) * M + m]);
+    rinv[m] = rsqrtf(ss / H + EPS);
+  }
+  for (int ch = t; ch < H; ch += C::NT) {
+    const float nw = __ldg(a.norm_w + size_t(g) * H + ch);
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      const size_t idx_out = (size_t(g) * M + m) * H + ch;
+      a.out_bf16[idx_out] = act::from_float(__ldcg(&gated_buf[idx_out]) * rinv[m] * nw);
+    }
+  }
 }
 
 template <int CL, int M>
@@ -506,7 +547,7 @@ __global__ void __launch_bounds__(256) gates_sm8x_norm_kernel(const float* __res
   const int t = threadIdx.x;
   if (t >= CPC) return;
   const int c = rank * CPC + t;
-  const float nw = norm_w[size_t(g) * H + c];
+  const float nw = __ldg(norm_w + size_t(g) * H + c);
 #pragma unroll
   for (int m = 0; m < M; ++m) {
     float ss = 0.f;
@@ -521,25 +562,51 @@ template <int CL, bool FG32>
 void launch_gates_sm8x(int G, int M, const GateArgs& a, cudaStream_t stream) {
   using C = GateCfg<CL, FG32>;
   const GatesSm8xScratch sc = gates_sm8x_scratch();
-  // FG32 dynamic SMEM (78,336 B + ~3 KiB static) exceeds Turing (64 KiB) and Pascal (48 KiB);
-  // fall back to direct __ldg weight streaming (0 B dynamic SMEM) on those devices.
-  const bool stage_fg = !FG32 || current_max_smem_optin() >= C::SMEM + 4096;
+  // Skip pointless 42-78 KiB SMEM weight staging at M = 1 (weights read once); for M > 1 stage if SMEM fits.
+  const bool stage_fg = (M > 1) && (!FG32 || current_max_smem_optin() >= C::SMEM + 4096);
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
+    constexpr bool kFuse = (MM == 1);
+    if constexpr (MM > 1) {
+      static std::atomic<uint32_t> down_attr{0};
+      int dev = 0;
+      if (cudaGetDevice(&dev) == cudaSuccess) {
+        const uint32_t bit = 1u << (dev & 31);
+        if (!(down_attr.load(std::memory_order_acquire) & bit)) {
+          (void)cudaFuncSetAttribute(gates_sm8x_down_kernel<CL, FG32, MM>,
+                                     cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+          down_attr.fetch_or(bit, std::memory_order_release);
+        }
+      }
+    }
     gates_sm8x_down_kernel<CL, FG32, MM><<<G * CL, C::NT, 0, stream>>>(a, sc.gall);
     CUDA_CHECK(cudaGetLastError());
     if (stage_fg) {
-      if constexpr (C::SMEM > 49152) {
-        CUDA_CHECK(cudaFuncSetAttribute(gates_sm8x_fg_kernel<CL, FG32, MM, true>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
+      static std::atomic<uint32_t> fg_attr{0};
+      int dev = 0;
+      if (cudaGetDevice(&dev) == cudaSuccess) {
+        const uint32_t bit = 1u << (dev & 31);
+        if (!(fg_attr.load(std::memory_order_acquire) & bit)) {
+          if constexpr (C::SMEM > 49152) {
+            CUDA_CHECK(cudaFuncSetAttribute(gates_sm8x_fg_norm_kernel<CL, FG32, MM, true, kFuse>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
+          }
+          (void)cudaFuncSetAttribute(gates_sm8x_fg_norm_kernel<CL, FG32, MM, true, kFuse>,
+                                     cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+          fg_attr.fetch_or(bit, std::memory_order_release);
+        }
       }
-      gates_sm8x_fg_kernel<CL, FG32, MM, true><<<G * CL, C::NT, C::SMEM, stream>>>(a, sc.gall, sc.gated, sc.ssall);
+      gates_sm8x_fg_norm_kernel<CL, FG32, MM, true, kFuse>
+          <<<G * CL, C::NT, C::SMEM, stream>>>(a, sc.gall, sc.gated, sc.ssall, sc.done);
     } else {
-      gates_sm8x_fg_kernel<CL, FG32, MM, false><<<G * CL, C::NT, 0, stream>>>(a, sc.gall, sc.gated, sc.ssall);
+      gates_sm8x_fg_norm_kernel<CL, FG32, MM, false, kFuse>
+          <<<G * CL, C::NT, 0, stream>>>(a, sc.gall, sc.gated, sc.ssall, sc.done);
     }
     CUDA_CHECK(cudaGetLastError());
-    gates_sm8x_norm_kernel<CL, MM><<<G * CL, 256, 0, stream>>>(sc.gated, sc.ssall, a.norm_w, a.out_bf16);
-    CUDA_CHECK(cudaGetLastError());
+    if constexpr (!kFuse) {
+      gates_sm8x_norm_kernel<CL, MM><<<G * CL, 256, 0, stream>>>(sc.gated, sc.ssall, a.norm_w, a.out_bf16);
+      CUDA_CHECK(cudaGetLastError());
+    }
   };
   switch (M) {
     case 1: go(std::integral_constant<int, 1>{}); break;

@@ -48,6 +48,26 @@ __device__ __forceinline__ void unpack_bf16x8(const uint4& v, float* f) {
   f[6] = bf_lo(v.w); f[7] = bf_hi(v.w);
 }
 
+// Adapted from ashalliants/ninfer-3090 (Apache-2.0): exact E4M3 * 2^-8 -> FP16x2 in 3 ALU ops (zero branches/LUTs).
+// Valid for all finite E4M3 codes (zeros, subnormals, normals); caller scales result by 256.f.
+__device__ __forceinline__ uint32_t e4m3x2_to_half2_m8(uint32_t u) {
+  const uint32_t t = __byte_perm(u, 0u, 0x4140u);
+  return ((t & 0x00800080u) << 8) | ((t & 0x007f007fu) << 7);
+}
+
+__device__ __forceinline__ void unpack_e4m3x4_m8(uint32_t u, float* f) {
+  const uint32_t hlo = e4m3x2_to_half2_m8(u);
+  const uint32_t hhi = e4m3x2_to_half2_m8(u >> 16);
+  const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&hlo));
+  const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&hhi));
+  f[0] = a.x; f[1] = a.y; f[2] = b.x; f[3] = b.y;
+}
+
+__device__ __forceinline__ void unpack_e4m3x16_m8(const uint4& v, float* f) {
+  unpack_e4m3x4_m8(v.x, f); unpack_e4m3x4_m8(v.y, f + 4);
+  unpack_e4m3x4_m8(v.z, f + 8); unpack_e4m3x4_m8(v.w, f + 12);
+}
+
 __device__ __forceinline__ uint32_t e4m3_to_bf16_bits_portable(uint32_t b) {
   const uint32_t s = (b & 0x80u) << 8;
   const uint32_t a = b & 0x7fu;

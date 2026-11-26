@@ -3,6 +3,7 @@
 // shared between tokens (deduplicated passes), the post-MLP conv state update and conv history, and
 // dequant_experts. Synthetic experts in checkpoint encoding; only experts 0..E-1 are allocated (routing
 // stays below E), which keeps GPU memory small.
+#include "core/device.h"
 #include "kernels/oracle.h"
 
 #include "kernels/moe/moe.h"
@@ -10,6 +11,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <numeric>
 
 using namespace ingine::test;
@@ -91,11 +93,38 @@ void fwht128_host(double* x) {
 struct ExpertWeight {
   int rows = 0, cols = 0;
   moe::Format fmt = moe::Format::NVFP4;
-  std::vector<float> value;  // [E, rows, cols] decoded BF16 values
+  std::vector<float> value;        // [E, rows, cols] decoded ActT values (matches dequant_experts)
+  std::vector<float> value_exact;  // [E, rows, cols] unrounded NVFP4 (code * scale * factor) for streaming oracle
   std::optional<DeviceArray<uint8_t>> codes, scales;
   std::optional<DeviceArray<uint16_t>> rin, rout;
   std::optional<DeviceArray<float>> factor;  // [128]
 };
+
+// Per-16-element symmetric INT8 activation quantization matching moe_{up,down}_nvfp4_dp4a_kernel on sm_61/70/75.
+std::vector<float> quant16_act_host(const std::vector<float>& x) {
+  std::vector<float> qx(x.size());
+  for (size_t base = 0; base < x.size(); base += 16) {
+    float amax = 0.f;
+    for (int j = 0; j < 16; ++j) amax = std::max(amax, std::fabs(x[base + j]));
+    const float sc = amax * (1.0f / 127.0f);
+    const float inv = amax > 0.f ? (127.0f / amax) : 0.f;
+    for (int j = 0; j < 16; ++j) {
+      const int q = std::max(-127, std::min(127, int(std::nearbyint(x[base + j] * inv))));
+      qx[base + j] = float(q) * sc;
+    }
+  }
+  return qx;
+}
+
+bool nvfp4_pre_sm80_stream() {
+  return ingine::kActIsFP16 && ingine::current_sm_major() < 8;
+}
+
+bool nvfp4_pre_sm80_dp4a() {
+  const char* v = std::getenv("INGINE_DISABLE_NVFP4_DP4A");
+  const bool disabled = v && v[0] != '\0' && v[0] != '0';
+  return nvfp4_pre_sm80_stream() && !disabled && ingine::current_sm_version() >= 61;
+}
 
 ExpertWeight make_expert_weight(Rng& rng, int rows, int cols, moe::Format fmt) {
   ExpertWeight w;
@@ -108,12 +137,14 @@ ExpertWeight make_expert_weight(Rng& rng, int rows, int cols, moe::Format fmt) {
     for (auto& c : codes) c = uint8_t(rng.next());
     for (auto& s : scales) s = float_to_e4m3(float(rng.uniform(16.0, 448.0)));
     for (int e = 0; e < E; ++e) factor[e] = float(rng.uniform(0.5, 1.5) * 0.002 / 448.0 * 64.0);
+    w.value_exact.resize(n);
     for (size_t i = 0; i < n; ++i) {
       const int e = int(i / (size_t(rows) * cols));
       const uint8_t byte = codes[i / 2];
       const float code = kE2M1[(i & 1) ? byte >> 4 : byte & 0xF];
       const float cs = code * e4m3_to_float(scales[i / 16]);  // exact (as in FP16)
-      w.value[i] = round_bf16(cs * factor[e]);
+      w.value_exact[i] = cs * factor[e];
+      w.value[i] = round_bf16(w.value_exact[i]);
     }
     w.codes.emplace(codes);
     w.scales.emplace(scales);
@@ -248,6 +279,10 @@ bool test_up(Rng& rng, const ExpertWeight& w13, int M) {
               (!is_exl3 && w13.fmt != moe::Format::MXFP8) ? w13.factor->get() : nullptr, w13.fmt, out.get(), true,
               g_stream, is_exl3 ? static_cast<const void*>(w13.rout->get()) : nullptr);
   sync();
+  const bool is_nvfp4_stream = (w13.fmt == moe::Format::NVFP4) && nvfp4_pre_sm80_stream();
+  const bool is_nvfp4_dp4a = (w13.fmt == moe::Format::NVFP4) && nvfp4_pre_sm80_dp4a();
+  const std::vector<float> x_oracle = is_nvfp4_dp4a ? quant16_act_host(x) : x;
+  const std::vector<float>& w_oracle = is_nvfp4_stream ? w13.value_exact : w13.value;
   std::vector<double> ref(size_t(M) * TOPK * I), rnd(ref.size());
   for (int m = 0; m < M; ++m)
     for (int k = 0; k < TOPK; ++k) {
@@ -256,8 +291,8 @@ bool test_up(Rng& rng, const ExpertWeight& w13, int M) {
         double gu[2] = {0, 0};
         for (int j = 0; j < 2; ++j) {
           const int wrow = is_exl3 ? (j * I + i) : (2 * i + j);
-          const float* row = &w13.value[(size_t(e) * 2 * I + wrow) * H];
-          for (int h = 0; h < H; ++h) gu[j] += double(row[h]) * x[size_t(m) * H + h];
+          const float* row = &w_oracle[(size_t(e) * 2 * I + wrow) * H];
+          for (int h = 0; h < H; ++h) gu[j] += double(row[h]) * x_oracle[size_t(m) * H + h];
         }
         const double g = rbf(gu[0]), u = rbf(gu[1]);
         const size_t o = (size_t(m) * TOPK + k) * I + i;
@@ -271,7 +306,34 @@ bool test_up(Rng& rng, const ExpertWeight& w13, int M) {
   // so FP16 rounding of x_rot can flip ~18% of BF16 ULPs (~60% of 8x finer FP16 ULPs) by 1 ULP while
   // staying well inside strict tol (worst err/tol < 0.10).
   const double exl3_off = ingine::kActIsFP16 ? 0.70 : 0.25;
-  return Check{what, 1.0 / 64, is_exl3 ? 3e-3 : 2e-3, is_exl3 ? exl3_off : 0.02}(bf16_download(out), ref, &rnd);
+  const auto got = bf16_download(out);
+  bool ok = Check{what, 1.0 / 64, is_exl3 ? 3e-3 : 2e-3, is_exl3 ? exl3_off : 0.02}(got, ref, &rnd);
+  if (is_nvfp4_dp4a) {
+    // Also verify end-to-end fidelity against unquantized FP64 reference (per-16 INT8 quant stays < 1.5% RMS).
+    double err2 = 0, ref2 = 0;
+    for (int m = 0; m < M; ++m)
+      for (int k = 0; k < TOPK; ++k) {
+        const int e = idx[size_t(m) * TOPK + k];
+        for (int i = 0; i < I; ++i) {
+          double gu[2] = {0, 0};
+          for (int j = 0; j < 2; ++j) {
+            const float* row = &w13.value[(size_t(e) * 2 * I + 2 * i + j) * H];
+            for (int h = 0; h < H; ++h) gu[j] += double(row[h]) * x[size_t(m) * H + h];
+          }
+          const double g = rbf(gu[0]), u = rbf(gu[1]);
+          const double r0 = softcap(g, 4.0) / (1.0 + std::exp(-g)) * softcap(u, 25.0);
+          const double d = double(got[(size_t(m) * TOPK + k) * I + i]) - r0;
+          err2 += d * d;
+          ref2 += r0 * r0;
+        }
+      }
+    const double rel_rms = std::sqrt(err2 / std::max(ref2, 1e-30));
+    const bool fid_ok = rel_rms < 0.015;
+    std::printf("%s %s (dp4a vs unquantized fp64): rel_rms=%.5f (limit 0.015)\n",
+                fid_ok ? "PASS" : "FAIL", what, rel_rms);
+    ok &= fid_ok;
+  }
+  return ok;
 }
 
 bool test_down(Rng& rng, const ExpertWeight& w2, int M) {
@@ -292,15 +354,19 @@ bool test_down(Rng& rng, const ExpertWeight& w2, int M) {
                 is_exl3 ? static_cast<const void*>(w2.rout->get()) : nullptr, is_exl3 ? dws.get() : nullptr);
   sync();
   const auto s = hist.download(), o = out.download(), st = dst.download();
+  const bool is_nvfp4_stream = (w2.fmt == moe::Format::NVFP4) && nvfp4_pre_sm80_stream();
+  const bool is_nvfp4_dp4a = (w2.fmt == moe::Format::NVFP4) && nvfp4_pre_sm80_dp4a();
+  const std::vector<float> act_oracle = is_nvfp4_dp4a ? quant16_act_host(act) : act;
+  const std::vector<float>& w_oracle = is_nvfp4_stream ? w2.value_exact : w2.value;
   std::vector<double> rs(s.size()), rsr(s.size());
   for (int m = 0; m < M; ++m)
     for (int c = 0; c < H; ++c) {
       double sum = 0;
       for (int k = 0; k < TOPK; ++k) {
         const int e = idx[size_t(m) * TOPK + k];
-        const float* row = &w2.value[(size_t(e) * H + c) * I];
+        const float* row = &w_oracle[(size_t(e) * H + c) * I];
         double y = 0;
-        for (int i = 0; i < I; ++i) y += double(row[i]) * act[(size_t(m) * TOPK + k) * I + i];
+        for (int i = 0; i < I; ++i) y += double(row[i]) * act_oracle[(size_t(m) * TOPK + k) * I + i];
         sum += double(wts[size_t(m) * TOPK + k]) * rbf(y);
       }
       rs[size_t(m) * H + c] = sum;
@@ -315,13 +381,35 @@ bool test_down(Rng& rng, const ExpertWeight& w2, int M) {
     for (int c = 0; c < H; ++c)
       for (int k = 0; k < TOPK; ++k) {
         const int e = idx[size_t(m) * TOPK + k];
-        const float* row = &w2.value[(size_t(e) * H + c) * I];
+        const float* row = &w_oracle[(size_t(e) * H + c) * I];
         double y = 0;
-        for (int i = 0; i < I; ++i) y += double(row[i]) * act[(size_t(m) * TOPK + k) * I + i];
+        for (int i = 0; i < I; ++i) y += double(row[i]) * act_oracle[(size_t(m) * TOPK + k) * I + i];
         max_term = std::max(max_term, std::fabs(double(wts[size_t(m) * TOPK + k]) * y));
       }
   const double exl3_down_off = ingine::kActIsFP16 ? 0.60 : 0.15;
   bool ok = Check{what, 1.0 / 64, 1e-4 + max_term / 256.0, is_exl3 ? exl3_down_off : 0.02}(s, rs, &rsr);
+  if (is_nvfp4_dp4a) {
+    double err2 = 0, ref2 = 0;
+    for (int m = 0; m < M; ++m)
+      for (int c = 0; c < H; ++c) {
+        double sum = 0;
+        for (int k = 0; k < TOPK; ++k) {
+          const int e = idx[size_t(m) * TOPK + k];
+          const float* row = &w2.value[(size_t(e) * H + c) * I];
+          double y = 0;
+          for (int i = 0; i < I; ++i) y += double(row[i]) * act[(size_t(m) * TOPK + k) * I + i];
+          sum += double(wts[size_t(m) * TOPK + k]) * rbf(y);
+        }
+        const double d = double(s[size_t(m) * H + c]) - sum;
+        err2 += d * d;
+        ref2 += sum * sum;
+      }
+    const double rel_rms = std::sqrt(err2 / std::max(ref2, 1e-30));
+    const bool fid_ok = rel_rms < 0.015;
+    std::printf("%s %s (dp4a vs unquantized fp64): rel_rms=%.5f (limit 0.015)\n",
+                fid_ok ? "PASS" : "FAIL", what, rel_rms);
+    ok &= fid_ok;
+  }
   std::vector<double> ro(o.size()), rst(st.size());
   for (int c = 0; c < H; ++c) {
     std::vector<double> ext(M + 3);
@@ -383,13 +471,15 @@ int main() {
   for (moe::Format fmt : {moe::Format::NVFP4, moe::Format::MXFP8, moe::Format::ATLAS2, moe::Format::ATLAS3,
                           moe::Format::EXL3_2, moe::Format::EXL3_3}) {
     const ExpertWeight w13 = make_expert_weight(rng, 2 * I, H, fmt);
-    for (int M : {1, 3, 8}) ok &= test_up(rng, w13, M);
+    for (int M : {1, 2, 3, 8})
+      if (M != 2 || fmt == moe::Format::NVFP4) ok &= test_up(rng, w13, M);
     ok &= test_dequant(w13);
   }
   for (moe::Format fmt : {moe::Format::NVFP4, moe::Format::MXFP8, moe::Format::ATLAS2, moe::Format::ATLAS3,
                           moe::Format::EXL3_2, moe::Format::EXL3_3}) {
     const ExpertWeight w2 = make_expert_weight(rng, H, I, fmt);
-    for (int M : {1, 3, 8}) ok &= test_down(rng, w2, M);
+    for (int M : {1, 2, 3, 8})
+      if (M != 2 || fmt == moe::Format::NVFP4) ok &= test_down(rng, w2, M);
     ok &= test_dequant(w2);
   }
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));

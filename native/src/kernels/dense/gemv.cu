@@ -168,6 +168,42 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
 
   const int gl = threadIdx.x % LANES;
   const int row = (blockIdx.x * BLOCK + threadIdx.x) / LANES;
+#if INGINE_ACT_FP16 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+  if constexpr (FP8) {
+    // Pre-Ada FP16-activation fast path (Volta sm_70 / Turing sm_75 / Pascal sm_60/61):
+    // Zero-SMEM full-row weight prefetch + L1-cached __ldg activations + branchless 3-op e4m3x2_to_half2_m8
+    // (* 256.f folded into row scale). Maximizes active waves and eliminates SMEM carveout tail waves.
+    if (row >= rows) return;
+    const int in = epi.input_of(row);
+    if (in < 0) return;
+    const ActT* x = epi.x_of(in);
+    const uint8_t* wr = w + size_t(row) * ROW_BYTES;
+    const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+    uint4 wv[CH];
+#pragma unroll
+    for (int i = 0; i < CH; ++i) {
+      wv[i] = l2::ld_stream<WEIGHT_L2>(wr + (size_t(i) * LANES + gl) * 16, wpol);
+    }
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < CH; ++i) {
+      const int c16 = i * LANES + gl;
+      float wf[16], xf[16];
+      unpack_e4m3x16_m8(wv[i], wf);
+      unpack_bf16x8(__ldg(reinterpret_cast<const uint4*>(x + c16 * 16)), xf);
+      unpack_bf16x8(__ldg(reinterpret_cast<const uint4*>(x + c16 * 16 + 8)), xf + 8);
+#pragma unroll
+      for (int j = 0; j < 16; ++j) acc = fmaf(wf[j], xf[j], acc);
+    }
+    float v[1] = {group_sum<LANES>(acc) * (__ldg(w_scale + row) * 256.f)};
+    if constexpr (Epi::kScatter) {
+      if (gl == 0) epi.store1(row, 0, v[0]);
+    } else {
+      epi.store(row, v, gl, group_mask<LANES>());
+    }
+    return;
+  }
+#endif
   // A whole group shares `row`, so groups exit together and the shuffles below stay within live groups.
   if (row >= rows) return;
   const int in = epi.input_of(row);
@@ -210,9 +246,12 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
   mma::mma_act(c, a0, a1, a2, a3, b0, b1);
 }
 
-// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one instruction on SM120a, hw FP16 convert on SM89, portable helper on SM86.
-__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-#if INGINE_ACT_FP16
+// 2 E4M3 (low 16 bits of u) -> Act2T. On pre-Ada FP16 builds (sm_60/61/70/75), use exact 3-op E4M3 * 2^-8 -> FP16x2
+// (adapted from ashalliants/ninfer-3090, Apache-2.0) and fold * 256.f into the epilogue scale.
+__device__ __forceinline__ uint32_t e4m3x2_to_mma_act2(uint32_t u) {
+#if INGINE_ACT_FP16 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+  return e4m3x2_to_half2_m8(u);
+#elif INGINE_ACT_FP16
   return act::e4m3x2_to_half2_bits(u);
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   uint32_t r;
@@ -306,17 +345,17 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
           const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
           const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
           const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_bf16x2(W0[u].x), e4m3x2_to_bf16x2(W0[u].x >> 16),
-                                   e4m3x2_to_bf16x2(W0[u].y), e4m3x2_to_bf16x2(W0[u].y >> 16),
+          mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W0[u].x), e4m3x2_to_mma_act2(W0[u].x >> 16),
+                                   e4m3x2_to_mma_act2(W0[u].y), e4m3x2_to_mma_act2(W0[u].y >> 16),
                                    x0.x ^ dep, x0.y, x0.z, x0.w);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_bf16x2(W0[u].z), e4m3x2_to_bf16x2(W0[u].z >> 16),
-                                   e4m3x2_to_bf16x2(W0[u].w), e4m3x2_to_bf16x2(W0[u].w >> 16),
+          mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W0[u].z), e4m3x2_to_mma_act2(W0[u].z >> 16),
+                                   e4m3x2_to_mma_act2(W0[u].w), e4m3x2_to_mma_act2(W0[u].w >> 16),
                                    x1.x, x1.y, x1.z, x1.w);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_bf16x2(W1[u].x), e4m3x2_to_bf16x2(W1[u].x >> 16),
-                                   e4m3x2_to_bf16x2(W1[u].y), e4m3x2_to_bf16x2(W1[u].y >> 16),
+          mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W1[u].x), e4m3x2_to_mma_act2(W1[u].x >> 16),
+                                   e4m3x2_to_mma_act2(W1[u].y), e4m3x2_to_mma_act2(W1[u].y >> 16),
                                    x2.x, x2.y, x2.z, x2.w);
-          mma::sm70_mma_f16_direct(c8, e4m3x2_to_bf16x2(W1[u].z), e4m3x2_to_bf16x2(W1[u].z >> 16),
-                                   e4m3x2_to_bf16x2(W1[u].w), e4m3x2_to_bf16x2(W1[u].w >> 16),
+          mma::sm70_mma_f16_direct(c8, e4m3x2_to_mma_act2(W1[u].z), e4m3x2_to_mma_act2(W1[u].z >> 16),
+                                   e4m3x2_to_mma_act2(W1[u].w), e4m3x2_to_mma_act2(W1[u].w >> 16),
                                    x3.x, x3.y, x3.z, x3.w);
         } else {
           const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
@@ -369,10 +408,10 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
                                   X[u][1].x,       X[u][1].y, X[u][1].z, X[u][1].w};
 #pragma unroll
           for (int s = 0; s < 4; ++s) {
-            const float2 fa0 = act::unpack2(e4m3x2_to_bf16x2(aw[s]));
-            const float2 fa1 = act::unpack2(e4m3x2_to_bf16x2(aw[s] >> 16));
-            const float2 fb0 = act::unpack2(e4m3x2_to_bf16x2(bw[s]));
-            const float2 fb1 = act::unpack2(e4m3x2_to_bf16x2(bw[s] >> 16));
+            const float2 fa0 = act::unpack2(e4m3x2_to_mma_act2(aw[s]));
+            const float2 fa1 = act::unpack2(e4m3x2_to_mma_act2(aw[s] >> 16));
+            const float2 fb0 = act::unpack2(e4m3x2_to_mma_act2(bw[s]));
+            const float2 fb1 = act::unpack2(e4m3x2_to_mma_act2(bw[s] >> 16));
 #pragma unroll
             for (int m = 0; m < M; ++m) {
               const int sl = 4 * m + t;
@@ -406,8 +445,8 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
                                   X[u][1].x, X[u][1].y, X[u][1].z, X[u][1].w};
 #pragma unroll
           for (int s = 0; s < 4; ++s)
-            mma_bf16(c, e4m3x2_to_bf16x2(aw[s]), e4m3x2_to_bf16x2(bw[s]), e4m3x2_to_bf16x2(aw[s] >> 16),
-                     e4m3x2_to_bf16x2(bw[s] >> 16), xw[2 * s] ^ dep, xw[2 * s + 1]);
+            mma_bf16(c, e4m3x2_to_mma_act2(aw[s]), e4m3x2_to_mma_act2(bw[s]), e4m3x2_to_mma_act2(aw[s] >> 16),
+                     e4m3x2_to_mma_act2(bw[s] >> 16), xw[2 * s] ^ dep, xw[2 * s + 1]);
         } else {
           mma_bf16(c, A[u].x, B[u].x, A[u].y, B[u].y, X[u][0].x ^ dep, X[u][0].y);
           mma_bf16(c, A[u].z, B[u].z, A[u].w, B[u].w, X[u][0].z ^ dep, X[u][0].w);
@@ -462,16 +501,21 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
     for (int k = 0; k < SPLITK; ++k) s += cs[k][r][m];
     return s;
   };
+#if INGINE_ACT_FP16 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+  constexpr float kFp8ScaleMul = FP8 ? 256.f : 1.f;
+#else
+  constexpr float kFp8ScaleMul = 1.f;
+#endif
   if constexpr (Epi::kScatter) {
     for (int k = threadIdx.x; k < 16 * M; k += 32 * SPLITK) {
       const int r = k / M, m = k % M, row = r0 + r;
       if (row < rows && epi.input_of(row) >= 0)
-        epi.store1(row, m, total(r, m) * (FP8 ? __ldg(w_scale + row) : 1.f));
+        epi.store1(row, m, total(r, m) * (FP8 ? (__ldg(w_scale + row) * kFp8ScaleMul) : 1.f));
     }
   } else {
     const int r = threadIdx.x, row = r0 + r;
     if (r < 16 && row < rows) {
-      const float scale = FP8 ? __ldg(w_scale + row) : 1.f;
+      const float scale = FP8 ? (__ldg(w_scale + row) * kFp8ScaleMul) : 1.f;
       float y[M];
 #pragma unroll
       for (int m = 0; m < M; ++m) y[m] = total(r, m) * scale;
@@ -498,8 +542,25 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     using E = decltype(epi);
     if constexpr (MM == 1 && (BLOCK > 0 || kActIsFP16)) {
       constexpr int B = BLOCK > 0 ? BLOCK : 32;  // (the branch is discarded for BLOCK = 0)
-      if (fp8) launch_ex(gemv_kernel<true, K, 16, B, E>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
-      else launch_ex(gemv_kernel<false, K, 32, B, E>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
+      if (fp8) {
+        if constexpr (kActIsFP16 && K == 3072 && B == 32) {
+          // Zero-SMEM 32-lane (CH=6) 128-thread blocks: 576 blocks across 80 SMs, full 100% occupancy (~32 regs).
+          constexpr int B128 = 128;
+          launch_ex(gemv_kernel<true, K, 32, B128, E>, dim3((rows * 32 + B128 - 1) / B128), B128, 0, 1, pdl, stream,
+                    wp, sc, rows, 0u, epi);
+        } else if constexpr (kActIsFP16 && K == 2304 && B == 256) {
+          // Zero-SMEM 16-lane (CH=9) 128-thread blocks: 1076 blocks for proj (13.5/SM), full L1 activation hit.
+          constexpr int B128 = 128;
+          launch_ex(gemv_kernel<true, K, 16, B128, E>, dim3((rows * 16 + B128 - 1) / B128), B128, 0, 1, pdl, stream,
+                    wp, sc, rows, 0u, epi);
+        } else {
+          launch_ex(gemv_kernel<true, K, 16, B, E>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows,
+                    0u, epi);
+        }
+      } else {
+        launch_ex(gemv_kernel<false, K, 32, B, E>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows,
+                  0u, epi);
+      }
     } else {
       const dim3 blocks((rows + 15) / 16);
       if (fp8) launch_ex(gemv_mma_kernel<true, K, MM, SPLITK, UFP8, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
