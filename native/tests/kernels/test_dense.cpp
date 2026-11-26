@@ -702,7 +702,8 @@ Q5kProjAuditStats audit_q5_k_proj(const std::vector<float>& got, const std::vect
     }
   }
   st.orig_rfc_v3_pass = (st.post_act_max_abs_vs_rnd <= 1e-3);
-  st.cast_aware_pass = (st.raw_pre_act_max_abs <= 1e-3) && (st.round_bit_diff == 0) && all_within_cast_aware;
+  st.cast_aware_pass = (st.raw_pre_act_max_abs <= 1e-3) && (st.round_bit_diff == 0) &&
+                       (st.max_ulp_gt1e3 <= 1) && all_within_cast_aware;
   return st;
 }
 
