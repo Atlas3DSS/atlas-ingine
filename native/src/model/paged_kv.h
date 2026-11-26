@@ -32,6 +32,7 @@ struct PagedKvConfig {
   int vram_mb = 0;               // VRAM budget for hot KV pages + staging (<= 0 disables paging)
   int ram_mb = 12288;            // pinned UVA host RAM cap in MiB before spilling to Tier-2 NVMe SwapFile
   int prefill_chunk = 512;       // max T for FP32 online-softmax partial buffers
+  int num_full_slots = NUM_FULL_VISITS;  // 8 (per_pass) or 4 (last_full)
   std::filesystem::path swap_dir;  // optional directory for SwapFile (empty -> system temp dir)
 };
 
@@ -67,6 +68,7 @@ class PagedKvCache {
 
   int max_ctx() const noexcept { return max_ctx_; }
   int max_pages() const noexcept { return max_pages_; }
+  int num_full_slots() const noexcept { return num_full_slots_; }
   bool has_nvme_spill() const noexcept { return swap_page_count_ > 0; }
   // Use bulk-DMA double-buffered streaming decode whenever NVMe swap is active or >=32 pages (144 MiB)
   // are resident in Tier-1 host RAM (saturates PCIe H2D at ~20 GB/s instead of ~2 GB/s scattered UVA).
@@ -146,6 +148,7 @@ class PagedKvCache {
 
   int max_ctx_ = 0;
   int max_pages_ = 0;
+  int num_full_slots_ = NUM_FULL_VISITS;
   int batch_pages_ = 4;
   int max_ram_slots_ = 0;
   int ram_chunk_slots_ = 112;  // 112 * 4.5 MiB = 504 MiB per lazy HostRegion slab

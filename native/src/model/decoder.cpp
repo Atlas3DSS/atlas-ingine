@@ -4,6 +4,7 @@
 #include "model/runtime.h"
 
 #include "core/device.h"
+#include "core/ops.h"
 #include "kernels/attn/attn.h"
 #include "kernels/dense/dense.h"
 #include "kernels/moe/moe.h"
@@ -104,8 +105,11 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   };
 
   if (w.embed_q4()) {
-    dense::embed_q4(static_cast<const std::int64_t*>(b.token.data), m, w.embed.data, f32p(w.embed_norm), f32m(b.B0),
-                    pdl, stream);
+    auto desc = ops::make_inkling_embed_q4_desc(m, VOCAB, pdl);
+    desc.token_bounds = ops::TokenBoundsMode::PreValidated;
+    const ops::EmbedQ4RmsNormArgs args{static_cast<const std::int64_t*>(b.token.data), w.embed.data,
+                                       f32p(w.embed_norm), f32m(b.B0)};
+    ops::run_embed_q4_rmsnorm(desc, args, stream);
   } else {
     dense::embed(static_cast<const std::int64_t*>(b.token.data), m, static_cast<const ActT*>(w.embed.data),
                  f32p(w.embed_norm), f32m(b.B0), pdl, stream);
@@ -204,7 +208,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     a.workspace_size = attn_ws_.bytes;
     a.out = bf16m(b.attn_out);
     if (layer.full) {
-      const int fi = FULL_INDEX[v];
+      const int fi = st.full_slot(v);
       if (streamed_paged_kv) {
         st.paged_kv->decode_attention_with_swap(fi, layer, v, f32p(proj_out), m, int(streamed_h_pos), st.conv_k_at(v),
                                                 st.conv_v_at(v), bf16m(b.attn_out), stream);

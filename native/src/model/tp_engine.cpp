@@ -182,6 +182,9 @@ void validate_tp_runtime_options(const RuntimeOptions& options, int tp_size) {
     throw std::invalid_argument(
         tag + " mode supports BF16/FP16 or --kv-fp8 KV cache (not --kv-q4, --kv-paged, --kv-vram-mb, or --kv-swap-dir)");
   }
+  if (options.kv_cache_mode != KvCacheMode::PerPass) {
+    throw std::invalid_argument(tag + " mode supports only --kv-cache-mode per_pass (not last_full)");
+  }
   if (options.vision) {
     throw std::invalid_argument(tag + " mode does not support --vision");
   }
@@ -579,7 +582,7 @@ class TpPrefiller {
     };
 
     pk::widen_ids(tokens, T, ids_, IMAGE_PLACEHOLDER_ID, s);
-    if (w.embed_q4()) dense::embed_q4(ids_, T, w.embed.data, f32p(w.embed_norm), B0_, false, s);
+    if (w.embed_q4()) dense::embed_q4(ids_, T, VOCAB, w.embed.data, f32p(w.embed_norm), B0_, false, s);
     else dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
 
     int prev_v = -1;
@@ -1760,7 +1763,7 @@ class TpDecoder {
     };
 
     if (w.embed_q4()) {
-      dense::embed_q4(static_cast<const std::int64_t*>(b.token.data), m, w.embed.data, f32p(w.embed_norm), f32m(b.B0), false, stream);
+      dense::embed_q4(static_cast<const std::int64_t*>(b.token.data), m, VOCAB, w.embed.data, f32p(w.embed_norm), f32m(b.B0), false, stream);
     } else {
       dense::embed(static_cast<const std::int64_t*>(b.token.data), m, static_cast<const ActT*>(w.embed.data), f32p(w.embed_norm), f32m(b.B0), false, stream);
     }
@@ -2218,7 +2221,7 @@ class TpSpecGenerator final : public Generator {
              std::equal(cached.begin(), cached.end(), prompt.begin());
     };
     int start = 0;
-    if (is_prefix(ckpt_ids_) && int(ckpt_ids_.size()) == n) {
+    if (options_.prefix_cache && is_prefix(ckpt_ids_) && int(ckpt_ids_.size()) == n) {
       // Exact prompt checkpoint hit!
       std::size_t restored = 0;
       pool_.run_all([&](int r) {
@@ -2237,7 +2240,7 @@ class TpSpecGenerator final : public Generator {
       stats.restored_bytes = restored;
       return;
     }
-    if (is_prefix(ckpt_ids_)) {
+    if (options_.prefix_cache && is_prefix(ckpt_ids_)) {
       std::size_t restored = 0;
       pool_.run_all([&](int r) {
         const std::size_t b = restore_state_ckpt(ranks_[r].state, ranks_[r].ckpt.p, pool_.stream(r));
@@ -2290,15 +2293,19 @@ class TpSpecGenerator final : public Generator {
       CUDA_CHECK(cudaSetDevice(0));
       drafter_->note_tokens(prompt);
     }
-    // Save checkpoint at end of prompt for fast subsequent reuse
-    pool_.run_all([&](int r) {
-      save_state_ckpt(ranks_[r].state, ranks_[r].ckpt.p, pool_.stream(r));
-      if (r == 0) {
-        if (drafter_) drafter_->save_checkpoint(ckpt_drafter_.p);
-        CUDA_CHECK(cudaMemcpyAsync(ckpt_logits_.p, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice, pool_.stream(0)));
-      }
-    });
-    ckpt_ids_ = tokens_in_state_;
+    // Save checkpoint at end of prompt for fast subsequent reuse when prefix caching is enabled
+    if (options_.prefix_cache) {
+      pool_.run_all([&](int r) {
+        save_state_ckpt(ranks_[r].state, ranks_[r].ckpt.p, pool_.stream(r));
+        if (r == 0) {
+          if (drafter_) drafter_->save_checkpoint(ckpt_drafter_.p);
+          CUDA_CHECK(cudaMemcpyAsync(ckpt_logits_.p, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice, pool_.stream(0)));
+        }
+      });
+      ckpt_ids_ = tokens_in_state_;
+    } else {
+      ckpt_ids_.clear();
+    }
   }
 
   std::int32_t sample_r0(const float* logits, const Sampling& sampling, head::SamplerRng& rng) {

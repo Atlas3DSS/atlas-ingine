@@ -83,6 +83,21 @@ void gather_full_kv(const void* src_k_pool, const void* src_v_pool, int slot, co
                     int max_pages_per_slot, int n, bool kv_fp8, void* dst_k, void* dst_v, int scratch_max_ctx,
                     cudaStream_t stream);
 
+// Copies a partial (<64-token) full-attention KV tail [src_pos0, src_pos0 + tail_tokens) across all 8 full visits
+// from scratch `[8, scratch_max_ctx, 8, 128]` into compact checkpoint tail `[8, tail_tokens, 8, 128]`.
+void copy_tail_kv_from_scratch(const void* src_k, const void* src_v, int scratch_max_ctx, int src_pos0,
+                               int tail_tokens, bool kv_fp8, void* dst_tail_k, void* dst_tail_v, cudaStream_t stream);
+
+// Copies a compact checkpoint tail `[8, tail_tokens, 8, 128]` into scratch `[8, scratch_max_ctx, 8, 128]`
+// at `[dst_pos0, dst_pos0 + tail_tokens)`.
+void copy_tail_kv_to_scratch(const void* src_tail_k, const void* src_tail_v, int tail_tokens, bool kv_fp8,
+                             void* dst_k, void* dst_v, int scratch_max_ctx, int dst_pos0, cudaStream_t stream);
+
+// Copies a compact checkpoint tail `[8, tail_tokens, 8, 128]` into rows `[0, tail_tokens)` of private physical
+// pool page `phys_page` inside `[num_pages, 8, 64, 8, 128]` (used on exact prompt hits with non-64-aligned length).
+void copy_tail_kv_to_pool_page(const void* src_tail_k, const void* src_tail_v, int tail_tokens, bool kv_fp8,
+                               int phys_page, void* dst_k_pool, void* dst_v_pool, cudaStream_t stream);
+
 // Converts a slice `[v_offset, v_offset + chunk_V)` of ActT raw head matmul outputs `[B, chunk_V]` into
 // softcapped FP32 logits `out[b, v_offset + v] = 30 * tanh(float(in[b, v]) / 30)` (stride total_V).
 void batched_head_softcap(const ActT* in, int B, int chunk_V, int v_offset, int total_V, float* out,

@@ -4,9 +4,12 @@
 #include "model/runtime.h"
 
 #include "core/device.h"
+#include "core/hal.h"
+#include "core/ops.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <stdexcept>
 
 namespace ingine::model {
@@ -63,6 +66,9 @@ void GraphExec::launch(cudaStream_t stream) const {
 
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  if (options_.kv_cache_mode == KvCacheMode::LastFull && options_.spec) {
+    throw std::invalid_argument("--kv-cache-mode last_full cannot be combined with --spec (B=1 non-spec control)");
+  }
   if (options_.kv_paged || options_.kv_vram_mb > 0) {
     options_.kv_paged = true;
     options_.kv_q4 = true;
@@ -85,6 +91,7 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   offload.prefill_chunk = options_.prefill_chunk;
   offload.kv_fp8 = options_.kv_fp8;
   offload.kv_q4 = options_.kv_q4;
+  offload.kv_last_full = (options_.kv_cache_mode == KvCacheMode::LastFull);
   offload.spec = options_.spec;
   offload.kv_vram_mb = options_.kv_paged ? options_.kv_vram_mb : 0;
   weights_ = load_weights(options_.model_dir, options_.dense_fp8, stream_, offload);
@@ -95,6 +102,15 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
 Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablation)
     : options_(options), weights_(std::move(weights)), ablation_(std::move(ablation)) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  if (options_.kv_cache_mode == KvCacheMode::LastFull && options_.spec) {
+    throw std::invalid_argument("--kv-cache-mode last_full cannot be combined with --spec (B=1 non-spec control)");
+  }
+  // Decoder/Prefiller always dereference the ablation buffers (zeroed when inactive); materialize an
+  // empty device ablation if the caller passed a default-constructed Ablation{}.
+  if (!ablation_.active && (!ablation_.attn_dirs.data || !ablation_.attn_w.data || !ablation_.mlp_dirs.data ||
+                            !ablation_.mlp_w.data)) {
+    ablation_ = load_ablation({});
+  }
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   init();
 }
@@ -109,7 +125,8 @@ void Runtime::init() {
     pkv.prefill_chunk = options.prefill_chunk;
     pkv.swap_dir = options.kv_swap_dir;
   }
-  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_q4, pkv);
+  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_q4, pkv,
+                      options.kv_cache_mode == KvCacheMode::LastFull);
   if (state_.paged_kv) {
     state_.paged_kv->ensure_decode_pages(0, kMaxWidth, stream_);
   }
@@ -149,6 +166,9 @@ void Runtime::init() {
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
+  int active_dev = 0;
+  CUDA_CHECK(cudaGetDevice(&active_dev));
+  supports_conditional_graphs_ = hal::conditional_graphs_enabled(active_dev);
   const bool eager_offload = weights_.expert_cache && weights_.expert_cache->needs_host_dispatch();
   if (!eager_offload) {
     for (const auto& [m, history] : history_) capture(m, history);
@@ -183,8 +203,10 @@ bool Runtime::needs_eager_step() const noexcept {
          (state_.paged_kv && state_.paged_kv->needs_streamed_decode());
 }
 
+bool Runtime::supports_conditional_graphs() const noexcept { return supports_conditional_graphs_; }
+
 bool Runtime::has_verify_graph() const noexcept {
-  return !(weights_.expert_cache && weights_.expert_cache->needs_host_dispatch());
+  return supports_conditional_graphs_ && !needs_eager_step();
 }
 
 Buffers& Runtime::buffers(int m) {
@@ -295,6 +317,7 @@ void Runtime::set_persona(const persona::PersonaProfile* profile, const PersonaT
 void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
   const int m = int(tokens.size());
   buffers(m);  // the width must exist
+  ops::validate_token_ids_i32(tokens.data(), m, VOCAB);
   if (state_.paged_kv) state_.paged_kv->ensure_decode_pages(position, m, stream_);
   set_step_inputs(tokens.data(), m, position, this->tokens(), pos(), stream_);
 }
@@ -365,12 +388,15 @@ std::size_t Runtime::checkpoint_bytes() const {
   return n;
 }
 
-void Runtime::save_checkpoint(void* dst) {
+std::size_t Runtime::save_checkpoint(void* dst) {
   char* p = static_cast<char*>(dst);
+  std::size_t copied = 0;
   for (const Tensor* t : checkpoint_tensors(state_)) {
     CUDA_CHECK(cudaMemcpyAsync(p, t->data, t->bytes(), cudaMemcpyDefault, stream_));
+    copied += t->bytes();
     p += carved(t->bytes());
   }
+  return copied;
 }
 
 std::size_t Runtime::restore_checkpoint(const void* src) {
@@ -388,37 +414,43 @@ std::size_t Runtime::full_rows_bytes(int n) const {
   if (n < 0 || n > options_.max_ctx)
     throw std::invalid_argument("full_rows_bytes: n = " + std::to_string(n) + " outside [0, max_ctx = " +
                                 std::to_string(options_.max_ctx) + "]");
-  const std::size_t row = state_.k_full.bytes() / NUM_FULL_VISITS / std::size_t(options_.max_ctx);
-  return 2 * std::size_t(NUM_FULL_VISITS) * row * std::size_t(n);
+  const int nfull = state_.num_full_slots();
+  const std::size_t row = state_.k_full.bytes() / std::size_t(nfull) / std::size_t(options_.max_ctx);
+  return 2 * std::size_t(nfull) * row * std::size_t(n);
 }
 
-// Copy NUM_FULL_VISITS visits of n positions packed contiguously (k visits, then v visits).
-// Per-visit 1D copies avoid CUDA's 2 GiB cudaMemcpy2DAsync pitch ceiling at >=1M context lengths.
-void Runtime::save_full_rows(void* dst, int n) {
-  const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
-  if (n == 0) return;
-  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+// Copy active full slots (8 in per_pass, 4 in last_full) of n positions packed contiguously (k slots, then v slots).
+// Per-slot 1D copies avoid CUDA's 2 GiB cudaMemcpy2DAsync pitch ceiling at >=1M context lengths.
+std::size_t Runtime::save_full_rows(void* dst, int n) {
+  const int nfull = state_.num_full_slots();
+  const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / std::size_t(nfull);
+  if (n == 0) return 0;
+  const std::size_t pitch = state_.k_full.bytes() / std::size_t(nfull);
   char* p = static_cast<char*>(dst);
+  std::size_t copied = 0;
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
     const char* src = static_cast<const char*>(t->data);
-    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+    for (int f = 0; f < nfull; ++f) {
       CUDA_CHECK(cudaMemcpyAsync(p + std::size_t(f) * width, src + std::size_t(f) * pitch, width, cudaMemcpyDefault,
                                  stream_));
+      copied += width;
     }
     p += bytes;
   }
+  return copied;
 }
 
 std::size_t Runtime::restore_full_rows(const void* src, int n) {
+  const int nfull = state_.num_full_slots();
   const std::size_t total = full_rows_bytes(n);
-  const std::size_t bytes = total / 2, width = bytes / NUM_FULL_VISITS;
+  const std::size_t bytes = total / 2, width = bytes / std::size_t(nfull);
   if (n == 0) return 0;
-  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+  const std::size_t pitch = state_.k_full.bytes() / std::size_t(nfull);
   const char* p = static_cast<const char*>(src);
   std::size_t copied = 0;
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
     char* dst = static_cast<char*>(t->data);
-    for (int f = 0; f < NUM_FULL_VISITS; ++f) {
+    for (int f = 0; f < nfull; ++f) {
       CUDA_CHECK(cudaMemcpyAsync(dst + std::size_t(f) * pitch, p + std::size_t(f) * width, width, cudaMemcpyDefault,
                                  stream_));
       copied += width;
@@ -458,68 +490,186 @@ void Runtime::record_rollback(int m, const std::int32_t* accepted, cudaStream_t 
   verify_rollback(state_ptrs(), backup_, hist, pos(), 0, accepted, 0, m, stream);
 }
 
-GraphExec Runtime::capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
-                                  const std::function<void(cudaStream_t, int)>& branch) {
+namespace {
+
+std::atomic<int> g_fail_next_switch_capture{int(cudaSuccess)};
+std::atomic<std::uint64_t> g_switch_verify_launches{0};
+std::atomic<std::uint64_t> g_switch_accept_launches{0};
+std::atomic<std::uint64_t> g_eager_verify_launches{0};
+std::atomic<std::uint64_t> g_eager_accept_launches{0};
+std::atomic<std::uint64_t> g_switch_capture_fallbacks{0};
+
+bool is_conditional_unsupported(cudaError_t err) noexcept {
+  switch (err) {
+    case cudaErrorNotSupported:
+    case cudaErrorNotPermitted:
+    case cudaErrorInsufficientDriver:
+    case cudaErrorCallRequiresNewerDriver:
+    case cudaErrorOperatingSystem:
+    case cudaErrorUnsupportedPtxVersion:
+      return true;
+    default:
+      return false;
+  }
+}
+
+struct SwitchCudaError {
+  cudaError_t err = cudaSuccess;
+  const char* what = "";
+  bool from_switch_node = false;
+};
+
+void throw_if_switch_err(cudaError_t err, const char* what, bool from_switch_node = false) {
+  if (err != cudaSuccess) throw SwitchCudaError{err, what, from_switch_node};
+}
+
+}  // namespace
+
+bool is_conditional_switch_unsupported_error(cudaError_t err) noexcept {
+  return is_conditional_unsupported(err);
+}
+
+void fail_next_switch_capture(cudaError_t err) noexcept {
+  g_fail_next_switch_capture.store(int(err), std::memory_order_relaxed);
+}
+
+SpecExecutionCounters spec_execution_counters() noexcept {
+  return SpecExecutionCounters{
+      g_switch_verify_launches.load(std::memory_order_relaxed),
+      g_switch_accept_launches.load(std::memory_order_relaxed),
+      g_eager_verify_launches.load(std::memory_order_relaxed),
+      g_eager_accept_launches.load(std::memory_order_relaxed),
+      g_switch_capture_fallbacks.load(std::memory_order_relaxed),
+  };
+}
+
+void reset_spec_execution_counters() noexcept {
+  g_switch_verify_launches.store(0, std::memory_order_relaxed);
+  g_switch_accept_launches.store(0, std::memory_order_relaxed);
+  g_eager_verify_launches.store(0, std::memory_order_relaxed);
+  g_eager_accept_launches.store(0, std::memory_order_relaxed);
+  g_switch_capture_fallbacks.store(0, std::memory_order_relaxed);
+}
+
+void record_spec_execution(bool is_verify, bool used_switch) noexcept {
+  if (is_verify) {
+    if (used_switch) g_switch_verify_launches.fetch_add(1, std::memory_order_relaxed);
+    else g_eager_verify_launches.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    if (used_switch) g_switch_accept_launches.fetch_add(1, std::memory_order_relaxed);
+    else g_eager_accept_launches.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+GraphExec Runtime::try_capture_switch(const std::function<cudaError_t(cudaStream_t, cudaGraphConditionalHandle)>& head,
+                                      const std::function<void(cudaStream_t, int)>& branch) {
+  if (!supports_conditional_graphs_) return GraphExec{};
   if (verify_widths_.empty()) throw std::logic_error("capture_switch needs the speculative widths (options.spec)");
+#if CUDART_VERSION < 12080
+  (void)head;
+  (void)branch;
+  supports_conditional_graphs_ = false;
+  g_switch_capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
+  return GraphExec{};
+#else
   const cudaStream_t s = capture_stream_;
   cudaGraph_t graph = nullptr;
-  CUDA_CHECK(cudaGraphCreate(&graph, 0));
   struct Owned {
-    cudaGraph_t g;
-    ~Owned() { cudaGraphDestroy(g); }
-  } owned{graph};
-  // run `body` captured into `g` (an exception ends the capture first)
-  auto captured = [&](cudaGraph_t g, const std::function<void()>& body) {
-    CUDA_CHECK(cudaStreamBeginCaptureToGraph(s, g, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
-    try {
-      body();
-    } catch (...) {
-      cudaGraph_t out = nullptr;
-      cudaStreamEndCapture(s, &out);
-      throw;
+    cudaGraph_t& g;
+    ~Owned() {
+      if (g) (void)cudaGraphDestroy(g);
     }
-    cudaGraph_t out = nullptr;
-    CUDA_CHECK(cudaStreamEndCapture(s, &out));
-  };
+  } owned{graph};
 
-  cudaGraphConditionalHandle handle;
-  CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, graph, 0, 0));
-  cudaGraph_t* bodies = nullptr;
-  captured(graph, [&] {
-    head(s, handle);
-    cudaStreamCaptureStatus status;
-    cudaGraph_t g = nullptr;
-    const cudaGraphNode_t* deps = nullptr;
-    std::size_t n = 0;
-#if CUDART_VERSION >= 13000
-    const cudaGraphEdgeData* edges = nullptr;
-    CUDA_CHECK(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &edges, &n));
-#else
-    CUDA_CHECK(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &n));
-#endif
-    cudaGraphNodeParams p{};
-    p.type = cudaGraphNodeTypeConditional;
-    p.conditional.handle = handle;
-    p.conditional.type = cudaGraphCondTypeSwitch;
-    p.conditional.size = unsigned(verify_widths_.size());
-    cudaGraphNode_t node = nullptr;
-#if CUDART_VERSION >= 13000
-    CUDA_CHECK(cudaGraphAddNode(&node, g, deps, edges, n, &p));
-    bodies = p.conditional.phGraph_out;
-    CUDA_CHECK(cudaStreamUpdateCaptureDependencies(s, &node, nullptr, 1, cudaStreamSetCaptureDependencies));
-#else
-    CUDA_CHECK(cudaGraphAddNode(&node, g, deps, n, &p));
-    bodies = p.conditional.phGraph_out;
-    CUDA_CHECK(cudaStreamUpdateCaptureDependencies(s, &node, 1, cudaStreamSetCaptureDependencies));
-#endif
-  });
-  for (std::size_t i = 0; i < verify_widths_.size(); ++i)
-    captured(bodies[i], [&] { branch(s, verify_widths_[i]); });
+  try {
+    throw_if_switch_err(cudaGraphCreate(&graph, 0), "cudaGraphCreate");
+    // run `body` captured into `g` (an exception ends the capture first)
+    auto captured = [&](cudaGraph_t g, const std::function<void()>& body) {
+      throw_if_switch_err(
+          cudaStreamBeginCaptureToGraph(s, g, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal),
+          "cudaStreamBeginCaptureToGraph");
+      try {
+        body();
+      } catch (...) {
+        cudaGraph_t out = nullptr;
+        (void)cudaStreamEndCapture(s, &out);
+        throw;
+      }
+      cudaGraph_t out = nullptr;
+      throw_if_switch_err(cudaStreamEndCapture(s, &out), "cudaStreamEndCapture");
+    };
 
-  cudaGraphExec_t exec = nullptr;
-  CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
-  GraphExec result(exec);
-  CUDA_CHECK(cudaGraphUpload(exec, stream_));
+    cudaGraphConditionalHandle handle{};
+    throw_if_switch_err(cudaGraphConditionalHandleCreate(&handle, graph, 0, 0),
+                        "cudaGraphConditionalHandleCreate", /*from_switch_node=*/true);
+    cudaGraph_t* bodies = nullptr;
+    captured(graph, [&] {
+      const cudaError_t head_err = head(s, handle);
+      throw_if_switch_err(head_err, "switch head selector", /*from_switch_node=*/true);
+      const cudaError_t injected = static_cast<cudaError_t>(g_fail_next_switch_capture.exchange(int(cudaSuccess)));
+      if (injected != cudaSuccess) {
+        throw_if_switch_err(injected, "injected switch capture error", /*from_switch_node=*/true);
+      }
+      cudaStreamCaptureStatus status;
+      cudaGraph_t g = nullptr;
+      const cudaGraphNode_t* deps = nullptr;
+      std::size_t n = 0;
+#if CUDART_VERSION >= 13000
+      const cudaGraphEdgeData* edges = nullptr;
+      throw_if_switch_err(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &edges, &n),
+                          "cudaStreamGetCaptureInfo");
+#else
+      throw_if_switch_err(cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &n),
+                          "cudaStreamGetCaptureInfo");
+#endif
+      cudaGraphNodeParams p{};
+      p.type = cudaGraphNodeTypeConditional;
+      p.conditional.handle = handle;
+      p.conditional.type = cudaGraphCondTypeSwitch;
+      p.conditional.size = unsigned(verify_widths_.size());
+      cudaGraphNode_t node = nullptr;
+#if CUDART_VERSION >= 13000
+      throw_if_switch_err(cudaGraphAddNode(&node, g, deps, edges, n, &p), "cudaGraphAddNode(SWITCH)",
+                          /*from_switch_node=*/true);
+      bodies = p.conditional.phGraph_out;
+      throw_if_switch_err(
+          cudaStreamUpdateCaptureDependencies(s, &node, nullptr, 1, cudaStreamSetCaptureDependencies),
+          "cudaStreamUpdateCaptureDependencies");
+#else
+      throw_if_switch_err(cudaGraphAddNode(&node, g, deps, n, &p), "cudaGraphAddNode(SWITCH)",
+                          /*from_switch_node=*/true);
+      bodies = p.conditional.phGraph_out;
+      throw_if_switch_err(cudaStreamUpdateCaptureDependencies(s, &node, 1, cudaStreamSetCaptureDependencies),
+                          "cudaStreamUpdateCaptureDependencies");
+#endif
+    });
+    for (std::size_t i = 0; i < verify_widths_.size(); ++i)
+      captured(bodies[i], [&] { branch(s, verify_widths_[i]); });
+
+    cudaGraphExec_t exec = nullptr;
+    throw_if_switch_err(cudaGraphInstantiate(&exec, graph, 0), "cudaGraphInstantiate(SWITCH)",
+                        /*from_switch_node=*/true);
+    GraphExec result(exec);
+    throw_if_switch_err(cudaGraphUpload(exec, stream_), "cudaGraphUpload(SWITCH)");
+    return result;
+  } catch (const SwitchCudaError& e) {
+    (void)cudaGetLastError();
+    if (is_conditional_unsupported(e.err) || (e.from_switch_node && e.err == cudaErrorInvalidValue)) {
+      supports_conditional_graphs_ = false;
+      g_switch_capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      return GraphExec{};
+    }
+    throw std::runtime_error(std::string(e.what) + ": " + cudaGetErrorName(e.err) + ": " + cudaGetErrorString(e.err));
+  }
+#endif
+}
+
+GraphExec Runtime::capture_switch(const std::function<cudaError_t(cudaStream_t, cudaGraphConditionalHandle)>& head,
+                                  const std::function<void(cudaStream_t, int)>& branch) {
+  GraphExec result = try_capture_switch(head, branch);
+  if (!result) {
+    throw std::runtime_error("capture_switch: conditional SWITCH CUDA graphs are disabled or unsupported");
+  }
   return result;
 }
 

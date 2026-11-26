@@ -53,15 +53,18 @@ class SpecLoop {
                 std::vector<std::int32_t>& tokens_in_state);
 
  private:
-  // The accept graph (width_select -> switch { accept + rollback + publish }) for this sampling setup.
+  // The accept graph (width_select -> switch { accept + rollback + publish }) for this sampling setup,
+  // or direct eager acceptance/rollback/publication for a runtime-selected width when conditional graphs
+  // are disabled.
   void prepare_accept(const Sampling& sampling);
+  void record_accept_for_width(int m, cudaStream_t stream);
   void ensure_verify_hooked();
 
   Runtime& rt_;
   Drafter& drafter_;
   Drafter::Draft draft_{};             // the drafter's fixed output buffers
   DeviceBuffer width_;                 // int32: the verify width chosen on the device
-  MappedHostBuffer width_host_;        // int32: mapped copy for eager low-VRAM / streamed-KV verify
+  MappedHostBuffer width_host_;        // int32: mapped copy for eager low-VRAM / streamed-KV / fallback verify
   MappedHostBuffer record_;            // VerifyRecord of the last round
   MappedHostBuffer forced_window_;     // forced replay: int32 [8], the forced tokens after the round's anchor
   GraphExec verify_, verify_hooked_, accept_;
@@ -74,6 +77,8 @@ class SpecLoop {
     bool operator==(const AcceptKey&) const = default;
   };
   AcceptKey accept_key_{};
+  kernels::head::SamplingParams accept_params_{};
+  bool accept_prepared_ = false;
   cudaEvent_t done_ = nullptr;
   cudaEvent_t width_ready_ = nullptr;
 };

@@ -86,6 +86,10 @@ int main() {
     expect_rejects(with([](RuntimeOptions& o) { o.kv_paged = true; }), 4, "TP rejects --kv-paged");
     expect_rejects(with([](RuntimeOptions& o) { o.kv_vram_mb = 512; }), 4, "TP rejects --kv-vram-mb");
     expect_rejects(with([](RuntimeOptions& o) { o.kv_swap_dir = "/tmp/kv_swap"; }), 2, "TP rejects --kv-swap-dir");
+    expect_rejects(with([](RuntimeOptions& o) { o.kv_cache_mode = KvCacheMode::LastFull; }), 2,
+                   "TP rejects --kv-cache-mode last_full");
+    expect_rejects(with([](RuntimeOptions& o) { o.kv_cache_mode = KvCacheMode::LastFull; }), 4,
+                   "TP4 rejects --kv-cache-mode last_full");
     expect_rejects(with([](RuntimeOptions& o) { o.vision = true; }), 2, "TP rejects --vision");
     expect_rejects(with([](RuntimeOptions& o) { o.offload_vram_mb = 4096; }), 4, "TP rejects --offload-vram-mb");
     expect_rejects(with([](RuntimeOptions& o) { o.kv_ckpt_path = "/tmp/ckpt"; }), 4, "TP rejects --kv-ckpt-path");
@@ -120,6 +124,9 @@ int main() {
                               spec_mode ? "make_generator(spec) rejects --kv-paged" : "make_generator(batch) rejects --kv-paged");
       expect_make_gen_rejects(mk([](RuntimeOptions& o) { o.kv_vram_mb = 512; }),
                               spec_mode ? "make_generator(spec) rejects --kv-vram-mb" : "make_generator(batch) rejects --kv-vram-mb");
+      expect_make_gen_rejects(mk([](RuntimeOptions& o) { o.kv_cache_mode = KvCacheMode::LastFull; }),
+                              spec_mode ? "make_generator(spec) rejects --kv-cache-mode last_full"
+                                        : "make_generator(batch) rejects --kv-cache-mode last_full");
       expect_make_gen_rejects(mk([](RuntimeOptions& o) { o.vision = true; }),
                               spec_mode ? "make_generator(spec) rejects --vision" : "make_generator(batch) rejects --vision");
     }

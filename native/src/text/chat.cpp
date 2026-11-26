@@ -485,6 +485,29 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
     prompt.prefill_ids = no_thinking_prefill();
   }
   prompt.ids = encode_prompt(*data_, prompt.text, prompt.stats);
+  // Verified stable root-prefix boundary directly on the actual rendered token IDs:
+  // leading <|message_system|> ... <|end_message|> blocks (tool_declare + leading system messages +
+  // "Thinking effort level: ..." block emitted before the first non-system turn).
+  std::size_t root_end = 0;
+  std::size_t pos = 0;
+  while (pos < prompt.ids.size() && prompt.ids[pos] == data_->message_system) {
+    ++pos;
+    while (pos < prompt.ids.size() && prompt.ids[pos] != data_->end_message) {
+      if (prompt.ids[pos] == data_->message_user || prompt.ids[pos] == data_->message_model ||
+          prompt.ids[pos] == data_->message_tool || prompt.ids[pos] == data_->message_system) {
+        pos = prompt.ids.size();
+        break;
+      }
+      ++pos;
+    }
+    if (pos < prompt.ids.size() && prompt.ids[pos] == data_->end_message) {
+      ++pos;
+      root_end = pos;
+    } else {
+      break;
+    }
+  }
+  prompt.root_prefix_tokens = int(root_end);
   prompt.stats.render_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   return prompt;
 }

@@ -70,13 +70,14 @@ class FakeHttpBatchGenerator final : public ingine::model::Generator {
         stats.prompt_tokens = int(prompt.ids.size());
         stats.reused_tokens = 0;
         stats.reuse = ingine::model::Reuse::None;
-        if (prefix_cache_enabled_) {
-          // Exact shared-prefix match against previously seen prompts (simulates Stage 2 paged prefix cache).
+        if (prefix_cache_enabled_ && !prompt.bypass_prefix_cache) {
+          // Exact shared-prefix match within matching cache_namespace (simulates Stage 2 paged prefix cache).
           std::size_t best = 0;
           for (const auto& prev : seen_prompts_) {
-            const std::size_t lim = std::min(prev.size(), prompt.ids.size());
+            if (prev.ns != prompt.cache_namespace) continue;
+            const std::size_t lim = std::min(prev.ids.size(), prompt.ids.size());
             std::size_t k = 0;
-            while (k < lim && prev[k] == prompt.ids[k]) ++k;
+            while (k < lim && prev.ids[k] == prompt.ids[k]) ++k;
             if (k > best) best = k;
           }
           if (best > 0) {
@@ -84,7 +85,8 @@ class FakeHttpBatchGenerator final : public ingine::model::Generator {
             stats.reuse = ingine::model::Reuse::PagedPrefix;
             stats.restored_bytes = best * 128;
           }
-          seen_prompts_.emplace_back(prompt.ids.begin(), prompt.ids.end());
+          seen_prompts_.push_back(SeenPrompt{prompt.cache_namespace,
+                                             std::vector<int32_t>(prompt.ids.begin(), prompt.ids.end())});
         }
         ++active_;
         peak_active_ = std::max(peak_active_, active_);
@@ -143,8 +145,12 @@ class FakeHttpBatchGenerator final : public ingine::model::Generator {
   int max_batch_;
   mutable std::mutex mu_;
   std::vector<Slot> slots_;
+  struct SeenPrompt {
+    std::string ns;
+    std::vector<int32_t> ids;
+  };
   bool prefix_cache_enabled_ = false;
-  std::vector<std::vector<int32_t>> seen_prompts_;
+  std::vector<SeenPrompt> seen_prompts_;
   int active_ = 0;
   int peak_active_ = 0;
   int peak_step_batch_ = 0;
@@ -282,6 +288,27 @@ int main() {
     }
     CHECK(sse_cached == j2["usage"]["prompt_tokens"].get<int>());
 
+    // Single-trusted-scope fail-closed isolation: requests carrying "user", "prompt_cache_key", or Authorization
+    // bypass prefix reuse on a server with no trusted --cache-namespace-header configured.
+    {
+      Json user_body = warm_body;
+      user_body["user"] = "tenant-alice";
+      auto ru = cli.Post("/v1/chat/completions", user_body.dump(), "application/json");
+      CHECK(ru && ru->status == 200);
+      CHECK(Json::parse(ru->body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+
+      Json pck_body = warm_body;
+      pck_body["prompt_cache_key"] = "key-alice";
+      auto rpk = cli.Post("/v1/chat/completions", pck_body.dump(), "application/json");
+      CHECK(rpk && rpk->status == 200);
+      CHECK(Json::parse(rpk->body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+
+      httplib::Headers auth_hdr = {{"Authorization", "Bearer tok-alice"}};
+      auto ra = cli.Post("/v1/chat/completions", auth_hdr, warm_body.dump(), "application/json");
+      CHECK(ra && ra->status == 200);
+      CHECK(Json::parse(ra->body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+    }
+
     // Deliberate miss (different system prompt after disabling/resetting cache) -> cached_tokens == 0.
     gen.set_prefix_cache_enabled(false);
     auto r4 = cli.Post("/v1/chat/completions", warm_body.dump(), "application/json");
@@ -290,6 +317,50 @@ int main() {
   }
 
   server.stop();
+
+  // Trusted proxy namespace header mode (--cache-namespace-header X-Tenant-Scope):
+  // tenant-a warms & hits tenant-a; tenant-b misses tenant-a; missing header fails closed (cached_tokens == 0).
+  {
+    FakeHttpBatchGenerator scoped_gen(fmt.tokenizer(), 8);
+    scoped_gen.set_prefix_cache_enabled(true);
+    ingine::serve::ServerOptions scoped_opts;
+    scoped_opts.max_queue = 8;
+    scoped_opts.cache_namespace_header = "X-Tenant-Scope";
+    ChatServer scoped_server(scoped_gen, fmt, scoped_opts);
+    CHECK(scoped_server.bind("127.0.0.1", 0));
+    scoped_server.start();
+
+    httplib::Client scli("127.0.0.1", scoped_server.port());
+    scli.set_read_timeout(30, 0);
+    const Json body = {{"model", "inkling-batch-test"},
+                       {"messages", Json::array({{{"role", "system"}, {"content", "Scoped system prompt."}},
+                                                 {{"role", "user"}, {"content", "Hello REQ_777"}}})},
+                       {"max_tokens", 32}};
+
+    httplib::Headers hdr_a = {{"X-Tenant-Scope", "tenant-a"}};
+    httplib::Headers hdr_b = {{"X-Tenant-Scope", "tenant-b"}};
+
+    auto ra1 = scli.Post("/v1/chat/completions", hdr_a, body.dump(), "application/json");
+    CHECK(ra1 && ra1->status == 200);
+    const Json ja1 = Json::parse(ra1->body);
+    CHECK(ja1["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+    const int p_scoped = ja1["usage"]["prompt_tokens"].get<int>();
+
+    auto ra2 = scli.Post("/v1/chat/completions", hdr_a, body.dump(), "application/json");
+    CHECK(ra2 && ra2->status == 200);
+    CHECK(Json::parse(ra2->body)["usage"]["prompt_tokens_details"]["cached_tokens"] == p_scoped);
+
+    auto rb1 = scli.Post("/v1/chat/completions", hdr_b, body.dump(), "application/json");
+    CHECK(rb1 && rb1->status == 200);
+    CHECK(Json::parse(rb1->body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+
+    // Missing trusted header -> fail closed (zero reuse, zero publish).
+    auto r_missing = scli.Post("/v1/chat/completions", body.dump(), "application/json");
+    CHECK(r_missing && r_missing->status == 200);
+    CHECK(Json::parse(r_missing->body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+
+    scoped_server.stop();
+  }
 
   CHECK(ok_count.load() == N);
   CHECK(gen.peak_active() >= 16);  // proves concurrent HTTP serving well above the old 8-thread cap!

@@ -8,10 +8,20 @@
 
 #include "core/dtype.h"
 
+#ifndef INGINE_BACKEND_CUDA
+#if defined(INGINE_BACKEND_CPU) || defined(INGINE_BACKEND_HIP) || defined(INGINE_BACKEND_MLX) || defined(INGINE_BACKEND_SYCL)
+#define INGINE_BACKEND_CUDA 0
+#else
+#define INGINE_BACKEND_CUDA 1
+#endif
+#endif
+
+#if INGINE_BACKEND_CUDA
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <library_types.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -24,6 +34,7 @@
 
 namespace ingine {
 
+#if INGINE_BACKEND_CUDA
 #if INGINE_ACT_FP16
 using ActT = __half;
 using Act2T = __half2;
@@ -36,6 +47,23 @@ using Act2T = __nv_bfloat162;
 inline constexpr DType kActDType = DType::BF16;
 inline constexpr cudaDataType_t kCublasActType = CUDA_R_16BF;
 inline constexpr bool kActIsFP16 = false;
+#endif
+#else
+struct alignas(2) Act16 {
+  std::uint16_t bits = 0;
+};
+struct alignas(4) Act16x2 {
+  std::uint32_t bits = 0;
+};
+using ActT = Act16;
+using Act2T = Act16x2;
+#if INGINE_ACT_FP16
+inline constexpr DType kActDType = DType::FP16;
+inline constexpr bool kActIsFP16 = true;
+#else
+inline constexpr DType kActDType = DType::BF16;
+inline constexpr bool kActIsFP16 = false;
+#endif
 #endif
 
 namespace act {
@@ -152,7 +180,7 @@ inline float host_round(float f) { return host_bits_to_float(host_float_to_bits(
 
 // ------------------------------------------------------------------------------------------- device helpers
 
-#if defined(__CUDACC__)
+#if INGINE_BACKEND_CUDA && defined(__CUDACC__)
 
 __device__ __forceinline__ float clamp_fp16_finite(float x) {
   return isfinite(x) ? fminf(fmaxf(x, -kFp16Max), kFp16Max) : x;
@@ -280,7 +308,7 @@ __device__ __forceinline__ std::uint32_t e4m3x2_to_act2_bits(std::uint32_t u) {
 #endif
 }
 
-#endif  // __CUDACC__
+#endif  // INGINE_BACKEND_CUDA && __CUDACC__
 
 }  // namespace act
 }  // namespace ingine

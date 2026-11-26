@@ -162,14 +162,15 @@ std::string default_model_dir() {
 int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
+  std::string kv_cache_mode = "per_pass";
   std::string concurrency_csv;
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
-  int max_batch = 0, max_kv_tokens = 0;
+  int max_batch = 0, max_kv_tokens = 0, park_mb = -1, park_host_mb = 0;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
-       ignore_eos = false, staggered = false;
+       ignore_eos = false, staggered = false, no_prefix_cache = false;
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -186,7 +187,10 @@ int main(int argc, char** argv) {
   ap.flag("--dense-fp8", "", &dense_fp8);
   ap.flag("--vision", "also load the vision tower", &vision);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
-  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok; SWA stays BF16)", &kv_q4);
+  ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok per_pass, 4.5 KiB/tok last_full; SWA stays BF16)", &kv_q4);
+  ap.option("--kv-cache-mode", "{per_pass,last_full}",
+            "full-attention KV mode: per_pass (default, 8 visit slots) or last_full (opt-in L11/L17 shared, 4 slots; B=1 non-spec)",
+            &kv_cache_mode, {"per_pass", "last_full"});
   ap.flag("--kv-paged", "3-tier paged Q4_0 full-attention KV cache (VRAM LRU + pinned UVA RAM + NVMe SwapFile)", &kv_paged);
   ap.option("--kv-vram-mb", "", "VRAM cap in MiB for paged Q4_0 KV cache (implies --kv-paged --kv-q4)", &kv_vram_mb);
   ap.option("--kv-ram-mb", "", "pinned UVA host RAM cap in MiB for paged Q4_0 KV before NVMe SwapFile spill (default 12288)",
@@ -211,6 +215,11 @@ int main(int argc, char** argv) {
   ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
+  ap.option("--park-mb", "", "VRAM cap (MiB) for Tier-0 parked checkpoints (-1 = auto, 0 = off)", &park_mb);
+  ap.option("--park-host-mb", "", "pinned host RAM cap (MiB) for Tier-1 parked checkpoints (default 0 = off)",
+            &park_host_mb);
+  ap.flag("--no-prefix-cache", "disable all prefix/root/parked checkpoint reuse (cache-off parity baseline)",
+          &no_prefix_cache);
   ap.option("--temperature", "", "", &temperature);
   ap.option("--long-prompt", "", "also time prefill of a synthetic prompt of N tokens", &long_prompt);
   ap.option("--forced", "", "teacher-forced replay of the outputs in FILE (JSON lines {name, prompt, output})",
@@ -225,6 +234,7 @@ int main(int argc, char** argv) {
   ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity (0 = auto)", &max_kv_tokens);
   ap.flag("--ignore-eos", "with --concurrency: decode full --tokens per request (steady-state peak throughput)", &ignore_eos);
   ap.flag("--staggered", "with --concurrency: also run a staggered mid-generation continuous-batching arrival pass", &staggered);
+  ap.flag("--no-prefix-cache", "disable prefix checkpoint caching (cache-off parity baseline)", &no_prefix_cache);
   ap.parse(argc, argv);
 
   try {
@@ -260,6 +270,7 @@ int main(int argc, char** argv) {
     options.dense_fp8 = dense_fp8;
     options.kv_fp8 = kv_fp8;
     options.kv_q4 = kv_q4;
+    options.kv_cache_mode = ingine::model::parse_kv_cache_mode(kv_cache_mode);
     options.kv_paged = kv_paged || kv_vram_mb > 0;
     options.kv_vram_mb = kv_vram_mb;
     options.kv_ram_mb = kv_ram_mb;
@@ -269,6 +280,9 @@ int main(int argc, char** argv) {
     options.kv_ckpt_resume = kv_ckpt_resume;
     options.spec = (resolved_max_batch > 1) ? false : spec;
     options.spec_threshold = float(spec_threshold);
+    options.park_mb = park_mb;
+    options.park_host_mb = park_host_mb;
+    options.prefix_cache = !no_prefix_cache;
     options.vision = vision;
     options.offload_vram_mb = offload_vram_mb;
     options.offload_ram_mb = offload_ram_mb;
@@ -277,12 +291,14 @@ int main(int argc, char** argv) {
     options.dump_router_stats = dump_router_stats;
     options.max_batch = resolved_max_batch;
     options.max_kv_tokens = max_kv_tokens;
+    options.prefix_cache = !no_prefix_cache;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;
     cudaMemGetInfo(&free1, &total);
     const double vram_gb = double(free0 > free1 ? free0 - free1 : 0) / 1e9;
-    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d)\n", load_s, vram_gb, gen->max_batch_size());
+    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s)\n", load_s, vram_gb,
+                gen->max_batch_size(), ingine::model::to_string(gen->kv_cache_mode()));
     std::fflush(stdout);
     if (!forced.empty()) {
       std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace, forced_free).c_str());

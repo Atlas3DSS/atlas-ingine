@@ -170,6 +170,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
     : fmt_(fmt),
       model_id_(options.model_id.empty() ? generator.model_id() : options.model_id),
       max_model_len_(options.max_model_len ? options.max_model_len : generator.max_model_len()),
+      kv_cache_mode_(generator.kv_cache_mode()),
       sampling_defaults_(options.sampling),
       image_options_([&] {
         ImageOptions images = options.images;
@@ -177,6 +178,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
         return images;
       }()),
       personas_(std::move(options.personas)),
+      cache_namespace_header_(std::move(options.cache_namespace_header)),
       created_(std::time(nullptr)),
       scheduler_(generator, fmt.stop_ids(), options.max_queue) {
   // Size the HTTP pool for concurrent active slots + waiting requests + /health probes (never starve at B=64).
@@ -203,6 +205,7 @@ Json ChatServer::model_card() const {
               {"created", created_},
               {"owned_by", "ingine"},
               {"max_model_len", max_model_len_},
+              {"kv_cache_mode", model::to_string(kv_cache_mode_)},
               {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
 }
 
@@ -240,6 +243,7 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
     send_json(res, 200,
               Json{{"status", "ok"},
                    {"model", model_id_},
+                   {"kv_cache_mode", model::to_string(kv_cache_mode_)},
                    {"waiting", st.waiting},
                    {"running", st.running},
                    {"active", st.active},
@@ -298,8 +302,22 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
 }
 
 void ChatServer::complete(const httplib::Request& req, httplib::Response& res, ChatRequest request) {
+  std::string cache_namespace;
+  bool bypass_prefix_cache = false;
+  if (!cache_namespace_header_.empty()) {
+    // Trusted reverse-proxy scope mode: require the configured header; fail closed if absent/empty.
+    if (req.has_header(cache_namespace_header_)) {
+      cache_namespace = req.get_header_value(cache_namespace_header_);
+    }
+    if (cache_namespace.empty()) bypass_prefix_cache = true;
+  } else {
+    // Single-trusted-scope server mode: fail closed for requests signaling caller/tenant isolation.
+    const bool has_auth = req.has_header("Authorization") && !req.get_header_value("Authorization").empty();
+    if (request.has_isolation_hint || request.has_user_or_cache_key || has_auth) bypass_prefix_cache = true;
+  }
   auto job = std::make_shared<engine::Job>(request.prompt_ids, request.max_new_tokens, request.sampling,
-                                           std::move(request.images));
+                                           std::move(request.images), request.root_prefix_tokens,
+                                           std::move(cache_namespace), bypass_prefix_cache);
   if (!scheduler_.submit(job)) {
     res.set_header("Retry-After", "1");
     send_error(res, 503, "server busy: request queue is full");

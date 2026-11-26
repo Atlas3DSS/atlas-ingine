@@ -33,6 +33,9 @@ class FakeGenerator final : public model::Generator {
     int max_new_tokens = 0;
     model::Sampling sampling;
     int images = 0, image_tokens = 0;  // of the prompt
+    int root_prefix_tokens = 0;
+    std::string cache_namespace;
+    bool bypass_prefix_cache = false;
     int yielded = 0;
     bool cancelled = false;
     bool done = false;

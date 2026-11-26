@@ -8,24 +8,19 @@
 // then the data region; data_offsets are relative to the start of the data region.
 
 #include "core/dtype.h"
+#include "core/hal.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
-
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <exception>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -147,10 +142,13 @@ struct UploadRequest {
                                            const SafetensorsTensor& tensor, void* dst);
 [[nodiscard]] UploadRequest upload_request(SafetensorsRef ref, void* dst);
 
+// Canonical chunk size shared by DeviceUploader and chunked safetensors content digests.
+inline constexpr std::size_t kSafetensorsHashChunkBytes = std::size_t(32) << 20;
+
 struct UploadOptions {
-    std::size_t chunk_bytes = std::size_t(32) << 20; // staging buffer size and max bytes per copy
-    int staging_buffers     = 12;                    // pinned buffers in flight
-    int reader_threads      = 6;                     // threads reading file data into staging
+    std::size_t chunk_bytes = kSafetensorsHashChunkBytes; // staging buffer size and max bytes per copy
+    int staging_buffers     = 12;                         // pinned buffers in flight
+    int reader_threads      = 6;                          // threads reading file data into staging
 };
 
 struct UploadStats {
@@ -160,6 +158,11 @@ struct UploadStats {
         return seconds > 0 ? double(bytes) / double(1ull << 30) / seconds : 0.0;
     }
 };
+
+// Optional per-chunk host-buffer observer invoked from a reader thread right after pread, with
+// (request_index, chunk_index_within_request, host_data, chunk_bytes). Must be thread-safe.
+using UploadChunkObserver =
+    std::function<void(std::size_t req_idx, std::size_t chunk_idx, const void* data, std::size_t bytes)>;
 
 // Uploads file ranges to device memory. Reader threads pread chunks into pinned staging buffers and
 // enqueue each chunk's cudaMemcpyAsync as soon as it is read, so disk/page-cache reads, the copies of
@@ -174,51 +177,21 @@ public:
     DeviceUploader& operator=(const DeviceUploader&) = delete;
 
     // Copies every request (on `stream`, after the work already queued there) and returns once all
-    // bytes have arrived on the device. Destinations must not overlap. The calling thread's current
-    // CUDA device must be the one current at construction. One upload() at a time per uploader.
-    UploadStats upload(std::span<const UploadRequest> requests, cudaStream_t stream);
+    // bytes have arrived on the device. Destinations must not overlap. On CUDA builds, the calling
+    // thread's current device must match the device at construction. One upload() at a time per uploader.
+    UploadStats upload(std::span<const UploadRequest> requests, hal::StreamHandle stream,
+                       UploadChunkObserver observer = {});
 
     [[nodiscard]] const UploadOptions& options() const noexcept { return options_; }
 
 private:
-    struct Chunk {
-        const SafetensorsFile* file;
-        std::uint64_t offset;
-        std::uint64_t bytes;
-        void* dst;
-    };
-    struct Slot {
-        std::byte* host    = nullptr;
-        cudaEvent_t done   = nullptr; // recorded after the slot's last copy
-        bool copy_inflight = false;
-    };
-
-    void worker_main();
-    void run_chunks();
-    int acquire_slot();
-    void release_slot(int slot);
-
+    struct Impl;
     UploadOptions options_;
-    void* pinned_ = nullptr;
-    std::vector<Slot> slots_;
-    std::deque<int> free_slots_; // FIFO: reuse the slot whose copy was issued longest ago
-    std::vector<std::thread> workers_;
-
-    std::mutex mutex_;
-    std::condition_variable work_cv_;
-    std::condition_variable done_cv_;
-    std::condition_variable slot_cv_;
-    std::mutex stream_mutex_;
-
-    // Current job (guarded by mutex_ unless noted).
-    std::uint64_t generation_ = 0;
-    bool stopping_            = false;
-    int active_workers_       = 0;
-    std::vector<Chunk> chunks_;
-    std::size_t next_chunk_ = 0;
-    cudaStream_t stream_    = nullptr;
-    int device_             = 0; // CUDA device current at construction (owns the events)
-    std::exception_ptr error_;
+    std::unique_ptr<Impl> impl_;
 };
+
+// Test hook: causes the next DeviceUploader worker startup loop to fail with std::system_error when
+// launching worker `worker_index` (0-based; negative disables).
+void fail_next_uploader_worker_start(int worker_index) noexcept;
 
 } // namespace ingine

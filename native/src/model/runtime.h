@@ -39,6 +39,26 @@
 
 namespace ingine::model {
 
+struct SpecExecutionCounters {
+  std::uint64_t switch_verify_launches = 0;
+  std::uint64_t switch_accept_launches = 0;
+  std::uint64_t eager_verify_launches = 0;
+  std::uint64_t eager_accept_launches = 0;
+  std::uint64_t switch_capture_fallbacks = 0;
+};
+
+// Returns true when `err` represents an unsupported driver/runtime/conditional-SWITCH error suitable for
+// controlled eager fallback rather than aborting.
+bool is_conditional_switch_unsupported_error(cudaError_t err) noexcept;
+
+// Test/fault-injection hook: forces the next Runtime::try_capture_switch construction after the HAL probe to
+// behave as if CUDA returned `err` (automatically resets to cudaSuccess once consumed).
+void fail_next_switch_capture(cudaError_t err) noexcept;
+
+SpecExecutionCounters spec_execution_counters() noexcept;
+void reset_spec_execution_counters() noexcept;
+void record_spec_execution(bool is_verify, bool used_switch) noexcept;
+
 // ---- loading (weights.load + FastDecoder._concat_projections/_stack_layer_params/_fp8_dense,
 // model.Ablation.load/none, model.State)
 Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream,
@@ -49,7 +69,8 @@ Weights load_weights_sharded(const std::filesystem::path& model_dir, bool dense_
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage);
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
-State make_state(int max_ctx, bool kv_fp8, bool kv_q4 = false, const PagedKvConfig& paged_kv = {});
+State make_state(int max_ctx, bool kv_fp8, bool kv_q4 = false, const PagedKvConfig& paged_kv = {},
+                 bool kv_last_full = false);
 Buffers make_buffers(int m);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
@@ -122,8 +143,9 @@ class Runtime {
   // Call widths available: {1}, or {1, 2, 4, 8} with options.spec.
   bool has_width(int m) const;
   std::span<const int> verify_widths() const;  // {2, 4, 8} with spec, else empty
-  bool needs_eager_step() const noexcept;      // true when host dispatch or streamed paged KV is active
-  bool has_verify_graph() const noexcept;      // false only when expert offload requires host dispatch
+  bool needs_eager_step() const noexcept;           // true when host dispatch or streamed paged KV is active
+  bool supports_conditional_graphs() const noexcept; // false if runtime/env disables conditional graph nodes
+  bool has_verify_graph() const noexcept;           // false when conditional graphs are disabled or host dispatch is needed
   Buffers& buffers(int m);
   std::int64_t* pos() { return static_cast<std::int64_t*>(pos_.p); }
 
@@ -160,7 +182,7 @@ class Runtime {
   // long); restore_checkpoint puts it back, so the state equals the one at the save up to rows past its
   // length, which nothing reads before overwriting. Stream-ordered.
   std::size_t checkpoint_bytes() const;
-  void save_checkpoint(void* dst);
+  std::size_t save_checkpoint(void* dst);
   std::size_t restore_checkpoint(const void* src);
 
   // Conversation parking: a checkpoint holds everything but the full-attention caches; save_full_rows copies
@@ -168,7 +190,7 @@ class Runtime {
   // full_rows_bytes(n) long, packed), restore_full_rows puts them back. A checkpoint taken at length n plus
   // its full rows [0, n) restore the state exactly, whatever ran in between. Stream-ordered.
   std::size_t full_rows_bytes(int n) const;
-  void save_full_rows(void* dst, int n);
+  std::size_t save_full_rows(void* dst, int n);
   std::size_t restore_full_rows(const void* src, int n);
 
   // Speculative rollback (engine._generate_spec / _rollback). save_verify before a verify call of m rows at
@@ -181,7 +203,11 @@ class Runtime {
   // ---- device-selected verify widths (graph building; `stream` is a capturing stream)
   // A graph of `head` (captured; it must set the switch condition to an index into verify_widths()) followed
   // by a switch node whose branch i is `branch(verify_widths()[i])` (captured).
-  GraphExec capture_switch(const std::function<void(cudaStream_t, cudaGraphConditionalHandle)>& head,
+  // try_capture_switch returns an empty GraphExec and disables conditional graphs on controlled unsupported
+  // driver/runtime/SWITCH failures; capture_switch throws if conditional SWITCH graphs are unavailable.
+  GraphExec try_capture_switch(const std::function<cudaError_t(cudaStream_t, cudaGraphConditionalHandle)>& head,
+                               const std::function<void(cudaStream_t, int)>& branch);
+  GraphExec capture_switch(const std::function<cudaError_t(cudaStream_t, cudaGraphConditionalHandle)>& head,
                            const std::function<void(cudaStream_t, int)>& branch);
   // Mech-interp / persona runtime hooks: fixed-address device table + dual unhooked/hooked CUDA graphs.
   PersonaRuntime& persona_runtime() { return *persona_rt_; }
@@ -219,6 +245,7 @@ class Runtime {
   std::map<int, cudaGraphExec_t> graphs_;
   std::map<int, cudaGraphExec_t> hooked_graphs_;
   std::vector<int> verify_widths_;
+  bool supports_conditional_graphs_ = false;
   // rollback scratch (VerifyBackup) and the width-1 undo records (StepUndo by position parity)
   DeviceBuffer backup_storage_;
   VerifyBackup backup_{};

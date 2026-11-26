@@ -53,6 +53,7 @@ using ReleaseHook = std::function<bool()>;
 int add_release_hook(ReleaseHook hook);
 void remove_release_hook(int id);
 void fail_next_allocations(int n);
+void fail_next_pinned_allocations(int n);
 
 class DeviceArena {
 public:
@@ -105,6 +106,7 @@ private:
 
 class PinnedHostBuffer {
 public:
+    PinnedHostBuffer() noexcept = default;
     explicit PinnedHostBuffer(std::size_t size_bytes);
     ~PinnedHostBuffer();
 

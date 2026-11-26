@@ -10,6 +10,7 @@
 #include "model/prefill.h"
 
 #include "core/device.h"
+#include "core/ops.h"
 #include "ingine/generator.h"
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
@@ -253,8 +254,14 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   };
 
   pk::widen_ids(tokens, T, ids_, IMAGE_PLACEHOLDER_ID, s);
-  if (w.embed_q4()) dense::embed_q4(ids_, T, w.embed.data, f32p(w.embed_norm), B0_, false, s);
-  else dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
+  if (w.embed_q4()) {
+    auto desc = ops::make_inkling_embed_q4_desc(T, VOCAB, false);
+    desc.token_bounds = ops::TokenBoundsMode::PreValidated;
+    const ops::EmbedQ4RmsNormArgs args{ids_, w.embed.data, f32p(w.embed_norm), B0_};
+    ops::run_embed_q4_rmsnorm(desc, args, s);
+  } else {
+    dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
+  }
   // image tokens: the vision tower's rows take the place of the placeholder's embedding (model.forward's
   // masked_scatter into the normed embeddings); every later read of the embedding block sees them
   for (const EmbedRows& r : rows) {
@@ -348,7 +355,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::AttnParams at;
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
     if (layer.full) {
-      const int fi = FULL_INDEX[v];
+      const int fi = st.full_slot(v);
       if (st.paged_kv) {
         st.paged_kv->ensure_write_pages(fi, pos0, T, s);
         ap.k_out = nullptr, ap.v_out = nullptr;
@@ -391,7 +398,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::conv_state_update(st.conv_v_at(v), proj_ + SEG_BEGIN[SEG_V], R, T, KV_DIM, s);
     pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
     if (layer.full && st.paged_kv) {
-      st.paged_kv->prefill_attention(FULL_INDEX[v], at, s);
+      st.paged_kv->prefill_attention(st.full_slot(v), at, s);
     } else {
       pk::attention(at, s);
     }

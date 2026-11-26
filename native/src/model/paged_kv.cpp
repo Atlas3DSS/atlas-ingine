@@ -15,9 +15,13 @@ namespace pk = kernels::prefill;
 PagedKvCache::PagedKvCache(const PagedKvConfig& cfg)
     : max_ctx_(cfg.max_ctx),
       max_pages_((cfg.max_ctx + kPageTokens - 1) / kPageTokens),
+      num_full_slots_(cfg.num_full_slots),
       swap_dir_(cfg.swap_dir) {
   if (max_ctx_ < 1 || max_pages_ < 1) throw std::invalid_argument("PagedKvCache: invalid max_ctx");
   if (cfg.vram_mb <= 0) throw std::invalid_argument("PagedKvCache: vram_mb must be positive");
+  if (num_full_slots_ < 1 || num_full_slots_ > NUM_FULL_VISITS) {
+    throw std::invalid_argument("PagedKvCache: invalid num_full_slots");
+  }
 
   // Size double-buffered prefill staging (36 MiB in <=6 GB mode, 72 MiB in >=12 GB mode).
   batch_pages_ = cfg.vram_mb >= 1024 ? 8 : 4;
@@ -45,9 +49,9 @@ PagedKvCache::PagedKvCache(const PagedKvConfig& cfg)
   decode_ws_ = DeviceBuffer(std::size_t(kDecodeSplits) * 8 * HEADS * (HEAD_DIM + 2) * sizeof(float));
   dec_pos_host_ = MappedHostBuffer(sizeof(std::int64_t));
 
-  // Per-visit fixed device page tables.
+  // Per-slot fixed device page tables.
   const std::size_t table_bytes = std::size_t(max_pages_) * sizeof(void*);
-  for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+  for (int fi = 0; fi < num_full_slots_; ++fi) {
     dev_k_ptrs_[fi] = DeviceBuffer(table_bytes);
     dev_v_ptrs_[fi] = DeviceBuffer(table_bytes);
     dev_k_ptrs_[fi].fill(0);
@@ -60,12 +64,12 @@ PagedKvCache::PagedKvCache(const PagedKvConfig& cfg)
   const std::size_t overhead_bytes =
       2 * (stage_half_k + stage_half_v) + partial_o_.bytes + partial_m_.bytes + partial_l_.bytes +
       dec_proj16_.bytes + dec_q_.bytes + dec_rel16_.bytes + dec_rel_.bytes + decode_ws_.bytes +
-      2 * NUM_FULL_VISITS * table_bytes;
+      2 * std::size_t(num_full_slots_) * table_bytes;
   const std::size_t budget_bytes = std::size_t(cfg.vram_mb) << 20;
-  // Minimum 16 VRAM slots (72 MiB) so all 8 full visits can pin 2 active write pages simultaneously.
+  // Minimum 2 * num_full_slots_ VRAM slots so every active full slot can pin 2 write pages simultaneously.
   const std::size_t avail_for_slab = budget_bytes > overhead_bytes ? (budget_bytes - overhead_bytes) : 0;
-  const int max_total_pages = NUM_FULL_VISITS * max_pages_;
-  int num_vram_slots = std::max(16, int(avail_for_slab / kPageBytes));
+  const int max_total_pages = num_full_slots_ * max_pages_;
+  int num_vram_slots = std::max(2 * num_full_slots_, int(avail_for_slab / kPageBytes));
   num_vram_slots = std::min(num_vram_slots, max_total_pages);
   vram_slab_ = VramLruSlab(num_vram_slots, kPageBytes);
   vram_bytes_ = overhead_bytes + vram_slab_.total_bytes();
@@ -99,7 +103,7 @@ std::uint8_t* PagedKvCache::ram_dev_ptr(int ram_slot) const noexcept {
 
 void PagedKvCache::ensure_swap_open() {
   if (swap_.valid()) return;
-  const std::size_t total_swap_bytes = std::size_t(NUM_FULL_VISITS) * std::size_t(max_pages_) * kPageBytes;
+  const std::size_t total_swap_bytes = std::size_t(num_full_slots_) * std::size_t(max_pages_) * kPageBytes;
   std::filesystem::path p;
   if (!swap_dir_.empty()) {
     std::filesystem::create_directories(swap_dir_);
@@ -268,9 +272,9 @@ void PagedKvCache::ensure_decode_pages(int pos0, int m, cudaStream_t stream) {
   const int p_end = (pos0 + m - 1) >> kPageShift;
   if (p_end >= max_pages_) return;  // attn_decode handles cap early-out cleanly
 
-  // Fast O(1) check: if all 8 full visits already have their write page(s) in Tier-0 VRAM, zero work!
+  // Fast O(1) check: if all active full slots already have their write page(s) in Tier-0 VRAM, zero work!
   bool all_hot = true;
-  for (int fi = 0; fi < NUM_FULL_VISITS && all_hot; ++fi) {
+  for (int fi = 0; fi < num_full_slots_ && all_hot; ++fi) {
     for (int p = p_begin; p <= p_end; ++p) {
       if (meta_[fi][p].loc != Loc::Vram || table_dirty_[fi]) {
         all_hot = false;
@@ -281,13 +285,13 @@ void PagedKvCache::ensure_decode_pages(int pos0, int m, cudaStream_t stream) {
   if (all_hot) return;
 
   ++pin_gen_;
-  // Pin already-resident target pages across all 8 visits first so evictions never thrash another visit's tail page!
-  for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+  // Pin already-resident target pages across all active slots first so evictions never thrash another slot's tail page!
+  for (int fi = 0; fi < num_full_slots_; ++fi) {
     for (int p = p_begin; p <= p_end; ++p) {
       if (meta_[fi][p].loc == Loc::Vram) vram_slab_.touch_and_pin(make_key(fi, p), pin_gen_);
     }
   }
-  for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+  for (int fi = 0; fi < num_full_slots_; ++fi) {
     for (int p = p_begin; p <= p_end; ++p) {
       PageMeta& pm = meta_[fi][p];
       if (pm.loc == Loc::Vram) continue;
@@ -323,7 +327,7 @@ void PagedKvCache::ensure_decode_pages(int pos0, int m, cudaStream_t stream) {
       set_page_ptrs(fi, p, acq.vram_ptr, acq.vram_ptr + kKPageBytes);
     }
   }
-  for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) flush_table(fi, stream);
+  for (int fi = 0; fi < num_full_slots_; ++fi) flush_table(fi, stream);
 }
 
 void PagedKvCache::copy_page_to_staging(int fi, int page, std::uint8_t* dst_k, std::uint8_t* dst_v) {
@@ -482,7 +486,7 @@ void PagedKvCache::decode_attention_with_swap(int fi, const Layer& layer, int /*
 void PagedKvCache::reset() {
   dma_.synchronize();
   vram_slab_.clear();
-  for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+  for (int fi = 0; fi < num_full_slots_; ++fi) {
     for (int p = 0; p < max_pages_; ++p) {
       meta_[fi][p] = PageMeta{};
       host_k_ptrs_[fi][p] = nullptr;
@@ -504,10 +508,10 @@ void PagedKvCache::export_page_to_host(int fi, int page, std::uint8_t* dst_k, st
                                        cudaStream_t compute_stream) {
   const PageMeta& pm = meta_[fi][page];
   if (pm.loc == Loc::Vram) {
-    CUDA_CHECK(cudaStreamSynchronize(compute_stream));
     const std::uint8_t* src = vram_slab_.slot_ptr(pm.slot);
-    if (dst_k) CUDA_CHECK(cudaMemcpy(dst_k, src, kKPageBytes, cudaMemcpyDeviceToHost));
-    if (dst_v) CUDA_CHECK(cudaMemcpy(dst_v, src + kKPageBytes, kVPageBytes, cudaMemcpyDeviceToHost));
+    if (dst_k) CUDA_CHECK(cudaMemcpyAsync(dst_k, src, kKPageBytes, cudaMemcpyDeviceToHost, compute_stream));
+    if (dst_v) CUDA_CHECK(cudaMemcpyAsync(dst_v, src + kKPageBytes, kVPageBytes, cudaMemcpyDeviceToHost, compute_stream));
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream));
   } else if (pm.loc == Loc::Ram) {
     const std::uint8_t* src = ram_host_ptr(pm.slot);
     if (dst_k) std::memcpy(dst_k, src, kKPageBytes);
@@ -539,14 +543,14 @@ void PagedKvCache::import_page_from_host(int fi, int page, const std::uint8_t* s
     }
   }
   ensure_write_pages(fi, page * kPageTokens, 1, compute_stream);
-  CUDA_CHECK(cudaStreamSynchronize(compute_stream));
   std::uint8_t* dst = vram_slab_.slot_ptr(meta_[fi][page].slot);
-  CUDA_CHECK(cudaMemcpy(dst, src_k, kKPageBytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dst + kKPageBytes, src_v, kVPageBytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(dst, src_k, kKPageBytes, cudaMemcpyHostToDevice, compute_stream));
+  CUDA_CHECK(cudaMemcpyAsync(dst + kKPageBytes, src_v, kVPageBytes, cudaMemcpyHostToDevice, compute_stream));
+  CUDA_CHECK(cudaStreamSynchronize(compute_stream));
 }
 
 void PagedKvCache::flush_all_tables(cudaStream_t stream) {
-  for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) flush_table(fi, stream);
+  for (int fi = 0; fi < num_full_slots_; ++fi) flush_table(fi, stream);
 }
 
 PagedKvStats PagedKvCache::stats() const noexcept {
@@ -554,7 +558,7 @@ PagedKvStats PagedKvCache::stats() const noexcept {
   s.vram_pages = 0;
   s.ram_pages = 0;
   s.swap_pages = 0;
-  for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+  for (int fi = 0; fi < num_full_slots_; ++fi) {
     for (int p = 0; p < max_pages_; ++p) {
       if (meta_[fi][p].loc == Loc::Vram) ++s.vram_pages;
       else if (meta_[fi][p].loc == Loc::Ram) ++s.ram_pages;

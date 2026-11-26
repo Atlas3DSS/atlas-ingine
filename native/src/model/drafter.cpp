@@ -385,10 +385,13 @@ void Drafter::adopt_checkpoint(const void* src, int length, std::span<const std:
   checkpoint_extra_.assign(context.begin(), context.end());
 }
 
-void Drafter::save_checkpoint(void* dst) {
+std::size_t Drafter::save_checkpoint(void* dst) {
   auto* d = static_cast<std::byte*>(dst);
+  std::size_t copied_bytes = 0;
   auto copy = [&](std::size_t off, const void* src, std::size_t bytes) {
+    if (bytes == 0) return;
     CUDA_CHECK(cudaMemcpyAsync(d + off, src, bytes, cudaMemcpyDeviceToDevice, stream_));
+    copied_bytes += bytes;
   };
   std::size_t off = 0;
   for (int l : {0, 2}) {
@@ -409,6 +412,7 @@ void Drafter::save_checkpoint(void* dst) {
   checkpoint_length_ = length_;
   checkpoint_clobbered_ = false;
   checkpoint_extra_ = short_extra_;
+  return copied_bytes;
 }
 
 std::size_t Drafter::restore_checkpoint(const void* src) {

@@ -798,6 +798,66 @@ __global__ void paged_full_kv_transfer_kernel(const void* __restrict__ scratch_k
   }
 }
 
+template <bool TO_TAIL, bool F8>
+__global__ void tail_kv_scratch_kernel(const void* __restrict__ scratch_k, const void* __restrict__ scratch_v,
+                                       void* __restrict__ tail_k, void* __restrict__ tail_v, int scratch_max_ctx,
+                                       int pos0, int tail_tokens) {
+  const int t = blockIdx.x;
+  const int fi = blockIdx.y;
+  if (t >= tail_tokens) return;
+  const int ch = threadIdx.x * 4;
+  const std::size_t scratch_off = (std::size_t(fi) * scratch_max_ctx + (pos0 + t)) * CONV_C + ch;
+  const std::size_t tail_off = (std::size_t(fi) * tail_tokens + t) * CONV_C + ch;
+  if constexpr (F8) {
+    if constexpr (TO_TAIL) {
+      *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(tail_k) + tail_off) =
+          *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(scratch_k) + scratch_off);
+      *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(tail_v) + tail_off) =
+          *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(scratch_v) + scratch_off);
+    } else {
+      *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(const_cast<void*>(scratch_k)) + scratch_off) =
+          *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(tail_k) + tail_off);
+      *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(const_cast<void*>(scratch_v)) + scratch_off) =
+          *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(tail_v) + tail_off);
+    }
+  } else {
+    if constexpr (TO_TAIL) {
+      *reinterpret_cast<uint2*>(static_cast<ActT*>(tail_k) + tail_off) =
+          *reinterpret_cast<const uint2*>(static_cast<const ActT*>(scratch_k) + scratch_off);
+      *reinterpret_cast<uint2*>(static_cast<ActT*>(tail_v) + tail_off) =
+          *reinterpret_cast<const uint2*>(static_cast<const ActT*>(scratch_v) + scratch_off);
+    } else {
+      *reinterpret_cast<uint2*>(static_cast<ActT*>(const_cast<void*>(scratch_k)) + scratch_off) =
+          *reinterpret_cast<const uint2*>(static_cast<const ActT*>(tail_k) + tail_off);
+      *reinterpret_cast<uint2*>(static_cast<ActT*>(const_cast<void*>(scratch_v)) + scratch_off) =
+          *reinterpret_cast<const uint2*>(static_cast<const ActT*>(tail_v) + tail_off);
+    }
+  }
+}
+
+template <bool F8>
+__global__ void tail_kv_to_pool_page_kernel(const void* __restrict__ tail_k, const void* __restrict__ tail_v,
+                                            int tail_tokens, int phys_page, void* __restrict__ pool_k,
+                                            void* __restrict__ pool_v) {
+  const int t = blockIdx.x;
+  const int fi = blockIdx.y;
+  if (t >= tail_tokens) return;
+  const int ch = threadIdx.x * 4;
+  const std::size_t tail_off = (std::size_t(fi) * tail_tokens + t) * CONV_C + ch;
+  const std::size_t pool_off = (((std::size_t(phys_page) * NUM_FULL_VISITS + fi) * kPageSize + t) * CONV_C) + ch;
+  if constexpr (F8) {
+    *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pool_k) + pool_off) =
+        *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(tail_k) + tail_off);
+    *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pool_v) + pool_off) =
+        *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(tail_v) + tail_off);
+  } else {
+    *reinterpret_cast<uint2*>(static_cast<ActT*>(pool_k) + pool_off) =
+        *reinterpret_cast<const uint2*>(static_cast<const ActT*>(tail_k) + tail_off);
+    *reinterpret_cast<uint2*>(static_cast<ActT*>(pool_v) + pool_off) =
+        *reinterpret_cast<const uint2*>(static_cast<const ActT*>(tail_v) + tail_off);
+  }
+}
+
 __global__ void batched_head_softcap_kernel(const ActT* __restrict__ in, int B, int chunk_V, int v_offset,
                                             int total_V, float* __restrict__ out) {
   const int v = blockIdx.x * blockDim.x + threadIdx.x;
@@ -952,6 +1012,58 @@ void gather_full_kv(const void* src_k_pool, const void* src_v_pool, int slot, co
     paged_full_kv_transfer_kernel<false, false><<<grid, CONV_C / 4, 0, stream>>>(
         dst_k, dst_v, const_cast<void*>(src_k_pool), const_cast<void*>(src_v_pool), scratch_max_ctx, 0, n, slot,
         page_table, max_pages_per_slot);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void copy_tail_kv_from_scratch(const void* src_k, const void* src_v, int scratch_max_ctx, int src_pos0,
+                               int tail_tokens, bool kv_fp8, void* dst_tail_k, void* dst_tail_v, cudaStream_t stream) {
+  if (tail_tokens <= 0) return;
+  require(src_k && src_v && dst_tail_k && dst_tail_v && src_pos0 >= 0 && tail_tokens < kPageSize &&
+              src_pos0 + tail_tokens <= scratch_max_ctx,
+          "copy_tail_kv_from_scratch: bad args");
+  const dim3 grid(tail_tokens, NUM_FULL_VISITS);
+  if (kv_fp8) {
+    tail_kv_scratch_kernel<true, true><<<grid, 256, 0, stream>>>(src_k, src_v, dst_tail_k, dst_tail_v, scratch_max_ctx,
+                                                                 src_pos0, tail_tokens);
+  } else {
+    tail_kv_scratch_kernel<true, false><<<grid, 256, 0, stream>>>(src_k, src_v, dst_tail_k, dst_tail_v, scratch_max_ctx,
+                                                                  src_pos0, tail_tokens);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void copy_tail_kv_to_scratch(const void* src_tail_k, const void* src_tail_v, int tail_tokens, bool kv_fp8,
+                             void* dst_k, void* dst_v, int scratch_max_ctx, int dst_pos0, cudaStream_t stream) {
+  if (tail_tokens <= 0) return;
+  require(src_tail_k && src_tail_v && dst_k && dst_v && dst_pos0 >= 0 && tail_tokens < kPageSize &&
+              dst_pos0 + tail_tokens <= scratch_max_ctx,
+          "copy_tail_kv_to_scratch: bad args");
+  const dim3 grid(tail_tokens, NUM_FULL_VISITS);
+  if (kv_fp8) {
+    tail_kv_scratch_kernel<false, true><<<grid, 256, 0, stream>>>(dst_k, dst_v, const_cast<void*>(src_tail_k),
+                                                                  const_cast<void*>(src_tail_v), scratch_max_ctx,
+                                                                  dst_pos0, tail_tokens);
+  } else {
+    tail_kv_scratch_kernel<false, false><<<grid, 256, 0, stream>>>(dst_k, dst_v, const_cast<void*>(src_tail_k),
+                                                                   const_cast<void*>(src_tail_v), scratch_max_ctx,
+                                                                   dst_pos0, tail_tokens);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void copy_tail_kv_to_pool_page(const void* src_tail_k, const void* src_tail_v, int tail_tokens, bool kv_fp8,
+                               int phys_page, void* dst_k_pool, void* dst_v_pool, cudaStream_t stream) {
+  if (tail_tokens <= 0) return;
+  require(src_tail_k && src_tail_v && dst_k_pool && dst_v_pool && tail_tokens < kPageSize && phys_page >= 0,
+          "copy_tail_kv_to_pool_page: bad args");
+  const dim3 grid(tail_tokens, NUM_FULL_VISITS);
+  if (kv_fp8) {
+    tail_kv_to_pool_page_kernel<true><<<grid, 256, 0, stream>>>(src_tail_k, src_tail_v, tail_tokens, phys_page,
+                                                                dst_k_pool, dst_v_pool);
+  } else {
+    tail_kv_to_pool_page_kernel<false><<<grid, 256, 0, stream>>>(src_tail_k, src_tail_v, tail_tokens, phys_page,
+                                                                 dst_k_pool, dst_v_pool);
   }
   CUDA_CHECK(cudaGetLastError());
 }

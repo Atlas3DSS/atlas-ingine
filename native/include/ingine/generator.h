@@ -3,6 +3,7 @@
 #pragma once
 
 #include "ingine/persona.h"
+#include "ingine/prefix_cache.h"
 
 #include <algorithm>
 #include <chrono>
@@ -14,9 +15,32 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ingine::model {
+
+// Full-attention KV cache sharing mode across loop passes (layers 11 and 17).
+// PerPass (default): all 8 full-attention visits (L5, L11x3, L17x3, L23) have independent KV slots.
+// LastFull (opt-in): L11 passes 0..2 share one slot and L17 passes 0..2 share one slot (4 full slots total);
+// prior tokens use the final pass's persisted KV while sliding rings (40) and conv states (48) stay pass-local.
+enum class KvCacheMode : std::uint8_t {
+  PerPass = 0,
+  LastFull = 1,
+};
+
+inline const char* to_string(KvCacheMode mode) {
+  switch (mode) {
+    case KvCacheMode::LastFull: return "last_full";
+    default: return "per_pass";
+  }
+}
+
+inline KvCacheMode parse_kv_cache_mode(std::string_view s) {
+  if (s == "per_pass") return KvCacheMode::PerPass;
+  if (s == "last_full") return KvCacheMode::LastFull;
+  throw std::invalid_argument("invalid kv_cache_mode '" + std::string(s) + "' (expected 'per_pass' or 'last_full')");
+}
 
 struct Sampling {
   float temperature = 1.0f;  // 0 => greedy
@@ -50,11 +74,26 @@ struct PromptImage {
   [[nodiscard]] int tokens() const { return rows() * cols(); }
 };
 
-// A prompt: token ids and its images, in the order of their positions (without overlap).
+// A prompt: token ids, images in position order (without overlap), optional verified root-prefix snapshot
+// boundary hint (0 = none; never a trust key), optional cache isolation namespace, and per-request bypass.
 struct Prompt {
   std::span<const std::int32_t> ids;
   std::span<const PromptImage> images;
+  int root_prefix_tokens = 0;
+  std::string cache_namespace;
+  bool bypass_prefix_cache = false;
 };
+
+// Validates that `root_prefix_tokens` lies inside [0, ids.size()] and does not straddle any PromptImage.
+// Returns the validated boundary (or 0 if invalid/out-of-range).
+inline int validate_root_prefix_tokens(std::span<const std::int32_t> ids, std::span<const PromptImage> images,
+                                       int root_prefix_tokens) noexcept {
+  if (root_prefix_tokens <= 0 || std::size_t(root_prefix_tokens) > ids.size()) return 0;
+  for (const PromptImage& img : images) {
+    if (img.pos < root_prefix_tokens && img.pos + img.tokens() > root_prefix_tokens) return 0;
+  }
+  return root_prefix_tokens;
+}
 
 // How the prompt reused the state of earlier requests (reused_tokens were not prefilled again).
 enum class Reuse {
@@ -111,11 +150,17 @@ struct RuntimeOptions {
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, kv_q4 = false, spec = false;
+  KvCacheMode kv_cache_mode = KvCacheMode::PerPass;
   float spec_threshold = 0.8f;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
   // min(3072, free memory after start-up - 4096), at least 0.
   int park_mb = -1;
+  // Bounded pinned host-RAM parking tier (MiB) for checkpoints evicted from VRAM or parked when park_mb=0
+  // (LRU eviction, graceful fallback under host memory pressure; default 0 = opt-in).
+  int park_host_mb = 0;
+  // Symmetric prefix-cache toggle for both B=1 and B>1 (false = cache-off parity baseline, zero reuse).
+  bool prefix_cache = true;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
   // Dynamic 3-tier MoE expert offloading (atlas-6g-homology):
@@ -187,11 +232,17 @@ class Generator {
     return stats;
   }
   virtual bool supports_images() const { return false; }
+  virtual KvCacheMode kv_cache_mode() const { return KvCacheMode::PerPass; }
   virtual std::string offload_summary() const { return {}; }
+  virtual PrefixCacheStats cache_stats() const { return {}; }
 
   // ---- Optional continuous-batching interface (used by Scheduler and ingine-bench when max_batch_size() > 1)
   virtual int max_batch_size() const { return 1; }
   virtual bool can_admit_slot(int /*prompt_tokens*/, int /*max_new_tokens*/) const { return false; }
+  // Prompt-aware admission check accounting for reusable shared committed KV pages (defaults to cold estimate).
+  virtual bool can_admit_slot(const Prompt& prompt, int max_new_tokens, const Sampling& /*sampling*/) const {
+    return can_admit_slot(int(prompt.ids.size()), max_new_tokens);
+  }
   // Allocates a free slot, prefills `prompt`, samples `first_token` and fills `stats`. Returns slot id >= 0,
   // or -1 if no slot / KV pages are currently available. Throws std::invalid_argument on invalid prompt.
   virtual int start_slot(const Prompt& /*prompt*/, int /*max_new_tokens*/, const Sampling& /*sampling*/,
