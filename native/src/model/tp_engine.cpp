@@ -382,7 +382,7 @@ class TpWorkerPool {
     {
       const char* env = std::getenv("INGINE_TP_P2P_AR");
       if (TP_SIZE == 2 && p2p_probe_.p2p_enabled && !p2p_probe_.corrupted && !(env && env[0] == '0')) {
-        constexpr int kSlots = 2 * NUM_VISITS, kCap = 8 * HIDDEN;
+        constexpr int kSlots = 2 * NUM_VISITS + 1, kCap = 8 * HIDDEN;
         constexpr std::size_t nf = std::size_t(kSlots) * kBlocksAr;
         for (int r = 0; r < TP_SIZE; ++r) {
           CUDA_CHECK(cudaSetDevice(r));
@@ -992,7 +992,8 @@ class TpBatchDecoder {
       : w_(w), abl_(abl), pool_(pool), max_batch_(max_batch), rank_(rank), comm_(comm), rinfo_(rinfo),
         gemm_(std::make_unique<pk::Gemm>()),
         tokens_host_(std::size_t(max_batch) * sizeof(std::int64_t)),
-        slots_host_(std::size_t(max_batch) * sizeof(std::int32_t)) {
+        slots_host_(std::size_t(max_batch) * sizeof(std::int32_t)),
+        banned_host_(std::size_t(max_batch) * sizeof(bk::BannedList)) {
     auto alloc = [&](std::size_t bytes) {
       storage_.emplace_back(bytes);
       storage_.back().fill(0);
@@ -1035,6 +1036,11 @@ class TpBatchDecoder {
     local_logits_ = f32(B * LOCAL_VOCAB_CHUNK);
     gathered_logits_ = f32(std::size_t(TP_SIZE) * B * LOCAL_VOCAB_CHUNK);
     logits_ = (rank_ == 0) ? f32(B * UNPADDED_VOCAB) : nullptr;
+    if (max_batch <= 128) {
+      banned_dev_ = static_cast<bk::BannedList*>(alloc(B * sizeof(bk::BannedList)));
+      argmax_ws_ = alloc(bk::p2p_argmax2_workspace_bytes(max_batch));
+      argmax_out_dev_ = static_cast<std::int32_t*>(alloc(B * sizeof(std::int32_t)));
+    }
     head_act_ = B > 8 ? bf16(B * kHeadChunk) : nullptr;
     wscratch_ = (w.dense_fp8 && B > 32) ? bf16(std::size_t(kHeadChunk) * H)
                 : (w.dense_q8 && B > 32) ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM))
@@ -1048,25 +1054,35 @@ class TpBatchDecoder {
     full_segments_ = upload_ints(proj_layout(true, false));
   }
 
-  ~TpBatchDecoder() {
-    for (auto& [b, exec] : graphs_)
-      if (exec) cudaGraphExecDestroy(exec);
+  ~TpBatchDecoder() { clear_graphs(); }
+
+  bool p2p_argmax_enabled() const {
+    static const bool env_on = [] {
+      const char* e = std::getenv("INGINE_TP_P2P_ARGMAX");
+      return !(e && e[0] == '0');
+    }();
+    return env_on && TP_SIZE == 2 && rinfo_.p2p_ar.active() && 2 * NUM_VISITS < rinfo_.p2p_ar.slots &&
+           argmax_ws_ != nullptr && 2 * max_batch_ <= rinfo_.p2p_ar.cap;
   }
 
-  void warmup_bucket(int B, cudaStream_t stream) {
+  void warmup_bucket(int B, cudaStream_t stream, bool greedy = false) {
     std::vector<std::int64_t> ztok(max_batch_, 0);
     std::vector<std::int32_t> nslot(max_batch_, -1);
     CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ztok.data(), ztok.size() * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev_, nslot.data(), nslot.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
-    decode_eager(B, stream);
+    if (greedy && banned_dev_) {
+      std::vector<bk::BannedList> zb(max_batch_);
+      CUDA_CHECK(cudaMemcpyAsync(banned_dev_, zb.data(), zb.size() * sizeof(bk::BannedList), cudaMemcpyHostToDevice, stream));
+    }
+    decode_eager(B, greedy, stream);
   }
 
-  bool capture_bucket(int B, cudaStream_t stream) {
+  bool capture_bucket(int B, cudaStream_t stream, bool greedy = false) {
     cudaGraph_t graph = nullptr;
     const cudaError_t berr = cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
     if (berr != cudaSuccess) return false;
     try {
-      decode_eager(B, stream);
+      decode_eager(B, greedy, stream);
     } catch (...) {
       cudaStreamEndCapture(stream, &graph);
       if (graph) cudaGraphDestroy(graph);
@@ -1082,7 +1098,10 @@ class TpBatchDecoder {
     cudaGraphDestroy(graph);
     if (ierr != cudaSuccess || !exec) return false;
     CUDA_CHECK(cudaGraphUpload(exec, stream));
-    graphs_[B] = exec;
+    auto& gm = greedy ? graphs_greedy_ : graphs_;
+    auto old = gm.find(B);
+    if (old != gm.end() && old->second) cudaGraphExecDestroy(old->second);
+    gm[B] = exec;
     return true;
   }
 
@@ -1090,7 +1109,12 @@ class TpBatchDecoder {
     for (auto& [b, exec] : graphs_)
       if (exec) cudaGraphExecDestroy(exec);
     graphs_.clear();
+    for (auto& [b, exec] : graphs_greedy_)
+      if (exec) cudaGraphExecDestroy(exec);
+    graphs_greedy_.clear();
   }
+
+  bool has_logits_graph(int B_active) const { return graphs_.lower_bound(B_active) != graphs_.end(); }
 
   const float* run_step(std::span<const BatchSlotStep> inputs, cudaStream_t stream) {
     const int B_active = int(inputs.size());
@@ -1113,12 +1137,45 @@ class TpBatchDecoder {
     if (it != graphs_.end()) {
       CUDA_CHECK(cudaGraphLaunch(it->second, stream));
     } else {
-      decode_eager(B_active, stream);
+      decode_eager(B_active, false, stream);
     }
     rinfo_.decode_steps.fetch_add(1, std::memory_order_relaxed);
     rinfo_.allreduce_calls.fetch_add(2 * NUM_VISITS, std::memory_order_relaxed);
     rinfo_.allgather_calls.fetch_add(1, std::memory_order_relaxed);
     return logits_;
+  }
+
+  const std::int32_t* run_step_greedy(std::span<const BatchSlotStep> inputs, std::span<const bk::BannedList> banned,
+                                      cudaStream_t stream) {
+    const int B_active = int(inputs.size());
+    auto it = graphs_greedy_.lower_bound(B_active);
+    const int B_cap = (it != graphs_greedy_.end()) ? it->first : B_active;
+
+    auto* ht = static_cast<std::int64_t*>(tokens_host_.data());
+    auto* hs = static_cast<std::int32_t*>(slots_host_.data());
+    auto* hb = static_cast<bk::BannedList*>(banned_host_.data());
+    for (int i = 0; i < B_active; ++i) {
+      ht[i] = inputs[i].token;
+      hs[i] = inputs[i].slot;
+      hb[i] = banned[i];
+    }
+    for (int i = B_active; i < B_cap; ++i) {
+      ht[i] = 0;
+      hs[i] = -1;
+      hb[i] = bk::BannedList{};
+    }
+    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(B_cap) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev_, hs, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(banned_dev_, hb, std::size_t(B_cap) * sizeof(bk::BannedList), cudaMemcpyHostToDevice, stream));
+
+    if (it != graphs_greedy_.end()) {
+      CUDA_CHECK(cudaGraphLaunch(it->second, stream));
+    } else {
+      decode_eager(B_active, true, stream);
+    }
+    rinfo_.decode_steps.fetch_add(1, std::memory_order_relaxed);
+    rinfo_.allreduce_calls.fetch_add(2 * NUM_VISITS, std::memory_order_relaxed);
+    return argmax_out_dev_;
   }
 
  private:
@@ -1132,7 +1189,7 @@ class TpBatchDecoder {
     return static_cast<const float* const*>(it->second.p);
   }
 
-  void decode_eager(int B, cudaStream_t stream) {
+  void decode_eager(int B, bool greedy, cudaStream_t stream) {
     const Weights& w = w_;
     const Ablation& abl = abl_;
     const std::size_t slab = std::size_t(B) * H;
@@ -1425,9 +1482,16 @@ class TpBatchDecoder {
         bk::batched_head_softcap(head_act_, B, cv, v0, LOCAL_VOCAB_CHUNK, local_logits_, stream);
       }
     }
-    NCCL_CHECK(ncclAllGather(local_logits_, gathered_logits_, std::size_t(B) * LOCAL_VOCAB_CHUNK, ncclFloat32, comm_, stream));
-    if (rank_ == 0) {
-      unpack_tp_logits(gathered_logits_, B, TP_SIZE, LOCAL_VOCAB_CHUNK, UNPADDED_VOCAB, logits_, stream);
+    if (greedy && p2p_argmax_enabled()) {
+      const int v0 = rank_ * LOCAL_VOCAB_CHUNK;
+      const int local_V = std::min(LOCAL_VOCAB_CHUNK, UNPADDED_VOCAB - v0);
+      bk::p2p_argmax2(local_logits_, B, local_V, LOCAL_VOCAB_CHUNK, v0, banned_dev_, argmax_ws_, rinfo_.p2p_ar,
+                      2 * NUM_VISITS, argmax_out_dev_, stream);
+    } else {
+      NCCL_CHECK(ncclAllGather(local_logits_, gathered_logits_, std::size_t(B) * LOCAL_VOCAB_CHUNK, ncclFloat32, comm_, stream));
+      if (rank_ == 0) {
+        unpack_tp_logits(gathered_logits_, B, TP_SIZE, LOCAL_VOCAB_CHUNK, UNPADDED_VOCAB, logits_, stream);
+      }
     }
     bk::batched_advance_pos(slot_ids_dev_, B, static_cast<std::int64_t*>(pool_.slot_pos.p), stream);
   }
@@ -1445,11 +1509,14 @@ class TpBatchDecoder {
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
   std::array<DeviceBuffer, 2> segments_;
   DeviceBuffer full_segments_, attn_ws_;
-  std::map<int, cudaGraphExec_t> graphs_;
-  PinnedHostBuffer tokens_host_, slots_host_;
+  std::map<int, cudaGraphExec_t> graphs_, graphs_greedy_;
+  PinnedHostBuffer tokens_host_, slots_host_, banned_host_;
 
   std::int64_t* tokens_dev_ = nullptr;
   std::int32_t* slot_ids_dev_ = nullptr;
+  bk::BannedList* banned_dev_ = nullptr;
+  void* argmax_ws_ = nullptr;
+  std::int32_t* argmax_out_dev_ = nullptr;
   float *B0_, *B1_, *B2_[PASSES], *E_[PASSES], *hid_, *part_, *y_, *y2_;
   ActT *xin_, *xin_chunk_, *xm_, *xf_;
   float *mixf_, *msgs_, *mixm_, *proj_fp32_, *wo_fp32_, *fpre_, *gpre_, *router_logits_, *wts_, *moe_f32_;
@@ -1540,37 +1607,20 @@ class TpBatchGenerator final : public Generator {
       CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
     });
 
-    // Step 3: warmup & capture power-of-2 buckets across all 4 ranks concurrently
+    // Step 3: warmup & capture power-of-2 buckets across all ranks concurrently.
+    // When P2P greedy argmax is active, capture greedy graphs at startup (full-logits graphs capture lazily on
+    // first temperature > 0 request to avoid extra graph VRAM on tight long-context configs).
     const char* no_graph = std::getenv("INGINE_TP_NO_GRAPH");
-    const bool enable_graphs = !(no_graph && no_graph[0] == '1');
-    std::vector<int> buckets;
-    for (int b = 1; b < options_.max_batch; b <<= 1) buckets.push_back(b);
+    enable_graphs_ = !(no_graph && no_graph[0] == '1');
+    for (int b = 1; b < options_.max_batch; b <<= 1) buckets_.push_back(b);
     for (int mid : {24, 48, 96})
-      if (mid < options_.max_batch) buckets.push_back(mid);
-    buckets.push_back(options_.max_batch);
-    std::sort(buckets.begin(), buckets.end());
-    buckets.erase(std::unique(buckets.begin(), buckets.end()), buckets.end());
-    for (int B : buckets) {
-      for (int w = 0; w < 2; ++w) {
-        pool_.run_all([&](int r) {
-          ranks_[r].decoder->warmup_bucket(B, pool_.stream(r));
-          CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
-        });
-      }
-      if (enable_graphs) {
-        std::array<bool, TP_SIZE> ok{};
-        pool_.run_all([&](int r) {
-          ok[r] = ranks_[r].decoder->capture_bucket(B, pool_.stream(r));
-          CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
-        });
-        const bool all_ok = std::all_of(ok.begin(), ok.end(), [](bool v) { return v; });
-        if (!all_ok) {
-          ingine::engine::server_log().warn("TP{}/EP{} CUDA graph capture failed for B={} — falling back to eager", TP_SIZE, TP_SIZE, B);
-          pool_.run_all([&](int r) { ranks_[r].decoder->clear_graphs(); });
-          break;
-        }
-      }
-    }
+      if (mid < options_.max_batch) buckets_.push_back(mid);
+    buckets_.push_back(options_.max_batch);
+    std::sort(buckets_.begin(), buckets_.end());
+    buckets_.erase(std::unique(buckets_.begin(), buckets_.end()), buckets_.end());
+    const bool greedy_init = ranks_[0].decoder->p2p_argmax_enabled();
+    capture_buckets_unlocked(greedy_init);
+    logits_graphs_ready_ = !greedy_init;
     pool_.run_all([&](int r) { MEMLOG(r, "graphs"); });
     ingine::engine::server_log().info("{}", offload_summary());
   }
@@ -1697,33 +1747,63 @@ class TpBatchGenerator final : public Generator {
       ensure_pages_all_unlocked(input.slot, slot_pos_host_[input.slot] + 1);
     }
 
-    const float* logits = nullptr;
-    pool_.run_all([&](int r) {
-      const float* l = ranks_[r].decoder->run_step(inputs, pool_.stream(r));
-      if (r == 0) logits = l;
-    });
-    for (int i = 0; i < B; ++i) slot_pos_host_[inputs[i].slot] += 1;
-
-    CUDA_CHECK(cudaSetDevice(0));
-    bool all_greedy = true;
-    const head::BannedTokens& b0 = slot_meta_[inputs[0].slot].params.banned;
+    bool all_greedy_temp = true;
     for (int i = 0; i < B; ++i) {
-      const head::SamplingParams& sp = slot_meta_[inputs[i].slot].params;
-      if (sp.temperature > 0.0f || !same_banned(sp.banned, b0)) { all_greedy = false; break; }
+      if (slot_meta_[inputs[i].slot].params.temperature > 0.0f) { all_greedy_temp = false; break; }
     }
-    auto* sampled = static_cast<std::int32_t*>(sampled_dev_.p);
-    if (all_greedy) {
-      head::argmax(logits, B, UNPADDED_VOCAB, UNPADDED_VOCAB, sampled, pool_.stream(0), b0);
-    } else {
+
+    if (all_greedy_temp && ranks_[0].decoder->p2p_argmax_enabled()) {
+      std::vector<bk::BannedList> banned(B);
       for (int i = 0; i < B; ++i) {
-        SlotMeta& meta = slot_meta_[inputs[i].slot];
-        head::sample(logits + std::size_t(i) * UNPADDED_VOCAB, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params,
-                     meta.rng, sampled + i, pool_.stream(0));
+        const auto& sb = slot_meta_[inputs[i].slot].params.banned;
+        banned[i].count = sb.count;
+        for (int k = 0; k < sb.count && k < bk::BannedList::kMax; ++k) banned[i].ids[k] = sb.ids[k];
       }
+      const std::int32_t* argmax_dev = nullptr;
+      pool_.run_all([&](int r) {
+        const std::int32_t* out = ranks_[r].decoder->run_step_greedy(inputs, banned, pool_.stream(r));
+        if (r == 0) argmax_dev = out;
+      });
+      for (int i = 0; i < B; ++i) slot_pos_host_[inputs[i].slot] += 1;
+
+      CUDA_CHECK(cudaSetDevice(0));
+      CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), argmax_dev, std::size_t(B) * sizeof(std::int32_t),
+                                 cudaMemcpyDeviceToHost, pool_.stream(0)));
+      CUDA_CHECK(cudaStreamSynchronize(pool_.stream(0)));
+    } else {
+      if (enable_graphs_ && !logits_graphs_ready_) {
+        capture_buckets_unlocked(false);
+        logits_graphs_ready_ = true;
+      }
+      const float* logits = nullptr;
+      pool_.run_all([&](int r) {
+        const float* l = ranks_[r].decoder->run_step(inputs, pool_.stream(r));
+        if (r == 0) logits = l;
+      });
+      for (int i = 0; i < B; ++i) slot_pos_host_[inputs[i].slot] += 1;
+
+      CUDA_CHECK(cudaSetDevice(0));
+      bool all_greedy = all_greedy_temp;
+      const head::BannedTokens& b0 = slot_meta_[inputs[0].slot].params.banned;
+      if (all_greedy) {
+        for (int i = 0; i < B; ++i) {
+          if (!same_banned(slot_meta_[inputs[i].slot].params.banned, b0)) { all_greedy = false; break; }
+        }
+      }
+      auto* sampled = static_cast<std::int32_t*>(sampled_dev_.p);
+      if (all_greedy) {
+        head::argmax(logits, B, UNPADDED_VOCAB, UNPADDED_VOCAB, sampled, pool_.stream(0), b0);
+      } else {
+        for (int i = 0; i < B; ++i) {
+          SlotMeta& meta = slot_meta_[inputs[i].slot];
+          head::sample(logits + std::size_t(i) * UNPADDED_VOCAB, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params,
+                       meta.rng, sampled + i, pool_.stream(0));
+        }
+      }
+      CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled, std::size_t(B) * sizeof(std::int32_t),
+                                 cudaMemcpyDeviceToHost, pool_.stream(0)));
+      CUDA_CHECK(cudaStreamSynchronize(pool_.stream(0)));
     }
-    CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled, std::size_t(B) * sizeof(std::int32_t),
-                               cudaMemcpyDeviceToHost, pool_.stream(0)));
-    CUDA_CHECK(cudaStreamSynchronize(pool_.stream(0)));
     const auto* host_out = static_cast<const std::int32_t*>(sampled_host_.data());
     for (int i = 0; i < B; ++i) {
       SlotMeta& meta = slot_meta_[inputs[i].slot];
@@ -1816,12 +1896,41 @@ class TpBatchGenerator final : public Generator {
     slot_in_use_[s] = false;
   }
 
+  void capture_buckets_unlocked(bool greedy) {
+    for (int B : buckets_) {
+      for (int w = 0; w < 2; ++w) {
+        pool_.run_all([&](int r) {
+          ranks_[r].decoder->warmup_bucket(B, pool_.stream(r), greedy);
+          CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
+        });
+      }
+      if (enable_graphs_) {
+        std::array<bool, TP_SIZE> ok{};
+        pool_.run_all([&](int r) {
+          ok[r] = ranks_[r].decoder->capture_bucket(B, pool_.stream(r), greedy);
+          CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
+        });
+        const bool all_ok = std::all_of(ok.begin(), ok.end(), [](bool v) { return v; });
+        if (!all_ok) {
+          ingine::engine::server_log().warn("TP{}/EP{} CUDA graph capture failed for B={} (greedy={}) — falling back to eager",
+                                            TP_SIZE, TP_SIZE, B, greedy ? 1 : 0);
+          pool_.run_all([&](int r) { ranks_[r].decoder->clear_graphs(); });
+          enable_graphs_ = false;
+          break;
+        }
+      }
+    }
+  }
+
   RuntimeOptions options_;
   TpWorkerPool pool_;
   std::array<RankCtx, TP_SIZE> ranks_;
   int prefill_chunk_ = 3072;
   int max_pages_per_slot_ = 0;
   int num_pages_ = 0;
+  bool enable_graphs_ = true;
+  bool logits_graphs_ready_ = false;
+  std::vector<int> buckets_;
   DeviceBuffer prefill_logits_, sampled_dev_;
   PinnedHostBuffer sampled_host_;
   std::vector<int> free_pages_;

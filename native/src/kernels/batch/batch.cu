@@ -1018,6 +1018,101 @@ __global__ void __launch_bounds__(128) p2p_allreduce2_kernel(float4* __restrict_
     data[i] = d;
   }
 }
+
+constexpr int kArgmaxSplits = 32;
+constexpr int kArgmaxMaxRows = 128;
+
+__device__ __forceinline__ bool argmax_better(float v, int i, float bv, int bi) {
+  return v > bv || (v == bv && i < bi);
+}
+
+__global__ void __launch_bounds__(256) local_argmax_part_kernel(const float* __restrict__ logits, int local_V,
+                                                                long long stride, int v_offset,
+                                                                const BannedList* __restrict__ banned,
+                                                                float* __restrict__ part_v,
+                                                                int* __restrict__ part_i) {
+  __shared__ float sv[8];
+  __shared__ int si[8];
+  const int s = blockIdx.x;
+  const int r = blockIdx.y;
+  const float* row = logits + static_cast<long long>(r) * stride;
+  BannedList bl{};
+  if (banned) bl = banned[r];
+
+  float bv = -INFINITY;
+  int bi = 0x7fffffff;
+  const int step = kArgmaxSplits * 256;
+  for (int v = s * 256 + int(threadIdx.x); v < local_V; v += step) {
+    const int gv = v_offset + v;
+    bool ban = false;
+    for (int k = 0; k < bl.count; ++k)
+      if (bl.ids[k] == gv) ban = true;
+    const float x = ban ? -INFINITY : row[v];
+    if (argmax_better(x, gv, bv, bi)) bv = x, bi = gv;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+    const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+    if (argmax_better(ov, oi, bv, bi)) bv = ov, bi = oi;
+  }
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  if (lane == 0) sv[warp] = bv, si[warp] = bi;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float fv = sv[0];
+    int fi = si[0];
+#pragma unroll
+    for (int w = 1; w < 8; ++w)
+      if (argmax_better(sv[w], si[w], fv, fi)) fv = sv[w], fi = si[w];
+    part_v[r * kArgmaxSplits + s] = fv;
+    part_i[r * kArgmaxSplits + s] = fi;
+  }
+}
+
+__global__ void __launch_bounds__(256) p2p_argmax2_merge_kernel(const float* __restrict__ part_v,
+                                                                const int* __restrict__ part_i, int rows,
+                                                                const uint2* my_recv, uint2* peer_recv,
+                                                                unsigned* my_flag, unsigned* peer_flag,
+                                                                unsigned* my_seq, std::int32_t* __restrict__ out) {
+  __shared__ float my_v[kArgmaxMaxRows];
+  __shared__ int my_i[kArgmaxMaxRows];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int r = warp; r < rows; r += 8) {
+    float bv = part_v[r * kArgmaxSplits + lane];
+    int bi = part_i[r * kArgmaxSplits + lane];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+      if (argmax_better(ov, oi, bv, bi)) bv = ov, bi = oi;
+    }
+    if (lane == 0) {
+      my_v[r] = bv;
+      my_i[r] = bi;
+      peer_recv[r] = make_uint2(__float_as_uint(bv), static_cast<unsigned>(bi));
+    }
+  }
+  __threadfence_system();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const unsigned seq = my_seq[0] + 1u;
+    my_seq[0] = seq;
+    *reinterpret_cast<volatile unsigned*>(peer_flag) = seq;
+    while (int(*reinterpret_cast<volatile unsigned*>(my_flag) - seq) < 0) __nanosleep(32);
+    __threadfence();
+  }
+  __syncthreads();
+  for (int r = int(threadIdx.x); r < rows; r += blockDim.x) {
+    const uint2 pr = __ldcg(my_recv + r);
+    const float pv = __uint_as_float(pr.x);
+    const int pi = static_cast<int>(pr.y);
+    float bv = my_v[r];
+    int bi = my_i[r];
+    if (argmax_better(pv, pi, bv, bi)) bv = pv, bi = pi;
+    out[r] = (bi == 0x7fffffff) ? 0 : bi;
+  }
+}
 }  // namespace
 
 std::size_t attn_workspace_bytes(int max_b) {
@@ -1260,6 +1355,30 @@ void p2p_allreduce2(float* data, int n, const P2pAllReduce2& ar, int slot, cudaS
   p2p_allreduce2_kernel<<<P2pAllReduce2::kBlocks, 128, 0, stream>>>(
       reinterpret_cast<float4*>(data), n / 4, reinterpret_cast<const float4*>(ar.my_recv + off),
       reinterpret_cast<float4*>(ar.peer_recv + off), ar.my_flag + foff, ar.peer_flag + foff, ar.my_seq + foff);
+}
+
+std::size_t p2p_argmax2_workspace_bytes(int max_rows) {
+  require(max_rows >= 1 && max_rows <= kArgmaxMaxRows, "p2p_argmax2_workspace_bytes: bad max_rows");
+  return std::size_t(max_rows) * kArgmaxSplits * (sizeof(float) + sizeof(int));
+}
+
+void p2p_argmax2(const float* local_logits, int rows, int local_V, std::int64_t stride, int v_offset,
+                 const BannedList* banned, void* ws, const P2pAllReduce2& ar, int slot,
+                 std::int32_t* out_tokens, cudaStream_t stream) {
+  require(local_logits && ws && out_tokens && ar.active() && rows >= 1 && rows <= kArgmaxMaxRows &&
+              local_V >= 1 && stride >= local_V && slot >= 0 && slot < ar.slots && 2 * rows <= ar.cap,
+          "p2p_argmax2: bad args");
+  auto* part_v = static_cast<float*>(ws);
+  auto* part_i = reinterpret_cast<int*>(part_v + std::size_t(rows) * kArgmaxSplits);
+  local_argmax_part_kernel<<<dim3(kArgmaxSplits, rows), 256, 0, stream>>>(local_logits, local_V, stride, v_offset,
+                                                                          banned, part_v, part_i);
+  const std::size_t off = std::size_t(slot) * std::size_t(ar.cap);
+  const std::size_t foff = std::size_t(slot) * P2pAllReduce2::kBlocks;
+  p2p_argmax2_merge_kernel<<<1, 256, 0, stream>>>(part_v, part_i, rows,
+                                                  reinterpret_cast<const uint2*>(ar.my_recv + off),
+                                                  reinterpret_cast<uint2*>(ar.peer_recv + off), ar.my_flag + foff,
+                                                  ar.peer_flag + foff, ar.my_seq + foff, out_tokens);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace ingine::kernels::batch

@@ -130,4 +130,20 @@ struct P2pAllReduce2 {
 };
 void p2p_allreduce2(float* data, int n, const P2pAllReduce2& ar, int slot, cudaStream_t stream);
 
+// Per-row banned token list for distributed greedy argmax (matches head::BannedTokens).
+struct BannedList {
+  static constexpr int kMax = 4;
+  int count = 0;
+  std::int32_t ids[kMax] = {-1, -1, -1, -1};
+};
+
+// Two-GPU distributed greedy argmax over sharded FP32 logits [rows, stride]. Each rank scans [0, local_V)
+// with global token ids [v_offset, v_offset + local_V), honours optional per-row `banned` [rows] (global ids),
+// exchanges (max_val, argmax_id) over `ar` at `slot`, and writes global argmax ids (ties -> lowest id, matching
+// head::argmax identically) into `out_tokens` [rows]. `rows` must be in [1, 128].
+std::size_t p2p_argmax2_workspace_bytes(int max_rows);
+void p2p_argmax2(const float* local_logits, int rows, int local_V, std::int64_t stride, int v_offset,
+                 const BannedList* banned, void* ws, const P2pAllReduce2& ar, int slot,
+                 std::int32_t* out_tokens, cudaStream_t stream);
+
 }  // namespace ingine::kernels::batch
