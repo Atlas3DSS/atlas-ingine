@@ -14,9 +14,16 @@ if(TARGET ingine_model)
   if(UNIX AND NOT APPLE)
     # Test-only deterministic synchronization wrappers for Suite 2h-consumed-weight-toctou (mutates private embed_norm
     # immediately after SafetensorsModel::read returns its payload and records actual GPU norm[0] + content_sha256).
+    if(INGINE_BACKEND STREQUAL "HIP")
+      set(_s3_load_weights_sym
+        "_ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP12ihipStream_tRKNS0_13OffloadConfigE")
+    else()
+      set(_s3_load_weights_sym
+        "_ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP11CUstream_stRKNS0_13OffloadConfigE")
+    endif()
     target_link_options(model_cache_stage3 PRIVATE
       -Wl,--wrap=_ZNK6ingine16SafetensorsModel4readESt17basic_string_viewIcSt11char_traitsIcEE
-      -Wl,--wrap=_ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP11CUstream_stRKNS0_13OffloadConfigE)
+      -Wl,--wrap=${_s3_load_weights_sym})
   endif()
   # full-model parity against the Python engine's goldens (tools/goldens_model.py); ~20 GB of GPU memory
   if(TARGET ingine-validate)

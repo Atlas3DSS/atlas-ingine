@@ -83,10 +83,17 @@ std::vector<std::byte> s3_wrap_st_read(const ingine::SafetensorsModel* model, st
   return original;
 }
 
+#if defined(INGINE_BACKEND_HIP) && INGINE_BACKEND_HIP
+extern "C" Weights s3_real_load_weights(const std::filesystem::path&, bool, cudaStream_t, const OffloadConfig&)
+    asm("__real__ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP12ihipStream_tRKNS0_13OffloadConfigE");
+extern "C" Weights s3_wrap_load_weights(const std::filesystem::path&, bool, cudaStream_t, const OffloadConfig&)
+    asm("__wrap__ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP12ihipStream_tRKNS0_13OffloadConfigE");
+#else
 extern "C" Weights s3_real_load_weights(const std::filesystem::path&, bool, cudaStream_t, const OffloadConfig&)
     asm("__real__ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP11CUstream_stRKNS0_13OffloadConfigE");
 extern "C" Weights s3_wrap_load_weights(const std::filesystem::path&, bool, cudaStream_t, const OffloadConfig&)
     asm("__wrap__ZN6ingine5model12load_weightsERKNSt10filesystem7__cxx114pathEbP11CUstream_stRKNS0_13OffloadConfigE");
+#endif
 
 Weights s3_wrap_load_weights(const std::filesystem::path& dir, bool dense, cudaStream_t stream,
                              const OffloadConfig& cfg) {

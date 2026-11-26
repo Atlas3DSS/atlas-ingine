@@ -669,8 +669,11 @@ bool test_bit_lock() {
 #if INGINE_ACT_FP16
   const bool check_reference_klock = strict_env || (sm == 70);
   const char* ref_label = "sm_70 FP16";
-#else
+#elif defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION)
   const bool check_reference_klock = strict_env || (sm == 120 && CUDART_VERSION >= 13000);
+  const char* ref_label = "sm_120/CUDA13 BF16";
+#else
+  const bool check_reference_klock = strict_env;
   const char* ref_label = "sm_120/CUDA13 BF16";
 #endif
   bool ok = true;
@@ -683,9 +686,18 @@ bool test_bit_lock() {
     const bool det = got[0] == got2[0] && got[1] == got2[1] && got[2] == got2[2];
     pair_ok = pair_ok && pair_ok2;
     if (!check_reference_klock) {
-      std::printf("%s bit lock M=%d (sm_%d CUDA %d.%d: two-run determinism %s, %s kLock skipped): "
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION)
+      const char* rt_name = "CUDA";
+      const int rt_maj = CUDART_VERSION / 1000;
+      const int rt_min = (CUDART_VERSION % 1000) / 10;
+#else
+      const char* rt_name = "HIP";
+      const int rt_maj = HIP_VERSION_MAJOR;
+      const int rt_min = HIP_VERSION_MINOR;
+#endif
+      std::printf("%s bit lock M=%d (sm_%d %s %d.%d: two-run determinism %s, %s kLock skipped): "
                   "{0x%016llxull, 0x%016llxull, 0x%016llxull}%s\n",
-                  det && pair_ok ? "PASS" : "FAIL", M, sm, CUDART_VERSION / 1000, (CUDART_VERSION % 1000) / 10,
+                  det && pair_ok ? "PASS" : "FAIL", M, sm, rt_name, rt_maj, rt_min,
                   det ? "ok" : "FAILED", ref_label, static_cast<unsigned long long>(got[0]),
                   static_cast<unsigned long long>(got[1]), static_cast<unsigned long long>(got[2]),
                   pair_ok ? "" : "; mix_pair differs from two mix launches");

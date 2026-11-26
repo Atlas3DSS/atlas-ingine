@@ -56,7 +56,7 @@ __device__ __forceinline__ void sync_32() noexcept {
   __builtin_amdgcn_wave_barrier();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 #elif defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >= 7)
-  __syncwarp(kFullWave32Mask);
+  ::__syncwarp();
 #else
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
   __builtin_amdgcn_wave_barrier();

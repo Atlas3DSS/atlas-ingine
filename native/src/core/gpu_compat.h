@@ -23,18 +23,30 @@
 
 #if defined(INGINE_BACKEND_HIP) && INGINE_BACKEND_HIP
 
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_version.h>
-#if __has_include(<hip/hip_bf16.h>)
-#include <hip/hip_bf16.h>
-#elif __has_include(<hip/hip_bfloat16.h>)
-#include <hip/hip_bfloat16.h>
-using __hip_bfloat16 = hip_bfloat16;
-struct __hip_bfloat162 {
+
+// Portable 2-element packed BF16 storage (ABI-identical across GCC host TUs and amdclang++ HIP TUs;
+// avoids ROCm 7's Clang-only <hip/hip_bf16.h> builtins under host GCC).
+struct alignas(4) ingine_hip_bfloat162 {
   hip_bfloat16 x;
   hip_bfloat16 y;
 };
+
+#if !(defined(__clang__) && defined(__HIP__))
+inline unsigned short __half_as_ushort(__half x) noexcept {
+  return static_cast<__half_raw>(x).x;
+}
+inline __half __ushort_as_half(unsigned short x) noexcept {
+  __half_raw r{x};
+  return __half(r);
+}
+#endif
+
+#ifndef CUDART_INF_F
+#define CUDART_INF_F (__builtin_inff())
 #endif
 
 // 1:1 CUDA -> HIP runtime type and constant aliases (no __CUDA_ARCH__ defined).
@@ -46,6 +58,7 @@ using cudaGraphExec_t            = hipGraphExec_t;
 using cudaGraphNode_t            = hipGraphNode_t;
 using cudaGraphConditionalHandle = unsigned long long;
 using cudaDeviceProp             = hipDeviceProp_t;
+using cudaPointerAttributes      = hipPointerAttribute_t;
 using cudaUUID_t                = hipUUID;
 using cudaMemcpyKind            = hipMemcpyKind;
 using cudaStreamCaptureMode     = hipStreamCaptureMode;
@@ -57,10 +70,17 @@ inline constexpr hipError_t cudaErrorNotReady                 = hipErrorNotReady
 inline constexpr hipError_t cudaErrorMemoryAllocation         = hipErrorMemoryAllocation;
 inline constexpr hipError_t cudaErrorInvalidValue             = hipErrorInvalidValue;
 inline constexpr hipError_t cudaErrorNotSupported             = hipErrorNotSupported;
-inline constexpr hipError_t cudaErrorNotPermitted             = hipErrorNotPermitted;
+inline constexpr hipError_t cudaErrorNotPermitted             = hipErrorNotSupported;
 inline constexpr hipError_t cudaErrorOperatingSystem          = hipErrorOperatingSystem;
 inline constexpr hipError_t cudaErrorInsufficientDriver       = hipErrorInsufficientDriver;
+inline constexpr hipError_t cudaErrorCallRequiresNewerDriver  = hipErrorInsufficientDriver;
+inline constexpr hipError_t cudaErrorUnsupportedPtxVersion    = hipErrorInvalidKernelFile;
+inline constexpr hipError_t cudaErrorIllegalAddress           = hipErrorIllegalAddress;
 inline constexpr hipError_t cudaErrorPeerAccessAlreadyEnabled = hipErrorPeerAccessAlreadyEnabled;
+
+inline constexpr hipMemoryType cudaMemoryTypeHost    = hipMemoryTypeHost;
+inline constexpr hipMemoryType cudaMemoryTypeDevice  = hipMemoryTypeDevice;
+inline constexpr hipMemoryType cudaMemoryTypeManaged = hipMemoryTypeManaged;
 
 inline constexpr hipMemcpyKind cudaMemcpyHostToHost     = hipMemcpyHostToHost;
 inline constexpr hipMemcpyKind cudaMemcpyHostToDevice   = hipMemcpyHostToDevice;
@@ -108,9 +128,17 @@ inline hipError_t cudaMemGetInfo(std::size_t* free_b, std::size_t* total_b) noex
   return hipMemGetInfo(free_b, total_b);
 }
 inline hipError_t cudaMalloc(void** ptr, std::size_t bytes) noexcept { return hipMalloc(ptr, bytes); }
+template <typename T>
+inline hipError_t cudaMalloc(T** ptr, std::size_t bytes) noexcept {
+  return hipMalloc(reinterpret_cast<void**>(ptr), bytes);
+}
 inline hipError_t cudaFree(void* ptr) noexcept { return hipFree(ptr); }
 inline hipError_t cudaHostAlloc(void** ptr, std::size_t bytes, unsigned int flags) noexcept {
   return hipHostMalloc(ptr, bytes, flags);
+}
+template <typename T>
+inline hipError_t cudaHostAlloc(T** ptr, std::size_t bytes, unsigned int flags) noexcept {
+  return hipHostMalloc(reinterpret_cast<void**>(ptr), bytes, flags);
 }
 inline hipError_t cudaFreeHost(void* ptr) noexcept { return hipHostFree(ptr); }
 inline hipError_t cudaHostRegister(void* ptr, std::size_t bytes, unsigned int flags) noexcept {
@@ -119,6 +147,9 @@ inline hipError_t cudaHostRegister(void* ptr, std::size_t bytes, unsigned int fl
 inline hipError_t cudaHostUnregister(void* ptr) noexcept { return hipHostUnregister(ptr); }
 inline hipError_t cudaHostGetDevicePointer(void** dev_ptr, void* host_ptr, unsigned int flags) noexcept {
   return hipHostGetDevicePointer(dev_ptr, host_ptr, flags);
+}
+inline hipError_t cudaPointerGetAttributes(hipPointerAttribute_t* attr, const void* ptr) noexcept {
+  return hipPointerGetAttributes(attr, ptr);
 }
 
 inline hipError_t cudaMemcpy(void* dst, const void* src, std::size_t bytes, hipMemcpyKind kind) noexcept {
@@ -141,6 +172,7 @@ inline hipError_t cudaMemsetAsync(void* dst, int value, std::size_t bytes, hipSt
   return hipMemsetAsync(dst, value, bytes, stream);
 }
 
+inline hipError_t cudaStreamCreate(hipStream_t* s) noexcept { return hipStreamCreate(s); }
 inline hipError_t cudaStreamCreateWithFlags(hipStream_t* s, unsigned int flags) noexcept {
   return hipStreamCreateWithFlags(s, flags);
 }
@@ -225,7 +257,15 @@ __device__ __forceinline__ int __any_sync(unsigned mask, int pred) {
 __device__ __forceinline__ int __all_sync(unsigned mask, int pred) {
   return (__ballot_sync(mask, pred) & mask) == mask ? 1 : 0;
 }
-#if !defined(HIP_VERSION_MAJOR) || (HIP_VERSION_MAJOR < 7)
+#if defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >= 7)
+// ROCm 7 provides 0-arg __syncwarp() and 64-bit-only template __syncwarp(MaskT); add a 32-bit
+// overload for shared CUDA/HIP kernels passing 32-bit logical warp masks.
+__device__ __forceinline__ void __syncwarp(unsigned /*mask*/) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  ::__syncwarp();
+#endif
+}
+#else
 __device__ __forceinline__ void __syncwarp(unsigned /*mask*/ = 0xffffffffu) {
 #if defined(__HIP_DEVICE_COMPILE__)
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");

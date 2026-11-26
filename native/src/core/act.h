@@ -69,8 +69,8 @@ using Act2T = __half2;
 inline constexpr DType kActDType = DType::FP16;
 inline constexpr bool kActIsFP16 = true;
 #else
-using ActT = __hip_bfloat16;
-using Act2T = __hip_bfloat162;
+using ActT = hip_bfloat16;
+using Act2T = ingine_hip_bfloat162;
 inline constexpr DType kActDType = DType::BF16;
 inline constexpr bool kActIsFP16 = false;
 #endif

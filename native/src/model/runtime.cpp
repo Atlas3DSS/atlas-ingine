@@ -540,12 +540,14 @@ std::atomic<std::uint64_t> g_switch_capture_fallbacks{0};
 bool is_conditional_unsupported(cudaError_t err) noexcept {
   switch (err) {
     case cudaErrorNotSupported:
-    case cudaErrorNotPermitted:
     case cudaErrorInsufficientDriver:
     case cudaErrorOperatingSystem:
 #if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
+    case cudaErrorNotPermitted:
     case cudaErrorCallRequiresNewerDriver:
     case cudaErrorUnsupportedPtxVersion:
+#elif defined(INGINE_BACKEND_HIP) && INGINE_BACKEND_HIP
+    case hipErrorInvalidKernelFile:
 #endif
       return true;
     default:

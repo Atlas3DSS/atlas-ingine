@@ -56,7 +56,7 @@ NON_HIP_BACKEND_FILES: set[str] = {
 
 RAW_CUDA_HEADER_RE = re.compile(
     r"^\s*#\s*include\s*<(cuda_runtime(?:_api)?\.h|cuda\.h|cuda_fp8\.h|cuda_fp16\.h|"
-    r"cuda_bf16\.h|cublasLt\.h|cublas_v2\.h|cooperative_groups\.h|nccl\.h|nvtx3/[^>]+)>",
+    r"cuda_bf16\.h|cublasLt\.h|cublas_v2\.h|cooperative_groups\.h|math_constants\.h|nccl\.h|nvtx3/[^>]+)>",
 )
 
 CUDA_ONLY_SYMBOL_RES: list[tuple[str, re.Pattern[str]]] = [

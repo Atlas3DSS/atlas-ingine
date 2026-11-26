@@ -20,7 +20,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA
 #include <math_constants.h>
+#endif
 #include <stdexcept>
 #include <string>
 

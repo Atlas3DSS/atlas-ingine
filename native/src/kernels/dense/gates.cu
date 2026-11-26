@@ -86,7 +86,7 @@ struct GateCfg {
 };
 
 template <int CL, bool FG32, int M>
-__global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a) {
+__global__ void __launch_bounds__((GateCfg<CL, FG32>::NT)) gates_kernel(GateArgs a) {
   using C = GateCfg<CL, FG32>;
   constexpr int DCH = H / (8 * 32);  // 9 chunks of 8 down weights per lane
   constexpr int XPT = H / C::NT;     // inputs per thread per half when staging x
@@ -319,7 +319,7 @@ GatesSm8xScratch gates_sm8x_scratch() {
 }
 
 template <int CL, bool FG32, int M>
-__global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(GateArgs a, float* __restrict__ gall_out) {
+__global__ void __launch_bounds__((GateCfg<CL, FG32>::NT)) gates_sm8x_down_kernel(GateArgs a, float* __restrict__ gall_out) {
   using C = GateCfg<CL, FG32>;
   constexpr int DCH = H / (8 * 32);
   constexpr int XPT = H / C::NT;
@@ -409,7 +409,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_down_kernel(
 }
 
 template <int CL, bool FG32, int M, bool STAGE_FG = true>
-__global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_sm8x_fg_kernel(GateArgs a,
+__global__ void __launch_bounds__((GateCfg<CL, FG32>::NT)) gates_sm8x_fg_kernel(GateArgs a,
                                                                                const float* __restrict__ gall_in,
                                                                                float* __restrict__ gated_out,
                                                                                float* __restrict__ ssall_out) {

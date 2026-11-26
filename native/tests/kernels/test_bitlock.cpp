@@ -303,8 +303,12 @@ int main() {
   INGINE_TEST_CUDA(cudaGetDeviceProperties(&prop, dev));
   const int sm = prop.major * 10 + prop.minor;
   const bool strict_env = std::getenv("INGINE_STRICT_BITLOCK") != nullptr;
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION)
   const bool check_reference_klock =
       strict_env || (!INGINE_ACT_FP16 && sm == 120 && CUDART_VERSION >= 13000);
+#else
+  const bool check_reference_klock = strict_env;
+#endif
 
   bool ok = true;
   uint64_t got[8][kLocks];
@@ -349,8 +353,17 @@ int main() {
       }
     }
     if (!check_reference_klock) {
-      std::printf("%s bit lock M=%d (sm_%d CUDA %d.%d %s: two-run determinism %s, sm_120/CUDA13 kLock skipped): {",
-                  det ? "PASS" : "FAIL", M, sm, CUDART_VERSION / 1000, (CUDART_VERSION % 1000) / 10,
+#if defined(INGINE_BACKEND_CUDA) && INGINE_BACKEND_CUDA && defined(CUDART_VERSION)
+      const char* rt_name = "CUDA";
+      const int rt_maj = CUDART_VERSION / 1000;
+      const int rt_min = (CUDART_VERSION % 1000) / 10;
+#else
+      const char* rt_name = "HIP";
+      const int rt_maj = HIP_VERSION_MAJOR;
+      const int rt_min = HIP_VERSION_MINOR;
+#endif
+      std::printf("%s bit lock M=%d (sm_%d %s %d.%d %s: two-run determinism %s, sm_120/CUDA13 kLock skipped): {",
+                  det ? "PASS" : "FAIL", M, sm, rt_name, rt_maj, rt_min,
                   INGINE_ACT_FP16 ? "FP16" : "BF16", det ? "ok" : nondet.c_str());
       for (int i = 0; i < kLocks; ++i)
         std::printf("%s0x%016llxull", i ? ", " : "", static_cast<unsigned long long>(got[M - 1][i]));
