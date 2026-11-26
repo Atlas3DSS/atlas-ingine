@@ -219,6 +219,146 @@ __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArg
 }
 
 
+// ---- decode routing in one launch (B <= 8): router logits (FP32 weights, FP32 sums), then the last CTA to finish
+// selects (topk_kernel's rule: sigmoid scores, 8 arg-max rounds over s + bias, lowest expert on ties, wts = 8 s / (sum
+// + 1e-20)) and builds the tiles and pair lists (route_kernel's). Replaces gemm + memset + topk + route.
+constexpr int kRouteCtas = kExperts, kRouteWarps = 4;  // a CTA an expert: every load in flight at once
+__global__ void __launch_bounds__(kRouteWarps * 32) route_decode_kernel(const uint16_t* __restrict__ x, int T,
+                                                                        const float* __restrict__ w,
+                                                                        const float* __restrict__ bias, int TR,
+                                                                        int* __restrict__ idx, float* __restrict__ wts,
+                                                                        float* logits, unsigned* done, MoeWork mw) {
+  __shared__ int counts[kExperts], offs[kExperts], tile0[kExperts], cursor[kExperts];
+  __shared__ float red[kRouteWarps][8];
+  __shared__ bool last;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, e = blockIdx.x;
+  {
+    constexpr int N4 = kHidden / 4, NT = kRouteWarps * 32, IT = (N4 + NT - 1) / NT;  // 576 float4s, 5 a thread
+    const float4* wr = reinterpret_cast<const float4*>(w + int64_t(e) * kHidden);
+    float4 wv[IT];
+#pragma unroll
+    for (int j = 0; j < IT; ++j) {
+      const int i = int(threadIdx.x) + NT * j;
+      wv[j] = i < N4 ? __ldg(wr + i) : make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+      if (t >= T) break;
+      const uint2* xt = reinterpret_cast<const uint2*>(x + int64_t(t) * kHidden);
+#pragma unroll
+      for (int j = 0; j < IT; ++j) {
+        const int i = int(threadIdx.x) + NT * j;
+        if (i >= N4) break;
+        const uint2 xv = __ldg(xt + i);
+        const float2 a2 = __half22float2(*reinterpret_cast<const __half2*>(&xv.x));
+        const float2 b2 = __half22float2(*reinterpret_cast<const __half2*>(&xv.y));
+        acc[t] += a2.x * wv[j].x + a2.y * wv[j].y + b2.x * wv[j].z + b2.y * wv[j].w;
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+      if (t >= T) break;
+      float v = acc[t];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+      if (lane == 0) red[warp][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < unsigned(T)) {
+      float v = red[0][threadIdx.x];
+#pragma unroll
+      for (int k = 1; k < kRouteWarps; ++k) v += red[k][threadIdx.x];
+      logits[threadIdx.x * kExperts + e] = v;
+    }
+  }
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const unsigned ticket = atomicAdd(done, 1u);
+    last = ticket == gridDim.x - 1;
+    if (last) *done = 0u;  // (the next replay)
+  }
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+  for (int i = threadIdx.x; i < kExperts; i += blockDim.x) counts[i] = 0, cursor[i] = 0;
+  __syncthreads();
+  for (int t = warp; t < T; t += kRouteWarps) {
+    float sc[4], key[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int ee = lane + 32 * i;
+      sc[i] = 1.f / (1.f + expf(-__ldcg(logits + t * kExperts + ee)));
+      key[i] = sc[i] + bias[ee];
+    }
+    int sel_e[kTopK];
+    float sel_s[kTopK];
+#pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
+      float best = -INFINITY;
+      int be = kExperts;
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        if (key[i] > best) best = key[i], be = lane + 32 * i;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        const float ob = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oe = __shfl_xor_sync(0xffffffffu, be, o);
+        if (ob > best || (ob == best && oe < be)) best = ob, be = oe;
+      }
+      sel_e[k] = be;
+      float s_be = 0.f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        if (lane + 32 * i == be) s_be = sc[i], key[i] = -INFINITY;
+      sel_s[k] = __shfl_sync(0xffffffffu, s_be, be & 31);
+    }
+    if (lane == 0) {
+      float sum = sel_s[0];
+#pragma unroll
+      for (int k = 1; k < kTopK; ++k) sum += sel_s[k];
+      const float den = sum + 1e-20f;
+#pragma unroll
+      for (int k = 0; k < kTopK; ++k) {
+        idx[t * kTopK + k] = sel_e[k];
+        wts[t * kTopK + k] = sel_s[k] / den * 8.f;
+        atomicAdd(&counts[sel_e[k]], 1);
+      }
+    }
+  }
+  __syncthreads();
+  {  // exclusive scans of the pair counts and tile counts, an expert a thread (kRouteWarps * 32 == kExperts)
+    static_assert(kRouteWarps * 32 == kExperts, "an expert a thread");
+    __shared__ int wsum_c[kRouteWarps], wsum_t[kRouteWarps];
+    const int ee = threadIdx.x, c = counts[ee], nt = (c + TR - 1) / TR;
+    int ic = c, it = nt;  // inclusive within the warp
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int pc = __shfl_up_sync(0xffffffffu, ic, o), pt = __shfl_up_sync(0xffffffffu, it, o);
+      if (lane >= o) ic += pc, it += pt;
+    }
+    if (lane == 31) wsum_c[warp] = ic, wsum_t[warp] = it;
+    __syncthreads();
+    int bc = 0, bt = 0;
+    for (int k = 0; k < warp; ++k) bc += wsum_c[k], bt += wsum_t[k];
+    offs[ee] = bc + ic - c, tile0[ee] = bt + it - nt;
+    if (ee == kExperts - 1) *mw.tiles_n = bt + it;
+  }
+  __syncthreads();
+  for (int ee = threadIdx.x; ee < kExperts; ee += blockDim.x) {
+    const int c = counts[ee];
+    for (int i = 0; i * TR < c; ++i) mw.tiles[tile0[ee] + i] = make_int4(ee, offs[ee] + i * TR, min(TR, c - i * TR), 0);
+  }
+  __syncthreads();
+  for (int p = threadIdx.x; p < T * kTopK; p += blockDim.x) {
+    const int ee = idx[p];
+    const int pos = offs[ee] + atomicAdd(&cursor[ee], 1);
+    mw.pair_token[pos] = p / kTopK;
+    mw.pair_dst[pos] = p;
+  }
+}
+
 bool decode_enabled(int T, int fmt) {
   static const int mode = [] {
     const char* e = std::getenv("INGINE_MOE_DECODE");
@@ -245,6 +385,19 @@ void launch_dec(int fmt, const DecArgs& d, int T, cudaStream_t stream) {
 }
 
 }  // namespace
+
+bool moe_route_decode(const ActT* x, int T, const float* router_f32, const float* bias, int* idx, float* wts,
+                      float* logits_scratch, unsigned* done, const MoeWork& w, cudaStream_t stream) {
+  static const bool on = [] {
+    const char* e = std::getenv("INGINE_MOE_ROUTE_FUSED");
+    return !(e && e[0] == '0');
+  }();
+  if (!on || T < 1 || T > 8 || !router_f32 || !done) return false;
+  route_decode_kernel<<<kRouteCtas, kRouteWarps * 32, 0, stream>>>(reinterpret_cast<const uint16_t*>(x), T, router_f32,
+                                                                   bias, moe_tile_rows(T), idx, wts, logits_scratch,
+                                                                   done, w);
+  return true;
+}
 
 bool moe_gate_up_decode(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, ActT* act, cudaStream_t stream) {
   if (!decode_enabled(T, e.fmt)) return false;

@@ -215,6 +215,11 @@ struct MoeExperts {
 // Decode-width (T <= 8) experts on Volta (moe_decode_v70.cu): NVFP4 / GGUF_Q5L / GGUF_IQ4. false: not taken (another
 // width, format or architecture); moe_gate_up / moe_down try these first (INGINE_MOE_DECODE=0 disables them).
 bool moe_gate_up_decode(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, ActT* act, cudaStream_t stream);
+// Decode routing in one launch (T <= 8): router logits from FP32 weights [128, H] (logits_scratch fp32 [8, 128]),
+// moe_topk's selection and moe_route's tiles / pairs (w.counts unused); `done` a zeroed device counter of its own.
+// false: not taken (INGINE_MOE_ROUTE_FUSED=0 or another width).
+bool moe_route_decode(const ActT* x, int T, const float* router_f32, const float* bias, int* idx, float* wts,
+                      float* logits_scratch, unsigned* done, const MoeWork& w, cudaStream_t stream);
 bool moe_down_decode(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, ActT* down, cudaStream_t stream);
 void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, ActT* act,
                  cudaStream_t stream);
