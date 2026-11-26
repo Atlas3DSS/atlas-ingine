@@ -990,6 +990,8 @@ class TpBatchDecoder {
     pair_token_ = i32(B * TOP_K);
     pair_dst_ = i32(B * TOP_K);
     tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_batch)) * sizeof(int4)));
+    route_done_ = static_cast<unsigned*>(alloc(sizeof(unsigned)));
+    CUDA_CHECK(cudaMemset(route_done_, 0, sizeof(unsigned)));
     act_ = bf16(B * TOP_K * INTER);
     down_ = bf16(B * TOP_K * H);
     moe_f32_ = f32(B * H);
@@ -1320,11 +1322,14 @@ class TpBatchDecoder {
       }
 
       // ---- EP4 MoE + NCCL AllReduce + per-slot static conv
-      gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, B, EXPERTS, H, stream);
-      CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), stream));
-      pk::moe_topk(router_logits_, f32p(layer.router_bias), B, idx_, wts_, counts_, stream);
       const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
-      pk::moe_route(idx_, B, work, stream);
+      if (!pk::moe_route_decode(xm_, B, f32p(layer.router), f32p(layer.router_bias), idx_, wts_, router_logits_,
+                                route_done_, work, stream)) {
+        gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, B, EXPERTS, H, stream);
+        CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), stream));
+        pk::moe_topk(router_logits_, f32p(layer.router_bias), B, idx_, wts_, counts_, stream);
+        pk::moe_route(idx_, B, work, stream);
+      }
       const Experts& ex = layer.experts;
       pk::MoeExperts me;
       me.fmt = static_cast<int>(ex.w13_fmt);
@@ -1402,6 +1407,7 @@ class TpBatchDecoder {
   float *B0_, *B1_, *B2_[PASSES], *E_[PASSES], *hid_, *part_, *y_, *y2_;
   ActT *xin_, *xin_chunk_, *xm_, *xf_;
   float *mixf_, *msgs_, *mixm_, *proj_fp32_, *wo_fp32_, *fpre_, *gpre_, *router_logits_, *wts_, *moe_f32_;
+  unsigned* route_done_ = nullptr;  // moe_route_decode's last-CTA counter
   ActT *proj_act_, *attn_out_, *gin_, *g16_, *act_, *down_, *head_act_, *wscratch_;
   int *idx_, *counts_, *tiles_n_, *pair_token_, *pair_dst_;
   int4* tiles_;
