@@ -41,8 +41,14 @@ public:
     void* p           = nullptr;
     std::size_t bytes = 0;
 
+    [[nodiscard]] bool hugepage_advised() const noexcept { return hugepage_advised_; }
+
 private:
     void require_range(std::size_t byte_offset, std::size_t count, const char* operation) const;
+
+    std::size_t backing_bytes_ = 0;
+    bool via_hugepage_mmap_    = false;
+    bool hugepage_advised_     = false;
 };
 
 // Device memory pressure: when the cudaMalloc of a DeviceBuffer fails, the registered release hooks free what
@@ -95,13 +101,17 @@ public:
     std::size_t capacity() const noexcept;
     std::size_t peak_used() const noexcept;
     void reset_peak() noexcept;
+    [[nodiscard]] bool hugepage_advised() const noexcept { return hugepage_advised_; }
 
 private:
-    void* base_       = nullptr;
-    std::size_t cap_  = 0;
-    std::size_t off_  = 0;
-    std::size_t peak_ = 0;
-    bool owns_        = true;
+    void* base_                = nullptr;
+    std::size_t cap_           = 0;
+    std::size_t off_           = 0;
+    std::size_t peak_          = 0;
+    bool owns_                 = true;
+    std::size_t backing_bytes_ = 0;
+    bool via_hugepage_mmap_    = false;
+    bool hugepage_advised_     = false;
 };
 
 class PinnedHostBuffer {
@@ -117,10 +127,14 @@ public:
 
     void* data() const noexcept;
     std::size_t size() const noexcept;
+    [[nodiscard]] bool hugepage_advised() const noexcept { return hugepage_advised_; }
 
 private:
-    void* data_       = nullptr;
-    std::size_t size_ = 0;
+    void* data_               = nullptr;
+    std::size_t size_         = 0;
+    std::size_t mapped_bytes_ = 0;
+    bool via_hugepage_mmap_   = false;
+    bool hugepage_advised_    = false;
 };
 
 using WorkspaceArena = DeviceArena;

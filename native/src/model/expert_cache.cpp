@@ -1017,6 +1017,9 @@ std::string ExpertCache::summary() const {
       total_lookups > 0 ? 100.0 * double(stats_.hot_hits + stats_.lru_hits) / double(total_lookups) : 0.0;
   const double rss_gb = double(process_rss_bytes()) / 1e9;
   char buf[512];
+  const char* warm_tag = warm_ram_.registered()
+                           ? (warm_ram_.hugepage_advised() ? " pinned+hp" : " pinned")
+                           : (warm_ram_.hugepage_advised() ? " pageable+hp" : " pageable");
   std::snprintf(
       buf, sizeof(buf),
       "[atlas-6g] mode=%s | experts: HOT=%d (%.2f GB VRAM) + LRU=%d slots (%.2f GB VRAM) | WARM=%d (%.2f GB RAM%s) | "
@@ -1024,7 +1027,7 @@ std::string ExpertCache::summary() const {
       "h2d=%.2f GB nvme=%.2f GB)",
       mode_ == OffloadMode::DmaLru ? "dma-lru" : "uva", stats_.hot_experts, double(stats_.hot_vram_bytes) / 1e9,
       stats_.lru_slots_total, double(stats_.lru_vram_bytes) / 1e9, stats_.warm_experts,
-      double(stats_.warm_ram_bytes) / 1e9, warm_ram_.registered() ? " pinned" : " pageable", stats_.cold_experts,
+      double(stats_.warm_ram_bytes) / 1e9, warm_tag, stats_.cold_experts,
       double(stats_.cold_nvme_bytes) / 1e9, rss_gb, static_cast<unsigned long long>(total_lookups), hit_pct,
       static_cast<unsigned long long>(stats_.hot_hits), static_cast<unsigned long long>(stats_.lru_hits),
       static_cast<unsigned long long>(stats_.warm_fetches), static_cast<unsigned long long>(stats_.cold_fetches),

@@ -18,12 +18,14 @@ if(INGINE_BACKEND STREQUAL "CUDA")
     CUDA::cudart CUDA::nvtx3 Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)
 
   add_library(ingine_ops STATIC
+    cpu_kernels.cpp
+    cpu_pool.cpp
     ops_fallback.cpp
     ops_cuda.cpp
   )
   ingine_internal_includes(ingine_ops)
   target_include_directories(ingine_ops PUBLIC ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
-  target_link_libraries(ingine_ops PUBLIC ingine_core)
+  target_link_libraries(ingine_ops PUBLIC ingine_core Threads::Threads)
 else()
   add_library(ingine_core STATIC
     dtype.cpp
@@ -37,6 +39,8 @@ else()
     Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)
 
   add_library(ingine_ops STATIC
+    cpu_kernels.cpp
+    cpu_pool.cpp
     ops_fallback.cpp
     ops_cpu.cpp
   )

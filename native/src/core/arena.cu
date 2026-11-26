@@ -2,6 +2,8 @@
 // Modified for fngine from cinference:src/core/arena.cu @ 383e5db. See NOTICE.
 #include "core/arena.h"
 
+#include "core/hugepage.h"
+
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -12,6 +14,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ingine {
@@ -69,6 +72,12 @@ ReleaseHooks& release_hooks() {
 std::atomic<int> g_fail_next{0};
 std::atomic<int> g_fail_next_pinned{0};
 
+bool consume_fail_pinned() noexcept {
+    for (int left = g_fail_next_pinned.load(); left > 0;)
+        if (g_fail_next_pinned.compare_exchange_weak(left, left - 1)) return true;
+    return false;
+}
+
 cudaError_t try_malloc(void** ptr, std::size_t bytes) {
     for (int left = g_fail_next.load(); left > 0;)
         if (g_fail_next.compare_exchange_weak(left, left - 1)) return cudaErrorMemoryAllocation;
@@ -76,8 +85,7 @@ cudaError_t try_malloc(void** ptr, std::size_t bytes) {
 }
 
 cudaError_t try_malloc_host(void** ptr, std::size_t bytes) {
-    for (int left = g_fail_next_pinned.load(); left > 0;)
-        if (g_fail_next_pinned.compare_exchange_weak(left, left - 1)) return cudaErrorMemoryAllocation;
+    if (consume_fail_pinned()) return cudaErrorMemoryAllocation;
     return cudaMallocHost(ptr, bytes);
 }
 
@@ -307,6 +315,29 @@ void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
+    if (consume_fail_pinned()) {
+        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", cudaErrorMemoryAllocation));
+    }
+
+    if (size_bytes >= kHugePageAlignBytes && hugepages_enabled()) {
+        HugePageMapping m = alloc_hugepage_anon(size_bytes);
+        if (m.ptr != nullptr) {
+            if (m.hugepage_advised) {
+                prefault_hugepage_stride_nondestructive(m.ptr, m.mapped_bytes);
+            }
+            const cudaError_t reg_err = cudaHostRegister(m.ptr, m.mapped_bytes, cudaHostRegisterPortable);
+            if (reg_err == cudaSuccess) {
+                data_              = m.ptr;
+                size_              = size_bytes;
+                mapped_bytes_      = m.mapped_bytes;
+                via_hugepage_mmap_ = m.via_mmap;
+                hugepage_advised_  = m.hugepage_advised;
+                return;
+            }
+            (void)cudaGetLastError();
+            free_hugepage_anon(m);
+        }
+    }
 
     void* ptr             = nullptr;
     const cudaError_t err = try_malloc_host(&ptr, size_bytes);
@@ -318,23 +349,46 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     size_ = size_bytes;
 }
 
-PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
+PinnedHostBuffer::~PinnedHostBuffer() {
+    if (data_ != nullptr) {
+        if (mapped_bytes_ > 0) {
+            log_cuda_error("cudaHostUnregister", cudaHostUnregister(data_));
+            HugePageMapping m{data_, mapped_bytes_, hugepage_advised_, via_hugepage_mmap_};
+            free_hugepage_anon(m);
+        } else {
+            free_pinned(data_);
+        }
+    }
+    data_              = nullptr;
+    size_              = 0;
+    mapped_bytes_      = 0;
+    via_hugepage_mmap_ = false;
+    hugepage_advised_  = false;
+}
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
-    other.data_ = nullptr;
-    other.size_ = 0;
-}
+    : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)),
+      mapped_bytes_(std::exchange(other.mapped_bytes_, 0)),
+      via_hugepage_mmap_(std::exchange(other.via_hugepage_mmap_, false)),
+      hugepage_advised_(std::exchange(other.hugepage_advised_, false)) {}
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    free_pinned(data_);
-    data_ = other.data_;
-    size_ = other.size_;
-
-    other.data_ = nullptr;
-    other.size_ = 0;
+    if (data_ != nullptr) {
+        if (mapped_bytes_ > 0) {
+            log_cuda_error("cudaHostUnregister", cudaHostUnregister(data_));
+            HugePageMapping m{data_, mapped_bytes_, hugepage_advised_, via_hugepage_mmap_};
+            free_hugepage_anon(m);
+        } else {
+            free_pinned(data_);
+        }
+    }
+    data_              = std::exchange(other.data_, nullptr);
+    size_              = std::exchange(other.size_, 0);
+    mapped_bytes_      = std::exchange(other.mapped_bytes_, 0);
+    via_hugepage_mmap_ = std::exchange(other.via_hugepage_mmap_, false);
+    hugepage_advised_  = std::exchange(other.hugepage_advised_, false);
     return *this;
 }
 

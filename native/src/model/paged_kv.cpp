@@ -573,13 +573,18 @@ PagedKvStats PagedKvCache::stats() const noexcept {
 
 std::string PagedKvCache::summary() const {
   const auto s = stats();
+  int hp_chunks = 0;
+  for (const auto& c : ram_chunks_) {
+    if (c.hugepage_advised()) ++hp_chunks;
+  }
   char buf[512];
   std::snprintf(buf, sizeof(buf),
-                "[paged-kv] max_ctx=%d page=%d | pages: VRAM=%llu (%.2f GiB cap) RAM=%llu (%.2f GiB pinned) "
+                "[paged-kv] max_ctx=%d page=%d | pages: VRAM=%llu (%.2f GiB cap) RAM=%llu (%.2f GiB pinned, hp=%d/%zu) "
                 "SWAP=%llu | evict(ram=%llu swap=%llu) promote(ram=%llu swap=%llu) | "
                 "DMA(h2d=%.2f GB d2h=%.2f GB) NVMe(w=%.2f GB r=%.2f GB)",
                 max_ctx_, kPageTokens, (unsigned long long)s.vram_pages, double(s.vram_bytes) / double(1ull << 30),
                 (unsigned long long)s.ram_pages, double(s.ram_pinned_bytes) / double(1ull << 30),
+                hp_chunks, ram_chunks_.size(),
                 (unsigned long long)s.swap_pages, (unsigned long long)s.evict_to_ram,
                 (unsigned long long)s.evict_to_swap, (unsigned long long)s.promote_from_ram,
                 (unsigned long long)s.promote_from_swap, double(s.pcie_h2d_bytes) / 1e9, double(s.pcie_d2h_bytes) / 1e9,

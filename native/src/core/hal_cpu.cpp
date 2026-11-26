@@ -6,6 +6,7 @@
 #include "core/arena.h"
 #include "core/hal.h"
 #include "core/host_memory.h"
+#include "core/hugepage.h"
 
 #include <spdlog/spdlog.h>
 
@@ -55,24 +56,35 @@ ReleaseHooks& release_hooks() {
 }
 
 std::atomic<int> g_fail_next{0};
+std::atomic<int> g_fail_next_pinned{0};
 
-void* alloc_aligned(std::size_t align, std::size_t bytes, const char* what) {
+bool consume_fail_pinned() noexcept {
+  for (int left = g_fail_next_pinned.load(); left > 0;) {
+    if (g_fail_next_pinned.compare_exchange_weak(left, left - 1)) return true;
+  }
+  return false;
+}
+
+HugePageMapping alloc_aligned_or_huge(std::size_t align, std::size_t bytes, const char* what) {
   for (int left = g_fail_next.load(); left > 0;) {
     if (g_fail_next.compare_exchange_weak(left, left - 1)) {
-      return nullptr;
+      return {};
     }
+  }
+  if (bytes >= kHugePageAlignBytes && hugepages_enabled()) {
+    HugePageMapping m = alloc_hugepage_anon(bytes);
+    if (m.ptr != nullptr) return m;
   }
   void* ptr = nullptr;
   const int rc = ::posix_memalign(&ptr, align, bytes);
   if (rc != 0) {
-    if (rc == ENOMEM) return nullptr;
+    if (rc == ENOMEM) return {};
     throw std::runtime_error(std::string(what) + " failed: " + std::strerror(rc));
   }
-  return ptr;
-}
-
-std::size_t align_huge(std::size_t bytes) {
-  return (bytes + kHugePageBytes - 1) / kHugePageBytes * kHugePageBytes;
+  HugePageMapping out;
+  out.ptr = ptr;
+  out.mapped_bytes = bytes;
+  return out;
 }
 
 std::uint64_t read_meminfo_kib(const char* target_key) {
@@ -110,11 +122,12 @@ void remove_release_hook(int id) {
 }
 
 void fail_next_allocations(int n) { g_fail_next = n; }
+void fail_next_pinned_allocations(int n) { g_fail_next_pinned = n; }
 
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
   if (bytes == 0) return;
-  void* ptr = alloc_aligned(256, bytes, "CPU DeviceBuffer");
-  if (!ptr) {
+  HugePageMapping m = alloc_aligned_or_huge(256, bytes, "CPU DeviceBuffer");
+  if (!m.ptr) {
     std::vector<ReleaseHook> hooks;
     {
       ReleaseHooks& h = release_hooks();
@@ -123,29 +136,45 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     }
     bool freed = false;
     for (const ReleaseHook& hook : hooks) freed |= hook();
-    if (freed) ptr = alloc_aligned(256, bytes, "CPU DeviceBuffer");
+    if (freed) m = alloc_aligned_or_huge(256, bytes, "CPU DeviceBuffer");
   }
-  if (!ptr) throw std::runtime_error("CPU DeviceBuffer allocation failed");
-  p = ptr;
+  if (!m.ptr) throw std::runtime_error("CPU DeviceBuffer allocation failed");
+  p = m.ptr;
+  backing_bytes_ = m.mapped_bytes;
+  via_hugepage_mmap_ = m.via_mmap;
+  hugepage_advised_ = m.hugepage_advised;
 }
 
 DeviceBuffer::~DeviceBuffer() {
-  std::free(p);
+  if (p) {
+    HugePageMapping m{p, backing_bytes_ > 0 ? backing_bytes_ : bytes, hugepage_advised_, via_hugepage_mmap_};
+    free_hugepage_anon(m);
+  }
   p = nullptr;
+  bytes = 0;
+  backing_bytes_ = 0;
+  via_hugepage_mmap_ = false;
+  hugepage_advised_ = false;
 }
 
-DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(other.bytes) {
-  other.p = nullptr;
-  other.bytes = 0;
-}
+DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept
+    : p(std::exchange(other.p, nullptr)),
+      bytes(std::exchange(other.bytes, 0)),
+      backing_bytes_(std::exchange(other.backing_bytes_, 0)),
+      via_hugepage_mmap_(std::exchange(other.via_hugepage_mmap_, false)),
+      hugepage_advised_(std::exchange(other.hugepage_advised_, false)) {}
 
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
   if (this == &other) return *this;
-  std::free(p);
-  p = other.p;
-  bytes = other.bytes;
-  other.p = nullptr;
-  other.bytes = 0;
+  if (p) {
+    HugePageMapping m{p, backing_bytes_ > 0 ? backing_bytes_ : bytes, hugepage_advised_, via_hugepage_mmap_};
+    free_hugepage_anon(m);
+  }
+  p = std::exchange(other.p, nullptr);
+  bytes = std::exchange(other.bytes, 0);
+  backing_bytes_ = std::exchange(other.backing_bytes_, 0);
+  via_hugepage_mmap_ = std::exchange(other.via_hugepage_mmap_, false);
+  hugepage_advised_ = std::exchange(other.hugepage_advised_, false);
   return *this;
 }
 
@@ -184,11 +213,14 @@ DeviceArena::Scope::Scope(Scope&& other) noexcept : arena_(other.arena_), saved_
 
 DeviceArena::DeviceArena(std::size_t capacity_bytes) {
   if (capacity_bytes == 0) throw std::invalid_argument("DeviceArena capacity must be nonzero");
-  void* ptr = alloc_aligned(256, capacity_bytes, "CPU DeviceArena");
-  if (!ptr) throw std::runtime_error("CPU DeviceArena allocation failed");
-  base_ = ptr;
+  HugePageMapping m = alloc_aligned_or_huge(256, capacity_bytes, "CPU DeviceArena");
+  if (!m.ptr) throw std::runtime_error("CPU DeviceArena allocation failed");
+  base_ = m.ptr;
   cap_ = capacity_bytes;
   off_ = 0;
+  backing_bytes_ = m.mapped_bytes;
+  via_hugepage_mmap_ = m.via_mmap;
+  hugepage_advised_ = m.hugepage_advised;
 }
 
 DeviceArena::DeviceArena(DeviceSpan storage) : base_(storage.data), cap_(storage.bytes), owns_(false) {
@@ -196,31 +228,37 @@ DeviceArena::DeviceArena(DeviceSpan storage) : base_(storage.data), cap_(storage
 }
 
 DeviceArena::~DeviceArena() {
-  if (owns_) std::free(base_);
+  if (owns_ && base_) {
+    HugePageMapping m{base_, backing_bytes_ > 0 ? backing_bytes_ : cap_, hugepage_advised_, via_hugepage_mmap_};
+    free_hugepage_anon(m);
+  }
+  base_ = nullptr;
 }
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
-    : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_), owns_(other.owns_) {
-  other.base_ = nullptr;
-  other.cap_ = 0;
-  other.off_ = 0;
-  other.peak_ = 0;
-  other.owns_ = true;
-}
+    : base_(std::exchange(other.base_, nullptr)),
+      cap_(std::exchange(other.cap_, 0)),
+      off_(std::exchange(other.off_, 0)),
+      peak_(std::exchange(other.peak_, 0)),
+      owns_(std::exchange(other.owns_, true)),
+      backing_bytes_(std::exchange(other.backing_bytes_, 0)),
+      via_hugepage_mmap_(std::exchange(other.via_hugepage_mmap_, false)),
+      hugepage_advised_(std::exchange(other.hugepage_advised_, false)) {}
 
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
   if (this == &other) return *this;
-  if (owns_) std::free(base_);
-  base_ = other.base_;
-  cap_ = other.cap_;
-  off_ = other.off_;
-  peak_ = other.peak_;
-  owns_ = other.owns_;
-  other.base_ = nullptr;
-  other.cap_ = 0;
-  other.off_ = 0;
-  other.peak_ = 0;
-  other.owns_ = true;
+  if (owns_ && base_) {
+    HugePageMapping m{base_, backing_bytes_ > 0 ? backing_bytes_ : cap_, hugepage_advised_, via_hugepage_mmap_};
+    free_hugepage_anon(m);
+  }
+  base_ = std::exchange(other.base_, nullptr);
+  cap_ = std::exchange(other.cap_, 0);
+  off_ = std::exchange(other.off_, 0);
+  peak_ = std::exchange(other.peak_, 0);
+  owns_ = std::exchange(other.owns_, true);
+  backing_bytes_ = std::exchange(other.backing_bytes_, 0);
+  via_hugepage_mmap_ = std::exchange(other.via_hugepage_mmap_, false);
+  hugepage_advised_ = std::exchange(other.hugepage_advised_, false);
   return *this;
 }
 
@@ -265,29 +303,46 @@ void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
   if (size_bytes == 0) throw std::invalid_argument("PinnedHostBuffer size must be nonzero");
-  void* ptr = alloc_aligned(4096, size_bytes, "CPU PinnedHostBuffer");
-  if (!ptr) throw std::runtime_error("CPU PinnedHostBuffer allocation failed");
-  data_ = ptr;
+  if (consume_fail_pinned()) throw std::runtime_error("CPU PinnedHostBuffer allocation failed");
+  HugePageMapping m = alloc_aligned_or_huge(4096, size_bytes, "CPU PinnedHostBuffer");
+  if (!m.ptr) throw std::runtime_error("CPU PinnedHostBuffer allocation failed");
+  data_ = m.ptr;
   size_ = size_bytes;
+  mapped_bytes_ = m.mapped_bytes;
+  via_hugepage_mmap_ = m.via_mmap;
+  hugepage_advised_ = m.hugepage_advised;
 }
 
 PinnedHostBuffer::~PinnedHostBuffer() {
-  std::free(data_);
+  if (data_) {
+    HugePageMapping m{data_, mapped_bytes_ > 0 ? mapped_bytes_ : size_, hugepage_advised_, via_hugepage_mmap_};
+    free_hugepage_anon(m);
+  }
   data_ = nullptr;
+  size_ = 0;
+  mapped_bytes_ = 0;
+  via_hugepage_mmap_ = false;
+  hugepage_advised_ = false;
 }
 
-PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept : data_(other.data_), size_(other.size_) {
-  other.data_ = nullptr;
-  other.size_ = 0;
-}
+PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
+    : data_(std::exchange(other.data_, nullptr)),
+      size_(std::exchange(other.size_, 0)),
+      mapped_bytes_(std::exchange(other.mapped_bytes_, 0)),
+      via_hugepage_mmap_(std::exchange(other.via_hugepage_mmap_, false)),
+      hugepage_advised_(std::exchange(other.hugepage_advised_, false)) {}
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
   if (this == &other) return *this;
-  std::free(data_);
-  data_ = other.data_;
-  size_ = other.size_;
-  other.data_ = nullptr;
-  other.size_ = 0;
+  if (data_) {
+    HugePageMapping m{data_, mapped_bytes_ > 0 ? mapped_bytes_ : size_, hugepage_advised_, via_hugepage_mmap_};
+    free_hugepage_anon(m);
+  }
+  data_ = std::exchange(other.data_, nullptr);
+  size_ = std::exchange(other.size_, 0);
+  mapped_bytes_ = std::exchange(other.mapped_bytes_, 0);
+  via_hugepage_mmap_ = std::exchange(other.via_hugepage_mmap_, false);
+  hugepage_advised_ = std::exchange(other.hugepage_advised_, false);
   return *this;
 }
 
@@ -296,22 +351,16 @@ std::size_t PinnedHostBuffer::size() const noexcept { return size_; }
 
 HostRegion::HostRegion(std::size_t bytes) {
   if (bytes == 0) throw std::invalid_argument("HostRegion size must be nonzero");
-  const std::size_t size = align_huge(bytes);
-  const std::size_t span = size + kHugePageBytes;
-  void* raw = ::mmap(nullptr, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (raw == MAP_FAILED) {
-    throw std::runtime_error("HostRegion: mmap of " + std::to_string(span) + " bytes failed: " + std::strerror(errno));
+  HugePageMapping m = alloc_hugepage_anon(bytes);
+  if (!m.ptr) {
+    throw std::runtime_error("HostRegion: mmap of " + std::to_string(bytes) + " bytes failed: " + std::strerror(errno));
   }
-  const auto base = reinterpret_cast<std::uintptr_t>(raw);
-  const auto aligned = (base + kHugePageBytes - 1) & ~(std::uintptr_t(kHugePageBytes) - 1);
-  const std::size_t head = aligned - base;
-  const std::size_t tail = span - head - size;
-  if (head) ::munmap(raw, head);
-  if (tail) ::munmap(reinterpret_cast<void*>(aligned + size), tail);
-  data_ = reinterpret_cast<std::byte*>(aligned);
-  size_ = size;
-  if (::madvise(data_, size_, MADV_HUGEPAGE) != 0) {
-    spdlog::warn("HostRegion: madvise(MADV_HUGEPAGE) failed: {}", std::strerror(errno));
+  data_ = static_cast<std::byte*>(m.ptr);
+  size_ = m.mapped_bytes;
+  via_mmap_ = m.via_mmap;
+  hugepage_advised_ = m.hugepage_advised;
+  if (hugepages_enabled() && !hugepage_advised_) {
+    spdlog::warn("HostRegion: madvise(MADV_HUGEPAGE) failed or unavailable");
   }
 }
 
@@ -321,6 +370,8 @@ HostRegion::HostRegion(HostRegion&& other) noexcept
     : data_(std::exchange(other.data_, nullptr)),
       size_(std::exchange(other.size_, 0)),
       registered_(std::exchange(other.registered_, false)),
+      via_mmap_(std::exchange(other.via_mmap_, true)),
+      hugepage_advised_(std::exchange(other.hugepage_advised_, false)),
       device_(std::exchange(other.device_, nullptr)),
       register_seconds_(other.register_seconds_) {}
 
@@ -330,6 +381,8 @@ HostRegion& HostRegion::operator=(HostRegion&& other) noexcept {
     data_ = std::exchange(other.data_, nullptr);
     size_ = std::exchange(other.size_, 0);
     registered_ = std::exchange(other.registered_, false);
+    via_mmap_ = std::exchange(other.via_mmap_, true);
+    hugepage_advised_ = std::exchange(other.hugepage_advised_, false);
     device_ = std::exchange(other.device_, nullptr);
     register_seconds_ = other.register_seconds_;
   }
@@ -345,22 +398,26 @@ void HostRegion::unregister() noexcept {
 void HostRegion::release() noexcept {
   unregister();
   if (data_ != nullptr) {
-    if (::munmap(data_, size_) != 0) {
-      spdlog::error("HostRegion: munmap failed: {}", std::strerror(errno));
-    }
+    HugePageMapping m{data_, size_, hugepage_advised_, via_mmap_};
+    free_hugepage_anon(m);
     data_ = nullptr;
     size_ = 0;
+    via_mmap_ = true;
+    hugepage_advised_ = false;
   }
 }
 
 MappedHostBuffer::MappedHostBuffer(std::size_t bytes) {
   if (bytes == 0) throw std::invalid_argument("MappedHostBuffer size must be nonzero");
-  void* ptr = alloc_aligned(4096, bytes, "CPU MappedHostBuffer");
-  if (!ptr) throw std::runtime_error("CPU MappedHostBuffer allocation failed");
-  std::memset(ptr, 0, bytes);
-  data_ = ptr;
-  device_ = ptr;
+  HugePageMapping m = alloc_aligned_or_huge(4096, bytes, "CPU MappedHostBuffer");
+  if (!m.ptr) throw std::runtime_error("CPU MappedHostBuffer allocation failed");
+  std::memset(m.ptr, 0, bytes);
+  data_ = m.ptr;
+  device_ = m.ptr;
   size_ = bytes;
+  mapped_bytes_ = m.mapped_bytes;
+  via_hugepage_mmap_ = m.via_mmap;
+  hugepage_advised_ = m.hugepage_advised;
 }
 
 MappedHostBuffer::~MappedHostBuffer() { release(); }
@@ -368,7 +425,10 @@ MappedHostBuffer::~MappedHostBuffer() { release(); }
 MappedHostBuffer::MappedHostBuffer(MappedHostBuffer&& other) noexcept
     : data_(std::exchange(other.data_, nullptr)),
       device_(std::exchange(other.device_, nullptr)),
-      size_(std::exchange(other.size_, 0)) {}
+      size_(std::exchange(other.size_, 0)),
+      mapped_bytes_(std::exchange(other.mapped_bytes_, 0)),
+      via_hugepage_mmap_(std::exchange(other.via_hugepage_mmap_, false)),
+      hugepage_advised_(std::exchange(other.hugepage_advised_, false)) {}
 
 MappedHostBuffer& MappedHostBuffer::operator=(MappedHostBuffer&& other) noexcept {
   if (this != &other) {
@@ -376,16 +436,23 @@ MappedHostBuffer& MappedHostBuffer::operator=(MappedHostBuffer&& other) noexcept
     data_ = std::exchange(other.data_, nullptr);
     device_ = std::exchange(other.device_, nullptr);
     size_ = std::exchange(other.size_, 0);
+    mapped_bytes_ = std::exchange(other.mapped_bytes_, 0);
+    via_hugepage_mmap_ = std::exchange(other.via_hugepage_mmap_, false);
+    hugepage_advised_ = std::exchange(other.hugepage_advised_, false);
   }
   return *this;
 }
 
 void MappedHostBuffer::release() noexcept {
   if (data_ != nullptr) {
-    std::free(data_);
+    HugePageMapping m{data_, mapped_bytes_ > 0 ? mapped_bytes_ : size_, hugepage_advised_, via_hugepage_mmap_};
+    free_hugepage_anon(m);
     data_ = nullptr;
     device_ = nullptr;
     size_ = 0;
+    mapped_bytes_ = 0;
+    via_hugepage_mmap_ = false;
+    hugepage_advised_ = false;
   }
 }
 

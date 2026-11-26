@@ -32,6 +32,7 @@ public:
     [[nodiscard]] std::byte* data() const noexcept { return data_; }
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
     [[nodiscard]] bool registered() const noexcept { return registered_; }
+    [[nodiscard]] bool hugepage_advised() const noexcept { return hugepage_advised_; }
     // Device-visible alias of data() when registered (UVA: equal to data()), else nullptr.
     [[nodiscard]] void* device_ptr() const noexcept { return device_; }
     // Seconds the last register_with_cuda() call took.
@@ -43,12 +44,14 @@ private:
     std::byte* data_         = nullptr;
     std::size_t size_        = 0;
     bool registered_         = false;
+    bool via_mmap_           = true;
+    bool hugepage_advised_   = false;
     void* device_            = nullptr;
     double register_seconds_ = 0;
 };
 
 // Pinned host allocation mapped into the device address space (cudaHostAlloc portable|mapped),
-// for host<->device exchange structures (doorbells, step inputs/outputs, staging rows).
+// or 2 MiB THP mmap + cudaHostRegister when bytes >= 2 MiB.
 // Zero-filled on construction. Throws on failure.
 class MappedHostBuffer {
 public:
@@ -64,13 +67,17 @@ public:
     [[nodiscard]] void* data() const noexcept { return data_; }
     [[nodiscard]] void* device_ptr() const noexcept { return device_; }
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] bool hugepage_advised() const noexcept { return hugepage_advised_; }
 
 private:
     void release() noexcept;
 
-    void* data_       = nullptr;
-    void* device_     = nullptr;
-    std::size_t size_ = 0;
+    void* data_                = nullptr;
+    void* device_              = nullptr;
+    std::size_t size_          = 0;
+    std::size_t mapped_bytes_  = 0;
+    bool via_hugepage_mmap_    = false;
+    bool hugepage_advised_     = false;
 };
 
 // /proc/meminfo MemAvailable in bytes (0 when unreadable).

@@ -13,7 +13,12 @@ if(INGINE_BACKEND STREQUAL "CUDA")
   ingine_add_test(NAME core_arena SOURCES test_arena.cpp LIBS ingine_core GPU)
   ingine_add_test(NAME core_paged_tier SOURCES test_paged_tier.cpp LIBS ingine_core GPU)
   ingine_add_test(NAME core_upload SOURCES test_upload.cpp LIBS ingine_core GPU)
+  ingine_add_test(NAME core_baremetal_cpu SOURCES test_baremetal_cpu.cpp LIBS ingine_ops ingine_core CUDA::cudart
+                  GPU ORACLE)
+  ingine_add_test(NAME core_baremetal_cuda SOURCES test_baremetal_cuda.cpp LIBS ingine_ops ingine_core
+                  ingine_kernels_moe CUDA::cudart GPU ORACLE)
 else()
   ingine_add_test(NAME hal_embed_q4_parity SOURCES test_embed_q4_parity.cpp LIBS ingine_ops ingine_core ORACLE)
   ingine_add_test(NAME core_upload SOURCES test_upload.cpp LIBS ingine_core)
+  ingine_add_test(NAME core_baremetal_cpu SOURCES test_baremetal_cpu.cpp LIBS ingine_ops ingine_core ORACLE)
 endif()
