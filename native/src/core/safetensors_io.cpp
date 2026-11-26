@@ -1,5 +1,7 @@
 #include "core/safetensors.h"
 
+#include "core/weight_pack.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -101,6 +103,35 @@ SafetensorsFile::SafetensorsFile(const std::filesystem::path& path) : path_(path
         struct stat st {};
         if (::fstat(fd_, &st) != 0) { fail_errno(path_, "fstat failed"); }
         file_size_ = static_cast<std::uint64_t>(st.st_size);
+        if (file_size_ >= sizeof(kWeightPackMagic)) {
+            char magic[sizeof(kWeightPackMagic)]{};
+            read_range(0, sizeof(magic), magic);
+            if (std::memcmp(magic, kWeightPackMagic, sizeof(kWeightPackMagic)) == 0) {
+                ::close(fd_);
+                fd_ = -1;
+                pack_        = std::make_unique<WeightPack>(path_);
+                file_size_   = pack_->file_size();
+                data_offset_ = pack_->data_offset();
+                metadata_    = pack_->metadata();
+                tensors_.reserve(pack_->entries().size());
+                for (const WeightPackEntry& e : pack_->entries()) {
+                    SafetensorsTensor t;
+                    t.name  = std::string(pack_->entry_name(e));
+                    t.dtype = std::string(pack_->entry_dtype(e));
+                    t.shape.assign(e.shape, e.shape + e.rank);
+                    t.offset = e.data_offset;
+                    t.bytes  = e.data_bytes;
+                    tensors_.push_back(std::move(t));
+                }
+                std::sort(tensors_.begin(), tensors_.end(),
+                          [](const SafetensorsTensor& a, const SafetensorsTensor& b) {
+                              return a.offset != b.offset ? a.offset < b.offset : a.name < b.name;
+                          });
+                index_.reserve(tensors_.size());
+                for (std::size_t i = 0; i < tensors_.size(); ++i) { index_.emplace(tensors_[i].name, i); }
+                return;
+            }
+        }
         (void)::posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
 
         if (file_size_ < 8) { fail(path_, "file shorter than the 8-byte header length"); }
@@ -188,7 +219,7 @@ SafetensorsFile::SafetensorsFile(const std::filesystem::path& path) : path_(path
         index_.reserve(tensors_.size());
         for (std::size_t i = 0; i < tensors_.size(); ++i) { index_.emplace(tensors_[i].name, i); }
     } catch (...) {
-        ::close(fd_);
+        if (fd_ >= 0) { ::close(fd_); }
         fd_ = -1;
         throw;
     }
@@ -200,6 +231,7 @@ SafetensorsFile::~SafetensorsFile() {
 
 SafetensorsFile::SafetensorsFile(SafetensorsFile&& other) noexcept
     : path_(std::move(other.path_)), fd_(std::exchange(other.fd_, -1)),
+      pack_(std::move(other.pack_)),
       file_size_(other.file_size_), data_offset_(other.data_offset_),
       metadata_(std::move(other.metadata_)), tensors_(std::move(other.tensors_)),
       index_(std::move(other.index_)) {}
@@ -209,6 +241,7 @@ SafetensorsFile& SafetensorsFile::operator=(SafetensorsFile&& other) noexcept {
         if (fd_ >= 0) { ::close(fd_); }
         path_        = std::move(other.path_);
         fd_          = std::exchange(other.fd_, -1);
+        pack_        = std::move(other.pack_);
         file_size_   = other.file_size_;
         data_offset_ = other.data_offset_;
         metadata_    = std::move(other.metadata_);
@@ -216,6 +249,19 @@ SafetensorsFile& SafetensorsFile::operator=(SafetensorsFile&& other) noexcept {
         index_       = std::move(other.index_);
     }
     return *this;
+}
+
+int SafetensorsFile::fd() const noexcept { return pack_ ? pack_->fd() : fd_; }
+
+const std::byte* SafetensorsFile::mapped_data() const noexcept {
+    return pack_ ? pack_->mapped_base() : nullptr;
+}
+
+const std::byte* SafetensorsFile::tensor_mapped_ptr(const SafetensorsTensor& tensor) const noexcept {
+    if (!pack_ || tensor.offset > file_size_ || tensor.bytes > file_size_ - tensor.offset) {
+        return nullptr;
+    }
+    return pack_->mapped_base() + tensor.offset;
 }
 
 std::vector<std::string> SafetensorsFile::names() const {
@@ -237,6 +283,10 @@ const SafetensorsTensor& SafetensorsFile::at(std::string_view name) const {
 }
 
 void SafetensorsFile::read_range(std::uint64_t offset, std::uint64_t bytes, void* dst) const {
+    if (pack_) {
+        pack_->read_range(offset, bytes, dst);
+        return;
+    }
     if (offset > file_size_ || bytes > file_size_ - offset) {
         fail(path_, "read of " + std::to_string(bytes) + " bytes at " + std::to_string(offset) +
                         " exceeds the file");
@@ -273,13 +323,17 @@ SafetensorsModel::SafetensorsModel(const std::filesystem::path& path) {
     fs::path index_path;
     fs::path single;
     if (fs::is_directory(path)) {
-        if (fs::exists(path / "model.safetensors.index.json")) {
+        if (weight_pack_enabled() && fs::exists(path / "model.ingpack")) {
+            single = path / "model.ingpack";
+        } else if (fs::exists(path / "model.safetensors.index.json")) {
             index_path = path / "model.safetensors.index.json";
         } else if (fs::exists(path / "model.safetensors")) {
             single = path / "model.safetensors";
+        } else if (fs::exists(path / "model.ingpack")) {
+            single = path / "model.ingpack";
         } else {
             throw std::runtime_error("safetensors model " + path.string() +
-                                     ": neither model.safetensors.index.json nor model.safetensors");
+                                     ": neither model.ingpack, model.safetensors.index.json nor model.safetensors");
         }
     } else if (path.extension() == ".json") {
         index_path = path;

@@ -26,6 +26,8 @@
 
 namespace ingine {
 
+class WeightPack;
+
 // Element size in bytes of a safetensors dtype string ("BF16", "F8_E4M3", "U8", ...); throws for
 // dtypes without a whole-byte element size or unknown names.
 std::size_t safetensors_dtype_size(std::string_view dtype);
@@ -59,7 +61,11 @@ public:
     SafetensorsFile& operator=(SafetensorsFile&& other) noexcept;
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
-    [[nodiscard]] int fd() const noexcept { return fd_; }
+    [[nodiscard]] int fd() const noexcept;
+    [[nodiscard]] bool is_weight_pack() const noexcept { return static_cast<bool>(pack_); }
+    [[nodiscard]] const WeightPack* weight_pack() const noexcept { return pack_.get(); }
+    [[nodiscard]] const std::byte* mapped_data() const noexcept;
+    [[nodiscard]] const std::byte* tensor_mapped_ptr(const SafetensorsTensor& tensor) const noexcept;
     [[nodiscard]] std::uint64_t file_size() const noexcept { return file_size_; }
     [[nodiscard]] std::uint64_t data_offset() const noexcept { return data_offset_; }
     // "__metadata__" (string values only, as the format requires); empty when absent.
@@ -88,6 +94,7 @@ private:
 
     std::filesystem::path path_;
     int fd_                    = -1;
+    std::unique_ptr<WeightPack> pack_;
     std::uint64_t file_size_   = 0;
     std::uint64_t data_offset_ = 0;
     std::map<std::string, std::string> metadata_;
@@ -117,6 +124,9 @@ public:
 
     [[nodiscard]] const std::vector<std::unique_ptr<SafetensorsFile>>& files() const noexcept {
         return files_;
+    }
+    [[nodiscard]] bool is_weight_pack() const noexcept {
+        return !files_.empty() && files_[0]->is_weight_pack();
     }
     [[nodiscard]] std::vector<std::string> names() const; // sorted
     [[nodiscard]] std::size_t size() const noexcept { return index_.size(); }

@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -27,11 +28,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -247,19 +250,121 @@ void test_hugepage_allocations() {
     std::printf("  INGINE_DISABLE_HUGEPAGES=1 verified: hugepage_advised=false, AnonHugePages=%.1f MiB\n",
                 sm.anon_huge_pages_bytes / 1048576.0);
   }
+
+  // NUMA-local allocation (SYS_mbind + /proc/self/numa_maps) and INGINE_DISABLE_NUMA_BIND=1 opt-out
+  {
+    const int cur_node = ingine::current_numa_node();
+    if (cur_node >= 0) {
+      ingine::HugePageMapping bound =
+          ingine::alloc_hugepage_anon(kFourMiB, true, cur_node, ingine::NumaPolicy::Bind);
+      INGINE_CHECK(bound.ptr != nullptr);
+      fill_pattern(static_cast<std::uint8_t*>(bound.ptr), kFourMiB, 0x13572468ull);
+      verify_pattern(static_cast<const std::uint8_t*>(bound.ptr), kFourMiB, 0x13572468ull);
+      const auto nm = ingine::query_range_numa_nodes(bound.ptr, kFourMiB);
+      std::printf("  NUMA Bind(node=%d): bound=%s readable=%s total=%.1f MiB node%d=%.1f MiB\n",
+                  cur_node, bound.numa_bound ? "yes" : "no", nm.readable ? "yes" : "no",
+                  nm.total_bytes() / 1048576.0, cur_node,
+                  (nm.node_bytes.count(cur_node) ? nm.node_bytes.at(cur_node) : 0ull) / 1048576.0);
+      if (bound.numa_bound && nm.readable && nm.total_bytes() > 0) {
+        INGINE_CHECK(nm.total_bytes() >= kFourMiB);
+        INGINE_CHECK(nm.node_bytes.count(cur_node) > 0 && nm.node_bytes.at(cur_node) >= kFourMiB);
+      }
+      ingine::free_hugepage_anon(bound);
+    }
+
+    ScopedEnvVar disable_numa("INGINE_DISABLE_NUMA_BIND", "1");
+    INGINE_CHECK(!ingine::numa_bind_enabled());
+    ingine::HostRegion no_numa(kFourMiB);
+    INGINE_CHECK(no_numa.data() != nullptr);
+    INGINE_CHECK(!no_numa.numa_bound());
+    INGINE_CHECK(no_numa.numa_node() == -1);
+  }
 }
 
 void test_cpu_thread_pool() {
-  std::printf("[2/4] Testing futex/spin-barrier CpuThreadPool...\n");
+  std::printf("[2/4] Testing futex/spin-barrier CpuThreadPool (affinity, SMT/cpuset spin=0, unwind)...\n");
   using namespace ingine::ops::cpu;
 
+  const CpuTopologyInfo topo = discover_cpu_topology();
   const int detected = default_cpu_pool_threads();
-  std::printf("  default_cpu_pool_threads()=%d, detected ISA=%s\n",
-              detected, cpu_isa_name(detect_cpu_isa()));
+  std::printf("  default_cpu_pool_threads()=%d, logical=%d, physical=%d, caller_cpu=%d, caller_node=%d, ISA=%s\n",
+              detected, topo.logical_cpus, topo.physical_cores, topo.caller_cpu, topo.caller_numa_node,
+              cpu_isa_name(detect_cpu_isa()));
   INGINE_CHECK(detected >= 1);
+  INGINE_CHECK(topo.logical_cpus >= topo.physical_cores);
+  INGINE_CHECK(topo.physical_cores >= 1);
 
 #ifdef __linux__
-  // Pin only this short-lived thread, leaving the test runner's affinity intact.
+  INGINE_CHECK(static_cast<int>(topo.ordered_cpus.size()) == topo.logical_cpus);
+
+  auto capture_affinity = [](std::size_t& out_bytes) -> cpu_set_t* {
+    for (int cap = CPU_SETSIZE; ; cap *= 2) {
+      out_bytes = CPU_ALLOC_SIZE(cap);
+      cpu_set_t* m = CPU_ALLOC(cap);
+      INGINE_CHECK(m != nullptr);
+      if (::sched_getaffinity(0, out_bytes, m) == 0) return m;
+      CPU_FREE(m);
+      INGINE_CHECK(errno == EINVAL && cap <= INT_MAX / 2);
+    }
+  };
+
+  // ScopedThreadPin save/restore + out-of-cpuset refusal
+  {
+    std::size_t before_bytes = 0, after_bytes = 0;
+    cpu_set_t* before = capture_affinity(before_bytes);
+    const int target_cpu = !topo.ordered_cpus.empty() ? topo.ordered_cpus[0] : ::sched_getcpu();
+    {
+      ScopedThreadPin pin(target_cpu);
+      INGINE_CHECK(pin.pinned());
+      INGINE_CHECK(pin.cpu() == target_cpu);
+      INGINE_CHECK(::sched_getcpu() == target_cpu);
+    }
+    cpu_set_t* after = capture_affinity(after_bytes);
+    INGINE_CHECK(before_bytes == after_bytes && CPU_EQUAL_S(before_bytes, before, after));
+    CPU_FREE(before);
+    CPU_FREE(after);
+
+    ScopedThreadPin bad_pin(999999);
+    INGINE_CHECK(!bad_pin.pinned());
+  }
+
+  // Worker sibling-0 pinning + verification that caller thread affinity stays intact
+  {
+    const int nt_pin = std::min(4, topo.physical_cores);
+    if (nt_pin >= 2) {
+      std::size_t before_bytes = 0, after_bytes = 0;
+      cpu_set_t* before = capture_affinity(before_bytes);
+      CpuThreadPool pinned_pool(nt_pin);
+      INGINE_CHECK(pinned_pool.workers_pinned());
+      INGINE_CHECK(!pinned_pool.oversubscribed());
+      INGINE_CHECK(pinned_pool.effective_spin_iters() == 4000);
+      INGINE_CHECK(static_cast<int>(pinned_pool.assigned_cpus().size()) == nt_pin);
+
+      std::atomic<int> worker_mismatches{0};
+      struct PinCheckCtx {
+        const std::vector<int>* assigned;
+        std::atomic<int>* mismatches;
+      } pctx{&pinned_pool.assigned_cpus(), &worker_mismatches};
+      for (int iter = 0; iter < 10; ++iter) {
+        pinned_pool.dispatch(nt_pin,
+                             [](int tid, int /*nt*/, void* raw) {
+                               auto* c = static_cast<PinCheckCtx*>(raw);
+                               if (tid > 0 && ::sched_getcpu() != (*c->assigned)[static_cast<std::size_t>(tid)]) {
+                                 c->mismatches->fetch_add(1, std::memory_order_relaxed);
+                               }
+                             },
+                             &pctx);
+      }
+      INGINE_CHECK(worker_mismatches.load() == 0);
+
+      cpu_set_t* after = capture_affinity(after_bytes);
+      INGINE_CHECK(before_bytes == after_bytes && CPU_EQUAL_S(before_bytes, before, after));
+      CPU_FREE(before);
+      CPU_FREE(after);
+    }
+  }
+
+  // Pin only a short-lived thread to 1 CPU: tests default_cpu_pool_threads() cap AND adaptive spin_iters=0.
   std::thread([] {
     const int cpu = ::sched_getcpu();
     INGINE_CHECK(cpu >= 0);
@@ -274,8 +379,86 @@ void test_cpu_thread_pool() {
     INGINE_CHECK(default_cpu_pool_threads() == 1);
     ScopedEnvVar oversized("INGINE_CPU_THREADS", "64");
     INGINE_CHECK(default_cpu_pool_threads() == 1);
+
+    ScopedEnvVar clear_spin("INGINE_CPU_POOL_SPIN", nullptr);
+    CpuThreadPool oversub_pool(2);
+    INGINE_CHECK(oversub_pool.oversubscribed());
+    INGINE_CHECK(oversub_pool.effective_spin_iters() == 0);
+    INGINE_CHECK(!oversub_pool.workers_pinned());
+    std::atomic<int> sum{0};
+    oversub_pool.parallel_for(32, 1, [&](int b, int e) {
+      for (int i = b; i < e; ++i) sum.fetch_add(i + 1, std::memory_order_relaxed);
+    });
+    INGINE_CHECK(sum.load() == 32 * 33 / 2);
   }).join();
+
+  // SMT-sibling sharing detection: restrict a child thread to 2 SMT siblings of 1 physical core if present.
+  {
+    std::map<std::string, std::vector<int>> sib_groups;
+    int smt_c0 = -1, smt_c1 = -1;
+    for (int cpu : topo.ordered_cpus) {
+      std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
+      std::string s;
+      if (std::getline(f, s) && !s.empty()) {
+        auto& g = sib_groups[s];
+        g.push_back(cpu);
+        if (g.size() == 2 && smt_c0 < 0) {
+          smt_c0 = g[0];
+          smt_c1 = g[1];
+        }
+      }
+    }
+    if (smt_c0 >= 0 && smt_c1 >= 0) {
+      std::thread([smt_c0, smt_c1]() {
+        const int maxc = std::max(smt_c0, smt_c1) + 1;
+        const auto bytes = CPU_ALLOC_SIZE(maxc);
+        const auto free_set = [](cpu_set_t* mask) { CPU_FREE(mask); };
+        std::unique_ptr<cpu_set_t, decltype(free_set)> mask(CPU_ALLOC(maxc), free_set);
+        INGINE_CHECK(mask != nullptr);
+        CPU_ZERO_S(bytes, mask.get());
+        CPU_SET_S(smt_c0, bytes, mask.get());
+        CPU_SET_S(smt_c1, bytes, mask.get());
+        INGINE_CHECK(::sched_setaffinity(0, bytes, mask.get()) == 0);
+        ScopedEnvVar clear_spin("INGINE_CPU_POOL_SPIN", nullptr);
+        const CpuTopologyInfo smt_topo = discover_cpu_topology();
+        INGINE_CHECK(smt_topo.logical_cpus == 2);
+        INGINE_CHECK(smt_topo.physical_cores == 1);
+        CpuThreadPool smt_pool(2);
+        INGINE_CHECK(smt_pool.oversubscribed());
+        INGINE_CHECK(smt_pool.effective_spin_iters() == 0);
+        std::atomic<int> acc{0};
+        smt_pool.parallel_for(32, 1, [&](int b, int e) {
+          for (int i = b; i < e; ++i) acc.fetch_add(i + 1, std::memory_order_relaxed);
+        });
+        INGINE_CHECK(acc.load() == 32 * 33 / 2);
+      }).join();
+    }
+  }
 #endif
+
+  // Deterministic partial worker startup unwind & recovery
+  {
+    fail_next_cpu_pool_worker_start(0);
+    bool threw0 = false;
+    try {
+      CpuThreadPool p0(4);
+    } catch (const std::system_error&) { threw0 = true; }
+    INGINE_CHECK(threw0);
+
+    fail_next_cpu_pool_worker_start(2);
+    bool threw2 = false;
+    try {
+      CpuThreadPool p2(4);
+    } catch (const std::system_error&) { threw2 = true; }
+    INGINE_CHECK(threw2);
+
+    CpuThreadPool healthy(4);
+    std::atomic<int> sum{0};
+    healthy.parallel_for(128, 1, [&](int b, int e) {
+      for (int i = b; i < e; ++i) sum.fetch_add(i + 1, std::memory_order_relaxed);
+    });
+    INGINE_CHECK(sum.load() == 128 * 129 / 2);
+  }
 
   CpuThreadPool boundary_pool(2);
   std::atomic<int> chunks{0};
@@ -744,14 +927,19 @@ void run_benchmarks() {
   using namespace ingine::ops::cpu;
   using namespace ingine::test;
   const CpuIsa isa = detect_cpu_isa();
-  std::printf("=== bare-metal Phase A CPU benchmarks (ISA=%s, hw_cores=%d) ===\n",
-              cpu_isa_name(isa), default_cpu_pool_threads());
+  const CpuTopologyInfo topo = discover_cpu_topology();
+  std::printf("=== bare-metal Phase B CPU benchmarks (ISA=%s, hw_cores=%d, logical=%d, numa_node=%d) ===\n",
+              cpu_isa_name(isa), default_cpu_pool_threads(), topo.logical_cpus, topo.caller_numa_node);
 
-  // 1. 512 MiB HugePage vs 4 KiB TLB page-walk microbenchmark
+  // 1. 512 MiB HugePage + NUMA-local mbind vs 4 KiB TLB page-walk microbenchmark
   {
     constexpr std::size_t kBytes = 512ull << 20;
     constexpr std::size_t kPages = kBytes / 4096ull;
     constexpr std::size_t kSamples = kPages * 2;  // 262,144 scattered 4 KiB-strided loads per pass
+
+    const int pin_cpu = !topo.primary_cpus.empty() ? topo.primary_cpus[0] : topo.caller_cpu;
+    ScopedThreadPin pin(pin_cpu);
+    const int local_node = ingine::current_numa_node() >= 0 ? ingine::current_numa_node() : 0;
 
     // Deterministic shuffled 4 KiB page order to force L1/L2 dTLB pressure.
     std::vector<std::uint32_t> perm(kPages);
@@ -763,14 +951,17 @@ void run_benchmarks() {
     }
 
     auto measure_tlb = [&](bool allow_hp, const char* label) -> double {
-      ScopedEnvVar env("INGINE_DISABLE_HUGEPAGES", allow_hp ? nullptr : "1");
-      ingine::HostRegion buf(kBytes);
-      auto* words = reinterpret_cast<std::uint64_t*>(buf.data());
-      // Populate 1 word per 4 KiB page (touches all 512 MiB).
+      ingine::HugePageMapping buf =
+          ingine::alloc_hugepage_anon(kBytes, allow_hp, local_node, ingine::NumaPolicy::Bind);
+      auto* words = reinterpret_cast<std::uint64_t*>(buf.ptr);
+      // Populate 1 word per 4 KiB page (touches all 512 MiB on local_node).
       for (std::size_t p = 0; p < kPages; ++p) {
         words[p * 512ull] = p * 6364136223846793005ull + 1ull;
       }
-      const auto sm = ingine::query_range_smaps_hugepages(buf.data(), kBytes);
+      const auto sm = ingine::query_range_smaps_hugepages(buf.ptr, kBytes);
+      const auto nm = ingine::query_range_numa_nodes(buf.ptr, kBytes);
+      const std::uint64_t local_mb =
+          (nm.node_bytes.count(local_node) ? nm.node_bytes.at(local_node) : 0ull) / 1048576ull;
 
       volatile std::uint64_t sink = 0;
       std::vector<double> passes_ns;
@@ -790,9 +981,11 @@ void run_benchmarks() {
         }
       }
       (void)sink;
+      ingine::free_hugepage_anon(buf);
       const double med_ns = median_d(passes_ns);
-      std::printf("  TLB 512MiB %-14s: AnonHugePages=%5.1f MiB  Rss=%5.1f MiB  median=%.2f ns/access\n",
-                  label, sm.anon_huge_pages_bytes / 1048576.0, sm.rss_bytes / 1048576.0, med_ns);
+      std::printf("  TLB 512MiB %-14s (cpu=%d node=%d): AnonHugePages=%5.1f MiB  Rss=%5.1f MiB  localN%d=%llu MiB  median=%.2f ns/access\n",
+                  label, pin_cpu, local_node, sm.anon_huge_pages_bytes / 1048576.0, sm.rss_bytes / 1048576.0,
+                  local_node, static_cast<unsigned long long>(local_mb), med_ns);
       return med_ns;
     };
 
@@ -955,6 +1148,115 @@ void run_benchmarks() {
       std::printf("  decode_q4_0    [1024x4096]: 1T-Scalar=%6.3fms | 1T-SIMD=%6.3fms (%.2fx) | 8T=%6.3fms | 16T=%6.3fms (%.2fx vs 1T-Scalar)\n",
                   t_1s, t_1v, t_1s / t_1v, t_8v, t_16v, t_1s / t_16v);
     }
+  }
+
+  // 4. Phase B: Pinned sibling-0 vs unpinned jitter + oversubscribed adaptive spin=0
+  {
+    std::printf("\n[Bench 4] Phase B affinity & oversubscription benchmarks:\n");
+    const int nt = topo.physical_cores >= 16 ? 16 : (topo.physical_cores >= 8 ? 8 : topo.physical_cores);
+    if (nt >= 4) {
+      CpuThreadPool unpinned(CpuPoolOptions{nt, 4000, /*pin_workers=*/0});
+      CpuThreadPool pinned(CpuPoolOptions{nt, 4000, /*pin_workers=*/1});
+      std::atomic<int> counter{0};
+      auto task = [](int tid, int /*nt*/, void* raw) {
+        if (tid == 0) static_cast<std::atomic<int>*>(raw)->fetch_add(1, std::memory_order_relaxed);
+      };
+      for (int i = 0; i < 200; ++i) {
+        unpinned.dispatch(nt, task, &counter);
+        pinned.dispatch(nt, task, &counter);
+      }
+      std::vector<double> u_ns(2000), p_ns(2000);
+      for (int i = 0; i < 2000; ++i) {
+        const auto t0 = Clock::now();
+        unpinned.dispatch(nt, task, &counter);
+        const auto t1 = Clock::now();
+        u_ns[static_cast<std::size_t>(i)] = std::chrono::duration<double, std::nano>(t1 - t0).count();
+      }
+      for (int i = 0; i < 2000; ++i) {
+        const auto t0 = Clock::now();
+        pinned.dispatch(nt, task, &counter);
+        const auto t1 = Clock::now();
+        p_ns[static_cast<std::size_t>(i)] = std::chrono::duration<double, std::nano>(t1 - t0).count();
+      }
+      std::printf("  %2dT unpinned barrier : p50=%.2f us  p95=%.2f us  p99=%.2f us\n",
+                  nt, percentile_ns(u_ns, 0.50) / 1e3, percentile_ns(u_ns, 0.95) / 1e3,
+                  percentile_ns(u_ns, 0.99) / 1e3);
+      std::printf("  %2dT sibling0 pinned  : p50=%.2f us  p95=%.2f us  p99=%.2f us\n",
+                  nt, percentile_ns(p_ns, 0.50) / 1e3, percentile_ns(p_ns, 0.95) / 1e3,
+                  percentile_ns(p_ns, 0.99) / 1e3);
+
+      constexpr int N = 4096, K = 4096;
+      const std::size_t rb = K / 2 + (K / 32) * 2;
+      Rng qr(44556677ull);
+      std::vector<std::uint8_t> w(static_cast<std::size_t>(N) * rb);
+      for (std::size_t i = 0; i < w.size(); ++i) w[i] = static_cast<std::uint8_t>(qr.next() & 0xffu);
+      auto x = randn(qr, K, 0.5);
+      std::vector<float> y(N);
+      auto med_gemv = [&](CpuThreadPool& pl) {
+        gemv_q4_0_f32(w.data(), x.data(), y.data(), N, K, &pl, isa);
+        std::vector<double> ms;
+        for (int i = 0; i < 7; ++i) {
+          const auto t0 = Clock::now();
+          gemv_q4_0_f32(w.data(), x.data(), y.data(), N, K, &pl, isa);
+          const auto t1 = Clock::now();
+          ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        return median_d(ms);
+      };
+      const double ug = med_gemv(unpinned);
+      const double pg = med_gemv(pinned);
+      std::printf("  %2dT q4_0 GEMV [4096x4096]: unpinned=%.3f ms | sibling0-pinned=%.3f ms (%.2fx)\n",
+                  nt, ug, pg, ug / pg);
+    }
+
+#ifdef __linux__
+    if (topo.ordered_cpus.size() >= 2) {
+      std::thread([&]() {
+        const int c0 = topo.ordered_cpus[0];
+        const int c1 = topo.ordered_cpus[1];
+        const int maxc = std::max(c0, c1) + 1;
+        const auto bytes = CPU_ALLOC_SIZE(maxc);
+        const auto free_set = [](cpu_set_t* m) { CPU_FREE(m); };
+        std::unique_ptr<cpu_set_t, decltype(free_set)> mask(CPU_ALLOC(maxc), free_set);
+        CPU_ZERO_S(bytes, mask.get());
+        CPU_SET_S(c0, bytes, mask.get());
+        CPU_SET_S(c1, bytes, mask.get());
+        if (::sched_setaffinity(0, bytes, mask.get()) != 0) return;
+
+        ScopedEnvVar clear_spin("INGINE_CPU_POOL_SPIN", nullptr);
+        CpuThreadPool spin_pool(CpuPoolOptions{8, 4000, 0});
+        CpuThreadPool adaptive_pool(CpuPoolOptions{8, -1, -1});
+        INGINE_CHECK(adaptive_pool.oversubscribed());
+        INGINE_CHECK(adaptive_pool.effective_spin_iters() == 0);
+
+        std::atomic<int> counter{0};
+        auto task = [](int tid, int /*nt*/, void* raw) {
+          if (tid == 0) static_cast<std::atomic<int>*>(raw)->fetch_add(1, std::memory_order_relaxed);
+        };
+        for (int i = 0; i < 20; ++i) {
+          spin_pool.dispatch(8, task, &counter);
+          adaptive_pool.dispatch(8, task, &counter);
+        }
+        std::vector<double> s_ns(500), a_ns(500);
+        for (int i = 0; i < 500; ++i) {
+          const auto t0 = Clock::now();
+          spin_pool.dispatch(8, task, &counter);
+          const auto t1 = Clock::now();
+          s_ns[static_cast<std::size_t>(i)] = std::chrono::duration<double, std::nano>(t1 - t0).count();
+        }
+        for (int i = 0; i < 500; ++i) {
+          const auto t0 = Clock::now();
+          adaptive_pool.dispatch(8, task, &counter);
+          const auto t1 = Clock::now();
+          a_ns[static_cast<std::size_t>(i)] = std::chrono::duration<double, std::nano>(t1 - t0).count();
+        }
+        std::printf("  Oversubscribed 8T on 2 CPUs: spin=4000 p50=%.2f us (p99=%.2f us) | adaptive spin=0 p50=%.2f us (p99=%.2f us, %.2fx p50)\n",
+                    percentile_ns(s_ns, 0.50) / 1e3, percentile_ns(s_ns, 0.99) / 1e3,
+                    percentile_ns(a_ns, 0.50) / 1e3, percentile_ns(a_ns, 0.99) / 1e3,
+                    percentile_ns(s_ns, 0.50) / percentile_ns(a_ns, 0.50));
+      }).join();
+    }
+#endif
   }
 }
 

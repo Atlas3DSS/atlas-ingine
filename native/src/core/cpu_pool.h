@@ -13,14 +13,60 @@
 
 namespace ingine::ops::cpu {
 
+struct CpuTopologyInfo {
+  int logical_cpus = 1;
+  int physical_cores = 1;
+  int caller_cpu = -1;
+  int caller_numa_node = -1;
+  std::vector<int> primary_cpus;
+  std::vector<int> smt_cpus;
+  std::vector<int> ordered_cpus;
+};
+
+// Discovers allowed logical/physical CPUs and NUMA topology within the current affinity mask.
+CpuTopologyInfo discover_cpu_topology() noexcept;
+
 // Defaults to available physical cores. Linux affinity also bounds an INGINE_CPU_THREADS override.
 int default_cpu_pool_threads() noexcept;
+
+// RAII thread-affinity pin within the caller's allowed Linux CPU mask; restores original mask on exit.
+class ScopedThreadPin {
+ public:
+  explicit ScopedThreadPin(int cpu_id) noexcept;
+  ~ScopedThreadPin() noexcept;
+
+  ScopedThreadPin(const ScopedThreadPin&) = delete;
+  ScopedThreadPin& operator=(const ScopedThreadPin&) = delete;
+  ScopedThreadPin(ScopedThreadPin&& other) noexcept;
+  ScopedThreadPin& operator=(ScopedThreadPin&& other) noexcept;
+
+  [[nodiscard]] bool pinned() const noexcept { return pinned_; }
+  [[nodiscard]] int cpu() const noexcept { return cpu_; }
+
+ private:
+  void release() noexcept;
+
+  void* saved_mask_ = nullptr;
+  std::size_t mask_bytes_ = 0;
+  int cpu_ = -1;
+  bool pinned_ = false;
+};
+
+struct CpuPoolOptions {
+  int num_threads = 0;   // <= 0 selects default_cpu_pool_threads()
+  int spin_iters = -1;   // < 0 uses INGINE_CPU_POOL_SPIN or adaptive 0 under oversubscription
+  int pin_workers = -1;  // < 0 respects INGINE_CPU_PIN (enabled by default when not oversubscribed)
+};
+
+// Test hook: injects std::system_error(EAGAIN) before spawning worker `worker_index` (0-based; negative disables).
+void fail_next_cpu_pool_worker_start(int worker_index) noexcept;
 
 class CpuThreadPool {
  public:
   using TaskFn = void (*)(int tid, int nthreads, void* ctx);
 
   explicit CpuThreadPool(int num_threads = default_cpu_pool_threads(), int spin_iters = -1);
+  explicit CpuThreadPool(CpuPoolOptions opts);
   ~CpuThreadPool();
 
   CpuThreadPool(const CpuThreadPool&) = delete;
@@ -29,6 +75,11 @@ class CpuThreadPool {
   static CpuThreadPool& global();
 
   [[nodiscard]] int num_threads() const noexcept { return num_threads_; }
+  [[nodiscard]] int effective_spin_iters() const noexcept { return spin_iters_; }
+  [[nodiscard]] bool oversubscribed() const noexcept { return oversubscribed_; }
+  [[nodiscard]] bool workers_pinned() const noexcept { return workers_pinned_; }
+  [[nodiscard]] int primary_numa_node() const noexcept { return primary_numa_node_; }
+  [[nodiscard]] const std::vector<int>& assigned_cpus() const noexcept { return assigned_cpus_; }
 
   // Dispatches `fn(tid, active_threads, ctx)` for tid in [0, active_threads).
   // The caller executes tid = 0 and waits for every worker to acknowledge the dispatch.
@@ -64,8 +115,9 @@ class CpuThreadPool {
   }
 
  private:
+  void init(int num_threads, int spin_iters, int pin_workers);
   void stop_workers() noexcept;
-  void worker_loop(int tid);
+  void worker_loop(int tid, int cpu_id);
   void capture_exception() noexcept;
 
   struct alignas(64) SharedState {
@@ -81,10 +133,16 @@ class CpuThreadPool {
 
   int num_threads_ = 1;
   int spin_iters_ = 4000;
+  int primary_numa_node_ = -1;
+  bool oversubscribed_ = false;
+  bool workers_pinned_ = false;
+  std::vector<int> assigned_cpus_;
   SharedState state_{};
   std::mutex dispatch_mu_;
   std::mutex err_mu_;
   std::atomic<bool> has_err_{false};
+  std::atomic<std::uint32_t> ready_workers_{0};
+  std::atomic<std::uint32_t> pinned_workers_{0};
   std::exception_ptr err_;
   std::vector<std::thread> workers_;
 };

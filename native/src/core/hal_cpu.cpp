@@ -359,6 +359,8 @@ HostRegion::HostRegion(std::size_t bytes) {
   size_ = m.mapped_bytes;
   via_mmap_ = m.via_mmap;
   hugepage_advised_ = m.hugepage_advised;
+  numa_bound_ = m.numa_bound;
+  numa_node_ = m.numa_node;
   if (hugepages_enabled() && !hugepage_advised_) {
     spdlog::warn("HostRegion: madvise(MADV_HUGEPAGE) failed or unavailable");
   }
@@ -372,6 +374,8 @@ HostRegion::HostRegion(HostRegion&& other) noexcept
       registered_(std::exchange(other.registered_, false)),
       via_mmap_(std::exchange(other.via_mmap_, true)),
       hugepage_advised_(std::exchange(other.hugepage_advised_, false)),
+      numa_bound_(std::exchange(other.numa_bound_, false)),
+      numa_node_(std::exchange(other.numa_node_, -1)),
       device_(std::exchange(other.device_, nullptr)),
       register_seconds_(other.register_seconds_) {}
 
@@ -383,6 +387,8 @@ HostRegion& HostRegion::operator=(HostRegion&& other) noexcept {
     registered_ = std::exchange(other.registered_, false);
     via_mmap_ = std::exchange(other.via_mmap_, true);
     hugepage_advised_ = std::exchange(other.hugepage_advised_, false);
+    numa_bound_ = std::exchange(other.numa_bound_, false);
+    numa_node_ = std::exchange(other.numa_node_, -1);
     device_ = std::exchange(other.device_, nullptr);
     register_seconds_ = other.register_seconds_;
   }
@@ -404,6 +410,8 @@ void HostRegion::release() noexcept {
     size_ = 0;
     via_mmap_ = true;
     hugepage_advised_ = false;
+    numa_bound_ = false;
+    numa_node_ = -1;
   }
 }
 

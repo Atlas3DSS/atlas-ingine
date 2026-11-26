@@ -127,7 +127,7 @@ endif()
 ingine_add_component(src/serve)
 
 if(INGINE_BUILD_APPS)
-  foreach(app serve bench validate persona_probe)
+  foreach(app serve bench validate persona_probe pack)
     ingine_add_component(apps/${app})
   endforeach()
 endif()

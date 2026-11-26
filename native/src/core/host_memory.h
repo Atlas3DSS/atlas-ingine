@@ -33,6 +33,8 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
     [[nodiscard]] bool registered() const noexcept { return registered_; }
     [[nodiscard]] bool hugepage_advised() const noexcept { return hugepage_advised_; }
+    [[nodiscard]] bool numa_bound() const noexcept { return numa_bound_; }
+    [[nodiscard]] int numa_node() const noexcept { return numa_node_; }
     // Device-visible alias of data() when registered (UVA: equal to data()), else nullptr.
     [[nodiscard]] void* device_ptr() const noexcept { return device_; }
     // Seconds the last register_with_cuda() call took.
@@ -46,6 +48,8 @@ private:
     bool registered_         = false;
     bool via_mmap_           = true;
     bool hugepage_advised_   = false;
+    bool numa_bound_         = false;
+    int numa_node_           = -1;
     void* device_            = nullptr;
     double register_seconds_ = 0;
 };

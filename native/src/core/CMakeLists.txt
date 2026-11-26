@@ -11,6 +11,7 @@ if(INGINE_BACKEND STREQUAL "CUDA")
     safetensors_io.cpp
     safetensors_upload_cuda.cpp
     tensor.cpp
+    weight_pack.cpp
   )
   ingine_cuda_target(ingine_core)
   target_compile_definitions(ingine_core PUBLIC INGINE_BACKEND_CUDA=1 INGINE_BACKEND_CPU=0)
@@ -33,6 +34,7 @@ else()
     safetensors_io.cpp
     safetensors_upload_cpu.cpp
     tensor.cpp
+    weight_pack.cpp
   )
   target_compile_definitions(ingine_core PUBLIC INGINE_BACKEND_CUDA=0 INGINE_BACKEND_CPU=1)
   target_link_libraries(ingine_core PUBLIC

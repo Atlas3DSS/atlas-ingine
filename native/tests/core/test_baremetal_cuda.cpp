@@ -8,17 +8,30 @@
 #include "core/arena.h"
 #include "core/cpu_kernels.h"
 #include "core/cpu_pool.h"
+#include "core/fixture.h"
+#include "core/hal.h"
 #include "core/host_memory.h"
 #include "core/hugepage.h"
+#include "core/safetensors.h"
+#include "core/sha256.h"
+#include "core/weight_pack.h"
 #include "kernels/moe/moe.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -195,6 +208,85 @@ void test_cpu_gpu_exl3_parity() {
   }
 }
 
+void test_cuda_weight_pack_upload() {
+  std::printf("[3/3] Testing INGPACK1 -> CUDA DeviceUploader + UploadChunkObserver SHA-256 parity...\n");
+  ingine::test::TempDir tmp;
+  const auto model_dir = tmp.path / "cuda_pack";
+  std::filesystem::create_directories(model_dir);
+
+  const std::vector<ingine::test::FixtureTensor> tensors = {
+      {"small.scale", "F32", {64}, ingine::test::pattern_bytes(256, 301)},
+      {"small.bf16", "BF16", {16, 32}, ingine::test::pattern_bytes(1024, 302)},
+      {"large.w1", "BF16", {1024, 2048}, ingine::test::pattern_bytes(4 * 1024 * 1024, 303)},
+      {"large.w2", "F32", {1024, 1280}, ingine::test::pattern_bytes(5 * 1024 * 1024, 304)},
+  };
+  ingine::test::write_safetensors(model_dir / "model-00001-of-00001.safetensors", tensors, {{"format", "pt"}});
+  nlohmann::json idx = {{"metadata", {{"total_size", 0}}}, {"weight_map", nlohmann::json::object()}};
+  for (const auto& t : tensors) { idx["weight_map"][t.name] = "model-00001-of-00001.safetensors"; }
+  std::ofstream(model_dir / "model.safetensors.index.json") << idx.dump(2);
+
+  const auto pack_path = model_dir / "model.ingpack";
+  const auto st = ingine::WeightPackBuilder::pack_from_safetensors(model_dir, pack_path);
+  INGINE_CHECK(st.num_tensors == tensors.size());
+
+  cudaStream_t stream = nullptr;
+  INGINE_TEST_CUDA(cudaStreamCreate(&stream));
+
+  auto upload_model = [&](const std::filesystem::path& target) {
+    const ingine::SafetensorsModel model(target);
+    std::size_t total = 0;
+    for (const auto& t : tensors) { total += t.data.size(); }
+    ingine::DeviceBuffer dev(total);
+    dev.fill(0);
+    std::vector<ingine::UploadRequest> reqs;
+    std::size_t off = 0;
+    for (const auto& t : tensors) {
+      reqs.push_back(ingine::upload_request(model.at(t.name), static_cast<std::byte*>(dev.p) + off));
+      off += t.data.size();
+    }
+    ingine::UploadOptions opts;
+    opts.chunk_bytes     = 1u << 20;
+    opts.staging_buffers = 4;
+    opts.reader_threads  = 2;
+    ingine::DeviceUploader up(opts);
+
+    std::map<std::pair<std::size_t, std::size_t>, std::array<std::uint8_t, 32>> shas;
+    std::mutex mu;
+    const auto stats = up.upload(
+        reqs, static_cast<ingine::hal::StreamHandle>(stream),
+        [&](std::size_t ri, std::size_t ci, const void* data, std::size_t bytes) {
+          const auto d = ingine::sha256_bytes(data, bytes);
+          std::lock_guard<std::mutex> lk(mu);
+          shas.emplace(std::make_pair(ri, ci), d);
+        });
+    INGINE_CHECK(stats.bytes == total);
+    std::vector<std::uint8_t> host_back(total);
+    dev.copy_to_host(host_back.data(), host_back.size());
+    return std::make_pair(std::move(host_back), std::move(shas));
+  };
+
+  {
+    const ingine::SafetensorsModel auto_m(model_dir);
+    INGINE_CHECK(auto_m.is_weight_pack());
+  }
+  const char* prev_disable = ::getenv("INGINE_DISABLE_WEIGHT_PACK");
+  const std::string saved_disable = prev_disable ? prev_disable : "";
+  const bool had_disable = (prev_disable != nullptr);
+
+  ::unsetenv("INGINE_DISABLE_WEIGHT_PACK");
+  auto [pk_bytes, pk_shas] = upload_model(model_dir);
+
+  ::setenv("INGINE_DISABLE_WEIGHT_PACK", "1", 1);
+  auto [st_bytes, st_shas] = upload_model(model_dir);
+
+  if (had_disable) { ::setenv("INGINE_DISABLE_WEIGHT_PACK", saved_disable.c_str(), 1); }
+  else { ::unsetenv("INGINE_DISABLE_WEIGHT_PACK"); }
+
+  INGINE_CHECK(pk_bytes == st_bytes);
+  INGINE_CHECK(pk_shas == st_shas);
+  INGINE_TEST_CUDA(cudaStreamDestroy(stream));
+}
+
 }  // namespace
 
 int main() {
@@ -208,6 +300,7 @@ int main() {
 
   test_cuda_hugepage_host_buffers();
   test_cpu_gpu_exl3_parity();
+  test_cuda_weight_pack_upload();
   std::printf("core_baremetal_cuda: ALL PASSED\n");
   return 0;
 }
