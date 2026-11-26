@@ -5,26 +5,35 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+// Active runtime check (never compiled out by -DNDEBUG).
+#define CHECK(cond)                                                                           \
+  do {                                                                                        \
+    if (!(cond)) {                                                                            \
+      std::cerr << "CHECK FAILED at " << __FILE__ << ":" << __LINE__ << ": " #cond << "\n";  \
+      std::exit(1);                                                                           \
+    }                                                                                         \
+  } while (0)
 
 namespace {
 
 using Json = nlohmann::ordered_json;
 using namespace ingine::text;
 
-// Minimal synthetic byte-level BPE tokenizer JSON (valid for Tokenizer::from_json) covering ASCII +
-// multi-byte JSON chunks + Inkling-2 special tokens.
+// Minimal synthetic byte-level BPE tokenizer JSON (valid for Tokenizer::from_json) covering all 256
+// single-byte tokens + multi-byte JSON chunks + Inkling-2 special tokens.
 std::string make_test_tokenizer_json() {
   Json vocab = Json::object();
   int next_id = 0;
-  // Emit all 256 GPT-2 ByteLevel single-byte tokens (required by Tokenizer::from_json).
   auto encode_cp_utf8 = [](int cp) -> std::string {
     std::string s;
     if (cp < 0x80) {
@@ -41,7 +50,6 @@ std::string make_test_tokenizer_json() {
     const int cp = visible ? b : next_cp++;
     vocab[encode_cp_utf8(cp)] = next_id++;
   }
-  // Multi-byte tokens (to verify multi-byte delimiter transitions & BPE chunk soundness)
   const char* chunks[] = {
       "true", "false", "null", "hello", "world", "status", "score", "tags", "ok", "fail",
       "42,", "123}", "\"ok\"", "\",", "\":", "},", "]}", "01", "```json", "You",
@@ -110,8 +118,31 @@ std::int32_t tok_id(const Tokenizer& tok, std::string_view piece) {
 void feed_pieces(ingine::model::TokenMasker& fsm, const Tokenizer& tok, const std::vector<std::string_view>& pieces) {
   for (std::string_view p : pieces) {
     const std::int32_t id = tok_id(tok, p);
-    assert(is_allowed(fsm, id));
+    CHECK(is_allowed(fsm, id));
     fsm.advance(id);
+  }
+}
+
+bool accepts_byte_payload(const Tokenizer& tok, const std::shared_ptr<const VocabByteIndex>& vocab,
+                          const std::vector<std::int32_t>& prompt, std::int32_t end_id, const Json& schema,
+                          std::string_view payload) {
+  const auto mode = schema.is_null() ? JsonFormatMode::JsonObject : JsonFormatMode::JsonSchema;
+  auto masker = make_json_fsm(vocab, {mode, schema}, prompt);
+  for (char byte : payload) {
+    const std::int32_t id = tok_id(tok, std::string_view(&byte, 1));
+    if (!is_allowed(*masker, id)) return false;
+    masker->advance(id);
+  }
+  return is_allowed(*masker, end_id);
+}
+
+bool schema_is_rejected(const std::shared_ptr<const VocabByteIndex>& vocab, const std::vector<std::int32_t>& prompt,
+                        const Json& schema) {
+  try {
+    (void)make_json_fsm(vocab, {JsonFormatMode::JsonSchema, schema}, prompt);
+    return false;
+  } catch (const std::invalid_argument&) {
+    return true;
   }
 }
 
@@ -121,48 +152,41 @@ void test_thinking_channel_unconstrained_then_json_object() {
       *tok.token_id(END_SAMPLING), *tok.token_id(ENDOFTEXT), *tok.token_id(MESSAGE_USER)};
   auto vocab = VocabByteIndex::build(tok, stops);
 
-  // Prefill ends in <|content_thinking|>: FSM must stay inactive during thinking!
   const std::vector<std::int32_t> prefill = {*tok.token_id(MESSAGE_MODEL), *tok.token_id(CONTENT_THINKING)};
   JsonFormatSpec spec{JsonFormatMode::JsonObject, Json()};
   auto fsm = make_json_fsm(vocab, spec, prefill);
-  assert(fsm != nullptr);
-  assert(!fsm->is_active());
+  CHECK(fsm != nullptr);
+  CHECK(!fsm->is_active());
 
-  // Thinking prose + transition into <|content_text|>
   fsm->advance(tok_id(tok, "You"));
-  assert(!fsm->is_active());
+  CHECK(!fsm->is_active());
   fsm->advance(*tok.token_id(END_MESSAGE));
   fsm->advance(*tok.token_id(MESSAGE_MODEL));
-  assert(!fsm->is_active());
+  CHECK(!fsm->is_active());
   fsm->advance(*tok.token_id(CONTENT_TEXT));
-  assert(fsm->is_active());
+  CHECK(fsm->is_active());
 
-  // At start of JSON object: '{' allowed; markdown fence / prose / '[' / '0' disallowed!
-  assert(is_allowed(*fsm, tok_id(tok, "{")));
-  assert(!is_allowed(*fsm, tok_id(tok, "```json")));
-  assert(!is_allowed(*fsm, tok_id(tok, "You")));
-  assert(!is_allowed(*fsm, tok_id(tok, "[")));
-  assert(!is_allowed(*fsm, tok_id(tok, "0")));
+  CHECK(is_allowed(*fsm, tok_id(tok, "{")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "```json")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "You")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "[")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "0")));
 
-  // Feed valid JSON with multi-byte tokens ("42,", "123}", escapes, nested array)
   feed_pieces(*fsm, tok, {"{", "\"", "score", "\":", "42,", "\"", "tags", "\":", "[", "\"", "a", "\\", "n", "\"", ",", "true", "]", ",", "\"", "ok", "\":", "123}"});
 
-  // Leading-zero check on separate fresh FSM
   const std::vector<std::int32_t> content_prefill = {*tok.token_id(CONTENT_TEXT)};
   auto fsm2 = make_json_fsm(vocab, spec, content_prefill);
   feed_pieces(*fsm2, tok, {"{", "\"", "a", "\":"});
-  assert(!is_allowed(*fsm2, tok_id(tok, "01")));  // RFC 8259 forbids leading zeros!
-  assert(is_allowed(*fsm2, tok_id(tok, "0")));
+  CHECK(!is_allowed(*fsm2, tok_id(tok, "01")));
+  CHECK(is_allowed(*fsm2, tok_id(tok, "0")));
 
-  // Top-level object complete on fsm: non-ws disallowed, <|end_message|> allowed!
-  assert(!is_allowed(*fsm, tok_id(tok, "{")));
-  assert(!is_allowed(*fsm, tok_id(tok, "You")));
-  assert(is_allowed(*fsm, *tok.token_id(END_MESSAGE)));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "{")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "You")));
+  CHECK(is_allowed(*fsm, *tok.token_id(END_MESSAGE)));
   fsm->advance(*tok.token_id(END_MESSAGE));
 
-  // After <|end_message|>: only stop/EOS tokens allowed
-  assert(!is_allowed(*fsm, tok_id(tok, "{")));
-  assert(is_allowed(*fsm, *tok.token_id(END_SAMPLING)));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "{")));
+  CHECK(is_allowed(*fsm, *tok.token_id(END_SAMPLING)));
   std::cout << "[PASS] test_thinking_channel_unconstrained_then_json_object\n";
 }
 
@@ -185,47 +209,39 @@ void test_strict_json_schema_required_enum_integer_and_no_duplicates() {
   JsonFormatSpec spec{JsonFormatMode::JsonSchema, schema};
   const std::vector<std::int32_t> content_prefill = {*tok.token_id(CONTENT_TEXT)};
   auto fsm = make_json_fsm(vocab, spec, content_prefill);
-  assert(fsm->is_active());
+  CHECK(fsm->is_active());
 
   feed_pieces(*fsm, tok, {"{"});
-  // Cannot close '}' while required keys are missing!
-  assert(!is_allowed(*fsm, tok_id(tok, "}")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "}")));
   feed_pieces(*fsm, tok, {"\""});
-  // Only keys matching unused schema properties ("status", "score", "tags") are allowed!
-  assert(is_allowed(*fsm, tok_id(tok, "status")));
-  assert(is_allowed(*fsm, tok_id(tok, "score")));
-  assert(!is_allowed(*fsm, tok_id(tok, "hello")));  // disallowed extra property!
+  CHECK(is_allowed(*fsm, tok_id(tok, "status")));
+  CHECK(is_allowed(*fsm, tok_id(tok, "score")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "hello")));
 
   feed_pieces(*fsm, tok, {"status", "\":"});
-  // Enum allows ONLY "\"ok\"" or "\"fail\"" (not "\"hello\"" or number!)
-  assert(is_allowed(*fsm, tok_id(tok, "\"ok\"")));
-  assert(!is_allowed(*fsm, tok_id(tok, "true")));
-  assert(!is_allowed(*fsm, tok_id(tok, "0")));
+  CHECK(is_allowed(*fsm, tok_id(tok, "\"ok\"")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "true")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "0")));
   feed_pieces(*fsm, tok, {"\"ok\""});
 
-  // Still missing required "score": '}' MUST be disallowed, ',' MUST be allowed!
-  assert(!is_allowed(*fsm, tok_id(tok, "}")));
-  assert(is_allowed(*fsm, tok_id(tok, ",")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "}")));
+  CHECK(is_allowed(*fsm, tok_id(tok, ",")));
   feed_pieces(*fsm, tok, {",", "\""});
 
-  // "status" already used -> duplicate key MUST be disallowed!
-  assert(!is_allowed(*fsm, tok_id(tok, "status")));
-  assert(is_allowed(*fsm, tok_id(tok, "score")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "status")));
+  CHECK(is_allowed(*fsm, tok_id(tok, "score")));
   feed_pieces(*fsm, tok, {"score", "\":", "4"});
-  // Integer forbids decimal point '.' and exponent 'e'!
-  assert(!is_allowed(*fsm, tok_id(tok, ".")));
-  assert(!is_allowed(*fsm, tok_id(tok, "e")));
-  assert(is_allowed(*fsm, tok_id(tok, "2")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, ".")));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "e")));
+  CHECK(is_allowed(*fsm, tok_id(tok, "2")));
   feed_pieces(*fsm, tok, {"2"});
 
-  // Now both required keys ("status", "score") are satisfied: '}' AND ',' (for optional "tags") both allowed!
-  assert(is_allowed(*fsm, tok_id(tok, "}")));
-  assert(is_allowed(*fsm, tok_id(tok, ",")));
+  CHECK(is_allowed(*fsm, tok_id(tok, "}")));
+  CHECK(is_allowed(*fsm, tok_id(tok, ",")));
   feed_pieces(*fsm, tok, {",", "\"", "tags", "\":", "[", "\"", "hello", "\"", "]", "}"});
 
-  // Complete -> end_message allowed, extra '{' disallowed.
-  assert(!is_allowed(*fsm, tok_id(tok, "{")));
-  assert(is_allowed(*fsm, *tok.token_id(END_MESSAGE)));
+  CHECK(!is_allowed(*fsm, tok_id(tok, "{")));
+  CHECK(is_allowed(*fsm, *tok.token_id(END_MESSAGE)));
   std::cout << "[PASS] test_strict_json_schema_required_enum_integer_and_no_duplicates\n";
 }
 
@@ -249,12 +265,192 @@ void test_ref_and_nullable_union() {
   const std::vector<std::int32_t> content_prefill = {*tok.token_id(CONTENT_TEXT)};
   auto fsm_null = make_json_fsm(vocab, spec, content_prefill);
   feed_pieces(*fsm_null, tok, {"{", "\"", "ok", "\":"});
-  assert(is_allowed(*fsm_null, tok_id(tok, "null")));
-  assert(is_allowed(*fsm_null, tok_id(tok, "\"")));
-  assert(!is_allowed(*fsm_null, tok_id(tok, "0")));
+  CHECK(is_allowed(*fsm_null, tok_id(tok, "null")));
+  CHECK(is_allowed(*fsm_null, tok_id(tok, "\"")));
+  CHECK(!is_allowed(*fsm_null, tok_id(tok, "0")));
   feed_pieces(*fsm_null, tok, {"null", "}"});
-  assert(is_allowed(*fsm_null, *tok.token_id(END_MESSAGE)));
+  CHECK(is_allowed(*fsm_null, *tok.token_id(END_MESSAGE)));
   std::cout << "[PASS] test_ref_and_nullable_union\n";
+}
+
+void test_oneof_exact_semantics() {
+  const Tokenizer tok = Tokenizer::from_json(make_test_tokenizer_json());
+  const std::int32_t end = *tok.token_id(END_SAMPLING);
+  const std::vector<std::int32_t> stops{end}, prompt{*tok.token_id(CONTENT_TEXT)};
+  auto vocab = VocabByteIndex::build(tok, stops);
+
+  const Json overlap = Json::parse(R"({"oneOf":[{"type":"integer"},{"type":"number"}]})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, overlap, "3"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, overlap, "3 "));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, overlap, "3.0"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, overlap, "3e0"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, overlap, "3.5"));
+
+  const Json literals = Json::parse(R"({"oneOf":[{"type":"string"},{"const":"a"}]})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, literals, R"("\u0061")"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, literals, R"("\u0062")"));
+
+  const Json bools = Json::parse(R"({"oneOf":[{"type":"boolean"},{"const":true}]})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, bools, "tru"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, bools, "true"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, bools, "false"));
+
+  const Json reordered = Json::parse(R"({"oneOf":[{"type":"object"},{"const":{"a":1,"b":2}}]})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, reordered, R"({"b":2,"a":1})"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, reordered, R"({"b":1,"a":2})"));
+
+  const Json wrapped = Json::parse(R"({
+    "type": "object",
+    "properties": {"v": {"oneOf": [{"type": "integer"}, {"type": "number"}]}},
+    "required": ["v"],
+    "additionalProperties": false
+  })");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, wrapped, R"({"v":3})"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, wrapped, R"({"v":3.0})"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, wrapped, R"({"v":3.5})"));
+
+  const Json disjoint = Json::parse(R"({"oneOf":[{"type":"boolean"},{"type":"null"}]})");
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, disjoint, "null"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, disjoint, "true"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, disjoint, "1"));
+
+  const Json obj_oneof = Json::parse(R"({
+    "oneOf": [
+      {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+      {"type": "object", "properties": {"b": {"type": "integer"}}, "required": ["b"]}
+    ]
+  })");
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, obj_oneof, R"({"a":1})"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, obj_oneof, R"({"b":2})"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, obj_oneof, R"({"a":1,"b":2})"));
+  std::cout << "[PASS] test_oneof_exact_semantics\n";
+}
+
+void test_many_properties_and_escaped_open_keys() {
+  const Tokenizer tok = Tokenizer::from_json(make_test_tokenizer_json());
+  const std::int32_t end = *tok.token_id(END_SAMPLING);
+  const std::vector<std::int32_t> stops{end}, prompt{*tok.token_id(CONTENT_TEXT)};
+  auto vocab = VocabByteIndex::build(tok, stops);
+
+  // >64 properties: 65th property ("k64") is required and deduplicated
+  Json many = Json::parse(R"({"type":"object","properties":{},"required":["k64"],"additionalProperties":false})");
+  for (int i = 0; i < 70; ++i) many["properties"]["k" + std::to_string(i)] = {{"type", "integer"}};
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, many, "{}"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, many, R"({"k64":7})"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, many, R"({"k64":7,"k64":8})"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, many, R"({"k0":1,"k64":7,"k69":9})"));
+
+  // Escaped key spelling in open object must preserve declared property type and reject duplicates
+  const Json note = Json::parse(R"({"type":"object","properties":{"a":{"type":"integer"}}})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, note, R"({"\u0061":false})"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, note, R"({"\u0061":1})"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, note, R"({"a":1,"\u0061":2})"));
+
+  // Open object duplicate undeclared keys rejected (plain and escaped)
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, nullptr, R"({"v":1,"v":2})"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, nullptr, R"({"v":1,"\u0076":2})"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, nullptr, R"({"v":1,"w":2})"));
+  std::cout << "[PASS] test_many_properties_and_escaped_open_keys\n";
+}
+
+void test_utf8_and_surrogates() {
+  const Tokenizer tok = Tokenizer::from_json(make_test_tokenizer_json());
+  const std::int32_t end = *tok.token_id(END_SAMPLING);
+  const std::vector<std::int32_t> stops{end}, prompt{*tok.token_id(CONTENT_TEXT)};
+  auto vocab = VocabByteIndex::build(tok, stops);
+
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, nullptr, std::string("{\"v\":\"\x80\"}")));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, nullptr, std::string("{\"v\":\"\xe2\"}")));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, nullptr, std::string("{\"v\":\"\xc0\xaf\"}")));  // overlong
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, nullptr, std::string("{\"v\":\"\xed\xa0\x80\"}")));  // UTF-8 surrogate
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, nullptr, std::string("{\"\x80\":1}")));  // invalid UTF-8 in key
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, nullptr, std::string("{\"v\":\"\xe2\x82\xac\"}")));  // €
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, nullptr, std::string("{\"v\":\"\xf0\x9f\x98\x80\"}")));  // 😀
+  // UTF-16 surrogate pair in \uXXXX
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, nullptr, R"({"v":"\uD83D\uDE00"})"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, nullptr, R"({"v":"\uD83D"})"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, nullptr, R"({"v":"\uDE00"})"));
+  std::cout << "[PASS] test_utf8_and_surrogates\n";
+}
+
+void test_assertions_conjunctions_and_rejections() {
+  const Tokenizer tok = Tokenizer::from_json(make_test_tokenizer_json());
+  const std::int32_t end = *tok.token_id(END_SAMPLING);
+  const std::vector<std::int32_t> stops{end}, prompt{*tok.token_id(CONTENT_TEXT)};
+  auto vocab = VocabByteIndex::build(tok, stops);
+
+  // Numeric bounds
+  const Json min2 = Json::parse(R"({"type":"integer","minimum":2})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, min2, "1"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, min2, "-5"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, min2, "2"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, min2, "10"));
+
+  const Json range_num = Json::parse(R"({"type":"number","minimum":0.0,"maximum":50.0})");
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, range_num, "0"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, range_num, "49.5"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, range_num, "-1"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, range_num, "50.5"));
+
+  // String length (in Unicode codepoints) & Array item bounds
+  const Json str_len = Json::parse(R"({"type":"string","minLength":2,"maxLength":3})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, str_len, R"("a")"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, str_len, R"("ab")"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, str_len, std::string("\"a\xe2\x82\xac\"")));  // 2 codepoints
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, str_len, R"("abcd")"));
+
+  const Json arr_len = Json::parse(R"({"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":3})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, arr_len, "[]"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, arr_len, "[1]"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, arr_len, "[1,2]"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, arr_len, "[1,2,3]"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, arr_len, "[1,2,3,4]"));
+
+  // Type + enum conjunction
+  const Json str_enum = Json::parse(R"({"type":"string","enum":[42,"ok"]})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, str_enum, "42"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, str_enum, R"("ok")"));
+
+  // Exact >2^53 64-bit signed & unsigned integer bounds + exact arbitrary-precision fractional bounds
+  const Json large_min = Json::parse(R"({"type":"integer","minimum":9007199254740993})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, large_min, "9007199254740992"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, large_min, "9007199254740993"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, large_min, "9007199254740994"));
+
+  const Json min_uint = Json::parse(R"({"type":"integer","minimum":18446744073709551615})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, min_uint, "0"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, min_uint, "18446744073709551615"));
+
+  const Json max_uint = Json::parse(R"({"type":"integer","maximum":9223372036854775808})");
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, max_uint, "0"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, max_uint, "9223372036854775808"));
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, max_uint, "9223372036854775809"));
+
+  const Json lower_half = Json::parse(R"({"type":"number","minimum":0.5})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, lower_half, "0.49999999999999999"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, lower_half, "0.5"));
+
+  const Json upper_half = Json::parse(R"({"type":"number","maximum":0.5})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, upper_half, "0.50000000000000001"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, upper_half, "0.5"));
+
+  const Json strict_half = Json::parse(R"({"type":"number","exclusiveMinimum":0.5})");
+  CHECK(!accepts_byte_payload(tok, vocab, prompt, end, strict_half, "0.5"));
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, strict_half, "0.50000000000000001"));
+
+  const Json typed_oneof = Json::parse(R"({"oneOf":[{"type":"integer"},{"type":"number"}]})");
+  CHECK(accepts_byte_payload(tok, vocab, prompt, end, typed_oneof, "1.0000000000000000001"));
+
+  // Explicit rejection of unresolved $ref, unsupported keywords, unrepresentable float bounds (>=2^53), and unsatisfiable schemas
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"$ref":"#/$defs/absent"})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"string","pattern":"^[a-z]+$"})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"allOf":[{"type":"string"}]})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"integer","minimum":10,"maximum":5})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"string","enum":[42]})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"integer","const":-1,"enum":[18446744073709551615]})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"integer","minimum":1e30})")));
+  CHECK(schema_is_rejected(vocab, prompt, Json::parse(R"({"type":"number","minimum":9007199254740993.0})")));
+  std::cout << "[PASS] test_assertions_conjunctions_and_rejections\n";
 }
 
 }  // namespace
@@ -263,6 +459,10 @@ int main() {
   test_thinking_channel_unconstrained_then_json_object();
   test_strict_json_schema_required_enum_integer_and_no_duplicates();
   test_ref_and_nullable_union();
+  test_oneof_exact_semantics();
+  test_many_properties_and_escaped_open_keys();
+  test_utf8_and_surrogates();
+  test_assertions_conjunctions_and_rejections();
   std::cout << "ALL test_json_fsm TESTS PASSED\n";
   return 0;
 }

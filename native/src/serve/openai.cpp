@@ -528,7 +528,11 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   }
   // Token-level JSON / JSON-Schema FSM masker (nullptr for default/text -> zero overhead).
   if (parsed_rf.spec.mode != text::JsonFormatMode::None) {
-    req.sampling.logit_masker = fmt.make_json_masker(parsed_rf.spec, prompt.prefill_ids);
+    try {
+      req.sampling.logit_masker = fmt.make_json_masker(parsed_rf.spec, prompt.prefill_ids);
+    } catch (const std::invalid_argument& e) {
+      throw BadRequest(e.what(), "response_format");
+    }
   }
 
   if (const Json* stop = get(body, "stop")) {

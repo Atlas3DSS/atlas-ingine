@@ -941,10 +941,24 @@ void test_response_format_and_tool_ban() {
     CHECK(std::find(ban.begin(), ban.end(), think_tok) == ban.end());
   }
 
-  // Invalid response_format -> 400
+  // Invalid response_format & unsupported/unsatisfiable json_schema -> explicit 400 before generation
   CHECK(chat(s->port(), {{"response_format", "json_object"}}).status == 400);
   CHECK(chat(s->port(), {{"response_format", {{"type", "xml"}}}}).status == 400);
   CHECK(chat(s->port(), {{"response_format", {{"type", "json_schema"}}}}).status == 400);
+  CHECK(chat(s->port(), {{"response_format",
+                          {{"type", "json_schema"},
+                           {"json_schema", {{"name", "bad_ref"}, {"schema", {{"$ref", "#/$defs/absent"}}}}}}}})
+            .status == 400);
+  CHECK(chat(s->port(), {{"response_format",
+                          {{"type", "json_schema"},
+                           {"json_schema",
+                            {{"name", "bad_kw"}, {"schema", {{"type", "string"}, {"pattern", "^[a-z]+$"}}}}}}}})
+            .status == 400);
+  CHECK(chat(s->port(), {{"response_format",
+                          {{"type", "json_schema"},
+                           {"json_schema",
+                            {{"name", "unsat"}, {"schema", {{"type", "integer"}, {"minimum", 10}, {"maximum", 5}}}}}}}})
+            .status == 400);
 }
 
 void test_persona_control_plane() {
