@@ -36,6 +36,8 @@ inline constexpr int HEADS = TOTAL_HEADS / TP_SIZE, KV_HEADS = TOTAL_KV_HEADS / 
 inline constexpr int SEG_SINK_PAD = (HEADS + 7) & ~7;
 inline constexpr int D_REL = 16, REL_EXTENT = 1024, WINDOW = 1024;
 inline constexpr int INTER = 1152, EXPERTS = 128, TOP_K = 8;
+// expert intermediate rows this rank holds (expert tensor parallelism: INTER / TP_SIZE of every expert)
+inline constexpr int INTER_LOCAL = INTER / (INGINE_TP_ETP ? INGINE_TP_SIZE : 1);
 inline constexpr int CONV_K = 4;
 inline constexpr int LAYERS = 24, BLOCK = 6;
 inline constexpr int LOOP_START = 6, LOOP_END = 18, PASSES = 3, MAX_PASSES = 8;

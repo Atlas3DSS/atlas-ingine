@@ -24,7 +24,8 @@ inline constexpr int kKvDim = kKvHeads * kHeadDim;  // 1024
 inline constexpr int kKvQ4NibbleBytes = kKvDim / 2;              // 512
 inline constexpr int kKvQ4ScaleBytes = kKvHeads * (kHeadDim / 32) * 2;  // 64
 inline constexpr int kKvQ4RowBytes = kKvQ4NibbleBytes + kKvQ4ScaleBytes;  // 576
-inline constexpr int kInter = 1152, kExperts = 128, kTopK = 8;
+// kInter: the expert intermediate size this rank holds (1152, or 1152 / TP with expert tensor parallelism)
+inline constexpr int kInter = 1152 / (INGINE_TP_ETP ? kTpSize : 1), kExperts = 128, kTopK = 8;
 inline constexpr int kAttnKeyTile = 64;    // keys per attention tile (tile bounds granularity)
 inline constexpr int kAttnMaxTiles = 64;   // explicit-position key tiles per call (ring + chunk)
 
