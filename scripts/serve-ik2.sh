@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 # Serve Inkling-2-Mini (UD-IQ4_XS + DSpark drafter) on GPUs 2+3, OpenAI-compatible.
 #
-# This is the campaign's best measured config, lifted from the benchmark line:
+# This is the campaign's best measured production config, lifted from:
 #   inkling-2-mini-atlas-ingine-2026-11-26, HANDOFF.md "Best config"
-#   4 x 256K = 1M KV token pool, FP4 values / FP8 keys, 4-way batching, spec decode.
+#   4 x 256K = 1M KV token pool, FP4 values / FP8 keys, 4-way batching, DSpark spec decode,
+#   closed-loop interleaved chunked prefill (mixed read+decode >= 80% of 0R/4D),
+#   and zero-copy paged prefix cache in pre-registered pinned host RAM (0 MiB VRAM).
 #
-# Measured with ingine-bench at 4K depth: 295.3 tok/s aggregate, 311.4 steady
-# (77.9 tok/s/stream), prefill 3143 tok/s, verify 23.7 ms.
+# VRAM headroom (2x V100-PCIE-16GB): ~260 MiB free on GPU 2, ~600 MiB free on GPU 3
+# (prefill-chunk 1024 avoids the 2 MiB VRAM cliff of chunk 2048 while matching/beating decode).
+#
+# Measured live HTTP SSE on 2x V100:
+#   0R/4D: 79.1-80.4 tok/s/req (316-322 agg)
+#   3R/1D: 65.8-69.2 tok/s/req (83-94% of 0R/4D; warm 22.8K prefill ~20,178 tok/s eff)
+#   2R/2D: 62.9-73.4 tok/s/req (80-96% of 0R/4D; warm 22.8K prefill ~15,568 tok/s eff)
+#   1R/3D: 63.4-68.0 tok/s/req (80-92% of 0R/4D; warm 22.8K prefill ~10,813 tok/s eff)
 #
 # GPUs 2 and 3 ONLY (CUDA_VISIBLE_DEVICES). The binary is the TP2/ETP build;
 # TP_SIZE is compile-time, so device selection is entirely CUDA_VISIBLE_DEVICES.
@@ -33,12 +41,15 @@ exec numactl --membind=1 --physcpubind=14-27,42-55,0-10,28-38 \
     --max-ctx 262144 \
     --max-kv-tokens 1048576 \
     --kv-fp4v \
-    --prefill-chunk 2048 \
+    --prefill-chunk 1024 \
+    --prefill-interleave-chunk 512 \
+    --mixed-decode-ratio 0.80 \
     --spec \
     --no-vision \
     --draft-ctx 8192 \
     --max-batch 4 \
     --max-queue 8 \
     --park-mb 0 \
+    --park-host-mb 2048 \
     --log-level info \
     "$@"
