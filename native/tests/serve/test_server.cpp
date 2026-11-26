@@ -1693,6 +1693,160 @@ void test_kv_cache_mode_advertisement() {
   }
 }
 
+void test_anthropic_messages_api() {
+  auto parse_anthropic_sse = [](const std::string& raw) {
+    std::vector<std::pair<std::string, Json>> events;
+    std::string cur_ev;
+    std::size_t pos = 0;
+    while (pos < raw.size()) {
+      std::size_t nl = raw.find('\n', pos);
+      std::string line = (nl == std::string::npos) ? raw.substr(pos) : raw.substr(pos, nl - pos);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      pos = (nl == std::string::npos) ? raw.size() : nl + 1;
+      if (line.starts_with("event: ")) cur_ev = line.substr(7);
+      else if (line.starts_with("data: ")) events.emplace_back(cur_ev, Json::parse(line.substr(6)));
+    }
+    return events;
+  };
+
+  // 1. Non-streaming text + thinking + system block array + count_tokens + stop_sequences.
+  {
+    auto s = serve(THINK_TEXT);
+    const Json body = {
+        {"model", "inkling-test"},
+        {"max_tokens", 256},
+        {"system", Json::array({{{"type", "text"}, {"text", "Be brief."}, {"cache_control", {{"type", "ephemeral"}}}}})},
+        {"messages", Json::array({{{"role", "user"}, {"content", Json::array({{{"type", "text"}, {"text", "Hi!"}}})}}})},
+        {"stop_sequences", Json::array({"STOP"})},
+    };
+    Response r = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(body));
+    CHECK(r.status == 200);
+    const Json j = Json::parse(r.body);
+    CHECK(j["type"] == "message" && j["role"] == "assistant" && j["model"] == "inkling-test");
+    CHECK(j["id"].get<std::string>().starts_with("msg_"));
+    CHECK(j["stop_reason"] == "end_turn");
+    CHECK(j["content"].size() == 2);
+    CHECK(j["content"][0]["type"] == "thinking");
+    CHECK(j["content"][0]["thinking"].get<std::string>().find("Let me think") != std::string::npos);
+    CHECK(j["content"][1]["type"] == "text");
+    CHECK(j["content"][1]["text"].get<std::string>().find("STOP") == std::string::npos);
+    CHECK(j["usage"]["input_tokens"].get<int>() > 0 && j["usage"]["output_tokens"].get<int>() > 0);
+
+    // /v1/messages/count_tokens matches input_tokens without requiring max_tokens.
+    Json count_body = body;
+    count_body.erase("max_tokens");
+    Response cr = request(s->port(), "POST", "/v1/messages/count_tokens", ingine::serve::dump(count_body));
+    CHECK(cr.status == 200);
+    CHECK(Json::parse(cr.body)["input_tokens"].get<int>() == j["usage"]["input_tokens"].get<int>());
+  }
+
+  // 2. Streaming SSE reconstruction matches non-streaming for thinking + tool_use blocks.
+  {
+    auto s = serve(TOOL_TEXT);
+    const Json tools = Json::array({
+        {{"name", "get_weather"},
+         {"description", "Get weather"},
+         {"input_schema", {{"type", "object"}, {"properties", {{"city", {{"type", "string"}}}}}}}},
+        {{"name", "search"}, {"input_schema", {{"type", "object"}}}},
+    });
+    const Json base = {
+        {"model", "inkling-test"},
+        {"max_tokens", 256},
+        {"tools", tools},
+        {"messages", Json::array({{{"role", "user"}, {"content", "Weather in Sao Paulo?"}}})},
+    };
+    Response nr = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(base));
+    CHECK(nr.status == 200);
+    const Json nj = Json::parse(nr.body);
+    CHECK(nj["stop_reason"] == "tool_use");
+    CHECK(nj["content"].size() == 3);
+    CHECK(nj["content"][0]["type"] == "thinking");
+    CHECK(nj["content"][1]["type"] == "tool_use" && nj["content"][1]["name"] == "get_weather");
+    CHECK(nj["content"][1]["input"]["days"] == 3);
+    CHECK(nj["content"][2]["type"] == "tool_use" && nj["content"][2]["name"] == "search");
+    CHECK(nj["content"][2]["input"]["q"] == "rain");
+
+    Json sbody = base;
+    sbody["stream"] = true;
+    Response sr = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(sbody));
+    CHECK(sr.status == 200);
+    const auto evs = parse_anthropic_sse(sr.body);
+    CHECK(!evs.empty() && evs.front().first == "message_start" && evs.back().first == "message_stop");
+    std::string s_thinking, s_stop;
+    std::map<int, std::string> tool_names, tool_json;
+    for (const auto& [ev, d] : evs) {
+      if (ev == "content_block_start" && d["content_block"]["type"] == "tool_use") {
+        tool_names[d["index"].get<int>()] = d["content_block"]["name"].get<std::string>();
+      } else if (ev == "content_block_delta") {
+        const auto& dl = d["delta"];
+        if (dl["type"] == "thinking_delta") s_thinking += dl["thinking"].get<std::string>();
+        else if (dl["type"] == "input_json_delta") tool_json[d["index"].get<int>()] += dl["partial_json"].get<std::string>();
+      } else if (ev == "message_delta") {
+        s_stop = d["delta"]["stop_reason"].get<std::string>();
+      }
+    }
+    CHECK(s_thinking == nj["content"][0]["thinking"].get<std::string>());
+    CHECK(s_stop == "tool_use");
+    CHECK(tool_names.size() == 2 && tool_names[1] == "get_weather" && tool_names[2] == "search");
+    CHECK(Json::parse(tool_json[1]) == nj["content"][1]["input"]);
+    CHECK(Json::parse(tool_json[2]) == nj["content"][2]["input"]);
+
+    // Multi-turn tool_use + tool_result round trip renders cleanly.
+    const Json follow = {
+        {"model", "inkling-test"},
+        {"max_tokens", 64},
+        {"tools", tools},
+        {"messages",
+         Json::array({
+             {{"role", "user"}, {"content", "Weather?"}},
+             {{"role", "assistant"}, {"content", nj["content"]}},
+             {{"role", "user"},
+              {"content",
+               Json::array({{{"type", "tool_result"},
+                             {"tool_use_id", nj["content"][1]["id"]},
+                             {"content", Json::array({{{"type", "text"}, {"text", "24C sunny"}}})}},
+                            {{"type", "text"}, {"text", "Summarize."}}})}},
+         })},
+    };
+    Response fr = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(follow));
+    CHECK(fr.status == 200);
+  }
+
+  // 3. Thinking disabled, error envelope, and x-api-key / metadata.user_id prefix-cache fail-closed isolation.
+  {
+    auto s = serve(THINK_TEXT);
+    const Json missing_max = {{"model", "inkling-test"}, {"messages", MSGS}};
+    Response br = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(missing_max));
+    CHECK(br.status == 400);
+    const Json bj = Json::parse(br.body);
+    CHECK(bj["type"] == "error" && bj["error"]["type"] == "invalid_request_error");
+
+    const Json no_think = {
+        {"model", "inkling-test"},
+        {"max_tokens", 32},
+        {"thinking", {{"type", "disabled"}}},
+        {"messages", MSGS},
+    };
+    Response tr = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(no_think));
+    CHECK(tr.status == 200);
+    const auto calls_tr = s->gen->calls();
+    const auto& banned = calls_tr.back().sampling.banned_tokens;
+    CHECK(std::find(banned.begin(), banned.end(), g_fmt->content_thinking_id()) != banned.end());
+
+    // x-api-key header fails closed for prefix caching when cache_namespace_header is unset.
+    const Json req_ok = {{"model", "inkling-test"}, {"max_tokens", 32}, {"messages", MSGS}};
+    Response kr = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(req_ok),
+                          httplib::Headers{{"x-api-key", "sk-ant-test"}});
+    CHECK(kr.status == 200 && s->gen->calls().back().bypass_prefix_cache);
+
+    // metadata.user_id also triggers fail-closed prefix-cache isolation.
+    Json req_uid = req_ok;
+    req_uid["metadata"] = {{"user_id", "omarchy-user-1"}};
+    Response ur = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(req_uid));
+    CHECK(ur.status == 200 && s->gen->calls().back().bypass_prefix_cache);
+  }
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -1731,6 +1885,7 @@ int main() {
       {"prompt_stability_and_render_stats", test_prompt_stability_and_render_stats},
       {"cache_scope_isolation", test_cache_scope_isolation},
       {"kv_cache_mode_advertisement", test_kv_cache_mode_advertisement},
+      {"anthropic_messages_api", test_anthropic_messages_api},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {

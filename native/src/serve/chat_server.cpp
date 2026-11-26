@@ -1,6 +1,7 @@
 #include "serve/chat_server.h"
 
 #include "engine/log.h"
+#include "serve/anthropic.h"
 #include "serve/http_transport.h"
 
 #include <spdlog/spdlog.h>
@@ -37,6 +38,10 @@ void send_json(httplib::Response& res, int status, const Json& body) {
 void send_error(httplib::Response& res, int status, std::string_view message,
                 const std::optional<std::string>& param = std::nullopt) {
   send_json(res, status, error_body(status, message, param));
+}
+
+void send_anthropic_error(httplib::Response& res, int status, std::string_view message) {
+  send_json(res, status, anthropic_error_body(status, message));
 }
 
 std::string sse(std::string_view payload) {
@@ -293,13 +298,20 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
 
 void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res) {
   const std::string path = route_path(req);
-  if (path != "/v1/chat/completions") {
+  const bool is_openai = (path == "/v1/chat/completions");
+  const bool is_anthropic = (path == "/v1/messages");
+  const bool is_anthropic_count = (path == "/v1/messages/count_tokens");
+  if (!is_openai && !is_anthropic && !is_anthropic_count) {
     send_error(res, 404, "no route for POST " + path);
     return;
   }
+  auto fail_post = [&](int status, std::string_view msg, const std::optional<std::string>& param = std::nullopt) {
+    if (is_anthropic || is_anthropic_count) send_anthropic_error(res, status, msg);
+    else send_error(res, status, msg, param);
+  };
   if (!req.has_header("Content-Length")) {
     res.set_header("Connection", "close");
-    send_error(res, 411, "Content-Length required");
+    fail_post(411, "Content-Length required");
     return;
   }
   if (req.has_header("X-Ingine-Expected-Loop-Passes")) {
@@ -320,17 +332,17 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
     if (!valid_lp || expected_lp < 1 || expected_lp > 8) {
       res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
       res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
-      send_error(res, 400, "invalid X-Ingine-Expected-Loop-Passes header: expected integer in 1..8",
-                 "X-Ingine-Expected-Loop-Passes");
+      fail_post(400, "invalid X-Ingine-Expected-Loop-Passes header: expected integer in 1..8",
+                "X-Ingine-Expected-Loop-Passes");
       return;
     }
     if (expected_lp != loop_passes_) {
       res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
       res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
-      send_error(res, 409,
-                 "worker loop_passes mismatch: expected=" + std::to_string(expected_lp) +
-                     ", server=" + std::to_string(loop_passes_),
-                 "X-Ingine-Expected-Loop-Passes");
+      fail_post(409,
+                "worker loop_passes mismatch: expected=" + std::to_string(expected_lp) +
+                    ", server=" + std::to_string(loop_passes_),
+                "X-Ingine-Expected-Loop-Passes");
       return;
     }
   }
@@ -340,16 +352,27 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
     try {
       body = Json::parse(req.body);
     } catch (const Json::parse_error& e) {
-      send_error(res, 400, std::string("invalid JSON body: ") + e.what());
+      fail_post(400, std::string("invalid JSON body: ") + e.what());
       return;
     }
     if (!body.is_object()) throw BadRequest("request body must be a JSON object");
-    request = parse_request(body, fmt_, max_model_len_, sampling_defaults_, image_options_, req.body,
-                            supports_logit_masker_);
-    if (request.sampling.logit_masker && !supports_logit_masker_) {
-      throw BadRequest(
-          "structured JSON response_format ('json_object'/'json_schema') is not supported by this model backend",
-          "response_format");
+    if (is_openai) {
+      request = parse_request(body, fmt_, max_model_len_, sampling_defaults_, image_options_, req.body,
+                              supports_logit_masker_);
+      if (request.sampling.logit_masker && !supports_logit_masker_) {
+        throw BadRequest(
+            "structured JSON response_format ('json_object'/'json_schema') is not supported by this model backend",
+            "response_format");
+      }
+    } else {
+      request = parse_anthropic_request(body, fmt_, max_model_len_, sampling_defaults_, image_options_,
+                                        /*require_max_tokens=*/is_anthropic);
+    }
+    if (is_anthropic_count) {
+      res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+      res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+      send_json(res, 200, Json{{"input_tokens", int(request.prompt_ids.size())}});
+      return;
     }
     if (personas_) {
       try {
@@ -361,13 +384,14 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
       throw BadRequest("unknown persona '" + request.persona_name + "' (no --persona-spec loaded)", "persona");
     }
   } catch (const BadRequest& e) {
-    send_error(res, e.status, e.what(), e.param);
+    fail_post(e.status, e.what(), e.param);
     return;
   } catch (const text::ChatError& e) {
-    send_error(res, 400, e.what(), e.param);
+    fail_post(400, e.what(), e.param);
     return;
   }
-  complete(req, res, std::move(request));
+  if (is_anthropic) complete_anthropic(req, res, std::move(request));
+  else complete(req, res, std::move(request));
 }
 
 void ChatServer::complete(const httplib::Request& req, httplib::Response& res, ChatRequest request) {
@@ -381,7 +405,8 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
     if (cache_namespace.empty()) bypass_prefix_cache = true;
   } else {
     // Single-trusted-scope server mode: fail closed for requests signaling caller/tenant isolation.
-    const bool has_auth = req.has_header("Authorization") && !req.get_header_value("Authorization").empty();
+    const bool has_auth = (req.has_header("Authorization") && !req.get_header_value("Authorization").empty()) ||
+                          (req.has_header("x-api-key") && !req.get_header_value("x-api-key").empty());
     if (request.has_isolation_hint || request.has_user_or_cache_key || has_auth) bypass_prefix_cache = true;
   }
   auto job = std::make_shared<engine::Job>(request.prompt_ids, request.max_new_tokens, request.sampling,
@@ -497,6 +522,204 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
       },
       [this, state](bool success) {
         // The client left before or while streaming: the job must not keep (or start) generating.
+        if (!success || !state->started.load(std::memory_order_acquire)) scheduler_.withdraw(state->x->job);
+      });
+}
+
+void ChatServer::complete_anthropic(const httplib::Request& req, httplib::Response& res, ChatRequest request) {
+  std::string cache_namespace;
+  bool bypass_prefix_cache = false;
+  if (!cache_namespace_header_.empty()) {
+    if (req.has_header(cache_namespace_header_)) {
+      cache_namespace = req.get_header_value(cache_namespace_header_);
+    }
+    if (cache_namespace.empty()) bypass_prefix_cache = true;
+  } else {
+    const bool has_auth = (req.has_header("Authorization") && !req.get_header_value("Authorization").empty()) ||
+                          (req.has_header("x-api-key") && !req.get_header_value("x-api-key").empty());
+    if (request.has_isolation_hint || request.has_user_or_cache_key || has_auth) bypass_prefix_cache = true;
+  }
+  auto job = std::make_shared<engine::Job>(request.prompt_ids, request.max_new_tokens, request.sampling,
+                                           std::move(request.images), request.root_prefix_tokens,
+                                           std::move(cache_namespace), bypass_prefix_cache);
+  if (!scheduler_.submit(job)) {
+    res.set_header("Retry-After", "1");
+    send_anthropic_error(res, 503, "server busy: request queue is full");
+    return;
+  }
+  text::StreamParser parser = fmt_.parser(request.prefill_ids, request.stop);
+  auto x = std::make_shared<Exchange>(std::move(job), std::move(parser), std::move(request));
+  const std::string msg_id = "msg_" + x->job->id;
+
+  if (!x->req.stream) {
+    try {
+      pump(*x, [&req] { return req.is_connection_closed(); }, [](std::vector<text::Delta>&) {});
+    } catch (const ClientDisconnected&) {
+      scheduler_.withdraw(x->job);
+      log_disconnected(*x);
+      res.set_header("Connection", "close");
+      send_anthropic_error(res, 500, "client disconnected");
+      return;
+    }
+    x->prefill_stats = x->job->wait_prefill_stats();
+    log_done(*x, kv_cache_mode_);
+    if (x->failure) {
+      send_anthropic_error(res, 500, *x->failure);
+      return;
+    }
+    const int prompt_tokens = int(x->job->prompt_ids.size());
+    const int cached = x->prefill_stats ? std::clamp(x->prefill_stats->reused_tokens, 0, prompt_tokens) : 0;
+    const Json resp = anthropic_message_response(msg_id, model_id_, x->parser.result(), prompt_tokens,
+                                                 x->parser.num_tokens(), cached);
+    res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+    res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+    send_json(res, 200, resp);
+    return;
+  }
+
+  auto state = std::make_shared<StreamState>(std::move(x));
+  res.set_header("Cache-Control", "no-cache");
+  res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+  res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+  res.set_chunked_content_provider(
+      "text/event-stream",
+      [this, state, msg_id](size_t, httplib::DataSink& sink) -> bool {
+        if (state->started.exchange(true, std::memory_order_acq_rel)) {
+          sink.done();
+          return true;
+        }
+        Exchange& x = *state->x;
+        SseTransport transport(sink, state->cancelled);
+        const int prompt_tokens = int(x.job->prompt_ids.size());
+
+        enum class BlockKind { None, Thinking, Text, ToolUse };
+        BlockKind cur_kind = BlockKind::None;
+        int cur_tool_idx = -1;
+        int cur_block = -1;
+        int next_block = 0;
+
+        auto close_block = [&] {
+          if (cur_kind != BlockKind::None) {
+            transport.write(anthropic_sse("content_block_stop",
+                                          Json{{"type", "content_block_stop"}, {"index", cur_block}}));
+            cur_kind = BlockKind::None;
+            cur_tool_idx = -1;
+            cur_block = -1;
+          }
+        };
+
+        try {
+          transport.write(anthropic_sse(
+              "message_start",
+              Json{{"type", "message_start"},
+                   {"message",
+                    {{"id", msg_id},
+                     {"type", "message"},
+                     {"role", "assistant"},
+                     {"model", model_id_},
+                     {"content", Json::array()},
+                     {"stop_reason", nullptr},
+                     {"stop_sequence", nullptr},
+                     {"usage",
+                      {{"input_tokens", prompt_tokens},
+                       {"output_tokens", 0},
+                       {"cache_creation_input_tokens", 0},
+                       {"cache_read_input_tokens", 0}}}}}}));
+
+          pump(x, [&] { return transport.poll(); },
+               [&](std::vector<text::Delta>& deltas) {
+                 for (const text::Delta& d : text::merge_deltas(deltas)) {
+                   if (!d.reasoning_content.empty()) {
+                     if (cur_kind != BlockKind::Thinking) {
+                       close_block();
+                       cur_kind = BlockKind::Thinking;
+                       cur_block = next_block++;
+                       transport.write(anthropic_sse(
+                           "content_block_start",
+                           Json{{"type", "content_block_start"},
+                                {"index", cur_block},
+                                {"content_block", {{"type", "thinking"}, {"thinking", ""}}}}));
+                     }
+                     transport.write(anthropic_sse(
+                         "content_block_delta",
+                         Json{{"type", "content_block_delta"},
+                              {"index", cur_block},
+                              {"delta", {{"type", "thinking_delta"}, {"thinking", d.reasoning_content}}}}));
+                   } else if (!d.content.empty()) {
+                     if (cur_kind != BlockKind::Text) {
+                       close_block();
+                       cur_kind = BlockKind::Text;
+                       cur_block = next_block++;
+                       transport.write(anthropic_sse(
+                           "content_block_start",
+                           Json{{"type", "content_block_start"},
+                                {"index", cur_block},
+                                {"content_block", {{"type", "text"}, {"text", ""}}}}));
+                     }
+                     transport.write(anthropic_sse(
+                         "content_block_delta",
+                         Json{{"type", "content_block_delta"},
+                              {"index", cur_block},
+                              {"delta", {{"type", "text_delta"}, {"text", d.content}}}}));
+                   } else if (d.tool_call) {
+                     const text::ToolCallDelta& tc = *d.tool_call;
+                     if (cur_kind != BlockKind::ToolUse || cur_tool_idx != tc.index) {
+                       close_block();
+                       cur_kind = BlockKind::ToolUse;
+                       cur_tool_idx = tc.index;
+                       cur_block = next_block++;
+                       transport.write(anthropic_sse(
+                           "content_block_start",
+                           Json{{"type", "content_block_start"},
+                                {"index", cur_block},
+                                {"content_block",
+                                 {{"type", "tool_use"},
+                                  {"id", tc.id ? *tc.id : ("call_" + std::to_string(tc.index))},
+                                  {"name", tc.name ? *tc.name : ""},
+                                  {"input", Json::object()}}}}));
+                     }
+                     if (!tc.arguments.empty()) {
+                       transport.write(anthropic_sse(
+                           "content_block_delta",
+                           Json{{"type", "content_block_delta"},
+                                {"index", cur_block},
+                                {"delta", {{"type", "input_json_delta"}, {"partial_json", tc.arguments}}}}));
+                     }
+                   }
+                 }
+               });
+        } catch (const ClientDisconnected&) {
+          scheduler_.withdraw(x.job);
+          log_disconnected(x);
+          return false;
+        }
+        x.prefill_stats = x.job->wait_prefill_stats();
+        log_done(x, kv_cache_mode_);
+        try {
+          close_block();
+          if (x.failure) {
+            transport.write(anthropic_sse("error", anthropic_error_body(500, *x.failure)));
+          } else {
+            const int cached = x.prefill_stats ? std::clamp(x.prefill_stats->reused_tokens, 0, prompt_tokens) : 0;
+            const auto stop = anthropic_stop_reason(x.parser.finish_reason());
+            transport.write(anthropic_sse(
+                "message_delta",
+                Json{{"type", "message_delta"},
+                     {"delta", {{"stop_reason", stop ? Json(*stop) : Json()}, {"stop_sequence", nullptr}}},
+                     {"usage",
+                      {{"input_tokens", prompt_tokens},
+                       {"output_tokens", x.parser.num_tokens()},
+                       {"cache_creation_input_tokens", 0},
+                       {"cache_read_input_tokens", cached}}}}));
+            transport.write(anthropic_sse("message_stop", Json{{"type", "message_stop"}}));
+          }
+        } catch (const ClientDisconnected&) {
+          return false;
+        }
+        sink.done();
+        return true;
+      },
+      [this, state](bool success) {
         if (!success || !state->started.load(std::memory_order_acquire)) scheduler_.withdraw(state->x->job);
       });
 }

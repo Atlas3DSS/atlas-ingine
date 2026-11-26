@@ -62,6 +62,7 @@ class ChatServer {
   void handle_get(const httplib::Request& req, httplib::Response& res);
   void handle_post(const httplib::Request& req, httplib::Response& res);
   void complete(const httplib::Request& req, httplib::Response& res, ChatRequest request);
+  void complete_anthropic(const httplib::Request& req, httplib::Response& res, ChatRequest request);
   Json model_card() const;
   Json supported_kv_cache_modes_json() const;
   Json personas_list() const;
