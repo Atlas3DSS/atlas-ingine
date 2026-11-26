@@ -1,5 +1,6 @@
 #include "core/safetensors.h"
 
+#include "core/sha256.h"
 #include "core/weight_pack.h"
 
 #include <nlohmann/json.hpp>
@@ -131,7 +132,16 @@ SafetensorsFile::SafetensorsFile(const std::filesystem::path& path) : path_(path
     try {
         struct stat st {};
         if (::fstat(fd_, &st) != 0) { fail_errno(path_, "fstat failed"); }
-        file_size_ = static_cast<std::uint64_t>(st.st_size);
+        file_size_             = static_cast<std::uint64_t>(st.st_size);
+        open_stat_.file_size   = file_size_;
+        open_stat_.dev         = static_cast<std::uint64_t>(st.st_dev);
+        open_stat_.ino         = static_cast<std::uint64_t>(st.st_ino);
+        open_stat_.nlink       = static_cast<std::uint64_t>(st.st_nlink);
+        open_stat_.mtime_sec   = static_cast<std::int64_t>(st.st_mtim.tv_sec);
+        open_stat_.mtime_nsec  = static_cast<std::int64_t>(st.st_mtim.tv_nsec);
+        open_stat_.ctime_sec   = static_cast<std::int64_t>(st.st_ctim.tv_sec);
+        open_stat_.ctime_nsec  = static_cast<std::int64_t>(st.st_ctim.tv_nsec);
+        open_stat_.valid       = S_ISREG(st.st_mode);
         if (file_size_ >= sizeof(kWeightPackMagic)) {
             char magic[sizeof(kWeightPackMagic)]{};
             read_range(0, sizeof(magic), magic);
@@ -242,6 +252,7 @@ SafetensorsFile::~SafetensorsFile() {
 SafetensorsFile::SafetensorsFile(SafetensorsFile&& other) noexcept
     : path_(std::move(other.path_)), fd_(std::exchange(other.fd_, -1)),
       pack_(std::move(other.pack_)),
+      open_stat_(std::exchange(other.open_stat_, SafetensorsFileStat{})),
       file_size_(other.file_size_), data_offset_(other.data_offset_),
       metadata_(std::move(other.metadata_)), tensors_(std::move(other.tensors_)),
       index_(std::move(other.index_)) {}
@@ -252,6 +263,7 @@ SafetensorsFile& SafetensorsFile::operator=(SafetensorsFile&& other) noexcept {
         path_        = std::move(other.path_);
         fd_          = std::exchange(other.fd_, -1);
         pack_        = std::move(other.pack_);
+        open_stat_   = std::exchange(other.open_stat_, SafetensorsFileStat{});
         file_size_   = other.file_size_;
         data_offset_ = other.data_offset_;
         metadata_    = std::move(other.metadata_);
@@ -410,11 +422,23 @@ SafetensorsModel::SafetensorsModel(const std::filesystem::path& path, Safetensor
         return;
     }
 
-    std::ifstream in(index_path);
+    std::ifstream in(index_path, std::ios::binary);
     if (!in) { throw std::runtime_error("cannot open " + index_path.string()); }
+    std::string index_bytes;
+    {
+        char buf[65536];
+        while (true) {
+            in.read(buf, sizeof(buf));
+            const std::streamsize got = in.gcount();
+            if (got > 0) { index_bytes.append(buf, static_cast<std::size_t>(got)); }
+            if (!in) { break; }
+        }
+        if (in.bad()) { throw std::runtime_error("cannot read " + index_path.string()); }
+    }
+    index_sha256_ = sha256_bytes(index_bytes.data(), index_bytes.size());
     nlohmann::json j;
     try {
-        j = nlohmann::json::parse(in);
+        j = nlohmann::json::parse(index_bytes);
     } catch (const nlohmann::json::exception& e) {
         throw std::runtime_error(index_path.string() + ": invalid JSON: " + e.what());
     }

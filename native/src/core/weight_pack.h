@@ -194,8 +194,16 @@ private:
         std::size_t source_order = 0;
     };
 
+    [[nodiscard]] WeightPackBuildStats write_impl(const std::filesystem::path& output_path,
+                                                  WeightPackBuildOptions opts,
+                                                  const std::function<void()>& pre_publish_check);
+
     std::map<std::string, std::string> metadata_;
     std::vector<PendingTensor> tensors_;
 };
+
+// Test hooks for deterministic snapshot-consistency verification in pack_from_safetensors.
+void set_next_pack_after_open_hook(std::function<void()> hook);
+void set_next_pack_before_copy_hook(std::function<void()> hook);
 
 }  // namespace ingine

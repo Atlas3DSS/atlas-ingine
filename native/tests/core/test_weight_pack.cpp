@@ -15,6 +15,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -754,6 +755,192 @@ void test_weight_source_consistency(const std::filesystem::path& dir) {
             std::memcpy(&v, b.data() + mid_off, sizeof(v));
             INGINE_CHECK(v == 1.0f);
         }
+    }
+
+    // 8a. Atomic release rename of model.safetensors during pack_from_safetensors (2 MiB & 36 MiB, after_open & before_copy)
+    //     MUST decline publication cleanly (no model.ingpack published, no .tmp.* left), leaving rev2 source active.
+    for (bool at_before_copy : {false, true}) {
+        for (std::size_t rows : {std::size_t(512), std::size_t(9216)}) {
+            const auto race_dir = consistency_root /
+                                  ("race_atomic_single_" + std::string(at_before_copy ? "bc_" : "ao_") +
+                                   std::to_string(rows));
+            std::filesystem::create_directories(race_dir);
+            const std::filesystem::path cur_st = race_dir / "model.safetensors";
+            const std::filesystem::path next_st =
+                consistency_root /
+                ("race_next_single_" + std::string(at_before_copy ? "bc_" : "ao_") + std::to_string(rows) +
+                 ".safetensors");
+            const std::filesystem::path pack_out = race_dir / "model.ingpack";
+
+            const std::size_t cols    = 1024u;
+            const std::size_t mid_off = (rows / 2u) * cols * sizeof(float);
+            std::vector<std::uint8_t> d1(rows * cols * sizeof(float), 0u);
+            std::vector<std::uint8_t> d2 = d1;
+            const float one              = 1.0f;
+            std::memcpy(d2.data() + mid_off, &one, sizeof(one));
+
+            write_safetensors(cur_st, {{"matrix", "F32", {static_cast<std::int64_t>(rows), static_cast<std::int64_t>(cols)}, std::move(d1)}});
+            set_fixed_mtime(cur_st, 1700000000);
+            write_safetensors(next_st, {{"matrix", "F32", {static_cast<std::int64_t>(rows), static_cast<std::int64_t>(cols)}, std::move(d2)}});
+            set_fixed_mtime(next_st, 1700000000);
+
+            bool hook_ran = false;
+            auto do_rename = [&]() {
+                std::filesystem::rename(next_st, cur_st);
+                hook_ran = true;
+            };
+            if (at_before_copy) {
+                ingine::set_next_pack_before_copy_hook(do_rename);
+            } else {
+                ingine::set_next_pack_after_open_hook(do_rename);
+            }
+            INGINE_CHECK(throws_runtime([&] { (void)WeightPackBuilder::pack_from_safetensors(race_dir, pack_out); }));
+            INGINE_CHECK(hook_ran);
+            ingine::set_next_pack_after_open_hook({});
+            ingine::set_next_pack_before_copy_hook({});
+
+            INGINE_CHECK(!std::filesystem::exists(pack_out));
+            for (const auto& entry : std::filesystem::directory_iterator(race_dir)) {
+                INGINE_CHECK(entry.path().string().find(".tmp.") == std::string::npos);
+            }
+            SafetensorsModel auto_m(race_dir);
+            SafetensorsModel src_m(race_dir, SafetensorsOpenMode::SafetensorsOnly);
+            INGINE_CHECK(!auto_m.is_weight_pack());
+            INGINE_CHECK(auto_m.read("matrix") == src_m.read("matrix"));
+            float v = -1.0f;
+            std::memcpy(&v, auto_m.read("matrix").data() + mid_off, sizeof(v));
+            INGINE_CHECK(v == 1.0f);
+        }
+    }
+
+    // 8b. Atomic release rename of model.safetensors.index.json (+ shard, or index-only in before_copy)
+    //     MUST decline publication cleanly, leaving rev2 source active.
+    for (bool index_only_before_copy : {false, true}) {
+        const auto idx_race_dir =
+            consistency_root / (index_only_before_copy ? "race_atomic_index_only_bc" : "race_atomic_index_ao");
+        std::filesystem::create_directories(idx_race_dir);
+        const std::filesystem::path shard_p  = idx_race_dir / "model-00001-of-00001.safetensors";
+        const std::filesystem::path idx_p    = idx_race_dir / "model.safetensors.index.json";
+        const std::filesystem::path staged_s = consistency_root / "race_staged_shard.safetensors";
+        const std::filesystem::path staged_i = consistency_root / "race_staged_index.json";
+        const std::filesystem::path pack_out = idx_race_dir / "model.ingpack";
+
+        write_safetensors(shard_p, t_25);
+        write_idx(idx_race_dir, t_25);
+
+        nlohmann::json idx2 = {{"weight_map", nlohmann::json::object()}};
+        for (const auto& t : t_24) { idx2["weight_map"][t.name] = "model-00001-of-00001.safetensors"; }
+        std::ofstream(staged_i) << idx2.dump(2);
+        if (!index_only_before_copy) { write_safetensors(staged_s, t_24); }
+
+        bool hook_ran = false;
+        auto do_idx_rename = [&]() {
+            if (!index_only_before_copy) { std::filesystem::rename(staged_s, shard_p); }
+            std::filesystem::rename(staged_i, idx_p);
+            hook_ran = true;
+        };
+        if (index_only_before_copy) {
+            ingine::set_next_pack_before_copy_hook(do_idx_rename);
+        } else {
+            ingine::set_next_pack_after_open_hook(do_idx_rename);
+        }
+        INGINE_CHECK(throws_runtime([&] { (void)WeightPackBuilder::pack_from_safetensors(idx_race_dir, pack_out); }));
+        INGINE_CHECK(hook_ran);
+        ingine::set_next_pack_after_open_hook({});
+        ingine::set_next_pack_before_copy_hook({});
+
+        INGINE_CHECK(!std::filesystem::exists(pack_out));
+        for (const auto& entry : std::filesystem::directory_iterator(idx_race_dir)) {
+            INGINE_CHECK(entry.path().string().find(".tmp.") == std::string::npos);
+        }
+        SafetensorsModel auto_m(idx_race_dir);
+        INGINE_CHECK(!auto_m.is_weight_pack());
+        INGINE_CHECK(auto_m.size() == 24);
+        INGINE_CHECK(!auto_m.contains("model.visual.review"));
+    }
+
+    // 8c. In-place overwrite of the open source shard inode during pack_from_safetensors MUST decline publication.
+    for (bool at_before_copy : {false, true}) {
+        const auto inplace_dir = consistency_root / (at_before_copy ? "race_inplace_before_copy" : "race_inplace_after_open");
+        std::filesystem::create_directories(inplace_dir);
+        const std::filesystem::path cur_st   = inplace_dir / "model.safetensors";
+        const std::filesystem::path next_st  = consistency_root / (at_before_copy ? "inplace_next1.safetensors" : "inplace_next2.safetensors");
+        const std::filesystem::path pack_out = inplace_dir / "model.ingpack";
+
+        std::vector<std::uint8_t> d1(512u * 1024u * sizeof(float), 0u);
+        std::vector<std::uint8_t> d2 = d1;
+        const float one              = 1.0f;
+        std::memcpy(d2.data() + (256u * 1024u) * sizeof(float), &one, sizeof(one));
+
+        write_safetensors(cur_st, {{"matrix", "F32", {512, 1024}, std::move(d1)}});
+        set_fixed_mtime(cur_st, 1700000000);
+        write_safetensors(next_st, {{"matrix", "F32", {512, 1024}, std::move(d2)}});
+        const auto next_bytes = read_file_bytes(next_st);
+
+        bool hook_ran = false;
+        auto overwrite_inplace = [&]() {
+            const int wfd = ::open(cur_st.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+            INGINE_CHECK(wfd >= 0);
+            std::size_t off = 0;
+            while (off < next_bytes.size()) {
+                const ssize_t n = ::write(wfd, next_bytes.data() + off, next_bytes.size() - off);
+                INGINE_CHECK(n > 0);
+                off += static_cast<std::size_t>(n);
+            }
+            ::close(wfd);
+            set_fixed_mtime(cur_st, 1700000000);
+            hook_ran = true;
+        };
+        if (at_before_copy) {
+            ingine::set_next_pack_before_copy_hook(overwrite_inplace);
+        } else {
+            ingine::set_next_pack_after_open_hook(overwrite_inplace);
+        }
+        INGINE_CHECK(throws_runtime([&] { (void)WeightPackBuilder::pack_from_safetensors(inplace_dir, pack_out); }));
+        INGINE_CHECK(hook_ran);
+        ingine::set_next_pack_after_open_hook({});
+        ingine::set_next_pack_before_copy_hook({});
+
+        INGINE_CHECK(!std::filesystem::exists(pack_out));
+        for (const auto& entry : std::filesystem::directory_iterator(inplace_dir)) {
+            INGINE_CHECK(entry.path().string().find(".tmp.") == std::string::npos);
+        }
+    }
+
+    // 8d. Post-build atomic rename release after clean pack_from_safetensors on rev1:
+    //     rev1 pack builds cleanly and passes verify_content_sha256(), while post-rename Auto open loads rev2.
+    {
+        const auto post_dir = consistency_root / "post_build_atomic_rename";
+        std::filesystem::create_directories(post_dir);
+        const std::filesystem::path cur_st   = post_dir / "model.safetensors";
+        const std::filesystem::path next_st  = consistency_root / "post_build_next.safetensors";
+        const std::filesystem::path pack_out = post_dir / "model.ingpack";
+        const std::size_t mid_off            = (256u * 1024u) * sizeof(float);
+
+        std::vector<std::uint8_t> d1(512u * 1024u * sizeof(float), 0u);
+        std::vector<std::uint8_t> d2 = d1;
+        const float one              = 1.0f;
+        std::memcpy(d2.data() + mid_off, &one, sizeof(one));
+
+        write_safetensors(cur_st, {{"matrix", "F32", {512, 1024}, std::move(d1)}});
+        set_fixed_mtime(cur_st, 1700000000);
+        write_safetensors(next_st, {{"matrix", "F32", {512, 1024}, std::move(d2)}});
+        set_fixed_mtime(next_st, 1700000000);
+
+        (void)WeightPackBuilder::pack_from_safetensors(post_dir, pack_out);
+        std::filesystem::rename(next_st, cur_st);
+
+        SafetensorsModel pack_only_m(post_dir, SafetensorsOpenMode::WeightPackOnly);
+        INGINE_CHECK(pack_only_m.files()[0]->weight_pack()->verify_content_sha256());
+        float pv = -1.0f;
+        std::memcpy(&pv, pack_only_m.read("matrix").data() + mid_off, sizeof(pv));
+        INGINE_CHECK(pv == 0.0f);
+
+        SafetensorsModel auto_m(post_dir);
+        INGINE_CHECK(!auto_m.is_weight_pack());
+        float av = -1.0f;
+        std::memcpy(&av, auto_m.read("matrix").data() + mid_off, sizeof(av));
+        INGINE_CHECK(av == 1.0f);
     }
 }
 

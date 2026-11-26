@@ -11,6 +11,7 @@
 #include "core/hal.h"
 #include "core/tensor.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -49,6 +50,18 @@ struct SafetensorsTensor {
     [[nodiscard]] Tensor view(void* data) const;
 };
 
+struct SafetensorsFileStat {
+    std::uint64_t file_size = 0;
+    std::uint64_t dev       = 0;
+    std::uint64_t ino       = 0;
+    std::uint64_t nlink     = 0;
+    std::int64_t mtime_sec  = 0;
+    std::int64_t mtime_nsec = 0;
+    std::int64_t ctime_sec  = 0;
+    std::int64_t ctime_nsec = 0;
+    bool valid              = false;
+};
+
 class SafetensorsFile {
 public:
     // Opens the file and parses its header. Throws std::runtime_error on I/O or format errors.
@@ -64,6 +77,7 @@ public:
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
     [[nodiscard]] int fd() const noexcept;
+    [[nodiscard]] SafetensorsFileStat open_stat() const noexcept { return open_stat_; }
     [[nodiscard]] bool is_weight_pack() const noexcept { return static_cast<bool>(pack_); }
     [[nodiscard]] const WeightPack* weight_pack() const noexcept { return pack_.get(); }
     [[nodiscard]] const std::byte* mapped_data() const noexcept;
@@ -99,6 +113,7 @@ private:
     std::filesystem::path path_;
     int fd_                    = -1;
     std::unique_ptr<WeightPack> pack_;
+    SafetensorsFileStat open_stat_{};
     std::uint64_t file_size_   = 0;
     std::uint64_t data_offset_ = 0;
     std::map<std::string, std::string> metadata_;
@@ -140,6 +155,9 @@ public:
     [[nodiscard]] bool is_weight_pack() const noexcept {
         return !files_.empty() && files_[0]->is_weight_pack();
     }
+    [[nodiscard]] const std::optional<std::array<std::uint8_t, 32>>& index_sha256() const noexcept {
+        return index_sha256_;
+    }
     [[nodiscard]] std::vector<std::string> names() const; // sorted
     [[nodiscard]] std::size_t size() const noexcept { return index_.size(); }
     [[nodiscard]] SafetensorsRef find(std::string_view name) const;
@@ -150,6 +168,7 @@ public:
 private:
     std::vector<std::unique_ptr<SafetensorsFile>> files_;
     std::map<std::string, SafetensorsRef, std::less<>> index_;
+    std::optional<std::array<std::uint8_t, 32>> index_sha256_;
 };
 
 // One host-to-device copy: `bytes` bytes at absolute offset `offset` of `file` to device `dst`.

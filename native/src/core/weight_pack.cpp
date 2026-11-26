@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -144,6 +145,7 @@ struct ShardFingerprint {
     std::uint64_t file_size  = 0;
     std::uint64_t dev        = 0;
     std::uint64_t ino        = 0;
+    std::uint64_t nlink      = 0;
     std::int64_t mtime_sec   = 0;
     std::int64_t mtime_nsec  = 0;
     std::int64_t ctime_sec   = 0;
@@ -157,12 +159,21 @@ bool timespec_strictly_less(std::int64_t a_sec, std::int64_t a_nsec,
     return a_sec < b_sec || (a_sec == b_sec && a_nsec < b_nsec);
 }
 
-bool stat_regular_file(const std::filesystem::path& path, ShardFingerprint& out) noexcept {
-    struct stat st {};
-    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) { return false; }
+std::mutex g_pack_hook_mu;
+std::function<void()> g_next_after_open_hook;
+std::function<void()> g_next_before_copy_hook;
+
+std::function<void()> take_hook(std::function<void()>& slot) {
+    std::lock_guard<std::mutex> lk(g_pack_hook_mu);
+    return std::exchange(slot, nullptr);
+}
+
+bool fill_fingerprint_from_stat(const struct stat& st, ShardFingerprint& out) noexcept {
+    if (!S_ISREG(st.st_mode) || st.st_size < 0) { return false; }
     out.file_size       = static_cast<std::uint64_t>(st.st_size);
     out.dev             = static_cast<std::uint64_t>(st.st_dev);
     out.ino             = static_cast<std::uint64_t>(st.st_ino);
+    out.nlink           = static_cast<std::uint64_t>(st.st_nlink);
     out.mtime_sec       = static_cast<std::int64_t>(st.st_mtim.tv_sec);
     out.mtime_nsec      = static_cast<std::int64_t>(st.st_mtim.tv_nsec);
     out.ctime_sec       = static_cast<std::int64_t>(st.st_ctim.tv_sec);
@@ -170,6 +181,18 @@ bool stat_regular_file(const std::filesystem::path& path, ShardFingerprint& out)
     out.has_full_sha256 = false;
     out.full_sha256     = {};
     return true;
+}
+
+bool stat_fd(int fd, ShardFingerprint& out) noexcept {
+    struct stat st {};
+    if (fd < 0 || ::fstat(fd, &st) != 0) { return false; }
+    return fill_fingerprint_from_stat(st, out);
+}
+
+bool stat_regular_file(const std::filesystem::path& path, ShardFingerprint& out) noexcept {
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0) { return false; }
+    return fill_fingerprint_from_stat(st, out);
 }
 
 bool pread_exact(int fd, std::uint64_t offset, void* dst, std::size_t len) noexcept {
@@ -187,19 +210,13 @@ bool pread_exact(int fd, std::uint64_t offset, void* dst, std::size_t len) noexc
     return true;
 }
 
-bool sha256_regular_file(const std::filesystem::path& path, std::array<std::uint8_t, 32>& out) noexcept {
-    ScopedFd sfd;
-    sfd.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (sfd.fd < 0) { return false; }
-    struct stat st {};
-    if (::fstat(sfd.fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) { return false; }
+bool sha256_fd(int fd, std::uint64_t fsz, std::array<std::uint8_t, 32>& out) noexcept {
     Sha256 ctx;
     std::uint8_t buf[65536];
     std::uint64_t off = 0;
-    const std::uint64_t fsz = static_cast<std::uint64_t>(st.st_size);
     while (off < fsz) {
         const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(fsz - off, sizeof(buf)));
-        if (!pread_exact(sfd.fd, off, buf, take)) { return false; }
+        if (!pread_exact(fd, off, buf, take)) { return false; }
         ctx.update(buf, take);
         off += take;
     }
@@ -207,13 +224,34 @@ bool sha256_regular_file(const std::filesystem::path& path, std::array<std::uint
     return true;
 }
 
-bool fingerprint_safetensors_file(const std::filesystem::path& path, ShardFingerprint& out) noexcept {
-    if (!stat_regular_file(path, out) || out.file_size < 8u) { return false; }
+bool sha256_regular_file(const std::filesystem::path& path, std::array<std::uint8_t, 32>& out) noexcept {
+    ScopedFd sfd;
+    sfd.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (sfd.fd < 0) { return false; }
+    struct stat st {};
+    if (::fstat(sfd.fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) { return false; }
+    return sha256_fd(sfd.fd, static_cast<std::uint64_t>(st.st_size), out);
+}
+
+bool fingerprint_safetensors_fd(int fd, ShardFingerprint& out) noexcept {
+    if (!stat_fd(fd, out) || out.file_size < 8u) { return false; }
     if (out.file_size <= kFullFileShaThresholdBytes) {
-        if (!sha256_regular_file(path, out.full_sha256)) { return false; }
+        if (!sha256_fd(fd, out.file_size, out.full_sha256)) { return false; }
         out.has_full_sha256 = true;
     }
     return true;
+}
+
+bool shard_stat_matches_open_stat(const ShardFingerprint& fp, const SafetensorsFileStat& st) noexcept {
+    return st.valid && fp.file_size == st.file_size && fp.dev == st.dev && fp.ino == st.ino &&
+           fp.nlink == st.nlink && fp.mtime_sec == st.mtime_sec && fp.mtime_nsec == st.mtime_nsec &&
+           fp.ctime_sec == st.ctime_sec && fp.ctime_nsec == st.ctime_nsec;
+}
+
+bool shard_stats_match(const ShardFingerprint& a, const ShardFingerprint& b) noexcept {
+    return a.file_size == b.file_size && a.dev == b.dev && a.ino == b.ino && a.nlink == b.nlink &&
+           a.mtime_sec == b.mtime_sec && a.mtime_nsec == b.mtime_nsec &&
+           a.ctime_sec == b.ctime_sec && a.ctime_nsec == b.ctime_nsec;
 }
 
 std::string format_shard_fingerprint_line(std::string_view rel_path, const ShardFingerprint& fp) {
@@ -846,6 +884,12 @@ void WeightPackBuilder::add_tensor(std::string name, std::string dtype, std::vec
 
 WeightPackBuildStats WeightPackBuilder::write(const std::filesystem::path& output_path,
                                               WeightPackBuildOptions opts) {
+    return write_impl(output_path, opts, {});
+}
+
+WeightPackBuildStats WeightPackBuilder::write_impl(const std::filesystem::path& output_path,
+                                                   WeightPackBuildOptions opts,
+                                                   const std::function<void()>& pre_publish_check) {
     const auto t0 = std::chrono::steady_clock::now();
     if (opts.tensor_alignment < kWeightPackSmallAlignBytes || !is_power_of_two_u64(opts.tensor_alignment)) {
         throw std::invalid_argument("WeightPackBuilder: invalid tensor_alignment");
@@ -1094,6 +1138,8 @@ WeightPackBuildStats WeightPackBuilder::write(const std::filesystem::path& outpu
         fd = -1;
         if (::close(close_fd) != 0) { fail_pack_errno(tmp_path, "close failed"); }
 
+        if (pre_publish_check) { pre_publish_check(); }
+
         if (::rename(tmp_path.c_str(), output_path.c_str()) != 0) {
             const int e = errno;
             std::error_code ec;
@@ -1149,6 +1195,8 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
     }
 
     const SafetensorsModel model(authoritative_src, SafetensorsOpenMode::SafetensorsOnly);
+    if (auto hook = take_hook(g_next_after_open_hook)) { hook(); }
+
     WeightPackBuilder builder;
     if (model.files().size() == 1) {
         for (const auto& [k, v] : model.files()[0]->metadata()) {
@@ -1158,19 +1206,27 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
     builder.add_metadata("ingpack.source_version", "1");
     builder.add_metadata("ingpack.source_kind", source_kind);
     if (source_kind == "index" || source_kind == "custom_index") {
-        std::array<std::uint8_t, 32> idx_sha{};
-        if (!sha256_regular_file(authoritative_src, idx_sha)) {
-            fail_pack(authoritative_src, "cannot read index json for provenance");
+        if (!model.index_sha256()) {
+            fail_pack(authoritative_src, "missing parsed index sha256 for provenance");
         }
-        builder.add_metadata("ingpack.source_index_sha256", sha256_hex(idx_sha));
+        builder.add_metadata("ingpack.source_index_sha256", sha256_hex(*model.index_sha256()));
     }
+    struct CapturedShard {
+        const SafetensorsFile* file = nullptr;
+        ShardFingerprint fp{};
+    };
+    std::vector<CapturedShard> captured_shards;
     bool any_large_shard_without_sha = false;
     bool has_max_ctime               = false;
     std::int64_t max_csec            = 0;
     std::int64_t max_cnsec           = 0;
     {
-        std::vector<std::pair<std::string, fs::path>> shard_paths;
-        shard_paths.reserve(model.files().size());
+        struct ShardRef {
+            std::string rel_path;
+            const SafetensorsFile* file = nullptr;
+        };
+        std::vector<ShardRef> shard_refs;
+        shard_refs.reserve(model.files().size());
         const fs::path norm_base = base_dir.lexically_normal();
         for (const auto& file_ptr : model.files()) {
             std::string rel_str;
@@ -1183,19 +1239,23 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
             } else {
                 rel_str = file_ptr->path().filename().string();
             }
-            shard_paths.emplace_back(std::move(rel_str), file_ptr->path());
+            shard_refs.push_back(ShardRef{std::move(rel_str), file_ptr.get()});
         }
-        std::sort(shard_paths.begin(), shard_paths.end(),
-                  [](const auto& a, const auto& b) { return a.first < b.first; });
-        shard_paths.erase(std::unique(shard_paths.begin(), shard_paths.end(),
-                                      [](const auto& a, const auto& b) { return a.first == b.first; }),
-                          shard_paths.end());
+        std::sort(shard_refs.begin(), shard_refs.end(),
+                  [](const ShardRef& a, const ShardRef& b) { return a.rel_path < b.rel_path; });
+        shard_refs.erase(std::unique(shard_refs.begin(), shard_refs.end(),
+                                     [](const ShardRef& a, const ShardRef& b) { return a.rel_path == b.rel_path; }),
+                         shard_refs.end());
 
         std::string shards_manifest;
-        for (const auto& [rel_str, full_path] : shard_paths) {
+        captured_shards.reserve(shard_refs.size());
+        for (const ShardRef& sr : shard_refs) {
             ShardFingerprint fp{};
-            if (!fingerprint_safetensors_file(full_path, fp)) {
-                fail_pack(full_path, "cannot fingerprint source shard for provenance");
+            if (!fingerprint_safetensors_fd(sr.file->fd(), fp)) {
+                fail_pack(sr.file->path(), "cannot fingerprint open source shard fd for provenance");
+            }
+            if (!shard_stat_matches_open_stat(fp, sr.file->open_stat())) {
+                fail_pack(sr.file->path(), "source shard changed in-place after open");
             }
             if (!fp.has_full_sha256) { any_large_shard_without_sha = true; }
             if (!has_max_ctime || timespec_strictly_less(max_csec, max_cnsec, fp.ctime_sec, fp.ctime_nsec)) {
@@ -1204,10 +1264,12 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
                 max_cnsec     = fp.ctime_nsec;
             }
             if (!shards_manifest.empty()) { shards_manifest.push_back('\n'); }
-            shards_manifest.append(format_shard_fingerprint_line(rel_str, fp));
+            shards_manifest.append(format_shard_fingerprint_line(sr.rel_path, fp));
+            captured_shards.push_back(CapturedShard{sr.file, fp});
         }
         builder.add_metadata("ingpack.source_shards", std::move(shards_manifest));
     }
+    if (auto hook = take_hook(g_next_before_copy_hook)) { hook(); }
     const std::size_t io_chunk = std::max<std::size_t>(opts.io_chunk_bytes, std::size_t(1) << 20);
     auto scratch = std::make_shared<std::vector<std::byte>>();
 
@@ -1237,7 +1299,34 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
                 });
         }
     }
-    WeightPackBuildStats stats = builder.write(output_path, opts);
+    const bool is_indexed = (source_kind == "index" || source_kind == "custom_index");
+    auto pre_publish_check = [&captured_shards, &authoritative_src, is_indexed, &model]() {
+        if (is_indexed) {
+            std::array<std::uint8_t, 32> cur_idx_sha{};
+            if (!model.index_sha256() || !sha256_regular_file(authoritative_src, cur_idx_sha) ||
+                cur_idx_sha != *model.index_sha256()) {
+                fail_pack(authoritative_src, "source snapshot changed during pack build");
+            }
+        }
+        for (const CapturedShard& cs : captured_shards) {
+            ShardFingerprint post_fp{};
+            if (!stat_fd(cs.file->fd(), post_fp) || !shard_stats_match(cs.fp, post_fp)) {
+                fail_pack(cs.file->path(), "source snapshot changed during pack build (open shard fd mutated)");
+            }
+            ShardFingerprint path_fp{};
+            if (!stat_regular_file(cs.file->path(), path_fp) || !shard_stats_match(cs.fp, path_fp)) {
+                fail_pack(cs.file->path(), "source snapshot changed during pack build (shard path replaced)");
+            }
+            if (cs.fp.has_full_sha256) {
+                std::array<std::uint8_t, 32> post_sha{};
+                if (!sha256_fd(cs.file->fd(), post_fp.file_size, post_sha) ||
+                    post_sha != cs.fp.full_sha256) {
+                    fail_pack(cs.file->path(), "source snapshot changed during pack build (shard content mutated)");
+                }
+            }
+        }
+    };
+    WeightPackBuildStats stats = builder.write_impl(output_path, opts, pre_publish_check);
     if (any_large_shard_without_sha && has_max_ctime) {
         for (int attempt = 0; attempt < 10; ++attempt) {
             struct stat pst {};
@@ -1253,6 +1342,16 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
         }
     }
     return stats;
+}
+
+void set_next_pack_after_open_hook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lk(g_pack_hook_mu);
+    g_next_after_open_hook = std::move(hook);
+}
+
+void set_next_pack_before_copy_hook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lk(g_pack_hook_mu);
+    g_next_before_copy_hook = std::move(hook);
 }
 
 }  // namespace ingine
