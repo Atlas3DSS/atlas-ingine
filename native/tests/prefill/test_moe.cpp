@@ -398,6 +398,9 @@ int main() {
   ok &= run(rng, 2, 200);
   ok &= run(rng, 3, 200);
   ok &= run(rng, 0, 9);
+  ok &= run(rng, 0, 1);  // decode widths (T <= 8): moe_decode_v70 on Volta
+  ok &= run(rng, 0, 4);
+  ok &= run(rng, 0, 8);
   ok &= run(rng, 2, 9);
   ok &= run(rng, 3, 9);
   ok &= run(rng, 0, 700);  // 128-row tiles (T > 512)
