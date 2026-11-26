@@ -302,6 +302,8 @@ std::string format_uuid(const cudaUUID_t& u) {
 
 // ----------------------------------------------------------------------------- TpWorkerPool (4-GPU NCCL coordinator)
 
+constexpr int kBlocksAr = kernels::batch::P2pAllReduce2::kBlocks;
+
 class TpWorkerPool {
  public:
   struct RankInfo {
@@ -316,6 +318,7 @@ class TpWorkerPool {
     std::atomic<std::uint64_t> decode_steps{0};
     std::atomic<std::uint64_t> allreduce_calls{0};
     std::atomic<std::uint64_t> allgather_calls{0};
+    kernels::batch::P2pAllReduce2 p2p_ar;  // TP2 decode all-reduce over peer access (inactive: NCCL)
   };
 
   TpWorkerPool() {
@@ -368,6 +371,31 @@ class TpWorkerPool {
     }
     CUDA_CHECK(cudaSetDevice(0));
     NCCL_CHECK(ncclCommInitAll(comms_, TP_SIZE, devs));
+    // TP2 decode all-reduces over peer access: a [B <= 8, H] FP32 vector a call, 96 slots (2 a visit); a 24 us NCCL
+    // ring all-reduce over PCIe became one 8-block kernel (INGINE_TP_P2P_AR=0: NCCL).
+    {
+      const char* env = std::getenv("INGINE_TP_P2P_AR");
+      if (TP_SIZE == 2 && p2p_probe_.p2p_enabled && !p2p_probe_.corrupted && !(env && env[0] == '0')) {
+        constexpr int kSlots = 2 * NUM_VISITS, kCap = 8 * HIDDEN;
+        constexpr std::size_t nf = std::size_t(kSlots) * kBlocksAr;
+        for (int r = 0; r < TP_SIZE; ++r) {
+          CUDA_CHECK(cudaSetDevice(r));
+          auto& a = info_[r].p2p_ar;
+          CUDA_CHECK(cudaMalloc(&a.my_recv, std::size_t(kSlots) * kCap * sizeof(float)));
+          CUDA_CHECK(cudaMalloc(&a.my_flag, nf * sizeof(unsigned)));
+          CUDA_CHECK(cudaMalloc(&a.my_seq, nf * sizeof(unsigned)));
+          CUDA_CHECK(cudaMemset(a.my_flag, 0, nf * sizeof(unsigned)));
+          CUDA_CHECK(cudaMemset(a.my_seq, 0, nf * sizeof(unsigned)));
+          a.slots = kSlots, a.cap = kCap;
+        }
+        for (int r = 0; r < TP_SIZE; ++r) {
+          info_[r].p2p_ar.peer_recv = info_[1 - r].p2p_ar.my_recv;
+          info_[r].p2p_ar.peer_flag = info_[1 - r].p2p_ar.my_flag;
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        log.info("TP2 decode all-reduce: CUDA peer access ({} slots x {} floats), NCCL for prefill", kSlots, kCap);
+      }
+    }
 
     for (int r = 0; r < TP_SIZE; ++r) {
       const int e_per = EXPERTS / TP_SIZE;
@@ -397,6 +425,8 @@ class TpWorkerPool {
     for (int r = 0; r < TP_SIZE; ++r) {
       cudaSetDevice(r);
       if (streams_[r]) cudaStreamSynchronize(streams_[r]);
+      auto& a = info_[r].p2p_ar;
+      if (a.my_recv) cudaFree(a.my_recv), cudaFree(a.my_flag), cudaFree(a.my_seq);
       if (comms_[r]) ncclCommDestroy(comms_[r]);
       if (streams_[r]) cudaStreamDestroy(streams_[r]);
     }
@@ -1259,7 +1289,10 @@ class TpBatchDecoder {
         const ActT* wo = bf16_rows(layer.wo);
         gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_fp32_, H, true, B, H, HEADS * HEAD_DIM, stream);
       }
-      NCCL_CHECK(ncclAllReduce(wo_fp32_, wo_fp32_, std::size_t(B) * H, ncclFloat32, ncclSum, comm_, stream));
+      if (rinfo_.p2p_ar.active() && B * H <= rinfo_.p2p_ar.cap && 2 * v + 1 < rinfo_.p2p_ar.slots)
+        bk::p2p_allreduce2(wo_fp32_, B * H, rinfo_.p2p_ar, 2 * v, stream);
+      else
+        NCCL_CHECK(ncclAllReduce(wo_fp32_, wo_fp32_, std::size_t(B) * H, ncclFloat32, ncclSum, comm_, stream));
       float* conv_attn_v = static_cast<float*>(pool_.conv_attn.p) + std::size_t(v) * (CONV_K - 1) * H;
       bk::batched_static_conv_step(wo_fp32_, true, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
                                    pool_.conv_h_slot_stride, y_, stream);
@@ -1306,7 +1339,10 @@ class TpBatchDecoder {
       pk::moe_gate_up(me, xm_, B, work, act_, stream);
       pk::moe_down(me, act_, B, work, down_, stream);
       pk::moe_combine_ep(down_, wts_, idx_, me.active_mask, B, moe_f32_, stream);
-      NCCL_CHECK(ncclAllReduce(moe_f32_, moe_f32_, std::size_t(B) * H, ncclFloat32, ncclSum, comm_, stream));
+      if (rinfo_.p2p_ar.active() && B * H <= rinfo_.p2p_ar.cap && 2 * v + 1 < rinfo_.p2p_ar.slots)
+        bk::p2p_allreduce2(moe_f32_, B * H, rinfo_.p2p_ar, 2 * v + 1, stream);
+      else
+        NCCL_CHECK(ncclAllReduce(moe_f32_, moe_f32_, std::size_t(B) * H, ncclFloat32, ncclSum, comm_, stream));
       float* conv_mlp_v = static_cast<float*>(pool_.conv_mlp.p) + std::size_t(v) * (CONV_K - 1) * H;
       bk::batched_static_conv_step(moe_f32_, true, H, B, H, slot_ids_dev_, f32p(layer.mlp_conv), conv_mlp_v,
                                    pool_.conv_h_slot_stride, y2_, stream);
