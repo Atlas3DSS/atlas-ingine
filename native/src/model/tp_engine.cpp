@@ -246,7 +246,9 @@ const ActT* bf16p(const Tensor& t) { return static_cast<const ActT*>(t.data); }
 const ActT* bf16p(const void* p) { return static_cast<const ActT*>(p); }
 
 dense::Matrix matrix(const Dense& d) {
-  return dense::Matrix{d.w.data, static_cast<const float*>(d.scale.data), d.rows()};
+  return dense::Matrix{d.w.data, static_cast<const float*>(d.scale.data), d.rows(),
+                       static_cast<const std::int64_t*>(d.blk_off.data), static_cast<const std::int32_t*>(d.blk_soff.data),
+                       static_cast<const std::uint16_t*>(d.q8_scale.data)};
 }
 
 std::vector<int> proj_layout(bool full, bool single_input) {
@@ -566,7 +568,7 @@ class TpPrefiller {
     moe_f32_ = f32(C * H);
     local_logits_ = f32(LOCAL_VOCAB_CHUNK);
     gathered_logits_ = f32(std::size_t(TP_SIZE) * LOCAL_VOCAB_CHUNK);
-    wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
+    wscratch_ = (w.dense_fp8 || w.dense_q8) ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
     ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   }
 
@@ -601,6 +603,10 @@ class TpPrefiller {
       dense::mix(p, false, s);
     };
     auto bf16_rows = [&](const Dense& d) -> const ActT* {
+      if (d.blocked()) {
+        dense::dequant_blocked(matrix(d), d.cols(), wscratch_, s);
+        return wscratch_;
+      }
       if (!d.fp8()) return bf16p(d.w);
       dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s);
       return wscratch_;
@@ -999,7 +1005,9 @@ class TpBatchDecoder {
     gathered_logits_ = f32(std::size_t(TP_SIZE) * B * LOCAL_VOCAB_CHUNK);
     logits_ = (rank_ == 0) ? f32(B * UNPADDED_VOCAB) : nullptr;
     head_act_ = B > 8 ? bf16(B * kHeadChunk) : nullptr;
-    wscratch_ = (w.dense_fp8 && B > 32) ? bf16(std::size_t(kHeadChunk) * H) : nullptr;
+    wscratch_ = (w.dense_fp8 && B > 32) ? bf16(std::size_t(kHeadChunk) * H)
+                : (w.dense_q8 && B > 32) ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM))
+                                         : nullptr;
     attn_ws_ = DeviceBuffer(bk::attn_workspace_bytes(max_batch));
     attn_ws_.fill(0);
 
@@ -1124,6 +1132,10 @@ class TpBatchDecoder {
       dense::mix(p, false, stream);
     };
     auto bf16_rows = [&](const Dense& d) -> const ActT* {
+      if (d.blocked()) {
+        dense::dequant_blocked(matrix(d), d.cols(), wscratch_, stream);
+        return wscratch_;
+      }
       if (!d.fp8()) return bf16p(d.w);
       dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, stream);
       return wscratch_;
@@ -1196,7 +1208,7 @@ class TpBatchDecoder {
       // ---- Sharded attention projections
       const int R = proj_rows(layer.full);
       const bool single = !layer.full && !msgs;
-      const bool proj_gemv = use_gemv || (layer.wproj.fp8() && B <= 32);
+      const bool proj_gemv = use_gemv || ((layer.wproj.fp8() || layer.wproj.blocked()) && B <= 32);
       if (proj_gemv) {
         const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
         if (B <= 8) {
@@ -1280,7 +1292,7 @@ class TpBatchDecoder {
       bk::batched_attn_decode(a, stream);
 
       // ---- Sharded wo (K = HEADS*HEAD_DIM = 768) + NCCL AllReduce + per-slot static conv
-      const bool wo_gemv = use_gemv || (layer.wo.fp8() && B <= 32);
+      const bool wo_gemv = use_gemv || ((layer.wo.fp8() || layer.wo.blocked()) && B <= 32);
       if (wo_gemv) {
         for (int b0 = 0; b0 < B; b0 += 8) {
           const int cb = std::min(8, B - b0);
