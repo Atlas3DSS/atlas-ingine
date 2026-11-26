@@ -24,7 +24,9 @@
 #include "kernels/moe/moe.h"
 #include "kernels/prefill/prefill.h"
 #include "model/batch_drafter.h"
+#include "model/batch_prefix_cache.h"
 #include "model/drafter.h"
+#include "model/kv_checkpoint.h"
 #include "model/model_kernels.h"
 #include "model/runtime.h"
 #include "model/weights_gguf.h"
@@ -2135,13 +2137,26 @@ class TpBatchGenerator final : public Generator {
                                       TP_SIZE, TP_SIZE, num_pages_, num_pages_ * bk::kPageSize, options_.max_batch, options_.max_ctx,
                                       options_.kv_fp4v ? "fp8k+fp4v" : (options_.kv_fp8 ? "fp8" : "fp16"));
 
-    free_pages_.resize(num_pages_);
-    for (int i = 0; i < num_pages_; ++i) free_pages_[i] = num_pages_ - 1 - i;
+    page_pool_.init(num_pages_);
     slot_pages_.assign(options_.max_batch, {});
     slot_pos_host_.assign(options_.max_batch, 0);
     slot_in_use_.assign(options_.max_batch, false);
     slot_meta_.resize(options_.max_batch);
     slot_prefill_.resize(options_.max_batch);
+
+    model_sha256_ = sha256_file_or_zero(options_.model_dir / "config.json");
+    if (!options_.ablation.empty()) {
+      const auto abl_h = sha256_file_or_zero(options_.ablation);
+      for (std::size_t i = 0; i < 32; ++i) model_sha256_[i] ^= abl_h[i];
+    }
+    if (!options_.prefix_cache || options_.park_host_mb < 0) {
+      prefix_cache_.set_vram_budget(0);
+    } else if (options_.park_host_mb > 0) {
+      prefix_cache_.set_vram_budget(std::size_t(options_.park_host_mb) << 20);
+    } else {
+      const std::size_t auto_host_mb = (options_.park_mb == 0) ? 0u : 2048u;
+      prefix_cache_.set_vram_budget(auto_host_mb << 20);
+    }
 
     // Step 2: allocate uniform paged pools + batch decoders on all ranks
     pool_.run_all([&](int r) {
@@ -2190,6 +2205,32 @@ class TpBatchGenerator final : public Generator {
       CUDA_CHECK(cudaStreamSynchronize(pool_.stream(0)));
     }
 
+    // Step 2c: pre-allocate & register pinned host RAM slots for zero-stall prefix snapshots (0 MiB VRAM)
+    if (prefix_cache_.vram_budget_bytes() > 0) {
+      const auto& kv0 = ranks_[0].kv_pool;
+      const std::size_t k_es = options_.kv_fp8 ? 1 : 2;
+      const std::size_t k_row_bytes = std::size_t(KV_DIM) * k_es;
+      const std::size_t v_row_bytes = options_.kv_fp4v ? (std::size_t(KV_DIM) / 2) : k_row_bytes;
+      const std::size_t max_rank_bytes =
+          2 * std::size_t(NUM_SLIDING_VISITS) * WINDOW * KV_DIM * sizeof(ActT) +
+          std::size_t(NUM_SLIDING_VISITS) * WINDOW * sizeof(std::int64_t) +
+          2 * kv0.conv_kv_slot_stride * sizeof(float) + 2 * kv0.conv_h_slot_stride * sizeof(float) +
+          std::size_t(NUM_FULL_VISITS) * std::size_t(bk::kPageSize - 1) * (k_row_bytes + v_row_bytes);
+      const std::size_t logits_bytes = std::size_t(UNPADDED_VOCAB) * sizeof(float);
+      const std::size_t drafter_bytes = batch_drafter_ ? batch_drafter_->slot_snapshot_bytes() : 0;
+      const std::size_t slot_bytes = std::size_t(TP_SIZE) * max_rank_bytes + logits_bytes + drafter_bytes;
+      const int n_slots = int(prefix_cache_.vram_budget_bytes() / std::max<std::size_t>(1, slot_bytes));
+      if (n_slots > 0) {
+        host_slot_pool_ = std::make_shared<HostSlotPool>(n_slots, max_rank_bytes, logits_bytes, drafter_bytes);
+        prefix_cache_.set_vram_budget(std::size_t(n_slots) * slot_bytes);
+        ingine::engine::server_log().info(
+            "TP{}/EP{} zero-copy paged prefix cache: {} pre-registered host slots ({} MiB pinned RAM, 0 MiB VRAM, paged_pool={} pages)",
+            TP_SIZE, TP_SIZE, n_slots, (std::size_t(n_slots) * slot_bytes) >> 20, num_pages_);
+      } else {
+        prefix_cache_.set_vram_budget(0);
+      }
+    }
+
     // Step 3: warmup & capture buckets across all ranks concurrently.
     const char* no_graph = std::getenv("INGINE_TP_NO_GRAPH");
     enable_graphs_ = !(no_graph && no_graph[0] == '1');
@@ -2220,6 +2261,8 @@ class TpBatchGenerator final : public Generator {
   }
 
   ~TpBatchGenerator() override {
+    prefix_cache_.clear(page_pool_);
+    host_slot_pool_.reset();
     if (spec_active_) {
       cudaSetDevice(0);
       if (accept_ready_ev_) cudaEventDestroy(accept_ready_ev_);
@@ -2293,11 +2336,49 @@ class TpBatchGenerator final : public Generator {
                                              : ""));
   }
 
+  PrefixCacheStats cache_stats() const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    PrefixCacheStats st = prefix_cache_.stats();
+    // TP2 prefix cache stores all private recurrent/tail/drafter state in pinned host RAM (0 MiB VRAM).
+    st.host_budget_bytes = st.vram_budget_bytes;
+    st.host_used_bytes = st.vram_used_bytes;
+    st.host_peak_bytes = st.vram_peak_bytes;
+    st.host_entries = st.vram_entries;
+    st.host_evictions = st.vram_evictions;
+    st.vram_budget_bytes = 0;
+    st.vram_used_bytes = 0;
+    st.vram_peak_bytes = 0;
+    st.vram_entries = 0;
+    st.vram_evictions = 0;
+    st.h2d_restore_bytes = h2d_restore_bytes_;
+    st.d2h_park_bytes = d2h_park_bytes_;
+    return st;
+  }
+
   bool can_admit_slot(int prompt_tokens, int /*max_new_tokens*/) const override {
     std::lock_guard<std::mutex> lk(mu_);
     if (free_slot_count_unlocked() <= 0) return false;
     const int need = (prompt_tokens + 1 + bk::kPageSize - 1) / bk::kPageSize;
-    return int(free_pages_.size()) >= need;
+    return page_pool_.available_for_admission() >= need;
+  }
+
+  bool can_admit_slot(const Prompt& full_prompt, int /*max_new_tokens*/, const Sampling& /*sampling*/) const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (free_slot_count_unlocked() <= 0) return false;
+    const int n = int(full_prompt.ids.size());
+    const int need = (n + 1 + bk::kPageSize - 1) / bk::kPageSize;
+    int F = 0;
+    std::uint64_t hit_id = 0;
+    if (cache_eligible_unlocked(full_prompt) && n > 0) {
+      const StateIdentity id = build_identity_unlocked(full_prompt);
+      if (const auto* hit = prefix_cache_.find_longest_prefix_const(id, full_prompt.ids)) {
+        F = int(hit->tokens.size()) / bk::kPageSize;
+        hit_id = hit->id;
+      }
+    }
+    const int fresh_need = std::max(0, need - F);
+    const int avail = page_pool_.free_count() + prefix_cache_.reclaimable_pages_excluding(page_pool_, hit_id);
+    return avail >= fresh_need;
   }
 
   bool supports_chunked_prefill() const override { return options_.prefill_interleave_chunk > 0; }
@@ -2317,32 +2398,89 @@ class TpBatchGenerator final : public Generator {
     if (n >= options_.max_ctx) throw std::invalid_argument("prompt exceeds max_ctx");
 
     std::lock_guard<std::mutex> lk(mu_);
-    const int need_pages = (n + 1 + bk::kPageSize - 1) / bk::kPageSize;
-    if (free_slot_count_unlocked() <= 0 || int(free_pages_.size()) < need_pages) return -1;
+    if (free_slot_count_unlocked() <= 0) return -1;
+
+    const bool cache_eligible = cache_eligible_unlocked(full_prompt);
+    const StateIdentity identity = cache_eligible ? build_identity_unlocked(full_prompt) : StateIdentity{};
+    const auto* hit = cache_eligible ? prefix_cache_.find_longest_prefix(identity, prompt) : nullptr;
+    const int L = hit ? int(hit->tokens.size()) : 0;
+    const int F = L / bk::kPageSize;
+    const int tail = L % bk::kPageSize;
+    const std::uint64_t hit_id = hit ? hit->id : 0;
+
+    const int initial_pages = (n + 1 + bk::kPageSize - 1) / bk::kPageSize;
+    const int fresh_needed = std::max(0, initial_pages - F);
+    if (page_pool_.free_count() < fresh_needed) {
+      prefix_cache_.ensure_free_pages(page_pool_, fresh_needed, hit_id);
+    }
+    if (page_pool_.free_count() < fresh_needed) return -1;
+
     const int s = alloc_slot_unlocked();
     if (s < 0) return -1;
-    if (!ensure_pages_all_unlocked(s, n + 1)) {
+    if (F > 0 && !attach_committed_pages_all_unlocked(s, hit->committed_pages)) {
+      free_slot_unlocked(s);
+      return -1;
+    }
+    if (!ensure_pages_all_unlocked(s, n + 1, hit_id)) {
       free_slot_unlocked(s);
       return -1;
     }
 
     try {
+      const auto tr0 = std::chrono::steady_clock::now();
+      std::uint64_t restored_bytes = 0;
       pool_.run_all([&](int r) {
         auto& rk = ranks_[r];
         State st = rk.kv_pool.prefill_view(s);
         reset_state(st, pool_.stream(r));
         if (r == 0 && batch_drafter_) batch_drafter_->reset_slot(s);
       });
+
+      if (hit != nullptr) {
+        std::array<std::uint64_t, TP_SIZE> rank_bytes{};
+        const int tail_phys = (tail > 0) ? slot_pages_[s][std::size_t(F)] : -1;
+        pool_.run_all([&](int r) {
+          rank_bytes[r] = restore_rank_payload_unlocked(r, s, hit->payload.rank_ptr(r), hit->payload.ring_rows,
+                                                        tail, tail_phys);
+          if (r == 0) {
+            if (batch_drafter_ && hit->payload.drafter_bytes > 0) {
+              rank_bytes[r] += batch_drafter_->restore_slot_from_host(
+                  s, hit->payload.drafter_ptr(), L);
+            }
+            if (L == n && hit->payload.logits_ptr() != nullptr) {
+              CUDA_CHECK(cudaMemcpyAsync(prefill_logits_.p, hit->payload.logits_ptr(), prefill_logits_.bytes,
+                                         cudaMemcpyHostToDevice, pool_.stream(0)));
+              rank_bytes[r] += prefill_logits_.bytes;
+            }
+          }
+          CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
+        });
+        for (int r = 0; r < TP_SIZE; ++r) restored_bytes += rank_bytes[r];
+        h2d_restore_bytes_ += restored_bytes;
+      }
+
       SlotPrefillState& ps = slot_prefill_[s];
       ps.active = true;
       ps.prompt_ids.assign(prompt.begin(), prompt.end());
-      ps.next_pos = 0;
+      ps.next_pos = L;
       ps.max_new_tokens = max_new_tokens;
       ps.params = to_head_params(sampling);
       ps.seed = sampling.seed;
       ps.forced.assign(sampling.forced.begin(), sampling.forced.end());
+      ps.cache_eligible = cache_eligible;
+      ps.identity = identity;
+      ps.root_prefix_tokens =
+          (cache_eligible && full_prompt.root_prefix_tokens >= bk::kPageSize &&
+           full_prompt.root_prefix_tokens > L && full_prompt.root_prefix_tokens < n)
+              ? full_prompt.root_prefix_tokens
+              : 0;
+      ps.root_published = false;
+      ps.reused_tokens = L;
+      ps.reuse = (L == 0) ? Reuse::None : (hit->is_root ? Reuse::RootCheckpoint : Reuse::PagedPrefix);
+      ps.restored_bytes = restored_bytes;
+      ps.has_restored_bytes = (hit != nullptr);
       ps.t0 = std::chrono::steady_clock::now();
-      ps.prefill_seconds = 0.0;
+      ps.prefill_seconds = (hit != nullptr) ? seconds_since(tr0) : 0.0;
       return s;
     } catch (...) {
       pool_.run_all([&](int r) { cudaStreamSynchronize(pool_.stream(r)); });
@@ -2359,34 +2497,61 @@ class TpBatchGenerator final : public Generator {
     SlotPrefillState& ps = slot_prefill_[s];
     const int n = int(ps.prompt_ids.size());
     const int start = ps.next_pos;
-    const int cap = (max_chunk_tokens > 0) ? std::min(prefill_chunk_, max_chunk_tokens) : prefill_chunk_;
-    const int T = std::min(cap, n - start);
-    const bool is_last = (start + T >= n);
     const auto tc0 = std::chrono::steady_clock::now();
 
     try {
-      pool_.run_all([&](int r) {
-        auto& rk = ranks_[r];
-        State st = rk.kv_pool.prefill_view(s);
-        st.length = start;
-        CUDA_CHECK(cudaMemcpyAsync(rk.chunk_tokens.p, ps.prompt_ids.data() + start,
-                                   std::size_t(T) * sizeof(std::int32_t), cudaMemcpyHostToDevice, pool_.stream(r)));
-        float* out_l = (r == 0 && is_last) ? static_cast<float*>(prefill_logits_.p) : nullptr;
-        ActT* tap_p = (r == 0 && batch_drafter_) ? static_cast<ActT*>(prefill_taps_.p) : nullptr;
-        Tensor tap_view = tap_p ? rm(tap_p, kActDType, {T, NUM_TAPS, HIDDEN}) : Tensor{};
-        rk.prefiller->run(st, static_cast<const std::int32_t*>(rk.chunk_tokens.p), T, start, out_l,
-                          tap_p ? &tap_view : nullptr, is_last);
-        if (r == 0 && batch_drafter_) batch_drafter_->commit_slot(s, tap_p, T, start);
-        if (is_last) {
-          const std::int64_t pos64 = n;
-          CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int64_t*>(rk.kv_pool.slot_pos.p) + s, &pos64, sizeof(pos64),
-                                     cudaMemcpyHostToDevice, pool_.stream(r)));
+      if (start < n) {
+        const int cap = (max_chunk_tokens > 0) ? std::min(prefill_chunk_, max_chunk_tokens) : prefill_chunk_;
+        int T = std::min(cap, n - start);
+        if (ps.root_prefix_tokens > start && start + T > ps.root_prefix_tokens) {
+          T = ps.root_prefix_tokens - start;
         }
-        CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
-      });
-      ps.next_pos = start + T;
-      ps.prefill_seconds += seconds_since(tc0);
-      if (!is_last) return false;
+        const bool is_last = (start + T >= n);
+        const bool hit_root =
+            (ps.cache_eligible && !ps.root_published && ps.root_prefix_tokens > 0 && start + T == ps.root_prefix_tokens);
+        const bool need_logits = (is_last || hit_root);
+
+        pool_.run_all([&](int r) {
+          auto& rk = ranks_[r];
+          State st = rk.kv_pool.prefill_view(s);
+          st.length = start;
+          CUDA_CHECK(cudaMemcpyAsync(rk.chunk_tokens.p, ps.prompt_ids.data() + start,
+                                     std::size_t(T) * sizeof(std::int32_t), cudaMemcpyHostToDevice, pool_.stream(r)));
+          float* out_l = (r == 0 && need_logits) ? static_cast<float*>(prefill_logits_.p) : nullptr;
+          ActT* tap_p = (r == 0 && batch_drafter_) ? static_cast<ActT*>(prefill_taps_.p) : nullptr;
+          Tensor tap_view = tap_p ? rm(tap_p, kActDType, {T, NUM_TAPS, HIDDEN}) : Tensor{};
+          rk.prefiller->run(st, static_cast<const std::int32_t*>(rk.chunk_tokens.p), T, start, out_l,
+                            tap_p ? &tap_view : nullptr, need_logits);
+          if (r == 0 && batch_drafter_) batch_drafter_->commit_slot(s, tap_p, T, start);
+          if (is_last) {
+            const std::int64_t pos64 = n;
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int64_t*>(rk.kv_pool.slot_pos.p) + s, &pos64, sizeof(pos64),
+                                       cudaMemcpyHostToDevice, pool_.stream(r)));
+          }
+          CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
+        });
+        ps.next_pos = start + T;
+        ps.prefill_seconds += seconds_since(tc0);
+        if (hit_root) {
+          snapshot_and_publish_unlocked(s, ps.identity,
+                                        std::span<const std::int32_t>(ps.prompt_ids.data(), std::size_t(ps.next_pos)),
+                                        /*is_root=*/true);
+          ps.root_published = true;
+        }
+        if (!is_last) return false;
+        if (ps.cache_eligible && n >= bk::kPageSize) {
+          snapshot_and_publish_unlocked(s, ps.identity, ps.prompt_ids, /*is_root=*/false);
+        }
+      } else {
+        // Exact prefix hit (start == n): no prefill compute needed, just publish device slot_pos.
+        pool_.run_all([&](int r) {
+          const std::int64_t pos64 = n;
+          CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int64_t*>(ranks_[r].kv_pool.slot_pos.p) + s, &pos64,
+                                     sizeof(pos64), cudaMemcpyHostToDevice, pool_.stream(r)));
+          CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
+        });
+        ps.prefill_seconds += seconds_since(tc0);
+      }
 
       slot_pos_host_[s] = n;
 
@@ -2435,8 +2600,10 @@ class TpBatchGenerator final : public Generator {
       }
 
       stats.prompt_tokens = n;
-      stats.reused_tokens = 0;
-      stats.reuse = Reuse::None;
+      stats.reused_tokens = ps.reused_tokens;
+      stats.reuse = ps.reuse;
+      if (ps.has_restored_bytes) stats.restored_bytes = ps.restored_bytes;
+      else stats.restored_bytes.reset();
       stats.prefill_seconds = ps.prefill_seconds;
       ps = SlotPrefillState{};
       return true;
@@ -2482,7 +2649,10 @@ class TpBatchGenerator final : public Generator {
       if (needed > max_pages_per_slot_) throw std::runtime_error("step_slots: paged KV pool exhausted");
       extra_pages += std::max(0, needed - int(slot_pages_[s].size()));
     }
-    if (extra_pages > int(free_pages_.size())) throw std::runtime_error("step_slots: paged KV pool exhausted");
+    if (extra_pages > page_pool_.free_count()) {
+      prefix_cache_.ensure_free_pages(page_pool_, extra_pages);
+    }
+    if (extra_pages > page_pool_.free_count()) throw std::runtime_error("step_slots: paged KV pool exhausted");
     for (const auto& input : inputs) {
       ensure_pages_all_unlocked(input.slot, slot_pos_host_[input.slot] + 1);
     }
@@ -2720,7 +2890,11 @@ class TpBatchGenerator final : public Generator {
       }
       return extra;
     };
-    while (calc_extra_pages() > int(free_pages_.size())) {
+    const int need_extra = calc_extra_pages();
+    if (need_extra > page_pool_.free_count()) {
+      prefix_cache_.ensure_free_pages(page_pool_, need_extra);
+    }
+    while (calc_extra_pages() > page_pool_.free_count()) {
       bool shrank = false;
       for (int i = 0; i < S; ++i) {
         if (m_slot[i] > 1) { --m_slot[i]; shrank = true; break; }
@@ -2964,19 +3138,63 @@ class TpBatchGenerator final : public Generator {
     }
     return -1;
   }
-  bool ensure_pages_all_unlocked(int s, int total_tokens) {
+  bool cache_eligible_unlocked(const Prompt& full_prompt) const noexcept {
+    return options_.prefix_cache && !full_prompt.bypass_prefix_cache && full_prompt.images.empty() &&
+           prefix_cache_.vram_budget_bytes() > 0;
+  }
+
+  StateIdentity build_identity_unlocked(const Prompt& full_prompt) const {
+    StateIdentity id;
+    id.model_sha256 = model_sha256_;
+    id.act_dtype = (kActDType == DType::FP16) ? 1u : 0u;
+    id.dense_fp8 = options_.dense_fp8;
+    id.kv_format = options_.kv_fp4v ? 3u : (options_.kv_fp8 ? 1u : 0u);
+    id.kv_cache_mode = static_cast<std::uint32_t>(options_.kv_cache_mode);
+    id.loop_passes = options_.loop_passes;
+    id.max_ctx = options_.max_ctx;
+    id.prefill_chunk = 0;
+    id.spec_enabled = spec_active_;
+    id.cache_namespace = full_prompt.cache_namespace;
+    return id;
+  }
+
+  bool attach_committed_pages_all_unlocked(int s, const std::vector<int>& committed_pages) {
+    const int F = int(committed_pages.size());
+    if (F <= 0) return true;
+    if (F > max_pages_per_slot_) return false;
+    auto& pages = slot_pages_[s];
+    if (!pages.empty()) return false;
+    pages.reserve(std::size_t(F));
+    for (int p : committed_pages) {
+      page_pool_.retain_committed_page(p);
+      pages.push_back(p);
+    }
+    pool_.run_all([&](int r) {
+      auto& kv = ranks_[r].kv_pool;
+      std::int32_t* dev_row = static_cast<std::int32_t*>(kv.page_table.p) + std::size_t(s) * max_pages_per_slot_;
+      CUDA_CHECK(cudaMemcpyAsync(dev_row, pages.data(), std::size_t(F) * sizeof(std::int32_t),
+                                 cudaMemcpyHostToDevice, pool_.stream(r)));
+    });
+    return true;
+  }
+
+  bool ensure_pages_all_unlocked(int s, int total_tokens, std::uint64_t protected_entry_id = 0) {
     const int needed = (total_tokens + bk::kPageSize - 1) / bk::kPageSize;
     if (needed > max_pages_per_slot_) return false;
     auto& pages = slot_pages_[s];
     const int cur = int(pages.size());
     if (needed <= cur) return true;
     const int add = needed - cur;
-    if (int(free_pages_.size()) < add) return false;
-    for (int i = 0; i < add; ++i) {
-      pages.push_back(free_pages_.back());
-      free_pages_.pop_back();
+    if (page_pool_.free_count() < add) {
+      prefix_cache_.ensure_free_pages(page_pool_, add, protected_entry_id);
     }
-    // Mirror exact page table update to all 4 ranks
+    if (page_pool_.free_count() < add) return false;
+    for (int i = 0; i < add; ++i) {
+      const int p = page_pool_.alloc_private_page();
+      if (p < 0) return false;
+      pages.push_back(p);
+    }
+    // Mirror exact page table update to all ranks
     pool_.run_all([&](int r) {
       auto& kv = ranks_[r].kv_pool;
       std::int32_t* dev_row = static_cast<std::int32_t*>(kv.page_table.p) + std::size_t(s) * max_pages_per_slot_;
@@ -2985,9 +3203,197 @@ class TpBatchGenerator final : public Generator {
     });
     return true;
   }
+
+  std::uint64_t restore_rank_payload_unlocked(int r, int s, const void* host_ptr, int ring_rows,
+                                              int tail, int tail_phys) {
+    auto& kv = ranks_[r].kv_pool;
+    const cudaStream_t stream = pool_.stream(r);
+    const auto* base = static_cast<const std::byte*>(host_ptr);
+    std::size_t off = 0;
+
+    const std::size_t ring_visit_pitch = std::size_t(WINDOW) * KV_DIM * sizeof(ActT);
+    const std::size_t ring_row_width = std::size_t(ring_rows) * KV_DIM * sizeof(ActT);
+    const std::size_t ring_bytes = std::size_t(NUM_SLIDING_VISITS) * ring_row_width;
+    auto* dst_kr = static_cast<ActT*>(kv.k_ring.p) + std::size_t(s) * kv.ring_slot_stride;
+    auto* dst_vr = static_cast<ActT*>(kv.v_ring.p) + std::size_t(s) * kv.ring_slot_stride;
+    CUDA_CHECK(cudaMemcpy2DAsync(dst_kr, ring_visit_pitch, base + off, ring_row_width, ring_row_width,
+                                 NUM_SLIDING_VISITS, cudaMemcpyHostToDevice, stream));
+    off += ring_bytes;
+    CUDA_CHECK(cudaMemcpy2DAsync(dst_vr, ring_visit_pitch, base + off, ring_row_width, ring_row_width,
+                                 NUM_SLIDING_VISITS, cudaMemcpyHostToDevice, stream));
+    off += ring_bytes;
+
+    const std::size_t rp_pitch = std::size_t(WINDOW) * sizeof(std::int64_t);
+    const std::size_t rp_width = std::size_t(ring_rows) * sizeof(std::int64_t);
+    const std::size_t rp_bytes = std::size_t(NUM_SLIDING_VISITS) * rp_width;
+    auto* dst_rp = static_cast<std::int64_t*>(kv.ring_pos.p) + std::size_t(s) * kv.ring_pos_slot_stride;
+    CUDA_CHECK(cudaMemcpy2DAsync(dst_rp, rp_pitch, base + off, rp_width, rp_width, NUM_SLIDING_VISITS,
+                                 cudaMemcpyHostToDevice, stream));
+    off += rp_bytes;
+
+    const std::size_t conv_kv_bytes = kv.conv_kv_slot_stride * sizeof(float);
+    const std::size_t conv_h_bytes = kv.conv_h_slot_stride * sizeof(float);
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(kv.conv_k.p) + std::size_t(s) * kv.conv_kv_slot_stride,
+                               base + off, conv_kv_bytes, cudaMemcpyHostToDevice, stream));
+    off += conv_kv_bytes;
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(kv.conv_v.p) + std::size_t(s) * kv.conv_kv_slot_stride,
+                               base + off, conv_kv_bytes, cudaMemcpyHostToDevice, stream));
+    off += conv_kv_bytes;
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(kv.conv_attn.p) + std::size_t(s) * kv.conv_h_slot_stride,
+                               base + off, conv_h_bytes, cudaMemcpyHostToDevice, stream));
+    off += conv_h_bytes;
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(kv.conv_mlp.p) + std::size_t(s) * kv.conv_h_slot_stride,
+                               base + off, conv_h_bytes, cudaMemcpyHostToDevice, stream));
+    off += conv_h_bytes;
+
+    if (tail > 0 && tail_phys >= 0) {
+      const std::size_t k_es = options_.kv_fp8 ? 1 : 2;
+      const std::size_t k_row_bytes = std::size_t(KV_DIM) * k_es;
+      const std::size_t v_row_bytes = options_.kv_fp4v ? (std::size_t(KV_DIM) / 2) : k_row_bytes;
+      const std::size_t k_pitch = std::size_t(bk::kPageSize) * k_row_bytes;
+      const std::size_t v_pitch = std::size_t(bk::kPageSize) * v_row_bytes;
+      const std::size_t k_width = std::size_t(tail) * k_row_bytes;
+      const std::size_t v_width = std::size_t(tail) * v_row_bytes;
+      auto* dst_k = static_cast<std::byte*>(kv.k_full_pool.p) + std::size_t(tail_phys) * NUM_FULL_VISITS * k_pitch;
+      auto* dst_v = static_cast<std::byte*>(kv.v_full_pool.p) + std::size_t(tail_phys) * NUM_FULL_VISITS * v_pitch;
+      CUDA_CHECK(cudaMemcpy2DAsync(dst_k, k_pitch, base + off, k_width, k_width, NUM_FULL_VISITS,
+                                   cudaMemcpyHostToDevice, stream));
+      off += std::size_t(NUM_FULL_VISITS) * k_width;
+      CUDA_CHECK(cudaMemcpy2DAsync(dst_v, v_pitch, base + off, v_width, v_width, NUM_FULL_VISITS,
+                                   cudaMemcpyHostToDevice, stream));
+      off += std::size_t(NUM_FULL_VISITS) * v_width;
+    }
+    return off;
+  }
+
+  void snapshot_and_publish_unlocked(int s, const StateIdentity& identity,
+                                     std::span<const std::int32_t> prefix_tokens, bool is_root) {
+    const int L = int(prefix_tokens.size());
+    if (L <= 0 || !host_slot_pool_ || prefix_cache_.vram_budget_bytes() == 0) return;
+    if (prefix_cache_.touch_exact(identity, prefix_tokens)) return;
+
+    const int F = L / bk::kPageSize;
+    const int tail = L % bk::kPageSize;
+    const int ring_rows = std::min(L, WINDOW);
+    const auto& kv0 = ranks_[0].kv_pool;
+    const std::size_t k_es = options_.kv_fp8 ? 1 : 2;
+    const std::size_t k_row_bytes = std::size_t(KV_DIM) * k_es;
+    const std::size_t v_row_bytes = options_.kv_fp4v ? (std::size_t(KV_DIM) / 2) : k_row_bytes;
+    const std::size_t ring_row_width = std::size_t(ring_rows) * KV_DIM * sizeof(ActT);
+    const std::size_t ring_bytes = std::size_t(NUM_SLIDING_VISITS) * ring_row_width;
+    const std::size_t rp_width = std::size_t(ring_rows) * sizeof(std::int64_t);
+    const std::size_t rp_bytes = std::size_t(NUM_SLIDING_VISITS) * rp_width;
+    const std::size_t conv_kv_bytes = kv0.conv_kv_slot_stride * sizeof(float);
+    const std::size_t conv_h_bytes = kv0.conv_h_slot_stride * sizeof(float);
+    const std::size_t tail_k_bytes = tail > 0 ? (std::size_t(NUM_FULL_VISITS) * std::size_t(tail) * k_row_bytes) : 0;
+    const std::size_t tail_v_bytes = tail > 0 ? (std::size_t(NUM_FULL_VISITS) * std::size_t(tail) * v_row_bytes) : 0;
+    const std::size_t logits_bytes = prefill_logits_.bytes;
+    const std::size_t drafter_bytes = batch_drafter_ ? batch_drafter_->slot_snapshot_bytes() : 0;
+    const std::size_t slot_budget_bytes = host_slot_pool_->slot_bytes();
+
+    if (slot_budget_bytes > prefix_cache_.vram_budget_bytes()) return;
+    prefix_cache_.ensure_private_vram(page_pool_, slot_budget_bytes);
+    if (prefix_cache_.stats().vram_used_bytes + slot_budget_bytes > prefix_cache_.vram_budget_bytes()) return;
+
+    const int hslot = host_slot_pool_->acquire();
+    if (hslot < 0) return;
+
+    try {
+      BatchPrefixEntry<TpPrefixPayload> entry;
+      entry.identity = identity;
+      entry.tokens.assign(prefix_tokens.begin(), prefix_tokens.end());
+      entry.committed_pages.assign(slot_pages_[s].begin(), slot_pages_[s].begin() + F);
+      entry.tail_tokens = tail;
+      entry.private_vram_bytes = slot_budget_bytes;
+      entry.is_root = is_root;
+
+      TpPrefixPayload& pl = entry.payload;
+      pl.pool = host_slot_pool_;
+      pl.slot_id = hslot;
+      pl.ring_rows = ring_rows;
+      pl.drafter_bytes = drafter_bytes;
+
+      const int tail_phys = (tail > 0) ? slot_pages_[s][std::size_t(F)] : -1;
+      pool_.run_all([&](int r) {
+        auto& kv = ranks_[r].kv_pool;
+        const cudaStream_t stream = pool_.stream(r);
+        auto* base = static_cast<std::byte*>(pl.rank_ptr(r));
+        std::size_t off = 0;
+
+        const std::size_t ring_visit_pitch = std::size_t(WINDOW) * KV_DIM * sizeof(ActT);
+        const auto* src_kr = static_cast<const ActT*>(kv.k_ring.p) + std::size_t(s) * kv.ring_slot_stride;
+        const auto* src_vr = static_cast<const ActT*>(kv.v_ring.p) + std::size_t(s) * kv.ring_slot_stride;
+        CUDA_CHECK(cudaMemcpy2DAsync(base + off, ring_row_width, src_kr, ring_visit_pitch, ring_row_width,
+                                     NUM_SLIDING_VISITS, cudaMemcpyDeviceToHost, stream));
+        off += ring_bytes;
+        CUDA_CHECK(cudaMemcpy2DAsync(base + off, ring_row_width, src_vr, ring_visit_pitch, ring_row_width,
+                                     NUM_SLIDING_VISITS, cudaMemcpyDeviceToHost, stream));
+        off += ring_bytes;
+
+        const std::size_t rp_pitch = std::size_t(WINDOW) * sizeof(std::int64_t);
+        const auto* src_rp =
+            static_cast<const std::int64_t*>(kv.ring_pos.p) + std::size_t(s) * kv.ring_pos_slot_stride;
+        CUDA_CHECK(cudaMemcpy2DAsync(base + off, rp_width, src_rp, rp_pitch, rp_width, NUM_SLIDING_VISITS,
+                                     cudaMemcpyDeviceToHost, stream));
+        off += rp_bytes;
+
+        CUDA_CHECK(cudaMemcpyAsync(base + off,
+                                   static_cast<const float*>(kv.conv_k.p) + std::size_t(s) * kv.conv_kv_slot_stride,
+                                   conv_kv_bytes, cudaMemcpyDeviceToHost, stream));
+        off += conv_kv_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(base + off,
+                                   static_cast<const float*>(kv.conv_v.p) + std::size_t(s) * kv.conv_kv_slot_stride,
+                                   conv_kv_bytes, cudaMemcpyDeviceToHost, stream));
+        off += conv_kv_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(base + off,
+                                   static_cast<const float*>(kv.conv_attn.p) + std::size_t(s) * kv.conv_h_slot_stride,
+                                   conv_h_bytes, cudaMemcpyDeviceToHost, stream));
+        off += conv_h_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(base + off,
+                                   static_cast<const float*>(kv.conv_mlp.p) + std::size_t(s) * kv.conv_h_slot_stride,
+                                   conv_h_bytes, cudaMemcpyDeviceToHost, stream));
+        off += conv_h_bytes;
+
+        if (tail > 0 && tail_phys >= 0) {
+          const std::size_t k_pitch = std::size_t(bk::kPageSize) * k_row_bytes;
+          const std::size_t v_pitch = std::size_t(bk::kPageSize) * v_row_bytes;
+          const std::size_t k_width = std::size_t(tail) * k_row_bytes;
+          const std::size_t v_width = std::size_t(tail) * v_row_bytes;
+          const auto* src_k =
+              static_cast<const std::byte*>(kv.k_full_pool.p) + std::size_t(tail_phys) * NUM_FULL_VISITS * k_pitch;
+          const auto* src_v =
+              static_cast<const std::byte*>(kv.v_full_pool.p) + std::size_t(tail_phys) * NUM_FULL_VISITS * v_pitch;
+          CUDA_CHECK(cudaMemcpy2DAsync(base + off, k_width, src_k, k_pitch, k_width, NUM_FULL_VISITS,
+                                       cudaMemcpyDeviceToHost, stream));
+          off += tail_k_bytes;
+          CUDA_CHECK(cudaMemcpy2DAsync(base + off, v_width, src_v, v_pitch, v_width, NUM_FULL_VISITS,
+                                       cudaMemcpyDeviceToHost, stream));
+          off += tail_v_bytes;
+        }
+        if (r == 0) {
+          CUDA_CHECK(cudaMemcpyAsync(pl.logits_ptr(), prefill_logits_.p, logits_bytes,
+                                     cudaMemcpyDeviceToHost, stream));
+          if (batch_drafter_ && drafter_bytes > 0) {
+            batch_drafter_->snapshot_slot_to_host(s, pl.drafter_ptr());
+          }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+      });
+
+      d2h_park_bytes_ += std::size_t(TP_SIZE) * (2 * ring_bytes + rp_bytes + 2 * conv_kv_bytes + 2 * conv_h_bytes +
+                                                 tail_k_bytes + tail_v_bytes) +
+                         logits_bytes + drafter_bytes;
+      (void)prefix_cache_.publish(page_pool_, std::move(entry));
+    } catch (...) {
+      // Never fail a live request under host memory pressure.
+      cudaGetLastError();
+      prefix_cache_.clear(page_pool_, true);
+    }
+  }
+
   void free_slot_unlocked(int s) {
     if (s < 0 || s >= options_.max_batch || !slot_in_use_[s]) return;
-    for (int p : slot_pages_[s]) free_pages_.push_back(p);
+    for (int p : slot_pages_[s]) page_pool_.release_active_page(p);
     slot_pages_[s].clear();
     slot_pos_host_[s] = 0;
     slot_in_use_[s] = false;
@@ -3089,7 +3495,84 @@ class TpBatchGenerator final : public Generator {
   std::map<int, float> bucket_ms_ema_;
   bool graphs_fell_back_ = false;  // verify ran eager (surfaced as EAGER in the metrics line)
   float spec_alpha_cal_ = 0.98f;
-  std::vector<int> free_pages_;
+  class HostSlotPool {
+   public:
+    HostSlotPool(int n_slots, std::size_t max_rank_bytes, std::size_t logits_bytes, std::size_t drafter_bytes)
+        : max_rank_bytes_(max_rank_bytes),
+          logits_bytes_(logits_bytes),
+          drafter_bytes_(drafter_bytes),
+          slot_bytes_(std::size_t(TP_SIZE) * max_rank_bytes + logits_bytes + drafter_bytes),
+          backing_(std::size_t(n_slots) * slot_bytes_) {
+      free_.reserve(std::size_t(n_slots));
+      for (int i = n_slots - 1; i >= 0; --i) free_.push_back(i);
+    }
+    int acquire() {
+      if (free_.empty()) return -1;
+      const int id = free_.back();
+      free_.pop_back();
+      return id;
+    }
+    void release(int id) noexcept {
+      if (id >= 0) free_.push_back(id);
+    }
+    std::size_t slot_bytes() const noexcept { return slot_bytes_; }
+    void* rank_ptr(int slot_id, int r) const noexcept {
+      return static_cast<std::byte*>(backing_.data()) + std::size_t(slot_id) * slot_bytes_ +
+             std::size_t(r) * max_rank_bytes_;
+    }
+    void* logits_ptr(int slot_id) const noexcept {
+      return static_cast<std::byte*>(backing_.data()) + std::size_t(slot_id) * slot_bytes_ +
+             std::size_t(TP_SIZE) * max_rank_bytes_;
+    }
+    void* drafter_ptr(int slot_id) const noexcept {
+      return static_cast<std::byte*>(backing_.data()) + std::size_t(slot_id) * slot_bytes_ +
+             std::size_t(TP_SIZE) * max_rank_bytes_ + logits_bytes_;
+    }
+
+   private:
+    std::size_t max_rank_bytes_ = 0;
+    std::size_t logits_bytes_ = 0;
+    std::size_t drafter_bytes_ = 0;
+    std::size_t slot_bytes_ = 0;
+    MappedHostBuffer backing_;
+    std::vector<int> free_;
+  };
+
+  struct TpPrefixPayload {
+    std::shared_ptr<HostSlotPool> pool;
+    int slot_id = -1;
+    int ring_rows = 0;
+    std::size_t drafter_bytes = 0;
+
+    TpPrefixPayload() = default;
+    TpPrefixPayload(const TpPrefixPayload&) = delete;
+    TpPrefixPayload& operator=(const TpPrefixPayload&) = delete;
+    TpPrefixPayload(TpPrefixPayload&& o) noexcept
+        : pool(std::move(o.pool)), slot_id(std::exchange(o.slot_id, -1)),
+          ring_rows(o.ring_rows), drafter_bytes(o.drafter_bytes) {}
+    TpPrefixPayload& operator=(TpPrefixPayload&& o) noexcept {
+      if (this != &o) {
+        if (pool && slot_id >= 0) pool->release(slot_id);
+        pool = std::move(o.pool);
+        slot_id = std::exchange(o.slot_id, -1);
+        ring_rows = o.ring_rows;
+        drafter_bytes = o.drafter_bytes;
+      }
+      return *this;
+    }
+    ~TpPrefixPayload() {
+      if (pool && slot_id >= 0) pool->release(slot_id);
+    }
+    void* rank_ptr(int r) const noexcept { return (pool && slot_id >= 0) ? pool->rank_ptr(slot_id, r) : nullptr; }
+    void* logits_ptr() const noexcept { return (pool && slot_id >= 0) ? pool->logits_ptr(slot_id) : nullptr; }
+    void* drafter_ptr() const noexcept { return (pool && slot_id >= 0) ? pool->drafter_ptr(slot_id) : nullptr; }
+  };
+  std::array<std::uint8_t, 32> model_sha256_{};
+  PagedKvPagePool page_pool_;
+  std::shared_ptr<HostSlotPool> host_slot_pool_;
+  BatchPrefixCache<TpPrefixPayload> prefix_cache_;
+  std::uint64_t h2d_restore_bytes_ = 0;
+  std::uint64_t d2h_park_bytes_ = 0;
   std::vector<std::vector<int>> slot_pages_;
   std::vector<int> slot_pos_host_;
   std::vector<bool> slot_in_use_;
@@ -3101,6 +3584,14 @@ class TpBatchGenerator final : public Generator {
     head::SamplingParams params{};
     std::optional<std::uint64_t> seed;
     std::vector<std::int32_t> forced;
+    bool cache_eligible = false;
+    StateIdentity identity{};
+    int root_prefix_tokens = 0;
+    bool root_published = false;
+    int reused_tokens = 0;
+    Reuse reuse = Reuse::None;
+    std::uint64_t restored_bytes = 0;
+    bool has_restored_bytes = false;
     std::chrono::steady_clock::time_point t0{};
     double prefill_seconds = 0.0;
   };

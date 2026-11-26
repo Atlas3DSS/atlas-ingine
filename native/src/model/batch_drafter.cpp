@@ -581,6 +581,68 @@ void BatchDrafter::reset_slot(int slot) {
   st.length = 0;
 }
 
+std::size_t BatchDrafter::slot_snapshot_bytes() const noexcept {
+  std::size_t total = std::size_t(H) * sizeof(ActT);
+  for (int l = 0; l < 3; ++l) {
+    const std::size_t kv_bytes =
+        is_local(l) ? std::size_t(LOCAL_SLOTS) * kd::KV_DIM * sizeof(ActT) : std::size_t(ctx_) * GLOBAL_SLOT_BYTES;
+    total += 2 * kv_bytes;
+    if (is_local(l)) total += std::size_t(kd::WINDOW) * sizeof(std::int32_t);
+  }
+  return total;
+}
+
+std::size_t BatchDrafter::snapshot_slot_to_host(int slot, void* dst) const {
+  if (slot < 0 || slot >= max_slots_)
+    throw std::invalid_argument("BatchDrafter::snapshot_slot_to_host: slot out of range");
+  const SlotState& st = slots_[slot];
+  auto* p = static_cast<std::byte*>(dst);
+  std::size_t off = 0;
+  const std::size_t f_bytes = std::size_t(H) * sizeof(ActT);
+  CUDA_CHECK(cudaMemcpyAsync(p + off, st.f_rnn, f_bytes, cudaMemcpyDeviceToHost, stream_));
+  off += f_bytes;
+  for (int l = 0; l < 3; ++l) {
+    const std::size_t kv_bytes =
+        is_local(l) ? std::size_t(LOCAL_SLOTS) * kd::KV_DIM * sizeof(ActT) : std::size_t(ctx_) * GLOBAL_SLOT_BYTES;
+    CUDA_CHECK(cudaMemcpyAsync(p + off, st.ctx.k_cache[l], kv_bytes, cudaMemcpyDeviceToHost, stream_));
+    off += kv_bytes;
+    CUDA_CHECK(cudaMemcpyAsync(p + off, st.ctx.v_cache[l], kv_bytes, cudaMemcpyDeviceToHost, stream_));
+    off += kv_bytes;
+    if (is_local(l)) {
+      const std::size_t cp_bytes = std::size_t(kd::WINDOW) * sizeof(std::int32_t);
+      CUDA_CHECK(cudaMemcpyAsync(p + off, st.ctx.ctx_pos[l], cp_bytes, cudaMemcpyDeviceToHost, stream_));
+      off += cp_bytes;
+    }
+  }
+  return off;
+}
+
+std::size_t BatchDrafter::restore_slot_from_host(int slot, const void* src, int length) {
+  if (slot < 0 || slot >= max_slots_)
+    throw std::invalid_argument("BatchDrafter::restore_slot_from_host: slot out of range");
+  SlotState& st = slots_[slot];
+  const auto* p = static_cast<const std::byte*>(src);
+  std::size_t off = 0;
+  const std::size_t f_bytes = std::size_t(H) * sizeof(ActT);
+  CUDA_CHECK(cudaMemcpyAsync(st.f_rnn, p + off, f_bytes, cudaMemcpyHostToDevice, stream_));
+  off += f_bytes;
+  for (int l = 0; l < 3; ++l) {
+    const std::size_t kv_bytes =
+        is_local(l) ? std::size_t(LOCAL_SLOTS) * kd::KV_DIM * sizeof(ActT) : std::size_t(ctx_) * GLOBAL_SLOT_BYTES;
+    CUDA_CHECK(cudaMemcpyAsync(st.ctx.k_cache[l], p + off, kv_bytes, cudaMemcpyHostToDevice, stream_));
+    off += kv_bytes;
+    CUDA_CHECK(cudaMemcpyAsync(st.ctx.v_cache[l], p + off, kv_bytes, cudaMemcpyHostToDevice, stream_));
+    off += kv_bytes;
+    if (is_local(l)) {
+      const std::size_t cp_bytes = std::size_t(kd::WINDOW) * sizeof(std::int32_t);
+      CUDA_CHECK(cudaMemcpyAsync(st.ctx.ctx_pos[l], p + off, cp_bytes, cudaMemcpyHostToDevice, stream_));
+      off += cp_bytes;
+    }
+  }
+  st.length = length;
+  return off;
+}
+
 void BatchDrafter::reset_all() {
   for (int s = 0; s < max_slots_; ++s) reset_slot(s);
   reset_context_shortlist();

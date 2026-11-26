@@ -412,10 +412,13 @@ void Scheduler::loop_batched() {
                                       std::to_string(max_len));
         }
         if (chunked) {
+          const auto t_beg0 = Clock::now();
           const int slot = generator_.begin_prefill_slot(
               model::Prompt{job->prompt_ids, job->images, job->root_prefix_tokens, job->cache_namespace,
                             job->bypass_prefix_cache},
               eff_max, job->sampling);
+          const double dt_beg_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_beg0).count();
+          if (!live.empty() && dt_beg_ms > 0.5) prefill_credit_ms -= dt_beg_ms;
           if (slot < 0) {
             std::lock_guard lock(mutex_);
             auto it = std::find(active_.begin(), active_.end(), job);

@@ -53,6 +53,10 @@ class BatchDrafter {
 
   // Resets one physical slot's local ring positions, f_rnn, and length (stream-ordered).
   void reset_slot(int slot);
+  // Per-slot host snapshot/restore for TP2 prefix-cache reuse (zero VRAM; stream-ordered D2H / H2D).
+  std::size_t slot_snapshot_bytes() const noexcept;
+  std::size_t snapshot_slot_to_host(int slot, void* dst) const;
+  std::size_t restore_slot_from_host(int slot, const void* src, int length);
   // Resets all slots and clears context tokens added to the shared shortlist (stream-ordered).
   void reset_all();
   // Clears context tokens added to the shared shortlist (call when all slots are idle).
