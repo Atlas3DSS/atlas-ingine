@@ -324,6 +324,7 @@ struct Weights {
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
   bool dense_q8 = false;      // wproj / wo are block-table matrices with Q8_0 blocks (GGUF on Volta)
   bool embed_q4() const { return embed.dtype == DType::U8; }
+  bool embed_q8() const { return embed.dtype == DType::I8; }  // GGUF Q8_0 rows [VOCAB, 2448] (weights_gguf.cpp)
   std::shared_ptr<ExpertCache> expert_cache;  // non-null when tiered MoE offloading is enabled
   // Verified cryptographic digest over model metadata + 100% of weight tensor contents, populated only by
   // load_weights(model_dir, ...). Absent (std::nullopt) for caller-supplied/synthetic Weights with no identity.

@@ -61,6 +61,8 @@ void* Drafter::alloc(std::size_t bytes) {
 Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream,
                  int shortlist_rows)
     : w_(w), stream_(stream), ctx_(std::min(max_ctx, DRAFT_CTX)) {
+  if (w.embed_q8())
+    throw std::invalid_argument("DSpark drafter: Q8_0 embedding tables are not supported (set INGINE_GGUF_Q8_EMBED=0)");
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("Drafter: max_ctx must hold two blocks");
   head_ = {w.unembed.w.data, w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
            w.unembed.rows()};

@@ -132,6 +132,9 @@ void message_gates(const float* h, bool h_shared, const float* msg, int G, int M
 void embed(const std::int64_t* token, int M, const ActT* table, const float* norm_w, float* out,
            bool pdl, cudaStream_t stream);
 
+// embed_q8: GGUF Q8_0 embedding rows u8 [V, 2448] ([FP16 d | 32 int8] x 72): act(q * d) values, embed's RMS norm.
+void embed_q8(const std::int64_t* token, int M, const void* table_q8, const float* norm_w, float* out, bool pdl,
+              cudaStream_t stream);
 // embed_q4: Q4_0 SoA embedding table u8 [V, 1296] ([1152B nibbles | 72 FP16 scales]) -> identical RMS norm output.
 // Guards out-of-range token IDs against [0, vocab_size) and sets *oob_flag = 1 if non-null.
 void embed_q4(const std::int64_t* token, int M, int vocab_size, const void* table_q4, const float* norm_w, float* out,

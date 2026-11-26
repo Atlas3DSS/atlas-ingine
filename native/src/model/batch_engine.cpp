@@ -524,7 +524,9 @@ class BatchDecoder {
       }
     };
 
-    if (w.embed_q4()) {
+    if (w.embed_q8()) {
+      dense::embed_q8(tokens_dev_, B, w.embed.data, f32p(w.embed_norm), B0_, false, stream);
+    } else if (w.embed_q4()) {
       auto desc = ops::make_inkling_embed_q4_desc(B, VOCAB, /*allow_pdl=*/false);
       desc.token_bounds = ops::TokenBoundsMode::PreValidated;
       const ops::EmbedQ4RmsNormArgs args{tokens_dev_, w.embed.data, f32p(w.embed_norm), B0_};

@@ -262,7 +262,9 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   };
 
   pk::widen_ids(tokens, T, ids_, IMAGE_PLACEHOLDER_ID, s);
-  if (w.embed_q4()) {
+  if (w.embed_q8()) {
+    dense::embed_q8(ids_, T, w.embed.data, f32p(w.embed_norm), B0_, false, s);
+  } else if (w.embed_q4()) {
     auto desc = ops::make_inkling_embed_q4_desc(T, VOCAB, false);
     desc.token_bounds = ops::TokenBoundsMode::PreValidated;
     const ops::EmbedQ4RmsNormArgs args{ids_, w.embed.data, f32p(w.embed_norm), B0_};

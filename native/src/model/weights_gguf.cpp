@@ -651,7 +651,12 @@ Weights load_weights_gguf(const fs::path& model_dir, cudaStream_t stream, int tp
   {
     const GgufTensor& e = f.at("token_embd.weight");
     if (e.row_len() != H || e.rows() != VOCAB) throw std::runtime_error("weights_gguf: token_embd shape");
-    w.embed = ld.act(ld.all_f32("token_embd.weight"), {VOCAB, H});
+    const char* q8e = std::getenv("INGINE_GGUF_Q8_EMBED");
+    if (e.type == GgmlType::Q8_0 && !(q8e && q8e[0] == '0')) {  // rows read 4 a step: kept as Q8_0 (dense::embed_q8)
+      w.embed = rm(ld.upload(e.data, e.bytes), DType::I8, {VOCAB, std::int32_t(e.row_bytes())});
+    } else {
+      w.embed = ld.act(ld.all_f32("token_embd.weight"), {VOCAB, H});
+    }
   }
   w.embed_norm = ld.f32("token_embd_norm.weight", {H});
   w.final_query = ld.f32("output_res_query.weight", {1, H});
