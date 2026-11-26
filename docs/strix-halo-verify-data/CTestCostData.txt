@@ -1,0 +1,74 @@
+batch_scheduler 2 0.0985998
+batch_prefix_cache 2 0.0146384
+batch_server 1 0.615914
+batch_kernels 2 2.27341
+batch_parity 0 0
+batch_prefix_parity 1 365.552
+core_safetensors 2 0.0169712
+core_safetensors_model 1 0.0364974
+core_oracle_precision_bf16 2 0.000701054
+core_oracle_precision_fp16 2 0.000565062
+core_vendor_portability 2 0.0152675
+core_mlx_uploader_host 2 0.00385619
+core_arch_ops_cuda 2 0.103122
+hal_embed_q4_parity 2 0.0466037
+hal_embed_q4_capture 2 0.0401616
+core_arena 2 0.0426325
+core_paged_tier 2 0.0432211
+core_upload 2 0.0499498
+core_baremetal_cpu 0 0
+core_baremetal_cuda 0 0
+core_weight_pack 2 0.383382
+image 2 0.0273877
+kernels_dense 2 4.83097
+kernels_moe 2 4.06875
+kernels_attn 2 22.5265
+kernels_head 2 1.37065
+kernels_bitlock 2 0.488782
+model_data 2 0.013357
+model_tp_p2p 2 0.0271191
+model_layer 1 1.4577
+model_runtime 0 0
+model_reuse 0 0
+model_cache_stage3 0 0
+model_parity 1 237.036
+model_parity_generate 1 37.5114
+model_parity_spec 1 39.4595
+model_path 2 68.7402
+model_path_spec 1 931.89
+model_vision 1 81.4773
+prefill_attention 2 1.76713
+prefill_moe 0 0
+prefill_rows 2 0.730556
+prefill_bench 0 0
+prefill_model_kvbf16 1 112.177
+prefill_model_kvfp8 1 112.717
+prefill_model_bench 0 0
+prefill_synth_bench 0 0
+prefill_profile 0 0
+serve_scheduler 2 0.0159337
+serve_server 1 10.655
+serve_cache_baseline 1 0.824463
+spec_draft_kernels 2 7.38411
+spec_accept 2 0.250926
+spec_sampling_fidelity 2 69.0533
+spec_drafter 1 0.94177
+spec_forced 1 50.5711
+spec_conditional_fallback 1 32.0782
+text_tokenizer 1 0.431689
+text_chat 1 0.341779
+text_stream 1 0.331249
+text_pyjson 2 0.0012858
+text_json_fsm 2 0.0077004
+text_render_cache 1 1.15174
+text_traces 0 0
+vision_kernels 2 0.288059
+vision_model 1 32.7623
+---
+batch_parity
+core_baremetal_cpu
+core_baremetal_cuda
+model_runtime
+model_reuse
+model_cache_stage3
+prefill_moe

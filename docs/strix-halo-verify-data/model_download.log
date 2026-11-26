@@ -1,0 +1,43 @@
+DL LICENSE
+DL NOTICE
+DL README.md
+DL SHA256SUMS
+DL chat_template.jinja
+DL config.json
+DL generation_config.json
+DL hf_quant_config.json
+DL inkling-2-mini-abliterated.safetensors
+DL model-00001-of-00001.safetensors
+DL model.safetensors.index.json
+DL mtp.safetensors
+DL processor_config.json
+DL special_tokens_map.json
+DL tiktoken/tokenizer.model
+DL tokenizer.json
+DL tokenizer_config.json
+abliteration/results/reasoning-original.json: FAILED open or read
+sha256sum: abliteration/results/refusals-abliterated-thinking.json: No such file or directory
+abliteration/results/refusals-abliterated-thinking.json: FAILED open or read
+sha256sum: abliteration/results/refusals-abliterated.json: No such file or directory
+abliteration/results/refusals-abliterated.json: FAILED open or read
+sha256sum: abliteration/results/refusals-original-thinking.json: No such file or directory
+abliteration/results/refusals-original-thinking.json: FAILED open or read
+sha256sum: abliteration/results/refusals-original.json: No such file or directory
+abliteration/results/refusals-original.json: FAILED open or read
+sha256sum: abliteration/results/verify-abliterated.json: No such file or directory
+abliteration/results/verify-abliterated.json: FAILED open or read
+chat_template.jinja: OK
+config.json: OK
+generation_config.json: OK
+hf_quant_config.json: OK
+inkling-2-mini-abliterated.safetensors: OK
+model-00001-of-00001.safetensors: OK
+model.safetensors.index.json: OK
+mtp.safetensors: OK
+processor_config.json: OK
+special_tokens_map.json: OK
+tiktoken/tokenizer.model: OK
+tokenizer.json: OK
+tokenizer_config.json: OK
+sha256sum: WARNING: 16 listed files could not be read
+DL_ALL_DONE
