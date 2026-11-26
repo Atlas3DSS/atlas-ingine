@@ -16,6 +16,8 @@ import argparse
 import atexit
 import dataclasses
 import html
+import hashlib
+import http.client
 import http.server
 import json
 import math
@@ -1356,18 +1358,18 @@ class AtlasSetupController:
 
     def __init__(self, root: Path = ROOT, hw: dict[str, Any] | None = None) -> None:
         self.root = root
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._log_lock = threading.Lock()
         self._hw_override = hw
         self._download_proc: subprocess.Popen[str] | None = None
         self._worker_procs: list[tuple[dict[str, Any], subprocess.Popen[str]]] = []
         self._logs: deque[str] = deque(maxlen=250)
         self._active_plan: dict[str, Any] | None = None
-        self._state = "idle"
         atexit.register(self.stop_all)
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
-        with self._lock:
+        with self._log_lock:
             self._logs.append(f"[{ts}] {msg}")
 
     def get_hardware(self) -> dict[str, Any]:
@@ -1381,11 +1383,11 @@ class AtlasSetupController:
                 s = line.rstrip()
                 if s:
                     self.log(f"{prefix}: {s}")
-        except Exception:
-            pass
+        finally:
+            stream.close()
 
     def start_download(self, plan: dict[str, Any], *, approved: bool) -> dict[str, Any]:
-        if not approved:
+        if approved is not True:
             raise PermissionError("Explicit user approval (approved=true) is required before downloading from Hugging Face.")
         if not plan.get("needs_download"):
             return {"ok": True, "message": "Checkpoint already present locally.", "model_dir": plan["model_dir"]}
@@ -1410,7 +1412,6 @@ class AtlasSetupController:
                     ),
                 ]
             self.log(f"Starting approved download: {' '.join(cmd)}")
-            self._state = "downloading"
             self._download_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -1426,87 +1427,83 @@ class AtlasSetupController:
             return {"ok": True, "message": f"Downloading {tier['repo_id']} into {dest}", "pid": self._download_proc.pid}
 
     def launch_workers(self, plan: dict[str, Any], *, approved: bool) -> dict[str, Any]:
-        if not approved:
+        if approved is not True:
             raise PermissionError("Explicit user approval (approved=true) is required before launching ingine-serve.")
         if not plan.get("binary_ready"):
             raise RuntimeError(f"ingine-serve binary not built yet. Run: {plan['build_command']}")
         if plan.get("needs_download") and plan.get("layout") != "cpu_fake":
             raise RuntimeError(f"Model weights missing at {plan['model_dir']}. Approve download first.")
 
-        self.stop_workers()
         with self._lock:
-            self._active_plan = plan
-            self._state = "starting"
+            self.stop_workers()
             started: list[dict[str, Any]] = []
-            for w in plan["workers"]:
-                env = os.environ.copy()
-                if w["cuda_visible_devices"]:
-                    env["CUDA_VISIBLE_DEVICES"] = w["cuda_visible_devices"]
-                self.log(f"Launching worker #{w['worker_index']} on {w['host']}:{w['port']}: {w['shell']}")
-                proc = subprocess.Popen(
-                    w["argv"],
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                )
-                self._worker_procs.append((w, proc))
-                threading.Thread(
-                    target=self._pipe_reader,
-                    args=(f"w{w['worker_index']}", proc.stdout),
-                    daemon=True,
-                ).start()
-                started.append({"worker_index": w["worker_index"], "pid": proc.pid, "base_url": w["base_url"]})
+            try:
+                for w in plan["workers"]:
+                    env = os.environ.copy()
+                    if w["cuda_visible_devices"]:
+                        env["CUDA_VISIBLE_DEVICES"] = w["cuda_visible_devices"]
+                    self.log(f"Launching worker #{w['worker_index']} on {w['host']}:{w['port']}: {w['shell']}")
+                    proc = subprocess.Popen(
+                        w["argv"],
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                    )
+                    self._worker_procs.append((w, proc))
+                    threading.Thread(
+                        target=self._pipe_reader,
+                        args=(f"w{w['worker_index']}", proc.stdout),
+                        daemon=True,
+                    ).start()
+                    started.append({"worker_index": w["worker_index"], "pid": proc.pid, "base_url": w["base_url"]})
+            except BaseException:
+                self.stop_workers()
+                raise
+            self._active_plan = plan
             return {"ok": True, "workers": started}
+
+    @staticmethod
+    def _stop_process(proc: subprocess.Popen[str]) -> None:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
     def stop_workers(self) -> None:
         with self._lock:
-            procs = list(self._worker_procs)
-            self._worker_procs.clear()
-        for w, proc in procs:
-            if proc.poll() is None:
+            for w, proc in self._worker_procs:
                 self.log(f"Stopping worker #{w['worker_index']} (pid {proc.pid})")
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=8.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        with self._lock:
-            self._state = "idle"
+                self._stop_process(proc)
+            self._worker_procs.clear()
+            self._active_plan = None
 
     def stop_all(self) -> None:
-        self.stop_workers()
         with self._lock:
-            dproc = self._download_proc
-            self._download_proc = None
-        if dproc is not None and dproc.poll() is None:
-            try:
-                dproc.terminate()
-                dproc.wait(timeout=5.0)
-            except Exception:
-                try:
-                    dproc.kill()
-                except Exception:
-                    pass
+            self.stop_workers()
+            if self._download_proc is not None:
+                self._stop_process(self._download_proc)
+                self._download_proc = None
 
     def status(self, probe_host: str = DEFAULT_SERVE_HOST, probe_port: int = DEFAULT_SERVE_PORT) -> dict[str, Any]:
         with self._lock:
             dl_running = self._download_proc is not None and self._download_proc.poll() is None
             dl_rc = None if self._download_proc is None else self._download_proc.poll()
             worker_items = list(self._worker_procs)
-            logs = list(self._logs)[-80:]
             active_plan = self._active_plan
+        with self._log_lock:
+            logs = list(self._logs)[-80:]
 
         worker_states: list[dict[str, Any]] = []
         any_healthy = False
         if worker_items:
             for w, proc in worker_items:
                 rc = proc.poll()
-                ok_h, health = _http_json(f"http://{w['host']}:{w['port']}/health", timeout=1.5)
+                ok_h, health = _http_json(f"http://{w['host']}:{w['port']}/health", timeout=1.5) if rc is None else (False, None)
                 ok_m, models = _http_json(f"http://{w['host']}:{w['port']}/v1/models", timeout=1.5) if ok_h else (False, None)
                 if ok_h:
                     any_healthy = True
@@ -1541,8 +1538,17 @@ class AtlasSetupController:
                     }
                 )
 
+        state = "idle"
+        if dl_running:
+            state = "downloading"
+        elif any(worker["exit_code"] is not None for worker in worker_states):
+            state = "exited"
+        elif any_healthy:
+            state = "ready"
+        elif worker_items:
+            state = "starting"
         return {
-            "state": "downloading" if dl_running else ("ready" if any_healthy else ("starting" if worker_items else "idle")),
+            "state": state,
             "download_running": dl_running,
             "download_exit_code": dl_rc,
             "workers": worker_states,
@@ -1876,7 +1882,7 @@ function renderSelectors() {
     b.type = 'button';
     b.className = 'seg-btn' + (state.mode === id ? ' active' : '');
     b.textContent = label;
-    b.onclick = () => { state.mode = id; renderMode(); };
+    b.onclick = () => { state.mode = id; refreshPlan(); };
     mr.appendChild(b);
   });
 }
@@ -1935,14 +1941,22 @@ print(resp.choices[0].message.content)`;
   }
 }
 
+let planRequest = 0;
+let lastDownloadExit = null;
 async function refreshPlan() {
-  state.plan = await api('/api/plan', {
+  const request = ++planRequest;
+  document.getElementById('approveCheck').checked = false;
+  state.plan = null;
+  syncButtons();
+  const plan = await api('/api/plan', {
     tier: state.tier,
     ctx: state.ctx,
     array_count: state.array_count,
     layout: state.layout,
     mode: state.mode,
   });
+  if (request !== planRequest) return;
+  state.plan = plan;
   state.tier = state.plan.tier.id;
   state.ctx = state.plan.ctx;
   state.array_count = state.plan.array_count;
@@ -1953,6 +1967,10 @@ async function refreshPlan() {
 async function pollStatus() {
   try {
     const s = await api('/api/status');
+    if (s.download_exit_code !== lastDownloadExit) {
+      lastDownloadExit = s.download_exit_code;
+      if (lastDownloadExit === 0) await refreshPlan();
+    }
     const dot = document.getElementById('statusDot');
     dot.className = 'dot ' + (s.state === 'ready' ? 'ready' : (s.state === 'idle' ? '' : 'busy'));
     document.getElementById('statusText').textContent = `${s.state.toUpperCase()} | ${s.endpoint_url}`;
@@ -1966,18 +1984,18 @@ document.getElementById('approveCheck').addEventListener('change', syncButtons);
 document.getElementById('downloadBtn').addEventListener('click', async () => {
   try {
     await api('/api/download', {
-      approved: true, tier: state.tier, ctx: state.ctx, array_count: state.array_count, layout: state.layout, mode: state.mode,
+      plan_id: state.plan.plan_id, approved: true, tier: state.tier, ctx: state.ctx, array_count: state.array_count, layout: state.layout, mode: state.mode,
     });
     pollStatus();
-  } catch (e) { alert(e.message); }
+  } catch (e) { alert(e.message); await refreshPlan(); }
 });
 document.getElementById('launchBtn').addEventListener('click', async () => {
   try {
     await api('/api/launch', {
-      approved: true, tier: state.tier, ctx: state.ctx, array_count: state.array_count, layout: state.layout, mode: state.mode,
+      plan_id: state.plan.plan_id, approved: true, tier: state.tier, ctx: state.ctx, array_count: state.array_count, layout: state.layout, mode: state.mode,
     });
     pollStatus();
-  } catch (e) { alert(e.message); }
+  } catch (e) { alert(e.message); await refreshPlan(); }
 });
 document.getElementById('stopBtn').addEventListener('click', async () => {
   try { await api('/api/stop', {}); pollStatus(); }
@@ -2034,7 +2052,7 @@ document.getElementById('chatForm').addEventListener('submit', async (ev) => {
   state.tier = initData.defaults.tier;
   state.ctx = initData.defaults.ctx;
   state.array_count = initData.defaults.array_count;
-  state.layout = initData.defaults.layout;
+  state.layout = initData.defaults.layout === 'single' ? 'auto' : initData.defaults.layout;
   state.mode = initData.defaults.mode;
   renderHw();
   await refreshPlan();
@@ -2060,12 +2078,32 @@ def make_http_handler(controller: AtlasSetupController, serve_host: str, serve_p
             self.end_headers()
             self.wfile.write(payload)
 
+        def _local_request(self) -> bool:
+            port = self.server.server_port
+            hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+            if port == 80:
+                hosts.update(("127.0.0.1", "localhost"))
+            host = self.headers.get("Host", "").lower()
+            origin = self.headers.get("Origin")
+            if host not in hosts or (origin is not None and origin != f"http://{host}"):
+                self._send_json(403, {"error": "Open the local setup page to use this endpoint."})
+                return False
+            return True
+
         def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            return json.loads(raw.decode("utf-8"))
+            if self.headers.get_content_type() != "application/json":
+                raise ValueError("Expected application/json")
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("Expected a JSON object")
+            body = json.loads(self.rfile.read(length))
+            if not isinstance(body, dict):
+                raise ValueError("Expected a JSON object")
+            return body
 
         def do_GET(self) -> None:
+            if not self._local_request():
+                return
             if self.path in ("/", "/index.html"):
                 body = ATLAS_UI_HTML.encode("utf-8")
                 self.send_response(200)
@@ -2092,6 +2130,8 @@ def make_http_handler(controller: AtlasSetupController, serve_host: str, serve_p
             self._send_json(404, {"error": "Not found"})
 
         def do_POST(self) -> None:
+            if not self._local_request():
+                return
             try:
                 body = self._read_json()
             except Exception as exc:
@@ -2102,7 +2142,7 @@ def make_http_handler(controller: AtlasSetupController, serve_host: str, serve_p
                 # Never trust client-supplied argv, repo_id, or arbitrary filesystem paths;
                 # recompute from validated selectors and server-discovered checkpoints only.
                 hw = controller.get_hardware()
-                return build_plan(
+                plan = build_plan(
                     hw,
                     tier_id=req_body.get("tier"),
                     ctx=req_body.get("ctx"),
@@ -2115,28 +2155,32 @@ def make_http_handler(controller: AtlasSetupController, serve_host: str, serve_p
                     vision=req_body.get("vision"),
                     spec=req_body.get("spec"),
                 )
+                actions = (plan["tier"]["repo_id"], plan["model_dir"], plan["needs_download"],
+                           [(w["cuda_visible_devices"], w["argv"]) for w in plan["workers"]])
+                plan["plan_id"] = hashlib.sha256(json.dumps(actions).encode()).hexdigest()
+                return plan
 
             if self.path == "/api/plan":
-                self._send_json(200, _server_plan(body))
+                try:
+                    plan = _server_plan(body)
+                except (KeyError, TypeError, ValueError) as exc:
+                    self._send_json(400, {"error": f"Invalid plan selection: {exc}"})
+                    return
+                self._send_json(200, plan)
                 return
 
-            if self.path == "/api/download":
+            if self.path in ("/api/download", "/api/launch"):
+                if body.get("approved") is not True:
+                    self._send_json(403, {"error": "Explicit approval is required."})
+                    return
                 try:
-                    res = controller.start_download(_server_plan(body), approved=bool(body.get("approved")))
-                    self._send_json(200, res)
-                except PermissionError as exc:
-                    self._send_json(403, {"error": str(exc)})
-                except Exception as exc:
-                    self._send_json(400, {"error": str(exc)})
-                return
-
-            if self.path == "/api/launch":
-                try:
-                    res = controller.launch_workers(_server_plan(body), approved=bool(body.get("approved")))
-                    self._send_json(200, res)
-                except PermissionError as exc:
-                    self._send_json(403, {"error": str(exc)})
-                except Exception as exc:
+                    plan = _server_plan(body)
+                    if "plan_id" in body and body["plan_id"] != plan["plan_id"]:
+                        self._send_json(409, {"error": "The plan changed. Review it again before continuing."})
+                        return
+                    action = controller.start_download if self.path == "/api/download" else controller.launch_workers
+                    self._send_json(200, action(plan, approved=True))
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
                     self._send_json(400, {"error": str(exc)})
                 return
 
@@ -2146,32 +2190,35 @@ def make_http_handler(controller: AtlasSetupController, serve_host: str, serve_p
                 return
 
             if self.path == "/api/chat":
-                endpoint = str(body.get("endpoint_url") or f"http://{serve_host}:{serve_port}/v1").rstrip("/")
-                if not (endpoint.startswith("http://127.0.0.1:") or endpoint.startswith("http://localhost:")):
-                    self._send_json(400, {"error": "Chat proxy only forwards to loopback endpoints."})
+                endpoint = f"http://{serve_host}:{serve_port}/v1"
+                if body.get("endpoint_url", endpoint) != endpoint:
+                    self._send_json(400, {"error": "Choose the inference endpoint configured for this launcher."})
                     return
-                payload = json.dumps(
-                    {
+                conn = http.client.HTTPConnection(serve_host, serve_port, timeout=180)
+                try:
+                    data = json.dumps({
                         "model": body.get("model", "inkling-2-mini"),
                         "messages": body.get("messages", []),
                         "max_tokens": int(body.get("max_tokens", 512)),
                         "stream": False,
-                    }
-                ).encode("utf-8")
-                req = urllib.request.Request(
-                    f"{endpoint}/chat/completions",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=180) as resp:
-                        raw = resp.read().decode("utf-8", errors="replace")
-                        self._send_json(resp.status, json.loads(raw))
-                except urllib.error.HTTPError as exc:
-                    self._send_json(exc.code, {"error": exc.read().decode("utf-8", errors="replace")})
-                except Exception as exc:
+                    }).encode("utf-8")
+                    conn.request("POST", "/v1/chat/completions", body=data, headers={"Content-Type": "application/json"})
+                    response = conn.getresponse()
+                    raw = response.read()
+                    if 300 <= response.status < 400:
+                        self._send_json(502, {"error": "The configured inference endpoint returned a redirect."})
+                    else:
+                        try:
+                            result = json.loads(raw)
+                        except (UnicodeError, ValueError):
+                            result = {"error": raw.decode("utf-8", errors="replace")}
+                        self._send_json(response.status, result)
+                except (TypeError, ValueError) as exc:
+                    self._send_json(400, {"error": str(exc)})
+                except (OSError, http.client.HTTPException) as exc:
                     self._send_json(502, {"error": f"Server unreachable at {endpoint}: {exc}"})
+                finally:
+                    conn.close()
                 return
 
             self._send_json(404, {"error": "Not found"})
@@ -2228,7 +2275,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model-dir", help="Use an existing local checkpoint directory.")
     ap.add_argument("--host", default=DEFAULT_SERVE_HOST, help="ingine-serve bind host.")
     ap.add_argument("--port", type=int, default=DEFAULT_SERVE_PORT, help="ingine-serve base port.")
-    ap.add_argument("--ui-host", default=DEFAULT_UI_HOST, help="Setup web UI bind host.")
+    ap.add_argument("--ui-host", choices=("127.0.0.1", "localhost"), default=DEFAULT_UI_HOST, help="Setup web UI bind host.")
     ap.add_argument("--ui-port", type=int, default=DEFAULT_UI_PORT, help="Setup web UI port.")
     ap.add_argument("--no-browser", action="store_true", help="Do not auto-open the system browser.")
     args = ap.parse_args(argv)
