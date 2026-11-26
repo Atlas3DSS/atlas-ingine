@@ -374,6 +374,7 @@ class BatchDecoder {
     head_act_ = B > 8 ? bf16(B * kHeadChunk) : nullptr;
     wscratch_ = (w.dense_fp8 && B > 32) ? bf16(std::size_t(kHeadChunk) * H) : nullptr;
     attn_ws_ = DeviceBuffer(bk::attn_workspace_bytes(max_batch));
+    attn_ws_.fill(0);  // (split-attention tickets start at zero)
     attn_ws_.fill(0);
 
     segments_[0] = upload_ints(proj_layout(false, true));

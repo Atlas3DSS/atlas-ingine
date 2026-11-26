@@ -1034,6 +1034,7 @@ class TpBatchDecoder {
                 : (w.dense_q8 && B > 32) ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM))
                                          : nullptr;
     attn_ws_ = DeviceBuffer(bk::attn_workspace_bytes(max_batch));
+    attn_ws_.fill(0);  // (split-attention tickets start at zero)
     attn_ws_.fill(0);
 
     segments_[0] = upload_ints(proj_layout(false, true));

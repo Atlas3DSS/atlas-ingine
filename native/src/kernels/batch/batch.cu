@@ -65,9 +65,11 @@ std::size_t ws_nkv_off(int max_b) {
 std::size_t ws_nst_off(int max_b) {
   return ws_nkv_off(max_b) + align256(std::size_t(max_b) * HKV * 2 * D * sizeof(ActT));
 }
-std::size_t ws_total_bytes(int max_b) {
+std::size_t ws_cnt_off(int max_b) {
   return ws_nst_off(max_b) + align256(std::size_t(max_b) * HKV * 3 * 2 * D * sizeof(float));
 }
+//   cnt:       u32 [max_b, HKV] split arrival tickets (zero at rest: the last split resets its ticket)
+std::size_t ws_total_bytes(int max_b) { return ws_cnt_off(max_b) + align256(std::size_t(max_b) * HKV * sizeof(unsigned)); }
 
 __device__ __forceinline__ float bf16r(float x) { return act::round_act(x); }
 
@@ -227,6 +229,7 @@ struct BatchedAttnKernelParams {
   float* part;
   ActT* saved_nkv;
   float* saved_nst;
+  unsigned* cnt;     // split tickets: the last split CTA of (b, g) runs the reduction (null: separate reduce kernel)
   ActT* out;
 };
 
@@ -262,6 +265,93 @@ struct AttnSmem {
   __align__(16) ActT nkv[2][D];
   float nst[3 * 2 * D];
 };
+
+// Stage 2 of split attention for (g, b): merge the split partials (sink + gate), commit the saved K/V row and conv
+// state. Partials / saved rows are read through L2 (__ldcg): in the fused path other CTAs just wrote them.
+template <bool FULL, int KVF, bool PROJ_FP32>
+__device__ __forceinline__ void attn_reduce_body(const BatchedAttnKernelParams& p, int g, int b) {
+  constexpr bool F8 = KVF != 0, V4 = KVF == 2;
+  static_assert(FULL || !F8, "FP8 caches are full-layer only");
+  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
+
+  const int slot = p.slot_ids[b];
+  if (slot < 0) return;
+
+  const int p0 = int(p.slot_pos[slot]);
+  if (FULL && p0 >= p.max_ctx) return;
+
+  const int tid = threadIdx.x;
+  const int R = p.R;
+  const std::size_t proj_base = std::size_t(b) * R;
+  const float* base_part = p.part + std::size_t((b * HKV + g) * p.splits) * GQA * PSTR;
+
+  for (int idx = tid; idx < GQA * D; idx += NT) {
+    const int row = idx / D, dim = idx % D;
+    const float sink = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_SINK + g * GQA + row) * LOG2E;
+    float mx = sink;
+    for (int q = 0; q < p.splits; ++q) {
+      const float2 ml = __ldcg(reinterpret_cast<const float2*>(base_part + (q * GQA + row) * PSTR + D));
+      mx = fmaxf(mx, ml.x);
+    }
+    float l = exp2f(sink - mx), a = 0.f;
+    for (int q = 0; q < p.splits; ++q) {
+      const float* pr = base_part + (q * GQA + row) * PSTR;
+      const float2 ml = __ldcg(reinterpret_cast<const float2*>(pr + D));
+      const float f = exp2f(ml.x - mx);
+      l += ml.y * f;
+      a += __ldcg(pr + dim) * f;
+    }
+    const float gate_in = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_GATE + (g * GQA + row) * D + dim);
+    const float gate = 1.f / (1.f + expf(-gate_in));
+    p.out[std::size_t(b) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
+  }
+
+  // Commit saved K/V row, conv state, and ring_pos.
+  float* const conv_k_slot = p.conv_k_visit + std::size_t(slot) * p.conv_slot_stride;
+  float* const conv_v_slot = p.conv_v_visit + std::size_t(slot) * p.conv_slot_stride;
+  ActT* const k_ring_slot = FULL ? nullptr : (p.k_ring_visit + std::size_t(slot) * p.ring_slot_stride);
+  ActT* const v_ring_slot = FULL ? nullptr : (p.v_ring_visit + std::size_t(slot) * p.ring_slot_stride);
+  std::int64_t* const kpos_slot = FULL ? nullptr : (p.ring_pos_visit + std::size_t(slot) * p.ring_pos_slot_stride);
+  const std::int32_t* const pt_slot = FULL ? (p.page_table + std::size_t(slot) * p.max_pages_per_slot) : nullptr;
+  CT* const k_pool = FULL ? static_cast<CT*>(p.k_full_pool) : reinterpret_cast<CT*>(k_ring_slot);
+  CT* const v_pool = FULL ? static_cast<CT*>(p.v_full_pool) : reinterpret_cast<CT*>(v_ring_slot);
+
+  const ActT* src_nkv = p.saved_nkv + std::size_t(b * HKV + g) * 2 * D;
+  for (int idx = tid; idx < 2 * 16; idx += NT) {
+    const int kv = idx / 16, c8 = idx % 16;
+    const uint4 u = __ldcg(reinterpret_cast<const uint4*>(src_nkv + kv * D) + c8);
+    std::size_t dst_off;
+    if constexpr (FULL) {
+      const int phys = pt_slot[p0 >> kPageShift];
+      dst_off = ((((std::size_t(phys) * NUM_FULL_VISITS + p.full_visit_idx) * kPageSize + (p0 & kPageMask)) * HKV + g) * D);
+    } else {
+      dst_off = (std::size_t(p0 & (WIN - 1)) * HKV + g) * D;
+    }
+    CT* const dst = (kv ? v_pool : k_pool) + dst_off;
+    if constexpr (V4) {
+      float f[8];
+      unpack8(u, f);
+      if (kv) reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(p.v_full_pool) + dst_off / 2)[c8] = pack_fp4x8(f);
+      else reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
+                                                          pack_e4m3x2(f[4], f[5]) | (pack_e4m3x2(f[6], f[7]) << 16));
+    } else if constexpr (F8) {
+      float f[8];
+      unpack8(u, f);
+      reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
+                                                     pack_e4m3x2(f[4], f[5]) | (pack_e4m3x2(f[6], f[7]) << 16));
+    } else {
+      reinterpret_cast<uint4*>(dst)[c8] = u;
+    }
+  }
+  const float* src_nst = p.saved_nst + std::size_t(b * HKV + g) * 3 * 2 * D;
+  for (int idx = tid; idx < 3 * 2 * D; idx += NT) {
+    const int i = idx / (2 * D), kv = (idx / D) & 1, ch = idx % D;
+    (kv ? conv_v_slot : conv_k_slot)[i * CONV_C + g * D + ch] = __ldcg(src_nst + idx);
+  }
+  if (!FULL && g == 0 && tid == 0) {
+    kpos_slot[p0 & (WIN - 1)] = p0;
+  }
+}
 
 template <bool FULL, int KVF, bool PROJ_FP32, bool SPLIT>
 __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKernelParams p) {
@@ -634,6 +724,22 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
       float* dst_nst = p.saved_nst + std::size_t(b * HKV + g) * 3 * 2 * D;
       for (int idx = tid; idx < 3 * 2 * D; idx += NT) dst_nst[idx] = sm.nst[idx];
     }
+    if (p.cnt) {  // the last split CTA of (b, g) merges (no second launch)
+      __shared__ unsigned last_split;
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) {
+        unsigned* cp = p.cnt + b * HKV + g;
+        const unsigned t = atomicAdd(cp, 1u);
+        last_split = t + 1 == unsigned(p.splits);
+        if (last_split) *cp = 0u;
+      }
+      __syncthreads();
+      if (last_split) {
+        __threadfence();
+        attn_reduce_body<FULL, KVF, PROJ_FP32>(p, g, b);
+      }
+    }
   } else {
     // ---- Non-split single-launch finish: fold sink + sigmoid(gate), write out, commit KV & conv state!
     for (int idx = tid; idx < GQA * D; idx += NT) {
@@ -694,89 +800,7 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
 
 template <bool FULL, int KVF, bool PROJ_FP32>
 __global__ void __launch_bounds__(NT) batched_attn_reduce_kernel(const BatchedAttnKernelParams p) {
-  constexpr bool F8 = KVF != 0, V4 = KVF == 2;
-  static_assert(FULL || !F8, "FP8 caches are full-layer only");
-  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
-
-  const int g = blockIdx.y;
-  const int b = blockIdx.z;
-  const int slot = p.slot_ids[b];
-  if (slot < 0) return;
-
-  const int p0 = int(p.slot_pos[slot]);
-  if (FULL && p0 >= p.max_ctx) return;
-
-  const int tid = threadIdx.x;
-  const int R = p.R;
-  const std::size_t proj_base = std::size_t(b) * R;
-  const float* base_part = p.part + std::size_t((b * HKV + g) * p.splits) * GQA * PSTR;
-
-  for (int idx = tid; idx < GQA * D; idx += NT) {
-    const int row = idx / D, dim = idx % D;
-    const float sink = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_SINK + g * GQA + row) * LOG2E;
-    float mx = sink;
-    for (int q = 0; q < p.splits; ++q) {
-      const float2 ml = *reinterpret_cast<const float2*>(base_part + (q * GQA + row) * PSTR + D);
-      mx = fmaxf(mx, ml.x);
-    }
-    float l = exp2f(sink - mx), a = 0.f;
-    for (int q = 0; q < p.splits; ++q) {
-      const float* pr = base_part + (q * GQA + row) * PSTR;
-      const float2 ml = *reinterpret_cast<const float2*>(pr + D);
-      const float f = exp2f(ml.x - mx);
-      l += ml.y * f;
-      a += pr[dim] * f;
-    }
-    const float gate_in = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_GATE + (g * GQA + row) * D + dim);
-    const float gate = 1.f / (1.f + expf(-gate_in));
-    p.out[std::size_t(b) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
-  }
-
-  // Commit saved K/V row, conv state, and ring_pos.
-  float* const conv_k_slot = p.conv_k_visit + std::size_t(slot) * p.conv_slot_stride;
-  float* const conv_v_slot = p.conv_v_visit + std::size_t(slot) * p.conv_slot_stride;
-  ActT* const k_ring_slot = FULL ? nullptr : (p.k_ring_visit + std::size_t(slot) * p.ring_slot_stride);
-  ActT* const v_ring_slot = FULL ? nullptr : (p.v_ring_visit + std::size_t(slot) * p.ring_slot_stride);
-  std::int64_t* const kpos_slot = FULL ? nullptr : (p.ring_pos_visit + std::size_t(slot) * p.ring_pos_slot_stride);
-  const std::int32_t* const pt_slot = FULL ? (p.page_table + std::size_t(slot) * p.max_pages_per_slot) : nullptr;
-  CT* const k_pool = FULL ? static_cast<CT*>(p.k_full_pool) : reinterpret_cast<CT*>(k_ring_slot);
-  CT* const v_pool = FULL ? static_cast<CT*>(p.v_full_pool) : reinterpret_cast<CT*>(v_ring_slot);
-
-  const ActT* src_nkv = p.saved_nkv + std::size_t(b * HKV + g) * 2 * D;
-  for (int idx = tid; idx < 2 * 16; idx += NT) {
-    const int kv = idx / 16, c8 = idx % 16;
-    const uint4 u = reinterpret_cast<const uint4*>(src_nkv + kv * D)[c8];
-    std::size_t dst_off;
-    if constexpr (FULL) {
-      const int phys = pt_slot[p0 >> kPageShift];
-      dst_off = ((((std::size_t(phys) * NUM_FULL_VISITS + p.full_visit_idx) * kPageSize + (p0 & kPageMask)) * HKV + g) * D);
-    } else {
-      dst_off = (std::size_t(p0 & (WIN - 1)) * HKV + g) * D;
-    }
-    CT* const dst = (kv ? v_pool : k_pool) + dst_off;
-    if constexpr (V4) {
-      float f[8];
-      unpack8(u, f);
-      if (kv) reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(p.v_full_pool) + dst_off / 2)[c8] = pack_fp4x8(f);
-      else reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
-                                                          pack_e4m3x2(f[4], f[5]) | (pack_e4m3x2(f[6], f[7]) << 16));
-    } else if constexpr (F8) {
-      float f[8];
-      unpack8(u, f);
-      reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
-                                                     pack_e4m3x2(f[4], f[5]) | (pack_e4m3x2(f[6], f[7]) << 16));
-    } else {
-      reinterpret_cast<uint4*>(dst)[c8] = u;
-    }
-  }
-  const float* src_nst = p.saved_nst + std::size_t(b * HKV + g) * 3 * 2 * D;
-  for (int idx = tid; idx < 3 * 2 * D; idx += NT) {
-    const int i = idx / (2 * D), kv = (idx / D) & 1, ch = idx % D;
-    (kv ? conv_v_slot : conv_k_slot)[i * CONV_C + g * D + ch] = src_nst[idx];
-  }
-  if (!FULL && g == 0 && tid == 0) {
-    kpos_slot[p0 & (WIN - 1)] = p0;
-  }
+  attn_reduce_body<FULL, KVF, PROJ_FP32>(p, blockIdx.y, blockIdx.z);
 }
 
 template <bool X_FP32>
@@ -962,8 +986,10 @@ void dispatch_attn(const BatchedAttnKernelParams& kp, cudaStream_t stream) {
   } else {
     const dim3 grid1(kp.splits, HKV, kp.B);
     batched_attn_kernel<FULL, F8, PROJ_FP32, true><<<grid1, NT, 0, stream>>>(kp);
-    const dim3 grid2(1, HKV, kp.B);
-    batched_attn_reduce_kernel<FULL, F8, PROJ_FP32><<<grid2, NT, 0, stream>>>(kp);
+    if (!kp.cnt) {
+      const dim3 grid2(1, HKV, kp.B);
+      batched_attn_reduce_kernel<FULL, F8, PROJ_FP32><<<grid2, NT, 0, stream>>>(kp);
+    }
   }
   CUDA_CHECK(cudaGetLastError());
 }
@@ -1051,6 +1077,11 @@ void batched_attn_decode(const BatchedAttnArgs& a, cudaStream_t stream) {
     kp.part = reinterpret_cast<float*>(ws);
     kp.saved_nkv = reinterpret_cast<ActT*>(ws + ws_nkv_off(a.B));
     kp.saved_nst = reinterpret_cast<float*>(ws + ws_nst_off(a.B));
+    static const bool fused = [] {
+      const char* e = std::getenv("INGINE_ATTN_FUSED_REDUCE");
+      return !(e && e[0] == '0');
+    }();
+    kp.cnt = fused ? reinterpret_cast<unsigned*>(ws + ws_cnt_off(a.B)) : nullptr;
   }
   kp.out = a.out;
 
