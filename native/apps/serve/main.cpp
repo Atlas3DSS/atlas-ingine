@@ -178,6 +178,10 @@ int main(int argc, char** argv) {
             &top_k);
   ap.parse(argc, argv);
   if (!dflash2_dir.empty()) spec = true;
+  if (!dflash2_dir.empty() && max_batch > 1) {
+    std::cerr << "ingine-serve: error: --dflash2-dir currently requires --max-batch 1 (batched speculation uses DSpark BatchDrafter)\n";
+    return 2;
+  }
   if (image_max_tokens < 1 || image_max_tokens > ingine::image::MAX_TOKENS || max_images < 0 || max_image_tokens < 0) {
     std::cerr << "ingine-serve: error: --image-max-tokens must be in [1, " << ingine::image::MAX_TOKENS
               << "] and --max-images, --max-image-tokens at least 0\n";

@@ -19,9 +19,10 @@ ChatRequest parse_anthropic_request(const Json& body, const text::ChatFormat& fm
 // {"type": "error", "error": {"type": "...", "message": "..."}}
 Json anthropic_error_body(int status, std::string_view message);
 
-// Maps StreamParser finish_reason ("stop" | "length" | "tool_calls") to Anthropic stop_reason
-// ("end_turn" | "max_tokens" | "tool_use").
-std::optional<std::string> anthropic_stop_reason(const std::optional<std::string>& finish_reason);
+// Maps StreamParser finish_reason ("stop" | "length" | "tool_calls") and optional matched stop_sequence to
+// Anthropic stop_reason ("end_turn" | "max_tokens" | "tool_use" | "stop_sequence").
+std::optional<std::string> anthropic_stop_reason(const std::optional<std::string>& finish_reason,
+                                                 const std::optional<std::string>& stop_sequence = std::nullopt);
 
 // Formats a completed turn as an Anthropic Messages API JSON response body.
 Json anthropic_message_response(const std::string& msg_id, const std::string& model_id,

@@ -701,11 +701,14 @@ void ChatServer::complete_anthropic(const httplib::Request& req, httplib::Respon
             transport.write(anthropic_sse("error", anthropic_error_body(500, *x.failure)));
           } else {
             const int cached = x.prefill_stats ? std::clamp(x.prefill_stats->reused_tokens, 0, prompt_tokens) : 0;
-            const auto stop = anthropic_stop_reason(x.parser.finish_reason());
+            const auto& matched_stop = x.parser.stop_sequence();
+            const auto stop = anthropic_stop_reason(x.parser.finish_reason(), matched_stop);
             transport.write(anthropic_sse(
                 "message_delta",
                 Json{{"type", "message_delta"},
-                     {"delta", {{"stop_reason", stop ? Json(*stop) : Json()}, {"stop_sequence", nullptr}}},
+                     {"delta",
+                      {{"stop_reason", stop ? Json(*stop) : Json()},
+                       {"stop_sequence", matched_stop ? Json(*matched_stop) : Json()}}},
                      {"usage",
                       {{"input_tokens", prompt_tokens},
                        {"output_tokens", x.parser.num_tokens()},

@@ -1724,7 +1724,8 @@ void test_anthropic_messages_api() {
     const Json j = Json::parse(r.body);
     CHECK(j["type"] == "message" && j["role"] == "assistant" && j["model"] == "inkling-test");
     CHECK(j["id"].get<std::string>().starts_with("msg_"));
-    CHECK(j["stop_reason"] == "end_turn");
+    CHECK(j["stop_reason"] == "stop_sequence");
+    CHECK(j["stop_sequence"] == "STOP");
     CHECK(j["content"].size() == 2);
     CHECK(j["content"][0]["type"] == "thinking");
     CHECK(j["content"][0]["thinking"].get<std::string>().find("Let me think") != std::string::npos);
@@ -1738,6 +1739,14 @@ void test_anthropic_messages_api() {
     Response cr = request(s->port(), "POST", "/v1/messages/count_tokens", ingine::serve::dump(count_body));
     CHECK(cr.status == 200);
     CHECK(Json::parse(cr.body)["input_tokens"].get<int>() == j["usage"]["input_tokens"].get<int>());
+
+    // Normal end_turn (no stop sequence match) returns stop_reason="end_turn" and stop_sequence=null.
+    Json no_stop = body;
+    no_stop.erase("stop_sequences");
+    Response nr2 = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(no_stop));
+    CHECK(nr2.status == 200);
+    const Json j2 = Json::parse(nr2.body);
+    CHECK(j2["stop_reason"] == "end_turn" && j2["stop_sequence"].is_null());
   }
 
   // 2. Streaming SSE reconstruction matches non-streaming for thinking + tool_use blocks.
@@ -1844,6 +1853,76 @@ void test_anthropic_messages_api() {
     req_uid["metadata"] = {{"user_id", "omarchy-user-1"}};
     Response ur = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(req_uid));
     CHECK(ur.status == 200 && s->gen->calls().back().bypass_prefix_cache);
+
+    // Unsupported tool_choice ('any' and named 'tool') fail closed before inference (HTTP 400).
+    const std::size_t calls_before = s->gen->calls().size();
+    const Json tools = Json::array({{{"name", "lookup"}, {"input_schema", {{"type", "object"}}}}});
+    for (const Json& tc : {Json{{"type", "any"}}, Json{{"type", "tool"}, {"name", "lookup"}}}) {
+      Json bad_tc = {{"model", "inkling-test"}, {"max_tokens", 32}, {"tools", tools}, {"tool_choice", tc}, {"messages", MSGS}};
+      Response r_bad = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(bad_tc));
+      CHECK(r_bad.status == 400);
+      const Json ej = Json::parse(r_bad.body);
+      CHECK(ej["type"] == "error" && ej["error"]["type"] == "invalid_request_error");
+    }
+    CHECK(s->gen->calls().size() == calls_before);
+
+    // tool_choice={"type":"none"} strips tools and bans <|content_invoke_tool_json|>.
+    Json none_tc = {
+        {"model", "inkling-test"},
+        {"max_tokens", 32},
+        {"tools", tools},
+        {"tool_choice", {{"type", "none"}}},
+        {"messages", MSGS},
+    };
+    Response r_none = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(none_tc));
+    CHECK(r_none.status == 200);
+    const auto calls_none = s->gen->calls();
+    const auto& banned_none = calls_none.back().sampling.banned_tokens;
+    CHECK(std::find(banned_none.begin(), banned_none.end(), g_fmt->content_invoke_tool_json_id()) != banned_none.end());
+  }
+
+  // 4. User stop_sequences (including cross-token matches) emit stop_reason="stop_sequence" and exact stop_sequence
+  //    in both non-streaming JSON and streaming SSE.
+  {
+    // "END_MARK_XYZ" spans multiple BPE tokens so StreamParser must match across token boundaries via hold_.
+    const std::string stop_seq = "END_MARK_XYZ";
+    CHECK(g_fmt->tokenizer().encode(stop_seq, false).size() >= 2);
+    const std::string stop_text =
+        "<|message_model|><|content_text|>alpha beta " + stop_seq + " trailing<|end_message|><|content_model_end_sampling|>";
+    auto s = serve(stop_text);
+
+    const Json req_sync = {
+        {"model", "inkling-test"},
+        {"max_tokens", 64},
+        {"stop_sequences", Json::array({"OTHER_STOP", stop_seq})},
+        {"messages", MSGS},
+    };
+    Response nr = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(req_sync));
+    CHECK(nr.status == 200);
+    const Json nj = Json::parse(nr.body);
+    CHECK(nj["stop_reason"] == "stop_sequence");
+    CHECK(nj["stop_sequence"] == stop_seq);
+    CHECK(nj["content"].size() == 1 && nj["content"][0]["type"] == "text");
+    CHECK(nj["content"][0]["text"] == "alpha beta ");
+
+    Json req_stream = req_sync;
+    req_stream["stream"] = true;
+    Response sr = request(s->port(), "POST", "/v1/messages", ingine::serve::dump(req_stream));
+    CHECK(sr.status == 200);
+    const auto evs = parse_anthropic_sse(sr.body);
+    CHECK(!evs.empty() && evs.front().first == "message_start" && evs.back().first == "message_stop");
+    std::string s_text, s_reason, s_seq;
+    for (const auto& [ev, d] : evs) {
+      if (ev == "content_block_delta" && d["delta"]["type"] == "text_delta") {
+        s_text += d["delta"]["text"].get<std::string>();
+      } else if (ev == "message_delta") {
+        s_reason = d["delta"]["stop_reason"].get<std::string>();
+        s_seq = d["delta"]["stop_sequence"].get<std::string>();
+      }
+    }
+    CHECK(s_text == "alpha beta ");
+    CHECK(s_reason == "stop_sequence");
+    CHECK(s_seq == stop_seq);
   }
 }
 

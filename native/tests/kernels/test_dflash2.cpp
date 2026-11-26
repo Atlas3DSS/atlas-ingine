@@ -409,6 +409,165 @@ bool test_topk16_and_select_path(Rng& rng) {
   return true;
 }
 
+bool test_sampled_verifier_fidelity(Rng& rng) {
+  // Verifies end-to-end sampled fidelity: dflash2_select_path (T=0.7, after_correction softcap 30.0)
+  // feeding directly into kd::sampled_accept preserves the exact target distribution p.
+  const int V = 256;
+  const float T = 0.7f;
+  const int anchor = 3;
+
+  // Build deterministic top-16 candidates per step (all distinct in [0, V)).
+  std::vector<std::int32_t> cidx(GAMMA * kd::DF2_TOPK);
+  std::vector<float> cval(GAMMA * kd::DF2_TOPK);
+  for (int i = 0; i < GAMMA; ++i) {
+    for (int c = 0; c < kd::DF2_TOPK; ++c) {
+      cidx[i * kd::DF2_TOPK + c] = (i * 19 + c * 7) % V;
+      cval[i * kd::DF2_TOPK + c] = float(2.0 - 0.25 * c + 0.1 * rng.normal());
+    }
+  }
+  const auto g_f = randn_bf16(rng, GAMMA * kd::DF2_RANK, 0.3);
+  const auto pred_f = randn_bf16(rng, std::size_t(V) * kd::DF2_RANK, 0.2);
+  const auto succ_f = randn_bf16(rng, std::size_t(V) * kd::DF2_RANK, 0.2);
+
+  // Target distribution p[0..GAMMA, V] (normalized probability distributions, focused mostly on the 16 candidates + tail).
+  std::vector<float> p_host(std::size_t(BLOCK) * V, 0.f);
+  for (int r = 0; r < BLOCK; ++r) {
+    double sum = 0.0;
+    std::vector<double> w(V, 0.0);
+    for (int v = 0; v < V; ++v) w[v] = 0.0005;
+    if (r < GAMMA) {
+      for (int c = 0; c < kd::DF2_TOPK; ++c) w[cidx[r * kd::DF2_TOPK + c]] = std::exp(1.5 - 0.2 * c + 0.3 * rng.normal());
+    }
+    for (int v = 0; v < V; ++v) sum += w[v];
+    for (int v = 0; v < V; ++v) p_host[std::size_t(r) * V + v] = float(w[v] / sum);
+  }
+
+  DeviceArray<float> d_cval(cval), d_g(g_f), d_p_probs(p_host);
+  DeviceArray<std::int32_t> d_cidx(cidx);
+  DeviceArray<ingine::ActT> d_pred(to_bf16(pred_f)), d_succ(to_bf16(succ_f));
+  DeviceArray<std::int32_t> d_prev(GAMMA * kd::DF2_TOPK);
+  INGINE_TEST_CUDA(cudaMemsetAsync(d_prev.get(), 0, GAMMA * kd::DF2_TOPK * 4, g_stream));
+  DeviceArray<float> d_dlogits(std::size_t(GAMMA) * V);
+  kd::fill(d_dlogits.get(), std::size_t(GAMMA) * V, -std::numeric_limits<float>::infinity(), g_stream);
+  DeviceArray<std::int32_t> d_toks(GAMMA);
+  DeviceArray<float> d_conf(GAMMA), d_qstats(2 * GAMMA);
+  DeviceArray<kd::DraftParams> d_params(1);
+  DeviceArray<float> d_u(GAMMA), d_ws(kd::sampled_accept_workspace_floats(V)), d_resid(V);
+  DeviceArray<kd::AcceptResult> d_acc(1);
+
+  kd::set_seed(d_params.get(), 0xCAFEBABE12345678ull, g_stream);
+  kd::set_draft_inputs(d_params.get(), anchor, 50, T, g_stream);
+
+  // 1. Exact numerical oracle check of sampled_accept(dflash2_select_path outputs) for both partial and all-accept.
+  kd::dflash2_select_path(d_cval.get(), d_cidx.get(), d_g.get(), d_pred.get(), d_succ.get(), d_prev.get(),
+                          d_dlogits.get(), V, 30.f, true, d_toks.get(), d_conf.get(), d_qstats.get(), d_params.get(),
+                          g_stream);
+  sync();
+  const auto dlogits = d_dlogits.download();
+  const auto drafts = d_toks.download();
+
+  for (int mode = 0; mode < 2; ++mode) {
+    // mode 0: force reject at step 2 (u = [0, 0, 0.99999, ...]); mode 1: force all-accept (u = all 0).
+    std::vector<float> u(GAMMA, 0.f);
+    if (mode == 0) u[2] = 0.99999f;
+    INGINE_TEST_CUDA(cudaMemcpyAsync(d_u.get(), u.data(), GAMMA * 4, cudaMemcpyHostToDevice, g_stream));
+    kd::sampled_accept(d_p_probs.get(), d_dlogits.get(), V, d_toks.get(), GAMMA, T, d_qstats.get(), d_u.get(),
+                       d_ws.get(), d_resid.get(), d_acc.get(), g_stream);
+    sync();
+    const auto acc = d_acc.download()[0];
+    const auto resid = d_resid.download();
+
+    // Compute exact FP64 host oracle for accepted and resid.
+    int exp_acc = 0;
+    for (int r = 0; r < GAMMA; ++r) {
+      double mx = -std::numeric_limits<double>::infinity();
+      for (int v = 0; v < V; ++v)
+        if (std::isfinite(dlogits[std::size_t(r) * V + v])) mx = std::max(mx, double(dlogits[std::size_t(r) * V + v]) / double(T));
+      double zs = 0.0;
+      for (int v = 0; v < V; ++v)
+        if (std::isfinite(dlogits[std::size_t(r) * V + v])) zs += std::exp(double(dlogits[std::size_t(r) * V + v]) / double(T) - mx);
+      const int d = drafts[r];
+      const double qd = std::isfinite(dlogits[std::size_t(r) * V + d])
+                            ? std::exp(double(dlogits[std::size_t(r) * V + d]) / double(T) - mx) / zs
+                            : 0.0;
+      const double pd = double(p_host[std::size_t(r) * V + d]);
+      if (double(u[r]) * qd < pd) ++exp_acc;
+      else break;
+    }
+    if (acc.accepted != exp_acc) {
+      std::printf("FAIL dflash2_sampled_verifier mode=%d accepted=%d ref=%d\n", mode, acc.accepted, exp_acc);
+      return false;
+    }
+    std::vector<double> ref_resid(V, 0.0);
+    if (exp_acc == GAMMA) {
+      for (int v = 0; v < V; ++v) ref_resid[v] = double(p_host[std::size_t(GAMMA) * V + v]);
+    } else {
+      const int a = exp_acc;
+      double mx = -std::numeric_limits<double>::infinity();
+      for (int v = 0; v < V; ++v)
+        if (std::isfinite(dlogits[std::size_t(a) * V + v])) mx = std::max(mx, double(dlogits[std::size_t(a) * V + v]) / double(T));
+      double zs = 0.0;
+      for (int v = 0; v < V; ++v)
+        if (std::isfinite(dlogits[std::size_t(a) * V + v])) zs += std::exp(double(dlogits[std::size_t(a) * V + v]) / double(T) - mx);
+      double rsum = 0.0;
+      for (int v = 0; v < V; ++v) {
+        const double qv = std::isfinite(dlogits[std::size_t(a) * V + v])
+                              ? std::exp(double(dlogits[std::size_t(a) * V + v]) / double(T) - mx) / zs
+                              : 0.0;
+        ref_resid[v] = std::max(double(p_host[std::size_t(a) * V + v]) - qv, 0.0);
+        rsum += ref_resid[v];
+      }
+      if (rsum == 0.0)
+        for (int v = 0; v < V; ++v) ref_resid[v] = double(p_host[std::size_t(a) * V + v]);
+    }
+    if (!check_vec(mode == 0 ? "dflash2_sampled_verifier_partial" : "dflash2_sampled_verifier_all", resid, ref_resid,
+                   1e-5, 1e-4))
+      return false;
+  }
+
+  // 2. Monte Carlo target-distribution preservation check on position 0 (3000 draws through GPU kernels).
+  const int N_DRAWS = 3000;
+  std::vector<double> counts(V, 0.0);
+  for (int trial = 0; trial < N_DRAWS; ++trial) {
+    kd::dflash2_select_path(d_cval.get(), d_cidx.get(), d_g.get(), d_pred.get(), d_succ.get(), d_prev.get(),
+                            d_dlogits.get(), V, 30.f, true, d_toks.get(), d_conf.get(), d_qstats.get(), d_params.get(),
+                            g_stream);
+    std::vector<float> u(GAMMA, 0.5f);
+    u[0] = float(rng.uniform());
+    INGINE_TEST_CUDA(cudaMemcpyAsync(d_u.get(), u.data(), GAMMA * 4, cudaMemcpyHostToDevice, g_stream));
+    kd::sampled_accept(d_p_probs.get(), d_dlogits.get(), V, d_toks.get(), 1, T, d_qstats.get(), d_u.get(), d_ws.get(),
+                       d_resid.get(), d_acc.get(), g_stream);
+    sync();
+    const auto acc = d_acc.download()[0];
+    int tok0 = 0;
+    if (acc.accepted >= 1) {
+      tok0 = d_toks.download()[0];
+    } else {
+      const auto resid = d_resid.download();
+      double rsum = 0.0;
+      for (float v : resid) rsum += double(v);
+      double pick = rng.uniform() * rsum, cum = 0.0;
+      tok0 = V - 1;
+      for (int v = 0; v < V; ++v) {
+        cum += double(resid[v]);
+        if (pick <= cum) {
+          tok0 = v;
+          break;
+        }
+      }
+    }
+    counts[tok0] += 1.0;
+  }
+  double l1 = 0.0;
+  for (int v = 0; v < V; ++v) l1 += std::abs(counts[v] / double(N_DRAWS) - double(p_host[v]));
+  if (l1 > 0.06) {
+    std::printf("FAIL dflash2_sampled_verifier_mc: L1=%.4f > 0.06\n", l1);
+    return false;
+  }
+  std::printf("PASS dflash2_sampled_verifier_mc (N=%d, L1=%.4f)\n", N_DRAWS, l1);
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -424,6 +583,7 @@ int main() {
   ok &= test_conv_and_rmsnorm(rng);
   ok &= test_block_attention_sliding_mask(rng);
   ok &= test_topk16_and_select_path(rng);
+  ok &= test_sampled_verifier_fidelity(rng);
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

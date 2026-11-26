@@ -107,6 +107,7 @@ struct Completion {
   std::string reasoning_content, content;
   std::vector<ToolCall> tool_calls;
   std::optional<std::string> finish_reason;  // "stop" | "length" | "tool_calls"; nullopt while unfinished
+  std::optional<std::string> stop_sequence;  // matched user stop string when stopped by stop_sequences, else nullopt
 };
 
 // Coalesce adjacent events of the same kind (same tool call for argument deltas): chat.merge_deltas.
@@ -131,6 +132,7 @@ class StreamParser {
   Completion result() const;
   int num_tokens() const noexcept { return num_tokens_; }  // generated tokens (prefill excluded)
   const std::optional<std::string>& finish_reason() const noexcept { return finish_reason_; }
+  const std::optional<std::string>& stop_sequence() const noexcept { return matched_stop_sequence_; }
 
  private:
   friend class ChatFormat;
@@ -182,6 +184,7 @@ class StreamParser {
   int num_tokens_ = 0;
   bool saw_stop_token_ = false;  // an end-of-turn / foreign-role token was generated
   bool stopped_by_string_ = false;
+  std::optional<std::string> matched_stop_sequence_;
   std::optional<std::string> finish_reason_;
 };
 

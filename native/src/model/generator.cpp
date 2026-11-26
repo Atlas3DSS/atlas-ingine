@@ -1460,6 +1460,23 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
   if (options.loop_passes < 1 || options.loop_passes > MAX_PASSES) {
     throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
   }
+  if (!options.dflash2_dir.empty()) {
+    if (!options.spec) {
+      throw std::invalid_argument("--dflash2-dir requires --spec");
+    }
+    if (options.loop_passes != PASSES) {
+      throw std::invalid_argument("--dflash2-dir requires --loop-passes 3");
+    }
+    if (options.kv_cache_mode != KvCacheMode::PerPass) {
+      throw std::invalid_argument("--dflash2-dir requires --kv-cache-mode per_pass");
+    }
+#if INGINE_TP_SIZE > 1
+    throw std::invalid_argument("--dflash2-dir currently requires TP=1");
+#endif
+    if (options.max_batch > 1) {
+      throw std::invalid_argument("--dflash2-dir currently requires --max-batch 1 (batched speculation uses DSpark BatchDrafter)");
+    }
+  }
 #if INGINE_TP_SIZE > 1
   if (options.loop_passes != PASSES) {
     throw std::invalid_argument("--loop-passes != 3 currently requires TP=1");
@@ -1484,6 +1501,23 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options, Weights weights, Ablation ablation) {
   if (options.loop_passes < 1 || options.loop_passes > MAX_PASSES) {
     throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
+  }
+  if (!options.dflash2_dir.empty()) {
+    if (!options.spec) {
+      throw std::invalid_argument("--dflash2-dir requires --spec");
+    }
+    if (options.loop_passes != PASSES) {
+      throw std::invalid_argument("--dflash2-dir requires --loop-passes 3");
+    }
+    if (options.kv_cache_mode != KvCacheMode::PerPass) {
+      throw std::invalid_argument("--dflash2-dir requires --kv-cache-mode per_pass");
+    }
+#if INGINE_TP_SIZE > 1
+    throw std::invalid_argument("--dflash2-dir currently requires TP=1");
+#endif
+    if (options.max_batch > 1) {
+      throw std::invalid_argument("--dflash2-dir currently requires --max-batch 1 (batched speculation uses DSpark BatchDrafter)");
+    }
   }
   if (options.max_batch > 1) {
     if (options.kv_cache_mode != KvCacheMode::PerPass) {

@@ -300,10 +300,10 @@ ChatRequest parse_anthropic_request(const Json& body, const text::ChatFormat& fm
     if (!tc_type || (*tc_type != "auto" && *tc_type != "any" && *tc_type != "none" && *tc_type != "tool")) {
       throw BadRequest("'tool_choice.type' must be 'auto', 'any', 'none', or 'tool'", "tool_choice");
     }
-    if (*tc_type == "none") disable_tools = true;
-    if (*tc_type == "tool") {
-      const std::string* name = string_at(*tc, "name");
-      if (!name || name->empty()) throw BadRequest("'tool_choice.name' is required when type is 'tool'", "tool_choice");
+    if (*tc_type == "none") {
+      disable_tools = true;
+    } else if (*tc_type == "any" || *tc_type == "tool") {
+      throw BadRequest("tool_choice.type '" + *tc_type + "' is not supported; use 'auto' or 'none'", "tool_choice");
     }
   }
   if (!disable_tools) {
@@ -363,8 +363,10 @@ Json anthropic_error_body(int status, std::string_view message) {
   return Json{{"type", "error"}, {"error", {{"type", kind}, {"message", message}}}};
 }
 
-std::optional<std::string> anthropic_stop_reason(const std::optional<std::string>& finish_reason) {
+std::optional<std::string> anthropic_stop_reason(const std::optional<std::string>& finish_reason,
+                                                 const std::optional<std::string>& stop_sequence) {
   if (!finish_reason) return std::nullopt;
+  if (stop_sequence.has_value()) return std::string("stop_sequence");
   if (*finish_reason == "tool_calls") return std::string("tool_use");
   if (*finish_reason == "length") return std::string("max_tokens");
   return std::string("end_turn");
@@ -393,14 +395,14 @@ Json anthropic_message_response(const std::string& msg_id, const std::string& mo
     }
     content.push_back(Json{{"type", "tool_use"}, {"id", tc.id}, {"name", tc.name}, {"input", std::move(input)}});
   }
-  const auto stop = anthropic_stop_reason(result.finish_reason);
+  const auto stop = anthropic_stop_reason(result.finish_reason, result.stop_sequence);
   return Json{{"id", msg_id},
               {"type", "message"},
               {"role", "assistant"},
               {"model", model_id},
               {"content", std::move(content)},
               {"stop_reason", stop ? Json(*stop) : Json()},
-              {"stop_sequence", nullptr},
+              {"stop_sequence", result.stop_sequence ? Json(*result.stop_sequence) : Json()},
               {"usage",
                {{"input_tokens", input_tokens},
                 {"output_tokens", output_tokens},

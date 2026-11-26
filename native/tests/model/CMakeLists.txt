@@ -8,6 +8,7 @@ if(TARGET ingine_model)
   ingine_add_test(NAME model_runtime SOURCES test_runtime.cpp LIBS ingine_model GPU TIMEOUT 600)
   # prompt checkpoints with speculative decoding on the full model (~22 GB of GPU memory)
   ingine_add_test(NAME model_reuse SOURCES test_reuse.cpp LIBS ingine_model GPU MODEL TIMEOUT 900)
+  ingine_add_test(NAME model_dflash2_e2e SOURCES test_dflash2_e2e.cpp LIBS ingine_model ingine_text GPU MODEL TIMEOUT 900)
   # Stage 3 (#826): verified root-prefix checkpoint, forks, exact-root, byte-capped pinned host-RAM parking,
   # LRU eviction, memory-pressure fallback, and restore-vs-recompute latency crossover
   ingine_add_test(NAME model_cache_stage3 SOURCES test_cache_stage3.cpp LIBS ingine_model ingine_text GPU MODEL TIMEOUT 1200)

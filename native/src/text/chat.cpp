@@ -625,7 +625,7 @@ StreamParser::StreamParser(std::shared_ptr<const detail::FormatData> fmt, std::v
 }
 
 Completion StreamParser::result() const {
-  return Completion{reasoning_, content_, tool_calls_, finish_reason_};
+  return Completion{reasoning_, content_, tool_calls_, finish_reason_, matched_stop_sequence_};
 }
 
 std::string StreamParser::decode(std::span<const int32_t> ids) const { return fmt_->tokenizer.decode_lossy(ids); }
@@ -826,11 +826,19 @@ void StreamParser::text(const std::string& text, std::vector<Delta>& out) {
   }
   const std::string buf = hold_ + text;
   std::size_t first = std::string::npos;
-  for (const std::string& s : stop_) first = std::min(first, buf.find(s));
+  const std::string* matched = nullptr;
+  for (const std::string& s : stop_) {
+    const std::size_t pos = buf.find(s);
+    if (pos < first) {
+      first = pos;
+      matched = &s;
+    }
+  }
   if (first != std::string::npos) {
     emit_content(std::string_view(buf).substr(0, first), out);
     hold_.clear();
     stopped_by_string_ = true;
+    matched_stop_sequence_ = *matched;
     return;
   }
   const std::size_t len = uni::utf8_length(buf);

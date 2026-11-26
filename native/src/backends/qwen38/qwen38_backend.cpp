@@ -174,6 +174,9 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
   if (!options.refusal_map.empty()) {
     throw std::invalid_argument("qwen38-dense does not support refusal_map hooks");
   }
+  if (!options.dflash2_dir.empty()) {
+    throw std::invalid_argument("qwen38-dense does not support --dflash2-dir (speculative decoding unsupported)");
+  }
 }
 
 Qwen38RuntimeDispatchPlan resolve_qwen38_runtime_options(const ingine::model::RuntimeOptions& options,
