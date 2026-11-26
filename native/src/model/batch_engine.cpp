@@ -805,7 +805,9 @@ class BatchDecoder {
 
     // Keep embed RMSNorm on fixed BW=64 (M >= 8) whenever buffer capacity permits so M=1..7 matches M>=8 bit-for-bit.
     const int M_embed = (M < 8 && max_rows_ >= 8) ? 8 : M;
-    if (w.embed_q4()) {
+    if (w.embed_q8()) {
+      dense::embed_q8(tokens_dev_, M_embed, w.embed.data, f32p(w.embed_norm), B0_, false, stream);
+    } else if (w.embed_q4()) {
       auto desc = ops::make_inkling_embed_q4_desc(M_embed, VOCAB, /*allow_pdl=*/false);
       desc.token_bounds = ops::TokenBoundsMode::PreValidated;
       const ops::EmbedQ4RmsNormArgs args{tokens_dev_, w.embed.data, f32p(w.embed_norm), B0_};

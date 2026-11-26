@@ -627,7 +627,8 @@ class TpPrefiller {
     };
 
     pk::widen_ids(tokens, T, ids_, IMAGE_PLACEHOLDER_ID, s);
-    if (w.embed_q4()) dense::embed_q4(ids_, T, VOCAB, w.embed.data, f32p(w.embed_norm), B0_, false, s);
+    if (w.embed_q8()) dense::embed_q8(ids_, T, w.embed.data, f32p(w.embed_norm), B0_, false, s);
+    else if (w.embed_q4()) dense::embed_q4(ids_, T, VOCAB, w.embed.data, f32p(w.embed_norm), B0_, false, s);
     else dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
 
     int prev_v = -1;
@@ -1152,7 +1153,8 @@ class TpBatchDecoder {
       }
     };
 
-    dense::embed(tokens_dev_, B, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
+    if (w.embed_q8()) dense::embed_q8(tokens_dev_, B, w.embed.data, f32p(w.embed_norm), B0_, false, stream);
+    else dense::embed(tokens_dev_, B, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
 
     int prev_v = -1;
     for (int v = 0; v < NUM_VISITS; ++v) {
@@ -1837,7 +1839,9 @@ class TpDecoder {
       return p;
     };
 
-    if (w.embed_q4()) {
+    if (w.embed_q8()) {
+      dense::embed_q8(static_cast<const std::int64_t*>(b.token.data), m, w.embed.data, f32p(w.embed_norm), f32m(b.B0), false, stream);
+    } else if (w.embed_q4()) {
       dense::embed_q4(static_cast<const std::int64_t*>(b.token.data), m, VOCAB, w.embed.data, f32p(w.embed_norm), f32m(b.B0), false, stream);
     } else {
       dense::embed(static_cast<const std::int64_t*>(b.token.data), m, static_cast<const ActT*>(w.embed.data), f32p(w.embed_norm), f32m(b.B0), false, stream);
