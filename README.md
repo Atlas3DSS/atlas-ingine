@@ -60,6 +60,30 @@ External baseline reference points (different hardware, quants, or settings — 
 - **Project Maya** (AMD ROCm/HIP & multi-GPU Inkling-2-Mini serving) and **`llama.cpp` / `Atlas3DSS/atlas-engine`** (GGUF serving; see [Atlas3DSS/atlas-engine](https://github.com/Atlas3DSS/atlas-engine)).
 - **Like-for-like 6-engine RTX 3090 24 GB bare multi-turn Blender authoring showdown** (identical prompts, 6 sequences / 24 shots, no Verified Ledger, Blender 4.5.14 LTS verifier): `atlas-ingine` Native **`220.15 tok/s`** (`21.23 GiB`, `25.0%` bare pass / `43.93%` compliance — **`1.86×`** Project Maya `118.26 tok/s`, **`2.11×`** `llama.cpp v7+DSpark` `104.16 tok/s`, **`3.48×`** `Kintsugi-12G` `63.22 tok/s`), while `atlas-12g` ran **`163.73 tok/s`** (**`2.59×`** `Kintsugi-12G` with vision included; upstream `satellitedown/ingine` fails startup on `sm_86`). Adding Verified Ledger lifts `atlas-ingine` Native from `25%` bare to `100%` (`28/28` shots).
 
+### Tesla V100 (`sm_70`): load, multi-GPU, and other engines' published figures
+
+![Inkling-2-Mini on the Tesla V100: atlas-ingine beside NInfer, StrataEngine, Lapilli, llama.cpp, DGX Spark and a P100 reference](docs/media/v100_inkling2mini_all_engines.png)
+
+Measured 2026-11-25 on Tesla V100-PCIE-32GB cards with [knapcio/speedbench](https://github.com/knapcio/speedbench) at `e95a638` (native `NVFP4+MXFP8`, `--dense-fp8 --kv-fp8`, built-in DSpark for single-stream speedbench and cold prefill, no drafting for the concurrent prose runs). These runs used a pre-merge build of the Volta prefill/batch kernels and have not been repeated on current `main`.
+
+| Setup | speedbench full, `c=1` (geomean) | Prose, 16 concurrent | Highest load measured (prose, 0 failed) | Cold prefill, 8K |
+|---|---:|---:|---:|---:|
+| 1× V100 (`--max-batch 64` for concurrent prose) | `72.8 tok/s` | `204.2 tok/s` | `463.4 tok/s` at `c=64` | `2,900 tok/s` |
+| 4× V100, `TP4+EP4` (`--max-batch 128` for concurrent prose) | `102.2 tok/s` | `369.9 tok/s` | `1,146.2 tok/s` at `c=128` | `3,854 tok/s` |
+| 4× V100, four independent replicas | — | `387.9 tok/s` | `1,808.1 tok/s` at `c=256` | — |
+
+On one card, 64 concurrent high-effort requests of 4,096 tokens exceeded the KV pool: 49 of 64 failed. The `c=128` and `c=256` rows are four-card capacity figures on this prose workload, not comparisons with another engine.
+
+Published V100 and P100 figures from other projects, on their hardware, quants, and prompts (not re-measured here):
+
+- **[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090)** ([`docs/tesla-v100.md` at `8ea67ce`](https://github.com/ashalliants/ninfer-3090/blob/8ea67ce616c481592d3016291043ed5143c9065b/docs/tesla-v100.md); Tesla V100 32 GB at 200 W, byte-exact repack of Unsloth `UD-Q8_K_XL`, INT8 KV): `78.0 tok/s` plain and `94.3 tok/s` with DSpark (12-chat average, 262,144 max context with vision), `198.2 tok/s` aggregate at 8 concurrent (the highest it publishes), prefill `2,727 tok/s` at 8K with `--prefill-chunk 8192` at 131,072 max context (`2,170` at its default chunk). **NInfer is ahead for 1–8 users:** ours are `81.0 tok/s` chat with `--spec`, `44.7 tok/s` plain at `c=1`, and `142.2 tok/s` at `c=8`. atlas-ingine's 8K prefill is `2,900 tok/s` against `2,727`; NInfer publishes no four-card or 1,048,576-token figures.
+- **[StrataEngine Hugging Face card at `04996a1e`](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata/blob/04996a1e2c45009b6a04f2af126cb6bdb2ba3587/README.md)** (Tesla V100 32 GB, its SQ-20 and SQ-10 packs, thinking off, draft decoding on for single requests; prompts, output length, and context not stated): `70.5 tok/s` for one request, `2,287 tok/s` prefill on SQ-20, and **`990.1 tok/s` (SQ-20) and `676.0 tok/s` (SQ-10) across 64 simultaneous requests**. Our `463.4 tok/s` at `c=64` is on a different workload (speedbench prose, native `NVFP4`, no drafting), so the two are not like for like; Strata's published 64-request figure is the higher one.
+- **[Lapilli Inkling port](https://github.com/chris83-dev/lapilli-v100/blob/f9b7dd093a9ff018bc68f177f81a1d27d3ffec91/docs/community/inkling2-mini.md)** (`f9b7dd0`; V100 PCIe 32 GB, official NVFP4 experts, no drafting): `69 tok/s` decode, `850 tok/s` on a short prompt.
+- **[`llama.cpp`, realugbun `inkling2-speed` fork README](https://github.com/realugbun/llama.cpp/blob/2eb2530ec4da/README.md)** (`2eb2530`; V100 32 GB, Unsloth `UD-Q4_K_XL`): `50.7 tok/s` and `1,185 tok/s` (`pp512`) on the fork, `32.0` and `725` on mainline as measured there.
+- **[knapcio DGX Spark recipe](https://github.com/knapcio/Inkling-2-Mini-4x-DGX-Spark-TP4)** (`c0f5f1c`; GB10 `sm_121`, SGLang, DFlash2 draft model, BF16 KV; same speedbench): speedbench full `40.6` (1 Spark, stock), `73.34` (1 Spark, tuned), `152.97` (4 Sparks, tuned); prose at 16 concurrent `186.2` / `288.3` / `572.6 tok/s`. One V100 matches a tuned Spark at `c=1`; four tuned Sparks are ahead of four V100s at equal load.
+- **[iammrduncan/tensorless](https://github.com/iammrduncan/tensorless)** (`11df9a5`; Tesla P100 16 GB, 12.8 GB quant on a `llama.cpp`-based engine, draft recipe): `28.5 tok/s` decode, `240 tok/s` prefill at about 4K, against the P100 `atlas-10g` 16K row above (`20.2` / `22.9 tok/s`, `282 tok/s`). The [StrataEngine card](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata/blob/04996a1e2c45009b6a04f2af126cb6bdb2ba3587/README.md) lists a Tesla P100 16 GB on its SQ-10 pack at `35.0 tok/s` decode, `223 tok/s` prefill, and `136.9 tok/s` across 32 requests (thinking off).
+- No V100 figures were found for Project Maya or upstream `satellitedown/ingine`.
+
 ## 1,000,000-Token Context (6 GB to 96 GB Silicon)
 
 ![1,000,000-Token Context Across 6 GB to 96 GB NVIDIA GPUs](docs/media/one_million_tokens.png)
@@ -173,7 +197,7 @@ hf download Atlas3D/Inkling-2-Mini-atlas-exl3-9g-fp8-ingine --local-dir ./Inklin
    # Use --profile atlas-10g for 12.01 GB on disk; add --no-vision or --text-only to trim further.
    ```
 
-2. **Guaranteed JSON Schema, Built-In GPU Vision, & Reasoning Dial (`main`):**
+2. **Constrained JSON Schema, Built-In GPU Vision, & Reasoning Dial (`main`):**
    ```python
    import base64
    from openai import OpenAI
@@ -264,9 +288,19 @@ Additional verified architecture, branch, and live-serving details:
    - Mixed-precision MoE tier converter ([`tools/quantize_elastic_ingine.py`](tools/quantize_elastic_ingine.py)) that compresses the 20.2 GB base checkpoint to **`atlas-12g` (`14.05 GB` on disk incl. vision + `mtp.safetensors`)** or **`atlas-10g` (`12.01 GB` on disk incl. vision + `mtp.safetensors`)**.
    - Native fused decode (`native/src/kernels/moe/moe.cu`) and prefill (`native/src/kernels/prefill/wgemm.cu`) kernels verified against FP64 oracles (`kernels_moe`, `prefill_moe`).
 3. **Structured outputs, tool-ban, and standalone Verified Ledger SDK:**
-   - OpenAI `response_format` (`text`, `json_object`, `json_schema`) prompt-guided JSON formatting in `ingine-serve` (`json_schema` compiles into an instance skeleton + field constraints; token-level grammar-constrained decoding is tracked separately).
+   - OpenAI `response_format` (`text`, `json_object`, `json_schema`) in `ingine-serve`. `json_object` and `json_schema` apply token-level logit masking; `text` is unconstrained. `json_schema` supports `oneOf`, objects with more than 64 properties, UTF-8 keys, and numeric, length, and item bounds. Schema numbers are compared as written on the wire, without rounding through binary64. Output can still be cut short by `max_tokens` / `max_completion_tokens`, the context limit, or a `stop` string, so check `finish_reason` and validate the returned content. Unsupported schemas and contradictions the validator detects return HTTP 400 before generation; not every unsatisfiable schema is detected.
    - Automatic `<|content_invoke_tool_json|>` token banning when `tools` is absent from the request.
    - Zero-dependency SQLite Verified Ledger SDK in [`ledger/`](ledger/README.md).
+4. **Opt-in shared full-attention KV (`--kv-cache-mode last_full`):**
+   - Layers 11 and 17 share one KV slot across the three loop passes, so full-attention KV drops from 8 slots to 4 (`9.00 GiB` to `4.50 GiB` at 1,048,576 tokens with `--kv-q4`). The default remains `per_pass`. `last_full` requires `--max-batch 1`, no `--spec`, a single GPU, and the default 3 loop passes.
+   - On a Tesla V100 with native weights, `last_full` raised NLL by 5.9–7.2% over 1,280 scored tokens (top-1 agreement 97.7–97.8%) at unchanged decode speed. KV checkpoints are rejected across modes.
+   - [`tools/host_cache_mode_policy.py`](tools/host_cache_mode_policy.py) reads each worker's advertised modes and applies per-worker admission; a session changes mode only through an explicitly authorized replay with the prefix cache bypassed.
+5. **Runtime loop depth (`--loop-passes`):**
+   - `ingine-serve` and `ingine-bench` accept `--loop-passes 1..8` (default 3, 48 layer visits), for models trained for variable depth such as `TML-d24-varloop`. Inkling-2-Mini is trained for 3; on an RTX PRO 6000 it produced degenerate output at 1 pass.
+   - Values other than 3 require `--max-batch 1` and cannot be combined with `--spec`, `--ablation`, persona hooks, or `--kv-cache-mode last_full`.
+6. **Host memory, CPU placement, and single-file weight packs:**
+   - 2 MiB hugepage host buffers, NUMA binding, and a pinned futex/spin CPU worker pool are on by default on Linux (`INGINE_DISABLE_HUGEPAGES=1`, `INGINE_DISABLE_NUMA_BIND=1`, `INGINE_CPU_PIN=0` turn each off).
+   - `ingine-pack build <model_dir> <model_dir>/model.ingpack` writes the weights as one 2 MiB-aligned file; `ingine-pack inspect <file> --verify` checks it. A pack next to the safetensors files is used only when it verifies against them, otherwise the loader reads the safetensors (`INGINE_DISABLE_WEIGHT_PACK=1` ignores packs).
 
 ## Requirements
 
@@ -404,13 +438,15 @@ Environment overrides (`~/.config/ingine/env` or shell environment):
 
 Use **`http://127.0.0.1:8003/v1`**, model **`inkling-2-mini`** (or `inkling-2-mini-abliterated` when `--ablation` is set).
 No API key is required and there is no authentication; keep the server bound to loopback. `GET /health` and
-`GET /v1/models` report server status.
+`GET /v1/models` report server status, including `kv_cache_mode`, `supported_kv_cache_modes`, and `loop_passes`. Responses carry
+`X-Ingine-Kv-Cache-Mode` and `X-Ingine-Loop-Passes`; a request may send `X-Ingine-Expected-Loop-Passes: N` to get HTTP 409
+instead of a generation when the server runs a different depth.
 
 `POST /v1/chat/completions` supports:
 
 * `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (mapped to `0, 0.1, 0.2, 0.7, 0.9, 0.99, 0.99`) or a float in `[0, 0.99]`.
 * `enable_thinking: false` (also accepted in `chat_template_kwargs`) to answer without reasoning.
-* `response_format`: `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` for prompt-guided JSON output (`json_schema` renders an instance skeleton + field constraints rather than dumping raw schema meta-keys; token-level grammar constraints are not yet implemented).
+* `response_format`: `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}`. `text` is unconstrained plain text. `json_object` and `json_schema` restrict candidate tokens during generation. It can be truncated by `max_tokens` / `max_completion_tokens`, the context limit, or `stop`, so check `finish_reason` and validate the returned content. Unsupported schemas and contradictions the validator detects return HTTP 400 before generation.
 * `tools` (function calling through the chat template). When `tools` is omitted, `<|content_invoke_tool_json|>` is automatically banned.
 * `stop`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`.
 * `stream: true` (SSE with `reasoning_content` and `content` deltas; `stream_options.include_usage` adds usage).
