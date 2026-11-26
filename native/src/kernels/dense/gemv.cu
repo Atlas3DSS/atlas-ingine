@@ -493,6 +493,12 @@ __device__ __forceinline__ void q8x4_h2(uint32_t w, __half2 d, uint32_t& lo, uin
   const __half2 hb = __hmul2(__hsub2(*reinterpret_cast<__half2*>(&b), k), d);
   lo = *reinterpret_cast<const uint32_t*>(&ha), hi = *reinterpret_cast<const uint32_t*>(&hb);
 }
+// 4 int8 codes with an FP32 scale (exact q * d for 6-bit codes and d = d16 * sc) -> 4 FP16 = RN(q * d)
+__device__ __forceinline__ void q8x4_f32s_h2(uint32_t w, float d, uint32_t& lo, uint32_t& hi) {
+  const __half2 a = __floats2half2_rn(float(int(w << 24) >> 24) * d, float(int(w << 16) >> 24) * d);
+  const __half2 b = __floats2half2_rn(float(int(w << 8) >> 24) * d, float(int(w) >> 24) * d);
+  lo = *reinterpret_cast<const uint32_t*>(&a), hi = *reinterpret_cast<const uint32_t*>(&b);
+}
 
 template <int K, int M, int SPLITK, class Epi>
 __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t* __restrict__ w, int rows,
@@ -514,8 +520,11 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
   float c[4] = {0.f, 0.f, 0.f, 0.f};
   bool waited = false;
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
-  auto pass = [&](int cur, auto q8tag) {
-    constexpr bool Q8 = decltype(q8tag)::value;
+  // FMT 0: activation-type rows; 1: Q8_0 (FP16 scale a 32 columns); 2: int8 codes with an FP32 scale a 16 columns
+  // (Q6_K rows: q in [-32, 31], scale d * sc), the scales at reinterpret_cast<const float*>(q8s + (-2 - soff)).
+  auto pass = [&](int cur, auto fmttag) {
+    constexpr int FMT = decltype(fmttag)::value;
+    constexpr bool Q8 = FMT != 0;
     // (Q8 rows: as many bytes in flight a warp as the activation-type rows - 6 steps of 1 KB - where the K slice
     //  allows it; 3 steps measured half the bandwidth: the stream is bound by the bytes in flight)
     constexpr int CPL = Q8 ? 16 : 8, SPAN = 4 * CPL;
@@ -525,19 +534,22 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
     const int c0_v = warp * KS + (qp & 1) * (2 * CPL);
     const bool lv = iv == cur, lx = idx < M;
     const uint8_t* wv = base + size_t(lv ? rl : 0) * ROW_BYTES;
-    const uint16_t* sv = q8s + (Q8 ? soff + (lv ? rl : 0) * (K / 32) : 0);
+    const uint16_t* sv = q8s + (FMT == 1 ? soff + (lv ? rl : 0) * (K / 32) : 0);
+    const float* svf = reinterpret_cast<const float*>(q8s + (FMT == 2 ? -2 - soff : 0)) + (FMT == 2 && lv ? rl * (K / 16) : 0);
     const ActT* xg = epi.x_of(cur) + size_t(lx ? idx : 0) * K;
 #pragma unroll 1
     for (int jb = 0; jb < NJ; jb += U) {
       uint4 W0[U], W1[U];
       uint16_t S[U];
+      float2 S2[U];
 #pragma unroll
       for (int u = 0; u < U; ++u) {
         const int col0 = c0_v + (jb + u) * SPAN;
         const size_t off0 = size_t(col0) * (Q8 ? 1 : 2);
         W0[u] = lv ? l2::ld_stream<WEIGHT_L2>(wv + off0, wpol) : make_uint4(0, 0, 0, 0);
         W1[u] = lv ? l2::ld_stream<WEIGHT_L2>(wv + off0 + 16, wpol) : make_uint4(0, 0, 0, 0);
-        if constexpr (Q8) S[u] = lv ? __ldg(sv + col0 / 32) : uint16_t(0);
+        if constexpr (FMT == 1) S[u] = lv ? __ldg(sv + col0 / 32) : uint16_t(0);
+        if constexpr (FMT == 2) S2[u] = lv ? __ldg(reinterpret_cast<const float2*>(svf + col0 / 16)) : make_float2(0.f, 0.f);
       }
       if (!waited) {
         pdl_wait_fenced(zero);
@@ -552,7 +564,8 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
       for (int u = 0; u < U; ++u) {
         const int col0 = c0_v + (jb + u) * SPAN;
         if constexpr (Q8) {
-          const __half2 d = __halves2half2(__ushort_as_half(S[u]), __ushort_as_half(S[u]));
+          [[maybe_unused]] const __half2 d =
+              FMT == 1 ? __halves2half2(__ushort_as_half(S[u]), __ushort_as_half(S[u])) : __half2{};
           const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
           const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
           const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
@@ -562,8 +575,14 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
 #pragma unroll
           for (int s = 0; s < 4; ++s) {
             uint32_t a0, a1, a2, a3;
-            q8x4_h2(ww[2 * s], d, a0, a1);
-            q8x4_h2(ww[2 * s + 1], d, a2, a3);
+            if constexpr (FMT == 2) {
+              const float ds = s < 2 ? S2[u].x : S2[u].y;
+              q8x4_f32s_h2(ww[2 * s], ds, a0, a1);
+              q8x4_f32s_h2(ww[2 * s + 1], ds, a2, a3);
+            } else {
+              q8x4_h2(ww[2 * s], d, a0, a1);
+              q8x4_h2(ww[2 * s + 1], d, a2, a3);
+            }
             mma::sm70_mma_f16_direct(c8, a0, a1, a2, a3, xx[s].x ^ (s == 0 ? dep : 0u), xx[s].y, xx[s].z, xx[s].w);
           }
         } else {
@@ -576,8 +595,9 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
     }
   };
   auto run = [&](int cur) {
-    if (soff >= 0) pass(cur, std::true_type{});
-    else pass(cur, std::false_type{});
+    if (soff >= 0) pass(cur, std::integral_constant<int, 1>{});
+    else if (soff == -1) pass(cur, std::integral_constant<int, 0>{});
+    else pass(cur, std::integral_constant<int, 2>{});
   };
   if constexpr (Epi::kInputs == 1) {
     run(0);
@@ -635,6 +655,9 @@ __global__ void dequant_blocked_kernel(const uint8_t* __restrict__ w, const std:
       const __half d = __ushort_as_half(q8s[so + rl * (K / 32) + k / 32]);
       const __half q = __int2half_rn(int(static_cast<int8_t>(base[size_t(rl) * K + k])));
       out[size_t(r) * K + k] = act::from_float(__half2float(__hmul(q, d)));
+    } else if (so <= -2) {
+      const float d = reinterpret_cast<const float*>(q8s + (-2 - so))[rl * (K / 16) + k / 16];
+      out[size_t(r) * K + k] = act::from_float(float(int(static_cast<int8_t>(base[size_t(rl) * K + k]))) * d);
     } else {
       out[size_t(r) * K + k] = reinterpret_cast<const ActT*>(base)[size_t(rl) * K + k];
     }

@@ -739,7 +739,7 @@ class BatchDecoder {
     // ---- Final read + LM head
     run_mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H,
             mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
-    const bool head_gemv = use_gemv || (w.unembed.fp8() && B <= 32);
+    const bool head_gemv = use_gemv || (w.unembed.fp8() && B <= 32) || w.unembed.blocked();
     if (head_gemv) {
       for (int b0 = 0; b0 < B; b0 += 8) {
         const int cb = std::min(8, B - b0);

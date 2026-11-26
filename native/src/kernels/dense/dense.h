@@ -21,7 +21,9 @@ struct Matrix {
   const float* scale = nullptr;
   int rows = 0;
   // Optional 16-row-block table (GGUF dense weights, Volta): block b's rows start at w + blk_off[b]; blk_soff[b] >= 0:
-  // Q8_0 rows (int8 [16, K] + FP16 scales q8_scale[blk_soff[b] + r (K / 32) + k / 32]), -1: activation-type rows.
+  // Q8_0 rows (int8 [16, K] + FP16 scales q8_scale[blk_soff[b] + r (K / 32) + k / 32]), -1: activation-type rows,
+  // <= -2: int8 codes with FP32 scales a 16 columns (Q6_K rows) at ((const float*)(q8_scale + (-2 - blk_soff[b])))
+  // [r (K / 16) + k / 16].
   const std::int64_t* blk_off = nullptr;
   const std::int32_t* blk_soff = nullptr;
   const std::uint16_t* q8_scale = nullptr;

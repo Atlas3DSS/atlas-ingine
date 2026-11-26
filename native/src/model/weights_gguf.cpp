@@ -364,6 +364,52 @@ struct BlockedBuilder {
     }
     any_q8 = true;
   }
+  // 16 rows of a Q6_K tensor starting at row r0 (rows >= valid: zeros) as int8 codes q - 32 and one FP32 scale
+  // d * sc a 16 columns. q * (d * sc) is exact in FP32 (11 + 8 + 6 bits), the value the FP32 dequantization gives.
+  void q6k(const GgufTensor& t, std::int64_t r0, std::int64_t valid) {
+    if (t.type != GgmlType::Q6_K || K % 256) throw std::runtime_error("weights_gguf: Q6_K block width");
+    off.push_back(std::int64_t(bytes.size()));
+    if (scales.size() % 2) scales.push_back(0);  // FP32 scales start 4-byte aligned
+    soff.push_back(-2 - std::int32_t(scales.size()));
+    std::vector<std::int8_t> q(K);
+    std::vector<float> ds(K / 16);
+    for (int r = 0; r < 16; ++r) {
+      std::fill(q.begin(), q.end(), std::int8_t(0));
+      std::fill(ds.begin(), ds.end(), 0.f);
+      if (r0 + r < valid) {
+        const std::uint8_t* row = reinterpret_cast<const std::uint8_t*>(t.row(r0 + r));
+        for (int blk = 0; blk < K / 256; ++blk) {
+          const std::uint8_t* b = row + 210 * std::size_t(blk);
+          const std::uint8_t* ql = b;
+          const std::uint8_t* qh = b + 128;
+          const std::int8_t* sc = reinterpret_cast<const std::int8_t*>(b + 192);
+          std::uint16_t dh;
+          std::memcpy(&dh, b + 208, 2);
+          __half_raw hr;
+          hr.x = dh;
+          const float d = __half2float(__half(hr));
+          std::int8_t* qq = q.data() + 256 * blk;
+          for (int n = 0; n < 2; ++n, qq += 128, ql += 64, qh += 32) {
+            for (int l = 0; l < 32; ++l) {
+              qq[l] = std::int8_t(int((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32);
+              qq[l + 32] = std::int8_t(int((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+              qq[l + 64] = std::int8_t(int((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+              qq[l + 96] = std::int8_t(int((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
+            }
+          }
+          for (int j = 0; j < 16; ++j) ds[16 * blk + j] = d * float(sc[j]);
+        }
+      }
+      bytes.insert(bytes.end(), reinterpret_cast<const std::uint8_t*>(q.data()),
+                   reinterpret_cast<const std::uint8_t*>(q.data()) + K);
+      for (float f : ds) {
+        std::uint16_t h[2];
+        std::memcpy(h, &f, 4);
+        scales.push_back(h[0]);
+        scales.push_back(h[1]);
+      }
+    }
+  }
   // 16 rows of FP32 values (zeros for padding) as activation-type rows
   void act(const float* v) {
     off.push_back(std::int64_t(bytes.size()));
@@ -667,12 +713,24 @@ Weights load_weights_gguf(const fs::path& model_dir, cudaStream_t stream, int tp
     const int vr = std::max(0, v1 - v0);
     w.vocab_begin = v0;
     w.vocab_rows = vr;
+    const GgufTensor& ot = f.at("output.weight");
+    const char* q6e = std::getenv("INGINE_GGUF_Q6K_HEAD");
+    if (ot.type == GgmlType::Q6_K && q8_dense_enabled() && !keep_full_unembed && !(q6e && q6e[0] == '0') &&
+        LOCAL_VOCAB_CHUNK % 16 == 0) {
+      // Q6_K head kept as 6-bit codes in int8 + FP32 scales a 16 columns (block-table matrix): 2880 instead of
+      // 4608 bytes a row, the same FP16 weights in the GEMV (dense::head)
+      BlockedBuilder bb;
+      bb.K = H;
+      for (int r = 0; r < LOCAL_VOCAB_CHUNK; r += 16) bb.q6k(ot, std::int64_t(v0) + r, std::int64_t(v1));
+      w.unembed = bb.upload(ld, LOCAL_VOCAB_CHUNK);
+    } else {
     std::vector<float> u(std::size_t(LOCAL_VOCAB_CHUNK) * H, 0.0f);
     if (vr > 0) {
       const std::vector<float> rows = ld.rows_f32("output.weight", v0, vr);
       std::copy(rows.begin(), rows.end(), u.begin());
     }
     w.unembed = Dense{ld.act(u, {LOCAL_VOCAB_CHUNK, H}), {}};
+    }
   }
   ck(cudaStreamSynchronize(stream), "sync");
   std::size_t bytes = 0;

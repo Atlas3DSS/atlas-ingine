@@ -828,8 +828,11 @@ class TpPrefiller {
       }
       dense::mix(fp, false, s);
     }
-    pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), LOCAL_VOCAB_CHUNK,
-                    local_logits_, s);
+    if (w.unembed.blocked())  // (Q6_K head kept as int8 codes: the block-table GEMV)
+      dense::head(xf_ + std::size_t(T - 1) * H, 1, matrix(w.unembed), local_logits_, false, s);
+    else
+      pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), LOCAL_VOCAB_CHUNK,
+                      local_logits_, s);
     NCCL_CHECK(ncclAllGather(local_logits_, gathered_logits_, LOCAL_VOCAB_CHUNK, ncclFloat32, comm_, s));
     rinfo_.allgather_calls.fetch_add(1, std::memory_order_relaxed);
     rinfo_.prefill_steps.fetch_add(1, std::memory_order_relaxed);
@@ -1393,7 +1396,7 @@ class TpBatchDecoder {
     // ---- Final read + sharded LM head + NCCL AllGather + unpack on rank 0
     run_mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H,
             mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
-    const bool head_gemv = use_gemv || (w.unembed.fp8() && B <= 32);
+    const bool head_gemv = use_gemv || (w.unembed.fp8() && B <= 32) || w.unembed.blocked();
     if (head_gemv) {
       for (int b0 = 0; b0 < B; b0 += 8) {
         const int cb = std::min(8, B - b0);

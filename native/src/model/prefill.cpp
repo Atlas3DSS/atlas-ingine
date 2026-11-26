@@ -501,7 +501,15 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   if (tap_out)
     CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
-  pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
+  if (w.unembed.blocked()) {  // (Q6_K head kept as int8 codes: the block-table GEMV)
+    const Dense& u = w.unembed;
+    const dense::Matrix m{u.w.data, nullptr, UNPADDED_VOCAB, static_cast<const std::int64_t*>(u.blk_off.data),
+                          static_cast<const std::int32_t*>(u.blk_soff.data),
+                          static_cast<const std::uint16_t*>(u.q8_scale.data)};
+    dense::head(xf_ + std::size_t(T - 1) * H, 1, m, logits, false, s);
+  } else {
+    pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
+  }
   CUDA_CHECK(cudaGetLastError());
   st.length = pos0 + T;
 }
