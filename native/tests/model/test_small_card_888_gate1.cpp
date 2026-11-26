@@ -55,6 +55,12 @@ std::size_t vram_used_bytes() {
   return total_b > free_b ? (total_b - free_b) : 0;
 }
 
+std::size_t weights_storage_bytes(const Weights& w) {
+  std::size_t tot = 0;
+  for (const auto& b : w.storage) tot += b.bytes;
+  return tot;
+}
+
 std::vector<ingine::ActT> to_act(const std::vector<float>& v) {
   std::vector<ingine::ActT> out(v.size());
   for (std::size_t i = 0; i < v.size(); ++i) {
@@ -209,7 +215,31 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
   std::vector<std::int32_t> ref_off, ref_loop_bf16, ref_q5k;
   double vram_off_mib = 0.0, vram_loop_bf16_mib = 0.0, vram_q5k_mib = 0.0;
 
-  // 2a. Control (off, loop_bf16=false): save ckpt_off at periodic chunk boundary (pos = 64 < prompt len)
+  // 2a. Exact persistent tensor-byte delta (Weights::storage) + Control disk checkpoint
+  double wt_off_mib = 0.0, wt_loop_mib = 0.0, wt_q5k_mib = 0.0;
+  {
+    Runtime rt_off(base);
+    wt_off_mib = double(weights_storage_bytes(rt_off.weights())) / (1024.0 * 1024.0);
+  }
+  {
+    RuntimeOptions opt = base;
+    opt.loop_bf16 = true;
+    Runtime rt_loop(opt);
+    wt_loop_mib = double(weights_storage_bytes(rt_loop.weights())) / (1024.0 * 1024.0);
+  }
+  {
+    RuntimeOptions opt = base;
+    opt.attn_requant = AttnRequantMode::Q5K;
+    Runtime rt_q5(opt);
+    wt_q5k_mib = double(weights_storage_bytes(rt_q5.weights())) / (1024.0 * 1024.0);
+  }
+  const double wt_loop_delta_mib = wt_loop_mib - wt_off_mib;
+  const double wt_q5k_delta_mib = wt_q5k_mib - wt_off_mib;
+  std::printf("  Exact Weights::storage tensor bytes: control=%.2f MiB, --loop-bf16=%.2f MiB (delta=%.2f MiB), --attn-requant q5_k=%.2f MiB (delta=%.2f MiB)\n",
+              wt_off_mib, wt_loop_mib, wt_loop_delta_mib, wt_q5k_mib, wt_q5k_delta_mib);
+  check(wt_loop_delta_mib <= -79.0 && wt_loop_delta_mib >= -83.0,
+        "Suite 2a-bytes: --loop-bf16 exact Weights::storage delta within RFC v3 -81.0 +/- 2.0 MiB");
+
   {
     RuntimeOptions opt = base;
     opt.kv_ckpt_path = ckpt_off;
@@ -330,6 +360,11 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
 
   std::filesystem::remove_all(tmp_dir);
   return Json{
+      {"weights_storage_control_mib", wt_off_mib},
+      {"weights_storage_loop_bf16_mib", wt_loop_mib},
+      {"weights_storage_loop_bf16_delta_mib", wt_loop_delta_mib},
+      {"weights_storage_q5k_mib", wt_q5k_mib},
+      {"weights_storage_q5k_delta_mib", wt_q5k_delta_mib},
       {"vram_control_mib", vram_off_mib},
       {"vram_loop_bf16_mib", vram_loop_bf16_mib},
       {"vram_loop_bf16_delta_mib", vram_loop_bf16_mib - vram_off_mib},
@@ -622,6 +657,71 @@ Json run_suite3_gpu_expert_cache_numerical(const std::filesystem::path& model_di
   };
 }
 
+// ---- Suite 4: Chat / Code / Domain-Shift Timings under 5888 & 7680 MiB (swaps=0 vs swaps=64) ----
+Json run_suite4_workload_timings(const std::filesystem::path& model_dir) {
+  std::printf("\n=== Suite 4: Chat / Code / Domain-Shift Timings (5888 & 7680 MiB, swaps=0 vs swaps=64) ===\n");
+  const auto fmt = ingine::text::ChatFormat::load(model_dir);
+  const std::vector<std::pair<std::string, std::string>> prompts = {
+      {"chat", "Summarize in four short bullet points how virtual memory paging prevents one process from corrupting another."},
+      {"code", "Write a compact C++20 lock-free single-producer single-consumer ring buffer template with push and pop."},
+      {"domain_shift",
+       "First explain the Krebs cycle ATP yield in biochemistry, then immediately switch to deriving the Black-Scholes PDE boundary conditions, then give a concise SQL query using a window function."},
+  };
+  std::vector<std::pair<std::string, std::vector<std::int32_t>>> rendered;
+  for (const auto& [tag, text] : prompts) {
+    const Json msgs = Json::array({{{"role", "user"}, {"content", text}}});
+    rendered.push_back({tag, fmt.render(msgs, Json::array(), ingine::text::ChatOptions{}).ids});
+  }
+
+  Sampling greedy;
+  greedy.temperature = 0.f;
+  Json rows = Json::array();
+  for (int vram_mb : {5888, 7680}) {
+    for (int swaps : {0, 64}) {
+      RuntimeOptions opt;
+      opt.model_dir = model_dir;
+      opt.dense_fp8 = true;
+      opt.kv_fp8 = true;
+      opt.max_ctx = 2048;
+      opt.prefill_chunk = 512;
+      opt.offload_vram_mb = vram_mb;
+      opt.offload_ram_mb = 12288;
+      opt.offload_mode = "dma-lru";
+      opt.expert_swaps = swaps;
+      opt.park_mb = 0;
+      opt.park_host_mb = 0;
+
+      auto gen = make_generator(opt);
+      const double actual_vram_mib = double(vram_used_bytes()) / (1024.0 * 1024.0);
+      for (const auto& [tag, ids] : rendered) {
+        std::vector<std::int32_t> out;
+        const GenerateStats st = gen->generate(Prompt{ids, {}, 0}, 32, greedy, {}, [&](std::span<const std::int32_t> t) {
+          out.insert(out.end(), t.begin(), t.end());
+          return true;
+        });
+        const double tok_s = st.decode_seconds > 0.0 ? double(st.generated_tokens) / st.decode_seconds : 0.0;
+        const double peak_mib = double(vram_used_bytes()) / (1024.0 * 1024.0);
+        std::printf("  cap=%d swaps=%2d workload=%-12s prompt=%zu gen=%d pf=%.3fs dec=%.3fs tok/s=%.2f actual_vram=%.1f MiB\n",
+                    vram_mb, swaps, tag.c_str(), ids.size(), st.generated_tokens, st.prefill_seconds,
+                    st.decode_seconds, tok_s, peak_mib);
+        rows.push_back(Json{
+            {"simulated_vram_cap_mib", vram_mb},
+            {"expert_swaps", swaps},
+            {"workload", tag},
+            {"prompt_tokens", ids.size()},
+            {"generated_tokens", st.generated_tokens},
+            {"prefill_seconds", st.prefill_seconds},
+            {"decode_seconds", st.decode_seconds},
+            {"decode_tok_s", tok_s},
+            {"actual_vram_mib", peak_mib},
+            {"runtime_base_vram_mib", actual_vram_mib},
+        });
+      }
+    }
+  }
+  return rows;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -630,10 +730,14 @@ int main(int argc, char** argv) {
   std::filesystem::path model_dir = INGINE_MODEL_DIR;
   std::string json_out;
   bool skip_microbench = false;
+  bool only_suite3 = false;
+  bool only_timings = false;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) model_dir = argv[++i];
     else if (std::strcmp(argv[i], "--json") == 0 && i + 1 < argc) json_out = argv[++i];
     else if (std::strcmp(argv[i], "--skip-microbench") == 0) skip_microbench = true;
+    else if (std::strcmp(argv[i], "--only-suite3") == 0) only_suite3 = true;
+    else if (std::strcmp(argv[i], "--only-timings") == 0) only_timings = true;
   }
   if (!std::filesystem::exists(model_dir / "config.json")) {
     std::printf("skip: no model at %s\n", model_dir.c_str());
@@ -644,11 +748,17 @@ int main(int argc, char** argv) {
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
   Json report;
-  if (!skip_microbench) {
-    report["suite1_microbench"] = run_suite1_microbench(stream);
+  if (only_suite3) {
+    report["suite3_gpu_expert_cache"] = run_suite3_gpu_expert_cache_numerical(model_dir, stream);
+  } else if (only_timings) {
+    report["suite4_workload_timings"] = run_suite4_workload_timings(model_dir);
+  } else {
+    if (!skip_microbench) {
+      report["suite1_microbench"] = run_suite1_microbench(stream);
+    }
+    report["suite2_ckpt_and_loop_bf16"] = run_suite2_checkpoint_and_loop_bf16(model_dir);
+    report["suite3_gpu_expert_cache"] = run_suite3_gpu_expert_cache_numerical(model_dir, stream);
   }
-  report["suite2_ckpt_and_loop_bf16"] = run_suite2_checkpoint_and_loop_bf16(model_dir);
-  report["suite3_gpu_expert_cache"] = run_suite3_gpu_expert_cache_numerical(model_dir, stream);
 
   INGINE_TEST_CUDA(cudaStreamDestroy(stream));
   if (!json_out.empty()) {
