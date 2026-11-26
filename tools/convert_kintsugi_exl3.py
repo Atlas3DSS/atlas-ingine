@@ -235,6 +235,9 @@ def main():
 
     t0 = time.time()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    for dp in args.out_dir.iterdir():
+        if dp.name.endswith(".ingpack") and (dp.is_symlink() or dp.is_file()):
+            dp.unlink()
     print(f"Parsing native checkpoint: {args.native_dir}")
     native = parse_safetensors_dir(args.native_dir)
     print(f"Parsing Kintsugi GGUF:     {args.kintsugi_gguf}")

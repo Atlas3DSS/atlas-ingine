@@ -96,6 +96,35 @@ Tensor SafetensorsTensor::view(void* data) const {
     return t;
 }
 
+SafetensorsFile::SafetensorsFile(std::unique_ptr<WeightPack> pack)
+    : path_(pack ? pack->path() : std::filesystem::path{}) {
+    if (!pack) { throw std::invalid_argument("SafetensorsFile: null WeightPack"); }
+    init_from_pack(std::move(pack));
+}
+
+void SafetensorsFile::init_from_pack(std::unique_ptr<WeightPack> pack) {
+    pack_        = std::move(pack);
+    file_size_   = pack_->file_size();
+    data_offset_ = pack_->data_offset();
+    metadata_    = pack_->metadata();
+    tensors_.reserve(pack_->entries().size());
+    for (const WeightPackEntry& e : pack_->entries()) {
+        SafetensorsTensor t;
+        t.name  = std::string(pack_->entry_name(e));
+        t.dtype = std::string(pack_->entry_dtype(e));
+        t.shape.assign(e.shape, e.shape + e.rank);
+        t.offset = e.data_offset;
+        t.bytes  = e.data_bytes;
+        tensors_.push_back(std::move(t));
+    }
+    std::sort(tensors_.begin(), tensors_.end(),
+              [](const SafetensorsTensor& a, const SafetensorsTensor& b) {
+                  return a.offset != b.offset ? a.offset < b.offset : a.name < b.name;
+              });
+    index_.reserve(tensors_.size());
+    for (std::size_t i = 0; i < tensors_.size(); ++i) { index_.emplace(tensors_[i].name, i); }
+}
+
 SafetensorsFile::SafetensorsFile(const std::filesystem::path& path) : path_(path) {
     fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) { fail_errno(path_, "open failed"); }
@@ -109,26 +138,7 @@ SafetensorsFile::SafetensorsFile(const std::filesystem::path& path) : path_(path
             if (std::memcmp(magic, kWeightPackMagic, sizeof(kWeightPackMagic)) == 0) {
                 ::close(fd_);
                 fd_ = -1;
-                pack_        = std::make_unique<WeightPack>(path_);
-                file_size_   = pack_->file_size();
-                data_offset_ = pack_->data_offset();
-                metadata_    = pack_->metadata();
-                tensors_.reserve(pack_->entries().size());
-                for (const WeightPackEntry& e : pack_->entries()) {
-                    SafetensorsTensor t;
-                    t.name  = std::string(pack_->entry_name(e));
-                    t.dtype = std::string(pack_->entry_dtype(e));
-                    t.shape.assign(e.shape, e.shape + e.rank);
-                    t.offset = e.data_offset;
-                    t.bytes  = e.data_bytes;
-                    tensors_.push_back(std::move(t));
-                }
-                std::sort(tensors_.begin(), tensors_.end(),
-                          [](const SafetensorsTensor& a, const SafetensorsTensor& b) {
-                              return a.offset != b.offset ? a.offset < b.offset : a.name < b.name;
-                          });
-                index_.reserve(tensors_.size());
-                for (std::size_t i = 0; i < tensors_.size(); ++i) { index_.emplace(tensors_[i].name, i); }
+                init_from_pack(std::make_unique<WeightPack>(path_));
                 return;
             }
         }
@@ -318,32 +328,84 @@ std::vector<std::byte> SafetensorsFile::read(std::string_view name) const {
     return out;
 }
 
-SafetensorsModel::SafetensorsModel(const std::filesystem::path& path) {
+SafetensorsModel::SafetensorsModel(const std::filesystem::path& path, SafetensorsOpenMode mode) {
     namespace fs = std::filesystem;
     fs::path index_path;
     fs::path single;
     if (fs::is_directory(path)) {
-        if (weight_pack_enabled() && fs::exists(path / "model.ingpack")) {
-            single = path / "model.ingpack";
-        } else if (fs::exists(path / "model.safetensors.index.json")) {
-            index_path = path / "model.safetensors.index.json";
-        } else if (fs::exists(path / "model.safetensors")) {
-            single = path / "model.safetensors";
-        } else if (fs::exists(path / "model.ingpack")) {
-            single = path / "model.ingpack";
+        const fs::path idx_candidate  = path / "model.safetensors.index.json";
+        const fs::path sgl_candidate  = path / "model.safetensors";
+        const fs::path pack_candidate = path / "model.ingpack";
+        const bool has_index          = fs::exists(idx_candidate);
+        const bool has_single         = fs::exists(sgl_candidate);
+        const bool has_pack           = fs::exists(pack_candidate);
+
+        if (mode == SafetensorsOpenMode::WeightPackOnly) {
+            if (!has_pack) {
+                throw std::runtime_error("safetensors model " + path.string() + ": no model.ingpack");
+            }
+            single = pack_candidate;
+        } else if (mode == SafetensorsOpenMode::SafetensorsOnly) {
+            if (has_index) {
+                index_path = idx_candidate;
+            } else if (has_single) {
+                single = sgl_candidate;
+            } else {
+                throw std::runtime_error("safetensors model " + path.string() +
+                                         ": neither model.safetensors.index.json nor model.safetensors");
+            }
         } else {
-            throw std::runtime_error("safetensors model " + path.string() +
-                                     ": neither model.ingpack, model.safetensors.index.json nor model.safetensors");
+            if (has_index || has_single) {
+                if (weight_pack_enabled() && has_pack) {
+                    try {
+                        auto pack = std::make_unique<WeightPack>(pack_candidate);
+                        if (weight_pack_matches_safetensors_dir(*pack, path)) {
+                            files_.push_back(std::make_unique<SafetensorsFile>(std::move(pack)));
+                            const SafetensorsFile& f = *files_.back();
+                            for (const SafetensorsTensor& t : f.tensors()) {
+                                index_.emplace(t.name, SafetensorsRef{&f, &t});
+                            }
+                            return;
+                        }
+                    } catch (const std::exception&) {
+                        // Fall back to the authoritative safetensors source in `path`.
+                    }
+                }
+                if (has_index) {
+                    index_path = idx_candidate;
+                } else {
+                    single = sgl_candidate;
+                }
+            } else if (has_pack) {
+                single = pack_candidate;
+            } else {
+                throw std::runtime_error("safetensors model " + path.string() +
+                                         ": neither model.ingpack, model.safetensors.index.json nor model.safetensors");
+            }
         }
     } else if (path.extension() == ".json") {
+        if (mode == SafetensorsOpenMode::WeightPackOnly) {
+            throw std::runtime_error("safetensors model " + path.string() + ": expected INGPACK1 weight pack");
+        }
         index_path = path;
     } else {
+        if (mode == SafetensorsOpenMode::SafetensorsOnly && is_weight_pack_file(path)) {
+            throw std::runtime_error("safetensors model " + path.string() +
+                                     ": expected safetensors source, got INGPACK1");
+        }
+        if (mode == SafetensorsOpenMode::WeightPackOnly && !is_weight_pack_file(path)) {
+            throw std::runtime_error("safetensors model " + path.string() + ": expected INGPACK1 weight pack");
+        }
         single = path;
     }
 
     if (!single.empty()) {
         files_.push_back(std::make_unique<SafetensorsFile>(single));
         const SafetensorsFile& f = *files_.back();
+        if (mode == SafetensorsOpenMode::SafetensorsOnly && f.is_weight_pack()) {
+            throw std::runtime_error("safetensors model " + single.string() +
+                                     ": expected safetensors source, got INGPACK1");
+        }
         for (const SafetensorsTensor& t : f.tensors()) { index_.emplace(t.name, SafetensorsRef{&f, &t}); }
         return;
     }
@@ -369,7 +431,12 @@ SafetensorsModel::SafetensorsModel(const std::filesystem::path& path) {
         const std::string file_name = it.value().get<std::string>();
         auto f                      = by_name.find(file_name);
         if (f == by_name.end()) {
-            files_.push_back(std::make_unique<SafetensorsFile>(dir / file_name));
+            auto sf = std::make_unique<SafetensorsFile>(dir / file_name);
+            if (mode == SafetensorsOpenMode::SafetensorsOnly && sf->is_weight_pack()) {
+                throw std::runtime_error("safetensors model " + (dir / file_name).string() +
+                                         ": expected safetensors shard, got INGPACK1");
+            }
+            files_.push_back(std::move(sf));
             f = by_name.emplace(file_name, files_.back().get()).first;
         }
         const SafetensorsTensor* t = f->second->find(it.key());

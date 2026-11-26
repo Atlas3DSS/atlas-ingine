@@ -203,9 +203,19 @@ def main() -> None:
                 l = int(t.split(".")[3])
                 src_fmts[l] = dt
 
-    # Copy metadata and auxiliary safetensors (e.g. mtp.safetensors for DSpark --spec), skipping weight shards.
+    # Remove any pre-existing weight packs in dst so stale packs never survive a re-quantize run.
+    for dp in dst.iterdir():
+        if dp.name.endswith(".ingpack") and (dp.is_symlink() or dp.is_file()):
+            dp.unlink()
+
+    # Copy metadata and auxiliary safetensors (e.g. mtp.safetensors for DSpark --spec), skipping weight shards
+    # and weight packs (*.ingpack).
     for fn in os.listdir(src):
-        if (fn.startswith("model") and fn.endswith(".safetensors")) or fn in ("model.safetensors.index.json", "hf_quant_config.json"):
+        if (
+            (fn.startswith("model") and fn.endswith(".safetensors"))
+            or fn.endswith(".ingpack")
+            or fn in ("model.safetensors.index.json", "hf_quant_config.json")
+        ):
             continue
         if omit_mtp and fn == "mtp.safetensors":
             continue

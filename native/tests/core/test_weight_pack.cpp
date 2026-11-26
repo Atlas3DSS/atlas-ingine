@@ -38,6 +38,7 @@ using ingine::DeviceUploader;
 using ingine::DType;
 using ingine::SafetensorsFile;
 using ingine::SafetensorsModel;
+using ingine::SafetensorsOpenMode;
 using ingine::UploadRequest;
 using ingine::WeightPack;
 using ingine::WeightPackBuilder;
@@ -444,8 +445,224 @@ void test_adversarial_corruption(const std::filesystem::path& dir) {
     }
 }
 
+void test_weight_source_consistency(const std::filesystem::path& dir) {
+    std::printf("[4/5] Testing same-source, changed-source, and explicit pack-only weight consistency...\n");
+    const auto consistency_root = dir / "source_consistency";
+    std::filesystem::create_directories(consistency_root);
+
+    // 1. Same-source multi-shard and single-file directories + explicit SafetensorsOpenMode overrides.
+    {
+        const auto single_dir = consistency_root / "same_single_dir";
+        std::filesystem::create_directories(single_dir);
+        const std::vector<FixtureTensor> t_v1 = {
+            {"w.embed", "F32", {4}, pattern_bytes(16, 41)},
+            {"w.block", "BF16", {32, 64}, pattern_bytes(32 * 64 * 2, 42)},
+        };
+        write_safetensors(single_dir / "model.safetensors", t_v1, {{"format", "pt"}});
+        (void)WeightPackBuilder::pack_from_safetensors(single_dir / "model.safetensors",
+                                                       single_dir / "model.ingpack");
+
+        SafetensorsModel auto_m(single_dir);
+        INGINE_CHECK(auto_m.is_weight_pack());
+        INGINE_CHECK(ingine::weight_pack_matches_safetensors_dir(*auto_m.files()[0]->weight_pack(), single_dir));
+        SafetensorsModel st_only(single_dir, SafetensorsOpenMode::SafetensorsOnly);
+        INGINE_CHECK(!st_only.is_weight_pack());
+        INGINE_CHECK(auto_m.read("w.embed") == st_only.read("w.embed"));
+        INGINE_CHECK(auto_m.read("w.block") == st_only.read("w.block"));
+
+        ScopedEnvVar off("INGINE_DISABLE_WEIGHT_PACK", "1");
+        SafetensorsModel wp_only(single_dir, SafetensorsOpenMode::WeightPackOnly);
+        INGINE_CHECK(wp_only.is_weight_pack());
+    }
+
+    // 2. Changed-source subcase A: --no-vision subset change (src 25 tensors w/ vision -> dst 24 tensors w/o vision + copied pack).
+    const auto src_25 = consistency_root / "src_25";
+    const auto dst_24 = consistency_root / "dst_24";
+    std::filesystem::create_directories(src_25);
+    std::filesystem::create_directories(dst_24);
+    std::vector<FixtureTensor> t_25;
+    for (int i = 0; i < 24; ++i) {
+        t_25.push_back({"model.llm.layers." + std::to_string(i) + ".mlp.experts.w13_weight",
+                        "U8",
+                        {1},
+                        {static_cast<std::uint8_t>(i)}});
+    }
+    std::vector<FixtureTensor> t_24 = t_25;
+    t_25.push_back({"model.visual.review", "U8", {1}, {std::uint8_t{7}}});
+    write_safetensors(src_25 / "model-00001-of-00001.safetensors", t_25);
+    write_safetensors(dst_24 / "model-00001-of-00001.safetensors", t_24);
+    auto write_idx = [](const std::filesystem::path& p, const std::vector<FixtureTensor>& ts) {
+        nlohmann::json idx = {{"weight_map", nlohmann::json::object()}};
+        for (const auto& t : ts) { idx["weight_map"][t.name] = "model-00001-of-00001.safetensors"; }
+        std::ofstream(p / "model.safetensors.index.json") << idx.dump(2);
+    };
+    write_idx(src_25, t_25);
+    write_idx(dst_24, t_24);
+    (void)WeightPackBuilder::pack_from_safetensors(src_25, src_25 / "model.ingpack");
+    std::filesystem::copy_file(src_25 / "model.ingpack", dst_24 / "model.ingpack",
+                               std::filesystem::copy_options::overwrite_existing);
+
+    {
+        SafetensorsModel dst_auto(dst_24);
+        INGINE_CHECK(!dst_auto.is_weight_pack());
+        INGINE_CHECK(dst_auto.size() == 24);
+        INGINE_CHECK(!dst_auto.contains("model.visual.review"));
+
+        SafetensorsModel dst_wp(dst_24, SafetensorsOpenMode::WeightPackOnly);
+        INGINE_CHECK(dst_wp.is_weight_pack());
+        INGINE_CHECK(dst_wp.size() == 25);
+        INGINE_CHECK(dst_wp.contains("model.visual.review"));
+    }
+
+    // 3. Changed-source subcase B1 (<= 1 MiB full sample): identical layout, header, size, and newer pack mtime.
+    {
+        const auto mut_dir = consistency_root / "same_shape_mutated";
+        std::filesystem::create_directories(mut_dir);
+        const std::filesystem::path shard_p = mut_dir / "model-00001-of-00001.safetensors";
+        const std::filesystem::path pack_p  = mut_dir / "model.ingpack";
+        const std::vector<FixtureTensor> v1 = {
+            {"w.large", "U8", {512 * 1024}, pattern_bytes(512 * 1024, 51)},
+        };
+        write_safetensors(shard_p, v1);
+        write_idx(mut_dir, v1);
+        (void)WeightPackBuilder::pack_from_safetensors(mut_dir, pack_p);
+        INGINE_CHECK(SafetensorsModel(mut_dir).is_weight_pack());
+
+        // Overwrite shard with identical layout/size and mutate only interior payload bytes.
+        std::vector<FixtureTensor> v2 = v1;
+        v2[0].data[200000] ^= 0xFFu;
+        write_safetensors(shard_p, v2);
+        // Set pack mtime cleanly ahead of shard mtime so timestamp-only checks would be fooled.
+        const auto shard_mtime = std::filesystem::last_write_time(shard_p);
+        std::filesystem::last_write_time(pack_p, shard_mtime + std::chrono::seconds(10));
+
+        SafetensorsModel refreshed(mut_dir);
+        INGINE_CHECK(!refreshed.is_weight_pack());
+        const auto got = refreshed.read("w.large");
+        INGINE_CHECK(got.size() == v2[0].data.size() &&
+                     std::memcmp(got.data(), v2[0].data.data(), got.size()) == 0);
+    }
+
+    // 3b. Changed-source subcase B2 (> 1 MiB sampled shard): mutated shard mtime +1s with pack mtime +10s.
+    {
+        const auto mut_big = consistency_root / "same_shape_mutated_big";
+        std::filesystem::create_directories(mut_big);
+        const std::filesystem::path shard_p = mut_big / "model-00001-of-00001.safetensors";
+        const std::filesystem::path pack_p  = mut_big / "model.ingpack";
+        const std::size_t big_sz            = 2560u * 1024u;  // 2.5 MiB
+        const std::vector<FixtureTensor> v1 = {
+            {"w.big", "U8", {static_cast<std::int64_t>(big_sz)}, pattern_bytes(big_sz, 55)},
+        };
+        write_safetensors(shard_p, v1);
+        write_idx(mut_big, v1);
+        (void)WeightPackBuilder::pack_from_safetensors(mut_big, pack_p);
+        INGINE_CHECK(SafetensorsModel(mut_big).is_weight_pack());
+
+        std::vector<FixtureTensor> v2 = v1;
+        v2[0].data[0] ^= 0xFFu;
+        const auto orig_mtime = std::filesystem::last_write_time(shard_p);
+        write_safetensors(shard_p, v2);
+        std::filesystem::last_write_time(shard_p, orig_mtime + std::chrono::seconds(1));
+        std::filesystem::last_write_time(pack_p, orig_mtime + std::chrono::seconds(10));
+
+        SafetensorsModel refreshed(mut_big);
+        INGINE_CHECK(!refreshed.is_weight_pack());
+        const auto got = refreshed.read("w.big");
+        INGINE_CHECK(got.size() == v2[0].data.size() &&
+                     std::memcmp(got.data(), v2[0].data.data(), got.size()) == 0);
+    }
+
+    // 4. Changed-source subcases C, D, E: unprovenanced pack, auxiliary file packed as model.ingpack, corrupt pack.
+    {
+        const auto unprov_dir = consistency_root / "unprovenanced_mixed";
+        std::filesystem::create_directories(unprov_dir);
+        const std::vector<FixtureTensor> st_ts = {{"w.a", "U8", {8}, pattern_bytes(8, 61)}};
+        write_safetensors(unprov_dir / "model.safetensors", st_ts);
+        {
+            WeightPackBuilder b;
+            const auto alt = pattern_bytes(8, 62);
+            b.add_tensor("w.wrong", "U8", {8}, alt.size(),
+                         [&](const auto& emit) { emit(alt.data(), alt.size()); });
+            (void)b.write(unprov_dir / "model.ingpack");
+        }
+        SafetensorsModel mixed_unprov(unprov_dir);
+        INGINE_CHECK(!mixed_unprov.is_weight_pack());
+        INGINE_CHECK(mixed_unprov.contains("w.a"));
+        INGINE_CHECK(!mixed_unprov.contains("w.wrong"));
+
+        // Explicit pack-only directory with the exact same unprovenanced pack MUST still load cleanly!
+        const auto pack_only_unprov = consistency_root / "pack_only_unprov";
+        std::filesystem::create_directories(pack_only_unprov);
+        std::filesystem::copy_file(unprov_dir / "model.ingpack", pack_only_unprov / "model.ingpack");
+        {
+            ScopedEnvVar off("INGINE_DISABLE_WEIGHT_PACK", "1");
+            SafetensorsModel only_m(pack_only_unprov);
+            INGINE_CHECK(only_m.is_weight_pack());
+            INGINE_CHECK(only_m.contains("w.wrong"));
+        }
+
+        // Auxiliary mtp.safetensors packed as model.ingpack next to model.safetensors -> rejected in Auto.
+        const auto aux_mixed = consistency_root / "aux_packed_mixed";
+        std::filesystem::create_directories(aux_mixed);
+        write_safetensors(aux_mixed / "model.safetensors", st_ts);
+        const std::vector<FixtureTensor> aux_ts = {{"mtp.w", "U8", {8}, pattern_bytes(8, 63)}};
+        write_safetensors(aux_mixed / "mtp.safetensors", aux_ts);
+        (void)WeightPackBuilder::pack_from_safetensors(aux_mixed / "mtp.safetensors",
+                                                       aux_mixed / "model.ingpack");
+        SafetensorsModel aux_auto(aux_mixed);
+        INGINE_CHECK(!aux_auto.is_weight_pack());
+        INGINE_CHECK(aux_auto.contains("w.a"));
+        INGINE_CHECK(!aux_auto.contains("mtp.w"));
+
+        // Corrupt model.ingpack next to valid safetensors -> Auto falls back cleanly, WeightPackOnly throws.
+        const auto corrupt_mixed = consistency_root / "corrupt_mixed";
+        std::filesystem::create_directories(corrupt_mixed);
+        write_safetensors(corrupt_mixed / "model.safetensors", st_ts);
+        write_file_bytes(corrupt_mixed / "model.ingpack", {0x00, 0x01, 0x02, 0x03});
+        SafetensorsModel corrupt_auto(corrupt_mixed);
+        INGINE_CHECK(!corrupt_auto.is_weight_pack());
+        INGINE_CHECK(corrupt_auto.contains("w.a"));
+        INGINE_CHECK(throws_runtime([&] { SafetensorsModel bad_wp(corrupt_mixed, SafetensorsOpenMode::WeightPackOnly); }));
+    }
+
+    // 5. Explicit pack-only reads (tagged directory + explicit file path + mode rejections).
+    {
+        const auto pack_only_dir = consistency_root / "pack_only_25";
+        std::filesystem::create_directories(pack_only_dir);
+        const auto explicit_pack = pack_only_dir / "model.ingpack";
+        std::filesystem::copy_file(src_25 / "model.ingpack", explicit_pack);
+
+        SafetensorsModel dir_auto(pack_only_dir);
+        INGINE_CHECK(dir_auto.is_weight_pack());
+        INGINE_CHECK(dir_auto.size() == 25);
+        INGINE_CHECK(dir_auto.contains("model.visual.review"));
+
+        ScopedEnvVar off("INGINE_DISABLE_WEIGHT_PACK", "1");
+        SafetensorsModel dir_disabled(pack_only_dir);
+        INGINE_CHECK(dir_disabled.is_weight_pack());
+        INGINE_CHECK(dir_disabled.size() == 25);
+
+        SafetensorsModel file_explicit(explicit_pack);
+        INGINE_CHECK(file_explicit.is_weight_pack());
+        INGINE_CHECK(file_explicit.size() == 25);
+
+        INGINE_CHECK(throws_runtime([&] {
+            SafetensorsModel bad1(explicit_pack, SafetensorsOpenMode::SafetensorsOnly);
+        }));
+        INGINE_CHECK(throws_runtime([&] {
+            SafetensorsModel bad2(pack_only_dir, SafetensorsOpenMode::SafetensorsOnly);
+        }));
+        INGINE_CHECK(throws_runtime([&] {
+            SafetensorsModel bad3(src_25 / "model-00001-of-00001.safetensors", SafetensorsOpenMode::WeightPackOnly);
+        }));
+        INGINE_CHECK(throws_runtime([&] {
+            SafetensorsModel bad4(src_25 / "model.safetensors.index.json", SafetensorsOpenMode::WeightPackOnly);
+        }));
+    }
+}
+
 void run_weight_pack_bench(const std::filesystem::path& dir) {
-    std::printf("[4/4] Running 128 MiB safetensors vs INGPACK1 open & read microbenchmark...\n");
+    std::printf("[5/5] Running 128 MiB safetensors vs INGPACK1 open & read microbenchmark...\n");
     const auto bench_dir = dir / "bench_128m";
     std::filesystem::create_directories(bench_dir);
 
@@ -532,6 +749,7 @@ int main(int argc, char** argv) {
     test_builder_and_roundtrip(tmp.path);
     test_safetensors_and_uploader_integration(tmp.path);
     test_adversarial_corruption(tmp.path);
+    test_weight_source_consistency(tmp.path);
     if (bench) { run_weight_pack_bench(tmp.path); }
     std::printf("core_weight_pack: ALL PASSED\n");
     return 0;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -128,6 +129,149 @@ void sync_parent_dir(const std::filesystem::path& file_path) noexcept {
         (void)::fsync(dfd);
         ::close(dfd);
     }
+}
+
+struct ScopedFd {
+    int fd = -1;
+    ~ScopedFd() {
+        if (fd >= 0) { ::close(fd); }
+    }
+};
+
+struct ShardFingerprint {
+    std::uint64_t file_size  = 0;
+    std::int64_t mtime_sec   = 0;
+    std::int64_t mtime_nsec  = 0;
+    std::array<std::uint8_t, 32> header_sha256{};
+    std::array<std::uint8_t, 32> sample_sha256{};
+};
+
+bool pread_exact(int fd, std::uint64_t offset, void* dst, std::size_t len) noexcept {
+    auto* out = static_cast<std::uint8_t*>(dst);
+    std::size_t done = 0;
+    while (done < len) {
+        const ssize_t got = ::pread(fd, out + done, len - done, static_cast<off_t>(offset + done));
+        if (got < 0) {
+            if (errno == EINTR) { continue; }
+            return false;
+        }
+        if (got == 0) { return false; }
+        done += static_cast<std::size_t>(got);
+    }
+    return true;
+}
+
+bool sha256_regular_file(const std::filesystem::path& path, std::array<std::uint8_t, 32>& out) noexcept {
+    ScopedFd sfd;
+    sfd.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (sfd.fd < 0) { return false; }
+    struct stat st {};
+    if (::fstat(sfd.fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) { return false; }
+    Sha256 ctx;
+    std::uint8_t buf[65536];
+    std::uint64_t off = 0;
+    const std::uint64_t fsz = static_cast<std::uint64_t>(st.st_size);
+    while (off < fsz) {
+        const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(fsz - off, sizeof(buf)));
+        if (!pread_exact(sfd.fd, off, buf, take)) { return false; }
+        ctx.update(buf, take);
+        off += take;
+    }
+    out = ctx.finish();
+    return true;
+}
+
+bool fingerprint_safetensors_file(const std::filesystem::path& path, ShardFingerprint& out) noexcept {
+    static constexpr std::uint64_t kMaxSafetensorsHeaderBytes = 100ull << 20;
+    static constexpr std::uint64_t kFullHashThreshold         = 1024ull * 1024ull;
+    static constexpr std::uint64_t kWindowBytes               = 16ull * 1024ull;
+    static constexpr std::uint64_t kNumWindows                = 8ull;
+
+    ScopedFd sfd;
+    sfd.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (sfd.fd < 0) { return false; }
+    struct stat st {};
+    if (::fstat(sfd.fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 8) { return false; }
+
+    out.file_size  = static_cast<std::uint64_t>(st.st_size);
+    out.mtime_sec  = static_cast<std::int64_t>(st.st_mtim.tv_sec);
+    out.mtime_nsec = static_cast<std::int64_t>(st.st_mtim.tv_nsec);
+
+    unsigned char len_bytes[8]{};
+    if (!pread_exact(sfd.fd, 0, len_bytes, sizeof(len_bytes))) { return false; }
+    std::uint64_t header_len = 0;
+    for (int i = 7; i >= 0; --i) { header_len = (header_len << 8) | len_bytes[i]; }
+    if (header_len > kMaxSafetensorsHeaderBytes || header_len > out.file_size - 8) { return false; }
+
+    std::uint8_t buf[65536];
+    {
+        Sha256 hctx;
+        hctx.update(len_bytes, sizeof(len_bytes));
+        std::uint64_t rem = header_len;
+        std::uint64_t off = 8;
+        while (rem > 0) {
+            const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(rem, sizeof(buf)));
+            if (!pread_exact(sfd.fd, off, buf, take)) { return false; }
+            hctx.update(buf, take);
+            off += take;
+            rem -= take;
+        }
+        out.header_sha256 = hctx.finish();
+    }
+
+    const std::uint64_t data_offset = 8 + header_len;
+    const std::uint64_t data_size   = out.file_size - data_offset;
+    {
+        Sha256 sctx;
+        sctx.update(&data_size, sizeof(data_size));
+        if (data_size <= kFullHashThreshold) {
+            std::uint64_t rem = data_size;
+            std::uint64_t off = data_offset;
+            while (rem > 0) {
+                const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(rem, sizeof(buf)));
+                if (!pread_exact(sfd.fd, off, buf, take)) { return false; }
+                sctx.update(buf, take);
+                off += take;
+                rem -= take;
+            }
+        } else {
+            const std::uint64_t max_off = data_size - kWindowBytes;
+            for (std::uint64_t i = 0; i < kNumWindows; ++i) {
+                const std::uint64_t win_off = (i * max_off) / (kNumWindows - 1);
+                sctx.update(&win_off, sizeof(win_off));
+                if (!pread_exact(sfd.fd, data_offset + win_off, buf, kWindowBytes)) { return false; }
+                sctx.update(buf, kWindowBytes);
+            }
+        }
+        out.sample_sha256 = sctx.finish();
+    }
+    return true;
+}
+
+std::string format_shard_fingerprint_line(std::string_view rel_path, const ShardFingerprint& fp) {
+    std::string line;
+    line.reserve(rel_path.size() + 180);
+    line.append(rel_path);
+    line.push_back('\t');
+    line.append(std::to_string(fp.file_size));
+    line.push_back('\t');
+    line.append(std::to_string(fp.mtime_sec));
+    line.push_back('\t');
+    line.append(std::to_string(fp.mtime_nsec));
+    line.push_back('\t');
+    line.append(sha256_hex(fp.header_sha256));
+    line.push_back('\t');
+    line.append(sha256_hex(fp.sample_sha256));
+    return line;
+}
+
+template <typename IntT>
+bool parse_exact_int(std::string_view sv, IntT& out) noexcept {
+    if (sv.empty()) { return false; }
+    const char* begin = sv.data();
+    const char* end   = sv.data() + sv.size();
+    auto res          = std::from_chars(begin, end, out, 10);
+    return res.ec == std::errc{} && res.ptr == end;
 }
 
 }  // namespace
@@ -503,6 +647,15 @@ Tensor WeightPack::tensor_view(std::string_view name) const {
     return t;
 }
 
+std::optional<std::string_view> WeightPack::find_metadata(std::string_view key) const noexcept {
+    for (const WeightPackMetaEntry& m : meta_entries_) {
+        if (slice_string(m.key_offset, m.key_len) == key) {
+            return slice_string(m.val_offset, m.val_len);
+        }
+    }
+    return std::nullopt;
+}
+
 std::map<std::string, std::string> WeightPack::metadata() const {
     std::map<std::string, std::string> out;
     for (const WeightPackMetaEntry& m : meta_entries_) {
@@ -510,6 +663,95 @@ std::map<std::string, std::string> WeightPack::metadata() const {
                     std::string(slice_string(m.val_offset, m.val_len)));
     }
     return out;
+}
+
+bool weight_pack_matches_safetensors_dir(const WeightPack& pack, const std::filesystem::path& dir) noexcept {
+    try {
+        namespace fs = std::filesystem;
+        const auto src_ver = pack.find_metadata("ingpack.source_version");
+        if (!src_ver || *src_ver != "1") { return false; }
+
+        std::error_code ec;
+        const bool has_index = fs::exists(dir / "model.safetensors.index.json", ec);
+        if (ec) { return false; }
+        const bool has_single = fs::exists(dir / "model.safetensors", ec);
+        if (ec) { return false; }
+        const std::string_view dir_kind = has_index ? "index" : (has_single ? "single" : "");
+        if (dir_kind.empty()) { return false; }
+
+        const auto src_kind = pack.find_metadata("ingpack.source_kind");
+        if (!src_kind || *src_kind != dir_kind) { return false; }
+
+        if (dir_kind == "index") {
+            const auto expected_idx = pack.find_metadata("ingpack.source_index_sha256");
+            if (!expected_idx || expected_idx->size() != 64u) { return false; }
+            std::array<std::uint8_t, 32> actual_idx{};
+            if (!sha256_regular_file(dir / "model.safetensors.index.json", actual_idx)) { return false; }
+            if (sha256_hex(actual_idx) != *expected_idx) { return false; }
+        }
+
+        const auto shards_meta = pack.find_metadata("ingpack.source_shards");
+        if (!shards_meta) { return false; }
+
+        std::size_t num_records = 0;
+        std::size_t pos         = 0;
+        while (pos < shards_meta->size()) {
+            const std::size_t nl       = shards_meta->find('\n', pos);
+            const std::string_view line = (nl == std::string_view::npos)
+                                              ? shards_meta->substr(pos)
+                                              : shards_meta->substr(pos, nl - pos);
+            pos = (nl == std::string_view::npos) ? shards_meta->size() : (nl + 1);
+            if (line.empty()) { continue; }
+            ++num_records;
+
+            std::string_view fields[6]{};
+            std::size_t fpos = 0;
+            for (int f = 0; f < 5; ++f) {
+                const std::size_t tab = line.find('\t', fpos);
+                if (tab == std::string_view::npos) { return false; }
+                fields[f] = line.substr(fpos, tab - fpos);
+                fpos      = tab + 1;
+            }
+            if (line.find('\t', fpos) != std::string_view::npos) { return false; }
+            fields[5] = line.substr(fpos);
+
+            const std::string_view rel_path = fields[0];
+            if (rel_path.empty()) { return false; }
+            const fs::path rel(rel_path);
+            if (rel.is_absolute()) { return false; }
+            for (const fs::path& comp : rel) {
+                if (comp == ".." || comp == ".") { return false; }
+            }
+            if (dir_kind == "single" && rel_path != "model.safetensors") { return false; }
+
+            std::uint64_t exp_size = 0;
+            std::int64_t exp_sec   = 0;
+            std::int64_t exp_nsec  = 0;
+            if (!parse_exact_int(fields[1], exp_size) || !parse_exact_int(fields[2], exp_sec) ||
+                !parse_exact_int(fields[3], exp_nsec)) {
+                return false;
+            }
+            if (fields[4].size() != 64u || fields[5].size() != 64u) { return false; }
+
+            ShardFingerprint actual{};
+            if (!fingerprint_safetensors_file(dir / rel, actual)) { return false; }
+            if (actual.file_size != exp_size || actual.mtime_sec != exp_sec ||
+                actual.mtime_nsec != exp_nsec) {
+                return false;
+            }
+            if (sha256_hex(actual.header_sha256) != fields[4] ||
+                sha256_hex(actual.sample_sha256) != fields[5]) {
+                return false;
+            }
+        }
+
+        if (dir_kind == "single") {
+            return num_records == 1;
+        }
+        return num_records >= 1 || pack.num_tensors() == 0;
+    } catch (...) {
+        return false;
+    }
 }
 
 void WeightPack::read_range(std::uint64_t offset, std::uint64_t bytes, void* dst) const {
@@ -885,19 +1127,80 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
                                                               WeightPackBuildOptions opts) {
     namespace fs = std::filesystem;
     fs::path authoritative_src = src_path;
+    fs::path base_dir;
+    std::string source_kind;
     if (fs::is_directory(src_path)) {
         if (fs::exists(src_path / "model.safetensors.index.json")) {
+            source_kind       = "index";
             authoritative_src = src_path / "model.safetensors.index.json";
+            base_dir          = src_path;
         } else if (fs::exists(src_path / "model.safetensors")) {
+            source_kind       = "single";
             authoritative_src = src_path / "model.safetensors";
+            base_dir          = src_path;
+        } else {
+            throw std::runtime_error("pack_from_safetensors " + src_path.string() +
+                                     ": no model.safetensors.index.json or model.safetensors");
         }
+    } else if (src_path.extension() == ".json") {
+        source_kind       = (src_path.filename() == "model.safetensors.index.json") ? "index" : "custom_index";
+        authoritative_src = src_path;
+        base_dir          = src_path.parent_path();
+    } else {
+        source_kind       = (src_path.filename() == "model.safetensors") ? "single" : "file";
+        authoritative_src = src_path;
+        base_dir          = src_path.parent_path();
     }
-    const SafetensorsModel model(authoritative_src);
+
+    const SafetensorsModel model(authoritative_src, SafetensorsOpenMode::SafetensorsOnly);
     WeightPackBuilder builder;
     if (model.files().size() == 1) {
         for (const auto& [k, v] : model.files()[0]->metadata()) {
             builder.add_metadata(k, v);
         }
+    }
+    builder.add_metadata("ingpack.source_version", "1");
+    builder.add_metadata("ingpack.source_kind", source_kind);
+    if (source_kind == "index" || source_kind == "custom_index") {
+        std::array<std::uint8_t, 32> idx_sha{};
+        if (!sha256_regular_file(authoritative_src, idx_sha)) {
+            fail_pack(authoritative_src, "cannot read index json for provenance");
+        }
+        builder.add_metadata("ingpack.source_index_sha256", sha256_hex(idx_sha));
+    }
+    {
+        std::vector<std::pair<std::string, fs::path>> shard_paths;
+        shard_paths.reserve(model.files().size());
+        const fs::path norm_base = base_dir.lexically_normal();
+        for (const auto& file_ptr : model.files()) {
+            std::string rel_str;
+            if (source_kind == "index" || source_kind == "custom_index") {
+                if (norm_base.empty() || norm_base == ".") {
+                    rel_str = file_ptr->path().lexically_normal().generic_string();
+                } else {
+                    rel_str = file_ptr->path().lexically_normal().lexically_relative(norm_base).generic_string();
+                }
+            } else {
+                rel_str = file_ptr->path().filename().string();
+            }
+            shard_paths.emplace_back(std::move(rel_str), file_ptr->path());
+        }
+        std::sort(shard_paths.begin(), shard_paths.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        shard_paths.erase(std::unique(shard_paths.begin(), shard_paths.end(),
+                                      [](const auto& a, const auto& b) { return a.first == b.first; }),
+                          shard_paths.end());
+
+        std::string shards_manifest;
+        for (const auto& [rel_str, full_path] : shard_paths) {
+            ShardFingerprint fp{};
+            if (!fingerprint_safetensors_file(full_path, fp)) {
+                fail_pack(full_path, "cannot fingerprint source shard for provenance");
+            }
+            if (!shards_manifest.empty()) { shards_manifest.push_back('\n'); }
+            shards_manifest.append(format_shard_fingerprint_line(rel_str, fp));
+        }
+        builder.add_metadata("ingpack.source_shards", std::move(shards_manifest));
     }
     const std::size_t io_chunk = std::max<std::size_t>(opts.io_chunk_bytes, std::size_t(1) << 20);
     auto scratch = std::make_shared<std::vector<std::byte>>();

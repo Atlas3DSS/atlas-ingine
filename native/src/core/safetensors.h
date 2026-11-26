@@ -53,6 +53,8 @@ class SafetensorsFile {
 public:
     // Opens the file and parses its header. Throws std::runtime_error on I/O or format errors.
     explicit SafetensorsFile(const std::filesystem::path& path);
+    // Wraps an already-opened WeightPack without reopening or remapping.
+    explicit SafetensorsFile(std::unique_ptr<WeightPack> pack);
     ~SafetensorsFile();
 
     SafetensorsFile(const SafetensorsFile&)            = delete;
@@ -92,6 +94,8 @@ private:
         }
     };
 
+    void init_from_pack(std::unique_ptr<WeightPack> pack);
+
     std::filesystem::path path_;
     int fd_                    = -1;
     std::unique_ptr<WeightPack> pack_;
@@ -112,12 +116,20 @@ struct SafetensorsRef {
     const SafetensorsTensor& operator*() const noexcept { return *tensor; }
 };
 
-// A checkpoint made of one or more safetensors files.
+// Controls how SafetensorsModel resolves checkpoints from a path or directory.
+enum class SafetensorsOpenMode {
+    Auto = 0,            // Pack-only dir -> model.ingpack; mixed dir -> verified matching model.ingpack if enabled, else safetensors; file -> detect format
+    SafetensorsOnly = 1, // Ignore model.ingpack in directories and reject INGPACK1 files
+    WeightPackOnly = 2,  // Require model.ingpack in directories or an INGPACK1 file
+};
+
+// A checkpoint made of one or more safetensors files (or an INGPACK1 pack).
 class SafetensorsModel {
 public:
-    // `path` is a .safetensors file, or a directory holding model.safetensors.index.json (every file
-    // named in its weight_map; the index decides which file holds which tensor) or model.safetensors.
-    explicit SafetensorsModel(const std::filesystem::path& path);
+    // `path` is a .safetensors/.ingpack file, a .index.json file, or a directory holding
+    // model.safetensors.index.json, model.safetensors, and/or model.ingpack.
+    explicit SafetensorsModel(const std::filesystem::path& path,
+                              SafetensorsOpenMode mode = SafetensorsOpenMode::Auto);
 
     SafetensorsModel(SafetensorsModel&&) noexcept            = default;
     SafetensorsModel& operator=(SafetensorsModel&&) noexcept = default;

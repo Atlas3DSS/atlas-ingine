@@ -3,6 +3,8 @@
 #include "core/act.h"
 #include "ingine/generator.h"
 #if INGINE_BACKEND_CUDA
+#include "core/safetensors.h"
+#include "core/weight_pack.h"
 #include "model/kv_checkpoint.h"
 #endif
 #include "model/model_data.h"
@@ -422,6 +424,43 @@ int main() {
     expect(compute_consumed_weights_sha256(cfg_sha, q_sha, tmap) !=
                compute_consumed_weights_sha256(cfg_sha, q_sha, tmap2),
            "compute_consumed_weights_sha256 distinguishes consumed tensor byte changes");
+
+    // Pack-only, same-source mixed, and changed-source mixed package SHA-256 checks:
+    const auto pkg_pack1 = pkg_base / "pack_only_rev1";
+    const auto pkg_pack2 = pkg_base / "pack_only_rev2";
+    std::filesystem::create_directories(pkg_pack1);
+    std::filesystem::create_directories(pkg_pack2);
+    write_str(pkg_pack1 / "config.json", shared_cfg);
+    write_str(pkg_pack2 / "config.json", shared_cfg);
+    (void)ingine::WeightPackBuilder::pack_from_safetensors(pkg_rev1, pkg_pack1 / "model.ingpack");
+    (void)ingine::WeightPackBuilder::pack_from_safetensors(pkg_rev2, pkg_pack2 / "model.ingpack");
+
+    const auto sha_pack1 = compute_model_package_sha256_opt(pkg_pack1);
+    const auto sha_pack2 = compute_model_package_sha256_opt(pkg_pack2);
+    expect(sha_pack1.has_value() && sha_pack2.has_value(),
+           "pack-only directories with model.ingpack produce verified content SHA");
+    expect(*sha_pack1 != *sha_pack2,
+           "pack-only directories with weights 1.0 vs 2.0 produce distinct package SHAs");
+    expect(compute_model_package_sha256_from_tensors(pkg_pack1, tmap) == *sha_pack1,
+           "pack-only compute_model_package_sha256_opt matches compute_model_package_sha256_from_tensors");
+
+    // Same-source mixed dir: model.ingpack built from pkg_rev1 matches pkg_rev1 safetensors bit-for-bit.
+    (void)ingine::WeightPackBuilder::pack_from_safetensors(pkg_rev1, pkg_rev1 / "model.ingpack");
+    expect(ingine::SafetensorsModel(pkg_rev1).is_weight_pack(),
+           "same-source mixed directory selects verified model.ingpack");
+    const auto sha_mixed_same = compute_model_package_sha256_opt(pkg_rev1);
+    expect(sha_mixed_same.has_value() && *sha_mixed_same == *sha_rev1,
+           "same-source mixed directory package SHA matches safetensors-only baseline bit-for-bit");
+
+    // Changed-source mixed dir: copying rev1 pack next to rev2 shards rejects stale pack and hashes rev2.
+    std::filesystem::copy_file(pkg_rev1 / "model.ingpack", pkg_rev2 / "model.ingpack",
+                               std::filesystem::copy_options::overwrite_existing);
+    expect(!ingine::SafetensorsModel(pkg_rev2).is_weight_pack(),
+           "changed-source mixed directory rejects stale model.ingpack");
+    const auto sha_mixed_changed = compute_model_package_sha256_opt(pkg_rev2);
+    expect(sha_mixed_changed.has_value() && *sha_mixed_changed == *sha_rev2 && *sha_mixed_changed != *sha_rev1,
+           "changed-source mixed directory package SHA hashes updated safetensors, not stale pack");
+
     std::filesystem::remove_all(pkg_base, ec);
   }
 #endif

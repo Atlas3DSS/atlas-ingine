@@ -502,7 +502,8 @@ std::optional<std::array<std::uint8_t, 32>> compute_model_package_sha256_opt(con
     std::map<std::string, std::array<std::uint8_t, 32>> tensor_shas;
     std::vector<std::byte> scratch;
     if (std::filesystem::exists(model_dir / "model.safetensors.index.json", ec) ||
-        std::filesystem::exists(model_dir / "model.safetensors", ec)) {
+        std::filesystem::exists(model_dir / "model.safetensors", ec) ||
+        std::filesystem::exists(model_dir / "model.ingpack", ec)) {
       const SafetensorsModel m(model_dir);
       for (const std::string& name : m.names()) {
         const SafetensorsRef ref = m.at(name);

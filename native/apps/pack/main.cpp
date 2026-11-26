@@ -164,7 +164,7 @@ int cmd_bench(int argc, char** argv) {
     std::uint64_t total_bytes = 0;
     for (int i = 0; i < iters; ++i) {
         const auto t0 = Clock::now();
-        ingine::SafetensorsModel sm(st_src);
+        ingine::SafetensorsModel sm(st_src, ingine::SafetensorsOpenMode::SafetensorsOnly);
         const auto t1 = Clock::now();
         st_open_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
         if (i == 0) {
@@ -180,7 +180,7 @@ int cmd_bench(int argc, char** argv) {
 
     std::vector<std::byte> sink_buf(std::size_t(32) << 20);
     auto read_all_st = [&]() {
-        ingine::SafetensorsModel sm(st_src);
+        ingine::SafetensorsModel sm(st_src, ingine::SafetensorsOpenMode::SafetensorsOnly);
         for (const std::string& n : sm.names()) {
             const ingine::SafetensorsRef r = sm.at(n);
             std::uint64_t off = 0;

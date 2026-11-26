@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -117,6 +118,7 @@ public:
     [[nodiscard]] const std::byte* tensor_data(const WeightPackEntry& entry) const noexcept;
     [[nodiscard]] const std::byte* tensor_data(std::string_view name) const;
     [[nodiscard]] Tensor tensor_view(std::string_view name) const;
+    [[nodiscard]] std::optional<std::string_view> find_metadata(std::string_view key) const noexcept;
     [[nodiscard]] std::map<std::string, std::string> metadata() const;
 
     void read_range(std::uint64_t offset, std::uint64_t bytes, void* dst) const;
@@ -145,6 +147,9 @@ private:
     std::span<const WeightPackMetaEntry> meta_entries_;
     const char* string_table_            = nullptr;
 };
+
+[[nodiscard]] bool weight_pack_matches_safetensors_dir(const WeightPack& pack,
+                                                       const std::filesystem::path& dir) noexcept;
 
 struct WeightPackBuildOptions {
     std::size_t tensor_alignment       = kWeightPackDefaultAlignBytes;
