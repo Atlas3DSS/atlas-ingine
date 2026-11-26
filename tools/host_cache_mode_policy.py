@@ -132,6 +132,11 @@ class WorkerCapability:
     decode_tok_per_s: float = 40.0
     measured_last_full_nll_delta: float = 0.01056  # measured #829 reference delta unless overridden
     cache_namespace_header: Optional[str] = None
+    # Digest of a checkpoint already loaded & verified inside this worker runtime (e.g. via
+    # `--kv-ckpt-resume <path>`). None means this HTTP worker has no preloaded checkpoint to
+    # satisfy a `compatible_checkpoint` mode switch (HTTP /v1/chat/completions has no on-demand
+    # disk-checkpoint restore operation, so mode switches must use authorized_replay instead).
+    loaded_checkpoint_digest: Optional[str] = None
 
     def __post_init__(self) -> None:
         validate_kv_cache_mode(self.active_kv_cache_mode)
@@ -193,6 +198,10 @@ class AdmissionRequest:
     mode_switch: Optional[ModeSwitchContext] = None
 
     def __post_init__(self) -> None:
+        if self.context_tokens < 0:
+            raise ValueError(f"context_tokens must be non-negative (got {self.context_tokens})")
+        if self.expected_new_tokens <= 0:
+            raise ValueError(f"expected_new_tokens must be positive (got {self.expected_new_tokens})")
         if self.preferred_mode is not None:
             validate_kv_cache_mode(self.preferred_mode)
 
@@ -267,6 +276,7 @@ def discover_worker_capability(
     decode_tok_per_s: float = 40.0,
     measured_last_full_nll_delta: float = 0.01056,
     cache_namespace_header: Optional[str] = None,
+    loaded_checkpoint_digest: Optional[str] = None,
     timeout: float = 15.0,
 ) -> WorkerCapability:
     """Query GET /health and GET /v1/models and build a verified WorkerCapability."""
@@ -321,6 +331,7 @@ def discover_worker_capability(
         decode_tok_per_s=decode_tok_per_s,
         measured_last_full_nll_delta=measured_last_full_nll_delta,
         cache_namespace_header=cache_namespace_header,
+        loaded_checkpoint_digest=loaded_checkpoint_digest,
     )
 
 
@@ -367,7 +378,45 @@ def _validate_mode_switch(
                 0,
                 None,
             )
-        return True, "mode_switch_via_compatible_checkpoint", "compatible_checkpoint", False, 0, ckpt.checkpoint_path
+        if ckpt.prefix_tokens <= 0:
+            return (
+                False,
+                "mode_switch_checkpoint_empty_prefix",
+                "none",
+                True,
+                0,
+                None,
+            )
+        # HTTP /v1/chat/completions exposes no on-demand disk checkpoint restore operation.
+        # Admit `compatible_checkpoint` ONLY when the target worker already holds that exact
+        # verified checkpoint loaded (e.g. launched with `--kv-ckpt-resume`) and verify
+        # `cached_tokens >= ckpt.prefix_tokens` on the response. Otherwise require authorized_replay.
+        if worker.loaded_checkpoint_digest == ckpt.identity_digest():
+            return (
+                True,
+                "mode_switch_via_verified_loaded_checkpoint",
+                "compatible_checkpoint",
+                False,
+                0,
+                ckpt.checkpoint_path,
+            )
+        if ms.replay_authorized and ms.authorized_replay_tokens > 0:
+            return (
+                True,
+                "mode_switch_via_authorized_replay",
+                "authorized_replay",
+                True,
+                ms.authorized_replay_tokens,
+                None,
+            )
+        return (
+            False,
+            "mode_switch_checkpoint_restore_unavailable_require_authorized_replay",
+            "none",
+            True,
+            0,
+            None,
+        )
 
     if ms.replay_authorized and ms.authorized_replay_tokens > 0:
         return (
@@ -599,6 +648,7 @@ class HostCacheModeRegistry:
                 effective_cache_namespace TEXT,
                 checkpoint_identity_json TEXT,
                 checkpoint_identity_digest TEXT,
+                max_tokens INTEGER NOT NULL,
                 estimated_state_mib REAL,
                 estimated_latency_seconds REAL
             );
@@ -656,8 +706,8 @@ class HostCacheModeRegistry:
                 dispatch_id, created_at, worker_id, session_id, task_id, admitted,
                 kv_cache_mode, worker_supported_modes_json, reason, mode_switch_action,
                 bypass_prefix_cache, effective_cache_namespace, checkpoint_identity_json,
-                checkpoint_identity_digest, estimated_state_mib, estimated_latency_seconds
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                checkpoint_identity_digest, max_tokens, estimated_state_mib, estimated_latency_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 dispatch_id,
@@ -674,6 +724,7 @@ class HostCacheModeRegistry:
                 decision.effective_cache_namespace,
                 ckpt_json,
                 ckpt_digest,
+                req.expected_new_tokens,
                 decision.estimated_state_mib,
                 decision.estimated_latency_seconds,
             ),
@@ -739,10 +790,21 @@ class HostCacheModeRegistry:
         req: AdmissionRequest,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
-        max_tokens: int = 256,
+        max_tokens: Optional[int] = None,
         timeout: float = 120.0,
     ) -> dict[str, Any]:
-        """Admit `req`, enforce session mode-switch contract, dispatch HTTP request, and audit."""
+        """Admit `req`, enforce session mode-switch contract, dispatch HTTP request, and audit.
+
+        Generation limit is bound end-to-end to `req.expected_new_tokens` (the exact budget
+        validated by admission). Passing a conflicting `max_tokens` fails closed with ValueError.
+        """
+        if max_tokens is not None and max_tokens != req.expected_new_tokens:
+            raise ValueError(
+                f"max_tokens mismatch: explicit max_tokens={max_tokens} != "
+                f"admitted req.expected_new_tokens={req.expected_new_tokens}"
+            )
+        bound_max_tokens = req.expected_new_tokens
+
         worker_map = {w.worker_id: w for w in workers}
         prior_mode = self.get_session_mode(req.session_id)
         eff_req = req
@@ -772,7 +834,7 @@ class HostCacheModeRegistry:
             "model": worker.model_id,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": bound_max_tokens,
             "stream": False,
         }
         if decision.bypass_prefix_cache and not worker.cache_namespace_header:
@@ -836,6 +898,52 @@ class HostCacheModeRegistry:
 
         usage = body.get("usage") or {}
         details = usage.get("prompt_tokens_details") or {}
+        cached_tokens = details.get("cached_tokens")
+
+        # Post-response mode-switch verification:
+        #   - compatible_checkpoint: server MUST prove cached_tokens >= checkpoint.prefix_tokens.
+        #   - authorized_replay: server MUST NOT reuse cached tokens (cached_tokens must be 0 or None).
+        if decision.mode_switch_action == "compatible_checkpoint":
+            want_prefix = (
+                eff_req.mode_switch.compatible_checkpoint.prefix_tokens
+                if (eff_req.mode_switch and eff_req.mode_switch.compatible_checkpoint)
+                else 1
+            )
+            if not isinstance(cached_tokens, int) or cached_tokens < want_prefix:
+                self.record_result(
+                    dispatch_id=dispatch_id,
+                    session_id=eff_req.session_id,
+                    admitted_mode=decision.selected_mode,
+                    server_mode=server_mode,
+                    status="checkpoint_restore_unverified",
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    cached_tokens=cached_tokens if isinstance(cached_tokens, int) else None,
+                    completion_tokens=usage.get("completion_tokens"),
+                    elapsed_seconds=elapsed,
+                    error_detail=f"cached_tokens={cached_tokens!r} < required checkpoint prefix_tokens={want_prefix}",
+                )
+                raise RuntimeError(
+                    f"checkpoint restore unverified on {dispatch_id}: "
+                    f"cached_tokens={cached_tokens!r} < required prefix_tokens={want_prefix}"
+                )
+        elif decision.mode_switch_action == "authorized_replay":
+            if cached_tokens not in (None, 0):
+                self.record_result(
+                    dispatch_id=dispatch_id,
+                    session_id=eff_req.session_id,
+                    admitted_mode=decision.selected_mode,
+                    server_mode=server_mode,
+                    status="replay_prefix_cache_violation",
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    cached_tokens=cached_tokens if isinstance(cached_tokens, int) else None,
+                    completion_tokens=usage.get("completion_tokens"),
+                    elapsed_seconds=elapsed,
+                    error_detail=f"authorized_replay observed non-zero cached_tokens={cached_tokens!r}",
+                )
+                raise RuntimeError(
+                    f"replay prefix-cache violation on {dispatch_id}: cached_tokens={cached_tokens!r} (expected 0)"
+                )
+
         ckpt_digest = decision.checkpoint_identity.identity_digest() if decision.checkpoint_identity else None
         self.record_result(
             dispatch_id=dispatch_id,
@@ -844,7 +952,7 @@ class HostCacheModeRegistry:
             server_mode=server_mode,
             status="ok",
             prompt_tokens=usage.get("prompt_tokens"),
-            cached_tokens=details.get("cached_tokens"),
+            cached_tokens=cached_tokens,
             completion_tokens=usage.get("completion_tokens"),
             elapsed_seconds=elapsed,
             checkpoint_identity_digest=ckpt_digest,
@@ -854,6 +962,7 @@ class HostCacheModeRegistry:
             "admitted": True,
             "decision": decision.to_dict(),
             "server_kv_cache_mode": server_mode,
+            "bound_max_tokens": bound_max_tokens,
             "elapsed_seconds": round(elapsed, 4),
             "response": body,
         }

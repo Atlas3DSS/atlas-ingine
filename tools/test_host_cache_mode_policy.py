@@ -23,6 +23,7 @@ def start_mock_worker(
     max_batch: int = 1,
     header_override: str | None = None,
     body_mode_override: str | None = None,
+    cached_tokens: int = 0,
 ):
     received: list[dict] = []
 
@@ -104,10 +105,10 @@ def start_mock_worker(
                         }
                     ],
                     "usage": {
-                        "prompt_tokens": 128,
+                        "prompt_tokens": max(128, cached_tokens),
                         "completion_tokens": 8,
-                        "total_tokens": 136,
-                        "prompt_tokens_details": {"cached_tokens": 0},
+                        "total_tokens": max(128, cached_tokens) + 8,
+                        "prompt_tokens_details": {"cached_tokens": cached_tokens},
                     },
                 },
                 mode_hdr=hdr,
@@ -262,7 +263,7 @@ class TestHostCacheModePolicy(unittest.TestCase):
         self.assertFalse(dec_bad.admitted)
         self.assertIn("mode_switch_checkpoint_mode_mismatch", dec_bad.reason)
 
-        # 3. Compatible last_full checkpoint -> ADMITTED without bypass!
+        # 3. Compatible last_full checkpoint on an HTTP worker WITHOUT matching loaded_checkpoint_digest -> BLOCKED!
         good_ckpt = pol.CheckpointIdentity(
             model_id="inkling-2-mini",
             kv_format="q4_0",
@@ -282,7 +283,25 @@ class TestHostCacheModePolicy(unittest.TestCase):
             preferred_mode="last_full",
             mode_switch=pol.ModeSwitchContext(prior_kv_cache_mode="per_pass", compatible_checkpoint=good_ckpt),
         )
-        dec_good = pol.evaluate_worker_for_mode(w_lf, req_good_ckpt, "last_full")
+        dec_unloaded = pol.evaluate_worker_for_mode(w_lf, req_good_ckpt, "last_full")
+        self.assertFalse(dec_unloaded.admitted)
+        self.assertIn("mode_switch_checkpoint_restore_unavailable_require_authorized_replay", dec_unloaded.reason)
+
+        # 3b. Compatible last_full checkpoint on a worker holding that exact verified loaded checkpoint -> ADMITTED!
+        w_lf_loaded = pol.WorkerCapability(
+            worker_id="w-lf-loaded",
+            base_url="http://127.0.0.1:9004",
+            model_id="inkling-2-mini",
+            active_kv_cache_mode="last_full",
+            supported_kv_cache_modes=("per_pass", "last_full"),
+            max_model_len=131072,
+            kv_format="q4_0",
+            available_kv_vram_mib=8192.0,
+            prefill_tok_per_s=2000.0,
+            decode_tok_per_s=50.0,
+            loaded_checkpoint_digest=good_ckpt.identity_digest(),
+        )
+        dec_good = pol.evaluate_worker_for_mode(w_lf_loaded, req_good_ckpt, "last_full")
         self.assertTrue(dec_good.admitted)
         self.assertEqual(dec_good.mode_switch_action, "compatible_checkpoint")
         self.assertFalse(dec_good.bypass_prefix_cache)
@@ -407,13 +426,23 @@ class TestHostCacheModePolicy(unittest.TestCase):
                     self.assertNotIn("x-tenant-scope", recv_lf[-1]["headers"])
                     self.assertEqual(reg.get_session_mode("sess-42"), "last_full")
 
-                    # Verify SQLite audit rows recorded everything.
+                    # Verify SQLite audit rows recorded everything, including end-to-end bound max_tokens.
+                    self.assertEqual(recv_pp[-1]["body"]["max_tokens"], 256)
+                    self.assertEqual(recv_lf[-1]["body"]["max_tokens"], 256)
                     conn = sqlite3.connect(str(db))
                     n_disp = conn.execute("SELECT COUNT(*) FROM dispatches").fetchone()[0]
                     n_res = conn.execute("SELECT COUNT(*) FROM results WHERE verified_mode_match = 1").fetchone()[0]
+                    disp_max_toks = [r[0] for r in conn.execute("SELECT max_tokens FROM dispatches").fetchall()]
                     conn.close()
                     self.assertEqual(n_disp, 3)
                     self.assertEqual(n_res, 2)
+                    self.assertEqual(disp_max_toks, [256, 256, 256])
+
+                    # Conflicting explicit max_tokens vs req.expected_new_tokens -> fails closed with ValueError.
+                    with self.assertRaisesRegex(ValueError, "max_tokens mismatch"):
+                        reg.dispatch_chat_completion(
+                            [w_pp], req1, [{"role": "user", "content": "hi"}], max_tokens=512
+                        )
 
                     # Conflicting server response header vs body -> fail-closed exception.
                     w_bad = pol.discover_worker_capability("w-bad", url_bad, available_kv_vram_mib=6144.0)
@@ -430,6 +459,86 @@ class TestHostCacheModePolicy(unittest.TestCase):
                         reg.dispatch_chat_completion([w_bad], req_bad, [{"role": "user", "content": "x"}])
         finally:
             for s in (srv_pp, srv_lf, srv_bad):
+                s.shutdown()
+                s.server_close()
+
+    def test_verified_checkpoint_restore_and_max_tokens_binding(self):
+        good_ckpt = pol.CheckpointIdentity(
+            model_id="inkling-2-mini",
+            kv_format="q4_0",
+            kv_cache_mode="last_full",
+            cache_namespace="acct-7:kv_mode=last_full",
+            prefix_tokens=4096,
+            prefix_sha256="ckpt-hash-1",
+            checkpoint_path="/mnt/nvme/lf.ckpt",
+        )
+        srv_zero, url_zero, recv_zero = start_mock_worker(
+            "last_full", ["per_pass", "last_full"], cached_tokens=0
+        )
+        srv_hit, url_hit, recv_hit = start_mock_worker(
+            "last_full", ["per_pass", "last_full"], cached_tokens=4096
+        )
+        try:
+            w_zero = pol.discover_worker_capability(
+                "w-lf-zero",
+                url_zero,
+                available_kv_vram_mib=8192.0,
+                loaded_checkpoint_digest=good_ckpt.identity_digest(),
+            )
+            w_hit = pol.discover_worker_capability(
+                "w-lf-hit",
+                url_hit,
+                available_kv_vram_mib=8192.0,
+                loaded_checkpoint_digest=good_ckpt.identity_digest(),
+            )
+            with tempfile.TemporaryDirectory() as td:
+                db = Path(td) / "ckpt_verify.sqlite"
+                with pol.HostCacheModeRegistry(db) as reg:
+                    req_sw = pol.AdmissionRequest(
+                        task_id="task-ckpt-sw",
+                        session_id="sess-ckpt",
+                        cache_namespace="acct-7",
+                        context_tokens=4096,
+                        expected_new_tokens=77,
+                        prefix_sha256="ckpt-hash-1",
+                        preferred_mode="last_full",
+                        mode_switch=pol.ModeSwitchContext(
+                            prior_kv_cache_mode="per_pass",
+                            compatible_checkpoint=good_ckpt,
+                        ),
+                    )
+                    # Server returns cached_tokens=0 -> MUST fail closed (never accept as checkpoint transition)!
+                    with self.assertRaisesRegex(RuntimeError, "checkpoint restore unverified"):
+                        reg.dispatch_chat_completion([w_zero], req_sw, [{"role": "user", "content": "hi"}])
+                    self.assertEqual(recv_zero[-1]["body"]["max_tokens"], 77)
+                    self.assertIsNone(reg.get_session_mode("sess-ckpt"))
+
+                    # Server proves cached_tokens == 4096 >= prefix_tokens -> succeeds and binds max_tokens=77!
+                    out_hit = reg.dispatch_chat_completion([w_hit], req_sw, [{"role": "user", "content": "hi"}])
+                    self.assertTrue(out_hit["admitted"])
+                    self.assertEqual(out_hit["bound_max_tokens"], 77)
+                    self.assertEqual(recv_hit[-1]["body"]["max_tokens"], 77)
+                    self.assertEqual(reg.get_session_mode("sess-ckpt"), "last_full")
+
+                    # Replay path where buggy server returns cached_tokens > 0 -> MUST fail closed!
+                    req_replay_bug = pol.AdmissionRequest(
+                        task_id="task-replay-bug",
+                        session_id="sess-replay-bug",
+                        cache_namespace="acct-7",
+                        context_tokens=4096,
+                        expected_new_tokens=55,
+                        prefix_sha256="ckpt-hash-2",
+                        preferred_mode="last_full",
+                        mode_switch=pol.ModeSwitchContext(
+                            prior_kv_cache_mode="per_pass",
+                            replay_authorized=True,
+                            authorized_replay_tokens=4096,
+                        ),
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "replay prefix-cache violation"):
+                        reg.dispatch_chat_completion([w_hit], req_replay_bug, [{"role": "user", "content": "hi"}])
+        finally:
+            for s in (srv_zero, srv_hit):
                 s.shutdown()
                 s.server_close()
 
