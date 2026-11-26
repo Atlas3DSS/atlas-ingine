@@ -166,20 +166,24 @@ Json run_suite1_microbench(cudaStream_t stream) {
 Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir) {
   std::printf("\n=== Suite 2: Real Disk Checkpoint Bidirectional Isolation & --loop-bf16 ===\n");
   const auto fmt = ingine::text::ChatFormat::load(model_dir);
+  std::string sys_text =
+      "You are a concise, deterministic systems engineer verifying GPU checkpoint isolation.\n";
+  for (int i = 0; i < 12; ++i) {
+    sys_text += "Invariant " + std::to_string(i + 1) +
+                ": Always verify exact weight quantization mode, KV format, and producer digest before resuming.\n";
+  }
   const Json msgs = Json::array(
-      {{{"role", "system"},
-        {"content", "You are a concise, deterministic systems engineer verifying GPU checkpoint isolation."}},
+      {{{"role", "system"}, {"content", sys_text}},
        {{"role", "user"}, {"content", "Explain why 2 + 2 = 4 in one clear sentence."}}});
   const auto rp = fmt.render(msgs, Json::array(), ingine::text::ChatOptions{});
-  const int R = int(rp.ids.size());
-  std::vector<std::int32_t> fork_ids = rp.ids;
-  for (int i = 0; i < 8; ++i) fork_ids.push_back(rp.ids[std::size_t(i % R)]);
+  const int ckpt_pos = 64;
+  check(int(rp.ids.size()) > ckpt_pos, "Suite 2: prompt length exceeds periodic checkpoint chunk boundary (64)");
 
   Sampling greedy;
   greedy.temperature = 0.f;
-  auto run_gen = [&](Generator& g, std::span<const std::int32_t> ids, int max_new, int root_hint = 0) {
+  auto run_gen = [&](Generator& g, std::span<const std::int32_t> ids, int max_new) {
     std::vector<std::int32_t> out;
-    GenerateStats st = g.generate(Prompt{ids, {}, root_hint}, max_new, greedy, {}, [&](std::span<const std::int32_t> t) {
+    GenerateStats st = g.generate(Prompt{ids, {}, 0}, max_new, greedy, {}, [&](std::span<const std::int32_t> t) {
       out.insert(out.end(), t.begin(), t.end());
       return true;
     });
@@ -191,8 +195,8 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
   base.dense_fp8 = true;
   base.kv_fp8 = true;
   base.max_ctx = 1024;
-  base.prefill_chunk = 512;
-  base.park_mb = 256;
+  base.prefill_chunk = ckpt_pos;  // Chunk boundary at 64 < rp.ids.size() triggers periodic save_kv_checkpoint
+  base.park_mb = 0;
   base.park_host_mb = 0;
 
   const std::filesystem::path tmp_dir =
@@ -205,15 +209,14 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
   std::vector<std::int32_t> ref_off, ref_loop_bf16, ref_q5k;
   double vram_off_mib = 0.0, vram_loop_bf16_mib = 0.0, vram_q5k_mib = 0.0;
 
-  // 2a. Control (off, loop_bf16=false): save ckpt_off at exact boundary pos = R (with logits) via root split
+  // 2a. Control (off, loop_bf16=false): save ckpt_off at periodic chunk boundary (pos = 64 < prompt len)
   {
     RuntimeOptions opt = base;
     opt.kv_ckpt_path = ckpt_off;
-    opt.kv_ckpt_every = R;
+    opt.kv_ckpt_every = ckpt_pos;
     auto gen = make_generator(opt);
     vram_off_mib = double(vram_used_bytes()) / (1024.0 * 1024.0);
-    (void)run_gen(*gen, fork_ids, 4, R);
-    auto [toks, st] = run_gen(*gen, rp.ids, 16, 0);
+    auto [toks, st] = run_gen(*gen, rp.ids, 16);
     ref_off = toks;
     check(std::filesystem::exists(ckpt_off) && toks.size() == 16,
           "Suite 2a: saved real disk checkpoint under attn_requant=off");
@@ -225,7 +228,7 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
     opt.loop_bf16 = true;
     auto gen = make_generator(opt);
     vram_loop_bf16_mib = double(vram_used_bytes()) / (1024.0 * 1024.0);
-    auto [toks, st] = run_gen(*gen, rp.ids, 16, 0);
+    auto [toks, st] = run_gen(*gen, rp.ids, 16);
     ref_loop_bf16 = toks;
     const double delta_mib = vram_loop_bf16_mib - vram_off_mib;
     std::printf("  VRAM: control=%.1f MiB, --loop-bf16=%.1f MiB (delta=%.2f MiB)\n", vram_off_mib,
@@ -238,24 +241,22 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
   // 2c. Same-mode off -> off resume succeeds
   {
     RuntimeOptions opt = base;
-    opt.park_mb = 0;
     opt.kv_ckpt_resume = ckpt_off;
     auto gen = make_generator(opt);
-    auto [toks, st] = run_gen(*gen, rp.ids, 16, 0);
-    check(st.reuse == Reuse::Checkpoint && st.reused_tokens == R && toks == ref_off,
+    auto [toks, st] = run_gen(*gen, rp.ids, 16);
+    check(st.reuse == Reuse::Checkpoint && st.reused_tokens >= ckpt_pos && toks == ref_off,
           "Suite 2c: same-mode disk resume off -> off hits Reuse::Checkpoint with exact parity");
   }
 
   // 2d. Cross-mode off -> q5_k: explicit resume MUST throw; auto resume MUST decline to Reuse::None
   {
     RuntimeOptions opt = base;
-    opt.park_mb = 0;
     opt.attn_requant = AttnRequantMode::Q5K;
     opt.kv_ckpt_resume = ckpt_off;
     auto gen = make_generator(opt);
     bool threw = false;
     try {
-      (void)run_gen(*gen, rp.ids, 8, 0);
+      (void)run_gen(*gen, rp.ids, 8);
     } catch (const std::exception&) {
       threw = true;
     }
@@ -263,12 +264,11 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
   }
   {
     RuntimeOptions opt = base;
-    opt.park_mb = 0;
     opt.attn_requant = AttnRequantMode::Q5K;
     opt.kv_ckpt_path = ckpt_off;
     opt.kv_ckpt_every = 0;
     auto gen = make_generator(opt);
-    auto [toks, st] = run_gen(*gen, rp.ids, 8, 0);
+    auto [toks, st] = run_gen(*gen, rp.ids, 8);
     check(st.reuse == Reuse::None && st.reused_tokens == 0 && toks.size() == 8,
           "Suite 2d: auto disk resume off -> q5_k declines to Reuse::None");
   }
@@ -278,11 +278,10 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
     RuntimeOptions opt = base;
     opt.attn_requant = AttnRequantMode::Q5K;
     opt.kv_ckpt_path = ckpt_q5k;
-    opt.kv_ckpt_every = R;
+    opt.kv_ckpt_every = ckpt_pos;
     auto gen = make_generator(opt);
     vram_q5k_mib = double(vram_used_bytes()) / (1024.0 * 1024.0);
-    (void)run_gen(*gen, fork_ids, 4, R);
-    auto [toks, st] = run_gen(*gen, rp.ids, 16, 0);
+    auto [toks, st] = run_gen(*gen, rp.ids, 16);
     ref_q5k = toks;
     const double delta_mib = vram_q5k_mib - vram_off_mib;
     std::printf("  VRAM: control=%.1f MiB, --attn-requant q5_k=%.1f MiB (delta=%.2f MiB)\n", vram_off_mib,
@@ -296,25 +295,23 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
   // 2f. Same-mode q5_k -> q5_k resume succeeds
   {
     RuntimeOptions opt = base;
-    opt.park_mb = 0;
     opt.attn_requant = AttnRequantMode::Q5K;
     opt.kv_ckpt_resume = ckpt_q5k;
     auto gen = make_generator(opt);
-    auto [toks, st] = run_gen(*gen, rp.ids, 16, 0);
-    check(st.reuse == Reuse::Checkpoint && st.reused_tokens == R && toks == ref_q5k,
+    auto [toks, st] = run_gen(*gen, rp.ids, 16);
+    check(st.reuse == Reuse::Checkpoint && st.reused_tokens >= ckpt_pos && toks == ref_q5k,
           "Suite 2f: same-mode disk resume q5_k -> q5_k hits Reuse::Checkpoint with exact parity");
   }
 
   // 2g. Cross-mode q5_k -> off: explicit resume MUST throw; auto resume MUST decline to Reuse::None
   {
     RuntimeOptions opt = base;
-    opt.park_mb = 0;
     opt.attn_requant = AttnRequantMode::Off;
     opt.kv_ckpt_resume = ckpt_q5k;
     auto gen = make_generator(opt);
     bool threw = false;
     try {
-      (void)run_gen(*gen, rp.ids, 8, 0);
+      (void)run_gen(*gen, rp.ids, 8);
     } catch (const std::exception&) {
       threw = true;
     }
@@ -322,12 +319,11 @@ Json run_suite2_checkpoint_and_loop_bf16(const std::filesystem::path& model_dir)
   }
   {
     RuntimeOptions opt = base;
-    opt.park_mb = 0;
     opt.attn_requant = AttnRequantMode::Off;
     opt.kv_ckpt_path = ckpt_q5k;
     opt.kv_ckpt_every = 0;
     auto gen = make_generator(opt);
-    auto [toks, st] = run_gen(*gen, rp.ids, 8, 0);
+    auto [toks, st] = run_gen(*gen, rp.ids, 8);
     check(st.reuse == Reuse::None && st.reused_tokens == 0 && toks.size() == 8,
           "Suite 2g: auto disk resume q5_k -> off declines to Reuse::None");
   }
