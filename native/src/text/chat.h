@@ -11,6 +11,7 @@
 //     ...<|content_model_end_sampling|>                                         -> end of turn
 #pragma once
 
+#include "text/json_fsm.h"
 #include "text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
@@ -208,6 +209,11 @@ class ChatFormat {
   // tokenizer.decode(ids, skip_special_tokens=False): lossy UTF-8.
   std::string decode(std::span<const int32_t> ids) const;
   const Tokenizer& tokenizer() const;
+  // Lazily built immutable vocabulary byte index for token-level constrained decoding (thread-safe).
+  std::shared_ptr<const VocabByteIndex> vocab_index() const;
+  // Build a per-request JSON / JSON-Schema token masker primed with prefill_ids (nullptr for None).
+  std::shared_ptr<model::TokenMasker> make_json_masker(const JsonFormatSpec& spec,
+                                                       std::span<const int32_t> prefill_ids) const;
 
  private:
   explicit ChatFormat(std::shared_ptr<const detail::FormatData> data) : data_(std::move(data)) {}

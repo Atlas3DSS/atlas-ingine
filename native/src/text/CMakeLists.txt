@@ -5,6 +5,7 @@ add_library(ingine_text STATIC
   pyjson.cpp
   jinja.cpp
   chat.cpp
+  json_fsm.cpp
 )
 ingine_internal_includes(ingine_text)
 target_include_directories(ingine_text PUBLIC ${PROJECT_SOURCE_DIR}/src)

@@ -911,10 +911,27 @@ void sample_from_probs(const float* probs, int rows, int V, std::int64_t stride,
   CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void apply_bitmask_kernel(const float* __restrict__ src, const std::uint32_t* __restrict__ mask, int V,
+                                       float* __restrict__ dst) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < V; i += blockDim.x * gridDim.x) {
+    const bool allow = ((mask[i >> 5] >> (i & 31)) & 1u) != 0u;
+    dst[i] = allow ? src[i] : -CUDART_INF_F;
+  }
+}
+
 void uniform(int n, SamplerRng& rng, float* out, cudaStream_t stream) {
   require(n >= 0 && (n == 0 || out != nullptr), "bad uniform arguments");
   if (n == 0) return;
   uniform_kernel<<<(n + 255) / 256, 256, 0, stream>>>(n, rng.seed, rng.counter++, out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void apply_bitmask(const float* src, const std::uint32_t* mask, int V, float* dst, cudaStream_t stream) {
+  require(V >= 0 && (V == 0 || (src != nullptr && mask != nullptr && dst != nullptr)), "bad apply_bitmask arguments");
+  if (V == 0) return;
+  constexpr int kThreads = 256;
+  const int blocks = std::min((V + kThreads - 1) / kThreads, 1024);
+  apply_bitmask_kernel<<<blocks, kThreads, 0, stream>>>(src, mask, V, dst);
   CUDA_CHECK(cudaGetLastError());
 }
 

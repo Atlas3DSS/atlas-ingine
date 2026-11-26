@@ -1117,10 +1117,11 @@ class BatchGenerator final : public Generator {
       meta.forced.assign(sampling.forced.begin(), sampling.forced.end());
       meta.forced_idx = 0;
       meta.max_pos = worst_tokens;
+      meta.logit_masker = sampling.logit_masker;
 
       auto* sampled = static_cast<std::int32_t*>(sampled_dev_.p);
-      head::sample(static_cast<const float*>(prefill_logits_.p), 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params,
-                   meta.rng, sampled, stream_);
+      const float* first_logits = apply_slot_mask(static_cast<const float*>(prefill_logits_.p), meta.logit_masker);
+      head::sample(first_logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params, meta.rng, sampled, stream_);
       CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled, sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream_));
       CUDA_CHECK(cudaStreamSynchronize(stream_));
       if (recorded_restore_events) {
@@ -1133,6 +1134,7 @@ class BatchGenerator final : public Generator {
         first_token = meta.forced[0];
         meta.forced_idx = 1;
       }
+      if (meta.logit_masker) meta.logit_masker->advance(first_token);
 
       // Stream is now synchronized: safely publish end-of-prefill checkpoint for future prefix/exact hits.
       if (cache_eligible && L < n) {
@@ -1194,12 +1196,13 @@ class BatchGenerator final : public Generator {
     last_step_batch_ = B;
     for (int i = 0; i < B; ++i) pool_.slot_pos_host[inputs[i].slot] += 1;
 
-    // Fast path: all greedy with identical banned tokens -> single batched argmax launch.
+    // Fast path: all greedy with identical banned tokens and no active logit masker -> single batched argmax launch.
     bool all_greedy = true;
     const head::BannedTokens& b0 = slot_meta_[inputs[0].slot].params.banned;
     for (int i = 0; i < B; ++i) {
-      const head::SamplingParams& sp = slot_meta_[inputs[i].slot].params;
-      if (sp.temperature > 0.0f || !same_banned(sp.banned, b0)) {
+      const SlotMeta& sm = slot_meta_[inputs[i].slot];
+      const head::SamplingParams& sp = sm.params;
+      if (sp.temperature > 0.0f || !same_banned(sp.banned, b0) || (sm.logit_masker && sm.logit_masker->is_active())) {
         all_greedy = false;
         break;
       }
@@ -1211,8 +1214,8 @@ class BatchGenerator final : public Generator {
     } else {
       for (int i = 0; i < B; ++i) {
         SlotMeta& meta = slot_meta_[inputs[i].slot];
-        head::sample(logits + std::size_t(i) * UNPADDED_VOCAB, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params,
-                     meta.rng, sampled + i, stream_);
+        const float* row_logits = apply_slot_mask(logits + std::size_t(i) * UNPADDED_VOCAB, meta.logit_masker);
+        head::sample(row_logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params, meta.rng, sampled + i, stream_);
       }
     }
 
@@ -1224,6 +1227,7 @@ class BatchGenerator final : public Generator {
       SlotMeta& meta = slot_meta_[inputs[i].slot];
       std::int32_t tok = host_out[i];
       if (meta.forced_idx < meta.forced.size()) tok = meta.forced[meta.forced_idx++];
+      if (meta.logit_masker) meta.logit_masker->advance(tok);
       out_tokens[i] = tok;
     }
   }
@@ -1231,6 +1235,7 @@ class BatchGenerator final : public Generator {
   void release_slot(int slot) override {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stream_) CUDA_CHECK(cudaStreamSynchronize(stream_));
+    if (slot >= 0 && slot < int(slot_meta_.size())) slot_meta_[slot].logit_masker.reset();
     pool_.free_slot(slot);
   }
 
@@ -1260,7 +1265,27 @@ class BatchGenerator final : public Generator {
     std::vector<std::int32_t> forced;
     std::size_t forced_idx = 0;
     int max_pos = 0;
+    std::shared_ptr<TokenMasker> logit_masker;
   };
+
+  const float* apply_slot_mask(const float* row_logits, const std::shared_ptr<TokenMasker>& masker) {
+    if (!masker || !masker->is_active()) return row_logits;
+    const std::size_t words = (std::size_t(UNPADDED_VOCAB) + 31u) / 32u;
+    if (mask_host_.size() < words) mask_host_.resize(words);
+    std::fill(mask_host_.begin(), mask_host_.begin() + std::ptrdiff_t(words), 0u);
+    if (!masker->fill_mask(mask_host_.data(), words)) return row_logits;
+    if (!mask_dev_.p || mask_dev_.bytes < words * sizeof(std::uint32_t)) {
+      mask_dev_ = DeviceBuffer(words * sizeof(std::uint32_t));
+    }
+    if (!masked_logits_.p || masked_logits_.bytes < prefill_logits_.bytes) {
+      masked_logits_ = DeviceBuffer(prefill_logits_.bytes);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mask_dev_.p, mask_host_.data(), words * sizeof(std::uint32_t),
+                               cudaMemcpyHostToDevice, stream_));
+    head::apply_bitmask(row_logits, static_cast<const std::uint32_t*>(mask_dev_.p), UNPADDED_VOCAB,
+                        static_cast<float*>(masked_logits_.p), stream_);
+    return static_cast<const float*>(masked_logits_.p);
+  }
 
   int effective_max_new(int prompt_tokens, int max_new_tokens, const Sampling& sampling) const {
     int eff = std::max(0, max_new_tokens);
@@ -1530,6 +1555,8 @@ class BatchGenerator final : public Generator {
   BatchPrefixCache<PrefixCheckpointGpu> prefix_cache_;
   std::unique_ptr<BatchDecoder> decoder_;
   DeviceBuffer chunk_tokens_, prefill_logits_, sampled_dev_;
+  DeviceBuffer masked_logits_, mask_dev_;
+  std::vector<std::uint32_t> mask_host_;
   PinnedHostBuffer sampled_host_;
   std::vector<SlotMeta> slot_meta_;
   bool last_prefill_logits_valid_ = false;

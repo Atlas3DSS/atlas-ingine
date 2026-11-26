@@ -134,21 +134,103 @@ model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, i
   if (on_prefill) on_prefill(stats);
 
   const std::unordered_set<int32_t> stops(stop_ids.begin(), stop_ids.end());
-  const size_t limit = std::min(out.size(), size_t(std::max(max_new_tokens, 0)));
+  const size_t limit = size_t(std::max(max_new_tokens, 0));
   bool cancelled = false;
   int yielded = 0;
-  for (size_t i = 0; i < limit; ++i) {
-    if (token_delay_ > 0) std::this_thread::sleep_for(std::chrono::duration<double>(token_delay_));
-    {
-      std::lock_guard lock(mutex_);
-      calls_[index].yielded = ++yielded;
+
+  if (sampling.logit_masker) {
+    // Honor token-level constrained decoding mask on FakeGenerator too (enables CPU E2E HTTP tests).
+    model::TokenMasker& masker = *sampling.logit_masker;
+    const int V = std::min(masker.vocab_size(), int(tokenizer_.vocab_size()));
+    const size_t words = (size_t(V) + 31u) / 32u;
+    std::vector<std::uint32_t> mask(words, 0u);
+    auto bit_ok = [&](int32_t id) {
+      return id >= 0 && id < V && ((mask[size_t(id) >> 5u] >> (uint32_t(id) & 31u)) & 1u) != 0u;
+    };
+    const int32_t end_msg = tokenizer_.token_id(kEndMessage).value_or(-1);
+    const int32_t end_samp = tokenizer_.token_id(kEndSampling).value_or(-1);
+    size_t src_i = 0;
+    for (size_t step = 0; step < limit; ++step) {
+      int32_t chosen = -1;
+      if (!masker.is_active()) {
+        if (src_i >= out.size()) break;
+        chosen = out[src_i++];
+      } else {
+        std::fill(mask.begin(), mask.end(), 0u);
+        const bool masked = masker.fill_mask(mask.data(), words);
+        if (!masked) {
+          if (src_i >= out.size()) break;
+          chosen = out[src_i++];
+        } else if (src_i < out.size() && bit_ok(out[src_i])) {
+          chosen = out[src_i++];
+        } else {
+          // Deterministically pick a valid minimal token allowed by the FSM bitmask.
+          if (end_samp >= 0 && bit_ok(end_samp)) {
+            chosen = end_samp;
+          } else if (end_msg >= 0 && bit_ok(end_msg)) {
+            chosen = end_msg;
+          } else {
+            // Prefer closing quotes before structural delimiters so open strings terminate immediately.
+            static constexpr const char* kPrefs[] = {"\"", "}", "]", ":", ",", "{", "[", "0", "true", "false", "null", "a"};
+            for (const char* p : kPrefs) {
+              const auto enc = tokenizer_.encode(p, false);
+              if (enc.size() == 1 && bit_ok(enc[0])) {
+                chosen = enc[0];
+                break;
+              }
+            }
+            if (chosen < 0) {
+              for (int32_t id = 0; id < V; ++id) {
+                if (bit_ok(id)) {
+                  const std::string b = tokenizer_.token_bytes(id);
+                  if (!b.empty() && b.size() == 1 && static_cast<unsigned char>(b[0]) >= 0x20 &&
+                      static_cast<unsigned char>(b[0]) < 0x7f) {
+                    chosen = id;
+                    break;
+                  }
+                }
+              }
+            }
+            if (chosen < 0) {
+              for (int32_t id = 0; id < V; ++id) {
+                if (bit_ok(id)) {
+                  chosen = id;
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+      if (chosen < 0) break;
+      masker.advance(chosen);
+      if (token_delay_ > 0) std::this_thread::sleep_for(std::chrono::duration<double>(token_delay_));
+      {
+        std::lock_guard lock(mutex_);
+        calls_[index].yielded = ++yielded;
+      }
+      const bool more = on_tokens(std::span<const int32_t>(&chosen, 1));
+      if (stops.contains(chosen)) break;
+      if (!more) {
+        cancelled = int(step) + 1 < max_new_tokens;
+        break;
+      }
     }
-    const bool more = on_tokens(std::span<const int32_t>(&out[i], 1));
-    if (stops.contains(out[i])) break;
-    if (!more) {
-      // Stop ids and max_new_tokens are handled here as well, so a refusal otherwise means cancellation.
-      cancelled = int(i) + 1 < max_new_tokens;
-      break;
+  } else {
+    const size_t n_emit = std::min(out.size(), limit);
+    for (size_t i = 0; i < n_emit; ++i) {
+      if (token_delay_ > 0) std::this_thread::sleep_for(std::chrono::duration<double>(token_delay_));
+      {
+        std::lock_guard lock(mutex_);
+        calls_[index].yielded = ++yielded;
+      }
+      const bool more = on_tokens(std::span<const int32_t>(&out[i], 1));
+      if (stops.contains(out[i])) break;
+      if (!more) {
+        // Stop ids and max_new_tokens are handled here as well, so a refusal otherwise means cancellation.
+        cancelled = int(i) + 1 < max_new_tokens;
+        break;
+      }
     }
   }
   {

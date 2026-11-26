@@ -62,4 +62,8 @@ void sample_from_probs(const float* probs, int rows, int V, std::int64_t stride,
 // out[i] = uniform in [0, 1), i < n (24-bit resolution, like torch.rand for FP32).
 void uniform(int n, SamplerRng& rng, float* out, cudaStream_t stream);
 
+// Copies one FP32 logits row [V] into dst [V], setting disallowed tokens (bit v == 0 in packed
+// uint32_t bitmask `mask`) to -INFINITY. src and dst may alias.
+void apply_bitmask(const float* src, const std::uint32_t* mask, int V, float* dst, cudaStream_t stream);
+
 }  // namespace ingine::kernels::head

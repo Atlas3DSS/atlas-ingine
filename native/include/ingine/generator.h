@@ -4,6 +4,7 @@
 
 #include "ingine/persona.h"
 #include "ingine/prefix_cache.h"
+#include "ingine/token_masker.h"
 
 #include <algorithm>
 #include <chrono>
@@ -56,6 +57,8 @@ struct Sampling {
   std::span<const int32_t> forced;
   // Optional resolved persona/mech-interp profile for this request (nullptr => unhooked fast path).
   std::shared_ptr<const persona::PersonaProfile> persona;
+  // Optional token-level constrained decoding masker (e.g. JSON / JSON-Schema FSM; nullptr => zero overhead).
+  std::shared_ptr<TokenMasker> logit_masker;
 };
 
 // The token whose embedding an image token replaces (<|unused_200054|>, the chat template's image placeholder).

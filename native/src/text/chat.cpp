@@ -35,6 +35,11 @@ struct RenderCache {
   std::deque<std::shared_ptr<const Entry>> entries;  // most recent first
 };
 
+struct VocabIndexCache {
+  std::once_flag once;
+  std::shared_ptr<const VocabByteIndex> index;
+};
+
 struct FormatData {
   Tokenizer tokenizer;
   JinjaTemplate chat_template;
@@ -44,6 +49,7 @@ struct FormatData {
   std::unordered_set<int32_t> stop_ids;
   std::unordered_map<int32_t, int> content_kind;  // tag id -> StreamParser kind (1 thinking, 2 text, 3 tool json)
   std::unique_ptr<RenderCache> cache = std::make_unique<RenderCache>();
+  std::unique_ptr<VocabIndexCache> vocab_cache = std::make_unique<VocabIndexCache>();
 };
 }  // namespace detail
 
@@ -372,6 +378,19 @@ ChatFormat ChatFormat::load(const std::filesystem::path& model_dir) {
 }
 
 const Tokenizer& ChatFormat::tokenizer() const { return data_->tokenizer; }
+
+std::shared_ptr<const VocabByteIndex> ChatFormat::vocab_index() const {
+  std::call_once(data_->vocab_cache->once, [this] {
+    data_->vocab_cache->index = VocabByteIndex::build(data_->tokenizer, stop_ids());
+  });
+  return data_->vocab_cache->index;
+}
+
+std::shared_ptr<model::TokenMasker> ChatFormat::make_json_masker(const JsonFormatSpec& spec,
+                                                                  std::span<const int32_t> prefill_ids) const {
+  if (spec.mode == JsonFormatMode::None) return nullptr;
+  return make_json_fsm(vocab_index(), spec, prefill_ids);
+}
 
 void ChatFormat::clear_render_cache() const {
   std::lock_guard lock(data_->cache->mu);

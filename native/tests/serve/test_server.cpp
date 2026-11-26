@@ -853,9 +853,16 @@ void test_response_format_and_tool_ban() {
 
   // response_format: text / json_object / json_schema
   CHECK(chat(s->port(), {{"response_format", {{"type", "text"}}}}).status == 200);
+  CHECK(s->gen->calls().back().sampling.logit_masker == nullptr);
   const size_t base_len = s->gen->calls().back().prompt_ids.size();
   r = chat(s->port(), {{"response_format", {{"type", "json_object"}}}});
   CHECK(r.status == 200 && s->gen->calls().back().prompt_ids.size() > base_len);
+  CHECK(s->gen->calls().back().sampling.logit_masker != nullptr);
+  {
+    const std::string content = r.body["choices"][0]["message"]["content"].get<std::string>();
+    const Json parsed = Json::parse(content);
+    CHECK(parsed.is_object());
+  }
   const std::string decoded_obj = g_fmt->decode(s->gen->calls().back().prompt_ids);
   CHECK(decoded_obj.find("single valid JSON object") != std::string::npos);
 
@@ -871,6 +878,19 @@ void test_response_format_and_tool_ban() {
       {"required", Json::array({"polarity", "tags", "scores", "answer"})}};
   r = chat(s->port(), {{"response_format", {{"type", "json_schema"}, {"json_schema", {{"name", "ans"}, {"schema", schema}}}}}});
   CHECK(r.status == 200);
+  CHECK(s->gen->calls().back().sampling.logit_masker != nullptr);
+  {
+    const std::string content = r.body["choices"][0]["message"]["content"].get<std::string>();
+    const Json parsed = Json::parse(content);
+    CHECK(parsed.is_object());
+    CHECK(parsed.contains("polarity") && parsed.contains("tags") && parsed.contains("scores") &&
+          parsed.contains("answer"));
+    const std::string pol = parsed["polarity"].get<std::string>();
+    CHECK(pol == "positive" || pol == "negative" || pol == "neutral" || pol == "mixed");
+    CHECK(parsed["tags"].is_array());
+    CHECK(parsed["scores"].is_object());
+    CHECK(parsed["answer"].is_string());
+  }
   const std::string decoded_schema = g_fmt->decode(s->gen->calls().back().prompt_ids);
   // Compiles into an instance skeleton + field constraints instead of echoing raw JSON Schema meta-object.
   CHECK(decoded_schema.find("\"answer\":\"<string>\"") != std::string::npos);

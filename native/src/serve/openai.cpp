@@ -351,17 +351,25 @@ Json build_schema_skeleton(const Json& node, const Json& root, std::vector<std::
   return nullptr;
 }
 
-// Parses OpenAI response_format ("text", "json_object", "json_schema") and returns a prompt-guided formatting
-// instruction to append to the last user turn when JSON output is requested (empty string for default/text).
-std::string parse_response_format_instruction(const Json& body) {
+struct ParsedResponseFormat {
+  std::string instruction;
+  text::JsonFormatSpec spec;
+};
+
+// Parses OpenAI response_format ("text", "json_object", "json_schema") into both a prompt-guided formatting
+// instruction and a token-level JSON/JSON-Schema FSM spec (None for default/text -> zero overhead).
+ParsedResponseFormat parse_response_format(const Json& body) {
+  ParsedResponseFormat out;
   const Json* rf = get(body, "response_format");
-  if (!rf) return {};
+  if (!rf) return out;
   if (!rf->is_object()) throw BadRequest("'response_format' must be an object", "response_format");
   const std::string* type = string_at(*rf, "type");
   if (!type) throw BadRequest("'response_format.type' must be a string", "response_format");
-  if (*type == "text") return {};
+  if (*type == "text") return out;
   if (*type == "json_object") {
-    return "\n\nRespond with a single valid JSON object only, with no markdown fences or surrounding text.";
+    out.instruction = "\n\nRespond with a single valid JSON object only, with no markdown fences or surrounding text.";
+    out.spec.mode = text::JsonFormatMode::JsonObject;
+    return out;
   }
   if (*type == "json_schema") {
     const auto js_it = rf->find("json_schema");
@@ -374,15 +382,17 @@ std::string parse_response_format_instruction(const Json& body) {
     }
     std::vector<std::string> constraints;
     const Json skeleton = build_schema_skeleton(*schema_it, *schema_it, constraints, "");
-    std::string out =
+    out.instruction =
         "\n\nRespond with a single valid JSON object matching this exact instance structure (replace placeholder values "
         "with your answer; do NOT wrap the output in JSON Schema keywords such as \"type\", \"properties\", "
         "\"required\", or \"additionalProperties\"), with no markdown fences, duplicates, or surrounding text:\n" +
         skeleton.dump();
     if (!constraints.empty()) {
-      out += "\nField constraints:";
-      for (const std::string& c : constraints) out += "\n- " + c;
+      out.instruction += "\nField constraints:";
+      for (const std::string& c : constraints) out.instruction += "\n- " + c;
     }
+    out.spec.mode = text::JsonFormatMode::JsonSchema;
+    out.spec.schema = *schema_it;
     return out;
   }
   throw BadRequest("'response_format.type' must be 'text', 'json_object', or 'json_schema'", "response_format");
@@ -466,7 +476,8 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   const auto messages = body.find("messages");
   const auto tools = body.find("tools");
   static const Json kAbsent;  // null: no messages/tools key (passed by reference, not a deep copy of the body)
-  const std::string rf_suffix = parse_response_format_instruction(body);
+  const ParsedResponseFormat parsed_rf = parse_response_format(body);
+  const std::string& rf_suffix = parsed_rf.instruction;
   const Json& raw_messages = messages == body.end() ? kAbsent : *messages;
   const Json augmented_messages = rf_suffix.empty() ? Json() : append_format_instruction(raw_messages, rf_suffix);
   const Json& effective_messages = rf_suffix.empty() ? raw_messages : augmented_messages;
@@ -514,6 +525,10 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   // When thinking is disabled, ban <|content_thinking|> so the model cannot spontaneously enter a reasoning turn.
   if (!thinking_enabled) {
     req.sampling.banned_tokens.push_back(fmt.content_thinking_id());
+  }
+  // Token-level JSON / JSON-Schema FSM masker (nullptr for default/text -> zero overhead).
+  if (parsed_rf.spec.mode != text::JsonFormatMode::None) {
+    req.sampling.logit_masker = fmt.make_json_masker(parsed_rf.spec, prompt.prefill_ids);
   }
 
   if (const Json* stop = get(body, "stop")) {

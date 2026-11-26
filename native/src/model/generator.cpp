@@ -336,7 +336,7 @@ class EngineGenerator final : public Generator {
           restore_timed = false;
         }
       };
-      if (spec_) {
+      if (spec_ && !sampling.logit_masker) {
         std::int32_t token = sample(static_cast<const float*>(logits_.p), sampling, rng);
         if (!sampling.forced.empty()) token = sampling.forced[0];
         finalize_restore_timing();
@@ -349,6 +349,9 @@ class EngineGenerator final : public Generator {
         }
       } else {
         decode(n, max_new_tokens, sampling, rng, stop_ids, on_tokens, on_prefill, finalize_restore_timing, stats, t);
+        // Constrained decode skips speculative drafter updates; reset drafter so the next unconstrained
+        // --spec request re-syncs cleanly without stale draft rows.
+        if (drafter_ && sampling.logit_masker) drafter_->reset();
       }
       CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
       finalize_restore_timing();
@@ -445,6 +448,65 @@ class EngineGenerator final : public Generator {
     }
     const head::SamplingParams params = to_head_params(sampling);
     auto* sampled = static_cast<std::int32_t*>(token_.p);
+    // Constrained decoding path (response_format json_object / json_schema):
+    // Keeps the captured CUDA decode graph (rt_.run_step(1)) untouched and applies a 25 KiB
+    // bitmask kernel only on steps where logit_masker->is_active() is true (zero masking in thinking).
+    if (sampling.logit_masker) {
+      TokenMasker& masker = *sampling.logit_masker;
+      const std::size_t words = (std::size_t(UNPADDED_VOCAB) + 31u) / 32u;
+      if (mask_host_.size() < words) mask_host_.resize(words);
+      if (!mask_dev_.p || mask_dev_.bytes < words * sizeof(std::uint32_t)) {
+        mask_dev_ = DeviceBuffer(words * sizeof(std::uint32_t));
+      }
+      if (!masked_logits_.p || masked_logits_.bytes < logits_.bytes) {
+        masked_logits_ = DeviceBuffer(logits_.bytes);
+      }
+      auto sample_masked = [&](const float* row_logits, int step_idx) -> std::int32_t {
+        const float* use_logits = row_logits;
+        if (masker.is_active()) {
+          std::fill(mask_host_.begin(), mask_host_.begin() + std::ptrdiff_t(words), 0u);
+          if (masker.fill_mask(mask_host_.data(), words)) {
+            CUDA_CHECK(cudaMemcpyAsync(mask_dev_.p, mask_host_.data(), words * sizeof(std::uint32_t),
+                                       cudaMemcpyHostToDevice, stream));
+            head::apply_bitmask(row_logits, static_cast<const std::uint32_t*>(mask_dev_.p), UNPADDED_VOCAB,
+                                static_cast<float*>(masked_logits_.p), stream);
+            use_logits = static_cast<const float*>(masked_logits_.p);
+          }
+        }
+        head::sample(use_logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, params, rng, sampled, stream);
+        CUDA_CHECK(cudaMemcpyAsync(host_token_.data(), sampled, sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::int32_t tok = *static_cast<const std::int32_t*>(host_token_.data());
+        if (std::size_t(step_idx) < sampling.forced.size()) tok = sampling.forced[std::size_t(step_idx)];
+        return tok;
+      };
+      auto is_stop = [&](std::int32_t tok) {
+        return std::find(stop_ids.begin(), stop_ids.end(), tok) != stop_ids.end();
+      };
+
+      const float* cur_logits = static_cast<const float*>(logits_.p);
+      for (int i = 0; i < max_new_tokens; ++i) {
+        const std::int32_t token = sample_masked(cur_logits, i);
+        if (i == 0) {
+          finalize_restore_timing();
+          stats.prefill_seconds = seconds_since(t);
+          if (on_prefill) on_prefill(stats);
+          t = std::chrono::steady_clock::now();
+        }
+        masker.advance(token);
+        const bool last = i + 1 == max_new_tokens;
+        stats.generated_tokens = i + 1;
+        const std::int32_t out[1] = {token};
+        const bool go_on = on_tokens(out);
+        if (last || is_stop(token) || !go_on) break;
+        tokens_in_state_.push_back(token);
+        CUDA_CHECK(cudaMemcpyAsync(sampled, &token, sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+        rt_.chain_advance(sampled, n + i);
+        cur_logits = rt_.run_step(1);
+      }
+      return;
+    }
+
     // forced replay: the forced tokens on the device; each sampled token is replaced by its forced one
     DeviceBuffer forced;
     if (!sampling.forced.empty()) {
@@ -1298,6 +1360,8 @@ class EngineGenerator final : public Generator {
   std::unique_ptr<SpecLoop> spec_;
   std::unique_ptr<VisionEncoder> vision_;  // image input (RuntimeOptions::vision)
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;
+  DeviceBuffer masked_logits_, mask_dev_;
+  std::vector<std::uint32_t> mask_host_;
   PinnedHostBuffer host_token_;
   // prompt checkpoint (save_checkpoint) — also serves as the fixed device staging buffer for parking
   DeviceBuffer checkpoint_;

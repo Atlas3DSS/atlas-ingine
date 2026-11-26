@@ -3,6 +3,7 @@ ingine_add_test(NAME text_tokenizer SOURCES test_tokenizer.cpp LIBS ingine_text 
 ingine_add_test(NAME text_chat SOURCES test_chat.cpp LIBS ingine_text TIMEOUT 300)
 ingine_add_test(NAME text_stream SOURCES test_stream.cpp LIBS ingine_text TIMEOUT 300)
 ingine_add_test(NAME text_pyjson SOURCES test_pyjson.cpp LIBS ingine_text)
+ingine_add_test(NAME text_json_fsm SOURCES test_json_fsm.cpp LIBS ingine_text)
 # Render cache: incremental renders of growing, edited and interleaved conversations against cold renders.
 ingine_add_test(NAME text_render_cache SOURCES test_render_cache.cpp LIBS ingine_text TIMEOUT 600)
 # Captured chat requests (optional local data): cold vs incremental renders; skipped when no directory is set.
