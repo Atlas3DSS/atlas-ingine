@@ -33,7 +33,7 @@ namespace {
 // order. Here a thread owns MIX_V quads, t + u * MIX_T (the same lane of reference warp w + u * MIX_W), so
 // the same butterflies run once per u and the totals are bit-identical for any MIX_T dividing 576 by 32s.
 constexpr int REF_W = H / 4 / 32;      // 18 reference warps
-constexpr int MIX_T = 192;             // threads per token
+constexpr int MIX_T = 576;             // threads per token
 constexpr int MIX_W = MIX_T / 32;
 constexpr int MIX_V = REF_W / MIX_W;   // channel quads per thread
 static_assert(MIX_T % 32 == 0 && MIX_V * MIX_W == REF_W, "MIX_T must split the 18 reference warps evenly");
