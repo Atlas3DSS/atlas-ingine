@@ -81,7 +81,9 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   kpos_ = i32(kpos_rows_);
   bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
   g16_ = bf16(C * GATE_RANK);
-  wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
+  wscratch_ = (w.dense_fp8 || w.attn_q5_k || w.dense_q8)
+                  ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM))
+                  : nullptr;
   if (loopcd_mode_ == LoopCdMode::LogitsAdaptive) {
     logits_weak_ = f32(UNPADDED_VOCAB);
     loopcd_reduce_ = f32(dense::kLoopCdReduceFloatsPerRow);
@@ -248,6 +250,18 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   };
   // B rows of a Dense matrix as BF16: the matrix itself, or its FP8 rows dequantized (weights.dequant)
   auto bf16_rows = [&](const Dense& d) -> const ActT* {
+    if (d.blocked()) {
+      dense::dequant_blocked(
+          dense::Matrix{d.w.data, nullptr, d.rows(), false, static_cast<const std::int64_t*>(d.blk_off.data),
+                        static_cast<const std::int32_t*>(d.blk_soff.data),
+                        static_cast<const std::uint16_t*>(d.q8_scale.data)},
+          d.cols(), wscratch_, s);
+      return wscratch_;
+    }
+    if (d.q5_k()) {
+      dense::dequant_q5_k_rows(d.w.data, d.rows(), d.cols(), wscratch_, s);
+      return wscratch_;
+    }
     if (!d.fp8()) return bf16p(d.w);
     dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s);
     return wscratch_;
@@ -516,7 +530,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
   auto blocked_head_mat = [&]() {
     const Dense& u = w.unembed;
-    return dense::Matrix{u.w.data, nullptr, UNPADDED_VOCAB, static_cast<const std::int64_t*>(u.blk_off.data),
+    return dense::Matrix{u.w.data, nullptr, UNPADDED_VOCAB, false, static_cast<const std::int64_t*>(u.blk_off.data),
                          static_cast<const std::int32_t*>(u.blk_soff.data),
                          static_cast<const std::uint16_t*>(u.q8_scale.data)};
   };

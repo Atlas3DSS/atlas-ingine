@@ -44,6 +44,7 @@
 // L2: the weight rows are read once per step, so their lines are filled evict-first (kernels/common/l2.cuh):
 // they stop evicting the activations, KV rings and the small kernels' evict-last constants.
 // Ported from engine/csrc/dense/gemv.cu (kernel bodies unchanged; torch launchers -> raw pointers).
+#include "core/q5_k.h"
 #include "kernels/common/mma_sm70.cuh"
 #include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
@@ -80,6 +81,25 @@ struct ProjEpi {
   }
   __device__ const ActT* x_of(int i) const { return xin + size_t(i) * M * H; }
   __device__ void store1(int row, int m, float v) const { out[size_t(m) * R + row] = round_bf16(v); }
+};
+
+template <int M, int KStride>
+struct ProjRawEpi {
+  static constexpr int kInputs = 3;
+  static constexpr bool kScatter = true;
+  const ActT* xin;
+  const int* segments;
+  int nseg, R;
+  float* out;
+  __device__ int input_of(int row) const {
+    for (int s = 0; s < nseg; ++s) {
+      const int b = __ldg(segments + 3 * s), e = __ldg(segments + 3 * s + 1);
+      if (row >= b && row < e) return __ldg(segments + 3 * s + 2);
+    }
+    return -1;
+  }
+  __device__ const ActT* x_of(int i) const { return xin + size_t(i) * M * KStride; }
+  __device__ void store1(int row, int m, float v) const { out[size_t(m) * R + row] = v; }
 };
 
 template <int M>
@@ -708,6 +728,98 @@ __global__ void dequant_blocked_kernel(const uint8_t* __restrict__ w, const std:
   }
 }
 
+// ---- Q5_K streaming GEMV (M = 1..8, K % 256 == 0, exact GGML BlockQ5K 176 B / 256 elems) --------------
+
+__device__ __forceinline__ void q5k_get_scale_min(int j, const uint8_t* q, uint8_t& sc, uint8_t& m) {
+  if (j < 4) {
+    sc = q[j] & 63u;
+    m = q[j + 4] & 63u;
+  } else {
+    sc = static_cast<uint8_t>((q[j + 4] & 0x0Fu) | ((q[j - 4] >> 6) << 4));
+    m = static_cast<uint8_t>((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+  }
+}
+
+template <int K, int M, class Epi>
+__global__ void __launch_bounds__(128) gemv_q5_k_kernel(const uint8_t* __restrict__ w, int rows, uint32_t zero,
+                                                        Epi epi) {
+  static_assert(K % q5k::kBlockElems == 0, "Q5_K GEMV requires K divisible by 256");
+  constexpr int NB = K / q5k::kBlockElems;
+  constexpr size_t ROW_BYTES = size_t(NB) * q5k::kBlockBytes;
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int row = blockIdx.x * 4 + warp;
+  if (row >= rows) return;
+  const int in = epi.input_of(row);
+  if (in < 0) return;
+
+  const ActT* x = epi.x_of(in);
+  const uint8_t* wr = w + size_t(row) * ROW_BYTES;
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+
+  pdl_wait_fenced(zero);
+  pdl_trigger();
+
+  float acc[M];
+#pragma unroll
+  for (int m = 0; m < M; ++m) acc[m] = 0.f;
+
+#pragma unroll 1
+  for (int b = 0; b < NB; ++b) {
+    const uint8_t* blk = wr + size_t(b) * q5k::kBlockBytes;
+    const uint16_t d_bits = *reinterpret_cast<const uint16_t*>(blk);
+    const uint16_t dm_bits = *reinterpret_cast<const uint16_t*>(blk + 2);
+    const float d = __half2float(__ushort_as_half(d_bits));
+    const float dmin = __half2float(__ushort_as_half(dm_bits));
+    uint8_t sc_raw[12];
+#pragma unroll
+    for (int i = 0; i < 12; ++i) sc_raw[i] = __ldg(blk + 4 + i);
+    const uint8_t qh = __ldg(blk + 16 + lane);
+    const uint8_t* qs = blk + 48;
+    const int base = b * q5k::kBlockElems;
+    (void)wpol;
+
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      uint8_t sc0 = 0, m0 = 0, sc1 = 0, m1 = 0;
+      q5k_get_scale_min(2 * c, sc_raw, sc0, m0);
+      q5k_get_scale_min(2 * c + 1, sc_raw, sc1, m1);
+      const float d0 = d * float(sc0);
+      const float dm0 = dmin * float(m0);
+      const float d1 = d * float(sc1);
+      const float dm1 = dmin * float(m1);
+      const uint8_t ql = __ldg(qs + 32 * c + lane);
+      const int q0 = int(ql & 0x0Fu) + ((qh & (1u << (2 * c))) ? 16 : 0);
+      const int q1 = int(ql >> 4) + ((qh & (1u << (2 * c + 1))) ? 16 : 0);
+      const float w0 = fmaf(d0, float(q0), -dm0);
+      const float w1 = fmaf(d1, float(q1), -dm1);
+      const int col0 = base + 64 * c + lane;
+      const int col1 = col0 + 32;
+#pragma unroll
+      for (int m = 0; m < M; ++m) {
+        const ActT* xm = x + size_t(m) * K;
+        const float x0 = act::to_float(__ldg(xm + col0));
+        const float x1 = act::to_float(__ldg(xm + col1));
+        acc[m] = fmaf(w0, x0, acc[m]);
+        acc[m] = fmaf(w1, x1, acc[m]);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int m = 0; m < M; ++m) acc[m] = group_sum<32>(acc[m]);
+
+  if constexpr (Epi::kScatter) {
+    if (lane == 0) {
+#pragma unroll
+      for (int m = 0; m < M; ++m) epi.store1(row, m, acc[m]);
+    }
+  } else {
+    epi.store(row, acc, lane, 0xffffffffu);
+  }
+}
+
 // ---- launch helpers -----------------------------------------------------------------------------------
 
 // BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
@@ -717,6 +829,8 @@ template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, int 
 void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make) {
   const bool fp8 = w.scale != nullptr;
   require(w.w != nullptr && w.rows > 0, "weight matrix is empty");
+  require(!(w.q5_k && fp8), "weight matrix cannot be both Q5_K and FP8");
+  require(!(w.q5_k && w.blk_off), "weight matrix cannot be both Q5_K and block-table");
   const int rows = w.rows;
   const float* sc = w.scale;
   const uint8_t* wp = static_cast<const uint8_t*>(w.w);
@@ -727,6 +841,14 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     if (w.blk_off) {  // block-table matrix (GGUF dense on Volta): every M on the HMMA.884 kernel
       launch_ex(gemv_blk_v70_kernel<K, MM, SPLITK, E, UFP8, UBF16>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl,
                 stream, wp, rows, w.blk_off, w.blk_soff, w.q8_scale, 0u, epi);
+      return;
+    }
+    if (w.q5_k) {
+      if constexpr (K % q5k::kBlockElems == 0) {
+        launch_ex(gemv_q5_k_kernel<K, MM, E>, dim3((rows + 3) / 4), 128, 0, 1, pdl, stream, wp, rows, 0u, epi);
+      } else {
+        require(false, "Q5_K GEMV requires K divisible by 256");
+      }
       return;
     }
     if constexpr (MM == 1 && (BLOCK > 0 || kActIsFP16)) {
@@ -1358,6 +1480,37 @@ void proj(const ActT* xin, int M, Matrix w, const int* segments, int nseg, float
   });
 }
 
+void proj_q5_k_raw_f32(const ActT* xin, int M, int K, Matrix w, const int* segments, int nseg, float* out, bool pdl,
+                       cudaStream_t stream) {
+  require(xin && segments && out && nseg > 0 && w.q5_k && w.w != nullptr && w.rows > 0,
+          "proj_q5_k_raw_f32: bad argument");
+  require(K == H || K == 3072, "proj_q5_k_raw_f32: K must be 2304 or 3072");
+  const int R = w.rows;
+  const uint8_t* wp = static_cast<const uint8_t*>(w.w);
+  auto go = [&](auto mc) {
+    constexpr int MM = decltype(mc)::value;
+    if (K == H) {
+      ProjRawEpi<MM, H> epi{xin, segments, nseg, R, out};
+      launch_ex(gemv_q5_k_kernel<H, MM, ProjRawEpi<MM, H>>, dim3((R + 3) / 4), 128, 0, 1, pdl, stream, wp, R, 0u, epi);
+    } else {
+      ProjRawEpi<MM, 3072> epi{xin, segments, nseg, R, out};
+      launch_ex(gemv_q5_k_kernel<3072, MM, ProjRawEpi<MM, 3072>>, dim3((R + 3) / 4), 128, 0, 1, pdl, stream, wp, R, 0u,
+                epi);
+    }
+  };
+  switch (M) {
+    case 1: go(std::integral_constant<int, 1>{}); break;
+    case 2: go(std::integral_constant<int, 2>{}); break;
+    case 3: go(std::integral_constant<int, 3>{}); break;
+    case 4: go(std::integral_constant<int, 4>{}); break;
+    case 5: go(std::integral_constant<int, 5>{}); break;
+    case 6: go(std::integral_constant<int, 6>{}); break;
+    case 7: go(std::integral_constant<int, 7>{}); break;
+    case 8: go(std::integral_constant<int, 8>{}); break;
+    default: require(false, "proj_q5_k_raw_f32: M must be in 1..8");
+  }
+}
+
 void proj_conv(const ActT* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,
                float* conv_hist, bool pdl, cudaStream_t stream) {
   require(x && conv_w && conv_state && out, "proj_conv: null argument");
@@ -1528,6 +1681,157 @@ void dequant_blocked(const Matrix& w, int K, ActT* out, cudaStream_t stream) {
   require(w.blk_off && w.blk_soff && out, "dequant_blocked: not a block-table matrix");
   dequant_blocked_kernel<<<w.rows, 256, 0, stream>>>(static_cast<const uint8_t*>(w.w), w.blk_off, w.blk_soff, w.q8_scale,
                                                      w.rows, K, out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// 1 warp per GGML BlockQ5K (256 elements): lane l in 0..31 owns element l of all 8 sub-blocks,
+// matching q5k::quantize_block_cpu bit-for-bit with zero shared memory and coalesced 32B stores.
+__global__ void quantize_q5_k_rows_kernel(const ActT* __restrict__ w, int rows, int K, uint8_t* __restrict__ out) {
+  const int nb = K / q5k::kBlockElems;
+  const long long blk_idx = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const long long total_blks = (long long)rows * nb;
+  if (blk_idx >= total_blks) return;
+
+  const int lane = threadIdx.x & 31;
+  const int row = int(blk_idx / nb);
+  const int b = int(blk_idx % nb);
+  const ActT* src = w + (size_t(row) * K + size_t(b) * q5k::kBlockElems);
+  uint8_t* dst = out + size_t(blk_idx) * q5k::kBlockBytes;
+
+  float vals[8];
+  float sb_mn[8];
+  float sb_mx[8];
+  float max_min = 0.f;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const float v = act::to_float(src[j * 32 + lane]);
+    vals[j] = v;
+    float mn = fminf(0.f, v);
+    float mx = fmaxf(0.f, v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, o));
+      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    }
+    sb_mn[j] = mn;
+    sb_mx[j] = mx;
+    max_min = fmaxf(max_min, -mn);
+  }
+
+  const __half dm_h = __float2half_rn(__fdiv_rn(max_min, 63.0f));
+  const float dm_val = __half2float(dm_h);
+
+  uint8_t m_q[8];
+  float need_sc[8];
+  float max_scale = 0.f;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int mq = (dm_val > 0.f) ? min(63, max(0, int(ceilf(__fdiv_rn(-sb_mn[j], dm_val))))) : 0;
+    m_q[j] = static_cast<uint8_t>(mq);
+    const float eff_m = dm_val * float(mq);
+    const float sc = fmaxf(0.f, __fdiv_rn(sb_mx[j] + eff_m, 31.0f));
+    need_sc[j] = sc;
+    max_scale = fmaxf(max_scale, sc);
+  }
+
+  const __half d_h = __float2half_rn(__fdiv_rn(max_scale, 63.0f));
+  const float d_val = __half2float(d_h);
+
+  uint8_t sc_q[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int sq = (d_val > 0.f) ? min(63, max(0, int(ceilf(__fdiv_rn(need_sc[j], d_val))))) : 0;
+    sc_q[j] = static_cast<uint8_t>(sq);
+  }
+
+  if (lane == 0) {
+    *reinterpret_cast<uint16_t*>(dst) = __half_as_ushort(d_h);
+    *reinterpret_cast<uint16_t*>(dst + 2) = __half_as_ushort(dm_h);
+    for (int j = 0; j < 4; ++j) {
+      dst[4 + j] = static_cast<uint8_t>((sc_q[j] & 63u) | ((sc_q[j + 4] >> 4) << 6));
+      dst[8 + j] = static_cast<uint8_t>((m_q[j] & 63u) | ((m_q[j + 4] >> 4) << 6));
+      dst[12 + j] = static_cast<uint8_t>((sc_q[j + 4] & 0x0Fu) | ((m_q[j + 4] & 0x0Fu) << 4));
+    }
+  }
+
+  uint8_t qh_byte = 0;
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const int j0 = 2 * c;
+    const int j1 = 2 * c + 1;
+    const float eff_s0 = d_val * float(sc_q[j0]);
+    const float eff_m0 = dm_val * float(m_q[j0]);
+    const float eff_s1 = d_val * float(sc_q[j1]);
+    const float eff_m1 = dm_val * float(m_q[j1]);
+    const float inv_s0 = (eff_s0 > 0.f) ? (1.0f / eff_s0) : 0.f;
+    const float inv_s1 = (eff_s1 > 0.f) ? (1.0f / eff_s1) : 0.f;
+    const int q0 = (inv_s0 > 0.f) ? min(31, max(0, int(rintf((vals[j0] + eff_m0) * inv_s0)))) : 0;
+    const int q1 = (inv_s1 > 0.f) ? min(31, max(0, int(rintf((vals[j1] + eff_m1) * inv_s1)))) : 0;
+    dst[48 + 32 * c + lane] = static_cast<uint8_t>((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+    if (q0 & 0x10) qh_byte |= static_cast<uint8_t>(1u << (2 * c));
+    if (q1 & 0x10) qh_byte |= static_cast<uint8_t>(1u << (2 * c + 1));
+  }
+  dst[16 + lane] = qh_byte;
+}
+
+__global__ void dequant_q5_k_rows_kernel(const uint8_t* __restrict__ q, int rows, int K, ActT* __restrict__ out) {
+  const int nb = K / q5k::kBlockElems;
+  const long long blk_idx = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const long long total_blks = (long long)rows * nb;
+  if (blk_idx >= total_blks) return;
+
+  const int lane = threadIdx.x & 31;
+  const int row = int(blk_idx / nb);
+  const int b = int(blk_idx % nb);
+  const uint8_t* blk = q + size_t(blk_idx) * q5k::kBlockBytes;
+  ActT* dst = out + (size_t(row) * K + size_t(b) * q5k::kBlockElems);
+
+  const float d = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(blk)));
+  const float dmin = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(blk + 2)));
+  uint8_t sc_raw[12];
+#pragma unroll
+  for (int i = 0; i < 12; ++i) sc_raw[i] = __ldg(blk + 4 + i);
+  const uint8_t qh = __ldg(blk + 16 + lane);
+  const uint8_t* qs = blk + 48;
+
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    uint8_t sc0 = 0, m0 = 0, sc1 = 0, m1 = 0;
+    q5k_get_scale_min(2 * c, sc_raw, sc0, m0);
+    q5k_get_scale_min(2 * c + 1, sc_raw, sc1, m1);
+    const float d0 = d * float(sc0);
+    const float dm0 = dmin * float(m0);
+    const float d1 = d * float(sc1);
+    const float dm1 = dmin * float(m1);
+    const uint8_t ql = __ldg(qs + 32 * c + lane);
+    const int q0 = int(ql & 0x0Fu) + ((qh & (1u << (2 * c))) ? 16 : 0);
+    const int q1 = int(ql >> 4) + ((qh & (1u << (2 * c + 1))) ? 16 : 0);
+    dst[64 * c + lane] = act::from_float(fmaf(d0, float(q0), -dm0));
+    dst[64 * c + 32 + lane] = act::from_float(fmaf(d1, float(q1), -dm1));
+  }
+}
+
+void quantize_q5_k_rows(const ActT* w, int rows, int K, void* q, cudaStream_t stream) {
+  require(w && q && rows >= 0 && K > 0 && (K % q5k::kBlockElems) == 0,
+          "quantize_q5_k_rows: K must be a positive multiple of 256");
+  const long long total_blks = (long long)rows * (K / q5k::kBlockElems);
+  if (total_blks > 0) {
+    // 8 warps = 256 threads per CTA -> 8 super-blocks per CTA
+    quantize_q5_k_rows_kernel<<<unsigned((total_blks + 7) / 8), 256, 0, stream>>>(
+        w, rows, K, static_cast<uint8_t*>(q));
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void dequant_q5_k_rows(const void* q, int rows, int K, ActT* out, cudaStream_t stream) {
+  require(q && out && rows >= 0 && K > 0 && (K % q5k::kBlockElems) == 0,
+          "dequant_q5_k_rows: K must be a positive multiple of 256");
+  const long long total_blks = (long long)rows * (K / q5k::kBlockElems);
+  if (total_blks > 0) {
+    dequant_q5_k_rows_kernel<<<unsigned((total_blks + 7) / 8), 256, 0, stream>>>(
+        static_cast<const uint8_t*>(q), rows, K, out);
+  }
+  CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace ingine::kernels::dense

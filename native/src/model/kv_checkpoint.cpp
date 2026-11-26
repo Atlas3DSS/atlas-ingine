@@ -583,6 +583,11 @@ std::array<std::uint8_t, 32> compute_disk_producer_sha256(const StateIdentity& i
     ctx.update(&identity.loopcd_mode, sizeof(identity.loopcd_mode));
     ctx.update(&identity.loopcd_omega_bits, sizeof(identity.loopcd_omega_bits));
   }
+  if (identity.attn_requant != 0u) {
+    static constexpr char kAttnRequantDomain[] = "ATTNREQ";
+    ctx.update(kAttnRequantDomain, sizeof(kAttnRequantDomain) - 1);
+    ctx.update(&identity.attn_requant, sizeof(identity.attn_requant));
+  }
   return ctx.finish();
 }
 

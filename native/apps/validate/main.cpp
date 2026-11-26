@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -65,13 +66,23 @@ struct Args {
   double max_kl = 0.25;
   double max_mean_kl = 0.01;
   double min_top1 = 0.95;
+  bool loop_bf16 = false;
+  std::string attn_requant = "off";
+  int offload_vram_mb = 0;
+  int offload_ram_mb = 12288;
+  std::string offload_mode = "auto";
+  int expert_swaps = 0;
+  bool force_no_dense_fp8 = false;
+  fs::path stage_digests;  // optional --stage-digests FILE: per-stage FNV-1a-64 over raw FP32 logits
 };
 
 void usage() {
   std::printf(
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec]]\n"
       "                       [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
-      "                       [--min-top1 F]\n"
+      "                       [--min-top1 F] [--loop-bf16] [--attn-requant off|q5_k] [--offload-vram-mb N]\n"
+      "                       [--offload-ram-mb N] [--offload-mode auto|dma-lru|uva] [--expert-swaps N] [--no-dense-fp8]\n"
+      "                       [--stage-digests FILE]\n"
       "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
       "plain-projection file the goldens of the abliterated model were made with\n");
 }
@@ -128,11 +139,48 @@ struct Totals {
   }
 };
 
-void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cases, Totals& tot) {
+std::uint64_t fnv1a64_floats(const std::vector<float>& v) {
+  std::uint64_t h = 14695981039346656037ull;
+  const auto* p = reinterpret_cast<const std::uint8_t*>(v.data());
+  const std::size_t n = v.size() * sizeof(float);
+  for (std::size_t i = 0; i < n; ++i) {
+    h ^= static_cast<std::uint64_t>(p[i]);
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& cases, Totals& tot,
+                std::ofstream* digest_out) {
   Runtime rt(opt);
   Prefiller prefiller(rt.weights(), rt.ablation(), opt.prefill_chunk, rt.stream());
   DeviceBuffer tokens(std::size_t(opt.prefill_chunk) * 4), logits(std::size_t(UNPADDED_VOCAB) * 4);
   std::vector<float> host(UNPADDED_VOCAB);
+  std::size_t peak_vram_bytes = 0;
+  auto sample_vram = [&]() {
+    std::size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b > free_b) {
+      peak_vram_bytes = std::max(peak_vram_bytes, total_b - free_b);
+    }
+  };
+  sample_vram();
+  auto record_digest = [&](const std::string& name, int stage_idx) {
+    if (!digest_out || !*digest_out) return;
+    int arg = 0;
+    float mx = -INFINITY;
+    for (std::size_t i = 0; i < host.size(); ++i) {
+      if (host[i] > mx) {
+        mx = host[i];
+        arg = static_cast<int>(i);
+      }
+    }
+    std::uint32_t mx_bits = 0;
+    std::memcpy(&mx_bits, &mx, sizeof(mx_bits));
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "%s %d %016llx %d %08x\n", name.c_str(), stage_idx,
+                  static_cast<unsigned long long>(fnv1a64_floats(host)), arg, mx_bits);
+    (*digest_out) << buf;
+  };
   auto fetch = [&](const float* d) {
     CUDA_CHECK(cudaMemcpyAsync(host.data(), d, host.size() * 4, cudaMemcpyDeviceToHost, rt.stream()));
     CUDA_CHECK(cudaStreamSynchronize(rt.stream()));
@@ -148,6 +196,8 @@ void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& ca
                     nullptr);
     }
     fetch(static_cast<const float*>(logits.p));
+    sample_vram();
+    record_digest(name, 0);
     const Stage pre = compare(c.at("prefill"), host);
     tot.add(pre);
     std::printf("%-22s prefill (%5zu tokens): KL %.3e  top1 %s  max|dlogit| %.4f\n", name.c_str(), ids.size(), pre.kl,
@@ -157,6 +207,7 @@ void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& ca
     for (const auto& step : c.at("decode")) {
       const float* d = rt.decode_logits(step.at("input_token").get<std::int32_t>(), step.at("pos").get<int>());
       fetch(d);
+      record_digest(name, steps + 1);
       const Stage s = compare(step, host);
       tot.add(s);
       sum_kl += s.kl;
@@ -165,9 +216,25 @@ void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& ca
       agree += s.top1;
       ++steps;
     }
+    sample_vram();
     std::printf("%-22s decode  (%2d steps):     KL mean %.3e max %.3e  top1 %d/%d  max|dlogit| %.4f\n", name.c_str(),
                 steps, steps ? sum_kl / steps : 0.0, max_kl, agree, steps, max_diff);
   }
+  std::printf("  [group_telemetry] actual_peak_vram=%.1f MiB", double(peak_vram_bytes) / (1024.0 * 1024.0));
+  if (rt.weights().expert_cache) {
+    const auto& st = rt.weights().expert_cache->stats();
+    std::printf(
+        " | expert_cache: hot=%d warm=%d cold=%d swaps_cap=%d hot_hits=%llu lru_hits=%llu warm_fetches=%llu "
+        "cold_fetches=%llu swaps_queued=%llu swaps_done=%llu hot_evict=%llu qdrop=%llu edrop=%llu",
+        st.hot_experts, st.warm_experts, st.cold_experts, st.expert_swaps_cap,
+        static_cast<unsigned long long>(st.hot_hits), static_cast<unsigned long long>(st.lru_hits),
+        static_cast<unsigned long long>(st.warm_fetches), static_cast<unsigned long long>(st.cold_fetches),
+        static_cast<unsigned long long>(st.async_swaps_queued),
+        static_cast<unsigned long long>(st.async_swaps_completed), static_cast<unsigned long long>(st.hot_evictions),
+        static_cast<unsigned long long>(st.async_swaps_dropped_bound),
+        static_cast<unsigned long long>(st.experts_dropped));
+  }
+  std::printf("\n");
 }
 
 // A fresh Generator per case: the golden prompts share prefixes (t300 starts t2100 starts t5000), and a Generator
@@ -297,6 +364,14 @@ int main(int argc, char** argv) {
     else if (k == "--max-kl") a.max_kl = std::stod(val());
     else if (k == "--max-mean-kl") a.max_mean_kl = std::stod(val());
     else if (k == "--min-top1") a.min_top1 = std::stod(val());
+    else if (k == "--loop-bf16") a.loop_bf16 = true;
+    else if (k == "--attn-requant") a.attn_requant = val();
+    else if (k == "--offload-vram-mb") a.offload_vram_mb = std::stoi(val());
+    else if (k == "--offload-ram-mb") a.offload_ram_mb = std::stoi(val());
+    else if (k == "--offload-mode") a.offload_mode = val();
+    else if (k == "--expert-swaps") a.expert_swaps = std::stoi(val());
+    else if (k == "--no-dense-fp8") a.force_no_dense_fp8 = true;
+    else if (k == "--stage-digests") a.stage_digests = val();
     else {
       usage();
       return k == "--help" || k == "-h" ? 0 : 2;
@@ -327,20 +402,31 @@ int main(int argc, char** argv) {
     }
     Totals tot;
     Gaps gaps;
+    std::ofstream digest_out;
+    if (!a.stage_digests.empty()) {
+      digest_out.open(a.stage_digests, std::ios::trunc);
+      if (!digest_out) throw std::runtime_error("cannot open --stage-digests " + a.stage_digests.string());
+    }
     for (const auto& [key, cases] : groups) {
       RuntimeOptions opt;
       opt.model_dir = a.model_dir;
       opt.ablation = key.first ? a.ablation : fs::path();
       opt.kv_fp8 = key.second;
-      opt.dense_fp8 = manifest.value("dense_fp8", true);
+      opt.dense_fp8 = a.force_no_dense_fp8 ? false : manifest.value("dense_fp8", true);
       opt.max_ctx = manifest.value("max_ctx", 8192);
       opt.prefill_chunk = manifest.value("prefill_chunk", 2048);
       opt.spec = a.generate && a.spec;
+      opt.loop_bf16 = a.loop_bf16;
+      opt.attn_requant = parse_attn_requant_mode(a.attn_requant);
+      opt.offload_vram_mb = a.offload_vram_mb;
+      opt.offload_ram_mb = a.offload_ram_mb;
+      opt.offload_mode = a.offload_mode;
+      opt.expert_swaps = a.expert_swaps;
       std::printf("== %s model, %s full-attention KV\n", key.first ? "abliterated" : "original",
                   key.second ? "FP8" : "BF16");
       if (a.path_tokens > 0) run_path(opt, cases, a, tot, gaps);
       else if (a.generate) run_generate(opt, cases, tot);
-      else run_pieces(opt, cases, tot);
+      else run_pieces(opt, cases, tot, digest_out.is_open() ? &digest_out : nullptr);
     }
     const double top1 = tot.stages ? double(tot.top1) / tot.stages : 0.0;
     const double mean_kl = tot.stages ? tot.sum_kl / tot.stages : 0.0;

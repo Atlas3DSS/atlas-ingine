@@ -249,7 +249,7 @@ const ActT* bf16p(const Tensor& t) { return static_cast<const ActT*>(t.data); }
 const ActT* bf16p(const void* p) { return static_cast<const ActT*>(p); }
 
 dense::Matrix matrix(const Dense& d) {
-  return dense::Matrix{d.w.data, static_cast<const float*>(d.scale.data), d.rows(),
+  return dense::Matrix{d.w.data, static_cast<const float*>(d.scale.data), d.rows(), d.q5_k(),
                        static_cast<const std::int64_t*>(d.blk_off.data), static_cast<const std::int32_t*>(d.blk_soff.data),
                        static_cast<const std::uint16_t*>(d.q8_scale.data)};
 }

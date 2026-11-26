@@ -27,6 +27,7 @@ struct StateIdentity {
   int loop_passes = 3;                          // recurrent loop passes (1..8, default 3)
   std::uint8_t loopcd_mode = 0;                 // 0 = off, 1 = logits-adaptive, 2 = hidden
   std::uint32_t loopcd_omega_bits = 0;          // IEEE-754 float bits of effective loopcd omega (0 when off)
+  std::uint8_t attn_requant = 0;                // 0 = off, 1 = q5_k (#888 opt-in attention requantization)
   int max_ctx = 0;
   int prefill_chunk = 0;
   bool spec_enabled = false;
@@ -59,6 +60,7 @@ inline std::uint64_t hash_state_identity(const StateIdentity& id) noexcept {
   h = detail::fnv1a_mix(h, &id.loop_passes, sizeof(id.loop_passes));
   h = detail::fnv1a_mix(h, &id.loopcd_mode, sizeof(id.loopcd_mode));
   h = detail::fnv1a_mix(h, &id.loopcd_omega_bits, sizeof(id.loopcd_omega_bits));
+  h = detail::fnv1a_mix(h, &id.attn_requant, sizeof(id.attn_requant));
   h = detail::fnv1a_mix(h, &id.max_ctx, sizeof(id.max_ctx));
   h = detail::fnv1a_mix(h, &id.prefill_chunk, sizeof(id.prefill_chunk));
   h = detail::fnv1a_mix(h, &id.spec_enabled, sizeof(id.spec_enabled));

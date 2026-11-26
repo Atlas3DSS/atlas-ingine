@@ -562,6 +562,34 @@ int main() {
     info_l5.num_full_slots = 12;
     expect(kv_checkpoint_runtime_matches(info_l5, lp5), "runtime match same loop_passes=5");
     expect(!kv_checkpoint_runtime_matches(info_l5, lp3), "runtime reject loop_passes=5 ckpt on L=3 engine");
+    // #888 bidirectional disk-checkpoint & prefix-reuse isolation for --attn-requant off <-> q5_k
+    StateIdentity id_off = lp3;
+    id_off.attn_requant = static_cast<std::uint8_t>(AttnRequantMode::Off);
+    StateIdentity id_q5 = id_off;
+    id_q5.attn_requant = static_cast<std::uint8_t>(AttnRequantMode::Q5K);
+    const auto sha_off = compute_disk_producer_sha256(id_off);
+    const auto sha_q5 = compute_disk_producer_sha256(id_q5);
+    expect(sha_off != sha_q5, "producer SHA distinguishes attn_requant off vs q5_k");
+    KvCheckpointInfo ckpt_off;
+    ckpt_off.pos = 128;
+    ckpt_off.act_dtype = static_cast<std::uint32_t>(ingine::DType::BF16);
+    ckpt_off.kv_format = 0u;
+    ckpt_off.kv_cache_mode = KvCacheMode::PerPass;
+    ckpt_off.loop_passes = PASSES;
+    ckpt_off.num_full_slots = NUM_FULL_VISITS;
+    ckpt_off.has_logits = true;
+    ckpt_off.has_producer_identity = true;
+    ckpt_off.producer_sha256 = sha_off;
+    KvCheckpointInfo ckpt_q5 = ckpt_off;
+    ckpt_q5.producer_sha256 = sha_q5;
+    expect(kv_checkpoint_auto_resume_eligible(ckpt_off, id_off, sha_off, 256, 8192, false),
+           "disk ckpt off->off eligible");
+    expect(kv_checkpoint_auto_resume_eligible(ckpt_q5, id_q5, sha_q5, 256, 8192, false),
+           "disk ckpt q5_k->q5_k eligible");
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_off, id_q5, sha_q5, 256, 8192, false),
+           "disk ckpt off->q5_k rejected");
+    expect(!kv_checkpoint_auto_resume_eligible(ckpt_q5, id_off, sha_off, 256, 8192, false),
+           "disk ckpt q5_k->off rejected");
 #endif
   }
   for (int L = 1; L <= MAX_PASSES; ++L) {

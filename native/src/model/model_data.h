@@ -213,18 +213,21 @@ inline T* ptr(const Tensor& t) {
 
 // ----------------------------------------------------------------------------------------------- weights
 
-// A dense matrix as the decoder stores it: BF16 rows, or float8_e4m3fn rows with FP32 per-row scales
-// (`scale.data != nullptr`; value = fp8 * scale, see weights.dequant / dense fp8_rows).
+// A dense matrix as the decoder stores it: BF16/FP16 rows, float8_e4m3fn rows with FP32 per-row scales
+// (`scale.data != nullptr`; value = fp8 * scale), or packed GGML Q5_K super-blocks (`is_q5_k == true`,
+// 176 bytes per 256 elements; w is U8 [rows, (cols / 256) * 176]).
 struct Dense {
-  Tensor w;      // [rows, cols] bf16 or fp8 (a block-table matrix: the byte arena, shape for rows() / cols() only)
-  Tensor scale;  // [rows] fp32, or empty (data == nullptr) for BF16
+  Tensor w;      // [rows, cols] bf16/fp8, [rows, (cols/256)*176] u8 for Q5_K, or byte arena for block-table GGUF
+  Tensor scale;  // [rows] fp32, or empty (data == nullptr) for BF16/Q5_K/blocked
+  bool is_q5_k = false;
   // GGUF dense on Volta (weights_gguf.cpp): a format per 16-row block. blk_off int64 [rows / 16] byte offset of the
   // block in w; blk_soff int32 [rows / 16] offset of its Q8_0 FP16 scales in q8_scale (-1: activation-type rows).
   Tensor blk_off, blk_soff, q8_scale;
   bool fp8() const { return scale.data != nullptr; }
+  bool q5_k() const { return is_q5_k; }
   bool blocked() const { return blk_off.data != nullptr; }
   int rows() const { return w.ne[1]; }
-  int cols() const { return w.ne[0]; }
+  int cols() const { return is_q5_k ? (w.ne[0] / 176) * 256 : w.ne[0]; }
 };
 
 // GGUF_Q5L / GGUF_IQ4: experts of GGUF files (weights_gguf.cpp), 32-value groups. Codes: 4 bits a value (value 2i in
@@ -323,6 +326,8 @@ struct Weights {
   int vocab_begin = 0, vocab_rows = UNPADDED_VOCAB;
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
   bool dense_q8 = false;      // wproj / wo are block-table matrices with Q8_0 blocks (GGUF on Volta)
+  bool attn_q5_k = false;     // wproj (+ views) and wo are GGML Q5_K super-blocks (--attn-requant q5_k)
+  bool loop_bf16 = false;     // unused FP32 controller & router duplicates elided (--loop-bf16)
   bool embed_q4() const { return embed.dtype == DType::U8; }
   bool embed_q8() const { return embed.dtype == DType::I8; }  // GGUF Q8_0 rows [VOCAB, 2448] (weights_gguf.cpp)
   std::shared_ptr<ExpertCache> expert_cache;  // non-null when tiered MoE offloading is enabled

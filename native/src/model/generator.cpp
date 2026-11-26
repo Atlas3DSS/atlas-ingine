@@ -161,6 +161,7 @@ class EngineGenerator final : public Generator {
 
   int loop_passes() const override { return options_.loop_passes; }
   LoopCdMode loopcd_mode() const override { return options_.loopcd_mode; }
+  AttnRequantMode attn_requant_mode() const override { return options_.attn_requant; }
 
   std::string offload_summary() const override {
     std::string out;
@@ -244,6 +245,7 @@ class EngineGenerator final : public Generator {
     } else {
       base_identity_.loopcd_omega_bits = 0u;
     }
+    base_identity_.attn_requant = static_cast<std::uint8_t>(options_.attn_requant);
     base_identity_.max_ctx = options_.max_ctx;
     base_identity_.prefill_chunk = options_.prefill_chunk;
     base_identity_.spec_enabled = (drafter_ != nullptr);
@@ -1525,6 +1527,32 @@ void validate_loopcd_options(const RuntimeOptions& options) {
   }
 }
 
+void validate_small_card_options(const RuntimeOptions& options) {
+  if (options.expert_swaps < 0) {
+    throw std::invalid_argument("--expert-swaps must be >= 0");
+  }
+  if (options.expert_swaps > 0) {
+    if (options.offload_vram_mb <= 0) {
+      throw std::invalid_argument("--expert-swaps > 0 requires --offload-vram-mb > 0 or --atlas-6g");
+    }
+    if (options.offload_mode == "uva") {
+      throw std::invalid_argument(
+          "--expert-swaps > 0 is not supported with --offload-mode uva (use auto or dma-lru)");
+    }
+    if (options.max_batch > 1) {
+      throw std::invalid_argument("--expert-swaps > 0 currently requires --max-batch 1");
+    }
+  }
+  if (options.attn_requant != AttnRequantMode::Off) {
+    if (options.max_batch > 1) {
+      throw std::invalid_argument("--attn-requant q5_k currently requires --max-batch 1");
+    }
+#if INGINE_TP_SIZE > 1
+    throw std::invalid_argument("--attn-requant q5_k currently requires TP=1");
+#endif
+  }
+}
+
 }  // namespace
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
@@ -1547,6 +1575,7 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
     throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
   }
   validate_loopcd_options(options);
+  validate_small_card_options(options);
   if (!options.dflash2_dir.empty()) {
     if (!options.spec) {
       throw std::invalid_argument("--dflash2-dir requires --spec");
@@ -1590,6 +1619,7 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options, Weights
     throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
   }
   validate_loopcd_options(options);
+  validate_small_card_options(options);
   if (!options.dflash2_dir.empty()) {
     if (!options.spec) {
       throw std::invalid_argument("--dflash2-dir requires --spec");

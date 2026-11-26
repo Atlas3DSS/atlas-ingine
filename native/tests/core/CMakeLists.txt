@@ -6,6 +6,7 @@ ingine_add_test(NAME core_oracle_precision_bf16 SOURCES test_scalar_oracle_preci
 target_compile_definitions(core_oracle_precision_bf16 PRIVATE INGINE_BACKEND_CUDA=0 INGINE_BACKEND_CPU=1 INGINE_ACT_FP16=0)
 ingine_add_test(NAME core_oracle_precision_fp16 SOURCES test_scalar_oracle_precision.cpp)
 target_compile_definitions(core_oracle_precision_fp16 PRIVATE INGINE_BACKEND_CUDA=0 INGINE_BACKEND_CPU=1 INGINE_ACT_FP16=1)
+ingine_add_test(NAME core_small_card_888 SOURCES test_small_card_888.cpp LIBS ingine_core)
 if(INGINE_BACKEND STREQUAL "CUDA")
   ingine_add_test(NAME hal_embed_q4_parity SOURCES test_embed_q4_parity.cpp LIBS ingine_ops ingine_core CUDA::cudart
                   GPU ORACLE)

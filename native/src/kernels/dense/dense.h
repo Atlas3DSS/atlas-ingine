@@ -15,11 +15,13 @@
 
 namespace ingine::kernels::dense {
 
-// A weight matrix [rows, K]: BF16 rows (scale == nullptr) or float8_e4m3fn rows with fp32 per-row scales.
+// A weight matrix [rows, K]: BF16/FP16 rows (scale == nullptr && !q5_k), float8_e4m3fn rows with fp32 per-row
+// scales (scale != nullptr), or packed GGML Q5_K super-blocks (q5_k == true, 176 B / 256 elems, scale == nullptr).
 struct Matrix {
   const void* w = nullptr;
   const float* scale = nullptr;
   int rows = 0;
+  bool q5_k = false;
   // Optional 16-row-block table (GGUF dense weights, Volta): block b's rows start at w + blk_off[b]; blk_soff[b] >= 0:
   // Q8_0 rows (int8 [16, K] + FP16 scales q8_scale[blk_soff[b] + r (K / 32) + k / 32]), -1: activation-type rows,
   // <= -2: int8 codes with FP32 scales a 16 columns (Q6_K rows) at ((const float*)(q8_scale + (-2 - blk_soff[b])))
@@ -33,6 +35,11 @@ struct Matrix {
 // input index); out fp32 [M, R] = bf16(w[r] . xin[seg(r).input, m]), R = w.rows.
 void proj(const ActT* xin, int M, Matrix w, const int* segments, int nseg, float* out, bool pdl,
           cudaStream_t stream);
+
+// Diagnostic raw pre-ActT FP32 accumulator output for Q5_K proj (K=2304) and proj_conv (K=3072).
+// Runs the identical gemv_q5_k_kernel accumulation loop without the epilogue round_bf16/ActT cast.
+void proj_q5_k_raw_f32(const ActT* xin, int M, int K, Matrix w, const int* segments, int nseg, float* out, bool pdl,
+                       cudaStream_t stream);
 
 // proj_conv: attention output projection (w [H, 3072]) + post-attention conv with state update.
 // x bf16 [M, 3072]; conv_w fp32 [H, 4]; conv_state fp32 [3, H]; out fp32 [M, H]; conv_hist fp32 [M, H]
@@ -78,6 +85,11 @@ void fp8_rows(const ActT* w, int rows, int K, void* q, float* scale, cudaStream_
 void dequant_rows(const void* q, const float* scale, int rows, int K, ActT* out, cudaStream_t stream);
 // dequant_blocked: a block-table matrix (Matrix::blk_off) as activation-type rows [rows, K] (Q8_0: act(q * d)).
 void dequant_blocked(const Matrix& w, int K, ActT* out, cudaStream_t stream);
+
+// quantize_q5_k_rows / dequant_q5_k_rows: GGML Q5_K super-block (176 B / 256 elems, K % 256 == 0)
+// load-time requantization and prefill dequantization into ActT scratch.
+void quantize_q5_k_rows(const ActT* w, int rows, int K, void* q, cudaStream_t stream);
+void dequant_q5_k_rows(const void* q, int rows, int K, ActT* out, cudaStream_t stream);
 
 // router: x bf16 [M, H]; w [128, H] fp32 (w_fp32) or bf16 holding BF16 values; bias fp32 [128];
 // idx int32 [M, 8] (descending score), wts fp32 [M, 8] = 8 s / (sum s + 1e-20).

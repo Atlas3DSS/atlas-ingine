@@ -10,6 +10,7 @@
 
 #include "core/act.h"
 #include "core/device.h"
+#include "core/q5_k.h"
 #include "core/safetensors.h"
 #include "kernels/dense/dense.h"
 #include "model/kv_checkpoint.h"
@@ -266,20 +267,35 @@ Dense to_fp8(Loader& ld, const Tensor& bf16, int rows, int cols) {
   void* q = ld.alloc(std::size_t(rows) * cols);
   float* s = static_cast<float*>(ld.alloc(std::size_t(rows) * 4));
   kernels::dense::fp8_rows(static_cast<const ActT*>(bf16.data), rows, cols, q, s, ld.stream());
-  return Dense{rm(q, DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows})};
+  return Dense{rm(q, DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows}), false};
+}
+
+// GGML Q5_K super-blocks (176 B / 256 elems) of an ActT matrix, into new storage.
+Dense to_q5_k(Loader& ld, const Tensor& bf16, int rows, int cols) {
+  const std::size_t rb = q5k::row_bytes(cols);
+  void* q = ld.alloc(std::size_t(rows) * rb);
+  kernels::dense::quantize_q5_k_rows(static_cast<const ActT*>(bf16.data), rows, cols, q, ld.stream());
+  return Dense{rm(q, DType::U8, {rows, std::int32_t(rb)}), {}, true};
 }
 
 Dense row_view(const Dense& d, int begin, int end) {
+  Dense v;
+  v.is_q5_k = d.is_q5_k;
+  if (d.q5_k()) {
+    const std::size_t rb = std::size_t(d.w.ne[0]);
+    v.w = rm(static_cast<char*>(d.w.data) + std::size_t(begin) * rb, d.w.dtype, {end - begin, d.w.ne[0]});
+    return v;
+  }
   const int cols = d.cols();
   const std::size_t esize = d.fp8() ? 1 : 2;
-  Dense v;
   v.w = rm(static_cast<char*>(d.w.data) + std::size_t(begin) * cols * esize, d.w.dtype, {end - begin, cols});
   if (d.fp8()) v.scale = rm(static_cast<float*>(d.scale.data) + begin, DType::FP32, {end - begin});
   return v;
 }
 
 Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, bool load_experts,
-                      std::vector<float>* router_bias_out = nullptr) {
+                      std::vector<float>* router_bias_out = nullptr, bool loop_bf16 = false,
+                      AttnRequantMode attn_requant = AttnRequantMode::Off) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -304,9 +320,10 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
                                             "attn.wk_dv.weight",        "attn.wv_dv.weight",
                                             "attn.k_sconv.weight_proj", "attn.v_sconv.weight_proj"};
   const int R = proj_rows(layer.full);
+  const bool attn_q5_k = (attn_requant == AttnRequantMode::Q5K);
   const bool proj_fp8_disk = m.at(p + seg_names[0])->dtype == "F8_E4M3";
   const bool wo_fp8_disk = m.at(p + "attn.wo_ud.weight")->dtype == "F8_E4M3";
-  DeviceBuffer proj_tmp, wo_tmp;
+  DeviceBuffer proj_tmp, wo_tmp, proj_fp8_tmp, proj_sc_tmp, wo_fp8_tmp, wo_sc_tmp, proj_act_tmp, wo_act_tmp;
   Tensor wproj_bf16, wo_bf16;
   auto queue_bf16_rows = [&](const std::string& name, void* dst, int rows, int cols) {
     const SafetensorsRef ref = m.at(name);
@@ -327,26 +344,31 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
     ld.queue(name + "_scale", s_dst);
   };
   if (proj_fp8_disk) {
-    void* q = ld.alloc(std::size_t(R) * H);
-    float* sc = static_cast<float*>(ld.alloc(std::size_t(R) * 4));
+    void* q = attn_q5_k ? (proj_fp8_tmp = DeviceBuffer(std::size_t(R) * H)).p : ld.alloc(std::size_t(R) * H);
+    float* sc = static_cast<float*>(
+        attn_q5_k ? (proj_sc_tmp = DeviceBuffer(std::size_t(R) * 4)).p : ld.alloc(std::size_t(R) * 4));
     for (int s = 0; s < num_segs(layer.full); ++s) {
       queue_fp8_rows(p + seg_names[s], static_cast<char*>(q) + std::size_t(SEG_BEGIN[s]) * H, sc + SEG_BEGIN[s],
                      SEG_ROWS[s], H);
     }
-    layer.wproj = Dense{rm(q, DType::FP8_E4M3FN, {R, H}), rm(sc, DType::FP32, {R})};
+    if (!attn_q5_k) layer.wproj = Dense{rm(q, DType::FP8_E4M3FN, {R, H}), rm(sc, DType::FP32, {R}), false};
   } else {
-    void* d = dense_fp8 ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p : ld.alloc(std::size_t(R) * H * 2);
+    void* d = (dense_fp8 || attn_q5_k) ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p
+                                       : ld.alloc(std::size_t(R) * H * 2);
     for (int s = 0; s < num_segs(layer.full); ++s)
       queue_bf16_rows(p + seg_names[s], static_cast<char*>(d) + std::size_t(SEG_BEGIN[s]) * H * 2, SEG_ROWS[s], H);
     wproj_bf16 = rm(d, kActDType, {R, H});
   }
   if (wo_fp8_disk) {
-    void* oq = ld.alloc(std::size_t(H) * HEADS * HEAD_DIM);
-    float* osc = static_cast<float*>(ld.alloc(std::size_t(H) * 4));
+    void* oq = attn_q5_k ? (wo_fp8_tmp = DeviceBuffer(std::size_t(H) * HEADS * HEAD_DIM)).p
+                         : ld.alloc(std::size_t(H) * HEADS * HEAD_DIM);
+    float* osc = static_cast<float*>(
+        attn_q5_k ? (wo_sc_tmp = DeviceBuffer(std::size_t(H) * 4)).p : ld.alloc(std::size_t(H) * 4));
     queue_fp8_rows(p + "attn.wo_ud.weight", oq, osc, H, HEADS * HEAD_DIM);
-    layer.wo = Dense{rm(oq, DType::FP8_E4M3FN, {H, HEADS * HEAD_DIM}), rm(osc, DType::FP32, {H})};
+    if (!attn_q5_k) layer.wo = Dense{rm(oq, DType::FP8_E4M3FN, {H, HEADS * HEAD_DIM}), rm(osc, DType::FP32, {H}), false};
   } else {
-    void* o = dense_fp8 ? (wo_tmp = DeviceBuffer(std::size_t(H) * 3072 * 2)).p : ld.alloc(std::size_t(H) * 3072 * 2);
+    void* o = (dense_fp8 || attn_q5_k) ? (wo_tmp = DeviceBuffer(std::size_t(H) * HEADS * HEAD_DIM * 2)).p
+                                       : ld.alloc(std::size_t(H) * HEADS * HEAD_DIM * 2);
     queue_bf16_rows(p + "attn.wo_ud.weight", o, H, HEADS * HEAD_DIM);
     wo_bf16 = rm(o, kActDType, {H, HEADS * HEAD_DIM});
   }
@@ -363,7 +385,9 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
   }
   layer.attn_conv = ld.f32(p + "attn_sconv.weight", {H, CONV_K});
   layer.mlp_conv = ld.f32(p + "mlp_sconv.weight", {H, CONV_K});
-  layer.router = ld.f32(p + "mlp.gate.weight", {EXPERTS, H});
+  if (!loop_bf16) {
+    layer.router = ld.f32(p + "mlp.gate.weight", {EXPERTS, H});
+  }
   {
     const std::vector<float>& rb = ld.read_f32(p + "mlp.gate.bias");
     if (router_bias_out) *router_bias_out = rb;
@@ -412,16 +436,21 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
     };
     const int D2 = 2 * H;
     layer.qkv_gate_down = ld.upload_bf16(stack(down, 3), {3, GATE_RANK, D2});  // exact (BF16 checkpoint)
-    layer.qkv_gate_forget = ld.upload_f32(stack(forget, 3), {3, H, GATE_RANK});
-    layer.qkv_gate_gain = ld.upload_f32(stack(gain, 3), {3, H, GATE_RANK});
+    if (!loop_bf16) {
+      layer.qkv_gate_forget = ld.upload_f32(stack(forget, 3), {3, H, GATE_RANK});
+      layer.qkv_gate_gain = ld.upload_f32(stack(gain, 3), {3, H, GATE_RANK});
+    }
     layer.qkv_gate_forget16 = ld.upload_bf16(stack(forget, 3), {3, H, GATE_RANK});
     layer.qkv_gate_gain16 = ld.upload_bf16(stack(gain, 3), {3, H, GATE_RANK});
     layer.mlp1_gate_down = ld.upload_bf16(down[3], {1, GATE_RANK, D2});
-    layer.mlp1_gate_forget = ld.upload_f32(forget[3], {1, H, GATE_RANK});
-    layer.mlp1_gate_gain = ld.upload_f32(gain[3], {1, H, GATE_RANK});
+    if (!loop_bf16) {
+      layer.mlp1_gate_forget = ld.upload_f32(forget[3], {1, H, GATE_RANK});
+      layer.mlp1_gate_gain = ld.upload_f32(gain[3], {1, H, GATE_RANK});
+    }
     layer.mlp1_gate_forget16 = ld.upload_bf16(forget[3], {1, H, GATE_RANK});
     layer.mlp1_gate_gain16 = ld.upload_bf16(gain[3], {1, H, GATE_RANK});
     auto at = [](const Tensor& stack, int g, DType dt, std::int32_t a, std::int32_t b) {
+      if (!stack.data) return Tensor{};
       const std::size_t es = dt == DType::FP32 ? 4 : 2;
       return rm(static_cast<char*>(stack.data) + std::size_t(g) * a * b * es, dt, {a, b});
     };
@@ -476,17 +505,39 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
   load_expert_proj("w13", ef.w13, ex.w13, ex.w13_scale, ex.w13_factor, ex.w13_rin, ex.w13_rout);
   load_expert_proj("w2", ef.w2, ex.w2, ex.w2_scale, ex.w2_factor, ex.w2_rin, ex.w2_rout);
 
-  if (!proj_fp8_disk || !wo_fp8_disk) {
+  if (attn_q5_k || !proj_fp8_disk || !wo_fp8_disk) {
     ld.flush();
-    if (!proj_fp8_disk) {
-      bf16_to_act_inplace(wproj_bf16.data, std::size_t(R) * H, ld.stream());
-      layer.wproj = dense_fp8 ? to_fp8(ld, wproj_bf16, R, H) : Dense{wproj_bf16, {}};
+    if (attn_q5_k) {
+      if (proj_fp8_disk) {
+        proj_act_tmp = DeviceBuffer(std::size_t(R) * H * 2);
+        kernels::dense::dequant_rows(proj_fp8_tmp.p, static_cast<const float*>(proj_sc_tmp.p), R, H,
+                                     static_cast<ActT*>(proj_act_tmp.p), ld.stream());
+        layer.wproj = to_q5_k(ld, rm(proj_act_tmp.p, kActDType, {R, H}), R, H);
+      } else {
+        bf16_to_act_inplace(wproj_bf16.data, std::size_t(R) * H, ld.stream());
+        layer.wproj = to_q5_k(ld, wproj_bf16, R, H);
+      }
+      if (wo_fp8_disk) {
+        wo_act_tmp = DeviceBuffer(std::size_t(H) * HEADS * HEAD_DIM * 2);
+        kernels::dense::dequant_rows(wo_fp8_tmp.p, static_cast<const float*>(wo_sc_tmp.p), H, HEADS * HEAD_DIM,
+                                     static_cast<ActT*>(wo_act_tmp.p), ld.stream());
+        layer.wo = to_q5_k(ld, rm(wo_act_tmp.p, kActDType, {H, HEADS * HEAD_DIM}), H, HEADS * HEAD_DIM);
+      } else {
+        bf16_to_act_inplace(wo_bf16.data, std::size_t(H) * HEADS * HEAD_DIM, ld.stream());
+        layer.wo = to_q5_k(ld, wo_bf16, H, HEADS * HEAD_DIM);
+      }
+      CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // before transient FP8/ActT temporaries are freed
+    } else {
+      if (!proj_fp8_disk) {
+        bf16_to_act_inplace(wproj_bf16.data, std::size_t(R) * H, ld.stream());
+        layer.wproj = dense_fp8 ? to_fp8(ld, wproj_bf16, R, H) : Dense{wproj_bf16, {}, false};
+      }
+      if (!wo_fp8_disk) {
+        bf16_to_act_inplace(wo_bf16.data, std::size_t(H) * HEADS * HEAD_DIM, ld.stream());
+        layer.wo = dense_fp8 ? to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM) : Dense{wo_bf16, {}, false};
+      }
+      if (dense_fp8) CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // before the BF16 temporaries are freed
     }
-    if (!wo_fp8_disk) {
-      bf16_to_act_inplace(wo_bf16.data, std::size_t(H) * HEADS * HEAD_DIM, ld.stream());
-      layer.wo = dense_fp8 ? to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM) : Dense{wo_bf16, {}};
-    }
-    if (dense_fp8) CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // before the BF16 temporaries are freed
   }
   Dense* views[NUM_SEGS] = {&layer.wq, &layer.wgate, &layer.wr, &layer.wsink,
                             &layer.wk, &layer.wv,    &layer.wk_dyn, &layer.wv_dyn};
@@ -500,7 +551,12 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
                      const OffloadConfig& offload) {
   if (is_gguf_model(model_dir)) {  // llama.cpp GGUF file (weights_gguf.cpp): no offload, dense in the activation type
     if (dense_fp8) throw std::invalid_argument("--dense-fp8 would re-quantize the GGUF dense weights; drop it");
-    (void) offload;
+    if (offload.attn_requant != AttnRequantMode::Off) {
+      throw std::invalid_argument("--attn-requant q5_k is not supported with GGUF models; drop it");
+    }
+    if (offload.expert_swaps > 0) {
+      throw std::invalid_argument("--expert-swaps is not supported with GGUF models (offload unavailable)");
+    }
     return load_weights_gguf(model_dir, stream, 0, 1);
   }
   const auto cfg_sha = sha256_file_or_zero(model_dir / "config.json");
@@ -510,6 +566,8 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   DeviceUploader up;
   Weights w;
   w.dense_fp8 = dense_fp8;
+  w.attn_q5_k = (offload.attn_requant == AttnRequantMode::Q5K);
+  w.loop_bf16 = offload.loop_bf16;
   for (int l = 0; l < LAYERS; ++l) {
     w.expert_formats[l] = efs[l].w13;
     w.w2_expert_formats[l] = efs[l].w2;
@@ -520,7 +578,8 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   const bool tiered = offload.vram_mb > 0;
   std::array<std::vector<float>, LAYERS> router_biases;
   for (int l = 0; l < LAYERS; ++l) {
-    w.layers.push_back(load_layer_into(ld, l, efs[l], dense_fp8, !tiered, &router_biases[l]));
+    w.layers.push_back(load_layer_into(ld, l, efs[l], dense_fp8, !tiered, &router_biases[l], offload.loop_bf16,
+                                       offload.attn_requant));
     w.dense_fp8 = w.dense_fp8 || w.layers.back().wproj.fp8() || w.layers.back().wo.fp8();
   }
 
@@ -605,7 +664,13 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     const std::size_t checkpoint_bytes = kv_ring_bytes + (std::size_t(16) << 20);
     // Prefiller aliases Attention vs MLP scratch (including EXL3 scratch) in one phase arena plus
     // 2 * chunk * HIDDEN * 4 B per loop pass for B2[p] and E[p] (~280 KiB/tok + 48 MiB at L=3).
-    const std::size_t prefill_bytes = offload_prefill_vram_bytes(offload.prefill_chunk, offload.loop_passes);
+    // When --attn-requant q5_k runs without --dense-fp8, Prefiller also allocates wscratch_ (38.07 MiB).
+    const std::size_t extra_wscratch =
+        (w.attn_q5_k && !w.dense_fp8)
+            ? (std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM) * 2)
+            : 0;
+    const std::size_t prefill_bytes =
+        offload_prefill_vram_bytes(offload.prefill_chunk, offload.loop_passes) + extra_wscratch;
     // DSpark drafter weights + shortlist + FP8 global KV ring (min(max_ctx, 65536) * 2 KiB) +
     // verify buffers (widths 2/4/8) + prefill taps when --spec is active (measured ~1.09 GB at 64K/1024).
     const std::size_t spec_bytes =

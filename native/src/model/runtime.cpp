@@ -92,6 +92,26 @@ void validate_loop_passes_options(const RuntimeOptions& options, bool ablation_a
     throw std::invalid_argument("--loopcd currently requires TP=1");
 #endif
   }
+  if (options.expert_swaps < 0) {
+    throw std::invalid_argument("--expert-swaps must be >= 0");
+  }
+  if (options.expert_swaps > 0) {
+    if (options.offload_vram_mb <= 0) {
+      throw std::invalid_argument("--expert-swaps > 0 requires --offload-vram-mb > 0 or --atlas-6g");
+    }
+    if (options.offload_mode == "uva") {
+      throw std::invalid_argument(
+          "--expert-swaps > 0 is not supported with --offload-mode uva (use auto or dma-lru)");
+    }
+  }
+  if (options.attn_requant != AttnRequantMode::Off) {
+    if (options.max_batch > 1) {
+      throw std::invalid_argument("--attn-requant q5_k currently requires --max-batch 1");
+    }
+#if INGINE_TP_SIZE > 1
+    throw std::invalid_argument("--attn-requant q5_k currently requires TP=1");
+#endif
+  }
 }
 
 }  // namespace
@@ -146,6 +166,9 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   offload.spec = options_.spec;
   offload.kv_vram_mb = options_.kv_paged ? options_.kv_vram_mb : 0;
   offload.loop_passes = options_.loop_passes;
+  offload.loop_bf16 = options_.loop_bf16;
+  offload.attn_requant = options_.attn_requant;
+  offload.expert_swaps = options_.expert_swaps;
   weights_ = load_weights(options_.model_dir, options_.dense_fp8, stream_, offload);
   ablation_ = load_ablation(options_.ablation);
   init();
