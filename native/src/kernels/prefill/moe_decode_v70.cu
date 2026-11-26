@@ -73,7 +73,7 @@ struct RowStep {
   uint32_t s0, s1, s2;
 };
 
-template <int FMT, bool UP, int SPLIT>
+template <int FMT, bool UP, int SPLIT, int MAX_TILE>
 __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArgs a) {
   constexpr int K = UP ? kHidden : kInter;
   constexpr int NE = UP ? 2 * kInter : kHidden;   // expert rows
@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArg
   __shared__ float lut[16];
   if (blockIdx.y >= unsigned(*a.w.tiles_n)) return;
   const int4 tile = a.w.tiles[blockIdx.y];
-  const int e = tile.x, pb = tile.y, n = min(tile.z, 8);
+  const int e = tile.x, pb = tile.y, n = min(tile.z, MAX_TILE);
   if (a.active_mask && !a.active_mask[e]) return;
   if constexpr (FMT == FMT_GQI4) {
     constexpr float kIq4[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
@@ -106,6 +106,10 @@ __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArg
   const bool x_ok = rr < n;
   const int xrow = x_ok ? (UP ? a.w.pair_token[pb + rr] : pb + rr) : 0;
   const uint16_t* xr = a.x + int64_t(xrow) * K + 16 * qp;
+  const bool has_hi = (MAX_TILE > 8) && (n > 8);
+  const bool x_ok1 = has_hi && (rr + 8 < n);
+  const int xrow1 = x_ok1 ? (UP ? a.w.pair_token[pb + rr + 8] : pb + rr + 8) : 0;
+  const uint16_t* xr1 = a.x + int64_t(xrow1) * K + 16 * qp;
 
   auto load_row = [&](const uint8_t* c, const uint8_t* s, int k) {
     RowStep r;
@@ -150,11 +154,17 @@ __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArg
   };
 
   float v[16];
+  float v1[16];
 #pragma unroll
   for (int m = 0; m < 16; ++m) v[m] = 0.f;
+  if constexpr (MAX_TILE > 8) {
+#pragma unroll
+    for (int m = 0; m < 16; ++m) v1[m] = 0.f;
+  }
   struct Step {
     RowStep ra, rb;
     uint4 xa, xb;
+    uint4 xa1, xb1;
   };
   auto load = [&](int k) {
     Step s;
@@ -164,6 +174,13 @@ __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArg
     if (x_ok) {
       s.xa = __ldg(reinterpret_cast<const uint4*>(xr + 64 * k));
       s.xb = __ldg(reinterpret_cast<const uint4*>(xr + 64 * k + 8));
+    }
+    if constexpr (MAX_TILE > 8) {
+      s.xa1 = s.xb1 = make_uint4(0u, 0u, 0u, 0u);
+      if (x_ok1) {
+        s.xa1 = __ldg(reinterpret_cast<const uint4*>(xr1 + 64 * k));
+        s.xb1 = __ldg(reinterpret_cast<const uint4*>(xr1 + 64 * k + 8));
+      }
     }
     return s;
   };
@@ -183,53 +200,76 @@ __global__ void __launch_bounds__(SPLIT * 32) moe_decode_v70_kernel(const DecArg
     mma884(v + 8, ab[2], ab[3], cur.xa.z, cur.xa.w);
     mma884(v + 8, ab[4], ab[5], cur.xb.x, cur.xb.y);
     mma884(v + 8, ab[6], ab[7], cur.xb.z, cur.xb.w);
+    if constexpr (MAX_TILE > 8) {
+      if (has_hi) {
+        mma884(v1, aa[0], aa[1], cur.xa1.x, cur.xa1.y);
+        mma884(v1, aa[2], aa[3], cur.xa1.z, cur.xa1.w);
+        mma884(v1, aa[4], aa[5], cur.xb1.x, cur.xb1.y);
+        mma884(v1, aa[6], aa[7], cur.xb1.z, cur.xb1.w);
+        mma884(v1 + 8, ab[0], ab[1], cur.xa1.x, cur.xa1.y);
+        mma884(v1 + 8, ab[2], ab[3], cur.xa1.z, cur.xa1.w);
+        mma884(v1 + 8, ab[4], ab[5], cur.xb1.x, cur.xb1.y);
+        mma884(v1 + 8, ab[6], ab[7], cur.xb1.z, cur.xb1.w);
+      }
+    }
   }
-#pragma unroll
-  for (int sh = 4; sh <= 8; sh <<= 1)
-#pragma unroll
-    for (int m = 0; m < 16; ++m) v[m] += __shfl_xor_sync(0xffffffffu, v[m], sh);
-  if (qp == 0) {
-#pragma unroll
-    for (int m = 0; m < 16; ++m) part[split][rr][m] = v[m];
-  }
-  __syncthreads();
-  if (split || qp) return;
   const float f = FMT == FMT_NVFP4 ? __ldg(a.factors + e) : 1.f;
-  // c[i]: row (j & 1) + 2 ((i >> 1) & 1) + 4 hi of the 8 against pair member (i & 1) + 2 (j >> 1) + 4 (i >> 2)
-#pragma unroll 1
-  for (int i = 0; i < 8; ++i) {
-    const int mem = (i & 1) + 2 * (j >> 1) + 4 * (i >> 2);
-    if (mem >= n) continue;
-    float tA = part[0][rr][i], tB = part[0][rr][8 + i];
+  auto write_group = [&](float (&vg)[16], int base_off, int gn) {
 #pragma unroll
-    for (int s = 1; s < SPLIT; ++s) tA += part[s][rr][i], tB += part[s][rr][8 + i];
-    tA *= f, tB *= f;
-    const int rin = (j & 1) + 2 * ((i >> 1) & 1) + 4 * hi;
-    if constexpr (UP) {
-      const float gt = round_bf16(tA), u = round_bf16(tB);
-      const float sig = 1.f / (1.f + expf(-gt));
-      const float act = __fmul_rn(__fmul_rn(softcap_d(gt, 4.f), sig), softcap_d(u, 25.f));
-      a.out[int64_t(pb + mem) * kInter + 8 * int(blockIdx.x) + rin] = f2bf_bits(act);
-    } else {
-      const int dst = a.w.pair_dst[pb + mem];
-      a.out[int64_t(dst) * kHidden + 16 * int(blockIdx.x) + rin] = f2bf_bits(tA);
-      a.out[int64_t(dst) * kHidden + 16 * int(blockIdx.x) + 8 + rin] = f2bf_bits(tB);
+    for (int sh = 4; sh <= 8; sh <<= 1)
+#pragma unroll
+      for (int m = 0; m < 16; ++m) vg[m] += __shfl_xor_sync(0xffffffffu, vg[m], sh);
+    if (qp == 0) {
+#pragma unroll
+      for (int m = 0; m < 16; ++m) part[split][rr][m] = vg[m];
+    }
+    __syncthreads();
+    if (!split && !qp) {
+      // c[i]: row (j & 1) + 2 ((i >> 1) & 1) + 4 hi of the 8 against pair member (i & 1) + 2 (j >> 1) + 4 (i >> 2)
+#pragma unroll 1
+      for (int i = 0; i < 8; ++i) {
+        const int mem = (i & 1) + 2 * (j >> 1) + 4 * (i >> 2);
+        if (mem >= gn) continue;
+        float tA = part[0][rr][i], tB = part[0][rr][8 + i];
+#pragma unroll
+        for (int s = 1; s < SPLIT; ++s) tA += part[s][rr][i], tB += part[s][rr][8 + i];
+        tA *= f, tB *= f;
+        const int rin = (j & 1) + 2 * ((i >> 1) & 1) + 4 * hi;
+        if constexpr (UP) {
+          const float gt = round_bf16(tA), u = round_bf16(tB);
+          const float sig = 1.f / (1.f + expf(-gt));
+          const float act = __fmul_rn(__fmul_rn(softcap_d(gt, 4.f), sig), softcap_d(u, 25.f));
+          a.out[int64_t(pb + base_off + mem) * kInter + 8 * int(blockIdx.x) + rin] = f2bf_bits(act);
+        } else {
+          const int dst = a.w.pair_dst[pb + base_off + mem];
+          a.out[int64_t(dst) * kHidden + 16 * int(blockIdx.x) + rin] = f2bf_bits(tA);
+          a.out[int64_t(dst) * kHidden + 16 * int(blockIdx.x) + 8 + rin] = f2bf_bits(tB);
+        }
+      }
+    }
+  };
+  write_group(v, 0, min(n, 8));
+  if constexpr (MAX_TILE > 8) {
+    if (has_hi) {
+      __syncthreads();
+      write_group(v1, 8, n - 8);
     }
   }
 }
 
 
-// ---- decode routing in one launch (B <= 8): router logits (FP32 weights, FP32 sums), then the last CTA to finish
+// ---- decode routing in one launch (B <= 16): router logits (FP32 weights, FP32 sums), then the last CTA to finish
 // selects (topk_kernel's rule: sigmoid scores, 8 arg-max rounds over s + bias, lowest expert on ties, wts = 8 s / (sum
 // + 1e-20)) and builds the tiles and pair lists (route_kernel's). Replaces gemm + memset + topk + route.
 constexpr int kRouteCtas = kExperts, kRouteWarps = 4;  // a CTA an expert: every load in flight at once
+template <int TMAX>
 __global__ void __launch_bounds__(kRouteWarps * 32) route_decode_kernel(const uint16_t* __restrict__ x, int T,
                                                                         const float* __restrict__ w,
                                                                         const float* __restrict__ bias, int TR,
                                                                         int* __restrict__ idx, float* __restrict__ wts,
                                                                         float* logits, unsigned* done, MoeWork mw) {
   __shared__ int counts[kExperts], offs[kExperts], tile0[kExperts], cursor[kExperts];
-  __shared__ float red[kRouteWarps][8];
+  __shared__ float red[kRouteWarps][TMAX];
   __shared__ bool last;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, e = blockIdx.x;
   {
@@ -241,9 +281,11 @@ __global__ void __launch_bounds__(kRouteWarps * 32) route_decode_kernel(const ui
       const int i = int(threadIdx.x) + NT * j;
       wv[j] = i < N4 ? __ldg(wr + i) : make_float4(0.f, 0.f, 0.f, 0.f);
     }
-    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float acc[TMAX];
 #pragma unroll
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < TMAX; ++t) acc[t] = 0.f;
+#pragma unroll
+    for (int t = 0; t < TMAX; ++t) {
       if (t >= T) break;
       const uint2* xt = reinterpret_cast<const uint2*>(x + int64_t(t) * kHidden);
 #pragma unroll
@@ -257,7 +299,7 @@ __global__ void __launch_bounds__(kRouteWarps * 32) route_decode_kernel(const ui
       }
     }
 #pragma unroll
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < TMAX; ++t) {
       if (t >= T) break;
       float v = acc[t];
 #pragma unroll
@@ -364,7 +406,7 @@ bool decode_enabled(int T, int fmt) {
     const char* e = std::getenv("INGINE_MOE_DECODE");
     return e ? std::atoi(e) : 1;
   }();
-  if (!mode || T < 1 || T > 8) return false;
+  if (!mode || T < 1 || T > 16) return false;
   if (fmt != FMT_NVFP4 && fmt != FMT_GQ5 && fmt != FMT_GQI4) return false;
   static const bool volta = [] {
     int dev = 0, major = 0, minor = 0;
@@ -378,10 +420,17 @@ bool decode_enabled(int T, int fmt) {
 
 template <bool UP, int SPLIT>
 void launch_dec(int fmt, const DecArgs& d, int T, cudaStream_t stream) {
-  const dim3 grid(UP ? (2 * kInter) / 16 : kHidden / 16, unsigned(T * kTopK));
-  if (fmt == FMT_NVFP4) moe_decode_v70_kernel<FMT_NVFP4, UP, SPLIT><<<grid, SPLIT * 32, 0, stream>>>(d);
-  else if (fmt == FMT_GQ5) moe_decode_v70_kernel<FMT_GQ5, UP, SPLIT><<<grid, SPLIT * 32, 0, stream>>>(d);
-  else moe_decode_v70_kernel<FMT_GQI4, UP, SPLIT><<<grid, SPLIT * 32, 0, stream>>>(d);
+  const int max_y = T * kTopK < kExperts ? T * kTopK : kExperts;
+  const dim3 grid(UP ? (2 * kInter) / 16 : kHidden / 16, unsigned(max_y));
+  if (T <= 8) {
+    if (fmt == FMT_NVFP4) moe_decode_v70_kernel<FMT_NVFP4, UP, SPLIT, 8><<<grid, SPLIT * 32, 0, stream>>>(d);
+    else if (fmt == FMT_GQ5) moe_decode_v70_kernel<FMT_GQ5, UP, SPLIT, 8><<<grid, SPLIT * 32, 0, stream>>>(d);
+    else moe_decode_v70_kernel<FMT_GQI4, UP, SPLIT, 8><<<grid, SPLIT * 32, 0, stream>>>(d);
+  } else {
+    if (fmt == FMT_NVFP4) moe_decode_v70_kernel<FMT_NVFP4, UP, SPLIT, 16><<<grid, SPLIT * 32, 0, stream>>>(d);
+    else if (fmt == FMT_GQ5) moe_decode_v70_kernel<FMT_GQ5, UP, SPLIT, 16><<<grid, SPLIT * 32, 0, stream>>>(d);
+    else moe_decode_v70_kernel<FMT_GQI4, UP, SPLIT, 16><<<grid, SPLIT * 32, 0, stream>>>(d);
+  }
 }
 
 }  // namespace
@@ -392,10 +441,16 @@ bool moe_route_decode(const ActT* x, int T, const float* router_f32, const float
     const char* e = std::getenv("INGINE_MOE_ROUTE_FUSED");
     return !(e && e[0] == '0');
   }();
-  if (!on || T < 1 || T > 8 || !router_f32 || !done) return false;
-  route_decode_kernel<<<kRouteCtas, kRouteWarps * 32, 0, stream>>>(reinterpret_cast<const uint16_t*>(x), T, router_f32,
-                                                                   bias, moe_tile_rows(T), idx, wts, logits_scratch,
-                                                                   done, w);
+  if (!on || T < 1 || T > 16 || !router_f32 || !done) return false;
+  if (T <= 8) {
+    route_decode_kernel<8><<<kRouteCtas, kRouteWarps * 32, 0, stream>>>(reinterpret_cast<const uint16_t*>(x), T,
+                                                                        router_f32, bias, moe_tile_rows(T), idx, wts,
+                                                                        logits_scratch, done, w);
+  } else {
+    route_decode_kernel<16><<<kRouteCtas, kRouteWarps * 32, 0, stream>>>(reinterpret_cast<const uint16_t*>(x), T,
+                                                                         router_f32, bias, moe_tile_rows(T), idx, wts,
+                                                                         logits_scratch, done, w);
+  }
   return true;
 }
 

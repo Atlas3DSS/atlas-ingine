@@ -507,7 +507,8 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
                                                                   const uint16_t* __restrict__ q8s, uint32_t zero,
                                                                   Epi epi) {
   constexpr int KS = K / SPLITK;
-  __shared__ float cs[SPLITK][16][8];
+  constexpr int NG = (M + 7) / 8;  // 1 for M <= 8 (bit-identical), 2 for M = 9..16 (shared weight decode)
+  __shared__ float cs[SPLITK][16][8 * NG];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
   const int r0 = blockIdx.x * 16;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
@@ -517,6 +518,7 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
   const std::int32_t soff = blk_soff[blockIdx.x];
   const uint8_t* base = w + blk_off[blockIdx.x];
   float c8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  float c8_hi[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   float c[4] = {0.f, 0.f, 0.f, 0.f};
   bool waited = false;
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
@@ -533,10 +535,12 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
     constexpr size_t ROW_BYTES = size_t(K) * (Q8 ? 1 : 2);
     const int c0_v = warp * KS + (qp & 1) * (2 * CPL);
     const bool lv = iv == cur, lx = idx < M;
+    const bool lx1 = (NG == 2) && ((idx + 8) < M);
     const uint8_t* wv = base + size_t(lv ? rl : 0) * ROW_BYTES;
     const uint16_t* sv = q8s + (FMT == 1 ? soff + (lv ? rl : 0) * (K / 32) : 0);
     const float* svf = reinterpret_cast<const float*>(q8s + (FMT == 2 ? -2 - soff : 0)) + (FMT == 2 && lv ? rl * (K / 16) : 0);
     const ActT* xg = epi.x_of(cur) + size_t(lx ? idx : 0) * K;
+    const ActT* xg1 = epi.x_of(cur) + size_t(lx1 ? (idx + 8) : 0) * K;
 #pragma unroll 1
     for (int jb = 0; jb < NJ; jb += U) {
       uint4 W0[U], W1[U];
@@ -572,6 +576,13 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
           const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
           const uint32_t ww[8] = {W0[u].x, W0[u].y, W0[u].z, W0[u].w, W1[u].x, W1[u].y, W1[u].z, W1[u].w};
           const uint4 xx[4] = {x0, x1, x2, x3};
+          [[maybe_unused]] uint4 yy[4];
+          if constexpr (NG == 2) {
+            yy[0] = lx1 ? ld_act(xg1 + col0) : make_uint4(0, 0, 0, 0);
+            yy[1] = lx1 ? ld_act(xg1 + col0 + 8) : make_uint4(0, 0, 0, 0);
+            yy[2] = lx1 ? ld_act(xg1 + col0 + 16) : make_uint4(0, 0, 0, 0);
+            yy[3] = lx1 ? ld_act(xg1 + col0 + 24) : make_uint4(0, 0, 0, 0);
+          }
 #pragma unroll
           for (int s = 0; s < 4; ++s) {
             uint32_t a0, a1, a2, a3;
@@ -584,12 +595,21 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
               q8x4_h2(ww[2 * s + 1], d, a2, a3);
             }
             mma::sm70_mma_f16_direct(c8, a0, a1, a2, a3, xx[s].x ^ (s == 0 ? dep : 0u), xx[s].y, xx[s].z, xx[s].w);
+            if constexpr (NG == 2) {
+              mma::sm70_mma_f16_direct(c8_hi, a0, a1, a2, a3, yy[s].x, yy[s].y, yy[s].z, yy[s].w);
+            }
           }
         } else {
           const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
           const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
           mma::sm70_mma_f16_direct(c8, W0[u].x, W0[u].y, W0[u].z, W0[u].w, x0.x ^ dep, x0.y, x0.z, x0.w);
           mma::sm70_mma_f16_direct(c8, W1[u].x, W1[u].y, W1[u].z, W1[u].w, x1.x, x1.y, x1.z, x1.w);
+          if constexpr (NG == 2) {
+            const uint4 y0 = lx1 ? ld_act(xg1 + col0) : make_uint4(0, 0, 0, 0);
+            const uint4 y1 = lx1 ? ld_act(xg1 + col0 + 8) : make_uint4(0, 0, 0, 0);
+            mma::sm70_mma_f16_direct(c8_hi, W0[u].x, W0[u].y, W0[u].z, W0[u].w, y0.x, y0.y, y0.z, y0.w);
+            mma::sm70_mma_f16_direct(c8_hi, W1[u].x, W1[u].y, W1[u].z, W1[u].w, y1.x, y1.y, y1.z, y1.w);
+          }
         }
       }
     }
@@ -615,6 +635,14 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
   cs[warp][g][2 * t + 1] = c[1];
   cs[warp][g + 8][2 * t] = c[2];
   cs[warp][g + 8][2 * t + 1] = c[3];
+  if constexpr (NG == 2) {
+    float c_hi[4] = {0.f, 0.f, 0.f, 0.f};
+    mma::sm70_reduce_acc8_to_d4(c8_hi, c_hi);
+    cs[warp][g][8 + 2 * t] = c_hi[0];
+    cs[warp][g][8 + 2 * t + 1] = c_hi[1];
+    cs[warp][g + 8][8 + 2 * t] = c_hi[2];
+    cs[warp][g + 8][8 + 2 * t + 1] = c_hi[3];
+  }
   __syncthreads();
   auto total = [&](int r, int m) {
     float s = 0.f;
@@ -695,6 +723,30 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
       else launch_ex(gemv_mma_kernel<false, K, MM, SPLITK, MMA_U_BF16, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
     }
   };
+  auto go_blk = [&](auto mc) {
+    constexpr int MM = decltype(mc)::value;
+    auto epi = make(std::integral_constant<int, MM>{});
+    using E = decltype(epi);
+    launch_ex(gemv_blk_v70_kernel<K, MM, SPLITK, E>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, rows,
+              w.blk_off, w.blk_soff, w.q8_scale, 0u, epi);
+  };
+  if (w.blk_off && M > 8) {
+    if constexpr (Epi<1>::kScatter) {
+      switch (M) {
+        case 9: go_blk(std::integral_constant<int, 9>{}); return;
+        case 10: go_blk(std::integral_constant<int, 10>{}); return;
+        case 11: go_blk(std::integral_constant<int, 11>{}); return;
+        case 12: go_blk(std::integral_constant<int, 12>{}); return;
+        case 13: go_blk(std::integral_constant<int, 13>{}); return;
+        case 14: go_blk(std::integral_constant<int, 14>{}); return;
+        case 15: go_blk(std::integral_constant<int, 15>{}); return;
+        case 16: go_blk(std::integral_constant<int, 16>{}); return;
+        default: require(false, "M must be in 1..16");
+      }
+    } else {
+      require(false, "M must be in 1..8");
+    }
+  }
   switch (M) {
     case 1: go(std::integral_constant<int, 1>{}); break;
     case 2: go(std::integral_constant<int, 2>{}); break;

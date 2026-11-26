@@ -296,14 +296,14 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   }
 }
 
-__device__ float g_gates_sm8x_gall[3 * 8 * RANK];
-__device__ float g_gates_sm8x_gated[3 * 8 * H];
-__device__ float g_gates_sm8x_ssall[3 * 16 * 8];
+__device__ float g_gates_sm8x_gall[3 * 16 * RANK];
+__device__ float g_gates_sm8x_gated[3 * 16 * H];
+__device__ float g_gates_sm8x_ssall[3 * 16 * 16];
 
 struct GatesSm8xScratch {
-  float* gall;   // [3][8][RANK]
-  float* gated;  // [3][8][H]
-  float* ssall;  // [3][16][8]
+  float* gall;   // [3][16][RANK]
+  float* gated;  // [3][16][H]
+  float* ssall;  // [3][16][16]
 };
 
 GatesSm8xScratch gates_sm8x_scratch() {
@@ -550,7 +550,15 @@ void launch_gates_sm8x(int G, int M, const GateArgs& a, cudaStream_t stream) {
     case 6: go(std::integral_constant<int, 6>{}); break;
     case 7: go(std::integral_constant<int, 7>{}); break;
     case 8: go(std::integral_constant<int, 8>{}); break;
-    default: require(false, "message_gates: M must be in 1..8");
+    case 9: go(std::integral_constant<int, 9>{}); break;
+    case 10: go(std::integral_constant<int, 10>{}); break;
+    case 11: go(std::integral_constant<int, 11>{}); break;
+    case 12: go(std::integral_constant<int, 12>{}); break;
+    case 13: go(std::integral_constant<int, 13>{}); break;
+    case 14: go(std::integral_constant<int, 14>{}); break;
+    case 15: go(std::integral_constant<int, 15>{}); break;
+    case 16: go(std::integral_constant<int, 16>{}); break;
+    default: require(false, "message_gates: M must be in 1..16");
   }
 }
 
@@ -583,7 +591,7 @@ void launch_gates(int G, int M, const GateArgs& a, bool pdl, cudaStream_t stream
 void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const ActT* w_down,
                    const void* w_forget, const void* w_gain, bool fg_fp32, const float* norm_w,
                    ActT* out_bf16, float* out_f32, bool pdl, cudaStream_t stream) {
-  require(G >= 1 && G <= 3 && M >= 1 && M <= 8, "message_gates: G in 1..3, M in 1..8");
+  require(G >= 1 && G <= 3 && M >= 1 && M <= 16, "message_gates: G in 1..3, M in 1..16");
   require(h && msg && w_down && w_forget && w_gain && norm_w && out_bf16, "message_gates: null argument");
   GateArgs a;
   a.h = h;

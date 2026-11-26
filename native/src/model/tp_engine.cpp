@@ -382,7 +382,7 @@ class TpWorkerPool {
     {
       const char* env = std::getenv("INGINE_TP_P2P_AR");
       if (TP_SIZE == 2 && p2p_probe_.p2p_enabled && !p2p_probe_.corrupted && !(env && env[0] == '0')) {
-        constexpr int kSlots = 2 * NUM_VISITS + 1, kCap = 8 * HIDDEN;
+        constexpr int kSlots = 2 * NUM_VISITS + 1, kCap = 16 * HIDDEN;
         constexpr std::size_t nf = std::size_t(kSlots) * kBlocksAr;
         for (int r = 0; r < TP_SIZE; ++r) {
           CUDA_CHECK(cudaSetDevice(r));
@@ -1009,17 +1009,19 @@ class TpBatchDecoder {
     B0_ = f32(B * H), B1_ = f32(B * H);
     for (int p = 0; p < PASSES; ++p) B2_[p] = f32(B * H), E_[p] = f32(B * H);
     hid_ = f32(B * H), part_ = f32(B * H), y_ = f32(B * H), y2_ = f32(B * H);
+    const bool blk_dense = w.layers[0].wproj.blocked();
+    const bool need_gemm_gates = blk_dense ? (B > 16) : (B > 8);
     xin_ = bf16(3 * B * H), xm_ = bf16(B * H), xf_ = bf16(B * H);
-    xin_chunk_ = (w.dense_fp8 && B > 8) ? bf16(3 * 8 * H) : nullptr;
+    xin_chunk_ = (w.dense_fp8 && B > 8) ? bf16(3 * 8 * H) : (blk_dense && B > 16 ? bf16(3 * 16 * H) : nullptr);
     mixf_ = f32(3 * B * H), msgs_ = f32(4 * B * H), mixm_ = f32(B * H);
-    proj_fp32_ = f32(std::min<std::size_t>(B, w.dense_fp8 ? 32 : 8) * PROJ_ROWS_FULL);
-    proj_act_ = B > 8 ? bf16(B * PROJ_ROWS_FULL) : nullptr;
+    proj_fp32_ = f32(std::min<std::size_t>(B, (w.dense_fp8 || blk_dense) ? 32 : 8) * PROJ_ROWS_FULL);
+    proj_act_ = need_gemm_gates ? bf16(B * PROJ_ROWS_FULL) : nullptr;
     attn_out_ = bf16(B * HEADS * HEAD_DIM);
     wo_fp32_ = f32(B * H);
-    gin_ = B > 8 ? bf16(3 * B * 2 * H) : nullptr;
-    g16_ = B > 8 ? bf16(B * GATE_RANK) : nullptr;
-    fpre_ = B > 8 ? f32(B * H) : nullptr;
-    gpre_ = B > 8 ? f32(B * H) : nullptr;
+    gin_ = need_gemm_gates ? bf16(3 * B * 2 * H) : nullptr;
+    g16_ = need_gemm_gates ? bf16(B * GATE_RANK) : nullptr;
+    fpre_ = need_gemm_gates ? f32(B * H) : nullptr;
+    gpre_ = need_gemm_gates ? f32(B * H) : nullptr;
     router_logits_ = f32(B * EXPERTS);
     idx_ = i32(B * TOP_K);
     wts_ = f32(B * TOP_K);
@@ -1193,7 +1195,7 @@ class TpBatchDecoder {
     const Weights& w = w_;
     const Ablation& abl = abl_;
     const std::size_t slab = std::size_t(B) * H;
-    const bool use_gemv = (B <= 8);
+    const bool use_gemv = (B <= 8) || (B <= 16 && w.layers[0].wproj.blocked());
 
     const float* attn_dirs = f32p(abl.attn_dirs);
     const float* attn_w = f32p(abl.attn_w);
@@ -1301,11 +1303,12 @@ class TpBatchDecoder {
       const bool proj_gemv = use_gemv || ((layer.wproj.fp8() || layer.wproj.blocked()) && B <= 32);
       if (proj_gemv) {
         const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
-        if (B <= 8) {
+        const int max_m = layer.wproj.blocked() ? 16 : 8;
+        if (B <= max_m) {
           dense::proj(xin_, B, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_, false, stream);
         } else {
-          for (int b0 = 0; b0 < B; b0 += 8) {
-            const int cb = std::min(8, B - b0);
+          for (int b0 = 0; b0 < B; b0 += max_m) {
+            const int cb = std::min(max_m, B - b0);
             const ActT* xptr = xin_ + std::size_t(b0) * H;
             if (!single) {
               for (int g = 0; g < 3; ++g) {
@@ -1385,8 +1388,9 @@ class TpBatchDecoder {
       // ---- Sharded wo (K = HEADS*HEAD_DIM = 768) + NCCL AllReduce + per-slot static conv
       const bool wo_gemv = use_gemv || ((layer.wo.fp8() || layer.wo.blocked()) && B <= 32);
       if (wo_gemv) {
-        for (int b0 = 0; b0 < B; b0 += 8) {
-          const int cb = std::min(8, B - b0);
+        const int max_m = layer.wo.blocked() ? 16 : 8;
+        for (int b0 = 0; b0 < B; b0 += max_m) {
+          const int cb = std::min(max_m, B - b0);
           dense::gemv(attn_out_ + std::size_t(b0) * HEADS * HEAD_DIM, cb, HEADS * HEAD_DIM, matrix(layer.wo),
                       wo_fp32_ + std::size_t(b0) * H, false, stream);
         }
@@ -1462,8 +1466,9 @@ class TpBatchDecoder {
             mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
     const bool head_gemv = use_gemv || (w.unembed.fp8() && B <= 32) || w.unembed.blocked();
     if (head_gemv) {
-      for (int b0 = 0; b0 < B; b0 += 8) {
-        const int cb = std::min(8, B - b0);
+      const int max_m = w.unembed.blocked() ? 16 : 8;
+      for (int b0 = 0; b0 < B; b0 += max_m) {
+        const int cb = std::min(max_m, B - b0);
         dense::head(xf_ + std::size_t(b0) * H, cb, matrix(w.unembed), local_logits_ + std::size_t(b0) * LOCAL_VOCAB_CHUNK,
                     false, stream);
       }
