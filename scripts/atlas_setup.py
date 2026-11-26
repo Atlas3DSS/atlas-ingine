@@ -272,28 +272,98 @@ def detect_host_ram_gb(meminfo_text: str | None = None) -> tuple[float, float]:
     return round(total_kb / (1024.0 * 1024.0), 2), round(avail_kb / (1024.0 * 1024.0), 2)
 
 
+FAKE_REQUIRED_FILES = ("config.json", "tokenizer.json", "chat_template.jinja")
+FAKE_DOWNLOAD_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
+
+
+def _effective_vram_gb(gpu: dict[str, Any]) -> float:
+    free_gb = float(gpu.get("vram_free_gb") or 0.0)
+    total_gb = float(gpu.get("vram_total_gb") or 0.0)
+    if free_gb > 0.0:
+        return min(free_gb, total_gb) if total_gb > 0.0 else free_gb
+    return total_gb
+
+
 def inspect_checkpoint_dir(path: Path) -> dict[str, Any] | None:
     if not path.is_dir():
         return None
     cfg_path = path / "config.json"
     if not cfg_path.is_file():
         return None
+    missing_files: list[str] = []
+    try:
+        cfg_obj = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if not isinstance(cfg_obj, dict):
+            missing_files.append("config.json (invalid JSON object)")
+    except Exception:
+        missing_files.append("config.json (unreadable JSON)")
+
+    tok_path = path / "tokenizer.json"
+    tmpl_path = path / "chat_template.jinja"
+    has_tokenizer = tok_path.is_file() and tok_path.stat().st_size > 0
+    has_chat_template = tmpl_path.is_file() and tmpl_path.stat().st_size > 0
+    if not has_tokenizer:
+        missing_files.append("tokenizer.json")
+    if not has_chat_template:
+        missing_files.append("chat_template.jinja")
+
     safetensors = sorted(path.glob("*.safetensors"))
-    if not safetensors:
+    primary_shards = [
+        f
+        for f in safetensors
+        if f.name != "mtp.safetensors"
+        and "abliterated" not in f.name.lower()
+        and f.is_file()
+        and f.stat().st_size > 0
+    ]
+
+    index_path = path / "model.safetensors.index.json"
+    complete_weights = False
+    if index_path.is_file():
+        try:
+            idx_data = json.loads(index_path.read_text(encoding="utf-8"))
+            weight_map = idx_data.get("weight_map") if isinstance(idx_data, dict) else None
+            if isinstance(weight_map, dict) and weight_map:
+                expected_shards = sorted({str(v) for v in weight_map.values()})
+                missing_shards = [
+                    s for s in expected_shards if not ((path / s).is_file() and (path / s).stat().st_size > 0)
+                ]
+                if missing_shards:
+                    missing_files.extend(missing_shards)
+                else:
+                    complete_weights = True
+            else:
+                missing_files.append("model.safetensors.index.json (empty weight_map)")
+        except Exception:
+            missing_files.append("model.safetensors.index.json (unreadable JSON)")
+    else:
+        if primary_shards:
+            complete_weights = True
+        else:
+            missing_files.append("model-*.safetensors")
+
+    complete_fake_assets = has_tokenizer and has_chat_template and not any(
+        m.startswith("config.json") for m in missing_files
+    )
+
+    if not safetensors and not complete_fake_assets:
         return None
+
     total_bytes = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
     size_gb = round(total_bytes / 1e9, 2)
-    has_mtp = (path / "mtp.safetensors").is_file()
-    has_ablation = (path / "inkling-2-mini-abliterated.safetensors").is_file()
-    has_tokenizer = (path / "tokenizer.json").is_file() or (path / "tiktoken" / "tokenizer.model").is_file()
+    has_mtp = (path / "mtp.safetensors").is_file() and (path / "mtp.safetensors").stat().st_size > 0
+    has_ablation = (
+        (path / "inkling-2-mini-abliterated.safetensors").is_file()
+        and (path / "inkling-2-mini-abliterated.safetensors").stat().st_size > 0
+    )
 
     name_l = path.name.lower()
     inferred_tier = "large"
-    if "exl3" in name_l or "9g" in name_l or size_gb <= 10.8:
+    if "exl3" in name_l or "9g" in name_l or (complete_weights and size_gb <= 10.8):
         inferred_tier = "small"
-    elif "10g" in name_l or size_gb <= 13.0:
+    elif "10g" in name_l or (complete_weights and size_gb <= 13.0):
         inferred_tier = "small_10g"
-    elif "12g" in name_l or size_gb <= 16.5:
+    elif "12g" in name_l or (complete_weights and size_gb <= 16.5):
         inferred_tier = "medium"
 
     return {
@@ -303,9 +373,25 @@ def inspect_checkpoint_dir(path: Path) -> dict[str, Any] | None:
         "has_mtp": has_mtp,
         "has_ablation": has_ablation,
         "has_tokenizer": has_tokenizer,
+        "has_chat_template": has_chat_template,
+        "complete_weights": complete_weights,
+        "complete_fake_assets": complete_fake_assets,
+        "usable_engine": complete_weights and complete_fake_assets,
+        "missing_files": missing_files,
         "inferred_tier": inferred_tier,
         "safetensor_count": len(safetensors),
     }
+
+
+def verify_checkpoint_dir(path: Path, *, require_weights: bool = True) -> tuple[bool, list[str]]:
+    info = inspect_checkpoint_dir(path)
+    if info is None:
+        return False, list(FAKE_REQUIRED_FILES) + (["model-*.safetensors"] if require_weights else [])
+    if require_weights:
+        ok = bool(info["usable_engine"])
+    else:
+        ok = bool(info["complete_fake_assets"])
+    return ok, list(info["missing_files"])
 
 
 def scan_local_checkpoints(root: Path = ROOT, extra_dirs: list[Path] | None = None) -> list[dict[str, Any]]:
@@ -356,6 +442,8 @@ def find_local_binaries(root: Path = ROOT) -> dict[str, str]:
         "multiarch": root / "native" / "build-multiarch" / "apps" / "serve" / "ingine-serve",
         "release": root / "native" / "build" / "apps" / "serve" / "ingine-serve",
         "sm70": root / "native" / "build-sm70" / "apps" / "serve" / "ingine-serve",
+        "sm80": root / "native" / "build-sm80" / "apps" / "serve" / "ingine-serve",
+        "sm90": root / "native" / "build-sm90" / "apps" / "serve" / "ingine-serve",
         "legacy_fp16": root / "native" / "build-legacy-fp16" / "apps" / "serve" / "ingine-serve",
         "cpu": root / "native" / "build-cpu" / "apps" / "serve" / "ingine-serve",
     }
@@ -422,6 +510,7 @@ def detect_hardware(root: Path = ROOT) -> dict[str, Any]:
         "iommu": iommu,
         "binaries": binaries,
         "checkpoints": checkpoints,
+        "has_private_cuda": (root / ".cuda-toolkit" / "nvidia" / "cu13" / "bin" / "nvcc").is_file(),
         "has_hf_cli": shutil.which("hf") is not None or shutil.which("huggingface-cli") is not None,
     }
 
@@ -434,8 +523,12 @@ def _select_best_gpu(gpus: list[dict[str, Any]], gpu_indices: list[int] | None =
         picked = [by_idx[i] for i in gpu_indices if i in by_idx]
         if picked:
             return picked
-    # Prefer highest total VRAM, then newest SM architecture.
-    return sorted(gpus, key=lambda g: (g["vram_total_mib"], g["sm_int"], -g["index"]), reverse=True)
+    # Prefer highest detected free VRAM, then total VRAM, then newest SM architecture.
+    return sorted(
+        gpus,
+        key=lambda g: (_effective_vram_gb(g), g["vram_total_mib"], g["sm_int"], -g["index"]),
+        reverse=True,
+    )
 
 
 def recommend_defaults(hw: dict[str, Any]) -> dict[str, Any]:
@@ -449,24 +542,19 @@ def recommend_defaults(hw: dict[str, Any]) -> dict[str, Any]:
             "mode": "chat",
         }
     primary = gpus[0]
-    vram_gb = primary["vram_total_gb"]
-    if vram_gb >= 23.0:
-        tier = "large" if vram_gb >= 30.0 else "medium"
-        # On 24 GB cards, native Large fits 64K comfortably; prefer Large when already local, else Medium/Large.
-        if vram_gb >= 23.0 and any(c["inferred_tier"] == "large" for c in hw.get("checkpoints", [])):
-            tier = "large"
-        elif vram_gb >= 23.0:
-            tier = "large"
+    vram_gb = _effective_vram_gb(primary)
+    if vram_gb >= 22.0:
+        tier = "large"
     elif vram_gb >= 15.5:
         tier = "small_10g" if primary["sm_int"] < 80 else "medium"
-    elif vram_gb >= 11.5:
+    elif vram_gb >= 12.0:
         tier = "small_10g"
     else:
         tier = "small"
 
-    if vram_gb >= 80.0:
+    if vram_gb >= 72.0:
         ctx = 262144
-    elif vram_gb >= 23.0:
+    elif vram_gb >= 22.0:
         ctx = 65536
     elif vram_gb >= 11.5:
         ctx = 65536 if tier == "small" else 16384
@@ -482,14 +570,59 @@ def recommend_defaults(hw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _gpu_dp_slots(gpu: dict[str, Any], tier: dict[str, Any], ctx: int) -> int:
+    eff = _effective_vram_gb(gpu)
+    if eff < 5.2:
+        return 0
+    if eff < tier["min_vram_gb"]:
+        return 1 if (tier["supports_atlas_6g"] and eff >= 5.2) else 0
+    # Estimate minimum VRAM per independent worker (weights + smallest viable KV + runtime headroom).
+    kv_gb = (ctx * KV_BYTES_PER_TOK[("q4", "per_pass")]) / (1024.0 ** 3)
+    if eff < 22.0 and ctx >= 262144:
+        kv_gb = 2.0  # paged Q4 VRAM cache cap
+    elif eff < 31.0 and ctx >= 524288 and tier["id"] == "large":
+        kv_gb = 1.0
+    per_worker_gb = max(tier["min_vram_gb"], tier["base_vram_gb"] + min(kv_gb, 16.0) + 1.0)
+    if eff < per_worker_gb:
+        return 1
+    return max(1, min(4, int((eff - 0.5) // per_worker_gb)))
+
+
+def _choose_tp_group(gpus: list[dict[str, Any]], tier: dict[str, Any], tp_size: int) -> list[dict[str, Any]]:
+    if tp_size <= 1:
+        return []
+    min_per_gpu = (tier["base_vram_gb"] / tp_size) + 2.0
+    sm_groups: dict[int, list[dict[str, Any]]] = {}
+    for g in gpus:
+        if _effective_vram_gb(g) >= min_per_gpu:
+            sm_groups.setdefault(g["sm_int"], []).append(g)
+    candidates: list[list[dict[str, Any]]] = []
+    for grp in sm_groups.values():
+        if len(grp) >= tp_size:
+            ordered = sorted(grp, key=lambda g: (_effective_vram_gb(g), g["vram_total_mib"], -g["index"]), reverse=True)
+            candidates.append(ordered[:tp_size])
+    if not candidates:
+        return []
+    return max(candidates, key=lambda grp: (min(_effective_vram_gb(g) for g in grp), grp[0]["sm_int"]))
+
+
 def compute_array_bounds(hw: dict[str, Any], tier_id: str, ctx: int) -> dict[str, Any]:
     tier = MODEL_TIERS.get(tier_id, MODEL_TIERS["small"])
     gpus = _select_best_gpu(hw.get("gpus", []))
     if not gpus:
-        return {"max_array": 1, "circles": [1], "supports_tp": [], "supports_dp": False, "max_batch_single": 1}
+        return {
+            "max_array": 1,
+            "circles": [1],
+            "supports_tp": [],
+            "supports_dp": False,
+            "dp_capacity": 0,
+            "eligible_dp_gpu_count": 0,
+            "per_gpu_dp_slots": [],
+            "max_batch_single": 1,
+        }
 
     primary = gpus[0]
-    vram_gb = primary["vram_total_gb"]
+    vram_gb = _effective_vram_gb(primary)
     headroom_gb = max(0.0, vram_gb - tier["base_vram_gb"] - 2.0)
 
     # Single-card continuous batching capacity estimate (~1.5 GiB per concurrent active slot at 64K Q4/FP8).
@@ -498,27 +631,31 @@ def compute_array_bounds(hw: dict[str, Any], tier_id: str, ctx: int) -> dict[str
         max_batch_single = 1
     else:
         max_batch_single = max(1, min(16, 1 + int(headroom_gb // max(0.75, per_slot_gb))))
-        if vram_gb >= 80.0 and ctx <= 65536:
+        if vram_gb >= 72.0 and ctx <= 65536:
             max_batch_single = min(32, max(max_batch_single, 8))
 
-    # Count GPUs that can each hold this tier for DP worker arrays.
-    eligible_dp_gpus = [g for g in gpus if g["vram_total_gb"] >= tier["min_vram_gb"]]
-    dp_replicas_total = 0
-    for g in eligible_dp_gpus:
-        if g["vram_total_gb"] >= tier["base_vram_gb"] * 2 + 4.0:
-            dp_replicas_total += min(4, int((g["vram_total_gb"] - 2.0) // (tier["base_vram_gb"] + 2.0)))
-        else:
-            dp_replicas_total += 1
-
-    # Homogeneous same-SM multi-GPU TP check (TP=2 or TP=4 supported by native CMake INGINE_TP_SIZE).
-    sm_counts: dict[int, int] = {}
+    per_gpu_dp_slots: list[dict[str, Any]] = []
+    dp_capacity = 0
+    eligible_dp_gpu_count = 0
     for g in gpus:
-        sm_counts[g["sm_int"]] = sm_counts.get(g["sm_int"], 0) + 1
-    max_same_sm = max(sm_counts.values()) if sm_counts else 0
-    supports_tp = [n for n in (2, 4) if max_same_sm >= n]
+        slots = _gpu_dp_slots(g, tier, ctx)
+        if slots > 0:
+            eligible_dp_gpu_count += 1
+            dp_capacity += slots
+        per_gpu_dp_slots.append(
+            {
+                "index": g["index"],
+                "name": g["name"],
+                "arch": g["arch"],
+                "free_vram_gb": _effective_vram_gb(g),
+                "total_vram_gb": g["vram_total_gb"],
+                "slots": slots,
+            }
+        )
 
-    max_array = max(1, max_batch_single, dp_replicas_total, max(supports_tp) if supports_tp else 1)
-    # Build clean clickable circles up to max_array (1..8, plus 16/32 if card supports it).
+    supports_tp = [n for n in (2, 4) if _choose_tp_group(gpus, tier, n)]
+
+    max_array = max(1, max_batch_single, dp_capacity, max(supports_tp) if supports_tp else 1)
     circles = [n for n in (1, 2, 3, 4, 6, 8, 12, 16, 24, 32) if n <= max_array]
     if max_array not in circles and max_array <= 32:
         circles.append(max_array)
@@ -530,76 +667,306 @@ def compute_array_bounds(hw: dict[str, Any], tier_id: str, ctx: int) -> dict[str
         "max_array": max_array,
         "circles": circles,
         "supports_tp": supports_tp,
-        "supports_dp": len(eligible_dp_gpus) >= 2 or dp_replicas_total >= 2,
-        "eligible_dp_gpu_count": len(eligible_dp_gpus),
+        "supports_dp": dp_capacity >= 2,
+        "dp_capacity": dp_capacity,
+        "eligible_dp_gpu_count": eligible_dp_gpu_count,
+        "per_gpu_dp_slots": per_gpu_dp_slots,
         "max_batch_single": max_batch_single,
     }
 
 
-def _choose_binary(hw: dict[str, Any], primary_gpu: dict[str, Any] | None, tp_size: int) -> tuple[str, str, bool]:
-    """Return (binary_path, build_command, binary_ready)."""
+def _choose_binary(hw: dict[str, Any], target_gpu: dict[str, Any] | None, tp_size: int) -> tuple[str, str, bool]:
+    """Return (binary_path, build_command_from_repo_root, binary_ready) matching target_gpu's SM arch."""
     binaries = hw.get("binaries", {})
-    if primary_gpu is None:
+    if target_gpu is None:
         if "cpu" in binaries:
             return binaries["cpu"], "", True
         return (
             str(ROOT / "native" / "build-cpu" / "apps" / "serve" / "ingine-serve"),
-            "cmake --preset cpu-dev -S native && cmake --build --preset cpu-dev --target ingine-serve",
+            "(cd native && cmake --preset cpu-dev && cmake --build --preset cpu-dev --target ingine-serve)",
             False,
         )
 
-    sm = primary_gpu["sm_int"]
+    sm = target_gpu["sm_int"]
+    arch_val = "120a" if sm >= 120 else str(sm)
+    has_private_cuda = bool(hw.get("has_private_cuda"))
+
     if tp_size > 1:
-        build_dir = f"native/build-tp{tp_size}"
+        build_dir = f"native/build-tp{tp_size}-sm{arch_val}"
         bin_path = str(ROOT / build_dir / "apps" / "serve" / "ingine-serve")
         fp16_flag = " -DINGINE_ACT_FP16=ON" if sm < 80 else ""
-        arch_val = "120a" if sm >= 120 else str(sm)
         nvcc_hint = (
             " -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc"
             if sm < 80
-            else " -DCMAKE_CUDA_COMPILER=$(pwd)/.cuda-toolkit/nvidia/cu13/bin/nvcc"
+            else ' -DCMAKE_CUDA_COMPILER="$(pwd)/.cuda-toolkit/nvidia/cu13/bin/nvcc"'
         )
+        prefix_setup = "" if (sm < 80 or has_private_cuda) else "bash scripts/install.sh --build-only && "
         cmd = (
-            f"cmake -G Ninja -S native -B {build_dir} -DCMAKE_BUILD_TYPE=Release "
+            f"{prefix_setup}cmake -G Ninja -S native -B {build_dir} -DCMAKE_BUILD_TYPE=Release "
             f"-DCMAKE_CUDA_ARCHITECTURES={arch_val} -DINGINE_TP_SIZE={tp_size}{fp16_flag}{nvcc_hint} "
             f"&& cmake --build {build_dir} --target ingine-serve"
         )
+        tp_key = f"tp{tp_size}_sm{arch_val}"
+        if tp_key in binaries:
+            return binaries[tp_key], "", True
         ready = Path(bin_path).is_file() and os.access(bin_path, os.X_OK)
-        return bin_path, cmd, ready
+        return bin_path, ("" if ready else cmd), ready
 
-    if sm < 80:
+    if sm == 70:
         for key in ("sm70", "legacy_fp16"):
             if key in binaries:
                 return binaries[key], "", True
-        preset = "sm70" if sm == 70 else "legacy-fp16"
         return (
-            str(ROOT / "native" / f"build-{preset}" / "apps" / "serve" / "ingine-serve"),
-            f"cmake --preset {preset} -S native && cmake --build --preset {preset} --target ingine-serve",
+            str(ROOT / "native" / "build-sm70" / "apps" / "serve" / "ingine-serve"),
+            "(cd native && cmake --preset sm70 && cmake --build --preset sm70 --target ingine-serve)",
             False,
         )
 
-    for key in ("install", "multiarch", "release"):
+    if sm < 80:
+        # Pascal sm_60/61 and Turing sm_75 require legacy-fp16 (NEVER sm70-only binary!).
+        if "legacy_fp16" in binaries:
+            return binaries["legacy_fp16"], "", True
+        return (
+            str(ROOT / "native" / "build-legacy-fp16" / "apps" / "serve" / "ingine-serve"),
+            "(cd native && cmake --preset legacy-fp16 && cmake --build --preset legacy-fp16 --target ingine-serve)",
+            False,
+        )
+
+    if sm in (80, 90):
+        # A100 (sm_80) and H100 (sm_90) are not in the install preset's 86;89;120a list.
+        key = f"sm{sm}"
         if key in binaries:
             return binaries[key], "", True
-    return (
-        str(ROOT / "native" / "build-install" / "apps" / "serve" / "ingine-serve"),
-        "bash scripts/install.sh",
-        False,
+        build_dir = f"native/build-sm{sm}"
+        prefix_setup = "" if has_private_cuda else "bash scripts/install.sh --build-only && "
+        return (
+            str(ROOT / build_dir / "apps" / "serve" / "ingine-serve"),
+            (
+                f"{prefix_setup}cmake -G Ninja -S native -B {build_dir} -DCMAKE_BUILD_TYPE=Release "
+                f'-DCMAKE_CUDA_ARCHITECTURES={sm} -DCMAKE_CUDA_COMPILER="$(pwd)/.cuda-toolkit/nvidia/cu13/bin/nvcc" '
+                f"&& cmake --build {build_dir} --target ingine-serve"
+            ),
+            False,
+        )
+
+    # sm_86 / sm_89 / sm_120a: install & multiarch include all three; release is sm_120a-only.
+    accepted = ("install", "multiarch", "release") if sm >= 120 else ("install", "multiarch")
+    for key in accepted:
+        if key in binaries:
+            return binaries[key], "", True
+    cmd = (
+        "(cd native && cmake --preset install && cmake --build --preset install --target ingine-serve)"
+        if has_private_cuda
+        else "bash scripts/install.sh --build-only"
     )
+    return str(ROOT / "native" / "build-install" / "apps" / "serve" / "ingine-serve"), cmd, False
 
 
-def _match_local_checkpoint(hw: dict[str, Any], tier_id: str, override_dir: str | None = None) -> tuple[str, dict[str, Any] | None]:
+def _match_local_checkpoint(
+    hw: dict[str, Any],
+    tier_id: str,
+    override_dir: str | None = None,
+    *,
+    require_weights: bool = True,
+) -> tuple[str, dict[str, Any] | None]:
     tier = MODEL_TIERS[tier_id]
     if override_dir:
         p = Path(override_dir).expanduser().resolve()
         info = inspect_checkpoint_dir(p)
         return str(p), info
     for ckpt in hw.get("checkpoints", []):
-        if ckpt["inferred_tier"] == tier_id:
+        if require_weights and ckpt.get("inferred_tier") == tier_id and ckpt.get("usable_engine"):
             return ckpt["path"], ckpt
+    if not require_weights:
+        for ckpt in hw.get("checkpoints", []):
+            if ckpt.get("complete_fake_assets"):
+                return ckpt["path"], ckpt
     default_dir = ROOT / "models" / tier["local_dir_name"]
     info = inspect_checkpoint_dir(default_dir)
     return str(default_dir), info
+
+
+def _tune_worker_for_gpu(
+    hw: dict[str, Any],
+    gpu: dict[str, Any],
+    tier: dict[str, Any],
+    ctx: int,
+    ckpt_path: str,
+    ckpt_info: dict[str, Any] | None,
+    *,
+    kv_cache_mode: str,
+    max_batch: int,
+    tp_size: int,
+    vision: bool | None,
+    spec: bool | None,
+    vram_budget_gb: float | None = None,
+) -> dict[str, Any]:
+    """Compute matching binary, flags, footprint, and warnings for one GPU (or TP bottleneck GPU)."""
+    warnings: list[str] = []
+    tier_id = tier["id"]
+    total_gb = float(gpu["vram_total_gb"])
+    free_gb = _effective_vram_gb(gpu)
+    vram_gb = min(free_gb, vram_budget_gb) if vram_budget_gb is not None else free_gb
+    sm = gpu["sm_int"]
+
+    if total_gb - free_gb >= 2.0:
+        warnings.append(
+            f"GPU {gpu['index']} ({gpu['name']}) currently has {free_gb:.1f}/{total_gb:.1f} GB free VRAM; sizing worker to free VRAM."
+        )
+    if sm >= 80 and gpu["driver_major"] and gpu["driver_major"] < MIN_CUDA13_DRIVER:
+        warnings.append(
+            f"GPU {gpu['index']}: NVIDIA driver {gpu['driver']} is older than {MIN_CUDA13_DRIVER}; CUDA 13.4 builds require driver >= 580."
+        )
+
+    use_atlas_6g = False
+    kv_format = "fp8"
+    kv_paged = False
+    kv_vram_mb = 0
+    kv_ram_mb = 12288
+    prefill_chunk = 3072
+    use_dense_fp8 = True
+    use_vision = True if vision is None else bool(vision)
+    use_spec = True if spec is None else bool(spec)
+    eff_kv_mode = kv_cache_mode
+
+    if vram_gb < 11.0 and tp_size == 1:
+        use_atlas_6g = True
+        if tier_id != "small":
+            warnings.append(
+                f"GPU {gpu['index']}: {tier['label']} ({tier['disk_gb']} GB) exceeds {vram_gb:.1f} GB free VRAM; select Small (EXL3 9 GB) for <=10 GB cards."
+            )
+        kv_format = "q4" if ctx >= 131072 else "fp8"
+        if ctx >= 131072:
+            kv_paged = True
+            kv_vram_mb = 512
+            kv_ram_mb = min(12288, max(4096, int((hw.get("ram_free_gb", 16.0) - 2.0) * 1024)))
+            prefill_chunk = 512
+        else:
+            prefill_chunk = 1024
+        use_vision = False
+        use_spec = False
+    elif vram_gb < 22.0 and tp_size == 1:
+        if ctx >= 262144:
+            kv_format = "q4"
+            kv_paged = True
+            kv_vram_mb = 2048 if vram_gb >= 15.0 else 1024
+            kv_ram_mb = min(12288, max(4096, int((hw.get("ram_free_gb", 16.0) - 2.0) * 1024)))
+            prefill_chunk = 512
+        else:
+            kv_format = "q4" if vram_gb < 15.0 else "fp8"
+            prefill_chunk = 1024 if ctx >= 65536 else 2048
+        if tier_id == "large":
+            warnings.append(
+                f"GPU {gpu['index']}: Large (20.2 GB) exceeds {vram_gb:.1f} GB free VRAM; switch to Small (EXL3 9 GB) or Compact (atlas-10g)."
+            )
+    elif vram_gb < 31.0:
+        if ctx >= 524288:
+            kv_format = "q4"
+            prefill_chunk = 2048
+            if tier_id == "large" and tp_size == 1:
+                kv_paged = True
+                kv_vram_mb = 1024
+                warnings.append(
+                    f"GPU {gpu['index']}: 1M context with Large (20.2 GB) on {vram_gb:.1f} GB uses paged Q4 KV; Small (EXL3 9 GB) runs 1M fully resident."
+                )
+            if vision is None:
+                use_vision = False
+        elif ctx >= 262144:
+            kv_format = "q4"
+            prefill_chunk = 2048
+        else:
+            kv_format = "fp8"
+            prefill_chunk = 3072
+    elif vram_gb < 64.0:
+        if ctx >= 524288:
+            kv_format = "q4"
+            prefill_chunk = 2048
+        else:
+            kv_format = "fp8"
+            prefill_chunk = 3072
+    else:
+        kv_format = "fp8"
+        prefill_chunk = 3072
+
+    if max_batch > 1:
+        if eff_kv_mode == "last_full":
+            eff_kv_mode = "per_pass"
+            warnings.append("--kv-cache-mode last_full is B=1 non-spec only; using per_pass for batched mode.")
+        if use_spec:
+            use_spec = False
+            warnings.append("DSpark --spec is disabled for --max-batch > 1 on main (batched MTP staged under #851).")
+
+    if eff_kv_mode == "last_full" and use_spec:
+        use_spec = False
+        warnings.append("--kv-cache-mode last_full is non-spec only; disabled --spec.")
+
+    if ckpt_info is not None and not ckpt_info.get("has_mtp") and use_spec:
+        use_spec = False
+        warnings.append(f"mtp.safetensors not found in {ckpt_path}; disabled --spec.")
+
+    binary_path, build_command, binary_ready = _choose_binary(hw, gpu, tp_size)
+
+    flags: list[str] = ["--engine", "--model-dir", ckpt_path, "--max-ctx", str(ctx)]
+    if use_atlas_6g:
+        flags.append("--atlas-6g")
+    elif use_dense_fp8:
+        flags.append("--dense-fp8")
+
+    if kv_paged:
+        flags.extend(["--kv-q4", "--kv-paged", "--kv-vram-mb", str(kv_vram_mb), "--kv-ram-mb", str(kv_ram_mb)])
+    elif kv_format == "q4":
+        flags.append("--kv-q4")
+    else:
+        flags.append("--kv-fp8")
+
+    if eff_kv_mode == "last_full":
+        flags.extend(["--kv-cache-mode", "last_full"])
+
+    if prefill_chunk != 3072:
+        flags.extend(["--prefill-chunk", str(prefill_chunk)])
+
+    if use_spec:
+        flags.extend(["--spec", "--spec-threshold", "0.8"])
+
+    if not use_vision and not use_atlas_6g:
+        flags.append("--no-vision")
+
+    if max_batch > 1:
+        flags.extend(["--max-batch", str(max_batch)])
+
+    if ckpt_info and ckpt_info.get("has_ablation"):
+        flags.extend(["--ablation", str(Path(ckpt_path) / "inkling-2-mini-abliterated.safetensors")])
+
+    flags.extend(["--model-id", tier["model_id"]])
+
+    kv_bpt = KV_BYTES_PER_TOK[(kv_format, eff_kv_mode)]
+    kv_total_gb = (ctx * kv_bpt) / (1024.0 ** 3)
+    if use_atlas_6g:
+        est_vram_gb = 5.4
+        est_ram_gb = round(min(16.0, 4.0 + kv_ram_mb / 1024.0), 1)
+    else:
+        vram_kv_gb = (kv_vram_mb / 1024.0) if kv_paged else kv_total_gb
+        batch_extra_gb = 0.0 if max_batch <= 1 else max(0.0, (max_batch - 1) * 0.9)
+        vision_gb = 0.6 if use_vision else 0.0
+        spec_gb = 0.7 if use_spec else 0.0
+        per_gpu_weights = tier["base_vram_gb"] / tp_size
+        est_vram_gb = round(per_gpu_weights + vram_kv_gb + batch_extra_gb + vision_gb + spec_gb, 2)
+        est_ram_gb = round((kv_ram_mb / 1024.0 if kv_paged else 1.2) + 0.5, 1)
+
+    return {
+        "binary_path": binary_path,
+        "build_command": build_command,
+        "binary_ready": binary_ready,
+        "flags": flags,
+        "kv_format": kv_format,
+        "kv_cache_mode": eff_kv_mode,
+        "kv_paged": kv_paged,
+        "vision": use_vision,
+        "spec": use_spec,
+        "estimated_vram_gb": est_vram_gb,
+        "estimated_ram_gb": est_ram_gb,
+        "warnings": warnings,
+    }
 
 
 def build_plan(
@@ -642,9 +1009,11 @@ def build_plan(
             f"Requested array count {requested_array} exceeds detected hardware capacity ({bounds['max_array']}); clamped to {clamped_array}."
         )
 
-    # Resolve layout: single | batch | dp | tp
+    # Resolve layout: single | batch | dp | tp | cpu_fake
     resolved_layout = layout
     tp_size = 1
+    tp_group: list[dict[str, Any]] = []
+
     if primary is None:
         resolved_layout = "cpu_fake"
         clamped_array = 1
@@ -656,23 +1025,45 @@ def build_plan(
         resolved_layout = "single"
     else:
         if resolved_layout == "tp":
-            if clamped_array in bounds["supports_tp"]:
+            tp_group = _choose_tp_group(gpus, tier, clamped_array)
+            if tp_group:
                 tp_size = clamped_array
             else:
-                warnings.append(f"TP={clamped_array} requires {clamped_array} same-architecture GPUs; using DP/batch instead.")
+                warnings.append(
+                    f"TP={clamped_array} requires {clamped_array} same-architecture GPUs with sufficient free VRAM; using DP/batch instead."
+                )
                 resolved_layout = "auto"
+        if resolved_layout == "dp" and bounds["dp_capacity"] < clamped_array:
+            if bounds["dp_capacity"] >= 1:
+                warnings.append(
+                    f"DP capacity across free GPU VRAM is {bounds['dp_capacity']} worker(s); clamped from {clamped_array}."
+                )
+                clamped_array = bounds["dp_capacity"]
+                if clamped_array == 1:
+                    resolved_layout = "single"
+            else:
+                warnings.append("No GPU has enough free VRAM for DP replicas; falling back to single worker.")
+                clamped_array = 1
+                resolved_layout = "single"
         if resolved_layout == "auto":
-            if len([g for g in gpus if g["vram_total_gb"] >= tier["min_vram_gb"]]) >= clamped_array:
+            if bounds["eligible_dp_gpu_count"] >= clamped_array:
                 resolved_layout = "dp"
             elif clamped_array <= bounds["max_batch_single"]:
                 resolved_layout = "batch"
-            elif clamped_array in bounds["supports_tp"]:
-                resolved_layout = "tp"
-                tp_size = clamped_array
-            else:
+            elif bounds["dp_capacity"] >= clamped_array:
                 resolved_layout = "dp"
+            else:
+                tp_group = _choose_tp_group(gpus, tier, clamped_array)
+                if tp_group:
+                    resolved_layout = "tp"
+                    tp_size = clamped_array
+                else:
+                    resolved_layout = "single"
+                    clamped_array = 1
 
     if resolved_layout == "tp":
+        if not tp_group:
+            tp_group = _choose_tp_group(gpus, tier, tp_size)
         if not hw.get("iommu", {}).get("p2p_friendly", False):
             warnings.append(
                 "Multi-GPU TP on PCIe performs best with kernel boot parameter iommu=pt (P2P DMA fallback works automatically, slightly slower)."
@@ -681,187 +1072,114 @@ def build_plan(
             kv_cache_mode = "per_pass"
             warnings.append("TP mode requires --kv-cache-mode per_pass; switched automatically.")
 
-    ckpt_path, ckpt_info = _match_local_checkpoint(hw, tier_id, model_dir)
-    needs_download = ckpt_info is None
-    download_gb = 0.0 if not needs_download else tier["disk_gb"]
+    require_weights = resolved_layout != "cpu_fake"
+    ckpt_path, ckpt_info = _match_local_checkpoint(hw, tier_id, model_dir, require_weights=require_weights)
+    if require_weights:
+        checkpoint_present = bool(ckpt_info and ckpt_info.get("usable_engine"))
+    else:
+        checkpoint_present = bool(ckpt_info and ckpt_info.get("complete_fake_assets"))
+
+    needs_download = not checkpoint_present
+    if ckpt_info is not None and needs_download and ckpt_info.get("missing_files"):
+        warnings.append(
+            f"Incomplete checkpoint at {ckpt_path}; missing: {', '.join(ckpt_info['missing_files'][:6])}."
+        )
+
+    download_files: list[str] = []
+    if needs_download:
+        if require_weights:
+            download_gb = tier["disk_gb"]
+            download_cmd = f"hf download {tier['repo_id']} --local-dir {shlex.quote(ckpt_path)}"
+        else:
+            download_gb = 0.03
+            download_files = list(FAKE_DOWNLOAD_FILES)
+            files_arg = " ".join(shlex.quote(f) for f in download_files)
+            download_cmd = f"hf download {tier['repo_id']} {files_arg} --local-dir {shlex.quote(ckpt_path)}"
+    else:
+        download_gb = 0.0
+        download_cmd = ""
 
     if needs_download and hw.get("disk_free_gb", 0.0) > 0 and hw["disk_free_gb"] < download_gb + 2.0:
         warnings.append(
             f"Low free disk space ({hw['disk_free_gb']:.1f} GB free, need ~{download_gb + 2.0:.1f} GB for {tier['repo_id']})."
         )
 
-    binary_path, build_command, binary_ready = _choose_binary(hw, primary, tp_size)
+    # Construct per-worker launch commands with per-GPU capacity, binary, and flags.
+    workers: list[dict[str, Any]] = []
+    build_commands: list[str] = []
 
-    # Determine optimal per-worker flags.
-    flags: list[str] = []
-    use_atlas_6g = False
-    kv_format = "fp8"
-    kv_paged = False
-    kv_vram_mb = 0
-    kv_ram_mb = 12288
-    prefill_chunk = 3072
-    use_dense_fp8 = True
-    use_vision = True if vision is None else bool(vision)
-    use_spec = True if spec is None else bool(spec)
+    def _add_build_cmd(cmd: str) -> None:
+        if cmd and cmd not in build_commands:
+            build_commands.append(cmd)
 
-    if primary is not None:
-        vram_gb = primary["vram_total_gb"]
-        sm = primary["sm_int"]
-        if sm >= 80 and primary["driver_major"] and primary["driver_major"] < MIN_CUDA13_DRIVER:
-            warnings.append(
-                f"NVIDIA driver {primary['driver']} is older than {MIN_CUDA13_DRIVER}; CUDA 13.4 builds require driver >= 580."
-            )
-
-        # Tier fit & 6 GB offload preset
-        if vram_gb < 11.0:
-            use_atlas_6g = True
-            if tier_id != "small":
-                warnings.append(
-                    f"{tier['label']} ({tier['disk_gb']} GB) exceeds {vram_gb:.1f} GB VRAM; select Small (EXL3 9 GB) for <=10 GB cards."
-                )
-            kv_format = "q4" if ctx >= 131072 else "fp8"
-            if ctx >= 131072:
-                kv_paged = True
-                kv_vram_mb = 512
-                kv_ram_mb = min(12288, max(4096, int((hw.get("ram_free_gb", 16.0) - 2.0) * 1024)))
-                prefill_chunk = 512
-            else:
-                prefill_chunk = 1024
-            use_vision = False
-            use_spec = False
-        elif vram_gb < 22.0:
-            # 12-16 GB class (P100, T4, RTX 4060 Ti 16G, RTX 4070 12G)
-            if ctx >= 262144:
-                kv_format = "q4"
-                kv_paged = True
-                kv_vram_mb = 2048 if vram_gb >= 15.0 else 1024
-                kv_ram_mb = min(12288, max(4096, int((hw.get("ram_free_gb", 16.0) - 2.0) * 1024)))
-                prefill_chunk = 512
-            else:
-                kv_format = "q4" if vram_gb < 15.0 else "fp8"
-                prefill_chunk = 1024 if ctx >= 65536 else 2048
-            if tier_id == "large":
-                warnings.append(
-                    f"Large (20.2 GB) exceeds {vram_gb:.1f} GB VRAM; switch to Small (EXL3 9 GB) or Compact (atlas-10g)."
-                )
-        elif vram_gb < 31.0:
-            # 24 GB class (RTX 3090, RTX 4090, Quadro RTX 6000)
-            if ctx >= 524288:
-                kv_format = "q4"
-                prefill_chunk = 2048
-                if tier_id == "large":
-                    kv_paged = True
-                    kv_vram_mb = 1024
-                    warnings.append("1M context with Large (20.2 GB) on 24 GB uses paged Q4 KV; Small (EXL3 9 GB) runs 1M fully resident.")
-                if vision is None:
-                    use_vision = False
-            elif ctx >= 262144:
-                kv_format = "q4"
-                prefill_chunk = 2048
-            else:
-                kv_format = "fp8"
-                prefill_chunk = 3072
-        elif vram_gb < 64.0:
-            # 32-48 GB class (V100 32 GB, RTX 5090 32 GB, A40/L40S 48 GB)
-            if ctx >= 524288:
-                kv_format = "q4"
-                prefill_chunk = 2048
-            else:
-                kv_format = "fp8"
-                prefill_chunk = 3072
-        else:
-            # 80-96+ GB class (A100, H100, RTX PRO 6000 96 GB)
-            kv_format = "fp8"
-            prefill_chunk = 3072
-
-        # Enforce hard engine constraints from native/apps/serve/main.cpp:
-        max_batch = clamped_array if resolved_layout == "batch" else 1
-        if max_batch > 1:
-            if kv_cache_mode == "last_full":
-                kv_cache_mode = "per_pass"
-                warnings.append("--kv-cache-mode last_full is B=1 non-spec only; using per_pass for batched mode.")
-            if use_spec:
-                use_spec = False
-                warnings.append("DSpark --spec is disabled for --max-batch > 1 on main (batched MTP staged under #851).")
-
-        if kv_cache_mode == "last_full" and use_spec:
-            use_spec = False
-            warnings.append("--kv-cache-mode last_full is non-spec only; disabled --spec.")
-
-        if ckpt_info is not None and not ckpt_info["has_mtp"] and use_spec:
-            use_spec = False
-            warnings.append(f"mtp.safetensors not found in {ckpt_path}; disabled --spec.")
-
-        flags.extend(["--engine", "--model-dir", ckpt_path, "--max-ctx", str(ctx)])
-        if use_atlas_6g:
-            flags.append("--atlas-6g")
-        elif use_dense_fp8:
-            flags.append("--dense-fp8")
-
-        if kv_paged:
-            flags.extend(["--kv-q4", "--kv-paged", "--kv-vram-mb", str(kv_vram_mb), "--kv-ram-mb", str(kv_ram_mb)])
-        elif kv_format == "q4":
-            flags.append("--kv-q4")
-        else:
-            flags.append("--kv-fp8")
-
-        if kv_cache_mode == "last_full":
-            flags.extend(["--kv-cache-mode", "last_full"])
-
-        if prefill_chunk != 3072:
-            flags.extend(["--prefill-chunk", str(prefill_chunk)])
-
-        if use_spec:
-            flags.extend(["--spec", "--spec-threshold", "0.8"])
-
-        if not use_vision and not use_atlas_6g:
-            flags.append("--no-vision")
-
-        if max_batch > 1:
-            flags.extend(["--max-batch", str(max_batch)])
-
-        if ckpt_info and ckpt_info.get("has_ablation"):
-            flags.extend(["--ablation", str(Path(ckpt_path) / "inkling-2-mini-abliterated.safetensors")])
-
-        flags.extend(["--model-id", tier["model_id"]])
-    else:
-        flags.extend(["--fake", "--model-dir", ckpt_path, "--model-id", f"{tier['model_id']}-fake"])
+    if resolved_layout == "cpu_fake":
+        binary_path, build_cmd, binary_ready = _choose_binary(hw, None, 1)
+        _add_build_cmd(build_cmd)
+        w_argv = [
+            binary_path,
+            "--fake",
+            "--model-dir",
+            ckpt_path,
+            "--model-id",
+            f"{tier['model_id']}-fake",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
+        workers.append(
+            {
+                "worker_index": 0,
+                "cuda_visible_devices": "",
+                "gpu_name": "CPU (--fake)",
+                "arch": "cpu",
+                "binary_path": binary_path,
+                "binary_ready": binary_ready,
+                "build_command": build_cmd,
+                "estimated_vram_gb": 0.0,
+                "host": host,
+                "port": port,
+                "base_url": f"http://{host}:{port}/v1",
+                "argv": w_argv,
+                "shell": " ".join(shlex.quote(a) for a in w_argv),
+            }
+        )
+        kv_format = "fp8"
+        kv_paged = False
         use_vision = False
         use_spec = False
-
-    # Construct per-worker launch commands.
-    workers: list[dict[str, Any]] = []
-    if resolved_layout == "dp":
-        eligible = [g for g in gpus if g["vram_total_gb"] >= tier["min_vram_gb"]] or gpus
-        for i in range(clamped_array):
-            g = eligible[i % len(eligible)]
-            w_port = port + i
-            w_argv = [binary_path, *flags, "--host", host, "--port", str(w_port)]
-            workers.append(
-                {
-                    "worker_index": i,
-                    "cuda_visible_devices": str(g["index"]),
-                    "gpu_name": g["name"],
-                    "host": host,
-                    "port": w_port,
-                    "base_url": f"http://{host}:{w_port}/v1",
-                    "argv": w_argv,
-                    "shell": f"CUDA_VISIBLE_DEVICES={g['index']} " + " ".join(shlex.quote(a) for a in w_argv),
-                }
-            )
+        est_vram_gb = 0.0
+        est_ram_gb = 0.5
     elif resolved_layout == "tp":
-        # Pick tp_size GPUs sharing the same SM architecture.
-        sm_groups: dict[int, list[dict[str, Any]]] = {}
-        for g in gpus:
-            sm_groups.setdefault(g["sm_int"], []).append(g)
-        chosen_group = max(sm_groups.values(), key=lambda grp: (len(grp), grp[0]["vram_total_mib"]))[:tp_size]
-        vis = ",".join(str(g["index"]) for g in chosen_group)
-        w_argv = [binary_path, *flags, "--host", host, "--port", str(port)]
+        # Derive architecture, binary, and flags strictly from the actual TP group's bottleneck GPU.
+        tp_bottleneck = min(tp_group, key=_effective_vram_gb)
+        tuned = _tune_worker_for_gpu(
+            hw,
+            tp_bottleneck,
+            tier,
+            ctx,
+            ckpt_path,
+            ckpt_info,
+            kv_cache_mode=kv_cache_mode,
+            max_batch=1,
+            tp_size=tp_size,
+            vision=vision,
+            spec=spec,
+        )
+        warnings.extend(w for w in tuned["warnings"] if w not in warnings)
+        _add_build_cmd(tuned["build_command"])
+        vis = ",".join(str(g["index"]) for g in tp_group)
+        w_argv = [tuned["binary_path"], *tuned["flags"], "--host", host, "--port", str(port)]
         workers.append(
             {
                 "worker_index": 0,
                 "cuda_visible_devices": vis,
-                "gpu_name": f"{tp_size}x {chosen_group[0]['name']} (TP={tp_size})",
+                "gpu_name": f"{tp_size}x {tp_group[0]['name']} (TP={tp_size})",
+                "arch": tp_bottleneck["arch"],
+                "binary_path": tuned["binary_path"],
+                "binary_ready": tuned["binary_ready"],
+                "build_command": tuned["build_command"],
+                "estimated_vram_gb": tuned["estimated_vram_gb"],
                 "host": host,
                 "port": port,
                 "base_url": f"http://{host}:{port}/v1",
@@ -869,46 +1187,127 @@ def build_plan(
                 "shell": f"CUDA_VISIBLE_DEVICES={vis} " + " ".join(shlex.quote(a) for a in w_argv),
             }
         )
+        kv_format = tuned["kv_format"]
+        kv_cache_mode = tuned["kv_cache_mode"]
+        kv_paged = tuned["kv_paged"]
+        use_vision = tuned["vision"]
+        use_spec = tuned["spec"]
+        est_vram_gb = tuned["estimated_vram_gb"]
+        est_ram_gb = tuned["estimated_ram_gb"]
+    elif resolved_layout == "dp":
+        # Spread 1 worker per eligible GPU first, then fill remaining per-GPU capacity without oversubscribing.
+        gpu_slots = {g["index"]: _gpu_dp_slots(g, tier, ctx) for g in gpus}
+        assigned_gpus: list[dict[str, Any]] = []
+        used_on_gpu: dict[int, int] = {g["index"]: 0 for g in gpus}
+        while len(assigned_gpus) < clamped_array:
+            progressed = False
+            for g in gpus:
+                if used_on_gpu[g["index"]] < gpu_slots[g["index"]]:
+                    assigned_gpus.append(g)
+                    used_on_gpu[g["index"]] += 1
+                    progressed = True
+                    if len(assigned_gpus) >= clamped_array:
+                        break
+            if not progressed:
+                break
+
+        tuned_list: list[dict[str, Any]] = []
+        for i, g in enumerate(assigned_gpus):
+            copies_on_g = used_on_gpu[g["index"]]
+            per_worker_budget = _effective_vram_gb(g) / max(1, copies_on_g)
+            tuned = _tune_worker_for_gpu(
+                hw,
+                g,
+                tier,
+                ctx,
+                ckpt_path,
+                ckpt_info,
+                kv_cache_mode=kv_cache_mode,
+                max_batch=1,
+                tp_size=1,
+                vision=vision,
+                spec=spec,
+                vram_budget_gb=per_worker_budget,
+            )
+            tuned_list.append(tuned)
+            warnings.extend(w for w in tuned["warnings"] if w not in warnings)
+            _add_build_cmd(tuned["build_command"])
+            w_port = port + i
+            w_argv = [tuned["binary_path"], *tuned["flags"], "--host", host, "--port", str(w_port)]
+            workers.append(
+                {
+                    "worker_index": i,
+                    "cuda_visible_devices": str(g["index"]),
+                    "gpu_name": g["name"],
+                    "arch": g["arch"],
+                    "binary_path": tuned["binary_path"],
+                    "binary_ready": tuned["binary_ready"],
+                    "build_command": tuned["build_command"],
+                    "estimated_vram_gb": tuned["estimated_vram_gb"],
+                    "host": host,
+                    "port": w_port,
+                    "base_url": f"http://{host}:{w_port}/v1",
+                    "argv": w_argv,
+                    "shell": f"CUDA_VISIBLE_DEVICES={g['index']} " + " ".join(shlex.quote(a) for a in w_argv),
+                }
+            )
+        clamped_array = len(workers)
+        lead = tuned_list[0]
+        kv_format = lead["kv_format"]
+        kv_cache_mode = lead["kv_cache_mode"]
+        kv_paged = any(t["kv_paged"] for t in tuned_list)
+        use_vision = all(t["vision"] for t in tuned_list)
+        use_spec = all(t["spec"] for t in tuned_list)
+        est_vram_gb = max(t["estimated_vram_gb"] for t in tuned_list)
+        est_ram_gb = round(sum(t["estimated_ram_gb"] for t in tuned_list), 1)
     else:
-        vis = str(primary["index"]) if primary is not None else ""
-        w_argv = [binary_path, *flags, "--host", host, "--port", str(port)]
-        prefix = f"CUDA_VISIBLE_DEVICES={vis} " if vis else ""
+        assert primary is not None
+        max_batch = clamped_array if resolved_layout == "batch" else 1
+        tuned = _tune_worker_for_gpu(
+            hw,
+            primary,
+            tier,
+            ctx,
+            ckpt_path,
+            ckpt_info,
+            kv_cache_mode=kv_cache_mode,
+            max_batch=max_batch,
+            tp_size=1,
+            vision=vision,
+            spec=spec,
+        )
+        warnings.extend(w for w in tuned["warnings"] if w not in warnings)
+        _add_build_cmd(tuned["build_command"])
+        vis = str(primary["index"])
+        w_argv = [tuned["binary_path"], *tuned["flags"], "--host", host, "--port", str(port)]
         workers.append(
             {
                 "worker_index": 0,
                 "cuda_visible_devices": vis,
-                "gpu_name": primary["name"] if primary else "CPU (--fake)",
+                "gpu_name": primary["name"],
+                "arch": primary["arch"],
+                "binary_path": tuned["binary_path"],
+                "binary_ready": tuned["binary_ready"],
+                "build_command": tuned["build_command"],
+                "estimated_vram_gb": tuned["estimated_vram_gb"],
                 "host": host,
                 "port": port,
                 "base_url": f"http://{host}:{port}/v1",
                 "argv": w_argv,
-                "shell": prefix + " ".join(shlex.quote(a) for a in w_argv),
+                "shell": f"CUDA_VISIBLE_DEVICES={vis} " + " ".join(shlex.quote(a) for a in w_argv),
             }
         )
+        kv_format = tuned["kv_format"]
+        kv_cache_mode = tuned["kv_cache_mode"]
+        kv_paged = tuned["kv_paged"]
+        use_vision = tuned["vision"]
+        use_spec = tuned["spec"]
+        est_vram_gb = tuned["estimated_vram_gb"]
+        est_ram_gb = tuned["estimated_ram_gb"]
 
-    # Footprint estimates
-    kv_bpt = KV_BYTES_PER_TOK[(kv_format, kv_cache_mode)]
-    kv_total_gb = (ctx * kv_bpt) / (1024.0 ** 3)
-    if use_atlas_6g:
-        est_vram_gb = 5.4
-        est_ram_gb = round(min(16.0, 4.0 + kv_ram_mb / 1024.0), 1)
-    elif primary is None:
-        est_vram_gb = 0.0
-        est_ram_gb = 0.5
-    else:
-        vram_kv_gb = (kv_vram_mb / 1024.0) if kv_paged else kv_total_gb
-        batch_extra_gb = 0.0 if resolved_layout != "batch" else max(0.0, (clamped_array - 1) * 0.9)
-        vision_gb = 0.6 if use_vision else 0.0
-        spec_gb = 0.7 if use_spec else 0.0
-        per_gpu_weights = tier["base_vram_gb"] / tp_size
-        est_vram_gb = round(per_gpu_weights + vram_kv_gb + batch_extra_gb + vision_gb + spec_gb, 2)
-        est_ram_gb = round((kv_ram_mb / 1024.0 if kv_paged else 1.2) + 0.5, 1)
-
-    download_cmd = (
-        f"hf download {tier['repo_id']} --local-dir {shlex.quote(ckpt_path)}"
-        if needs_download
-        else ""
-    )
+    binary_path = workers[0]["binary_path"]
+    binary_ready = all(w["binary_ready"] for w in workers)
+    build_command = " && ".join(build_commands)
 
     return {
         "tier": tier,
@@ -924,20 +1323,22 @@ def build_plan(
         "vision": use_vision,
         "spec": use_spec,
         "model_dir": ckpt_path,
-        "checkpoint_present": not needs_download,
+        "checkpoint_present": checkpoint_present,
         "needs_download": needs_download,
+        "download_files": download_files,
         "download_gb": download_gb,
         "download_command": download_cmd,
         "binary_path": binary_path,
         "binary_ready": binary_ready,
         "build_command": build_command,
+        "build_commands": build_commands,
         "estimated_vram_per_gpu_gb": est_vram_gb,
         "estimated_host_ram_gb": est_ram_gb,
         "array_bounds": bounds,
         "workers": workers,
         "warnings": warnings,
         "endpoint_url": workers[0]["base_url"],
-        "model_id": tier["model_id"],
+        "model_id": tier["model_id"] if require_weights else f"{tier['model_id']}-fake",
     }
 
 
@@ -1876,8 +2277,29 @@ def main(argv: list[str] | None = None) -> int:
             if rc != 0:
                 print(f"Download exited with status {rc}", file=sys.stderr)
                 return rc
-            plan["needs_download"] = False
-            plan["checkpoint_present"] = True
+            ok_ckpt, missing = verify_checkpoint_dir(
+                Path(plan["model_dir"]),
+                require_weights=(plan["layout"] != "cpu_fake"),
+            )
+            if not ok_ckpt:
+                print(
+                    f"Downloaded checkpoint at {plan['model_dir']} is incomplete; missing: {', '.join(missing)}",
+                    file=sys.stderr,
+                )
+                return 1
+            hw = detect_hardware(ROOT)
+            plan = build_plan(
+                hw,
+                tier_id=args.tier or plan["tier"]["id"],
+                ctx=args.ctx or plan["ctx"],
+                array_count=args.array_count or plan["array_count"],
+                layout=args.layout,
+                mode=args.mode,
+                kv_cache_mode=args.kv_cache_mode,
+                host=args.host,
+                port=args.port,
+                model_dir=plan["model_dir"],
+            )
         controller.launch_workers(plan, approved=True)
         print(f"\nServing on {plan['endpoint_url']} (Ctrl-C to stop)...")
         try:

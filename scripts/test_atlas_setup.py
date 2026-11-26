@@ -50,8 +50,16 @@ def _make_hw(
     }
 
 
-def _gpu(idx: int, name: str, vram_mib: int, cc: str, driver: str = "580.178.04") -> dict:
-    return mod.parse_nvidia_smi_csv(f"{idx}, {name}, {vram_mib}, {vram_mib - 512}, {cc}, {driver}, 0000:01:00.0")[0]
+def _gpu(
+    idx: int,
+    name: str,
+    vram_mib: int,
+    cc: str,
+    driver: str = "580.178.04",
+    free_mib: int | None = None,
+) -> dict:
+    free = (vram_mib - 512) if free_mib is None else free_mib
+    return mod.parse_nvidia_smi_csv(f"{idx}, {name}, {vram_mib}, {free}, {cc}, {driver}, 0000:01:00.0")[0]
 
 
 class AutoTunerTests(unittest.TestCase):
@@ -147,13 +155,141 @@ class AutoTunerTests(unittest.TestCase):
             ckpt = Path(td) / "Inkling-2-Mini-exl3-9g"
             ckpt.mkdir()
             (ckpt / "config.json").write_text("{}", encoding="utf-8")
+            (ckpt / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (ckpt / "chat_template.jinja").write_text("{{ messages }}", encoding="utf-8")
             (ckpt / "model-00001-of-00001.safetensors").write_bytes(b"\x00" * 16)
             (ckpt / "mtp.safetensors").write_bytes(b"\x00" * 16)
             info = mod.inspect_checkpoint_dir(ckpt)
             self.assertIsNotNone(info)
             assert info is not None
             self.assertTrue(info["has_mtp"])
+            self.assertTrue(info["usable_engine"])
+            self.assertTrue(info["complete_fake_assets"])
             self.assertEqual(info["inferred_tier"], "small")
+            ok, missing = mod.verify_checkpoint_dir(ckpt, require_weights=True)
+            self.assertTrue(ok)
+            self.assertEqual(missing, [])
+
+    def test_partial_checkpoint_and_missing_index_shard_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            # Partial dir with only config + mtp (no model shard, no tokenizer/template)
+            partial = Path(td) / "Inkling-2-Mini-partial"
+            partial.mkdir()
+            (partial / "config.json").write_text("{}", encoding="utf-8")
+            (partial / "mtp.safetensors").write_bytes(b"\x00" * 16)
+            ok, missing = mod.verify_checkpoint_dir(partial, require_weights=True)
+            self.assertFalse(ok)
+            self.assertIn("tokenizer.json", missing)
+            self.assertIn("chat_template.jinja", missing)
+            self.assertIn("model-*.safetensors", missing)
+
+            # Indexed checkpoint missing shard 2
+            indexed = Path(td) / "Inkling-2-Mini-indexed"
+            indexed.mkdir()
+            (indexed / "config.json").write_text("{}", encoding="utf-8")
+            (indexed / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (indexed / "chat_template.jinja").write_text("{{ messages }}", encoding="utf-8")
+            (indexed / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"a": "model-00001.safetensors", "b": "model-00002.safetensors"}}),
+                encoding="utf-8",
+            )
+            (indexed / "model-00001.safetensors").write_bytes(b"\x00" * 16)
+            ok2, missing2 = mod.verify_checkpoint_dir(indexed, require_weights=True)
+            self.assertFalse(ok2)
+            self.assertIn("model-00002.safetensors", missing2)
+
+            # Fake assets alone suffice for CPU --fake mode
+            ok_fake, _ = mod.verify_checkpoint_dir(indexed, require_weights=False)
+            self.assertTrue(ok_fake)
+
+    def test_free_vram_controls_sizing_and_per_gpu_dp_cap(self) -> None:
+        # 24 GB card with only 9.5 GB free must size to free VRAM (--atlas-6g) and warn.
+        busy_3090 = _gpu(0, "NVIDIA GeForce RTX 3090", 24576, "8.6", free_mib=9728)
+        hw_busy = _make_hw([busy_3090])
+        plan_busy = mod.build_plan(hw_busy, tier_id="small", ctx=65536)
+        self.assertIn("--atlas-6g", plan_busy["workers"][0]["argv"])
+        self.assertTrue(any("free VRAM" in w for w in plan_busy["warnings"]))
+
+        # Heterogeneous DP: PRO 6000 (95 GB free) + RTX 3090 (23.5 GB free) with array=4 Large:
+        # 3090 fits at most 1 Large worker; PRO 6000 holds the remaining workers (never 2 on 3090!).
+        gpus = [
+            _gpu(0, "NVIDIA GeForce RTX 3090", 24576, "8.6", free_mib=24064),
+            _gpu(1, "NVIDIA RTX PRO 6000 Blackwell", 97887, "12.0", free_mib=97280),
+        ]
+        hw_het = _make_hw(gpus, binaries={"install": "/fake/install/ingine-serve"})
+        plan_dp = mod.build_plan(hw_het, tier_id="large", ctx=65536, array_count=4, layout="dp")
+        self.assertEqual(plan_dp["layout"], "dp")
+        self.assertEqual(len(plan_dp["workers"]), 4)
+        gpu0_workers = [w for w in plan_dp["workers"] if w["cuda_visible_devices"] == "0"]
+        gpu1_workers = [w for w in plan_dp["workers"] if w["cuda_visible_devices"] == "1"]
+        self.assertEqual(len(gpu0_workers), 1)
+        self.assertEqual(len(gpu1_workers), 3)
+
+    def test_mixed_sm_dp_uses_per_gpu_binaries_and_flags(self) -> None:
+        gpus = [
+            _gpu(0, "Tesla V100-PCIE-32GB", 32768, "7.0", free_mib=32256),
+            _gpu(1, "NVIDIA GeForce RTX 3090", 24576, "8.6", free_mib=24064),
+        ]
+        hw = _make_hw(
+            gpus,
+            binaries={"sm70": "/fake/sm70/ingine-serve", "install": "/fake/install/ingine-serve"},
+        )
+        plan = mod.build_plan(hw, tier_id="large", ctx=262144, array_count=2, layout="dp")
+        by_dev = {w["cuda_visible_devices"]: w for w in plan["workers"]}
+        self.assertEqual(by_dev["0"]["binary_path"], "/fake/sm70/ingine-serve")
+        self.assertEqual(by_dev["1"]["binary_path"], "/fake/install/ingine-serve")
+        # 32 GB V100 uses --kv-fp8 at 262K; 24 GB 3090 uses --kv-q4 at 262K.
+        self.assertIn("--kv-fp8", by_dev["0"]["argv"])
+        self.assertIn("--kv-q4", by_dev["1"]["argv"])
+
+    def test_tp_selects_actual_group_before_arch_and_flags(self) -> None:
+        # 1x PRO 6000 (sm_120a) + 2x V100 (sm_70): TP=2 MUST pick the 2x V100 group and build for sm_70 FP16!
+        gpus = [
+            _gpu(0, "NVIDIA RTX PRO 6000 Blackwell", 97887, "12.0", free_mib=96000),
+            _gpu(1, "Tesla V100-PCIE-32GB", 32768, "7.0", free_mib=32000),
+            _gpu(2, "Tesla V100-PCIE-32GB", 32768, "7.0", free_mib=32000),
+        ]
+        hw = _make_hw(gpus, binaries={})
+        plan = mod.build_plan(hw, tier_id="large", ctx=65536, array_count=2, layout="tp")
+        self.assertEqual(plan["layout"], "tp")
+        self.assertEqual(plan["workers"][0]["cuda_visible_devices"], "1,2")
+        self.assertEqual(plan["workers"][0]["arch"], "sm_70")
+        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=70", plan["build_command"])
+        self.assertIn("-DINGINE_ACT_FP16=ON", plan["build_command"])
+        self.assertIn("-DINGINE_TP_SIZE=2", plan["build_command"])
+
+    def test_legacy_and_arch_specific_binary_matching_and_repo_root_presets(self) -> None:
+        # Turing sm_75 MUST NOT reuse sm70-only binary; must require legacy-fp16.
+        hw_t4 = _make_hw([_gpu(0, "Tesla T4", 15360, "7.5")], binaries={"sm70": "/fake/sm70/ingine-serve"})
+        plan_t4 = mod.build_plan(hw_t4, tier_id="small", ctx=65536)
+        self.assertFalse(plan_t4["binary_ready"])
+        self.assertIn("(cd native && cmake --preset legacy-fp16", plan_t4["build_command"])
+
+        # RTX 3090 sm_86 MUST NOT reuse release (sm_120a-only) binary.
+        hw_3090 = _make_hw([_gpu(0, "NVIDIA GeForce RTX 3090", 24576, "8.6")], binaries={"release": "/fake/release/ingine-serve"})
+        plan_3090 = mod.build_plan(hw_3090, tier_id="large", ctx=65536)
+        self.assertFalse(plan_3090["binary_ready"])
+        self.assertIn("bash scripts/install.sh --build-only", plan_3090["build_command"])
+
+        # A100 sm_80 is not in install preset (86;89;120a) -> explicit sm_80 build command.
+        hw_a100 = _make_hw([_gpu(0, "NVIDIA A100-PCIE-80GB", 81920, "8.0")], binaries={"install": "/fake/install/ingine-serve"})
+        plan_a100 = mod.build_plan(hw_a100, tier_id="large", ctx=262144)
+        self.assertFalse(plan_a100["binary_ready"])
+        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=80", plan_a100["build_command"])
+
+        # CPU --fake needs tokenizer+template assets and uses repo-root-valid (cd native && cmake --preset cpu-dev ...).
+        hw_cpu = _make_hw([], binaries={})
+        plan_cpu = mod.build_plan(hw_cpu)
+        self.assertTrue(plan_cpu["needs_download"])
+        self.assertIn("tokenizer.json", plan_cpu["download_files"])
+        self.assertIn("chat_template.jinja", plan_cpu["download_files"])
+        self.assertIn("(cd native && cmake --preset cpu-dev", plan_cpu["build_command"])
+
+        # Verify every preset referenced in build_command exists in native/CMakePresets.json!
+        presets_json = json.loads((ROOT / "native" / "CMakePresets.json").read_text(encoding="utf-8"))
+        valid_presets = {p["name"] for p in presets_json["configurePresets"]}
+        for p_name in ("cpu-dev", "sm70", "legacy-fp16", "install"):
+            self.assertIn(p_name, valid_presets)
 
 
 class HttpUiAndProxyTests(unittest.TestCase):
@@ -315,6 +451,27 @@ class CliSmokeTests(unittest.TestCase):
         )
         self.assertEqual(help_res.returncode, 0, help_res.stderr)
         self.assertIn("--auto", help_res.stdout)
+
+        inst_res = subprocess.run(
+            ["bash", str(ROOT / "scripts" / "install.sh"), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(inst_res.returncode, 0, inst_res.stderr)
+        self.assertIn("--build-only", inst_res.stdout)
+
+        # Verify repo-root preset listing works via `(cd native && cmake --list-presets)`.
+        preset_res = subprocess.run(
+            ["bash", "-c", "(cd native && cmake --list-presets)"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(preset_res.returncode, 0, preset_res.stderr)
+        for p_name in ("install", "sm70", "legacy-fp16", "cpu-dev"):
+            self.assertIn(f'"{p_name}"', preset_res.stdout)
 
 
 if __name__ == "__main__":

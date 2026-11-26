@@ -10,7 +10,7 @@ fail() {
 
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
   cat <<'HELP'
-Usage: bash scripts/install.sh [--download-only | --update-from COMMIT]
+Usage: bash scripts/install.sh [--build-only | --download-only | --update-from COMMIT]
 
 Without options: check the system, install uv (into .tools/ when missing), the installer's
 Python environment in .tools/venv/ (CMake, Ninja and huggingface_hub), the CUDA 13.4 toolkit
@@ -18,6 +18,9 @@ with cuBLAS in .cuda-toolkit/, build ingine's C++ server into native/build-insta
 download and verify the pinned model (Inkling-2-Mini weights and the ablation, about 20.2 GB)
 into models/Inkling-2-Mini. The server runs without Python or PyTorch.
 
+--build-only       install uv, .tools/venv, private CUDA 13.4 toolkit, and build ingine-serve
+                   without downloading the 20.2 GB manifest model (used by ./atlas-setup when
+                   selecting Elastic EXL3 9 GB / atlas-10g / atlas-12g or an existing checkpoint).
 --download-only    only what downloading needs (uv, .tools/venv with huggingface_hub), then
                    download or resume the model; menu option 2.
 --update-from REV  used by bash setup.sh --update: reinstall the software steps, rebuild what
@@ -42,7 +45,9 @@ fi
 
 MODE=full
 UPDATE_FROM=""
-if [[ $# == 1 && "$1" == --download-only ]]; then
+if [[ $# == 1 && "$1" == --build-only ]]; then
+  MODE=build
+elif [[ $# == 1 && "$1" == --download-only ]]; then
   MODE=download
 elif [[ $# == 2 && "$1" == --update-from ]]; then
   MODE=update
@@ -101,8 +106,10 @@ if [[ "$MODE" != download ]]; then
   driver_major="${driver%%.*}"
   [[ "$driver_major" =~ ^[0-9]+$ ]] || fail "Cannot read the NVIDIA driver version from nvidia-smi ($driver)."
   (( driver_major >= MIN_DRIVER )) || fail "NVIDIA driver $driver is too old: ingine is built with CUDA 13, which needs driver $MIN_DRIVER or newer. Update the driver, then rerun."
-  if ! awk -F', ' '($3 == "8.6" || $3 == "8.9" || $3 == "12.0") && $4 + 0 >= 12000 {found = 1} END {exit !found}' <<< "$gpus"; then
-    confirm 'atlas-ingine targets NVIDIA sm_86 (RTX 3090), sm_89 (RTX 4090), or sm_120a (RTX 5090 / RTX PRO Blackwell) GPUs with >= 12 GiB VRAM (use INGINE_CTX=65536 on 24 GB cards or Elastic atlas-12g/atlas-10g on 12-16 GB cards).'
+  min_vram_mib=12000
+  [[ "$MODE" != build ]] || min_vram_mib=5500
+  if ! awk -F', ' -v min_mib="$min_vram_mib" '($3 == "8.6" || $3 == "8.9" || $3 == "12.0") && $4 + 0 >= min_mib {found = 1} END {exit !found}' <<< "$gpus"; then
+    confirm 'atlas-ingine targets NVIDIA sm_86 (RTX 3090 / A2000), sm_89 (RTX 4090), or sm_120a (RTX 5090 / RTX PRO Blackwell) GPUs (use --atlas-6g / EXL3 9 GB on 6-12 GB cards or INGINE_CTX=65536 on 24 GB cards).'
   fi
 fi
 
@@ -199,7 +206,9 @@ PY
 # update, is kept without rehashing.
 missing_bytes="$(model_missing_bytes)"
 download=1
-if [[ "$MODE" != download && "$missing_bytes" == 0 ]]; then
+if [[ "$MODE" == build ]]; then
+  download=0
+elif [[ "$MODE" != download && "$missing_bytes" == 0 ]]; then
   if [[ "$MODE" == update ]]; then
     previous_revision=""
     if [[ -n "$UPDATE_FROM" ]]; then
@@ -374,6 +383,8 @@ if [[ "$download" == 1 ]]; then
   printf '\nDownloading and verifying the model at revision %s (about %s GB) into %s...\n' "${REVISION:0:12}" "${pin[2]}" "$MODEL_DIR"
   "$PYTHON" "$ROOT/scripts/download_model.py" --model-dir "$MODEL_DIR" \
     || fail 'The model download did not finish. Run it again to resume (bash setup.sh, option 2).'
+elif [[ "$MODE" == build ]]; then
+  printf '\nBuild-only mode complete; skipped manifest model download (%s). Use ./atlas-setup to select and download a model tier.\n' "$SERVER"
 elif [[ "$MODE" == update ]]; then
   printf '\nThe model is unchanged (revision %s) and complete in %s.\n' "${REVISION:0:12}" "$MODEL_DIR"
 else
