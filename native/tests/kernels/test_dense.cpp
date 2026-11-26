@@ -617,9 +617,9 @@ bool test_proj_q5_k(Rng& rng, int M, bool full, bool single) {
     }
   }
   char what[96];
-  std::snprintf(what, sizeof what, "proj_q5_k M=%d %s%s (max_abs=%.3e)", M, full ? "full" : "sliding",
+  std::snprintf(what, sizeof what, "proj_q5_k M=%d %s%s (max_abs_vs_rnd=%.3e)", M, full ? "full" : "sliding",
                 single ? " single-input" : "", max_abs);
-  return Check{what, 1.0 / 128, 1e-3, 0.01}(got, ref, &rnd) && (max_abs <= 1e-3);
+  return Check{what, 1.0 / 128, 1e-6, 0.01}(got, ref, &rnd);
 }
 
 bool test_proj_conv_q5_k(Rng& rng, int M) {
@@ -656,8 +656,8 @@ bool test_proj_conv_q5_k(Rng& rng, int M) {
     }
   }
   char what[96];
-  std::snprintf(what, sizeof what, "proj_conv_q5_k M=%d inputs (max_abs=%.3e)", M, max_abs);
-  bool ok = Check{what, 1.0 / 128, 1e-3, 0.01}(y, ry, &rr) && (max_abs <= 1e-3);
+  std::snprintf(what, sizeof what, "proj_conv_q5_k M=%d inputs (max_abs_vs_rnd=%.3e)", M, max_abs);
+  bool ok = Check{what, 1.0 / 128, 1e-6, 0.01}(y, ry, &rr);
   std::vector<double> ro(o.size()), rs(st.size());
   for (int c = 0; c < H; ++c) {
     std::vector<double> ext(M + 3);
