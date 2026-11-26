@@ -1926,6 +1926,36 @@ void test_anthropic_messages_api() {
   }
 }
 
+void test_loopcd_advertisement() {
+  using ingine::model::LoopCdMode;
+  for (LoopCdMode mode : {LoopCdMode::Off, LoopCdMode::LogitsAdaptive, LoopCdMode::Hidden}) {
+    auto s = serve();
+    s->gen->set_loopcd_mode(mode);
+    // Construct a fresh server bound to the generator with this LoopCD mode.
+    ingine::serve::ServerOptions opts;
+    opts.model_id = "inkling-loopcd-test";
+    ingine::serve::ChatServer srv(*s->gen, *g_fmt, opts);
+    CHECK(srv.bind("127.0.0.1", 0));
+    srv.start();
+    const std::string expected = ingine::model::to_string(mode);
+    Response h = request(srv.port(), "GET", "/health");
+    CHECK(h.status == 200);
+    CHECK(Json::parse(h.body)["loopcd"] == expected);
+    CHECK(header(h.headers, "X-Ingine-LoopCD") == expected);
+
+    Response m = request(srv.port(), "GET", "/v1/models");
+    CHECK(m.status == 200);
+    CHECK(Json::parse(m.body)["data"][0]["loopcd"] == expected);
+    CHECK(header(m.headers, "X-Ingine-LoopCD") == expected);
+
+    const Json req_body = {{"model", "inkling-loopcd-test"}, {"messages", MSGS}, {"max_tokens", 16}};
+    Response c = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(req_body));
+    CHECK(c.status == 200);
+    CHECK(header(c.headers, "X-Ingine-LoopCD") == expected);
+    srv.stop();
+  }
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -1965,6 +1995,7 @@ int main() {
       {"cache_scope_isolation", test_cache_scope_isolation},
       {"kv_cache_mode_advertisement", test_kv_cache_mode_advertisement},
       {"anthropic_messages_api", test_anthropic_messages_api},
+      {"loopcd_advertisement", test_loopcd_advertisement},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {
