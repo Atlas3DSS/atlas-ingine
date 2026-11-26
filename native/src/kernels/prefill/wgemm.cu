@@ -48,13 +48,18 @@ struct Cfg {
   static constexpr int R = WK / BK;  // activation steps per weight chunk
   static constexpr int KC = K / WK;  // weight chunks
   static constexpr int AS_STG = LOW_SMEM ? 2 : AS;
-  // On Volta sm_70 (INGINE_ACT_FP16 && !LOW_SMEM), each warp owns its 16 weight rows exclusively
-  // and cp.async does not exist. Streaming NVFP4/MXFP8 weights + scales directly via __ldg into
-  // registers eliminates w_smem (20 KiB) and sc_smem (18 KiB), dropping TM=32 SMEM from 88 KiB -> 8.2 KiB!
+  // On Volta sm_70 (INGINE_ACT_FP16 && !LOW_SMEM) and HIP (no cp.async), each warp owns its 16 weight
+  // rows exclusively. Streaming NVFP4/MXFP8 weights + scales directly via __ldg into registers eliminates
+  // w_smem and sc_smem, dropping TM=32 SMEM from 47-88 KiB -> 8.2 KiB (high CTA occupancy per SM/CU).
   static constexpr bool VOLTA_DIRECT = INGINE_ACT_FP16 && !LOW_SMEM && (FMT == FMT_NVFP4 || FMT == FMT_MXFP8);
   static constexpr bool VOLTA_COMPACT = INGINE_ACT_FP16 && !LOW_SMEM;
-  static constexpr bool STAGE_W = !VOLTA_DIRECT;
-  static constexpr bool STAGE_SC = !VOLTA_COMPACT;
+#if defined(INGINE_BACKEND_HIP) && INGINE_BACKEND_HIP
+  static constexpr bool HIP_DIRECT = (FMT == FMT_NVFP4 || FMT == FMT_MXFP8);
+#else
+  static constexpr bool HIP_DIRECT = false;
+#endif
+  static constexpr bool STAGE_W = !(VOLTA_DIRECT || HIP_DIRECT);
+  static constexpr bool STAGE_SC = !(VOLTA_COMPACT || HIP_DIRECT);
   static constexpr int WS = (LOW_SMEM || VOLTA_COMPACT) ? (FMT == FMT_MXFP8 ? 3 : 2)
                                      : (TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6)
                                                  : (FMT == FMT_MXFP8 ? 4 : 3));
@@ -177,6 +182,28 @@ __device__ __forceinline__ void mma_step_sm70(float (&acc_v)[TM / 16][2][8], con
 }
 #endif
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+// Native AMD RDNA 3 / 3.5 (gfx11) Wave32 16x16x16 WMMA step: direct SMEM A loads + direct per-lane
+// weight row decode (lanes l and l+16 hold identical row warp*16 + (l & 15)) -> ZERO warp shuffles!
+template <int MT, int TM, class DecodeB>
+__device__ __forceinline__ void mma_step_gfx11(mma::Gfx11Acc8 (&acc)[TM / 16], const uint16_t* A, int lane,
+                                               DecodeB&& decode_b) {
+  const int row_l = lane & 15;
+#pragma unroll
+  for (int kk = 0; kk < BK / 16; ++kk) {
+    std::uint32_t bf[8];
+    decode_b(kk, bf);
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      const uint4 a0 = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + row_l, kk * 2));
+      const uint4 a1 = *reinterpret_cast<const uint4*>(A + swz<KCH>(mt * 16 + row_l, kk * 2 + 1));
+      const std::uint32_t af[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+      mma::gfx11_wmma_act(acc[mt], af, bf);
+    }
+  }
+}
+#endif
+
 // Up: A = x rows of the pairs' tokens (K = H), W = w13 (N = 2I), out act [pairs, I].
 // Down: A = act rows (K = I), W = w2 (N = H), out down [T * 8, H] at pair_dst.
 template <int FMT, Mode MODE, int K, int TM, bool LOW_SMEM = false>
@@ -265,6 +292,183 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   const int c = lane & 3;
   const float factor = FMT != FMT_MXFP8 ? __ldg(g.factors + e) : 1.f;
   const int mact = min((n + 15) / 16, TM / 16);  // active m16 row blocks (same for every warp)
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+  // Native RDNA 3 / 3.5 (gfx11) Wave32 16x16x16 WMMA path: each lane owns weight row warp*16 + (lane & 15)
+  // (naturally replicated across wave halves), 1 Gfx11Acc8 per 16 activation rows -> ZERO K-loop shuffles!
+  mma::Gfx11Acc8 acc_g11[TM / 16];
+#pragma unroll
+  for (int a = 0; a < TM / 16; ++a) acc_g11[a] = mma::gfx11_acc_zero();
+  const int row_w = warp * 16 + (lane & 15);
+  if constexpr (!C::STAGE_W && FMT == FMT_NVFP4) {
+    const uint8_t* wrow = code_tile + int64_t(row_w) * C::CODE_ROW;
+    const uint8_t* srow = scale_tile + int64_t(row_w) * C::SCALE_ROW;
+    uint4 w0_cur = __ldg(reinterpret_cast<const uint4*>(wrow));
+    uint4 w1_cur = __ldg(reinterpret_cast<const uint4*>(wrow + 16));
+    uint32_t s4_cur = __ldg(reinterpret_cast<const uint32_t*>(srow));
+#pragma unroll 1
+    for (int ks = 0; ks < KS; ++ks) {
+      __syncthreads();
+      issue(ks + C::AS_STG - 1);
+      const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
+      uint4 w0_nxt, w1_nxt;
+      uint32_t s4_nxt = 0u;
+      if (ks + 1 < KS) {
+        w0_nxt = __ldg(reinterpret_cast<const uint4*>(wrow + (ks + 1) * 32));
+        w1_nxt = __ldg(reinterpret_cast<const uint4*>(wrow + (ks + 1) * 32 + 16));
+        s4_nxt = __ldg(reinterpret_cast<const uint32_t*>(srow + (ks + 1) * 4));
+      }
+      const float2 slo = e4m3x2_to_float2(uint16_t(s4_cur & 0xffffu));
+      const float2 shi = e4m3x2_to_float2(uint16_t(s4_cur >> 16));
+      const float sc[4] = {slo.x, slo.y, shi.x, shi.y};
+      auto decode_g11 = [&](int kk, std::uint32_t (&bf)[8]) {
+        const uint32_t wx = (kk == 0) ? w0_cur.x : (kk == 1) ? w0_cur.z : (kk == 2) ? w1_cur.x : w1_cur.z;
+        const uint32_t wy = (kk == 0) ? w0_cur.y : (kk == 1) ? w0_cur.w : (kk == 2) ? w1_cur.y : w1_cur.w;
+        const float s = sc[kk];
+#pragma unroll
+        for (int bi = 0; bi < 4; ++bi) {
+          const uint32_t b0 = (wx >> (8 * bi)) & 0xffu;
+          const uint32_t b1 = (wy >> (8 * bi)) & 0xffu;
+          bf[bi] = pack_bf16x2((lut[b0 & 0xfu] * s) * factor, (lut[b0 >> 4] * s) * factor);
+          bf[4 + bi] = pack_bf16x2((lut[b1 & 0xfu] * s) * factor, (lut[b1 >> 4] * s) * factor);
+        }
+      };
+      switch (mact) {
+        case 1: if constexpr (1 <= TM / 16) mma_step_gfx11<1, TM>(acc_g11, A, lane, decode_g11); break;
+        case 2: if constexpr (2 <= TM / 16) mma_step_gfx11<2, TM>(acc_g11, A, lane, decode_g11); break;
+        case 3: if constexpr (3 <= TM / 16) mma_step_gfx11<3, TM>(acc_g11, A, lane, decode_g11); break;
+        case 4: if constexpr (4 <= TM / 16) mma_step_gfx11<4, TM>(acc_g11, A, lane, decode_g11); break;
+        case 5: if constexpr (5 <= TM / 16) mma_step_gfx11<5, TM>(acc_g11, A, lane, decode_g11); break;
+        case 6: if constexpr (6 <= TM / 16) mma_step_gfx11<6, TM>(acc_g11, A, lane, decode_g11); break;
+        case 7: if constexpr (7 <= TM / 16) mma_step_gfx11<7, TM>(acc_g11, A, lane, decode_g11); break;
+        default: mma_step_gfx11<TM / 16, TM>(acc_g11, A, lane, decode_g11); break;
+      }
+      if (ks + 1 < KS) {
+        w0_cur = w0_nxt;
+        w1_cur = w1_nxt;
+        s4_cur = s4_nxt;
+      }
+    }
+  } else if constexpr (!C::STAGE_W && FMT == FMT_MXFP8) {
+    const uint8_t* wrow = code_tile + int64_t(row_w) * C::CODE_ROW;
+    const uint8_t* srow = scale_tile + int64_t(row_w) * C::SCALE_ROW;
+#pragma unroll 1
+    for (int ks = 0; ks < KS; ++ks) {
+      __syncthreads();
+      issue(ks + C::AS_STG - 1);
+      const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
+      const uint8_t ms0 = __ldg(srow + ks * 2);
+      const uint8_t ms1 = __ldg(srow + ks * 2 + 1);
+      const float sc0 = ms0 ? __uint_as_float(uint32_t(ms0) << 23) : __uint_as_float(0x00400000u);
+      const float sc1 = ms1 ? __uint_as_float(uint32_t(ms1) << 23) : __uint_as_float(0x00400000u);
+      uint4 qbuf[4];
+#pragma unroll
+      for (int kk = 0; kk < 4; ++kk) qbuf[kk] = __ldg(reinterpret_cast<const uint4*>(wrow + ks * 64 + kk * 16));
+      auto decode_g11 = [&](int kk, std::uint32_t (&bf)[8]) {
+        const uint4 q = qbuf[kk];
+        const uint32_t qw[4] = {q.x, q.y, q.z, q.w};
+        const float s = (kk < 2) ? sc0 : sc1;
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+          const float2 f0 = e4m3x2_to_float2(uint16_t(qw[p] & 0xffffu));
+          const float2 f1 = e4m3x2_to_float2(uint16_t(qw[p] >> 16));
+          bf[2 * p] = pack_bf16x2(f0.x * s, f0.y * s);
+          bf[2 * p + 1] = pack_bf16x2(f1.x * s, f1.y * s);
+        }
+      };
+      switch (mact) {
+        case 1: if constexpr (1 <= TM / 16) mma_step_gfx11<1, TM>(acc_g11, A, lane, decode_g11); break;
+        case 2: if constexpr (2 <= TM / 16) mma_step_gfx11<2, TM>(acc_g11, A, lane, decode_g11); break;
+        case 3: if constexpr (3 <= TM / 16) mma_step_gfx11<3, TM>(acc_g11, A, lane, decode_g11); break;
+        case 4: if constexpr (4 <= TM / 16) mma_step_gfx11<4, TM>(acc_g11, A, lane, decode_g11); break;
+        case 5: if constexpr (5 <= TM / 16) mma_step_gfx11<5, TM>(acc_g11, A, lane, decode_g11); break;
+        case 6: if constexpr (6 <= TM / 16) mma_step_gfx11<6, TM>(acc_g11, A, lane, decode_g11); break;
+        case 7: if constexpr (7 <= TM / 16) mma_step_gfx11<7, TM>(acc_g11, A, lane, decode_g11); break;
+        default: mma_step_gfx11<TM / 16, TM>(acc_g11, A, lane, decode_g11); break;
+      }
+    }
+  } else {
+#pragma unroll 1
+    for (int ks = 0; ks < KS; ++ks) {
+      __syncthreads();
+      const int chunk = ks / C::R;
+      if constexpr (C::STAGE_W) {
+        if (ks % C::R == 0 && chunk + C::WS - 1 < C::KC) load_w(chunk + C::WS - 1);
+      }
+      issue(ks + C::AS_STG - 1);
+      const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
+      const unsigned char* ws = w_smem + ((ks / C::R) % C::WS) * C::W_BYTES;
+      float sc[4];
+      if constexpr (FMT != FMT_MXFP8) {
+        const uint32_t s4 = C::STAGE_SC
+            ? *reinterpret_cast<const uint32_t*>(sc_smem + row_w * C::SCALE_ROW + ks * 4)
+            : __ldg(reinterpret_cast<const uint32_t*>(scale_tile + int64_t(row_w) * C::SCALE_ROW + ks * 4));
+        const float2 slo = e4m3x2_to_float2(uint16_t(s4 & 0xffffu));
+        const float2 shi = e4m3x2_to_float2(uint16_t(s4 >> 16));
+        sc[0] = slo.x; sc[1] = slo.y; sc[2] = shi.x; sc[3] = shi.y;
+      } else {
+        const uint8_t* ms = sc_smem + row_w * C::SCALE_ROW + ks * 2;
+        sc[0] = sc[1] = exp2f(float(ms[0]) - 127.f);
+        sc[2] = sc[3] = exp2f(float(ms[1]) - 127.f);
+      }
+      auto decode_g11 = [&](int kk, std::uint32_t (&bf)[8]) {
+        const int kc = (ks % C::R) * BK + kk * 16;
+        const float s = sc[kk];
+        if constexpr (FMT == FMT_ATLAS2) {
+          const uint32_t wd = *reinterpret_cast<const uint32_t*>(ws + row_w * C::WSTRIDE + kc / 4);
+#pragma unroll
+          for (int p = 0; p < 8; ++p) {
+            bf[p] = pack_bf16x2((lut[(wd >> (4 * p)) & 3u] * s) * factor,
+                                (lut[(wd >> (4 * p + 2)) & 3u] * s) * factor);
+          }
+        } else {
+          const unsigned char* blk = ws + row_w * C::WSTRIDE + (kc / 32) * 12;
+          const int half = (kc >> 4) & 1;
+          const uint32_t lo = *reinterpret_cast<const uint32_t*>(blk + half * 4);
+          const uint16_t hi16 = *reinterpret_cast<const uint16_t*>(blk + 8 + half * 2);
+#pragma unroll
+          for (int p = 0; p < 8; ++p) {
+            const uint32_t c0 = ((lo >> (4 * p)) & 3u) | (((hi16 >> (2 * p)) & 1u) << 2);
+            const uint32_t c1 = ((lo >> (4 * p + 2)) & 3u) | (((hi16 >> (2 * p + 1)) & 1u) << 2);
+            bf[p] = pack_bf16x2((lut[c0] * s) * factor, (lut[c1] * s) * factor);
+          }
+        }
+      };
+      switch (mact) {
+        case 1: if constexpr (1 <= TM / 16) mma_step_gfx11<1, TM>(acc_g11, A, lane, decode_g11); break;
+        case 2: if constexpr (2 <= TM / 16) mma_step_gfx11<2, TM>(acc_g11, A, lane, decode_g11); break;
+        case 3: if constexpr (3 <= TM / 16) mma_step_gfx11<3, TM>(acc_g11, A, lane, decode_g11); break;
+        case 4: if constexpr (4 <= TM / 16) mma_step_gfx11<4, TM>(acc_g11, A, lane, decode_g11); break;
+        case 5: if constexpr (5 <= TM / 16) mma_step_gfx11<5, TM>(acc_g11, A, lane, decode_g11); break;
+        case 6: if constexpr (6 <= TM / 16) mma_step_gfx11<6, TM>(acc_g11, A, lane, decode_g11); break;
+        case 7: if constexpr (7 <= TM / 16) mma_step_gfx11<7, TM>(acc_g11, A, lane, decode_g11); break;
+        default: mma_step_gfx11<TM / 16, TM>(acc_g11, A, lane, decode_g11); break;
+      }
+    }
+  }
+  const int cl = warp * 16 + (lane & 15);
+#pragma unroll
+  for (int mt = 0; mt < TM / 16; ++mt) {
+    if (mt >= mact) continue;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int row = mt * 16 + 2 * i + (lane >> 4);
+      const float val = acc_g11[mt][i];
+      const float peer = __shfl_xor_sync(0xffffffffu, val, 1);
+      if (row < n && (lane & 1) == 0) {
+        if constexpr (MODE == Mode::Up) {
+          const float gt = round_bf16(val), u = round_bf16(peer);
+          const float sig = 1.f / (1.f + expf(-gt));
+          const float v = __fmul_rn(__fmul_rn(softcap(gt, 4.f), sig), softcap(u, 25.f));
+          g.out[size_t(pb + row) * kInter + (n0 + cl) / 2] = f2bf_bits(v);
+        } else {
+          const int dst = g.w.pair_dst[pb + row];
+          *reinterpret_cast<uint32_t*>(g.out + size_t(dst) * kHidden + n0 + cl) = pack_bf16x2(val, peer);
+        }
+      }
+    }
+  }
+  return;
+#endif
   float acc[TM / 16][2][4];
 #if !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA))
 #pragma unroll
@@ -279,11 +483,14 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
     for (int nt = 0; nt < 2; ++nt) {
       const int row = warp * 16 + nt * 8 + (lane >> 2);
       if constexpr (FMT != FMT_MXFP8) {
-        const uint32_t s4 = *reinterpret_cast<const uint32_t*>(sc_smem + row * C::SCALE_ROW + ks * 4);
+        const uint32_t s4 = C::STAGE_SC
+            ? *reinterpret_cast<const uint32_t*>(sc_smem + row * C::SCALE_ROW + ks * 4)
+            : __ldg(reinterpret_cast<const uint32_t*>(scale_tile + int64_t(row) * C::SCALE_ROW + ks * 4));
         const float2 lo = e4m3x2_to_float2(uint16_t(s4 & 0xffff)), hi = e4m3x2_to_float2(uint16_t(s4 >> 16));
         sc[nt][0] = lo.x, sc[nt][1] = lo.y, sc[nt][2] = hi.x, sc[nt][3] = hi.y;
       } else {
-        const uint8_t* ms = sc_smem + row * C::SCALE_ROW + ks * 2;
+        const uint8_t* ms = C::STAGE_SC ? (sc_smem + row * C::SCALE_ROW + ks * 2)
+                                        : (scale_tile + int64_t(row) * C::SCALE_ROW + ks * 2);
         sc[nt][0] = sc[nt][1] = exp2f(float(ms[0]) - 127.f);
         sc[nt][2] = sc[nt][3] = exp2f(float(ms[1]) - 127.f);
       }
@@ -292,18 +499,23 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   auto decode = [&](int ks, int kk, const float (&sc)[2][4], unsigned (&b)[BK / 16][2][2]) {
     const unsigned char* ws = w_smem + ((ks / C::R) % C::WS) * C::W_BYTES;
     const int kc = (ks % C::R) * BK + kk * 16;  // first element of the k16 group inside the chunk
+    const int k_abs = ks * BK + kk * 16;
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
       const int row = warp * 16 + nt * 8 + (lane >> 2);
       const float s = sc[nt][kk];
       if constexpr (FMT == FMT_NVFP4) {
         // elements 2c, 2c+1 (byte c) and 8 + 2c, +1 (byte 4 + c) of the k16 group
-        const uint2 wd = *reinterpret_cast<const uint2*>(ws + row * C::WSTRIDE + kc / 2);
+        const uint2 wd = C::STAGE_W
+            ? *reinterpret_cast<const uint2*>(ws + row * C::WSTRIDE + kc / 2)
+            : __ldg(reinterpret_cast<const uint2*>(code_tile + int64_t(row) * C::CODE_ROW + k_abs / 2));
         const uint32_t b0 = (wd.x >> (8 * c)) & 0xffu, b1 = (wd.y >> (8 * c)) & 0xffu;
         b[kk][nt][0] = pack_bf16x2((lut[b0 & 0xf] * s) * factor, (lut[b0 >> 4] * s) * factor);
         b[kk][nt][1] = pack_bf16x2((lut[b1 & 0xf] * s) * factor, (lut[b1 >> 4] * s) * factor);
       } else if constexpr (FMT == FMT_MXFP8) {
-        const uint4 q = *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc);
+        const uint4 q = C::STAGE_W
+            ? *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc)
+            : __ldg(reinterpret_cast<const uint4*>(code_tile + int64_t(row) * C::CODE_ROW + k_abs));
         const uint32_t w0 = (c >> 1) ? q.y : q.x, w1 = (c >> 1) ? q.w : q.z;
         const float2 f0 = e4m3x2_to_float2(uint16_t(w0 >> (16 * (c & 1))));
         const float2 f1 = e4m3x2_to_float2(uint16_t(w1 >> (16 * (c & 1))));
@@ -600,7 +812,9 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
     __syncthreads();
     const int chunk = ks / C::R;
     // first step of a chunk: the chunk WS - 1 ahead into the slot the previous chunk used (read before the barrier)
-    if (ks % C::R == 0 && chunk + C::WS - 1 < C::KC) load_w(chunk + C::WS - 1);
+    if constexpr (C::STAGE_W) {
+      if (ks % C::R == 0 && chunk + C::WS - 1 < C::KC) load_w(chunk + C::WS - 1);
+    }
     issue(ks + C::AS_STG - 1);
     if (ks == 0) {
       float sc0[2][4];
@@ -807,6 +1021,43 @@ __device__ __forceinline__ void mma_step_exl3(float (&acc)[TM / 16][2][4], const
 #endif
 }
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+// Native AMD RDNA 3 / 3.5 (gfx11) EXL3 step: combines both nt=0 (h01,h23) and nt=1 (h45,h67) weight
+// halves into a single 16-column WMMA B-fragment once per kk and streams direct SMEM A loads across MT.
+template <int MT, int TM, int BITS>
+__device__ __forceinline__ void mma_step_exl3_gfx11(mma::Gfx11Acc8 (&acc)[TM / 16], const uint16_t* A,
+                                                    const uint8_t* w_warp, int lane) {
+  constexpr int TILE_BYTES = 32 * BITS;
+  const int row_l = lane & 15;
+  const int row_g = lane & 7;
+  const bool hi_n = (lane & 8) != 0;
+#pragma unroll 1
+  for (int kk = 0; kk < 8; ++kk) {
+    const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_warp + kk * TILE_BYTES);
+    uint32_t h01, h23, h45, h67;
+    exl3::dq8_mcg<BITS>([&](int wi) { return tw[wi]; }, lane, h01, h23, h45, h67);
+    std::uint32_t bf[8];
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      const int src = (row_g << 2) | p;
+      const uint32_t b0 = __shfl_sync(0xffffffffu, h01, src);
+      const uint32_t b1 = __shfl_sync(0xffffffffu, h23, src);
+      const uint32_t b2 = __shfl_sync(0xffffffffu, h45, src);
+      const uint32_t b3 = __shfl_sync(0xffffffffu, h67, src);
+      bf[p] = hi_n ? b2 : b0;
+      bf[4 + p] = hi_n ? b3 : b1;
+    }
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      const uint4 a0 = *reinterpret_cast<const uint4*>(A + swz<16>(mt * 16 + row_l, kk * 2));
+      const uint4 a1 = *reinterpret_cast<const uint4*>(A + swz<16>(mt * 16 + row_l, kk * 2 + 1));
+      const std::uint32_t af[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+      mma::gfx11_wmma_f16(acc[mt], af, bf);
+    }
+  }
+}
+#endif
+
 template <int TM>
 inline constexpr int exl3_a_stages() {
   return (TM == 32 || !INGINE_ACT_FP16) ? 2 : 1;
@@ -815,6 +1066,8 @@ inline constexpr int exl3_a_stages() {
 template <int BITS, Mode MODE, int K, int TM>
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
 __global__ void __launch_bounds__(NT, TM == 32 ? 2 : 1) wgemm_exl3_kernel(const Exl3GemmArgs g) {
+#elif defined(__HIP_DEVICE_COMPILE__)
+__global__ void __launch_bounds__(NT, 1) wgemm_exl3_kernel(const Exl3GemmArgs g) {
 #else
 __global__ void __launch_bounds__(NT, TM == 32 ? 3 : 1) wgemm_exl3_kernel(const Exl3GemmArgs g) {
 #endif
@@ -863,11 +1116,17 @@ __global__ void __launch_bounds__(NT, TM == 32 ? 3 : 1) wgemm_exl3_kernel(const 
 
   load_w(0);
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+  mma::Gfx11Acc8 acc_g11[TM / 16];
+#pragma unroll
+  for (int a = 0; a < TM / 16; ++a) acc_g11[a] = mma::gfx11_acc_zero();
+#else
   float acc[TM / 16][2][4];
 #pragma unroll
   for (int a = 0; a < TM / 16; ++a)
 #pragma unroll
     for (int b = 0; b < 2; ++b) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0.f;
+#endif
 
   const __half* rin_base = g.rin_ptrs ? reinterpret_cast<const __half*>(g.rin_ptrs[e]) : (g.rin + size_t(e) * K);
 
@@ -900,6 +1159,18 @@ __global__ void __launch_bounds__(NT, TM == 32 ? 3 : 1) wgemm_exl3_kernel(const 
     if (ks + 1 < KS) load_w(ks + 1);
 
     const uint8_t* w_warp = W_smem + (ks & 1) * W_STAGE_BYTES + warp * W_CHUNK_ROW;
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+    switch (mact) {
+      case 1: if constexpr (1 <= TM / 16) mma_step_exl3_gfx11<1, TM, BITS>(acc_g11, A_smem, w_warp, lane); break;
+      case 2: if constexpr (2 <= TM / 16) mma_step_exl3_gfx11<2, TM, BITS>(acc_g11, A_smem, w_warp, lane); break;
+      case 3: if constexpr (3 <= TM / 16) mma_step_exl3_gfx11<3, TM, BITS>(acc_g11, A_smem, w_warp, lane); break;
+      case 4: if constexpr (4 <= TM / 16) mma_step_exl3_gfx11<4, TM, BITS>(acc_g11, A_smem, w_warp, lane); break;
+      case 5: if constexpr (5 <= TM / 16) mma_step_exl3_gfx11<5, TM, BITS>(acc_g11, A_smem, w_warp, lane); break;
+      case 6: if constexpr (6 <= TM / 16) mma_step_exl3_gfx11<6, TM, BITS>(acc_g11, A_smem, w_warp, lane); break;
+      case 7: if constexpr (7 <= TM / 16) mma_step_exl3_gfx11<7, TM, BITS>(acc_g11, A_smem, w_warp, lane); break;
+      default: mma_step_exl3_gfx11<TM / 16, TM, BITS>(acc_g11, A_smem, w_warp, lane); break;
+    }
+#else
     switch (mact) {
       case 1: if constexpr (1 <= TM / 16) mma_step_exl3<1, TM, BITS>(acc, A_smem, w_warp, lane); break;
       case 2: if constexpr (2 <= TM / 16) mma_step_exl3<2, TM, BITS>(acc, A_smem, w_warp, lane); break;
@@ -910,6 +1181,7 @@ __global__ void __launch_bounds__(NT, TM == 32 ? 3 : 1) wgemm_exl3_kernel(const 
       case 7: if constexpr (7 <= TM / 16) mma_step_exl3<7, TM, BITS>(acc, A_smem, w_warp, lane); break;
       default: mma_step_exl3<TM / 16, TM, BITS>(acc, A_smem, w_warp, lane); break;
     }
+#endif
     if constexpr (AS_EXL == 1) __syncthreads();
   }
   if constexpr (AS_EXL > 1) __syncthreads();
@@ -926,6 +1198,13 @@ __global__ void __launch_bounds__(NT, TM == 32 ? 3 : 1) wgemm_exl3_kernel(const 
 
   const int g_row = lane >> 2, c_pair = lane & 3;
   for (int mt = 0; mt < mact; ++mt) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+    const int cl = warp * 16 + (lane & 15);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      ep[(2 * i + (lane >> 4)) * 128 + cl] = acc_g11[mt][i];
+    }
+#else
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
       const int cl = warp * 16 + nt * 8 + c_pair * 2;
@@ -934,6 +1213,7 @@ __global__ void __launch_bounds__(NT, TM == 32 ? 3 : 1) wgemm_exl3_kernel(const 
       ep[(g_row + 8) * 128 + cl] = acc[mt][nt][2];
       ep[(g_row + 8) * 128 + cl + 1] = acc[mt][nt][3];
     }
+#endif
     __syncthreads();
 #pragma unroll
     for (int half = 0; half < 2; ++half) {

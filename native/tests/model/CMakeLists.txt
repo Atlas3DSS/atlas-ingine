@@ -27,7 +27,7 @@ if(TARGET ingine_model)
   endif()
   # full-model parity against the Python engine's goldens (tools/goldens_model.py); ~20 GB of GPU memory
   if(TARGET ingine-validate)
-    set(_validate ingine-validate --model-dir ${INGINE_TEST_MODEL_DIR} --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)
+    set(_validate ingine-validate --default-model-dir ${INGINE_TEST_MODEL_DIR} --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)
     add_test(NAME model_parity COMMAND ${_validate})
     # exact greedy continuations only where the goldens have no near ties (long and FP8-cache cases flip at ties)
     set(_greedy_cases --cases kv16_chat,kv16_t300 --min-top1 1)

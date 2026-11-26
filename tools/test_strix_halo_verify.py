@@ -1021,6 +1021,58 @@ class TestStrixHaloVerify(unittest.TestCase):
             self.assertFalse(s_sil["hardware_verified"])
             self.assertEqual(s_sil["passed"], 11)
 
+    def test_zero_cuda_linkage_ignores_libicudata_and_catches_cuda_libs(self) -> None:
+        self.assertFalse(shv.is_cuda_ldd_line("\tlibicudata.so.78 => /usr/lib/libicudata.so.78 (0x00007f23fe000000)"))
+        self.assertFalse(shv.is_cuda_ldd_line("\tlibamdhip64.so.7 => /opt/rocm/lib/libamdhip64.so.7 (0x00007f0000000000)"))
+        self.assertFalse(shv.is_cuda_ldd_line("\tlibhipblaslt.so.1 => /opt/rocm/lib/libhipblaslt.so.1 (0x00007f0000000000)"))
+        self.assertTrue(shv.is_cuda_ldd_line("\tlibcudart.so.12 => /usr/local/cuda/lib64/libcudart.so.12 (0x00007f0000000000)"))
+        self.assertTrue(shv.is_cuda_ldd_line("\tlibcublasLt.so.12 => /usr/local/cuda/lib64/libcublasLt.so.12 (0x00007f0000000000)"))
+        self.assertTrue(shv.is_cuda_ldd_line("\tlibcuda.so.1 => /lib/x86_64-linux-gnu/libcuda.so.1 (0x00007f0000000000)"))
+
+    def test_parse_ctest_summary_counts_subprocess_aborted_and_exceptions(self) -> None:
+        sample = "\n".join(
+            [
+                " 1/5 Test #1: core_dtype .......................   Passed    0.02 sec",
+                " 2/5 Test #2: model_runtime ....................Subprocess aborted***Exception:   3.61 sec",
+                " 3/5 Test #3: prefill_moe ......................***Failed   15.05 sec",
+                " 4/5 Test #4: model_reuse ......................***Timeout 900.12 sec",
+                " 5/5 Test #5: optional_test ....................***Skipped   0.01 sec",
+            ]
+        )
+        s = shv.parse_ctest_summary(sample)
+        self.assertEqual(s["passed"], 1)
+        self.assertEqual(s["failed"], 3)
+        self.assertEqual(s["skipped"], 1)
+        self.assertEqual(s["total_observed"], 5)
+
+    def test_preflight_memory_warnings_and_max_ctx_auto_sizing(self) -> None:
+        w_low = shv.build_preflight_memory_warnings(
+            {"MemAvailable": 20 << 30},
+            [{"card": "card1", "mem_info_gtt_used": 73 << 30}],
+        )
+        self.assertEqual(len(w_low), 2)
+        w_ok = shv.build_preflight_memory_warnings(
+            {"MemAvailable": 118 << 30},
+            [{"card": "card1", "mem_info_vram_used": 2 << 30, "mem_info_gtt_used": 1 << 30}],
+        )
+        self.assertEqual(w_ok, [])
+
+        auto_131k = shv.resolve_serve_args_with_max_ctx([], [8192, 32768, 131072, 96000], fake_smoke=False)
+        self.assertIn("--max-ctx", auto_131k)
+        ctx_val = int(auto_131k[auto_131k.index("--max-ctx") + 1])
+        self.assertGreaterEqual(ctx_val, 143360)
+        # Short / cold 34K fits default 65536 without bloating startup KV pool.
+        self.assertEqual(shv.resolve_serve_args_with_max_ctx([], [34816], fake_smoke=False), [])
+        # Explicit user --max-ctx is preserved untouched.
+        user_args = ["--max-ctx", "262144", "--kv-fp8"]
+        self.assertEqual(shv.resolve_serve_args_with_max_ctx(user_args, [131072], fake_smoke=False), user_args)
+        # CLI parser accepts --ctest-timeout on build-test and all.
+        p = shv.build_parser()
+        a_bt = p.parse_args(["build-test", "--ctest-timeout", "14400"])
+        self.assertEqual(a_bt.ctest_timeout, 14400.0)
+        a_all = p.parse_args(["all", "--model-dir", "/tmp/m", "--out-dir", "/tmp/o", "--ctest-timeout", "10800"])
+        self.assertEqual(a_all.ctest_timeout, 10800.0)
+
 
 if __name__ == "__main__":
     unittest.main()

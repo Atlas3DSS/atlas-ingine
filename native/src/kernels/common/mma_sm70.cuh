@@ -158,6 +158,102 @@ __device__ __forceinline__ void sm70_reduce_acc8_to_d4(const float (&acc)[8], fl
 }
 #endif
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+// Native AMD RDNA 3 / RDNA 3.5 (gfx1100/gfx1101/gfx1151) Wave32 16x16x16 WMMA primitives.
+// Exact operand layout (AMD RDNA 3 ISA / Matrix Instruction Calculator):
+//   A [16x16]: lane l holds row m = l & 15, k = 0..15 (lanes 0..15 MUST be replicated in lanes 16..31)
+//   B [16x16]: lane l holds col n = l & 15, k = 0..15 (lanes 0..15 MUST be replicated in lanes 16..31)
+//   D [16x16]: D[2*i + (l >> 4)][l & 15] = acc[i] for i = 0..7  (D = A * B + C)
+using Gfx11Bf16Frag = short __attribute__((ext_vector_type(16)));
+using Gfx11F16Frag  = _Float16 __attribute__((ext_vector_type(16)));
+using Gfx11Acc8     = float __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ Gfx11Acc8 gfx11_acc_zero() {
+  return Gfx11Acc8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+}
+
+__device__ __forceinline__ void gfx11_wmma_bf16(Gfx11Acc8& acc, const std::uint32_t (&a)[8],
+                                                const std::uint32_t (&b)[8]) {
+  Gfx11Bf16Frag af, bf;
+  __builtin_memcpy(&af, a, sizeof(af));
+  __builtin_memcpy(&bf, b, sizeof(bf));
+  acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af, bf, acc);
+}
+
+__device__ __forceinline__ void gfx11_wmma_f16(Gfx11Acc8& acc, const std::uint32_t (&a)[8],
+                                               const std::uint32_t (&b)[8]) {
+  Gfx11F16Frag af, bf;
+  __builtin_memcpy(&af, a, sizeof(af));
+  __builtin_memcpy(&bf, b, sizeof(bf));
+  acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc);
+}
+
+__device__ __forceinline__ void gfx11_wmma_act(Gfx11Acc8& acc, const std::uint32_t (&a)[8],
+                                               const std::uint32_t (&b)[8]) {
+#if INGINE_ACT_FP16
+  gfx11_wmma_f16(acc, a, b);
+#else
+  gfx11_wmma_bf16(acc, a, b);
+#endif
+}
+
+// Permute PTX m16n8k16 A/B fragments into RDNA 3 16x16x16 WMMA fragments (replicated across wave halves)
+// and accumulate into Gfx11Acc8. Columns 8..15 of B are duplicated (ignored on extraction).
+template <bool IS_BF16>
+__device__ __forceinline__ void gfx11_wmma_m16n8k16_acc(Gfx11Acc8& acc, unsigned a0, unsigned a1, unsigned a2,
+                                                        unsigned a3, unsigned b0, unsigned b1) {
+  const int lane = threadIdx.x & 31;
+  const int row_g = lane & 7;
+  const bool hi_m = (lane & 8) != 0;
+  std::uint32_t af[8], bf[8];
+#pragma unroll
+  for (int p = 0; p < 4; ++p) {
+    const int src = (row_g << 2) | p;
+    const unsigned a0_s = __shfl_sync(0xffffffffu, a0, src);
+    const unsigned a1_s = __shfl_sync(0xffffffffu, a1, src);
+    const unsigned a2_s = __shfl_sync(0xffffffffu, a2, src);
+    const unsigned a3_s = __shfl_sync(0xffffffffu, a3, src);
+    af[p] = hi_m ? a1_s : a0_s;
+    af[4 + p] = hi_m ? a3_s : a2_s;
+    bf[p] = __shfl_sync(0xffffffffu, b0, src);
+    bf[4 + p] = __shfl_sync(0xffffffffu, b1, src);
+  }
+  if constexpr (IS_BF16) {
+    gfx11_wmma_bf16(acc, af, bf);
+  } else {
+    gfx11_wmma_f16(acc, af, bf);
+  }
+}
+
+// Extract PTX m16n8k16 output d[4] (D[g, 2t], D[g, 2t+1], D[g+8, 2t], D[g+8, 2t+1]) from Gfx11Acc8.
+__device__ __forceinline__ void gfx11_reduce_acc8_to_d4(const Gfx11Acc8& acc, float (&d)[4]) {
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int reg_lo = g >> 1;  // 0..3 -> rows g = 2*reg_lo + (g&1), g+8 = 2*(reg_lo+4) + (g&1)
+  const int src0 = ((g & 1) << 4) | (t << 1);
+  const int src1 = src0 | 1;
+  float v0 = 0.f, v1 = 0.f, v2 = 0.f, v3 = 0.f;
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const float lo0 = __shfl_sync(0xffffffffu, acc[r], src0);
+    const float lo1 = __shfl_sync(0xffffffffu, acc[r], src1);
+    const float hi0 = __shfl_sync(0xffffffffu, acc[r + 4], src0);
+    const float hi1 = __shfl_sync(0xffffffffu, acc[r + 4], src1);
+    if (reg_lo == r) {
+      v0 = lo0;
+      v1 = lo1;
+      v2 = hi0;
+      v3 = hi1;
+    }
+  }
+  d[0] += v0;
+  d[1] += v1;
+  d[2] += v2;
+  d[3] += v3;
+}
+#endif
+
 // Drop-in replacement for ldmatrix.sync.aligned.m8n8.x4.shared.b16
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
                                             ingine::gpu::SmemAddr saddr) {
@@ -219,10 +315,14 @@ __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, ingine::
 }
 
 // D += A * B, m16n8k16, FP16 inputs, FP32 accumulation (native m16n8k16 on sm_80+, native HMMA.884 on sm_70,
-// portable wave32 SIMT on HIP and pre-sm70).
+// native RDNA 3 WMMA on gfx11, portable wave32 SIMT on other HIP targets and pre-sm70).
 __device__ __forceinline__ void mma_f16(float (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                         unsigned b1) {
-#if defined(__HIP_DEVICE_COMPILE__) || !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+  Gfx11Acc8 acc = gfx11_acc_zero();
+  gfx11_wmma_m16n8k16_acc<false>(acc, a0, a1, a2, a3, b0, b1);
+  gfx11_reduce_acc8_to_d4(acc, d);
+#elif defined(__HIP_DEVICE_COMPILE__) || !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)
   // SIMT seam for targets without tensor cores. Each lane owns two columns
   // in two rows of the m16n8k16 tile; exchange the packed K pairs within the warp.
   const int row = (threadIdx.x & 31) / 4;
@@ -346,6 +446,10 @@ __device__ __forceinline__ void mma_act(float (&d)[4], unsigned a0, unsigned a1,
                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+  Gfx11Acc8 acc = gfx11_acc_zero();
+  gfx11_wmma_m16n8k16_acc<true>(acc, a0, a1, a2, a3, b0, b1);
+  gfx11_reduce_acc8_to_d4(acc, d);
 #else
   // Portable BF16 m16n8k16 with exact FP32 accumulation for HIP (matches CUDA fragment layout).
   const int row = (threadIdx.x & 31) / 4;

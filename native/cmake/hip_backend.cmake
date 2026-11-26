@@ -22,7 +22,11 @@ list(REMOVE_DUPLICATES _ingine_hip_arch_norm)
 
 set(INGINE_HIP_ARCH_LIST "")
 set(INGINE_HIP_WAVE64 OFF)
-set(INGINE_HIP_FP_CONTRACT_ON OFF)
+# Preserve IEEE-rounded __fmul_rn/__fadd_rn across all HIP targets: clang defaults to -ffp-contract=fast
+# and expands __fmul_rn/__fadd_rn to plain * / + (defining OCML_BASIC_ROUNDED_OPERATIONS breaks __fdiv_rn
+# linking in ROCm 7.2.4 due to missing __ocml_div_rte_f32). -ffp-contract=off emits exact v_mul_f32 +
+# v_add_f32 for __fmul_rn/__fadd_rn while explicit fmaf() still emits hardware v_fma/v_fmac.
+set(INGINE_HIP_FP_CONTRACT_OFF ON)
 set(INGINE_HIP_HAS_WMMA OFF)
 
 foreach(_arch IN LISTS _ingine_hip_arch_norm)
@@ -33,11 +37,6 @@ foreach(_arch IN LISTS _ingine_hip_arch_norm)
   elseif(_base IN_LIST _ingine_hip_wave64)
     message(STATUS "ingine HIP: '${_base}' uses CDNA wave64 logical-32 half-wavefront mapping")
     set(INGINE_HIP_WAVE64 ON)
-    if(_base STREQUAL "gfx942" OR _base STREQUAL "gfx950")
-      # Packed FP32 instructions (v_pk_fma_f32) with clang's default -ffp-contract=fast can break
-      # multi-activation vs single-activation bit identity; keep contraction source-scoped.
-      set(INGINE_HIP_FP_CONTRACT_ON ON)
-    endif()
   else()
     message(FATAL_ERROR
       "Unsupported INGINE_HIP_ARCHITECTURES entry '${_base}' in '${INGINE_HIP_ARCHITECTURES}'")
@@ -106,7 +105,7 @@ function(ingine_hip_target target)
   if(INGINE_HIP_WAVE64)
     target_compile_definitions(${target} PUBLIC INGINE_HIP_WAVE64=1)
   endif()
-  if(INGINE_HIP_FP_CONTRACT_ON)
-    target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=on>)
+  if(INGINE_HIP_FP_CONTRACT_OFF)
+    target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>)
   endif()
 endfunction()

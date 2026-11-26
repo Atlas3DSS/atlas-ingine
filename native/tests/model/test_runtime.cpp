@@ -408,7 +408,7 @@ bool run(bool kv_fp8) {
 
   // 7. the device-selected verify (switch over the widths: save, decode, rollback with the width, position and
   //    accepted count read on the device) equals the host-driven call bit for bit
-  {
+  if (ingine::hal::conditional_graphs_enabled(0)) {
     DeviceBuffer width(sizeof(std::int32_t)), accepted(sizeof(std::int32_t));
     const std::span<const int> vw = rt.verify_widths();
     Widths widths;
@@ -447,6 +447,15 @@ bool run(bool kv_fp8) {
                    "device-selected verify width " + std::to_string(m) + ", commit " + std::to_string(acc + 1) +
                        " equals the host-driven call" + tag);
     }
+  } else {
+    bool threw = false;
+    try {
+      (void)rt.capture_switch([](cudaStream_t, cudaGraphConditionalHandle) { return cudaSuccess; },
+                              [](cudaStream_t, int) {});
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    ok &= report(threw, "capture_switch throws cleanly when conditional SWITCH graphs are unsupported" + tag);
   }
 
   // 8. prompt checkpoint round trip: save, decode 1100 steps (the rings wrap), restore: bit-identical state
@@ -518,52 +527,58 @@ bool run(bool kv_fp8) {
     widths.n = int(vw.size());
     std::copy(vw.begin(), vw.end(), widths.w);
     DeviceBuffer conf(7 * 4), drafts(7 * 4), m_out(4), marker(4), m_in(4), acc(4), next(4);
-    auto mark = [&](cudaStream_t cs, int m) { INGINE_TEST_CUDA(cudaMemsetAsync(marker.p, m, 1, cs)); };
-    GraphExec select = rt.capture_switch(
-        [&](cudaStream_t cs, cudaGraphConditionalHandle h) {
-          return verify_select(static_cast<const float*>(conf.p), static_cast<const std::int32_t*>(drafts.p), 0.8f,
-                               widths, rt.tokens(), static_cast<std::int32_t*>(m_out.p), h, cs);
-        },
-        mark);
-    GraphExec by_width = rt.capture_switch(
-        [&](cudaStream_t cs, cudaGraphConditionalHandle h) {
-          return width_select(static_cast<const std::int32_t*>(m_in.p), widths, h, cs);
-        },
-        mark);
     const std::int32_t d[7] = {101, 102, 103, 104, 105, 106, 107};
-    INGINE_TEST_CUDA(cudaMemcpy(drafts.p, d, sizeof d, cudaMemcpyHostToDevice));
-    bool sel_ok = true;
-    for (auto [lead, want] : {std::pair{0, 2}, std::pair{1, 2}, std::pair{2, 4}, std::pair{4, 8}, std::pair{7, 8}}) {
-      float c[7];
-      for (int i = 0; i < 7; ++i) c[i] = i < lead ? 0.9f : (i == lead ? 0.8f : 0.95f);  // 0.8 is not > 0.8
-      INGINE_TEST_CUDA(cudaMemcpy(conf.p, c, sizeof c, cudaMemcpyHostToDevice));
-      INGINE_TEST_CUDA(cudaMemset(marker.p, 0, 4));
-      INGINE_TEST_CUDA(cudaMemset(rt.tokens(), 0, 8 * 8));
-      INGINE_TEST_CUDA(cudaDeviceSynchronize());  // the uploads above are not ordered with stream s
-      select.launch(s);
-      INGINE_TEST_CUDA(cudaStreamSynchronize(s));
-      std::int32_t m = 0, mk = 0;
-      std::int64_t tk[8];
-      INGINE_TEST_CUDA(cudaMemcpy(&m, m_out.p, 4, cudaMemcpyDeviceToHost));
-      INGINE_TEST_CUDA(cudaMemcpy(&mk, marker.p, 4, cudaMemcpyDeviceToHost));
-      INGINE_TEST_CUDA(cudaMemcpy(tk, rt.tokens(), sizeof tk, cudaMemcpyDeviceToHost));
-      bool tok_ok = tk[0] == 0;
-      for (int i = 0; i < 7; ++i) tok_ok &= tk[1 + i] == d[i];
-      sel_ok &= m == want && (mk & 0xff) == want && tok_ok;
-    }
-    ok &= report(sel_ok, "verify_select picks the width of leads 0/1/2/4/7 and copies the drafts" + tag);
-    bool none_ok = true;
-    for (auto [m, want] : {std::pair{4, 4}, std::pair{5, 0}}) {
-      INGINE_TEST_CUDA(cudaMemset(marker.p, 0, 4));
-      INGINE_TEST_CUDA(cudaMemcpy(m_in.p, &m, 4, cudaMemcpyHostToDevice));
+    if (ingine::hal::conditional_graphs_enabled(0)) {
+      auto mark = [&](cudaStream_t cs, int m) { INGINE_TEST_CUDA(cudaMemsetAsync(marker.p, m, 1, cs)); };
+      GraphExec select = rt.capture_switch(
+          [&](cudaStream_t cs, cudaGraphConditionalHandle h) {
+            return verify_select(static_cast<const float*>(conf.p), static_cast<const std::int32_t*>(drafts.p), 0.8f,
+                                 widths, rt.tokens(), static_cast<std::int32_t*>(m_out.p), h, cs);
+          },
+          mark);
+      GraphExec by_width = rt.capture_switch(
+          [&](cudaStream_t cs, cudaGraphConditionalHandle h) {
+            return width_select(static_cast<const std::int32_t*>(m_in.p), widths, h, cs);
+          },
+          mark);
+      INGINE_TEST_CUDA(cudaMemcpy(drafts.p, d, sizeof d, cudaMemcpyHostToDevice));
+      bool sel_ok = true;
+      for (auto [lead, want] : {std::pair{0, 2}, std::pair{1, 2}, std::pair{2, 4}, std::pair{4, 8}, std::pair{7, 8}}) {
+        float c[7];
+        for (int i = 0; i < 7; ++i) c[i] = i < lead ? 0.9f : (i == lead ? 0.8f : 0.95f);  // 0.8 is not > 0.8
+        INGINE_TEST_CUDA(cudaMemcpy(conf.p, c, sizeof c, cudaMemcpyHostToDevice));
+        INGINE_TEST_CUDA(cudaMemset(marker.p, 0, 4));
+        INGINE_TEST_CUDA(cudaMemset(rt.tokens(), 0, 8 * 8));
+        INGINE_TEST_CUDA(cudaDeviceSynchronize());  // the uploads above are not ordered with stream s
+        select.launch(s);
+        INGINE_TEST_CUDA(cudaStreamSynchronize(s));
+        std::int32_t m = 0, mk = 0;
+        std::int64_t tk[8];
+        INGINE_TEST_CUDA(cudaMemcpy(&m, m_out.p, 4, cudaMemcpyDeviceToHost));
+        INGINE_TEST_CUDA(cudaMemcpy(&mk, marker.p, 4, cudaMemcpyDeviceToHost));
+        INGINE_TEST_CUDA(cudaMemcpy(tk, rt.tokens(), sizeof tk, cudaMemcpyDeviceToHost));
+        bool tok_ok = tk[0] == 0;
+        for (int i = 0; i < 7; ++i) tok_ok &= tk[1 + i] == d[i];
+        sel_ok &= m == want && (mk & 0xff) == want && tok_ok;
+      }
+      ok &= report(sel_ok, "verify_select picks the width of leads 0/1/2/4/7 and copies the drafts" + tag);
+      bool none_ok = true;
+      for (auto [m, want] : {std::pair{4, 4}, std::pair{5, 0}}) {
+        INGINE_TEST_CUDA(cudaMemset(marker.p, 0, 4));
+        INGINE_TEST_CUDA(cudaMemcpy(m_in.p, &m, 4, cudaMemcpyHostToDevice));
+        INGINE_TEST_CUDA(cudaDeviceSynchronize());
+        by_width.launch(s);
+        INGINE_TEST_CUDA(cudaStreamSynchronize(s));
+        std::int32_t mk = 0;
+        INGINE_TEST_CUDA(cudaMemcpy(&mk, marker.p, 4, cudaMemcpyDeviceToHost));
+        none_ok &= (mk & 0xff) == want;
+      }
+      ok &= report(none_ok, "width_select runs the branch of a verify width and none for another width" + tag);
+    } else {
+      std::int64_t seeded[8] = {0, d[0], d[1], d[2], d[3], d[4], d[5], d[6]};
+      INGINE_TEST_CUDA(cudaMemcpy(rt.tokens(), seeded, sizeof seeded, cudaMemcpyHostToDevice));
       INGINE_TEST_CUDA(cudaDeviceSynchronize());
-      by_width.launch(s);
-      INGINE_TEST_CUDA(cudaStreamSynchronize(s));
-      std::int32_t mk = 0;
-      INGINE_TEST_CUDA(cudaMemcpy(&mk, marker.p, 4, cudaMemcpyDeviceToHost));
-      none_ok &= (mk & 0xff) == want;
     }
-    ok &= report(none_ok, "width_select runs the branch of a verify width and none for another width" + tag);
     MappedHostBuffer rec(sizeof(VerifyRecord));
     const std::int32_t m = 4, a = 2, nx = 777;
     INGINE_TEST_CUDA(cudaMemcpy(m_in.p, &m, 4, cudaMemcpyHostToDevice));

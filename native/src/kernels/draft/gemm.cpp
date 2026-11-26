@@ -65,6 +65,7 @@ struct Bf16Gemm::Impl {
 Bf16Gemm::Bf16Gemm(std::size_t workspace_bytes) : impl_(new Impl) {
   try {
     hipblas_check(hipblasCreate(&impl_->blas_handle), "create");
+    (void)hipblasSetAtomicsMode(impl_->blas_handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
 #if defined(INGINE_HIPBLASLT_AVAILABLE) && INGINE_HIPBLASLT_AVAILABLE
     impl_->workspace_bytes = workspace_bytes;
     if (hipblasLtCreate(&impl_->lt_handle) == HIPBLAS_STATUS_SUCCESS) {

@@ -1201,6 +1201,69 @@ __global__ void __launch_bounds__(MAXWARPS * 32, LOW_SMEM ? 1 : 2) attn_decode_k
                 for (int j = 0; j < NPW; ++j)
                     if (nn0 + j * nstep < NTN) mma::sm70_reduce_acc8_to_d4(a4_v[j], a4[j]);
             }
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+            // Native AMD RDNA 3 / 3.5 (gfx11) Wave32 16x16x16 WMMA S^T = K Q^T: direct SMEM K/Q loads
+            // and hoisted Gfx11Acc8 across ks=0..7 -> ZERO input shuffles, 8x fewer reductions, ZERO spills!
+            if (nn0 < NTN) {
+                mma::Gfx11Acc8 a4_g11[NPW];
+#pragma unroll
+                for (int j = 0; j < NPW; ++j) a4_g11[j] = mma::gfx11_acc_zero();
+                const int key_l = km * 16 + (lane & 15);
+                const int row_in = lane & 7;
+#pragma unroll 1
+                for (int ks = 0; ks < D / 16; ++ks) {
+                    std::uint32_t af[8];
+                    if constexpr (KRAW) {
+                        if constexpr (Q4) {
+                            const int blk = ks >> 1, sub = ks & 1, swz_ch = blk ^ (key_l & 3);
+                            const char* kr = kraw + key_l * 64 + swz_ch * 16 + sub * 8;
+                            const uint2 u = *reinterpret_cast<const uint2*>(kr);
+                            const char* ksc = kraw + 2 * KT * 64 + key_l * 8 + blk * 2;
+                            const float dr = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(ksc)));
+                            const float d0 = isfinite(dr) ? dr : 0.f, neg0 = -8.f * d0;
+                            const uint32_t uw[2] = {u.x, u.y};
+#pragma unroll
+                            for (int p_i = 0; p_i < 2; ++p_i) {
+                                const uint32_t w = uw[p_i];
+                                af[4 * p_i + 0] = pack2(fmaf(float(w & 0xfu), d0, neg0), fmaf(float((w >> 4) & 0xfu), d0, neg0));
+                                af[4 * p_i + 1] = pack2(fmaf(float((w >> 8) & 0xfu), d0, neg0), fmaf(float((w >> 12) & 0xfu), d0, neg0));
+                                af[4 * p_i + 2] = pack2(fmaf(float((w >> 16) & 0xfu), d0, neg0), fmaf(float((w >> 20) & 0xfu), d0, neg0));
+                                af[4 * p_i + 3] = pack2(fmaf(float((w >> 24) & 0xfu), d0, neg0), fmaf(float((w >> 28) & 0xfu), d0, neg0));
+                            }
+                        } else {
+                            const char* kr = kraw + key_l * D + ((ks ^ (key_l & 7)) * 16);
+                            const uint4 u = *reinterpret_cast<const uint4*>(kr);
+                            const uint32_t uw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                            for (int p_i = 0; p_i < 4; ++p_i) {
+                                const float2 f0 = e4m3x2_f2(uw[p_i] & 0xffffu);
+                                const float2 f1 = e4m3x2_f2(uw[p_i] >> 16);
+                                af[2 * p_i] = pack2(f0.x, f0.y);
+                                af[2 * p_i + 1] = pack2(f1.x, f1.y);
+                            }
+                        }
+                    } else {
+                        const uint4 k0 = *reinterpret_cast<const uint4*>(kaddr(key_l, 2 * ks));
+                        const uint4 k1 = *reinterpret_cast<const uint4*>(kaddr(key_l, 2 * ks + 1));
+                        af[0] = k0.x; af[1] = k0.y; af[2] = k0.z; af[3] = k0.w;
+                        af[4] = k1.x; af[5] = k1.y; af[6] = k1.z; af[7] = k1.w;
+                    }
+#pragma unroll
+                    for (int j = 0; j < NPW; ++j) {
+                        const int nn = nn0 + j * nstep;
+                        if (nn < NTN) {
+                            const int row = nn * 8 + row_in;
+                            const uint4 q0 = *reinterpret_cast<const uint4*>(qb + row * D + (((2 * ks) ^ (row & 7)) * 8));
+                            const uint4 q1 = *reinterpret_cast<const uint4*>(qb + row * D + (((2 * ks + 1) ^ (row & 7)) * 8));
+                            const std::uint32_t bf[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+                            mma::gfx11_wmma_act(a4_g11[j], af, bf);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NPW; ++j)
+                    if (nn0 + j * nstep < NTN) mma::gfx11_reduce_acc8_to_d4(a4_g11[j], a4[j]);
+            }
 #else
             if (nn0 < NTN) {
 #pragma unroll
@@ -1365,6 +1428,35 @@ __global__ void __launch_bounds__(MAXWARPS * 32, LOW_SMEM ? 1 : 2) attn_decode_k
                     mma::sm70_mma_f16_direct(t8, va0, va1, va2, va3, q0.x, q0.y, q1.x, q1.y);
                     float t[4] = {0.f, 0.f, 0.f, 0.f};
                     mma::sm70_reduce_acc8_to_d4(t8, t);
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) oacc[n][v] = fmaf(f[ks][n][v & 1], t[v], oacc[n][v]);
+                }
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+                // Native AMD RDNA 3 / 3.5 (gfx11) Wave32 16x16x16 WMMA O^T += V^T (P_hi + P_lo)^T
+                const int d_l = lane & 15;
+                const int d_ch = warp * 2 + (d_l >> 3), d_in = d_l & 7;
+                const int k0 = ks * 16;
+                std::uint32_t af[8];
+#pragma unroll
+                for (int p_i = 0; p_i < 8; ++p_i) {
+                    const unsigned v0 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 2 * p_i, d_ch) + d_in));
+                    const unsigned v1 = mma::ld_smem_u16(smem_u32(vaddr(k0 + 2 * p_i + 1, d_ch) + d_in));
+                    af[p_i] = v0 | (v1 << 16);
+                }
+#pragma unroll
+                for (int n = 0; n < NTN; ++n) {
+                    mma::Gfx11Acc8 t8 = mma::gfx11_acc_zero();
+                    const __half* pr = ps + (n * 8 + (lane & 7)) * PSTRIDE + ks * 16;
+                    const uint4 p0 = *reinterpret_cast<const uint4*>(pr);
+                    const uint4 p1 = *reinterpret_cast<const uint4*>(pr + 8);
+                    const std::uint32_t pf[8] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
+                    mma::gfx11_wmma_f16(t8, af, pf);
+                    const uint4 q0 = *reinterpret_cast<const uint4*>(pr + NRP * PSTRIDE);
+                    const uint4 q1 = *reinterpret_cast<const uint4*>(pr + NRP * PSTRIDE + 8);
+                    const std::uint32_t qf[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+                    mma::gfx11_wmma_f16(t8, af, qf);
+                    float t[4] = {0.f, 0.f, 0.f, 0.f};
+                    mma::gfx11_reduce_acc8_to_d4(t8, t);
 #pragma unroll
                     for (int v = 0; v < 4; ++v) oacc[n][v] = fmaf(f[ks][n][v & 1], t[v], oacc[n][v]);
                 }

@@ -51,7 +51,7 @@ namespace head = kernels::head;
 namespace pk = kernels::prefill;
 
 constexpr int H = HIDDEN;
-constexpr int kHeadChunk = 32768;  // tiled FP8/BF16 unembed chunk for B > 8 (32768 * 2304 * 2 = 150.9 MB)
+constexpr int kHeadChunk = 16384;  // tiled unscaled FP8/BF16 unembed chunk for B > 32 (16384 * 2304 * 2 = 75.5 MB)
 
 double seconds_since(std::chrono::steady_clock::time_point t) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
@@ -348,17 +348,14 @@ class BatchDecoder {
     for (int p = 0; p < PASSES; ++p) B2_[p] = f32(B * H), E_[p] = f32(B * H);
     hid_ = f32(B * H), part_ = f32(B * H), y_ = f32(B * H), y2_ = f32(B * H);
     xin_ = bf16(3 * B * H), xm_ = bf16(B * H), xf_ = bf16(B * H);
-    xin_chunk_ = (w.dense_fp8 && B > 8) ? bf16(3 * 8 * H) : nullptr;
+    xin_chunk_ = B > 1 ? bf16(3 * 8 * H) : nullptr;
     mixf_ = f32(3 * B * H), msgs_ = f32(4 * B * H), mixm_ = f32(B * H);
-    proj_fp32_ = f32(std::min<std::size_t>(B, w.dense_fp8 ? 32 : 8) * PROJ_ROWS_FULL);
-    proj_act_ = B > 8 ? bf16(B * PROJ_ROWS_FULL) : nullptr;
-    attn_out_ = bf16(B * HEADS * HEAD_DIM);
-    wo_fp32_ = f32(std::min<std::size_t>(B, w.dense_fp8 ? 32 : 8) * H);
-    wo_act_ = B > 8 ? bf16(B * H) : nullptr;
-    gin_ = B > 8 ? bf16(3 * B * 2 * H) : nullptr;
-    g16_ = B > 8 ? bf16(B * GATE_RANK) : nullptr;
-    fpre_ = B > 8 ? f32(B * H) : nullptr;
-    gpre_ = B > 8 ? f32(B * H) : nullptr;
+    proj_fp32_ = f32(std::max<std::size_t>(B, 2) * PROJ_ROWS_FULL);
+    attn_out_ = bf16(std::max<std::size_t>(B, 2) * HEADS * HEAD_DIM);
+    wo_fp32_ = f32(std::max<std::size_t>(B, 2) * H);
+    gin_ = bf16(3 * B * 2 * H);
+    g16_ = bf16(3 * B * GATE_RANK);
+    gate_ss_ = f32(3 * B * 16);
     router_logits_ = f32(B * EXPERTS);
     idx_ = i32(B * TOP_K);
     wts_ = f32(B * TOP_K);
@@ -370,8 +367,8 @@ class BatchDecoder {
     act_ = bf16(B * TOP_K * INTER);
     down_ = bf16(B * TOP_K * H);
     moe_sum_ = bf16(B * H);
-    logits_ = f32(B * UNPADDED_VOCAB);
-    head_act_ = B > 8 ? bf16(B * kHeadChunk) : nullptr;
+    logits_ = f32(std::max<std::size_t>(B, 2) * UNPADDED_VOCAB);
+    head_fp32_ = B > 8 ? f32(B * kHeadChunk) : nullptr;
     wscratch_ = (w.dense_fp8 && B > 32) ? bf16(std::size_t(kHeadChunk) * H) : nullptr;
     attn_ws_ = DeviceBuffer(bk::attn_workspace_bytes(max_batch));
     attn_ws_.fill(0);
@@ -438,15 +435,16 @@ class BatchDecoder {
 
     auto* ht = static_cast<std::int64_t*>(tokens_host_.data());
     auto* hs = static_cast<std::int32_t*>(slots_host_.data());
+    const int pad_n = std::max(B_cap, std::min(max_batch_, 8));
     for (int i = 0; i < B_active; ++i) {
       ht[i] = inputs[i].token;
       hs[i] = inputs[i].slot;
     }
-    for (int i = B_active; i < B_cap; ++i) {
+    for (int i = B_active; i < pad_n; ++i) {
       ht[i] = 0;
       hs[i] = -1;
     }
-    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(B_cap) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(tokens_dev_, ht, std::size_t(pad_n) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev_, hs, std::size_t(B_cap) * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
 
     if (it != graphs_.end()) {
@@ -502,35 +500,20 @@ class BatchDecoder {
       dense::mix(p, false, stream);
     };
 
-    auto bf16_rows = [&](const Dense& d) -> const ActT* {
-      if (!d.fp8()) return bf16p(d.w);
-      dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, stream);
-      return wscratch_;
+    auto next_gemv_chunk = [](int rem) -> int {
+      if (rem <= 8) return rem;
+      if (rem == 9) return 5;  // keep every chunk in {2..8} so B >= 2 stays on gemv_mma_kernel
+      return 8;
     };
 
-    auto run_gates_gemm = [&](const pk::GateRows& rows, int G, const Tensor& down, const Tensor& forget16,
-                              const Tensor& gain16, const float* norm_w, ActT* out) {
-      pk::gate_inputs(rows, G, B, gin_, stream);
-      for (int g = 0; g < G; ++g) {
-        const ActT* gd = bf16p(down) + std::size_t(g) * GATE_RANK * 2 * H;
-        gemm_->run(gin_ + std::size_t(g) * B * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, B, GATE_RANK, 2 * H,
-                   stream);
-        gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, B, H,
-                   GATE_RANK, stream);
-        gemm_->run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gpre_, H, true, B, H,
-                   GATE_RANK, stream);
-        pk::gate_apply(rows.h[g], rows.msg[g], fpre_, gpre_, norm_w + std::size_t(g) * H, B,
-                       out + std::size_t(g) * slab, stream);
-      }
-    };
-
+    const int B_embed = (B < 8 && max_batch_ >= 8) ? 8 : B;
     if (w.embed_q4()) {
       auto desc = ops::make_inkling_embed_q4_desc(B, VOCAB, /*allow_pdl=*/false);
       desc.token_bounds = ops::TokenBoundsMode::PreValidated;
       const ops::EmbedQ4RmsNormArgs args{tokens_dev_, w.embed.data, f32p(w.embed_norm), B0_};
       ops::run_embed_q4_rmsnorm(desc, args, stream, /*allow_fallback=*/false, /*force_fallback=*/false);
     } else {
-      dense::embed(tokens_dev_, B, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
+      dense::embed(tokens_dev_, B_embed, bf16p(w.embed), f32p(w.embed_norm), B0_, false, stream);
     }
 
     int prev_v = -1;
@@ -571,72 +554,60 @@ class BatchDecoder {
       float* partial_out = hid != base ? hid : nullptr;
       if (msgs) {
         run_mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_);
-        if (use_gemv) {
-          dense::message_gates(mixf_, !layer.full, msgs_, 3, B, bf16p(layer.qkv_gate_down),
-                               layer.qkv_gate_forget16.data, layer.qkv_gate_gain16.data, false, f32p(layer.attn_norm3),
-                               xin_, nullptr, false, stream);
-        } else {
-          pk::GateRows rows;
-          for (int g = 0; g < 3; ++g) rows.h[g] = mixf_ + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_ + g * slab;
-          run_gates_gemm(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16,
-                         f32p(layer.attn_norm3), xin_);
-        }
+        bk::batched_message_gates(mixf_, !layer.full, msgs_, 3, B, bf16p(layer.qkv_gate_down),
+                                  bf16p(layer.qkv_gate_forget16), bf16p(layer.qkv_gate_gain16), f32p(layer.attn_norm3),
+                                  gin_, g16_, gate_ss_, xin_, stream);
       } else {
         run_mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
                 f32p(layer.attn_norm_mix), xin_, nullptr);
       }
 
       // ---- Attention projections
-      // For FP8 dense weights at B <= 32, fused chunk-8 GEMV moves ceil(B/8)x W_fp8 vs 5x W_fp8 for dequant+cuBLASLt.
+      // Keep wproj on M-invariant chunked GEMV (gemv_mma_kernel, padding B=1 -> 2 when max_batch_ >= 2)
+      // so identical replicates and cross-batch sizes match bit-for-bit without BLAS heuristic drift.
       const int R = proj_rows(layer.full);
       const bool single = !layer.full && !msgs;
-      const bool proj_gemv = use_gemv || (layer.wproj.fp8() && B <= 32);
-      if (proj_gemv) {
-        const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
-        if (B <= 8) {
-          dense::proj(xin_, B, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_,
-                      false, stream);
-        } else {
-          for (int b0 = 0; b0 < B; b0 += 8) {
-            const int cb = std::min(8, B - b0);
-            const ActT* xptr = xin_ + std::size_t(b0) * H;
-            if (!single) {
-              for (int g = 0; g < 3; ++g) {
-                CUDA_CHECK(cudaMemcpyAsync(xin_chunk_ + std::size_t(g) * cb * H,
-                                           xin_ + std::size_t(g) * slab + std::size_t(b0) * H,
-                                           std::size_t(cb) * H * sizeof(ActT), cudaMemcpyDeviceToDevice, stream));
-              }
-              xptr = xin_chunk_;
-            }
-            dense::proj(xptr, cb, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full),
-                        proj_fp32_ + std::size_t(b0) * R, false, stream);
+      const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
+      if (B == 1 && max_batch_ >= 2) {
+        const ActT* xptr = xin_;
+        if (!single) {
+          for (int g = 0; g < 3; ++g) {
+            CUDA_CHECK(cudaMemcpyAsync(xin_chunk_ + std::size_t(g) * 2 * H, xin_ + std::size_t(g) * slab,
+                                       std::size_t(H) * sizeof(ActT), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemsetAsync(xin_chunk_ + std::size_t(g) * 2 * H + H, 0,
+                                       std::size_t(H) * sizeof(ActT), stream));
           }
+          xptr = xin_chunk_;
+        } else {
+          CUDA_CHECK(cudaMemsetAsync(xin_ + H, 0, std::size_t(H) * sizeof(ActT), stream));
         }
+        dense::proj(xptr, 2, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_,
+                    false, stream);
+      } else if (B <= 8) {
+        dense::proj(xin_, B, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_,
+                    false, stream);
       } else {
-        const ActT* wp = bf16_rows(layer.wproj);
-        if (single) {
-          gemm_->run(xin_, H, wp, H, proj_act_, R, false, B, R, H, stream);
-        } else {
-          struct Part {
-            int begin, end, input;
-          };
-          const Part parts[] = {{SEG_BEGIN[SEG_Q], SEG_BEGIN[SEG_K], 0},
-                                {SEG_BEGIN[SEG_K], SEG_BEGIN[SEG_V], 1},
-                                {SEG_BEGIN[SEG_V], SEG_BEGIN[SEG_K_DYN], 2},
-                                {SEG_BEGIN[SEG_K_DYN], SEG_BEGIN[SEG_V_DYN], 1},
-                                {SEG_BEGIN[SEG_V_DYN], SEG_BEGIN[NUM_SEGS], 2}};
-          for (const Part& part : parts) {
-            if (part.begin >= R) break;
-            gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H,
-                       proj_act_ + part.begin, R, false, B, part.end - part.begin, H, stream);
+        for (int b0 = 0; b0 < B;) {
+          const int cb = next_gemv_chunk(B - b0);
+          const ActT* xptr = xin_ + std::size_t(b0) * H;
+          if (!single) {
+            for (int g = 0; g < 3; ++g) {
+              CUDA_CHECK(cudaMemcpyAsync(xin_chunk_ + std::size_t(g) * cb * H,
+                                         xin_ + std::size_t(g) * slab + std::size_t(b0) * H,
+                                         std::size_t(cb) * H * sizeof(ActT), cudaMemcpyDeviceToDevice, stream));
+            }
+            xptr = xin_chunk_;
           }
+          dense::proj(xptr, cb, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full),
+                      proj_fp32_ + std::size_t(b0) * R, false, stream);
+          b0 += cb;
         }
       }
 
       // ---- Batched per-slot attention (sliding ring or paged full KV)
       bk::BatchedAttnArgs a;
-      a.proj = proj_gemv ? static_cast<const void*>(proj_fp32_) : static_cast<const void*>(proj_act_);
-      a.proj_fp32 = proj_gemv;
+      a.proj = static_cast<const void*>(proj_fp32_);
+      a.proj_fp32 = true;
       a.B = B;
       a.slot_ids = slot_ids_dev_;
       a.slot_pos = static_cast<const std::int64_t*>(pool_.slot_pos.p);
@@ -678,21 +649,19 @@ class BatchDecoder {
 
       // ---- Output projection + per-slot post-attention 4-tap conv
       float* conv_attn_v = static_cast<float*>(pool_.conv_attn.p) + std::size_t(v) * (CONV_K - 1) * H;
-      const bool wo_gemv = use_gemv || (layer.wo.fp8() && B <= 32);
-      if (wo_gemv) {
-        for (int b0 = 0; b0 < B; b0 += 8) {
-          const int cb = std::min(8, B - b0);
+      if (B == 1 && max_batch_ >= 2) {
+        CUDA_CHECK(cudaMemsetAsync(attn_out_ + HEADS * HEAD_DIM, 0, std::size_t(HEADS * HEAD_DIM) * sizeof(ActT), stream));
+        dense::gemv(attn_out_, 2, HEADS * HEAD_DIM, matrix(layer.wo), wo_fp32_, false, stream);
+      } else {
+        for (int b0 = 0; b0 < B;) {
+          const int cb = next_gemv_chunk(B - b0);
           dense::gemv(attn_out_ + std::size_t(b0) * HEADS * HEAD_DIM, cb, HEADS * HEAD_DIM, matrix(layer.wo),
                       wo_fp32_ + std::size_t(b0) * H, false, stream);
+          b0 += cb;
         }
-        bk::batched_static_conv_step(wo_fp32_, true, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
-                                     pool_.conv_h_slot_stride, y_, stream);
-      } else {
-        const ActT* wo = bf16_rows(layer.wo);
-        gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_act_, H, false, B, H, HEADS * HEAD_DIM, stream);
-        bk::batched_static_conv_step(wo_act_, false, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
-                                     pool_.conv_h_slot_stride, y_, stream);
       }
+      bk::batched_static_conv_step(wo_fp32_, true, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
+                                   pool_.conv_h_slot_stride, y_, stream);
 
       // ---- MLP read + message gate
       std::vector<const float*> mlp_blocks = blocks;
@@ -701,23 +670,16 @@ class BatchDecoder {
       if (msgs) {
         run_mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
                 f32p(layer.mlp_query), 1, nullptr, nullptr, mixm_);
-        if (use_gemv) {
-          dense::message_gates(mixm_, false, msgs_ + 3 * slab, 1, B, bf16p(layer.mlp1_gate_down),
-                               layer.mlp1_gate_forget16.data, layer.mlp1_gate_gain16.data, false,
-                               f32p(layer.mlp_norm1), xm_, nullptr, false, stream);
-        } else {
-          pk::GateRows rows;
-          rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
-          run_gates_gemm(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16,
-                         f32p(layer.mlp_norm1), xm_);
-        }
+        bk::batched_message_gates(mixm_, false, msgs_ + 3 * slab, 1, B, bf16p(layer.mlp1_gate_down),
+                                  bf16p(layer.mlp1_gate_forget16), bf16p(layer.mlp1_gate_gain16), f32p(layer.mlp_norm1),
+                                  gin_, g16_, gate_ss_, xm_, stream);
       } else {
         run_mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
                 f32p(layer.mlp_query), 1, f32p(layer.mlp_norm1), xm_, nullptr);
       }
 
       // ---- Router + grouped tensor-core MoE + per-slot post-MLP 4-tap conv
-      gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, B, EXPERTS, H, stream);
+      bk::batched_router_logits(xm_, bf16p(layer.router_bf16), B, router_logits_, stream);
       CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), stream));
       pk::moe_topk(router_logits_, f32p(layer.router_bias), B, idx_, wts_, counts_, stream);
       const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
@@ -739,24 +701,31 @@ class BatchDecoder {
             mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
     const bool head_gemv = use_gemv || (w.unembed.fp8() && B <= 32);
     if (head_gemv) {
-      for (int b0 = 0; b0 < B; b0 += 8) {
-        const int cb = std::min(8, B - b0);
-        dense::head(xf_ + std::size_t(b0) * H, cb, matrix(w.unembed), logits_ + std::size_t(b0) * UNPADDED_VOCAB,
-                    false, stream);
+      if (B == 1 && max_batch_ >= 2) {
+        CUDA_CHECK(cudaMemsetAsync(xf_ + H, 0, std::size_t(H) * sizeof(ActT), stream));
+        dense::head(xf_, 2, matrix(w.unembed), logits_, false, stream);
+      } else {
+        for (int b0 = 0; b0 < B;) {
+          const int cb = next_gemv_chunk(B - b0);
+          dense::head(xf_ + std::size_t(b0) * H, cb, matrix(w.unembed), logits_ + std::size_t(b0) * UNPADDED_VOCAB,
+                      false, stream);
+          b0 += cb;
+        }
       }
     } else {
+      const float* hscale = w.unembed.fp8() ? f32p(w.unembed.scale) : nullptr;
       for (int v0 = 0; v0 < UNPADDED_VOCAB; v0 += kHeadChunk) {
         const int cv = std::min(kHeadChunk, UNPADDED_VOCAB - v0);
         const ActT* wchunk;
         if (w.unembed.fp8()) {
           const auto* q = static_cast<const std::uint8_t*>(w.unembed.w.data) + std::size_t(v0) * H;
-          dense::dequant_rows(q, f32p(w.unembed.scale) + v0, cv, H, wscratch_, stream);
+          bk::dequant_e4m3_unscaled(q, cv, H, wscratch_, stream);
           wchunk = wscratch_;
         } else {
           wchunk = bf16p(w.unembed.w) + std::size_t(v0) * H;
         }
-        gemm_->run(xf_, H, wchunk, H, head_act_, cv, false, B, cv, H, stream);
-        bk::batched_head_softcap(head_act_, B, cv, v0, UNPADDED_VOCAB, logits_, stream);
+        gemm_->run(xf_, H, wchunk, H, head_fp32_, cv, true, B, cv, H, stream);
+        bk::batched_head_scale_softcap(head_fp32_, hscale, B, cv, v0, UNPADDED_VOCAB, logits_, stream);
       }
     }
 
@@ -785,19 +754,18 @@ class BatchDecoder {
   ActT *xin_ = nullptr, *xin_chunk_ = nullptr, *xm_ = nullptr, *xf_ = nullptr;
   float *mixf_ = nullptr, *msgs_ = nullptr, *mixm_ = nullptr;
   float* proj_fp32_ = nullptr;
-  ActT* proj_act_ = nullptr;
   ActT* attn_out_ = nullptr;
   float* wo_fp32_ = nullptr;
-  ActT* wo_act_ = nullptr;
   ActT *gin_ = nullptr, *g16_ = nullptr;
-  float *fpre_ = nullptr, *gpre_ = nullptr;
+  float* gate_ss_ = nullptr;
   float* router_logits_ = nullptr;
   int *idx_ = nullptr, *counts_ = nullptr, *tiles_n_ = nullptr, *pair_token_ = nullptr, *pair_dst_ = nullptr;
   int4* tiles_ = nullptr;
   float* wts_ = nullptr;
   ActT *act_ = nullptr, *down_ = nullptr, *moe_sum_ = nullptr;
   float* logits_ = nullptr;
-  ActT *head_act_ = nullptr, *wscratch_ = nullptr;
+  float* head_fp32_ = nullptr;
+  ActT* wscratch_ = nullptr;
 };
 
 // ----------------------------------------------------------------------------- BatchGenerator (implements Generator)

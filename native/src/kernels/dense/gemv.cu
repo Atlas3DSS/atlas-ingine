@@ -266,6 +266,14 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
   const int c0_v = warp * KS + (qp & 1) * (2 * CPL);
   float c[4] = {0.f, 0.f, 0.f, 0.f};
   float c8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+  // Native AMD RDNA 3 / 3.5 (gfx11) Wave32 16x16x16 WMMA: lane l owns weight row r0 + (l & 15) and
+  // token (l & 15) (naturally replicated across wave halves) -> ZERO shuffles in K-loop and epilogue!
+  static_assert(KS % 32 == 0, "gfx11 WMMA gemv requires KS multiple of 32");
+  const int row_l = lane & 15;
+  const int rv = r0 + row_l;
+  const int iv = rv < rows ? epi.input_of(rv) : -1;
+  mma::Gfx11Acc8 c_g11 = mma::gfx11_acc_zero();
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
   float acc_a[M], acc_b[M];
 #pragma unroll
@@ -324,6 +332,67 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
           mma::sm70_mma_f16_direct(c8, W0[u].x, W0[u].y, W0[u].z, W0[u].w, x0.x ^ dep, x0.y, x0.z, x0.w);
           mma::sm70_mma_f16_direct(c8, W1[u].x, W1[u].y, W1[u].z, W1[u].w, x1.x, x1.y, x1.z, x1.w);
         }
+      }
+    }
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+    const bool lv = iv == cur, lx = row_l < M;
+    const uint8_t* wv = w + size_t(lv ? rv : 0) * ROW_BYTES;
+    const ActT* xg = epi.x_of(cur) + size_t(lx ? row_l : 0) * K;
+    const int k_base = warp * KS;
+#pragma unroll 1
+    for (int ok = 0; ok < KS; ok += 32) {
+      const int col0 = k_base + ok;
+      if constexpr (FP8) {
+        const uint4 w0 = lv ? l2::ld_stream<WEIGHT_L2>(wv + size_t(col0), wpol) : make_uint4(0, 0, 0, 0);
+        const uint4 w1 = lv ? l2::ld_stream<WEIGHT_L2>(wv + size_t(col0 + 16), wpol) : make_uint4(0, 0, 0, 0);
+        if (!waited) {
+          pdl_wait_fenced(zero);
+          pdl_trigger();
+          waited = true;
+        }
+        const uint32_t dep = (w0.x ^ w1.w) & zero;
+        const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
+        const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
+        const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
+        const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
+        const std::uint32_t af0[8] = {
+            e4m3x2_to_bf16x2(w0.x), e4m3x2_to_bf16x2(w0.x >> 16),
+            e4m3x2_to_bf16x2(w0.y), e4m3x2_to_bf16x2(w0.y >> 16),
+            e4m3x2_to_bf16x2(w0.z), e4m3x2_to_bf16x2(w0.z >> 16),
+            e4m3x2_to_bf16x2(w0.w), e4m3x2_to_bf16x2(w0.w >> 16),
+        };
+        const std::uint32_t bf0[8] = {x0.x ^ dep, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        mma::gfx11_wmma_act(c_g11, af0, bf0);
+        const std::uint32_t af1[8] = {
+            e4m3x2_to_bf16x2(w1.x), e4m3x2_to_bf16x2(w1.x >> 16),
+            e4m3x2_to_bf16x2(w1.y), e4m3x2_to_bf16x2(w1.y >> 16),
+            e4m3x2_to_bf16x2(w1.z), e4m3x2_to_bf16x2(w1.z >> 16),
+            e4m3x2_to_bf16x2(w1.w), e4m3x2_to_bf16x2(w1.w >> 16),
+        };
+        const std::uint32_t bf1[8] = {x2.x, x2.y, x2.z, x2.w, x3.x, x3.y, x3.z, x3.w};
+        mma::gfx11_wmma_act(c_g11, af1, bf1);
+      } else {
+        const size_t boff = size_t(col0) * 2;
+        const uint4 w0 = lv ? l2::ld_stream<WEIGHT_L2>(wv + boff, wpol) : make_uint4(0, 0, 0, 0);
+        const uint4 w1 = lv ? l2::ld_stream<WEIGHT_L2>(wv + boff + 16, wpol) : make_uint4(0, 0, 0, 0);
+        const uint4 w2 = lv ? l2::ld_stream<WEIGHT_L2>(wv + boff + 32, wpol) : make_uint4(0, 0, 0, 0);
+        const uint4 w3 = lv ? l2::ld_stream<WEIGHT_L2>(wv + boff + 48, wpol) : make_uint4(0, 0, 0, 0);
+        if (!waited) {
+          pdl_wait_fenced(zero);
+          pdl_trigger();
+          waited = true;
+        }
+        const uint32_t dep = (w0.x ^ w3.w) & zero;
+        const uint4 x0 = lx ? ld_act(xg + col0) : make_uint4(0, 0, 0, 0);
+        const uint4 x1 = lx ? ld_act(xg + col0 + 8) : make_uint4(0, 0, 0, 0);
+        const uint4 x2 = lx ? ld_act(xg + col0 + 16) : make_uint4(0, 0, 0, 0);
+        const uint4 x3 = lx ? ld_act(xg + col0 + 24) : make_uint4(0, 0, 0, 0);
+        const std::uint32_t af0[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        const std::uint32_t bf0[8] = {x0.x ^ dep, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        mma::gfx11_wmma_act(c_g11, af0, bf0);
+        const std::uint32_t af1[8] = {w2.x, w2.y, w2.z, w2.w, w3.x, w3.y, w3.z, w3.w};
+        const std::uint32_t bf1[8] = {x2.x, x2.y, x2.z, x2.w, x3.x, x3.y, x3.z, x3.w};
+        mma::gfx11_wmma_act(c_g11, af1, bf1);
       }
     }
 #else
@@ -423,7 +492,8 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
     // inputs present among the block's 16 rows (warp-uniform; every warp sees the same rows)
 #pragma unroll 1
     for (int i = 0; i < Epi::kInputs; ++i)
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+#if ((defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700) || (defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__))) && \
+    !defined(INGINE_FORCE_SIMT_MMA)
       if (__any_sync(0xffffffffu, iv == i)) pass(i);
 #else
       if (__any_sync(0xffffffffu, ia == i || ib == i)) pass(i);
@@ -436,6 +506,11 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
   cs[warp][g][2 * t + 1] = c[1];
   cs[warp][g + 8][2 * t] = c[2];
   cs[warp][g + 8][2 * t + 1] = c[3];
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+  if (row_l < 8) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) cs[warp][2 * i + (lane >> 4)][row_l] = c_g11[i];
+  }
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
 #pragma unroll
   for (int m = 0; m < M; ++m) {

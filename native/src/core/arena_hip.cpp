@@ -1,5 +1,6 @@
 // Pure native AMD ROCm/HIP DeviceBuffer, DeviceArena, and PinnedHostBuffer implementation.
 #include "core/arena.h"
+#include "core/hugepage.h"
 
 #include <hip/hip_runtime.h>
 
@@ -254,31 +255,77 @@ std::size_t DeviceArena::capacity() const noexcept { return cap_; }
 std::size_t DeviceArena::peak_used() const noexcept { return peak_; }
 void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
-PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) : size_(size_bytes) {
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
   if (size_bytes == 0) throw std::invalid_argument("PinnedHostBuffer size must be nonzero");
   if (consume_fail_pinned()) {
     throw std::runtime_error("PinnedHostBuffer(HIP): injected pinned allocation failure");
+  }
+  if (size_bytes >= kHugePageAlignBytes && hugepages_enabled()) {
+    HugePageMapping m = alloc_hugepage_anon(size_bytes);
+    if (m.ptr != nullptr) {
+      if (m.hugepage_advised) {
+        prefault_hugepage_stride_nondestructive(m.ptr, m.mapped_bytes);
+      }
+      const hipError_t reg_err = hipHostRegister(m.ptr, m.mapped_bytes, hipHostRegisterPortable);
+      if (reg_err == hipSuccess) {
+        data_              = m.ptr;
+        size_              = size_bytes;
+        mapped_bytes_      = m.mapped_bytes;
+        via_hugepage_mmap_ = m.via_mmap;
+        hugepage_advised_  = m.hugepage_advised;
+        return;
+      }
+      (void)hipGetLastError();
+      free_hugepage_anon(m);
+    }
   }
   void* ptr = nullptr;
   const hipError_t err = hipHostMalloc(&ptr, size_bytes, hipHostMallocPortable);
   if (err != hipSuccess) throw std::runtime_error(hip_error_message("hipHostMalloc failed", err));
   data_ = ptr;
+  size_ = size_bytes;
 }
 
-PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
-
-PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept : data_(other.data_), size_(other.size_) {
-  other.data_ = nullptr;
-  other.size_ = 0;
+PinnedHostBuffer::~PinnedHostBuffer() {
+  if (data_ != nullptr) {
+    if (mapped_bytes_ > 0) {
+      log_hip_error("hipHostUnregister", hipHostUnregister(data_));
+      HugePageMapping m{data_, mapped_bytes_, hugepage_advised_, via_hugepage_mmap_};
+      free_hugepage_anon(m);
+    } else {
+      free_pinned(data_);
+    }
+  }
+  data_              = nullptr;
+  size_              = 0;
+  mapped_bytes_      = 0;
+  via_hugepage_mmap_ = false;
+  hugepage_advised_  = false;
 }
+
+PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
+    : data_(std::exchange(other.data_, nullptr)),
+      size_(std::exchange(other.size_, 0)),
+      mapped_bytes_(std::exchange(other.mapped_bytes_, 0)),
+      via_hugepage_mmap_(std::exchange(other.via_hugepage_mmap_, false)),
+      hugepage_advised_(std::exchange(other.hugepage_advised_, false)) {}
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
   if (this == &other) return *this;
-  free_pinned(data_);
-  data_ = other.data_;
-  size_ = other.size_;
-  other.data_ = nullptr;
-  other.size_ = 0;
+  if (data_ != nullptr) {
+    if (mapped_bytes_ > 0) {
+      log_hip_error("hipHostUnregister", hipHostUnregister(data_));
+      HugePageMapping m{data_, mapped_bytes_, hugepage_advised_, via_hugepage_mmap_};
+      free_hugepage_anon(m);
+    } else {
+      free_pinned(data_);
+    }
+  }
+  data_              = std::exchange(other.data_, nullptr);
+  size_              = std::exchange(other.size_, 0);
+  mapped_bytes_      = std::exchange(other.mapped_bytes_, 0);
+  via_hugepage_mmap_ = std::exchange(other.via_hugepage_mmap_, false);
+  hugepage_advised_  = std::exchange(other.hugepage_advised_, false);
   return *this;
 }
 

@@ -82,6 +82,7 @@ struct Gemm::Impl {
 Gemm::Gemm() : impl_(new Impl) {
   try {
     hipblas_check(hipblasCreate(&impl_->blas_handle), "create");
+    (void)hipblasSetAtomicsMode(impl_->blas_handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
 #if defined(INGINE_HIPBLASLT_AVAILABLE) && INGINE_HIPBLASLT_AVAILABLE
     if (hipblasLtCreate(&impl_->lt_handle) == HIPBLAS_STATUS_SUCCESS) {
       if (hipMalloc(&impl_->workspace, kWorkspaceBytes) != hipSuccess) {

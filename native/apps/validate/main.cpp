@@ -53,7 +53,8 @@ fs::path default_model_dir() {
 }
 
 struct Args {
-  fs::path model_dir = default_model_dir();
+  fs::path model_dir;
+  fs::path default_model_dir_arg;
   fs::path ablation;  // --ablation; default: the file the goldens were made with, <golden>/ablation.safetensors
   fs::path golden = fs::path(INGINE_REPO_DIR) / "native" / "tests" / "golden" / "model";
   std::string filter;
@@ -286,6 +287,7 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     if (k == "--model-dir") a.model_dir = val();
+    else if (k == "--default-model-dir") a.default_model_dir_arg = val();
     else if (k == "--ablation") a.ablation = val();
     else if (k == "--golden") a.golden = val();
     else if (k == "--cases") a.filter = val();
@@ -300,6 +302,15 @@ int main(int argc, char** argv) {
     else {
       usage();
       return k == "--help" || k == "-h" ? 0 : 2;
+    }
+  }
+  if (a.model_dir.empty()) {
+    if (const char* env = std::getenv("INGINE_MODEL_DIR"); env != nullptr && *env != '\0') {
+      a.model_dir = env;
+    } else if (!a.default_model_dir_arg.empty()) {
+      a.model_dir = a.default_model_dir_arg;
+    } else {
+      a.model_dir = default_model_dir();
     }
   }
   if (a.ablation.empty()) a.ablation = a.golden / "ablation.safetensors";

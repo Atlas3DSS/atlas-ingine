@@ -142,6 +142,15 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
   __syncthreads();
   const bool head = w < QH;       // warp-uniform
   const int hw = head ? w : 0;
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+  // Native AMD RDNA 3 / 3.5 (gfx11) Wave32 16x16x16 WMMA: read qs directly from LDS (saves 64 VGPRs),
+  // keep oacc_g11[8] in hardware WMMA layout with XOR-16 softmax -> ZERO spills!
+  const int q_lane = lane & 15;
+  float m_run = -INFINITY, l_run = 0.f;
+  mma::Gfx11Acc8 oacc_g11[HEAD_DIM / 16];
+#pragma unroll
+  for (int d = 0; d < HEAD_DIM / 16; ++d) oacc_g11[d] = mma::gfx11_acc_zero();
+#else
 #if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
   const int v_qp = (lane >> 2) & 3;
   const int v_idx = (lane & 3) | ((lane & 16) >> 2);
@@ -155,7 +164,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
     qb_v[s][0] = q0.x, qb_v[s][1] = q0.y, qb_v[s][2] = q1.x, qb_v[s][3] = q1.y;
   }
 #elif defined(__HIP_DEVICE_COMPILE__) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)))
-  // Pascal sm_60/sm_61 and HIP: reads qs directly from SMEM via uint4 in tile() with exact FP32 fmaf (0 shuffles).
+  // Pascal sm_60/sm_61 and non-gfx11 HIP: reads qs directly from SMEM via uint4 in tile() with exact FP32 fmaf.
 #else
   uint32_t qb[HEAD_DIM / 16][2];  // this head's queries as B fragments (16 dims x 8 queries), per 16 dims
 #pragma unroll
@@ -168,6 +177,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
   for (int d = 0; d < HEAD_DIM / 16; ++d)
 #pragma unroll
     for (int i = 0; i < 4; ++i) oacc[d][i] = 0.f;
+#endif
 
   auto tile = [&](TileRegs<FP8>& x, int t0, int buf) {
     // stage the tile as BF16 [16 keys][128]
@@ -210,6 +220,72 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
     if (t0 + 2 * ATT_TILE < kend) load(x, t0 + 2 * ATT_TILE);
     if (!head) return;
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+    // Scores S^T = K Q^T via 8 hardware RDNA 3 WMMAs: sc_g11[i] = S^T[key = 2*i + (lane>>4), q = lane & 15]
+    mma::Gfx11Acc8 sc_g11 = mma::gfx11_acc_zero();
+#pragma unroll 2
+    for (int s = 0; s < HEAD_DIM / 16; ++s) {
+      const uint4 k0 = *reinterpret_cast<const uint4*>(&kt[buf][q_lane][16 * s]);
+      const uint4 k1 = *reinterpret_cast<const uint4*>(&kt[buf][q_lane][16 * s + 8]);
+      const std::uint32_t kf[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+      uint4 q0 = make_uint4(0, 0, 0, 0), q1 = make_uint4(0, 0, 0, 0);
+      if (q_lane < BLOCK) {
+        q0 = *reinterpret_cast<const uint4*>(&qs[hw][q_lane][16 * s]);
+        q1 = *reinterpret_cast<const uint4*>(&qs[hw][q_lane][16 * s + 8]);
+      }
+      const std::uint32_t qf[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+      mma::gfx11_wmma_act(sc_g11, kf, qf);
+    }
+    const unsigned mask = vmask[buf];
+    float xs[8], mt = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int key = 2 * i + (lane >> 4);
+      xs[i] = ((mask >> key) & 1u) ? sc_g11[i] * scale : -INFINITY;
+      mt = fmaxf(mt, xs[i]);
+    }
+    mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, 16));
+    const float m_new = fmaxf(m_run, mt);
+    const float al = m_new == m_run ? 1.f : (m_run == -INFINITY ? 0.f : __expf(m_run - m_new));
+    float ps = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int key = 2 * i + (lane >> 4);
+      const ActT pv = act::from_float(((mask >> key) & 1u) ? __expf(xs[i] - m_new) : 0.f);
+      ps += act::to_float(pv);
+      if (q_lane < BLOCK) pt[w][q_lane][key] = pv;
+    }
+    ps += __shfl_xor_sync(0xffffffffu, ps, 16);
+    l_run = l_run * al + ps;
+    m_run = m_new;
+    __syncwarp();
+
+    // O^T = O^T * al + V^T P^T via 8 hardware RDNA 3 WMMAs
+    const bool rescale = __any_sync(0xffffffffu, q_lane < BLOCK && al != 1.f);
+    uint4 p0 = make_uint4(0, 0, 0, 0), p1 = make_uint4(0, 0, 0, 0);
+    if (q_lane < BLOCK) {
+      p0 = *reinterpret_cast<const uint4*>(&pt[w][q_lane][0]);
+      p1 = *reinterpret_cast<const uint4*>(&pt[w][q_lane][8]);
+    }
+    const std::uint32_t pf[8] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
+#pragma unroll 2
+    for (int d = 0; d < HEAD_DIM / 16; ++d) {
+      if (rescale) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) oacc_g11[d][i] *= al;
+      }
+      const int dc = 16 * d + q_lane;
+      std::uint32_t vf[8];
+#pragma unroll
+      for (int p_i = 0; p_i < 8; ++p_i) {
+        const unsigned v0 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][2 * p_i][dc]));
+        const unsigned v1 = mma::ld_smem_u16(ingine::gpu::make_smem_addr(&vt[buf][2 * p_i + 1][dc]));
+        vf[p_i] = v0 | (v1 << 16);
+      }
+      mma::gfx11_wmma_act(oacc_g11[d], vf, pf);
+    }
+    return;
+#else
     // scores: keys gl (0, 1) and gl + 8 (2, 3) against queries 2 t, 2 t + 1
     float sc[4] = {0.f, 0.f, 0.f, 0.f};
 #if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
@@ -363,6 +439,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
       mma_bf16(oacc[d], a, pf);
     }
 #endif
+#endif
   };
   for (int t0 = k0; t0 < kend; t0 += 2 * ATT_TILE) {
     tile(ra, t0, 0);
@@ -372,6 +449,20 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
 
   // partial outputs of queries qi = 8 w + 2 t + (0, 1) at dims 16 d + gl and 16 d + 8 + gl
   const size_t base = size_t(chunk) * KV_HEADS + g;
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+  if (q_lane < BLOCK) {
+    const int qi = BLOCK * w + q_lane;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM / 16; ++d) {
+      float* at = ws_o + (base * NQ + qi) * HEAD_DIM + 16 * d;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) at[2 * i + (lane >> 4)] = oacc_g11[d][i];
+    }
+    if (lane < BLOCK) {
+      *reinterpret_cast<float2*>(ws_ml + (base * NQ + qi) * 2) = make_float2(m_run, l_run);
+    }
+  }
+#else
   const int qi = BLOCK * w + 2 * t;
 #pragma unroll
   for (int d = 0; d < HEAD_DIM / 16; ++d) {
@@ -385,6 +476,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const ActT* q
     float* at = ws_ml + (base * NQ + qi) * 2;
     *reinterpret_cast<float4*>(at) = make_float4(m_run[0], l_run[0], m_run[1], l_run[1]);
   }
+#endif
 }
 
 // grid KV_HEADS * NQ, block 128: thread c weighs chunk c, then every thread sums its dim over the chunks

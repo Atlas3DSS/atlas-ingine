@@ -285,9 +285,62 @@ def collect_model_provenance(model_dir: Path | None, hash_packs: bool = False) -
     }
 
 
+def read_drm_gpu_meminfo() -> list[dict[str, Any]]:
+    """Read AMDGPU VRAM/GTT sysfs counters when available (works even without rocm-smi CLI)."""
+    cards: list[dict[str, Any]] = []
+    drm_root = Path("/sys/class/drm")
+    if not drm_root.exists():
+        return cards
+    for card in sorted(drm_root.glob("card[0-9]*")):
+        if "-" in card.name:
+            continue
+        dev = card / "device"
+        fields = ("mem_info_vram_total", "mem_info_vram_used", "mem_info_gtt_total", "mem_info_gtt_used")
+        row: dict[str, Any] = {"card": card.name}
+        found = False
+        for fn in fields:
+            fp = dev / fn
+            if fp.exists():
+                try:
+                    row[fn] = int(fp.read_text(encoding="utf-8", errors="replace").strip())
+                    found = True
+                except (OSError, ValueError):
+                    pass
+        if found:
+            cards.append(row)
+    return cards
+
+
+def build_preflight_memory_warnings(meminfo: dict[str, int], gpu_mem: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    gib = float(1 << 30)
+    avail = meminfo.get("MemAvailable")
+    if isinstance(avail, int) and avail < (40 << 30):
+        warnings.append(
+            f"Low host/unified MemAvailable ({avail / gib:.1f} GiB < 40.0 GiB); "
+            "stop background GPU/LLM services before running full model tests or benchmarks."
+        )
+    for card in gpu_mem:
+        vram_used = card.get("mem_info_vram_used")
+        gtt_used = card.get("mem_info_gtt_used")
+        used_max = max(v for v in (vram_used, gtt_used) if isinstance(v, int)) if any(
+            isinstance(v, int) for v in (vram_used, gtt_used)
+        ) else 0
+        if used_max > (16 << 30):
+            warnings.append(
+                f"{card.get('card', 'gpu')} already has {used_max / gib:.1f} GiB GPU/GTT memory in use; "
+                "model tests may hit hipErrorOutOfMemory under contention."
+            )
+    return warnings
+
+
 def run_preflight(repo_root: Path, model_dir: Path | None, require_gfx1151: bool, hash_packs: bool) -> dict[str, Any]:
+    if model_dir is not None:
+        model_dir = model_dir.expanduser()
     meminfo_path = Path("/proc/meminfo")
     meminfo = parse_meminfo_bytes(meminfo_path.read_text(encoding="utf-8", errors="replace")) if meminfo_path.exists() else {}
+    gpu_mem = read_drm_gpu_meminfo()
+    warnings = build_preflight_memory_warnings(meminfo, gpu_mem)
 
     cpu_model = platform.processor()
     cpuinfo_path = Path("/proc/cpuinfo")
@@ -317,6 +370,8 @@ def run_preflight(repo_root: Path, model_dir: Path | None, require_gfx1151: bool
         "cpu_model": cpu_model,
         "cpu_count": os.cpu_count(),
         "memory_bytes": meminfo,
+        "gpu_memory_sysfs": gpu_mem,
+        "warnings": warnings,
         "rocm": {
             "rocminfo_rc": rocminfo.get("returncode"),
             "gfx_targets": gfx_targets,
@@ -357,6 +412,12 @@ def resolve_preset_build_dir(native_dir: Path, preset: str) -> Path:
     return native_dir / f"build-{preset}"
 
 
+_CUDA_SONAME_RE = re.compile(
+    r"\blib(?:cuda|cudart|cublas|cublaslt|nvrtc|nccl|cufft|cusparse|cusolver|cudnn|nvtx)(?:[._0-9-]*\.so\b|\b)",
+    re.IGNORECASE,
+)
+
+
 def parse_ctest_summary(output: str) -> dict[str, Any]:
     passed = 0
     failed = 0
@@ -364,7 +425,9 @@ def parse_ctest_summary(output: str) -> dict[str, Any]:
     tests: list[dict[str, str]] = []
     for line in output.splitlines():
         m = re.search(
-            r"Test\s+#\d+:\s+(\S+)\s+\.+\s*(\*\*\*Skipped|Passed|\*\*\*Failed|\*\*\*Not Run|\*\*\*Timeout|\*\*\*Exception)",
+            r"Test\s+#\d+:\s+(\S+)\s+\.+\s*"
+            r"(\*\*\*Skipped|Passed|\*\*\*Failed|\*\*\*Not Run|\*\*\*Timeout|\*\*\*Exception(?::\s*[^\s]+)?|"
+            r"Subprocess aborted|Subprocess killed)",
             line,
         )
         if m:
@@ -385,6 +448,11 @@ def parse_ctest_summary(output: str) -> dict[str, Any]:
     }
 
 
+def is_cuda_ldd_line(line: str) -> bool:
+    """Match actual CUDA/NVIDIA shared-library linkage without false-matching ICU (libicudata.so)."""
+    return bool(_CUDA_SONAME_RE.search(line))
+
+
 def check_zero_cuda_linkage(binaries: list[Path]) -> dict[str, Any]:
     checked: list[dict[str, Any]] = []
     clean = True
@@ -396,7 +464,7 @@ def check_zero_cuda_linkage(binaries: list[Path]) -> dict[str, Any]:
             checked.append({"binary": str(b), "status": "ldd_unavailable", "cuda_libs": []})
             continue
         res = run_capture([ldd_bin, str(b)])
-        cuda_hits = [ln.strip() for ln in res.get("stdout", "").splitlines() if "cuda" in ln.lower() or "cublas" in ln.lower()]
+        cuda_hits = [ln.strip() for ln in res.get("stdout", "").splitlines() if is_cuda_ldd_line(ln)]
         if cuda_hits:
             clean = False
         checked.append({"binary": str(b), "returncode": res.get("returncode"), "cuda_libs": cuda_hits})
@@ -410,13 +478,15 @@ def run_build_and_test(
     ctest_regex: str | None,
     model_dir: Path | None,
     extra_cmake_args: list[str],
+    ctest_timeout_s: float = 7200.0,
 ) -> dict[str, Any]:
     native_dir = repo_root / "native"
     build_dir = resolve_preset_build_dir(native_dir, preset)
+    resolved_model_dir = model_dir.expanduser().resolve() if model_dir is not None else None
 
     cfg_cmd = ["cmake", "--preset", preset]
-    if model_dir is not None:
-        cfg_cmd.append(f"-DINGINE_TEST_MODEL_DIR={model_dir}")
+    if resolved_model_dir is not None:
+        cfg_cmd.append(f"-DINGINE_TEST_MODEL_DIR:PATH={resolved_model_dir}")
     cfg_cmd.extend(extra_cmake_args)
 
     t0 = time.monotonic()
@@ -447,10 +517,27 @@ def run_build_and_test(
     if ctest_regex:
         ctest_cmd.extend(["-R", ctest_regex])
     env = os.environ.copy()
-    if model_dir is not None:
-        env["INGINE_MODEL_DIR"] = str(model_dir)
-    proc = subprocess.run(ctest_cmd, cwd=str(native_dir), env=env, capture_output=True, text=True, timeout=1800.0, check=False)
-    ctest_out = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
+    if resolved_model_dir is not None:
+        env["INGINE_MODEL_DIR"] = str(resolved_model_dir)
+    ctest_timed_out = False
+    try:
+        proc = subprocess.run(
+            ctest_cmd,
+            cwd=str(native_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=ctest_timeout_s,
+            check=False,
+        )
+        ctest_rc: int | None = proc.returncode
+        ctest_out = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
+    except subprocess.TimeoutExpired as exc:
+        ctest_timed_out = True
+        ctest_rc = None
+        out_s = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        err_s = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        ctest_out = out_s + ("\n" + err_s if err_s else "") + f"\n[ctest timed out after {ctest_timeout_s}s]\n"
     summary = parse_ctest_summary(ctest_out)
 
     serve_bin = build_dir / "apps" / "serve" / "ingine-serve"
@@ -462,14 +549,15 @@ def run_build_and_test(
         cuda_ok = True
 
     return {
-        "ok": proc.returncode == 0 and cuda_ok,
-        "stage": "complete",
+        "ok": (not ctest_timed_out) and ctest_rc == 0 and cuda_ok,
+        "stage": "ctest_timeout" if ctest_timed_out else "complete",
         "preset": preset,
         "build_dir": str(build_dir),
         "serve_bin": str(serve_bin) if serve_bin.exists() else None,
         "pack_bin": str(pack_bin) if pack_bin.exists() else None,
         "elapsed_s": round(time.monotonic() - t0, 3),
-        "ctest_returncode": proc.returncode,
+        "ctest_timeout_s": ctest_timeout_s,
+        "ctest_returncode": ctest_rc,
         "ctest_summary": summary,
         "ctest_tail": ctest_out[-4000:],
         "zero_cuda_audit": cuda_audit,
@@ -958,6 +1046,29 @@ def find_free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _has_cli_flag(args: list[str], flag: str) -> bool:
+    prefix = flag + "="
+    return any(a == flag or a.startswith(prefix) for a in args)
+
+
+def resolve_serve_args_with_max_ctx(
+    extra_args: list[str],
+    target_lengths: list[int],
+    fake_smoke: bool,
+) -> list[str]:
+    """Ensure managed ingine-serve starts with --max-ctx covering all requested prompt lengths + margin."""
+    out = list(extra_args)
+    if fake_smoke or _has_cli_flag(out, "--max-ctx"):
+        return out
+    max_len = max((int(x) for x in target_lengths if x and int(x) > 0), default=0)
+    # Prompts are generated with ~1.02x word margin plus system/turn-2 overhead and completion tokens.
+    needed = int(max_len * 1.06) + 4096
+    if needed > 65536:
+        rounded = ((needed + 4095) // 4096) * 4096
+        out.extend(["--max-ctx", str(rounded)])
+    return out
+
+
 def launch_serve_process(
     serve_bin: Path,
     model_dir: Path,
@@ -968,7 +1079,7 @@ def launch_serve_process(
     cmd = [
         str(serve_bin),
         "--model-dir",
-        str(model_dir),
+        str(model_dir.expanduser().resolve()),
         "--host",
         "127.0.0.1",
         "--port",
@@ -1250,7 +1361,10 @@ def run_benchmark_suite(
             raise ValueError("Provide either --base-url or both --serve-bin and --model-dir")
         port = find_free_port()
         active_url = f"http://127.0.0.1:{port}"
-        managed_proc = launch_serve_process(serve_bin, model_dir, port, fake_smoke, extra_serve_args)
+        main_serve_args = resolve_serve_args_with_max_ctx(
+            extra_serve_args, [*prefill_lengths, *agent_lengths], fake_smoke
+        )
+        managed_proc = launch_serve_process(serve_bin, model_dir, port, fake_smoke, main_serve_args)
         startup_ready_s = wait_for_health(active_url, managed_proc, startup_timeout_s)
     else:
         wait_for_health(active_url, None, min(startup_timeout_s, 30.0))
@@ -1348,8 +1462,9 @@ def run_benchmark_suite(
             {"role": "system", "content": "You are a concise assistant."},
             {"role": "user", "content": cold_text + "\nSummarize in one sentence."},
         ]
+        cold_serve_args = resolve_serve_args_with_max_ctx(extra_serve_args, [cold_tokens], fake_smoke)
         cold_t0 = time.monotonic()
-        cold_proc = launch_serve_process(serve_bin, model_dir, cold_port, fake_smoke, extra_serve_args)
+        cold_proc = launch_serve_process(serve_bin, model_dir, cold_port, fake_smoke, cold_serve_args)
         try:
             cold_ready_s = wait_for_health(cold_url, cold_proc, startup_timeout_s)
             cold_runtime_info = detect_server_runtime_info(cold_url, model_id_override)
@@ -1741,6 +1856,7 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--preset", default="hip-strix-dev")
     bt.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4)))
     bt.add_argument("--ctest-regex", default=None)
+    bt.add_argument("--ctest-timeout", type=float, default=7200.0)
     bt.add_argument("--model-dir", type=Path, default=None)
     bt.add_argument("--extra-cmake-args", default="")
     bt.add_argument("--out", type=Path, default=None)
@@ -1775,6 +1891,7 @@ def build_parser() -> argparse.ArgumentParser:
     al.add_argument("--preset", default="hip-strix-dev")
     al.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4)))
     al.add_argument("--ctest-regex", default=None)
+    al.add_argument("--ctest-timeout", type=float, default=7200.0)
     al.add_argument("--extra-cmake-args", default="")
     al.add_argument("--model-dir", type=Path, required=True)
     al.add_argument("--model-id", default=None)
@@ -1820,8 +1937,10 @@ def main(argv: list[str] | None = None) -> int:
             args.ctest_regex,
             args.model_dir,
             shlex.split(args.extra_cmake_args),
+            ctest_timeout_s=args.ctest_timeout,
         )
         write_json(args.out, res)
+        sys.stdout.flush()
         return 0 if res["ok"] else 2
 
     if args.command == "bench":
@@ -1885,10 +2004,12 @@ def main(argv: list[str] | None = None) -> int:
             args.ctest_regex,
             args.model_dir,
             shlex.split(args.extra_cmake_args),
+            ctest_timeout_s=args.ctest_timeout,
         )
         report["build_test"] = bt
+        write_json(args.out_dir / "strix_halo_report.json", report)
+        sys.stdout.flush()
         if not bt["ok"] or not bt.get("serve_bin"):
-            write_json(args.out_dir / "strix_halo_report.json", report)
             return 2
 
         bench = run_benchmark_suite(

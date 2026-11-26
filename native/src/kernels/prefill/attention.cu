@@ -231,6 +231,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     }
     cp_commit();
   }
+#if !(defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA))
   // per-thread rows: lane / 4 and lane / 4 + 8 of the warp's 16
   int qpos[2];
   const uint16_t* relp[2];
@@ -241,6 +242,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     qpos[r] = p.pos0 + t;
     relp[r] = reinterpret_cast<const uint16_t*>(p.rel) + (size_t(t) * kHeads + h) * kRelExtent;
   }
+#endif
   const int qmin = p.pos0 + R0 / GQA;
   const int qmax = p.pos0 + min(R0 + BR - 1, rows - 1) / GQA;
 
@@ -270,6 +272,229 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   cp_wait<0>();
   __syncthreads();
   if constexpr (EXPLICIT) ntiles = s.nlist;
+
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+  // Native AMD RDNA 3 / 3.5 (gfx11) Wave32 16x16x16 WMMA flash attention:
+  //   Q [16x128] in qf_g11[8][8] (direct swizzled uint4 loads, replicated across wave halves)
+  //   S = Q K^T via 4x8 hardware v_wmma_f32_16x16x16_{bf16,f16}, 16-lane XOR softmax,
+  //   P staged swizzled into dead s.k[buf] (exact 16 KiB fit), O += P V via 4x8 hardware WMMA.
+  static_assert(BK * D == NWARPS * 16 * BK, "P staging fits s.k[buf]");
+  std::uint32_t qf_g11[DCH / 2][8];
+  const int row_q = warp * 16 + (lane & 15);
+#pragma unroll
+  for (int kk = 0; kk < DCH / 2; ++kk) {
+    const uint4 q0 = *reinterpret_cast<const uint4*>(&s.k[0][0] + swz<DCH>(row_q, kk * 2));
+    const uint4 q1 = *reinterpret_cast<const uint4*>(&s.k[0][0] + swz<DCH>(row_q, kk * 2 + 1));
+    qf_g11[kk][0] = q0.x; qf_g11[kk][1] = q0.y; qf_g11[kk][2] = q0.z; qf_g11[kk][3] = q0.w;
+    qf_g11[kk][4] = q1.x; qf_g11[kk][5] = q1.y; qf_g11[kk][6] = q1.z; qf_g11[kk][7] = q1.w;
+  }
+  __syncthreads();
+
+  auto tile_at_g11 = [&](int i) { return EXPLICIT ? s.list[i] : first + i; };
+  mma::Gfx11Acc8 o_g11[D / 16];
+#pragma unroll
+  for (int dt = 0; dt < D / 16; ++dt) o_g11[dt] = mma::gfx11_acc_zero();
+  float m_g11[8], l_g11[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    m_g11[i] = -INFINITY;
+    l_g11[i] = 0.f;
+  }
+  if (p.partial_o && !p.partial_init) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int R = R0 + warp * 16 + 2 * i + (lane >> 4);
+      if (R >= rows) continue;
+      const int t = R / GQA, h = g * GQA + R % GQA;
+      const size_t rh = size_t(t) * kHeads + h;
+      m_g11[i] = p.partial_m[rh];
+      l_g11[i] = (lane & 15) == 0 ? p.partial_l[rh] : 0.f;
+#pragma unroll
+      for (int dt = 0; dt < D / 16; ++dt) o_g11[dt][i] = p.partial_o[rh * D + dt * 16 + (lane & 15)];
+    }
+  }
+
+  KvRegs<KV_FMT> regs_g11;
+  if (ntiles > 0) {
+    load_tile<KV_FMT, EXPLICIT>(p, g, tile_at_g11(0) * BK, regs_g11);
+    store_tile<KV_FMT, EXPLICIT>(s, 0, regs_g11);
+  }
+  __syncthreads();
+
+#pragma unroll 1
+  for (int i = 0; i < ntiles; ++i) {
+    const int kt = tile_at_g11(i), buf = STAGES == 2 ? (i & 1) : 0;
+    if (i + 1 < ntiles) load_tile<KV_FMT, EXPLICIT>(p, g, tile_at_g11(i + 1) * BK, regs_g11);
+
+    int kmin, kmax;
+    bool allv;
+    if constexpr (EXPLICIT) {
+      const int4 b = s.bounds[kt];
+      kmin = b.x, kmax = b.y, allv = b.z != 0;
+    } else {
+      kmin = p.k_pos_base + kt * BK;
+      kmax = p.k_pos_base + min(kt * BK + BK - 1, p.L - 1);
+      allv = kt * BK + BK <= p.L;
+    }
+    const int dmin = qmin - kmax, dmax = qmax - kmin;
+    const bool need_mask = !(allv && dmin >= 0 && (p.window == 0 || dmax < p.window));
+    const bool need_bias = dmin < kRelExtent;
+
+    // ---- S = Q K^T
+    mma::Gfx11Acc8 sc_g11[BK / 16];
+#pragma unroll
+    for (int nt = 0; nt < BK / 16; ++nt) sc_g11[nt] = mma::gfx11_acc_zero();
+    const uint16_t* Ks = s.k[buf];
+#pragma unroll 2
+    for (int kk = 0; kk < DCH / 2; ++kk) {
+#pragma unroll
+      for (int nt = 0; nt < BK / 16; ++nt) {
+        const int k_row = nt * 16 + (lane & 15);
+        const uint4 k0 = *reinterpret_cast<const uint4*>(Ks + swz<DCH>(k_row, kk * 2));
+        const uint4 k1 = *reinterpret_cast<const uint4*>(Ks + swz<DCH>(k_row, kk * 2 + 1));
+        const std::uint32_t kf[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+        mma::gfx11_wmma_act(sc_g11[nt], qf_g11[kk], kf);
+      }
+    }
+    if constexpr (STAGES == 2) {
+      if (i + 1 < ntiles) store_tile<KV_FMT, EXPLICIT>(s, buf ^ 1, regs_g11);
+    }
+    // Wait until all warps finish reading s.k[buf] before reusing s.k[buf] to stage P.
+    __syncthreads();
+
+    uint16_t* pw = s.k[buf] + warp * (16 * BK);
+#pragma unroll 1
+    for (int r_i = 0; r_i < 8; ++r_i) {
+      const int r_local = 2 * r_i + (lane >> 4);
+      int qpos_i = 0;
+      const uint16_t* relp_i = nullptr;
+      if (need_mask || need_bias) {
+        const int R = min(R0 + warp * 16 + r_local, rows - 1);
+        const int t_row = R / GQA, h_row = g * GQA + R % GQA;
+        qpos_i = p.pos0 + t_row;
+        relp_i = reinterpret_cast<const uint16_t*>(p.rel) + (size_t(t_row) * kHeads + h_row) * kRelExtent;
+      }
+      float rmax = m_g11[r_i];
+#pragma unroll
+      for (int nt = 0; nt < BK / 16; ++nt) {
+        const int jl = nt * 16 + (lane & 15);
+        float x = sc_g11[nt][r_i] * kScale;
+        if (need_mask || need_bias) {
+          const int j_local = kt * BK + jl;
+          const int kp = EXPLICIT ? s.kpos[buf][jl] : (p.k_pos_base + j_local);
+          const int d = qpos_i - kp;
+          const bool ok = kp >= 0 && d >= 0 && (p.window == 0 || d < p.window) && (EXPLICIT || j_local < p.L);
+          if (need_bias && ok && d < kRelExtent) x += bf2f(__ldg(relp_i + d));
+          x = ok ? x * kLog2e : -INFINITY;
+        } else {
+          x *= kLog2e;
+        }
+        sc_g11[nt][r_i] = x;
+        rmax = fmaxf(rmax, x);
+      }
+      rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 1));
+      rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 2));
+      rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 4));
+      rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 8));
+      const float mref = rmax == -INFINITY ? 0.f : rmax;
+      const float alpha = exp2f(m_g11[r_i] - mref);
+      m_g11[r_i] = rmax;
+      l_g11[r_i] *= alpha;
+#pragma unroll
+      for (int dt = 0; dt < D / 16; ++dt) o_g11[dt][r_i] *= alpha;
+#pragma unroll
+      for (int nt = 0; nt < BK / 16; ++nt) {
+        const float pv = exp2f(sc_g11[nt][r_i] - mref);
+        l_g11[r_i] += pv;
+        const int ch = ((nt * 2 + ((lane & 15) >> 3)) ^ (r_local & 7));
+        pw[r_local * BK + (ch << 3) + (lane & 7)] = __half_as_ushort(__float2half_rn(pv * kPScale));
+      }
+    }
+    __syncwarp();
+
+    // ---- O += P V
+    const uint16_t* Vs = s.v[buf];
+    const int p_row = lane & 15;
+#pragma unroll 1
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      const int ch0 = (kk * 2) ^ (p_row & 7);
+      const int ch1 = (kk * 2 + 1) ^ (p_row & 7);
+      const uint4 p0 = *reinterpret_cast<const uint4*>(pw + p_row * BK + (ch0 << 3));
+      const uint4 p1 = *reinterpret_cast<const uint4*>(pw + p_row * BK + (ch1 << 3));
+      const std::uint32_t pf[8] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
+#pragma unroll
+      for (int dt = 0; dt < D / 16; ++dt) {
+        const int d_col = dt * 16 + (lane & 15);
+        const int d_ch = d_col >> 3, d_in = d_col & 7;
+        std::uint32_t vf[8];
+#pragma unroll
+        for (int p_i = 0; p_i < 8; ++p_i) {
+          const int r0 = kk * 16 + 2 * p_i;
+          const unsigned v0 = Vs[swz<DCH>(r0, d_ch) + d_in];
+          const unsigned v1 = Vs[swz<DCH>(r0 + 1, d_ch) + d_in];
+          vf[p_i] = v0 | (v1 << 16);
+        }
+        mma::gfx11_wmma_f16(o_g11[dt], pf, vf);
+      }
+    }
+
+    __syncthreads();
+    if constexpr (STAGES == 1) {
+      if (i + 1 < ntiles) {
+        store_tile<KV_FMT, EXPLICIT>(s, 0, regs_g11);
+        __syncthreads();
+      }
+    }
+  }
+
+  // ---- epilogue (or save online-softmax partials for next paged KV batch)
+  if (p.partial_o && !p.partial_final) {
+#pragma unroll
+    for (int r_i = 0; r_i < 8; ++r_i) {
+      float lr = l_g11[r_i];
+      lr += __shfl_xor_sync(0xffffffffu, lr, 1);
+      lr += __shfl_xor_sync(0xffffffffu, lr, 2);
+      lr += __shfl_xor_sync(0xffffffffu, lr, 4);
+      lr += __shfl_xor_sync(0xffffffffu, lr, 8);
+      const int R = R0 + warp * 16 + 2 * r_i + (lane >> 4);
+      if (R >= rows) continue;
+      const int t = R / GQA, h = g * GQA + R % GQA;
+      const size_t rh = size_t(t) * kHeads + h;
+      if ((lane & 15) == 0) {
+        p.partial_m[rh] = m_g11[r_i];
+        p.partial_l[rh] = lr;
+      }
+#pragma unroll
+      for (int dt = 0; dt < D / 16; ++dt) p.partial_o[rh * D + dt * 16 + (lane & 15)] = o_g11[dt][r_i];
+    }
+    return;
+  }
+  const uint16_t* proj_g11 = reinterpret_cast<const uint16_t*>(p.proj);
+#pragma unroll
+  for (int r_i = 0; r_i < 8; ++r_i) {
+    float lr = l_g11[r_i];
+    lr += __shfl_xor_sync(0xffffffffu, lr, 1);
+    lr += __shfl_xor_sync(0xffffffffu, lr, 2);
+    lr += __shfl_xor_sync(0xffffffffu, lr, 4);
+    lr += __shfl_xor_sync(0xffffffffu, lr, 8);
+    const int R = R0 + warp * 16 + 2 * r_i + (lane >> 4);
+    if (R >= rows) continue;
+    const int t = R / GQA, h = g * GQA + R % GQA;
+    const uint16_t* prow = proj_g11 + size_t(t) * p.ld;
+    const float lse = (m_g11[r_i] + log2f(lr)) * kLn2;
+    const float factor = 1.f / (1.f + expf(-(lse - bf2f(prow[SINK_COL + h]))));
+    uint16_t* out = reinterpret_cast<uint16_t*>(p.out) + (size_t(t) * kHeads + h) * D;
+#pragma unroll
+    for (int dt = 0; dt < D / 16; ++dt) {
+      const int col = dt * 16 + (lane & 15);
+      const float g_val = bf2f(prow[GATE_COL + h * D + col]);
+      const float a_val = round_bf16(o_g11[dt][r_i] * kPUnscale / lr * factor);
+      const float s_val = 1.f / (1.f + expf(-g_val));
+      out[col] = f2bf_bits(a_val * s_val);
+    }
+  }
+  return;
+#else
 
   unsigned qf[DCH / 2][4];
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
@@ -627,6 +852,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
       *reinterpret_cast<uint32_t*>(out + col) = pack_bf16x2(a0 * s0, a1 * s1);
     }
   }
+#endif
 }
 
 template <int KV_FMT, bool EXPLICIT>

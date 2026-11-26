@@ -421,9 +421,9 @@ __device__ __forceinline__ void decode(const Chunk<3>& ch, float factor, uint32_
     }
 }
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA))
-// Direct float2 decoders for Pascal sm_60/sm_61: avoid 1/64-rate sm_61 __hmul2 and clamp_fp16_finite,
-// while matching model.decode_experts' ActT rounding exactly for NVFP4/ATLAS2/ATLAS3.
+#if defined(__HIP_DEVICE_COMPILE__) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || defined(INGINE_FORCE_SIMT_MMA)))
+// Direct float2 decoders for Pascal sm_60/sm_61 and HIP M=1 sparse-token decode: avoid wasted 8-column
+// expansion when only 1 token is active while matching model.decode_experts' ActT rounding exactly.
 __device__ __forceinline__ float2 round_act_f2(float a, float b) {
 #if INGINE_ACT_FP16
     return __half22float2(__floats2half2_rn(a, b));
@@ -655,6 +655,41 @@ __device__ __forceinline__ void mma_frag(const Frag<FMT>& f, float (&d)[4], uint
     for (int i = 0; i < 8; ++i)
         mma::sm70_mma_f16_acc(acc8, a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1], f.x[2 * i], f.x[2 * i + 1]);
     mma::sm70_reduce_acc8_to_d4(acc8, d);
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+    if (M == 1) {
+        // Single-token decode: only token 0 is active (avoid 8-column MMA expansion and shuffles).
+        float2 fa[16], fb[16];
+        decode_f2(f.r0, f.factor, fa);
+        decode_f2(f.r1, f.factor, fb);
+        const int t = threadIdx.x & 3;
+        float pa = 0.f, pb = 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const float2 fx = act::unpack2(__shfl_sync(0xffffffffu, f.x[i], t));
+            pa = fmaf(fa[i].x, fx.x, fmaf(fa[i].y, fx.y, pa));
+            pb = fmaf(fb[i].x, fx.x, fmaf(fb[i].y, fx.y, pb));
+        }
+        pa += __shfl_xor_sync(0xffffffffu, pa, 1);
+        pa += __shfl_xor_sync(0xffffffffu, pa, 2);
+        pb += __shfl_xor_sync(0xffffffffu, pb, 1);
+        pb += __shfl_xor_sync(0xffffffffu, pb, 2);
+        if (t == 0) {
+            d[0] += pa;
+            d[2] += pb;
+        }
+    } else {
+        // Multi-token verify: hoist RDNA 3 WMMA accumulator across all 8 steps -> 1 reduction instead of 8.
+        uint32_t a[16], b[16];
+        decode(f.r0, f.factor, a);
+        decode(f.r1, f.factor, b);
+        (void)mask;
+        mma::Gfx11Acc8 acc8 = mma::gfx11_acc_zero();
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            mma::gfx11_wmma_m16n8k16_acc<!kActIsFP16>(acc8, a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
+                                                      f.x[2 * i], f.x[2 * i + 1]);
+        mma::gfx11_reduce_acc8_to_d4(acc8, d);
+    }
 #else
     uint32_t a[16], b[16];
     decode(f.r0, f.factor, a);
@@ -1025,7 +1060,11 @@ moe_up_exl3_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, cons
     const uint8_t* w_e = w_ptrs ? w_ptrs[e] : (w + size_t(e) * NT * KT * TILE_BYTES);
     const __half* rout_e = rout_ptrs ? reinterpret_cast<const __half*>(rout_ptrs[e]) : (rout + size_t(e) * (2 * I));
     auto run_side = [&](int side, int nt0, float (&acc)[8][4]) {
+#if defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
         for (int nt_l = 0; nt_l < 8; ++nt_l) {
             float d[4] = {0.f, 0.f, 0.f, 0.f};
             const uint8_t* w_row = w_e + (size_t(nt0 + nt_l) * KT + warp * 8) * TILE_BYTES;
@@ -1092,6 +1131,38 @@ moe_up_exl3_kernel(const ActT* __restrict__ x, const int* __restrict__ idx, cons
                 mma::sm70_mma_f16_acc(acc8, h01, h45, h23, h67, xb0[kt_l], xb1[kt_l]);
             }
             mma::sm70_reduce_acc8_to_d4(acc8, d);
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+            if constexpr (M1) {
+                float pa = 0.f, pb = 0.f;
+#pragma unroll 1
+                for (int kt_l = 0; kt_l < 8; ++kt_l) {
+                    const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_row + kt_l * TILE_BYTES);
+                    float2 f01, f23, f45, f67;
+                    exl3::dq8_mcg_f2<BITS>([&](int wi) { return ld_stream_u1(tw + wi, wpol); }, lane, f01, f23, f45, f67);
+                    const uint32_t ux0 = __shfl_sync(0xffffffffu, xb0[kt_l], ti);
+                    const uint32_t ux1 = __shfl_sync(0xffffffffu, xb1[kt_l], ti);
+                    const float2 fx0 = __half22float2(*reinterpret_cast<const __half2*>(&ux0));
+                    const float2 fx1 = __half22float2(*reinterpret_cast<const __half2*>(&ux1));
+                    pa = fmaf(f01.x, fx0.x, fmaf(f01.y, fx0.y, fmaf(f23.x, fx1.x, fmaf(f23.y, fx1.y, pa))));
+                    pb = fmaf(f45.x, fx0.x, fmaf(f45.y, fx0.y, fmaf(f67.x, fx1.x, fmaf(f67.y, fx1.y, pb))));
+                }
+                pa += __shfl_xor_sync(0xffffffffu, pa, 1);
+                pa += __shfl_xor_sync(0xffffffffu, pa, 2);
+                pb += __shfl_xor_sync(0xffffffffu, pb, 1);
+                pb += __shfl_xor_sync(0xffffffffu, pb, 2);
+                d[0] = pa;
+                d[2] = pb;
+            } else {
+                mma::Gfx11Acc8 acc8 = mma::gfx11_acc_zero();
+#pragma unroll 1
+                for (int kt_l = 0; kt_l < 8; ++kt_l) {
+                    const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_row + kt_l * TILE_BYTES);
+                    uint32_t h01, h23, h45, h67;
+                    exl3::dq8_mcg<BITS>([&](int wi) { return ld_stream_u1(tw + wi, wpol); }, lane, h01, h23, h45, h67);
+                    mma::gfx11_wmma_m16n8k16_acc<false>(acc8, h01, h45, h23, h67, xb0[kt_l], xb1[kt_l]);
+                }
+                mma::gfx11_reduce_acc8_to_d4(acc8, d);
+            }
 #else
 #pragma unroll
             for (int kt_l = 0; kt_l < 8; ++kt_l) {
@@ -1292,7 +1363,11 @@ moe_down_exl3_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, 
     const uint8_t* w_e = w_ptrs ? w_ptrs[e] : (w + size_t(e) * NT * KT * TILE_BYTES);
     const __half* rout_e = rout_ptrs ? reinterpret_cast<const __half*>(rout_ptrs[e]) : (rout + size_t(e) * H);
     const int nt0 = blk * 8;
+#if defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
     for (int nt_l = 0; nt_l < 8; ++nt_l) {
         float d[4] = {0.f, 0.f, 0.f, 0.f};
         const uint8_t* w_row = w_e + (size_t(nt0 + nt_l) * KT + warp * 8) * TILE_BYTES;
@@ -1357,6 +1432,38 @@ moe_down_exl3_kernel(const ActT* __restrict__ act, const int* __restrict__ idx, 
             mma::sm70_mma_f16_acc(acc8, h01, h45, h23, h67, xb0[kt_l], xb1[kt_l]);
         }
         mma::sm70_reduce_acc8_to_d4(acc8, d);
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__) && !defined(INGINE_FORCE_SIMT_MMA)
+        if constexpr (M1) {
+            float pa = 0.f, pb = 0.f;
+#pragma unroll 1
+            for (int kt_l = 0; kt_l < 8; ++kt_l) {
+                const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_row + kt_l * TILE_BYTES);
+                float2 f01, f23, f45, f67;
+                exl3::dq8_mcg_f2<BITS>([&](int wi) { return ld_stream_u1(tw + wi, wpol); }, lane, f01, f23, f45, f67);
+                const uint32_t ux0 = __shfl_sync(0xffffffffu, xb0[kt_l], ti);
+                const uint32_t ux1 = __shfl_sync(0xffffffffu, xb1[kt_l], ti);
+                const float2 fx0 = __half22float2(*reinterpret_cast<const __half2*>(&ux0));
+                const float2 fx1 = __half22float2(*reinterpret_cast<const __half2*>(&ux1));
+                pa = fmaf(f01.x, fx0.x, fmaf(f01.y, fx0.y, fmaf(f23.x, fx1.x, fmaf(f23.y, fx1.y, pa))));
+                pb = fmaf(f45.x, fx0.x, fmaf(f45.y, fx0.y, fmaf(f67.x, fx1.x, fmaf(f67.y, fx1.y, pb))));
+            }
+            pa += __shfl_xor_sync(0xffffffffu, pa, 1);
+            pa += __shfl_xor_sync(0xffffffffu, pa, 2);
+            pb += __shfl_xor_sync(0xffffffffu, pb, 1);
+            pb += __shfl_xor_sync(0xffffffffu, pb, 2);
+            d[0] = pa;
+            d[2] = pb;
+        } else {
+            mma::Gfx11Acc8 acc8 = mma::gfx11_acc_zero();
+#pragma unroll 1
+            for (int kt_l = 0; kt_l < 8; ++kt_l) {
+                const uint32_t* tw = reinterpret_cast<const uint32_t*>(w_row + kt_l * TILE_BYTES);
+                uint32_t h01, h23, h45, h67;
+                exl3::dq8_mcg<BITS>([&](int wi) { return ld_stream_u1(tw + wi, wpol); }, lane, h01, h23, h45, h67);
+                mma::gfx11_wmma_m16n8k16_acc<false>(acc8, h01, h45, h23, h67, xb0[kt_l], xb1[kt_l]);
+            }
+            mma::gfx11_reduce_acc8_to_d4(acc8, d);
+        }
 #else
 #pragma unroll
         for (int kt_l = 0; kt_l < 8; ++kt_l) {
