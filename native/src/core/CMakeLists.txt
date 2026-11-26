@@ -5,6 +5,7 @@ if(INGINE_BACKEND STREQUAL "CUDA")
     decode_graph.cpp
     device.cu
     dtype.cpp
+    gguf.cpp
     hal_cuda.cpp
     host_memory.cpp
     paged_tier.cpp
@@ -30,6 +31,7 @@ if(INGINE_BACKEND STREQUAL "CUDA")
 else()
   add_library(ingine_core STATIC
     dtype.cpp
+    gguf.cpp
     hal_cpu.cpp
     safetensors_io.cpp
     safetensors_upload_cpu.cpp

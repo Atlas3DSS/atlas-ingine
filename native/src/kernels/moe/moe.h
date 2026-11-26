@@ -14,7 +14,7 @@
 
 namespace ingine::kernels::moe {
 
-enum class Format : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5 };
+enum class Format : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5 , GGUF_Q5L = 6, GGUF_IQ4 = 7 };
 
 // Optional per-expert device pointer table ([128] base pointers for one layer) for tiered expert offloading.
 // When null, kernels index contiguous [128, ...] weight arrays as before.

@@ -14,6 +14,7 @@
 #include "kernels/dense/dense.h"
 #include "model/kv_checkpoint.h"
 #include "model/model_kernels.h"
+#include "model/weights_gguf.h"
 
 #include <nlohmann/json.hpp>
 
@@ -497,6 +498,11 @@ Layer load_layer_into(Loader& ld, int l, LayerExpertFormats ef, bool dense_fp8, 
 
 Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream,
                      const OffloadConfig& offload) {
+  if (is_gguf_model(model_dir)) {  // llama.cpp GGUF file (weights_gguf.cpp): no offload, dense in the activation type
+    if (dense_fp8) throw std::invalid_argument("--dense-fp8 would re-quantize the GGUF dense weights; drop it");
+    (void) offload;
+    return load_weights_gguf(model_dir, stream, 0, 1);
+  }
   const auto cfg_sha = sha256_file_or_zero(model_dir / "config.json");
   std::array<std::uint8_t, 32> quant_sha{};
   const auto efs = expert_formats(model_dir, &quant_sha);
@@ -882,6 +888,10 @@ Weights load_weights_sharded(const fs::path& model_dir, bool dense_fp8, cudaStre
   if (tp_size == 1) return load_weights(model_dir, dense_fp8, stream);
   if (tp_size != TP_SIZE || tp_rank < 0 || tp_rank >= tp_size)
     throw std::invalid_argument("load_weights_sharded: invalid tp_rank/tp_size");
+  if (is_gguf_model(model_dir)) {
+    if (dense_fp8) throw std::invalid_argument("--dense-fp8 would re-quantize the GGUF dense weights; drop it");
+    return load_weights_gguf(model_dir, stream, tp_rank, tp_size, keep_full_unembed);
+  }
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;

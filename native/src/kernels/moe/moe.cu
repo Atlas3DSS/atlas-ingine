@@ -1480,6 +1480,7 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
 void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w13_scale,
             const float* w13_factor, Format fmt, ActT* out, bool pdl, cudaStream_t stream,
             const void* w13_rout, const ExpertPtrs* ptrs) {
+    require(static_cast<int>(fmt) <= 5, "moe decode kernels: GGUF expert formats run only on the batched (wgemm) path");
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     const uint8_t* const* wp = ptrs ? ptrs->w13 : nullptr;
     const uint8_t* const* wsp = ptrs ? ptrs->w13_scale : nullptr;
@@ -1515,6 +1516,7 @@ void moe_down(const ActT* act, int M, const int* idx, const float* wts, const vo
               const void* w2_scale, const float* w2_factor, Format fmt, const float* conv_w, float* conv_state,
               float* out, float* conv_hist, bool pdl, cudaStream_t stream,
               const void* w2_rout, ActT* workspace, const ExpertPtrs* ptrs) {
+    require(static_cast<int>(fmt) <= 5, "moe decode kernels: GGUF expert formats run only on the batched (wgemm) path");
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     const uint8_t* const* wp = ptrs ? ptrs->w2 : nullptr;
     const uint8_t* const* wsp = ptrs ? ptrs->w2_scale : nullptr;

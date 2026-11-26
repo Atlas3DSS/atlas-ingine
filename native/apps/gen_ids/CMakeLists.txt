@@ -1,0 +1,5 @@
+if(TARGET ingine_model)
+  add_executable(ingine-gen-ids main.cpp)
+  ingine_internal_includes(ingine-gen-ids)
+  target_link_libraries(ingine-gen-ids PRIVATE ingine_model nlohmann_json::nlohmann_json)
+endif()
