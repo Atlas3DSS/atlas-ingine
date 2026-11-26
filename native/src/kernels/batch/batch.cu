@@ -32,6 +32,7 @@ constexpr int R_SLIDING = OFF_KDYN, R_FULL = OFF_VDYN + HKV * 4;
 constexpr int NT = 256;
 constexpr int KW = 8;  // 8 warps per block
 constexpr int U = 2;   // key pairs per warp per register buffer
+constexpr int kSingleSplitMaxKeys = 1024;  // B/W-invariant single-split threshold (covers all sliding & <=1024 full KV)
 constexpr int PSTR = D + 4;
 constexpr float CLIP_QK = 22.627416997969522f, CLIP_REL = 8.f;
 constexpr float LOG2E = 1.4426950408889634f;
@@ -415,11 +416,14 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
   // ---- K/V streaming over cached keys
   // Sliding ring entries are written sequentially at p & (WIN - 1) from a -1-initialized ring,
   // so for p0 < WIN all valid entries live in [0, p0) and scanning [p0, WIN) wastes KV bandwidth.
+  // For old_end <= kSingleSplitMaxKeys, owner (rank 0) runs the full single-split reduction order so
+  // B-varying split counts (16/8/4/3/2/1) produce 0-ULP bit-identical attention outputs across all B.
   const int old_end = FULL ? p0 : (p0 < WIN ? p0 : WIN);
+  const bool single_split = (old_end <= kSingleSplitMaxKeys);
   constexpr int STEP = KW * 2 * U;
   constexpr int TILE = 2 * STEP;
-  const int stride = p.splits * TILE;
-  const int c0 = rank * TILE;
+  const int stride = single_split ? TILE : (p.splits * TILE);
+  const int c0 = single_split ? 0 : (rank * TILE);
   const std::uint64_t kvpol = l2::policy<KV_L2>();
 
   auto kv_offset = [&](int j) -> std::size_t {
@@ -528,8 +532,9 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
   };
 
   KeyBuf<KV> A, B;
-  if (c0 < old_end) load_buf(A, c0);
-  if (c0 + STEP < old_end) load_buf(B, c0 + STEP);
+  const bool run_keys = owner || !single_split;
+  if (run_keys && c0 < old_end) load_buf(A, c0);
+  if (run_keys && c0 + STEP < old_end) load_buf(B, c0 + STEP);
 
   if (owner) {
     KeyBuf<uint4> N;
@@ -547,12 +552,14 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
     compute(N, true);
   }
 
-  for (int base = c0; base < old_end; base += stride) {
-    compute(A, false);
-    if (base + stride < old_end) load_buf(A, base + stride);
-    if (base + STEP < old_end) {
-      compute(B, false);
-      if (base + stride + STEP < old_end) load_buf(B, base + stride + STEP);
+  if (run_keys) {
+    for (int base = c0; base < old_end; base += stride) {
+      compute(A, false);
+      if (base + stride < old_end) load_buf(A, base + stride);
+      if (base + STEP < old_end) {
+        compute(B, false);
+        if (base + stride + STEP < old_end) load_buf(B, base + stride + STEP);
+      }
     }
   }
 
@@ -615,21 +622,26 @@ __global__ void __launch_bounds__(NT, 2) batched_attn_kernel(const BatchedAttnKe
       for (int idx = tid; idx < 3 * 2 * D; idx += NT) dst_nst[idx] = sm.nst[idx];
     }
   } else {
-    // ---- Non-split single-launch finish: fold sink + sigmoid(gate), write out, commit KV & conv state!
+    // ---- Non-split single-launch finish: match split-reduce 2-step warp->sink merge for 0-ULP invariance!
     for (int idx = tid; idx < GQA * D; idx += NT) {
       const int row = idx / D, dim = idx % D;
-      const float sink = sm.sink[row] * LOG2E;
-      float mx = sink;
+      float mx0 = NEG_INIT;
 #pragma unroll
-      for (int k = 0; k < KW; ++k) mx = fmaxf(mx, sm.u.red.ml[(k * GQA + row) * 2]);
-      float l = exp2f(sink - mx), a = 0.f;
+      for (int k = 0; k < KW; ++k) mx0 = fmaxf(mx0, sm.u.red.ml[(k * GQA + row) * 2]);
+      float l0 = 0.f, a0 = 0.f;
 #pragma unroll
       for (int k = 0; k < KW; ++k) {
         const int w = k * GQA + row;
-        const float f = exp2f(sm.u.red.ml[w * 2] - mx);
-        l += sm.u.red.ml[w * 2 + 1] * f;
-        a += sm.u.red.o[w * D + dim] * f;
+        const float f = exp2f(sm.u.red.ml[w * 2] - mx0);
+        l0 += sm.u.red.ml[w * 2 + 1] * f;
+        a0 += sm.u.red.o[w * D + dim] * f;
       }
+      const float sink = sm.sink[row] * LOG2E;
+      const float mx = fmaxf(sink, mx0);
+      const float f0 = exp2f(mx0 - mx);
+      float l = exp2f(sink - mx), a = 0.f;
+      l += l0 * f0;
+      a += a0 * f0;
       const float gate_in = load_proj_val<PROJ_FP32>(p.proj, proj_base + OFF_GATE + (g * GQA + row) * D + dim);
       const float gate = 1.f / (1.f + expf(-gate_in));
       p.out[std::size_t(b) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
@@ -1556,17 +1568,14 @@ struct BatchedVerifyAttnKernelParams {
   ActT* out;
 };
 
-constexpr int V_KT = 16;  // cached keys per shared-memory tile (amortized Wx across all W tokens of slot b)
-
 template <int W, bool F8>
 struct VerifyAttnSmem {
-  using CT = std::conditional_t<F8, __nv_fp8_storage_t, ActT>;
   __align__(16) ActT q[W][GQA][D];
   float rel[W][GQA][DREL];
   float sink[W][GQA];
   __align__(16) ActT nkv[2][W][D];
   float nst[3 * 2 * D];
-  float relp0[DREL][8];
+  float relp0[DREL];
   union {
     struct {
       float qs[GQA * D];
@@ -1576,11 +1585,6 @@ struct VerifyAttnSmem {
       float dyn[W * 2 * 4];
       float nkf[2 * D];
     } stage;
-    struct {
-      __align__(16) CT k[V_KT][D];
-      __align__(16) CT v[V_KT][D];
-      int kp[V_KT];
-    } tile;
     struct {
       float o[KW * GQA * D];
       float ml[KW * GQA * 2];
@@ -1626,10 +1630,6 @@ __global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const Batche
   const bool owner = (rank == 0);
   const int R = p.R;
 
-  constexpr int KW_PER_TOK = KW / W;  // 8, 4, 2, 1 warps per trial token
-  const int tok = warp / KW_PER_TOK;  // 0..W-1
-  const int kw = warp % KW_PER_TOK;   // 0..KW_PER_TOK-1
-
   __shared__ VerifyAttnSmem<W, F8> sm;
 
   float* const conv_k_slot = p.conv_k_visit + std::size_t(slot) * p.conv_slot_stride;
@@ -1641,7 +1641,7 @@ __global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const Batche
   CT* const k_pool = FULL ? static_cast<CT*>(p.k_full_pool) : reinterpret_cast<CT*>(k_ring_slot);
   CT* const v_pool = FULL ? static_cast<CT*>(p.v_full_pool) : reinterpret_cast<CT*>(v_ring_slot);
 
-  // ---- Stage shared scales, sink, and owner conv weights/state/relp0.
+  // ---- Stage shared scales, sink, relp0, and conv state/weights in all CTAs so sm.nkv is valid for virtual overlay.
   for (int i = tid; i < GQA * D; i += NT) sm.u.stage.qs[i] = p.q_scale[g * GQA * D + i];
   for (int i = tid; i < GQA * DREL; i += NT) sm.u.stage.rs[i] = p.r_scale[g * GQA * DREL + i];
   for (int i = tid; i < W * GQA; i += NT) {
@@ -1649,40 +1649,36 @@ __global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const Batche
     sm.sink[w][row] = (w < w_lim) ? load_proj_val<PROJ_FP32>(p.proj, std::size_t(b * W + w) * R + OFF_SINK + g * GQA + row)
                                   : 0.f;
   }
-  if (owner) {
-    for (int i = tid; i < 3 * 2 * D; i += NT) {
-      const int j = i / (2 * D), kv = (i / D) & 1, ch = i % D;
-      sm.u.stage.st[i] = (kv ? conv_v_slot : conv_k_slot)[j * CONV_C + g * D + ch];
-    }
-    for (int i = tid; i < 2 * D * 4; i += NT) {
-      const int kv = i / (D * 4), q = i % (D * 4);
-      const float* wptr = kv ? p.v_conv : p.k_conv;
-      if constexpr (FULL) {
-        const int lag = q / D, ch = q % D;
-        sm.u.stage.w[i] = wptr[lag * CONV_C + g * D + ch];
-      } else {
-        const int ch = q / 4, tap = q & 3;
-        sm.u.stage.w[i] = wptr[(g * D + ch) * 4 + tap];
-      }
-    }
+  for (int i = tid; i < 3 * 2 * D; i += NT) {
+    const int j = i / (2 * D), kv = (i / D) & 1, ch = i % D;
+    sm.u.stage.st[i] = (kv ? conv_v_slot : conv_k_slot)[j * CONV_C + g * D + ch];
+  }
+  for (int i = tid; i < 2 * D * 4; i += NT) {
+    const int kv = i / (D * 4), q = i % (D * 4);
+    const float* wptr = kv ? p.v_conv : p.k_conv;
     if constexpr (FULL) {
-      for (int i = tid; i < W * 8; i += NT) {
-        const int w = i / 8, rem = i & 7, kv = rem >> 2, lag = rem & 3;
-        sm.u.stage.dyn[i] = (w < w_lim)
-                                ? load_proj_val<PROJ_FP32>(
-                                      p.proj, std::size_t(b * W + w) * R + (kv ? OFF_VDYN : OFF_KDYN) + g * 4 + lag)
-                                : 0.f;
-      }
+      const int lag = q / D, ch = q % D;
+      sm.u.stage.w[i] = wptr[lag * CONV_C + g * D + ch];
+    } else {
+      const int ch = q / 4, tap = q & 3;
+      sm.u.stage.w[i] = wptr[(g * D + ch) * 4 + tap];
     }
-    for (int i = tid; i < DREL * 8; i += NT) {
-      const int c2 = i >> 3, d0 = i & 7;
-      sm.relp0[c2][d0] = p.rel_proj[c2 * EXT + d0];
+  }
+  if constexpr (FULL) {
+    for (int i = tid; i < W * 8; i += NT) {
+      const int w = i / 8, rem = i & 7, kv = rem >> 2, lag = rem & 3;
+      sm.u.stage.dyn[i] = (w < w_lim)
+                              ? load_proj_val<PROJ_FP32>(
+                                    p.proj, std::size_t(b * W + w) * R + (kv ? OFF_VDYN : OFF_KDYN) + g * 4 + lag)
+                              : 0.f;
     }
+  }
+  if (tid < DREL) {
+    sm.relp0[tid] = p.rel_proj[tid * EXT];
   }
   __syncthreads();
 
   // ---- Q and rel post-processing for all w < w_lim (bit-exact with batched_attn_decode).
-  // One warp processes one (w, head) pair at a time across (W * GQA) total rows.
   for (int row_id = warp; row_id < W * GQA; row_id += KW) {
     const int w = row_id / GQA;
     const int h = row_id % GQA;
@@ -1704,7 +1700,6 @@ __global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const Batche
       reinterpret_cast<uint2*>(&sm.q[w][h][0])[lane] = make_uint2(act::pack2(x[0], x[1]), act::pack2(x[2], x[3]));
     }
   }
-  // Rel: one half-warp per (w, h) row. Loop trip count MUST be warp-uniform so hsum16(0xffffffffu) never diverges!
   constexpr int REL_ITERS = (W * GQA + KW * 2 - 1) / (KW * 2);
   for (int iter = 0; iter < REL_ITERS; ++iter) {
     const int row_id = iter * (KW * 2) + warp * 2 + half;
@@ -1726,66 +1721,101 @@ __global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const Batche
     }
   }
 
-  // ---- Owner: sequential w_lim-step K/V conv + key clip / value RMS norm + optional E4M3 round + hist_k/v.
-  if (owner) {
-    for (int w = 0; w < w_lim; ++w) {
-      const std::size_t pb = std::size_t(b * W + w) * R;
-      for (int idx = tid; idx < 2 * D; idx += NT) {
-        const int kv = idx / D, ch = idx % D;
-        const float e0 = sm.u.stage.st[(0 * 2 + kv) * D + ch];
-        const float e1 = sm.u.stage.st[(1 * 2 + kv) * D + ch];
-        const float e2 = sm.u.stage.st[(2 * 2 + kv) * D + ch];
-        const float e3 = bf16r(load_proj_val<PROJ_FP32>(p.proj, pb + (kv ? OFF_V : OFF_K) + g * D + ch));
+  // ---- Sequential w_lim-step K/V conv + key clip / value RMS norm + optional E4M3 round + owner hist_k/v.
+  for (int w = 0; w < w_lim; ++w) {
+    const std::size_t pb = std::size_t(b * W + w) * R;
+    for (int idx = tid; idx < 2 * D; idx += NT) {
+      const int kv = idx / D, ch = idx % D;
+      const float e0 = sm.u.stage.st[(0 * 2 + kv) * D + ch];
+      const float e1 = sm.u.stage.st[(1 * 2 + kv) * D + ch];
+      const float e2 = sm.u.stage.st[(2 * 2 + kv) * D + ch];
+      const float e3 = bf16r(load_proj_val<PROJ_FP32>(p.proj, pb + (kv ? OFF_V : OFF_K) + g * D + ch));
+      if (owner) {
         if (kv == 0 && p.hist_k_visit) {
           p.hist_k_visit[std::size_t(b * W + w) * CONV_C + g * D + ch] = e3;
         } else if (kv == 1 && p.hist_v_visit) {
           p.hist_v_visit[std::size_t(b * W + w) * CONV_C + g * D + ch] = e3;
         }
-        float y;
-        if constexpr (FULL) {
-          float o = 0.f;
-          const float e_arr[4] = {e0, e1, e2, e3};
-#pragma unroll
-          for (int lag = 0; lag < 4; ++lag) {
-            const float wval = __fadd_rn(sm.u.stage.w[(kv * 4 + lag) * D + ch], sm.u.stage.dyn[w * 8 + kv * 4 + lag]);
-            o = __fadd_rn(o, __fmul_rn(wval, e_arr[3 - lag]));
-          }
-          y = __fmul_rn(__fadd_rn(o, e3), INV_3);
-        } else {
-          const float* wptr = sm.u.stage.w + (kv * D + ch) * 4;
-          float o = __fmul_rn(wptr[0], e0);
-          o = __fadd_rn(o, __fmul_rn(wptr[1], e1));
-          o = __fadd_rn(o, __fmul_rn(wptr[2], e2));
-          o = __fadd_rn(o, __fmul_rn(wptr[3], e3));
-          y = __fmul_rn(__fadd_rn(o, e3), INV_SQRT5);
-        }
-        sm.u.stage.nkf[kv * D + ch] = bf16r(y);
-        sm.u.stage.st[(0 * 2 + kv) * D + ch] = e1;
-        sm.u.stage.st[(1 * 2 + kv) * D + ch] = e2;
-        sm.u.stage.st[(2 * 2 + kv) * D + ch] = e3;
       }
-      __syncthreads();
-      if (warp < 2) {
-        const int kv = warp;
-        const float4 x = reinterpret_cast<const float4*>(sm.u.stage.nkf + kv * D)[lane];
-        const float ss = wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
-        const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
-        float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
-        if constexpr (F8) {
+      float y;
+      if constexpr (FULL) {
+        float o = 0.f;
+        const float e_arr[4] = {e0, e1, e2, e3};
 #pragma unroll
-          for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
+        for (int lag = 0; lag < 4; ++lag) {
+          const float wval = __fadd_rn(sm.u.stage.w[(kv * 4 + lag) * D + ch], sm.u.stage.dyn[w * 8 + kv * 4 + lag]);
+          o = __fadd_rn(o, __fmul_rn(wval, e_arr[3 - lag]));
         }
-        reinterpret_cast<uint2*>(&sm.nkv[kv][w][0])[lane] = make_uint2(act::pack2(y[0], y[1]), act::pack2(y[2], y[3]));
+        y = __fmul_rn(__fadd_rn(o, e3), INV_3);
+      } else {
+        const float* wptr = sm.u.stage.w + (kv * D + ch) * 4;
+        float o = __fmul_rn(wptr[0], e0);
+        o = __fadd_rn(o, __fmul_rn(wptr[1], e1));
+        o = __fadd_rn(o, __fmul_rn(wptr[2], e2));
+        o = __fadd_rn(o, __fmul_rn(wptr[3], e3));
+        y = __fmul_rn(__fadd_rn(o, e3), INV_SQRT5);
       }
-      __syncthreads();
+      sm.u.stage.nkf[kv * D + ch] = bf16r(y);
+      sm.u.stage.st[(0 * 2 + kv) * D + ch] = e1;
+      sm.u.stage.st[(1 * 2 + kv) * D + ch] = e2;
+      sm.u.stage.st[(2 * 2 + kv) * D + ch] = e3;
     }
+    __syncthreads();
+    if (warp < 2) {
+      const int kv = warp;
+      const float4 x = reinterpret_cast<const float4*>(sm.u.stage.nkf + kv * D)[lane];
+      const float ss = wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
+      const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
+      float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
+      if constexpr (F8) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
+      }
+      reinterpret_cast<uint2*>(&sm.nkv[kv][w][0])[lane] = make_uint2(act::pack2(y[0], y[1]), act::pack2(y[2], y[3]));
+    }
+    __syncthreads();
+  }
+  if (owner) {
     for (int i = tid; i < 3 * 2 * D; i += NT) sm.nst[i] = sm.u.stage.st[i];
   }
-  __syncthreads();  // stage inputs dead; sm.u.tile may now be used
+  __syncthreads();  // stage inputs dead; sm.u.red may now be used
 
-  // ---- Load this warp's token `tok` queries into registers (30 floats total -> zero spills!).
-  float qv[GQA][8], relv[GQA];
-  if (tok < w_lim) {
+  constexpr int STEP = KW * 2 * U;
+  constexpr int TILE = 2 * STEP;
+  const std::uint64_t kvpol = l2::policy<KV_L2>();
+
+  auto kv_offset = [&](int j) -> std::size_t {
+    if constexpr (FULL) {
+      const int phys = pt_slot[j >> kPageShift];
+      return ((((std::size_t(phys) * NUM_FULL_VISITS + p.full_visit_idx) * kPageSize + (j & kPageMask)) * HKV + g) * D) +
+             c * 8;
+    } else {
+      return (std::size_t(j) * HKV + g) * D + c * 8;
+    }
+  };
+
+  auto pack_nkv_elem = [&](int kv, int prev_w) -> KV {
+    const uint4 u = *reinterpret_cast<const uint4*>(&sm.nkv[kv][prev_w][c * 8]);
+    if constexpr (F8) {
+      float f[8];
+      unpack8(u, f);
+      return make_uint2(pack_e4m3x2(f[0], f[1]) | (pack_e4m3x2(f[2], f[3]) << 16),
+                        pack_e4m3x2(f[4], f[5]) | (pack_e4m3x2(f[6], f[7]) << 16));
+    } else {
+      return u;
+    }
+  };
+
+  // ---- Cooperative KW=8 reduction per token tok=0..w_lim-1: 0-ULP bit-exact match to serial batched_attn_decode!
+  for (int tok = 0; tok < w_lim; ++tok) {
+    const int pw = p0 + tok;
+    const int old_end = FULL ? pw : (pw < WIN ? pw : WIN);
+    const bool single_split = (old_end <= kSingleSplitMaxKeys);
+    const int stride = single_split ? TILE : (p.splits * TILE);
+    const int c0 = single_split ? 0 : (rank * TILE);
+    const bool run_keys = owner || !single_split;
+
+    float qv[GQA][8], relv[GQA];
 #pragma unroll
     for (int i = 0; i < GQA; ++i) {
       float qf[8];
@@ -1794,223 +1824,233 @@ __global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const Batche
       for (int e = 0; e < 8; ++e) qv[i][e] = qf[e] * QSCALE;
       relv[i] = sm.rel[tok][i][c];
     }
-  } else {
+
+    auto load_buf = [&](KeyBuf<KV>& buf, int base) {
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int j = base + (warp * U + u) * 2 + half;
+        buf.k[u] = buf.v[u] = KV{};
+        buf.kp[u] = -1;
+        buf.dp[u] = FULL ? (pw - j) : (1 + ((pw - 1 - j) & (WIN - 1)));
+        buf.rp[u] = (j < old_end && buf.dp[u] < EXT) ? __ldg(p.rel_proj + c * EXT + buf.dp[u]) : 0.f;
+        if (j < old_end) {
+          if constexpr (FULL) {
+            if (j >= p0) {
+              const int prev_w = j - p0;
+              buf.k[u] = pack_nkv_elem(0, prev_w);
+              buf.v[u] = pack_nkv_elem(1, prev_w);
+              buf.kp[u] = j;
+            } else {
+              const std::size_t off = kv_offset(j);
+              if constexpr (F8) {
+                buf.k[u] = ld_kv8(k_pool + off, kvpol);
+                buf.v[u] = ld_kv8(v_pool + off, kvpol);
+              } else {
+                buf.k[u] = ld_kv(k_pool + off, kvpol);
+                buf.v[u] = ld_kv(v_pool + off, kvpol);
+              }
+              buf.kp[u] = j;
+            }
+          } else {
+            const int delta = (j - p0) & (WIN - 1);
+            if (delta < tok) {
+              buf.k[u] = pack_nkv_elem(0, delta);
+              buf.v[u] = pack_nkv_elem(1, delta);
+              buf.kp[u] = p0 + delta;
+            } else {
+              const std::size_t off = kv_offset(j);
+              buf.k[u] = ld_kv(k_pool + off, kvpol);
+              buf.v[u] = ld_kv(v_pool + off, kvpol);
+              buf.kp[u] = int(kpos_slot[j]);
+            }
+          }
+        }
+      }
+    };
+
+    float mrun[GQA], lrun[GQA], acc[GQA][8];
 #pragma unroll
     for (int i = 0; i < GQA; ++i) {
+      mrun[i] = NEG_INIT;
+      lrun[i] = 0.f;
 #pragma unroll
-      for (int e = 0; e < 8; ++e) qv[i][e] = 0.f;
-      relv[i] = 0.f;
+      for (int e = 0; e < 8; ++e) acc[i][e] = 0.f;
     }
-  }
 
-  float mrun[GQA], lrun[GQA], acc[GQA][8];
+    auto compute = [&](const auto& buf, bool is_new) {
+      float s[U][GQA];
+      bool valid[U], need[U];
+      int dist[U];
+      bool any_need = false;
 #pragma unroll
-  for (int i = 0; i < GQA; ++i) {
-    mrun[i] = NEG_INIT;
-    lrun[i] = 0.f;
-#pragma unroll
-    for (int e = 0; e < 8; ++e) acc[i][e] = 0.f;
-  }
-
-  const int P_tok = p0 + tok;
-
-  // ---- Owner attends causal self-keys j in [0..tok] from sm.nkv (warp-uniform trip count).
-  if (owner && kw == 0 && tok < w_lim) {
-    constexpr int SELF_STEPS = (W + 1) / 2;
-#pragma unroll
-    for (int step = 0; step < SELF_STEPS; ++step) {
-      const int j = 2 * step + half;
-      const bool ok = (j <= tok);
-      const int d = tok - j;
-      float kf[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-      float vf[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-      if (ok) {
-        unpack8(*reinterpret_cast<const uint4*>(&sm.nkv[0][j][c * 8]), kf);
-        unpack8(*reinterpret_cast<const uint4*>(&sm.nkv[1][j][c * 8]), vf);
-      }
-      const float rp = ok ? sm.relp0[c][d] : 0.f;
-#pragma unroll
-      for (int i = 0; i < GQA; ++i) {
-        float t = 0.f;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) t = fmaf(qv[i][e], kf[e], t);
-        float s = hsum16(t);
-        const float bias = hsum16(relv[i] * rp);
-        if (ok) s = fmaf(bf16r(bias), LOG2E, s);
-        else s = -INFINITY;
-        const float mx = fmaxf(mrun[i], s);
-        const float sc = exp2f(mrun[i] - mx);
-        mrun[i] = mx;
-        lrun[i] *= sc;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) acc[i][e] *= sc;
-        const float pu = exp2f(s - mrun[i]);
-        lrun[i] += pu;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) acc[i][e] = fmaf(pu, vf[e], acc[i][e]);
-      }
-    }
-  }
-
-  // ---- Stream cached keys [0, old_end) in V_KT=16-key SMEM tiles, 1x global load shared across all W tokens!
-  const int old_end = FULL ? p0 : (p0 < WIN ? p0 : WIN);
-  const int stride = p.splits * V_KT;
-  const int c0 = rank * V_KT;
-  const std::uint64_t kvpol = l2::policy<KV_L2>();
-
-  constexpr int KEYS_PER_WARP = V_KT / KW_PER_TOK;  // 2, 4, 8, 16
-
-  for (int base = c0; base < old_end; base += stride) {
-    // Cooperative tile load: 512 vector loads (2 per thread for NT=256).
-    for (int idx = tid; idx < V_KT * 2 * (D / 8); idx += NT) {
-      const int k_idx = idx / (2 * (D / 8));
-      const int kv = (idx / (D / 8)) & 1;
-      const int c8 = idx & ((D / 8) - 1);
-      const int j = base + k_idx;
-      if (j < old_end) {
-        std::size_t off;
-        if constexpr (FULL) {
-          const int phys = pt_slot[j >> kPageShift];
-          off = ((((std::size_t(phys) * NUM_FULL_VISITS + p.full_visit_idx) * kPageSize + (j & kPageMask)) * HKV + g) * D) +
-                c8 * 8;
-        } else {
-          off = (std::size_t(j) * HKV + g) * D + c8 * 8;
-        }
-        const CT* src = (kv ? v_pool : k_pool) + off;
-        if constexpr (F8) {
-          const uint2 val = ld_kv8(src, kvpol);
-          reinterpret_cast<uint2*>((kv ? &sm.u.tile.v[k_idx][0] : &sm.u.tile.k[k_idx][0]))[c8] = val;
-        } else {
-          const uint4 val = ld_kv(src, kvpol);
-          reinterpret_cast<uint4*>((kv ? &sm.u.tile.v[k_idx][0] : &sm.u.tile.k[k_idx][0]))[c8] = val;
-        }
-      } else {
-        if constexpr (F8) {
-          reinterpret_cast<uint2*>((kv ? &sm.u.tile.v[k_idx][0] : &sm.u.tile.k[k_idx][0]))[c8] = make_uint2(0u, 0u);
-        } else {
-          reinterpret_cast<uint4*>((kv ? &sm.u.tile.v[k_idx][0] : &sm.u.tile.k[k_idx][0]))[c8] =
-              make_uint4(0u, 0u, 0u, 0u);
-        }
-      }
-    }
-    if (tid < V_KT) {
-      const int j = base + tid;
-      sm.u.tile.kp[tid] = (j < old_end) ? (FULL ? j : int(kpos_slot[j])) : -1;
-    }
-    __syncthreads();
-
-    if (tok < w_lim) {
-#pragma unroll
-      for (int step = 0; step < KEYS_PER_WARP / 2; ++step) {
-        const int k_idx = kw * KEYS_PER_WARP + 2 * step + half;
-        const int kp = sm.u.tile.kp[k_idx];
-        const int d = P_tok - kp;
-        const bool ok = (kp >= 0 && kp < p0 && d >= 0 && (FULL || d < WIN));
-        const bool need = (ok && d < EXT);
-        float kf[8], vf[8];
-        if constexpr (F8) {
-          unpack8(reinterpret_cast<const uint2*>(&sm.u.tile.k[k_idx][0])[c], kf);
-        } else {
-          unpack8(reinterpret_cast<const uint4*>(&sm.u.tile.k[k_idx][0])[c], kf);
-        }
-        float s[GQA];
+      for (int u = 0; u < U; ++u) {
+        const int kp = buf.kp[u], d = pw - kp;
+        const bool ok = kp >= 0 && d >= 0 && (is_new || (kp < pw && (FULL || d < WIN)));
+        valid[u] = ok;
+        need[u] = ok && d < EXT;
+        dist[u] = d;
+        any_need |= need[u];
+        float kf[8];
+        unpack8(buf.k[u], kf);
 #pragma unroll
         for (int i = 0; i < GQA; ++i) {
           float t = 0.f;
 #pragma unroll
           for (int e = 0; e < 8; ++e) t = fmaf(qv[i][e], kf[e], t);
-          s[i] = hsum16(t);
+          s[u][i] = hsum16(t);
         }
-        if (__any_sync(0xffffffffu, need)) {
-          const float rp = need ? __ldg(p.rel_proj + c * EXT + d) : 0.f;
+      }
+      if (__any_sync(0xffffffffu, any_need)) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          float rp = buf.rp[u];
+          if (need[u] && dist[u] != buf.dp[u]) rp = is_new ? sm.relp0[c] : __ldg(p.rel_proj + c * EXT + dist[u]);
 #pragma unroll
           for (int i = 0; i < GQA; ++i) {
             const float bias = hsum16(relv[i] * rp);
-            if (need) s[i] = fmaf(bf16r(bias), LOG2E, s[i]);
+            if (need[u]) s[u][i] = fmaf(bf16r(bias), LOG2E, s[u][i]);
           }
         }
-        if (ok) {
-          if constexpr (F8) {
-            unpack8(reinterpret_cast<const uint2*>(&sm.u.tile.v[k_idx][0])[c], vf);
-          } else {
-            unpack8(reinterpret_cast<const uint4*>(&sm.u.tile.v[k_idx][0])[c], vf);
-          }
-        } else {
+      }
 #pragma unroll
-          for (int e = 0; e < 8; ++e) vf[e] = 0.f;
+      for (int i = 0; i < GQA; ++i) {
+        float mx = mrun[i];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          if (!valid[u]) s[u][i] = -INFINITY;
+          mx = fmaxf(mx, s[u][i]);
         }
+        const float sc = exp2f(mrun[i] - mx);
+        mrun[i] = mx;
+        lrun[i] *= sc;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[i][e] *= sc;
+      }
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        float vf[8];
+        using V = std::decay_t<decltype(buf.v[0])>;
+        unpack8(valid[u] ? buf.v[u] : V{}, vf);
 #pragma unroll
         for (int i = 0; i < GQA; ++i) {
-          const float sv = ok ? s[i] : -INFINITY;
-          const float mx = fmaxf(mrun[i], sv);
-          const float sc = exp2f(mrun[i] - mx);
-          mrun[i] = mx;
-          lrun[i] *= sc;
-#pragma unroll
-          for (int e = 0; e < 8; ++e) acc[i][e] *= sc;
-          const float pu = exp2f(sv - mrun[i]);
+          const float pu = exp2f(s[u][i] - mrun[i]);
           lrun[i] += pu;
 #pragma unroll
           for (int e = 0; e < 8; ++e) acc[i][e] = fmaf(pu, vf[e], acc[i][e]);
         }
       }
-    }
-    __syncthreads();
-  }
+    };
 
-  // ---- Merge the two half-warps in registers, then write per-warp partials to sm.u.red.
+    KeyBuf<KV> A, B;
+    if (run_keys && c0 < old_end) load_buf(A, c0);
+    if (run_keys && c0 + STEP < old_end) load_buf(B, c0 + STEP);
+
+    if (owner) {
+      KeyBuf<uint4> N;
 #pragma unroll
-  for (int i = 0; i < GQA; ++i) {
-    const float mo = __shfl_xor_sync(0xffffffffu, mrun[i], 16);
-    const float lo = __shfl_xor_sync(0xffffffffu, lrun[i], 16);
-    const float mx = fmaxf(mrun[i], mo);
-    const float f1 = exp2f(mrun[i] - mx), f2 = exp2f(mo - mx);
-    lrun[i] = lrun[i] * f1 + lo * f2;
-#pragma unroll
-    for (int e = 0; e < 8; ++e)
-      acc[i][e] = acc[i][e] * f1 + __shfl_xor_sync(0xffffffffu, acc[i][e], 16) * f2;
-    mrun[i] = mx;
-  }
-  __syncthreads();  // tile dead; alias sm.u.red
-  if (half == 0) {
+      for (int u = 0; u < U; ++u) {
+        const int m2 = (warp * U + u) * 2 + half;
+        N.k[u] = N.v[u] = make_uint4(0u, 0u, 0u, 0u);
+        N.kp[u] = -1, N.dp[u] = -1, N.rp[u] = 0.f;
+        if (m2 == 0) {
+          N.k[u] = *reinterpret_cast<const uint4*>(&sm.nkv[0][tok][c * 8]);
+          N.v[u] = *reinterpret_cast<const uint4*>(&sm.nkv[1][tok][c * 8]);
+          N.kp[u] = pw;
+        }
+      }
+      compute(N, true);
+    }
+
+    if (run_keys) {
+      for (int base = c0; base < old_end; base += stride) {
+        compute(A, false);
+        if (base + stride < old_end) load_buf(A, base + stride);
+        if (base + STEP < old_end) {
+          compute(B, false);
+          if (base + stride + STEP < old_end) load_buf(B, base + stride + STEP);
+        }
+      }
+    }
+
+    // ---- Merge the two half-warps, then the 8 warps in sm.u.red (exact match to batched_attn_kernel).
 #pragma unroll
     for (int i = 0; i < GQA; ++i) {
-      float4* dst = reinterpret_cast<float4*>(sm.u.red.o + (warp * GQA + i) * D + c * 8);
-      dst[0] = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
-      dst[1] = make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]);
-      if (c == 0) {
-        sm.u.red.ml[(warp * GQA + i) * 2] = mrun[i];
-        sm.u.red.ml[(warp * GQA + i) * 2 + 1] = lrun[i];
+      const float mo = __shfl_xor_sync(0xffffffffu, mrun[i], 16);
+      const float lo = __shfl_xor_sync(0xffffffffu, lrun[i], 16);
+      const float mx = fmaxf(mrun[i], mo);
+      const float f1 = exp2f(mrun[i] - mx), f2 = exp2f(mo - mx);
+      lrun[i] = lrun[i] * f1 + lo * f2;
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        acc[i][e] = acc[i][e] * f1 + __shfl_xor_sync(0xffffffffu, acc[i][e], 16) * f2;
+      mrun[i] = mx;
+    }
+    __syncthreads();
+    if (half == 0) {
+#pragma unroll
+      for (int i = 0; i < GQA; ++i) {
+        float4* dst = reinterpret_cast<float4*>(sm.u.red.o + (warp * GQA + i) * D + c * 8);
+        dst[0] = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        dst[1] = make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]);
+        if (c == 0) {
+          sm.u.red.ml[(warp * GQA + i) * 2] = mrun[i];
+          sm.u.red.ml[(warp * GQA + i) * 2 + 1] = lrun[i];
+        }
       }
     }
+    __syncthreads();
+
+    if constexpr (SPLIT) {
+      float* part_base = p.part + std::size_t(((b * p.splits + rank) * HKV + g) * W) * GQA * PSTR;
+      for (int idx = tid; idx < GQA * (D / 4); idx += NT) {
+        const int row = idx / (D / 4), d4 = idx % (D / 4);
+        float mx = NEG_INIT;
+#pragma unroll
+        for (int k = 0; k < KW; ++k) mx = fmaxf(mx, sm.u.red.ml[(k * GQA + row) * 2]);
+        float l = 0.f;
+        float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int k = 0; k < KW; ++k) {
+          const int wi = k * GQA + row;
+          const float f = exp2f(sm.u.red.ml[wi * 2] - mx);
+          l += sm.u.red.ml[wi * 2 + 1] * f;
+          const float4 a = reinterpret_cast<const float4*>(sm.u.red.o + wi * D)[d4];
+          o.x += a.x * f, o.y += a.y * f, o.z += a.z * f, o.w += a.w * f;
+        }
+        float* pr = part_base + std::size_t(tok * GQA + row) * PSTR;
+        reinterpret_cast<float4*>(pr)[d4] = o;
+        if (d4 == 0) *reinterpret_cast<float2*>(pr + D) = make_float2(mx, l);
+      }
+    } else {
+      const std::size_t pb = std::size_t(b * W + tok) * R;
+      for (int idx = tid; idx < GQA * D; idx += NT) {
+        const int row = idx / D, dim = idx % D;
+        float mx0 = NEG_INIT;
+#pragma unroll
+        for (int k = 0; k < KW; ++k) mx0 = fmaxf(mx0, sm.u.red.ml[(k * GQA + row) * 2]);
+        float l0 = 0.f, a0 = 0.f;
+#pragma unroll
+        for (int k = 0; k < KW; ++k) {
+          const int wi = k * GQA + row;
+          const float f = exp2f(sm.u.red.ml[wi * 2] - mx0);
+          l0 += sm.u.red.ml[wi * 2 + 1] * f;
+          a0 += sm.u.red.o[wi * D + dim] * f;
+        }
+        const float sink = sm.sink[tok][row] * LOG2E;
+        const float mx = fmaxf(sink, mx0);
+        const float f0 = exp2f(mx0 - mx);
+        float l = exp2f(sink - mx), a = 0.f;
+        l += l0 * f0;
+        a += a0 * f0;
+        const float gate_in = load_proj_val<PROJ_FP32>(p.proj, pb + OFF_GATE + (g * GQA + row) * D + dim);
+        const float gate = 1.f / (1.f + expf(-gate_in));
+        p.out[std::size_t(b * W + tok) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
+      }
+    }
+    __syncthreads();  // sm.u.red safe to reuse on next tok
   }
-  __syncthreads();
 
   if constexpr (SPLIT) {
-    // Stage 1 (READ-ONLY on KV/ring_pos/conv): write split partials + owner saves nkv/nst.
-    float* part_base = p.part + std::size_t(((b * p.splits + rank) * HKV + g) * W) * GQA * PSTR;
-    for (int idx = tid; idx < w_lim * GQA * (D / 4); idx += NT) {
-      const int w = idx / (GQA * (D / 4));
-      const int rem = idx % (GQA * (D / 4));
-      const int row = rem / (D / 4), d4 = rem % (D / 4);
-      const int w0 = w * KW_PER_TOK;
-      float mx = NEG_INIT;
-#pragma unroll
-      for (int k = 0; k < KW_PER_TOK; ++k) mx = fmaxf(mx, sm.u.red.ml[((w0 + k) * GQA + row) * 2]);
-      float l = 0.f;
-      float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll
-      for (int k = 0; k < KW_PER_TOK; ++k) {
-        const int wi = (w0 + k) * GQA + row;
-        const float f = exp2f(sm.u.red.ml[wi * 2] - mx);
-        l += sm.u.red.ml[wi * 2 + 1] * f;
-        const float4 a = reinterpret_cast<const float4*>(sm.u.red.o + wi * D)[d4];
-        o.x += a.x * f, o.y += a.y * f, o.z += a.z * f, o.w += a.w * f;
-      }
-      float* pr = part_base + std::size_t(w * GQA + row) * PSTR;
-      reinterpret_cast<float4*>(pr)[d4] = o;
-      if (d4 == 0) *reinterpret_cast<float2*>(pr + D) = make_float2(mx, l);
-    }
     if (owner) {
       ActT* dst_nkv = p.saved_nkv + std::size_t(b * HKV + g) * 2 * W * D;
       for (int idx = tid; idx < 2 * w_lim * 16; idx += NT) {
@@ -2024,30 +2064,6 @@ __global__ void __launch_bounds__(NT, 1) batched_attn_verify_kernel(const Batche
       for (int idx = tid; idx < 3 * 2 * D; idx += NT) dst_nst[idx] = sm.nst[idx];
     }
   } else {
-    // Non-split finish: write out, commit per-head K/V and conv state.
-    // Note: for !FULL (sliding), ring_pos is committed in a separate post-grid kernel so no head can race on kpos!
-    for (int idx = tid; idx < w_lim * GQA * D; idx += NT) {
-      const int w = idx / (GQA * D);
-      const int rem = idx % (GQA * D);
-      const int row = rem / D, dim = rem % D;
-      const int w0 = w * KW_PER_TOK;
-      const float sink = sm.sink[w][row] * LOG2E;
-      float mx = sink;
-#pragma unroll
-      for (int k = 0; k < KW_PER_TOK; ++k) mx = fmaxf(mx, sm.u.red.ml[((w0 + k) * GQA + row) * 2]);
-      float l = exp2f(sink - mx), a = 0.f;
-#pragma unroll
-      for (int k = 0; k < KW_PER_TOK; ++k) {
-        const int wi = (w0 + k) * GQA + row;
-        const float f = exp2f(sm.u.red.ml[wi * 2] - mx);
-        l += sm.u.red.ml[wi * 2 + 1] * f;
-        a += sm.u.red.o[wi * D + dim] * f;
-      }
-      const std::size_t pb = std::size_t(b * W + w) * R;
-      const float gate_in = load_proj_val<PROJ_FP32>(p.proj, pb + OFF_GATE + (g * GQA + row) * D + dim);
-      const float gate = 1.f / (1.f + expf(-gate_in));
-      p.out[std::size_t(b * W + w) * HQ * D + (g * GQA + row) * D + dim] = act::from_float(bf16r(a / l) * gate);
-    }
     for (int idx = tid; idx < (W - w_lim) * GQA * D; idx += NT) {
       const int w = w_lim + idx / (GQA * D);
       const int rem = idx % (GQA * D);

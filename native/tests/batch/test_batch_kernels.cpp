@@ -1802,6 +1802,289 @@ void test_m_invariant_router_gates_and_fp8_scale() {
   }
 }
 
+// 0-ULP bit-identity across B in {1, 2, 4, 6, 8, 12, 16, 32, 36} (crossing split counts 16/8/4/3/2/1) and
+// across W in {1, 2, 4, 8} (batched_attn_verify vs serial batched_attn_decode) on identical inputs,
+// with a first-difference trace on any bit mismatch.
+void test_attn_bw_bit_invariance(bool full, bool cache_fp8, int p0) {
+  std::mt19937 rng(20261126 + (full ? 100 : 0) + (cache_fp8 ? 10 : 0) + p0);
+  const int R = full ? R_FULL : R_SLIDING;
+  const int max_ctx = 512;
+  const int max_pages_per_slot = (max_ctx + bk::kPageSize - 1) / bk::kPageSize;
+  const std::size_t es = cache_fp8 ? 1 : sizeof(ActT);
+  const int kMaxW = 8;
+  const int kMaxB = 36;
+
+  const auto q_scale = rand_floats(rng, HQ * D, 0.3f);
+  const auto r_scale = rand_floats(rng, HQ * DREL, 0.3f);
+  const auto rel_proj = rand_floats(rng, DREL * EXT, 0.2f);
+  const auto k_conv = rand_floats(rng, KV_DIM * 4, 0.2f);
+  const auto v_conv = rand_floats(rng, KV_DIM * 4, 0.2f);
+  const auto proj_seq = rand_floats(rng, std::size_t(kMaxW) * R, 0.25f);
+  const auto ck_init = rand_floats(rng, 3 * KV_DIM, 0.2f);
+  const auto cv_init = rand_floats(rng, 3 * KV_DIM, 0.2f);
+
+  std::vector<ActT> kr_init, vr_init;
+  std::vector<std::int64_t> rp_init;
+  std::vector<std::uint8_t> kf_init, vf_init;
+  if (!full) {
+    kr_init = to_act(rand_floats(rng, WIN * KV_DIM, 0.25f));
+    vr_init = to_act(rand_floats(rng, WIN * KV_DIM, 0.25f));
+    rp_init.assign(WIN, -1);
+    const int n_valid = std::min(p0, WIN);
+    for (int i = 0; i < n_valid; ++i) {
+      const int pos = p0 - n_valid + i;
+      rp_init[std::size_t(pos & (WIN - 1))] = pos;
+    }
+  } else {
+    const auto kf = rand_floats(rng, std::size_t(max_ctx) * KV_DIM, 0.25f);
+    const auto vf = rand_floats(rng, std::size_t(max_ctx) * KV_DIM, 0.25f);
+    if (cache_fp8) {
+      kf_init.resize(kf.size());
+      vf_init.resize(vf.size());
+      for (std::size_t i = 0; i < kf.size(); ++i) {
+        kf_init[i] = __nv_cvt_float_to_fp8(kf[i], __NV_SATFINITE, __NV_E4M3);
+        vf_init[i] = __nv_cvt_float_to_fp8(vf[i], __NV_SATFINITE, __NV_E4M3);
+      }
+    } else {
+      const auto ka = to_act(kf), va = to_act(vf);
+      kf_init.resize(ka.size() * sizeof(ActT));
+      vf_init.resize(va.size() * sizeof(ActT));
+      std::memcpy(kf_init.data(), ka.data(), kf_init.size());
+      std::memcpy(vf_init.data(), va.data(), vf_init.size());
+    }
+  }
+
+  DeviceBuffer d_qs(q_scale.size() * 4), d_rs(r_scale.size() * 4), d_rp(rel_proj.size() * 4);
+  DeviceBuffer d_kc(k_conv.size() * 4), d_vc(v_conv.size() * 4);
+  d_qs.copy_from_host(q_scale.data(), d_qs.bytes);
+  d_rs.copy_from_host(r_scale.data(), d_rs.bytes);
+  d_rp.copy_from_host(rel_proj.data(), d_rp.bytes);
+  d_kc.copy_from_host(k_conv.data(), d_kc.bytes);
+  d_vc.copy_from_host(v_conv.data(), d_vc.bytes);
+
+  DeviceBuffer d_ck(3 * KV_DIM * 4), d_cv(3 * KV_DIM * 4);
+  DeviceBuffer d_kr(full ? 4 : WIN * KV_DIM * sizeof(ActT)), d_vr(full ? 4 : WIN * KV_DIM * sizeof(ActT));
+  DeviceBuffer d_rpos(full ? 8 : WIN * 8);
+  DeviceBuffer d_kpool(full ? std::size_t(max_pages_per_slot) * NUM_FULL_VISITS * bk::kPageSize * KV_DIM * es : 4);
+  DeviceBuffer d_vpool(full ? std::size_t(max_pages_per_slot) * NUM_FULL_VISITS * bk::kPageSize * KV_DIM * es : 4);
+  std::vector<std::int32_t> pt(static_cast<std::size_t>(max_pages_per_slot));
+  for (int pg = 0; pg < max_pages_per_slot; ++pg) pt[std::size_t(pg)] = pg;
+  DeviceBuffer d_pt(pt.size() * 4);
+  d_pt.copy_from_host(pt.data(), d_pt.bytes);
+
+  auto reset_state = [&]() {
+    d_ck.copy_from_host(ck_init.data(), d_ck.bytes);
+    d_cv.copy_from_host(cv_init.data(), d_cv.bytes);
+    if (!full) {
+      d_kr.copy_from_host(kr_init.data(), d_kr.bytes);
+      d_vr.copy_from_host(vr_init.data(), d_vr.bytes);
+      d_rpos.copy_from_host(rp_init.data(), d_rpos.bytes);
+    } else {
+      d_kpool.fill(0);
+      d_vpool.fill(0);
+      const std::size_t row_bytes = std::size_t(KV_DIM) * es;
+      for (int t = 0; t < p0; ++t) {
+        const std::size_t dst_off =
+            (((std::size_t(t >> bk::kPageShift) * NUM_FULL_VISITS + 0) * bk::kPageSize + (t & bk::kPageMask)) * row_bytes);
+        CUDA_CHECK(cudaMemcpy(static_cast<char*>(d_kpool.p) + dst_off, kf_init.data() + std::size_t(t) * row_bytes,
+                              row_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(static_cast<char*>(d_vpool.p) + dst_off, vf_init.data() + std::size_t(t) * row_bytes,
+                              row_bytes, cudaMemcpyHostToDevice));
+      }
+    }
+  };
+
+  DeviceBuffer d_ws(std::max(bk::attn_workspace_bytes(kMaxB), bk::attn_verify_workspace_bytes(kMaxB, kMaxW)));
+  d_ws.fill(0);
+  DeviceBuffer d_proj(std::size_t(kMaxB) * kMaxW * R * 4);
+  DeviceBuffer d_out(std::size_t(kMaxB) * kMaxW * HQ * D * sizeof(ActT));
+  DeviceBuffer d_sids(std::size_t(kMaxB) * 4), d_wlim(std::size_t(kMaxB) * 4), d_spos(8);
+
+  // Reference: serial W=1 batched_attn_decode(B=1) for steps w=0..kMaxW-1.
+  reset_state();
+  std::vector<ActT> ref_seq(std::size_t(kMaxW) * HQ * D);
+  for (int w = 0; w < kMaxW; ++w) {
+    const std::int32_t sid = 0;
+    const std::int64_t pos = p0 + w;
+    d_sids.copy_from_host(&sid, 4);
+    d_spos.copy_from_host(&pos, 8);
+    d_proj.copy_from_host(proj_seq.data() + std::size_t(w) * R, std::size_t(R) * 4);
+    bk::BatchedAttnArgs a{};
+    a.proj = d_proj.p;
+    a.proj_fp32 = true;
+    a.B = 1;
+    a.slot_ids = static_cast<const std::int32_t*>(d_sids.p);
+    a.slot_pos = static_cast<const std::int64_t*>(d_spos.p);
+    a.q_scale = static_cast<const float*>(d_qs.p);
+    a.r_scale = static_cast<const float*>(d_rs.p);
+    a.rel_proj = static_cast<const float*>(d_rp.p);
+    a.k_conv = static_cast<const float*>(d_kc.p);
+    a.v_conv = static_cast<const float*>(d_vc.p);
+    a.conv_k_visit = static_cast<float*>(d_ck.p);
+    a.conv_v_visit = static_cast<float*>(d_cv.p);
+    a.conv_slot_stride = 3 * KV_DIM;
+    a.workspace = d_ws.p;
+    a.workspace_size = d_ws.bytes;
+    a.out = static_cast<ActT*>(d_out.p);
+    if (!full) {
+      a.k_ring_visit = static_cast<ActT*>(d_kr.p);
+      a.v_ring_visit = static_cast<ActT*>(d_vr.p);
+      a.ring_pos_visit = static_cast<std::int64_t*>(d_rpos.p);
+      a.ring_slot_stride = WIN * KV_DIM;
+      a.ring_pos_slot_stride = WIN;
+      a.window = WIN;
+      a.log_scaling = false;
+    } else {
+      a.k_full_pool = d_kpool.p;
+      a.v_full_pool = d_vpool.p;
+      a.page_table = static_cast<const std::int32_t*>(d_pt.p);
+      a.max_pages_per_slot = max_pages_per_slot;
+      a.full_visit_idx = 0;
+      a.max_ctx = max_ctx;
+      a.cache_fp8 = cache_fp8;
+      a.window = 0;
+      a.log_scaling = true;
+    }
+    bk::batched_attn_decode(a, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(ref_seq.data() + std::size_t(w) * HQ * D, d_out.p, HQ * D * sizeof(ActT),
+                          cudaMemcpyDeviceToHost));
+  }
+
+  auto check_bit_exact = [&](const char* tag, int B, int W, int step_w, const ActT* got, const ActT* ref) {
+    if (std::memcmp(got, ref, HQ * D * sizeof(ActT)) != 0) {
+      for (int i = 0; i < HQ * D; ++i) {
+        std::uint16_t ga = 0, rb = 0;
+        std::memcpy(&ga, &got[i], 2);
+        std::memcpy(&rb, &ref[i], 2);
+        if (ga != rb) {
+          std::fprintf(stderr,
+                       "attn B/W invariance FIRST_DIFF (%s full=%d fp8=%d p0=%d B=%d W=%d w=%d): idx=%d got=%g(0x%04x) ref=%g(0x%04x)\n",
+                       tag, int(full), int(cache_fp8), p0, B, W, step_w, i, ingine::act::host_to_float(got[i]), ga,
+                       ingine::act::host_to_float(ref[i]), rb);
+          break;
+        }
+      }
+      CHECK(false);
+    }
+  };
+
+  // 1. batched_attn_decode across B in {2, 4, 6, 8, 12, 16, 32, 36} (slot 0 active, rest -1) == ref_seq[0] BIT-EXACT.
+  for (int B : {2, 4, 6, 8, 12, 16, 32, 36}) {
+    reset_state();
+    std::vector<std::int32_t> sids(std::size_t(B), -1);
+    sids[0] = 0;
+    const std::int64_t pos = p0;
+    d_sids.copy_from_host(sids.data(), sids.size() * 4);
+    d_spos.copy_from_host(&pos, 8);
+    d_proj.fill(0);
+    d_proj.copy_from_host(proj_seq.data(), std::size_t(R) * 4);
+    bk::BatchedAttnArgs a{};
+    a.proj = d_proj.p;
+    a.proj_fp32 = true;
+    a.B = B;
+    a.slot_ids = static_cast<const std::int32_t*>(d_sids.p);
+    a.slot_pos = static_cast<const std::int64_t*>(d_spos.p);
+    a.q_scale = static_cast<const float*>(d_qs.p);
+    a.r_scale = static_cast<const float*>(d_rs.p);
+    a.rel_proj = static_cast<const float*>(d_rp.p);
+    a.k_conv = static_cast<const float*>(d_kc.p);
+    a.v_conv = static_cast<const float*>(d_vc.p);
+    a.conv_k_visit = static_cast<float*>(d_ck.p);
+    a.conv_v_visit = static_cast<float*>(d_cv.p);
+    a.conv_slot_stride = 3 * KV_DIM;
+    a.workspace = d_ws.p;
+    a.workspace_size = d_ws.bytes;
+    a.out = static_cast<ActT*>(d_out.p);
+    if (!full) {
+      a.k_ring_visit = static_cast<ActT*>(d_kr.p);
+      a.v_ring_visit = static_cast<ActT*>(d_vr.p);
+      a.ring_pos_visit = static_cast<std::int64_t*>(d_rpos.p);
+      a.ring_slot_stride = WIN * KV_DIM;
+      a.ring_pos_slot_stride = WIN;
+      a.window = WIN;
+      a.log_scaling = false;
+    } else {
+      a.k_full_pool = d_kpool.p;
+      a.v_full_pool = d_vpool.p;
+      a.page_table = static_cast<const std::int32_t*>(d_pt.p);
+      a.max_pages_per_slot = max_pages_per_slot;
+      a.full_visit_idx = 0;
+      a.max_ctx = max_ctx;
+      a.cache_fp8 = cache_fp8;
+      a.window = 0;
+      a.log_scaling = true;
+    }
+    bk::batched_attn_decode(a, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<ActT> got(HQ * D);
+    CUDA_CHECK(cudaMemcpy(got.data(), d_out.p, HQ * D * sizeof(ActT), cudaMemcpyDeviceToHost));
+    check_bit_exact("decode", B, 1, 0, got.data(), ref_seq.data());
+  }
+
+  // 2. batched_attn_verify across B in {1, 2, 4, 8, 12, 16} x W in {1, 2, 4, 8} == ref_seq[0..W-1] BIT-EXACT.
+  for (int B : {1, 2, 4, 8, 12, 16}) {
+    for (int W : {1, 2, 4, 8}) {
+      reset_state();
+      std::vector<std::int32_t> sids(std::size_t(B), -1);
+      std::vector<std::int32_t> wlim(std::size_t(B), W);
+      sids[0] = 0;
+      const std::int64_t pos = p0;
+      d_sids.copy_from_host(sids.data(), sids.size() * 4);
+      d_wlim.copy_from_host(wlim.data(), wlim.size() * 4);
+      d_spos.copy_from_host(&pos, 8);
+      d_proj.fill(0);
+      d_proj.copy_from_host(proj_seq.data(), std::size_t(W) * R * 4);
+      bk::BatchedVerifyAttnArgs va{};
+      va.proj = d_proj.p;
+      va.proj_fp32 = true;
+      va.B = B;
+      va.W = W;
+      va.slot_ids = static_cast<const std::int32_t*>(d_sids.p);
+      va.slot_w_limit = static_cast<const std::int32_t*>(d_wlim.p);
+      va.slot_pos = static_cast<const std::int64_t*>(d_spos.p);
+      va.q_scale = static_cast<const float*>(d_qs.p);
+      va.r_scale = static_cast<const float*>(d_rs.p);
+      va.rel_proj = static_cast<const float*>(d_rp.p);
+      va.k_conv = static_cast<const float*>(d_kc.p);
+      va.v_conv = static_cast<const float*>(d_vc.p);
+      va.conv_k_visit = static_cast<float*>(d_ck.p);
+      va.conv_v_visit = static_cast<float*>(d_cv.p);
+      va.conv_slot_stride = 3 * KV_DIM;
+      va.workspace = d_ws.p;
+      va.workspace_size = d_ws.bytes;
+      va.out = static_cast<ActT*>(d_out.p);
+      if (!full) {
+        va.k_ring_visit = static_cast<ActT*>(d_kr.p);
+        va.v_ring_visit = static_cast<ActT*>(d_vr.p);
+        va.ring_pos_visit = static_cast<std::int64_t*>(d_rpos.p);
+        va.ring_slot_stride = WIN * KV_DIM;
+        va.ring_pos_slot_stride = WIN;
+        va.window = WIN;
+        va.log_scaling = false;
+      } else {
+        va.k_full_pool = d_kpool.p;
+        va.v_full_pool = d_vpool.p;
+        va.page_table = static_cast<const std::int32_t*>(d_pt.p);
+        va.max_pages_per_slot = max_pages_per_slot;
+        va.full_visit_idx = 0;
+        va.max_ctx = max_ctx;
+        va.cache_fp8 = cache_fp8;
+        va.window = 0;
+        va.log_scaling = true;
+      }
+      bk::batched_attn_verify(va, nullptr);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      std::vector<ActT> got(std::size_t(W) * HQ * D);
+      CUDA_CHECK(cudaMemcpy(got.data(), d_out.p, got.size() * sizeof(ActT), cudaMemcpyDeviceToHost));
+      for (int w = 0; w < W; ++w) {
+        check_bit_exact("verify", B, W, w, got.data() + std::size_t(w) * HQ * D,
+                        ref_seq.data() + std::size_t(w) * HQ * D);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1814,6 +2097,11 @@ int main() {
   }
   test_static_conv();
   test_m_invariant_router_gates_and_fp8_scale();
+  test_attn_bw_bit_invariance(false, false, 192);
+  test_attn_bw_bit_invariance(false, false, 1022);
+  test_attn_bw_bit_invariance(true, false, 62);
+  test_attn_bw_bit_invariance(true, true, 62);
+  test_attn_bw_bit_invariance(true, true, 219);
   for (int B : {1, 3, 4, 6, 12, 15, 16, 64}) {
     for (bool proj_fp32 : {true, false}) {
       test_batched_attn_vs_single(false, false, proj_fp32, B);  // sliding
