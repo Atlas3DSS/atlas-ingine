@@ -19,7 +19,7 @@ PagedKvCache::PagedKvCache(const PagedKvConfig& cfg)
       swap_dir_(cfg.swap_dir) {
   if (max_ctx_ < 1 || max_pages_ < 1) throw std::invalid_argument("PagedKvCache: invalid max_ctx");
   if (cfg.vram_mb <= 0) throw std::invalid_argument("PagedKvCache: vram_mb must be positive");
-  if (num_full_slots_ < 1 || num_full_slots_ > NUM_FULL_VISITS) {
+  if (num_full_slots_ < 1 || num_full_slots_ > 2 + 2 * MAX_PASSES) {
     throw std::invalid_argument("PagedKvCache: invalid num_full_slots");
   }
 
@@ -50,6 +50,12 @@ PagedKvCache::PagedKvCache(const PagedKvConfig& cfg)
   dec_pos_host_ = MappedHostBuffer(sizeof(std::int64_t));
 
   // Per-slot fixed device page tables.
+  dev_k_ptrs_.resize(std::size_t(num_full_slots_));
+  dev_v_ptrs_.resize(std::size_t(num_full_slots_));
+  host_k_ptrs_.resize(std::size_t(num_full_slots_));
+  host_v_ptrs_.resize(std::size_t(num_full_slots_));
+  table_dirty_.assign(std::size_t(num_full_slots_), false);
+  meta_.resize(std::size_t(num_full_slots_));
   const std::size_t table_bytes = std::size_t(max_pages_) * sizeof(void*);
   for (int fi = 0; fi < num_full_slots_; ++fi) {
     dev_k_ptrs_[fi] = DeviceBuffer(table_bytes);

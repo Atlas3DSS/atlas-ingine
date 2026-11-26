@@ -172,6 +172,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       max_model_len_(options.max_model_len ? options.max_model_len : generator.max_model_len()),
       kv_cache_mode_(generator.kv_cache_mode()),
       supported_kv_cache_modes_(generator.supported_kv_cache_modes()),
+      loop_passes_(generator.loop_passes()),
       sampling_defaults_(options.sampling),
       image_options_([&] {
         ImageOptions images = options.images;
@@ -220,6 +221,7 @@ Json ChatServer::model_card() const {
               {"kv_cache_mode", model::to_string(kv_cache_mode_)},
               {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
               {"kv_cache_mode_mutable", false},
+              {"loop_passes", loop_passes_},
               {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
 }
 
@@ -261,6 +263,7 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                    {"kv_cache_mode", model::to_string(kv_cache_mode_)},
                    {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
                    {"kv_cache_mode_mutable", false},
+                   {"loop_passes", loop_passes_},
                    {"waiting", st.waiting},
                    {"running", st.running},
                    {"active", st.active},

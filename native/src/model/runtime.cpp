@@ -36,13 +36,41 @@ struct Carve {
 };
 constexpr std::size_t carved(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
-constexpr std::size_t kUndoBytes = carved(std::size_t(NUM_VISITS) * CONV_ROW_FLOATS * 4) +
-                                   2 * carved(std::size_t(NUM_SLIDING_VISITS) * KV_DIM * 2) +
-                                   carved(std::size_t(NUM_SLIDING_VISITS) * 8);
-constexpr std::size_t kBackupBytes = 2 * carved(std::size_t(NUM_VISITS) * 3 * KV_DIM * 4) +
-                                     2 * carved(std::size_t(NUM_VISITS) * 3 * HIDDEN * 4) +
-                                     2 * carved(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM * 2) +
-                                     carved(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * 8);
+std::size_t undo_bytes_for(const VisitPlan& plan) {
+  return carved(std::size_t(plan.num_visits) * CONV_ROW_FLOATS * 4) +
+         2 * carved(std::size_t(plan.num_sliding_visits) * KV_DIM * 2) +
+         carved(std::size_t(plan.num_sliding_visits) * 8);
+}
+
+std::size_t backup_bytes_for(const VisitPlan& plan) {
+  return 2 * carved(std::size_t(plan.num_visits) * 3 * KV_DIM * 4) +
+         2 * carved(std::size_t(plan.num_visits) * 3 * HIDDEN * 4) +
+         2 * carved(std::size_t(plan.num_sliding_visits) * kMaxWidth * KV_DIM * 2) +
+         carved(std::size_t(plan.num_sliding_visits) * kMaxWidth * 8);
+}
+
+void validate_loop_passes_options(const RuntimeOptions& options, bool ablation_active = false) {
+  if (options.loop_passes < 1 || options.loop_passes > MAX_PASSES) {
+    throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
+  }
+  if (options.loop_passes != PASSES) {
+    if (options.spec) {
+      throw std::invalid_argument("--loop-passes != 3 is not supported with --spec (DSpark drafter requires 3 passes)");
+    }
+    if (!options.ablation.empty() || ablation_active) {
+      throw std::invalid_argument("--loop-passes != 3 is not supported with --ablation (48-visit ablation file)");
+    }
+    if (options.enable_persona_hooks) {
+      throw std::invalid_argument("--loop-passes != 3 is not supported with persona hooks (fixed 48-visit hook ABI)");
+    }
+    if (options.max_batch > 1) {
+      throw std::invalid_argument("--loop-passes != 3 currently requires --max-batch 1");
+    }
+    if (options.kv_cache_mode == KvCacheMode::LastFull) {
+      throw std::invalid_argument("--loop-passes != 3 is not supported with --kv-cache-mode last_full");
+    }
+  }
+}
 
 }  // namespace
 
@@ -69,6 +97,7 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options_.kv_cache_mode == KvCacheMode::LastFull && options_.spec) {
     throw std::invalid_argument("--kv-cache-mode last_full cannot be combined with --spec (B=1 non-spec control)");
   }
+  validate_loop_passes_options(options_);
   if (options_.kv_paged || options_.kv_vram_mb > 0) {
     options_.kv_paged = true;
     options_.kv_q4 = true;
@@ -94,6 +123,7 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   offload.kv_last_full = (options_.kv_cache_mode == KvCacheMode::LastFull);
   offload.spec = options_.spec;
   offload.kv_vram_mb = options_.kv_paged ? options_.kv_vram_mb : 0;
+  offload.loop_passes = options_.loop_passes;
   weights_ = load_weights(options_.model_dir, options_.dense_fp8, stream_, offload);
   ablation_ = load_ablation(options_.ablation);
   init();
@@ -105,6 +135,7 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
   if (options_.kv_cache_mode == KvCacheMode::LastFull && options_.spec) {
     throw std::invalid_argument("--kv-cache-mode last_full cannot be combined with --spec (B=1 non-spec control)");
   }
+  validate_loop_passes_options(options_, ablation_.active);
   // Decoder/Prefiller always dereference the ablation buffers (zeroed when inactive); materialize an
   // empty device ablation if the caller passed a default-constructed Ablation{}.
   if (!ablation_.active && (!ablation_.attn_dirs.data || !ablation_.attn_w.data || !ablation_.mlp_dirs.data ||
@@ -126,7 +157,8 @@ void Runtime::init() {
     pkv.swap_dir = options.kv_swap_dir;
   }
   state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_q4, pkv,
-                      options.kv_cache_mode == KvCacheMode::LastFull);
+                      options.kv_cache_mode == KvCacheMode::LastFull, options.loop_passes);
+  const VisitPlan& plan = state_.plan;
   if (state_.paged_kv) {
     state_.paged_kv->ensure_decode_pages(0, kMaxWidth, stream_);
   }
@@ -139,29 +171,30 @@ void Runtime::init() {
   CUDA_CHECK(cudaStreamCreateWithFlags(&capture_stream_, cudaStreamNonBlocking));
   for (cudaEvent_t& e : chain_done_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
   chain_host_ = MappedHostBuffer(2 * sizeof(std::int32_t));
+  const std::size_t undo_bytes = undo_bytes_for(plan);
   for (int i = 0; i < 2; ++i) {
-    undo_storage_[i] = DeviceBuffer(kUndoBytes);
+    undo_storage_[i] = DeviceBuffer(undo_bytes);
     Carve c{static_cast<char*>(undo_storage_[i].p)};
-    undo_[i].conv = c.take<float>(std::size_t(NUM_VISITS) * CONV_ROW_FLOATS);
-    undo_[i].k = c.take<ActT>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
-    undo_[i].v = c.take<ActT>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
-    undo_[i].pos = c.take<std::int64_t>(NUM_SLIDING_VISITS);
+    undo_[i].conv = c.take<float>(std::size_t(plan.num_visits) * CONV_ROW_FLOATS);
+    undo_[i].k = c.take<ActT>(std::size_t(plan.num_sliding_visits) * KV_DIM);
+    undo_[i].v = c.take<ActT>(std::size_t(plan.num_sliding_visits) * KV_DIM);
+    undo_[i].pos = c.take<std::int64_t>(std::size_t(plan.num_sliding_visits));
   }
 
-  buffers_.emplace(1, make_buffers(1));
+  buffers_.emplace(1, make_buffers(1, options.loop_passes));
   history_[1] = false;
   if (options.spec) {
     for (int w : kVerifyWidths) {
-      buffers_.emplace(w, make_buffers(w));
+      buffers_.emplace(w, make_buffers(w, options.loop_passes));
       history_[w] = true;
       verify_widths_.push_back(w);
     }
-    backup_storage_ = DeviceBuffer(kBackupBytes);
+    backup_storage_ = DeviceBuffer(backup_bytes_for(plan));
     Carve c{static_cast<char*>(backup_storage_.p)};
-    for (int i = 0; i < 4; ++i) backup_.conv[i] = c.take<float>(std::size_t(NUM_VISITS) * 3 * CONV_COLS[i]);
-    backup_.k = c.take<ActT>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
-    backup_.v = c.take<ActT>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
-    backup_.pos = c.take<std::int64_t>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth);
+    for (int i = 0; i < 4; ++i) backup_.conv[i] = c.take<float>(std::size_t(plan.num_visits) * 3 * CONV_COLS[i]);
+    backup_.k = c.take<ActT>(std::size_t(plan.num_sliding_visits) * kMaxWidth * KV_DIM);
+    backup_.v = c.take<ActT>(std::size_t(plan.num_sliding_visits) * kMaxWidth * KV_DIM);
+    backup_.pos = c.take<std::int64_t>(std::size_t(plan.num_sliding_visits) * kMaxWidth);
   }
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
@@ -224,6 +257,8 @@ StatePtrs Runtime::state_ptrs() const {
   p.k_ring = ptr<ActT>(state_.k_ring);
   p.v_ring = ptr<ActT>(state_.v_ring);
   p.ring_pos = ptr<std::int64_t>(state_.ring_pos);
+  p.num_visits = state_.plan.num_visits;
+  p.num_sliding_visits = state_.plan.num_sliding_visits;
   return p;
 }
 
@@ -310,6 +345,9 @@ void Runtime::ensure_hooked_graphs() {
 
 void Runtime::set_persona(const persona::PersonaProfile* profile, const PersonaTapConfig& taps) {
   const bool want_active = (profile != nullptr && !profile->is_unhooked()) || !taps.empty();
+  if (want_active && options_.loop_passes != PASSES) {
+    throw std::invalid_argument("--loop-passes != 3 is not supported with active persona hooks");
+  }
   if (want_active && hooked_graphs_.empty()) ensure_hooked_graphs();
   persona_rt_->configure(profile, taps, stream_);
 }
@@ -419,7 +457,7 @@ std::size_t Runtime::full_rows_bytes(int n) const {
   return 2 * std::size_t(nfull) * row * std::size_t(n);
 }
 
-// Copy active full slots (8 in per_pass, 4 in last_full) of n positions packed contiguously (k slots, then v slots).
+// Copy active full slots (2+2*L in per_pass, 4 in last_full) of n positions packed contiguously (k slots, then v slots).
 // Per-slot 1D copies avoid CUDA's 2 GiB cudaMemcpy2DAsync pitch ceiling at >=1M context lengths.
 std::size_t Runtime::save_full_rows(void* dst, int n) {
   const int nfull = state_.num_full_slots();

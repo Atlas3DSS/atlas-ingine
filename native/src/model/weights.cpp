@@ -588,17 +588,18 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     for (const auto& b : w.storage) non_expert_bytes += b.bytes;
     // Estimate post-load fixed VRAM (KV cache + prefiller scratch + checkpoint + runtime/cuBLAS headroom)
     // so total model GPU memory stays strictly within offload.vram_mb MiB.
+    const VisitPlan plan = make_visit_plan(offload.loop_passes);
     const std::size_t kv_ring_bytes =
-        std::size_t(NUM_SLIDING_VISITS) * WINDOW * KV_DIM * 4 + std::size_t(NUM_SLIDING_VISITS) * WINDOW * 8;
+        std::size_t(plan.num_sliding_visits) * WINDOW * KV_DIM * 4 + std::size_t(plan.num_sliding_visits) * WINDOW * 8;
     const std::size_t kv_full_bytes =
         offload.kv_vram_mb > 0
             ? (std::size_t(offload.kv_vram_mb) << 20)
-            : (std::size_t(full_slot_count(offload.kv_last_full)) * std::size_t(offload.max_ctx) *
+            : (std::size_t(offload.kv_last_full ? NUM_FULL_SLOTS_LAST_FULL : plan.num_full_visits) * std::size_t(offload.max_ctx) *
                (offload.kv_q4 ? (2 * std::size_t(KV_Q4_ROW_BYTES)) : (std::size_t(KV_DIM) * (offload.kv_fp8 ? 2 : 4))));
     const std::size_t checkpoint_bytes = kv_ring_bytes + (std::size_t(16) << 20);
-    // Prefiller aliases Attention vs MLP scratch (including EXL3 scratch) in one phase arena (~269 KB/tok + 42 MiB).
-    const std::size_t prefill_bytes =
-        std::size_t(offload.prefill_chunk) * std::size_t(280) * 1024 + (std::size_t(48) << 20);
+    // Prefiller aliases Attention vs MLP scratch (including EXL3 scratch) in one phase arena plus
+    // 2 * chunk * HIDDEN * 4 B per loop pass for B2[p] and E[p] (~280 KiB/tok + 48 MiB at L=3).
+    const std::size_t prefill_bytes = offload_prefill_vram_bytes(offload.prefill_chunk, offload.loop_passes);
     // DSpark drafter weights + shortlist + FP8 global KV ring (min(max_ctx, 65536) * 2 KiB) +
     // verify buffers (widths 2/4/8) + prefill taps when --spec is active (measured ~1.09 GB at 64K/1024).
     const std::size_t spec_bytes =

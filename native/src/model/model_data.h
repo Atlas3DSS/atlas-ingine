@@ -15,6 +15,8 @@
 #include <initializer_list>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ingine::model {
@@ -36,7 +38,7 @@ inline constexpr int D_REL = 16, REL_EXTENT = 1024, WINDOW = 1024;
 inline constexpr int INTER = 1152, EXPERTS = 128, TOP_K = 8;
 inline constexpr int CONV_K = 4;
 inline constexpr int LAYERS = 24, BLOCK = 6;
-inline constexpr int LOOP_START = 6, LOOP_END = 18, PASSES = 3;
+inline constexpr int LOOP_START = 6, LOOP_END = 18, PASSES = 3, MAX_PASSES = 8;
 inline constexpr int VOCAB = 201024, UNPADDED_VOCAB = 200058;
 inline constexpr int LOCAL_VOCAB_CHUNK = TP_SIZE == 1 ? UNPADDED_VOCAB : (((UNPADDED_VOCAB + TP_SIZE - 1) / TP_SIZE + 15) & ~15);
 inline constexpr int GATE_RANK = 64;
@@ -112,6 +114,58 @@ inline constexpr int full_slot_count(bool kv_last_full) noexcept {
 }
 inline constexpr int full_slot_index(int v, bool kv_last_full) noexcept {
   return kv_last_full ? FULL_INDEX_LAST_FULL[v] : FULL_INDEX[v];
+}
+
+// Runtime visit schedule for variable loop depth L in [1, MAX_PASSES] (default L = PASSES = 3 -> 48 visits).
+struct VisitPlan {
+  int passes = PASSES;
+  int num_visits = NUM_VISITS;
+  int num_full_visits = NUM_FULL_VISITS;
+  int num_sliding_visits = NUM_SLIDING_VISITS;
+  std::vector<Visit> visits;
+  std::vector<int> ring_index;
+  std::vector<int> full_index;
+
+  int last_pass() const noexcept { return passes - 1; }
+};
+
+inline VisitPlan make_visit_plan(int passes) {
+  if (passes < 1 || passes > MAX_PASSES) {
+    throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES) + ", got " +
+                                std::to_string(passes));
+  }
+  VisitPlan plan;
+  plan.passes = passes;
+  const int loop_len = LOOP_END - LOOP_START;
+  plan.num_visits = LOOP_START + passes * loop_len + (LAYERS - LOOP_END);
+  plan.visits.reserve(std::size_t(plan.num_visits));
+  for (int l = 0; l < LOOP_START; ++l) plan.visits.push_back({l, 0});
+  for (int p = 0; p < passes; ++p)
+    for (int l = LOOP_START; l < LOOP_END; ++l) plan.visits.push_back({l, p});
+  for (int l = LOOP_END; l < LAYERS; ++l) plan.visits.push_back({l, 0});
+  plan.ring_index.resize(std::size_t(plan.num_visits), -1);
+  plan.full_index.resize(std::size_t(plan.num_visits), -1);
+  int nf = 0, ns = 0;
+  for (int v = 0; v < plan.num_visits; ++v) {
+    if (is_full_layer(plan.visits[std::size_t(v)].layer)) plan.full_index[std::size_t(v)] = nf++;
+    else plan.ring_index[std::size_t(v)] = ns++;
+  }
+  plan.num_full_visits = nf;
+  plan.num_sliding_visits = ns;
+  return plan;
+}
+
+// Prefiller per-pass persistent block states: B2[p] + E[p] = 2 * chunk * HIDDEN * sizeof(float) per pass.
+inline constexpr std::size_t prefill_loop_pass_bytes(int prefill_chunk, int loop_passes) {
+  return std::size_t(loop_passes) * 2 * std::size_t(prefill_chunk) * std::size_t(HIDDEN) * sizeof(float);
+}
+
+// Offload VRAM budget estimate for Prefiller (aliased phase arena + persistent block states for `loop_passes`).
+// Matches the original L=3 budget (chunk * 280 KiB + 48 MiB) exactly while tracking +/- 18 KiB/tok per pass.
+inline constexpr std::size_t offload_prefill_vram_bytes(int prefill_chunk, int loop_passes) {
+  const std::size_t base_per_tok = std::size_t(280) * 1024 - std::size_t(PASSES) * 2 * std::size_t(HIDDEN) * sizeof(float);
+  return std::size_t(prefill_chunk) * base_per_tok + (std::size_t(48) << 20) +
+         prefill_loop_pass_bytes(prefill_chunk, loop_passes);
 }
 
 // model.TAP_VISITS: DSpark features = the partial block entering these visits, then the final normed hidden
@@ -295,18 +349,19 @@ struct State {
   bool kv_fp8 = false;
   bool kv_q4 = false;
   bool kv_last_full = false;
+  VisitPlan plan = make_visit_plan(PASSES);
   std::shared_ptr<PagedKvCache> paged_kv;  // non-null when 3-tier paged Q4_0 full-attention KV is enabled
-  Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
-  Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
+  Tensor k_ring, v_ring;      // bf16 [plan.num_sliding_visits, 1024, 8, 128] (sliding visits)
+  Tensor ring_pos;            // int64 [plan.num_sliding_visits, 1024], absolute position per slot, -1 = empty
   Tensor k_full, v_full;      // bf16/fp8 [num_full_slots, max_ctx, 8, 128] or q4_0 u8 [num_full_slots, max_ctx, 576]
-  Tensor conv_k, conv_v;      // fp32 [48, 3, 1024] previous 3 key/value conv inputs (oldest first)
-  Tensor conv_attn, conv_mlp; // fp32 [48, 3, H]
+  Tensor conv_k, conv_v;      // fp32 [plan.num_visits, 3, 1024] previous 3 key/value conv inputs (oldest first)
+  Tensor conv_attn, conv_mlp; // fp32 [plan.num_visits, 3, H]
   int length = 0;             // tokens in the context (host copy; decode steps do not advance it)
 
   std::vector<DeviceBuffer> storage;
 
-  int num_full_slots() const noexcept { return full_slot_count(kv_last_full); }
-  int full_slot(int v) const noexcept { return full_slot_index(v, kv_last_full); }
+  int num_full_slots() const noexcept { return kv_last_full ? NUM_FULL_SLOTS_LAST_FULL : plan.num_full_visits; }
+  int full_slot(int v) const noexcept { return kv_last_full ? FULL_INDEX_LAST_FULL[v] : plan.full_index[std::size_t(v)]; }
   std::size_t full_row_bytes() const { return kv_q4 ? KV_Q4_ROW_BYTES : std::size_t(KV_DIM) * (kv_fp8 ? 1 : 2); }
 
   // per-visit views
@@ -325,12 +380,13 @@ struct State {
 
 // fast.Buffers: fixed device buffers of one call width M (one set per captured CUDA graph).
 //   B0 = embedding; B1 = hidden entering layer 6 (pass 0); B2[p] = hidden entering layer 12 in pass p;
-//   E[p] = hidden after layer 17 in pass p (E[2] is also the block entering layer 18).
+//   E[p] = hidden after layer 17 in pass p (E[passes - 1] is also the block entering layer 18).
 struct Buffers {
   int m = 0;
-  Tensor token;                     // int64 [m] input token ids (read by embed)
-  Tensor B0, B1;                    // fp32 [m, H]
-  std::array<Tensor, PASSES> B2, E; // fp32 [m, H]
+  int passes = PASSES;
+  Tensor token;                         // int64 [m] input token ids (read by embed)
+  Tensor B0, B1;                        // fp32 [m, H]
+  std::array<Tensor, MAX_PASSES> B2, E; // fp32 [m, H] (0..passes-1 allocated)
   Tensor hid, part, y, y2;          // fp32 [m, H]
   Tensor xin;                       // bf16 [3, m, H]
   Tensor mixf;                      // fp32 [3, m, H]

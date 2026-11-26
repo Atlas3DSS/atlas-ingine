@@ -70,8 +70,8 @@ Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, 
                  std::vector<DeviceBuffer>& storage);
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
 State make_state(int max_ctx, bool kv_fp8, bool kv_q4 = false, const PagedKvConfig& paged_kv = {},
-                 bool kv_last_full = false);
-Buffers make_buffers(int m);
+                 bool kv_last_full = false, int loop_passes = PASSES);
+Buffers make_buffers(int m, int loop_passes = PASSES);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
 void reset_state(State& state, cudaStream_t stream);

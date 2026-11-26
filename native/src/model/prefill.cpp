@@ -34,19 +34,27 @@ const ActT* bf16p(const Tensor& t) { return static_cast<const ActT*>(t.data); }
 const ActT* bf16p(const void* p) { return static_cast<const ActT*>(p); }
 
 // fast.Buffers.blocks
-std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* B1, float* const* B2, float* const* E) {
+std::vector<const float*> blocks_of(int l, int p, int last_pass, const float* B0, const float* B1, float* const* B2,
+                                    float* const* E) {
   if (l < 1) return {};
   if (l < 7) return {B0};
   if (l < 13) return {B0, B1};
-  if (l < 19) return {B0, B1, B2[l < LOOP_END ? p : 2]};
-  return {B0, B1, B2[2], E[2]};
+  if (l < 19) return {B0, B1, B2[l < LOOP_END ? p : last_pass]};
+  return {B0, B1, B2[last_pass], E[last_pass]};
 }
 
 }  // namespace
 
-Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream)
-    : w_(w), abl_(abl), max_chunk_(max_chunk), stream_(stream), gemm_(std::make_unique<pk::Gemm>()) {
+Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int loop_passes)
+    : w_(w),
+      abl_(abl),
+      max_chunk_(max_chunk),
+      loop_passes_(loop_passes),
+      stream_(stream),
+      gemm_(std::make_unique<pk::Gemm>()) {
   if (max_chunk < 1) throw std::invalid_argument("Prefiller: max_chunk must be positive");
+  if (loop_passes_ < 1 || loop_passes_ > MAX_PASSES)
+    throw std::invalid_argument("Prefiller: loop_passes must be in 1.." + std::to_string(MAX_PASSES));
   const int L = WINDOW + max_chunk;
   kpos_rows_ = (L + pk::kAttnKeyTile - 1) / pk::kAttnKeyTile * pk::kAttnKeyTile;
   if (kpos_rows_ / pk::kAttnKeyTile > pk::kAttnMaxTiles)
@@ -64,7 +72,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
 
   // Persistent across a visit (block states, residual accumulators, message buffer, tiny helpers).
   B0_ = f32(C * H), B1_ = f32(C * H);
-  for (int p = 0; p < PASSES; ++p) B2_[p] = f32(C * H), E_[p] = f32(C * H);
+  for (int p = 0; p < loop_passes_; ++p) B2_[p] = f32(C * H), E_[p] = f32(C * H);
   hid_ = f32(C * H), part_ = f32(C * H), y_ = f32(C * H), y2_ = f32(C * H);
   msgs_ = f32(4 * C * H);
   kpos_ = i32(kpos_rows_);
@@ -268,15 +276,20 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     if (r.row < 0 || r.count < 0 || r.row + r.count > T) throw std::invalid_argument("Prefiller::run: embedding rows outside the chunk");
     pk::put_rows(r.src, r.count, B0_ + std::size_t(r.row) * H, s);
   }
+  if (st.plan.passes > loop_passes_) {
+    throw std::invalid_argument("Prefiller::run: state loop_passes exceeds Prefiller capacity");
+  }
+  const VisitPlan& plan = st.plan;
+  const int last_pass = plan.last_pass();
   int prev_v = -1;
   int tap = 0;
 
-  for (int v = 0; v < NUM_VISITS; ++v) {
-    const int l = VISITS[v].layer, p = VISITS[v].pass;
+  for (int v = 0; v < plan.num_visits; ++v) {
+    const int l = plan.visits[std::size_t(v)].layer, p = plan.visits[std::size_t(v)].pass;
     const Layer& layer = w.layers[l];
     const bool msgs = is_loop_layer(l) && p > 0;
     const bool boundary = l % BLOCK == 0;
-    const std::vector<const float*> blocks = blocks_of(l, p, B0_, B1_, B2_, E_);
+    const std::vector<const float*> blocks = blocks_of(l, p, last_pass, B0_, B1_, B2_, E_);
 
     // ---- hidden entering this visit (the previous MLP write applied), stored where it is a block
     float* hid;
@@ -287,12 +300,12 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     } else if (l == LOOP_START && p > 0) {
       hid = B1_, base = B1_, write = nullptr;
     } else {
-      hid = l == 6 ? B1_ : l == 12 ? B2_[p] : l == 18 ? E_[2] : hid_;
+      hid = l == 6 ? B1_ : l == 12 ? B2_[p] : l == 18 ? E_[last_pass] : hid_;
       base = part_, write = y2_;
     }
     const int pv = prev_v >= 0 ? prev_v : 0;
-    const float* r_prev = mlp_dirs + std::size_t(pv) * H;
-    const float* w_prev = mlp_w + 4 * std::size_t(pv);
+    const float* r_prev = abl_.active ? (mlp_dirs + std::size_t(pv) * H) : mlp_dirs;
+    const float* w_prev = abl_.active ? (mlp_w + 4 * std::size_t(pv)) : mlp_w;
     if (msgs) {
       const int i = l - LOOP_START;
       const float* src_base = i == 0 ? part_ : E_[p - 1];
@@ -379,7 +392,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
         at.window = 0;
       }
     } else {
-      const int ri = RING_INDEX[v];
+      const int ri = plan.ring_index[std::size_t(v)];
       auto* k_ring = static_cast<ActT*>(st.k_ring_at(ri).data);
       auto* v_ring = static_cast<ActT*>(st.v_ring_at(ri).data);
       std::int64_t* ring_pos = st.ring_pos_at(ri);
@@ -414,15 +427,17 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     std::vector<const float*> mlp_blocks = blocks;
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
+    const float* r_attn = abl_.active ? (attn_dirs + std::size_t(v) * H) : attn_dirs;
+    const float* w_attn = abl_.active ? (attn_w + 4 * std::size_t(v)) : attn_w;
     if (msgs) {
-      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1, nullptr,
+      mix(mlp_blocks, mbase, y_, r_attn, w_attn, part_, f32p(layer.mlp_query), 1, nullptr,
           nullptr, mixm_, hooks ? &hooks->depth_ffn[v] : nullptr);
       pk::GateRows rows;
       rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
       gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1),
             xm_);
     } else {
-      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1,
+      mix(mlp_blocks, mbase, y_, r_attn, w_attn, part_, f32p(layer.mlp_query), 1,
           f32p(layer.mlp_norm1), xm_, nullptr, hooks ? &hooks->depth_ffn[v] : nullptr);
     }
     if (hooks) dense::tap_ffn_inp(xm_, T, &hooks->ffn_inp_tap[v], nullptr, pos0, s);
@@ -477,7 +492,9 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   }
 
   // ---- final read, taps, head of the last row
-  mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr,
+  const float* r_last = abl_.active ? (mlp_dirs + std::size_t(prev_v) * H) : mlp_dirs;
+  const float* w_last = abl_.active ? (mlp_w + 4 * std::size_t(prev_v)) : mlp_w;
+  mix({B0_, B1_, B2_[last_pass], E_[last_pass]}, part_, y2_, r_last, w_last, nullptr,
       f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr, hooks ? &hooks->depth_output : nullptr);
   if (tap_out)
     CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,

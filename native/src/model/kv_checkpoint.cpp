@@ -184,8 +184,19 @@ bool producer_trailer_tail_is_zero(const RawHeader& hdr) noexcept {
 }
 
 KvCheckpointInfo info_from_raw_header(const RawHeader& hdr) {
-  if (hdr.num_full_visits != NUM_FULL_VISITS && hdr.num_full_visits != NUM_FULL_SLOTS_LAST_FULL) {
-    throw std::runtime_error("kv_checkpoint: unsupported num_full_visits " + std::to_string(hdr.num_full_visits));
+  if (hdr.num_visits < 24 || (hdr.num_visits - 12) % 12 != 0) {
+    throw std::runtime_error("kv_checkpoint: unsupported num_visits " + std::to_string(hdr.num_visits));
+  }
+  const int passes = (hdr.num_visits - 12) / 12;
+  if (passes < 1 || passes > MAX_PASSES || hdr.num_sliding_visits != 10 + 10 * passes) {
+    throw std::runtime_error("kv_checkpoint: unsupported loop geometry (visits=" + std::to_string(hdr.num_visits) +
+                             " sliding=" + std::to_string(hdr.num_sliding_visits) + ")");
+  }
+  const int expected_per_pass_full = 2 + 2 * passes;
+  const bool valid_last_full_slots = (passes == PASSES && hdr.num_full_visits == NUM_FULL_SLOTS_LAST_FULL);
+  if (hdr.num_full_visits != expected_per_pass_full && !valid_last_full_slots) {
+    throw std::runtime_error("kv_checkpoint: unsupported num_full_visits " + std::to_string(hdr.num_full_visits) +
+                             " for loop_passes=" + std::to_string(passes));
   }
   if (hdr.pos < 0) {
     throw std::runtime_error("kv_checkpoint: negative checkpoint pos " + std::to_string(hdr.pos));
@@ -204,6 +215,7 @@ KvCheckpointInfo info_from_raw_header(const RawHeader& hdr) {
   info.act_dtype = hdr.act_dtype;
   info.kv_format = hdr.kv_format;
   info.num_full_slots = hdr.num_full_visits;
+  info.loop_passes = passes;
   info.has_logits = hdr.has_logits != 0;
 
   if ((hdr.kv_mode_flags & ~kKvModeFlagValid) != 0u) {
@@ -215,7 +227,11 @@ KvCheckpointInfo info_from_raw_header(const RawHeader& hdr) {
       throw std::runtime_error("kv_checkpoint: unsupported kv_cache_mode " + std::to_string(hdr.kv_cache_mode_v2));
     }
     info.kv_cache_mode = (hdr.kv_cache_mode_v2 == 1u) ? KvCacheMode::LastFull : KvCacheMode::PerPass;
-    const int want_slots = (info.kv_cache_mode == KvCacheMode::LastFull) ? NUM_FULL_SLOTS_LAST_FULL : NUM_FULL_VISITS;
+    if (info.kv_cache_mode == KvCacheMode::LastFull && passes != PASSES) {
+      throw std::runtime_error("kv_checkpoint: last_full mode requires loop_passes=3");
+    }
+    const int want_slots =
+        (info.kv_cache_mode == KvCacheMode::LastFull) ? NUM_FULL_SLOTS_LAST_FULL : expected_per_pass_full;
     if (hdr.num_full_visits != want_slots) {
       throw std::runtime_error("kv_checkpoint: kv_cache_mode=" + std::string(to_string(info.kv_cache_mode)) +
                                " disagrees with num_full_visits=" + std::to_string(hdr.num_full_visits));
@@ -232,8 +248,8 @@ KvCheckpointInfo info_from_raw_header(const RawHeader& hdr) {
       info.producer_prefill_chunk = hdr.producer_prefill_chunk;
       std::memcpy(info.producer_sha256.data(), hdr.producer_sha256, 32);
     }
-  } else if (hdr.num_full_visits == NUM_FULL_VISITS) {
-    // Legacy or #827 producer-tagged per_pass header (8 full slots, bytes 192..199 zeroed).
+  } else if (hdr.num_full_visits == expected_per_pass_full) {
+    // Legacy or #827 producer-tagged per_pass header (2+2*L full slots, bytes 192..199 zeroed).
     info.kv_cache_mode = KvCacheMode::PerPass;
     if ((hdr.producer_flags & ~kProducerFlagValid) != 0u) {
       throw std::runtime_error("kv_checkpoint: unsupported producer_flags " + std::to_string(hdr.producer_flags));
@@ -248,7 +264,7 @@ KvCheckpointInfo info_from_raw_header(const RawHeader& hdr) {
       std::memcpy(info.producer_sha256.data(), hdr.producer_sha256, 32);
     }
   } else {
-    // Standalone #829 4-slot file: wrote kv_cache_mode=1 at byte 144 with bytes 148..191 zeroed and NO producer
+    // Standalone #829 4-slot file (L=3): wrote kv_cache_mode=1 at byte 144 with bytes 148..191 zeroed and NO producer
     // trailer. NEVER promote byte 144 to has_producer_identity; fail closed on any other 4-slot legacy layout.
     if (hdr.producer_flags != 1u || !producer_trailer_tail_is_zero(hdr)) {
       throw std::runtime_error("kv_checkpoint: corrupt or ambiguous 4-slot legacy header");
@@ -556,6 +572,11 @@ std::array<std::uint8_t, 32> compute_disk_producer_sha256(const StateIdentity& i
     ctx.update(kKvModeDomain, sizeof(kKvModeDomain) - 1);
     ctx.update(&identity.kv_cache_mode, sizeof(identity.kv_cache_mode));
   }
+  if (identity.loop_passes != PASSES) {
+    static constexpr char kLoopDomain[] = "LOOPPASSES";
+    ctx.update(kLoopDomain, sizeof(kLoopDomain) - 1);
+    ctx.update(&identity.loop_passes, sizeof(identity.loop_passes));
+  }
   return ctx.finish();
 }
 
@@ -616,9 +637,9 @@ void save_kv_checkpoint(State& st, const std::filesystem::path& model_dir,
   hdr.max_ctx_at_save = st.max_ctx;
   hdr.pos = pos;
   hdr.num_full_visits = nfull;
-  hdr.num_sliding_visits = NUM_SLIDING_VISITS;
+  hdr.num_sliding_visits = st.plan.num_sliding_visits;
   hdr.window = WINDOW;
-  hdr.num_visits = NUM_VISITS;
+  hdr.num_visits = st.plan.num_visits;
   hdr.conv_k = CONV_K;
   hdr.has_logits = d_logits ? 1u : 0u;
   hdr.row_bytes = row_b;
@@ -760,14 +781,18 @@ KvCheckpointLoadResult load_kv_checkpoint_checked(
     }
     const int expected_nfull = st.num_full_slots();
     const KvCacheMode expected_mode = st.kv_last_full ? KvCacheMode::LastFull : KvCacheMode::PerPass;
-    if (info.kv_cache_mode != expected_mode || info.num_full_slots != expected_nfull) {
-      throw std::runtime_error("kv_checkpoint: kv_cache_mode mismatch (ckpt=" + std::string(to_string(info.kv_cache_mode)) +
-                               " full_slots=" + std::to_string(info.num_full_slots) + ", engine=" +
-                               std::string(to_string(expected_mode)) + " full_slots=" +
-                               std::to_string(expected_nfull) + ")");
+    if (info.kv_cache_mode != expected_mode || info.num_full_slots != expected_nfull ||
+        info.loop_passes != st.plan.passes) {
+      throw std::runtime_error("kv_checkpoint: kv_cache_mode/loop_passes mismatch (ckpt=" +
+                               std::string(to_string(info.kv_cache_mode)) +
+                               " full_slots=" + std::to_string(info.num_full_slots) +
+                               " loop_passes=" + std::to_string(info.loop_passes) + ", engine=" +
+                               std::string(to_string(expected_mode)) +
+                               " full_slots=" + std::to_string(expected_nfull) +
+                               " loop_passes=" + std::to_string(st.plan.passes) + ")");
     }
-    if (hdr.num_sliding_visits != NUM_SLIDING_VISITS || hdr.window != WINDOW || hdr.num_visits != NUM_VISITS ||
-        hdr.conv_k != CONV_K) {
+    if (hdr.num_sliding_visits != st.plan.num_sliding_visits || hdr.window != WINDOW ||
+        hdr.num_visits != st.plan.num_visits || hdr.conv_k != CONV_K) {
       throw std::runtime_error("kv_checkpoint: model architecture geometry mismatch");
     }
     if (hdr.swa_bytes != swa_total_bytes(st)) {

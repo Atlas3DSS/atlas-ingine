@@ -508,6 +508,80 @@ int main() {
   }
   expect(threw_bad_mode, "parse_kv_cache_mode rejects unknown string");
 
+  // Variable loop depth VisitPlan (L in 1..MAX_PASSES)
+  {
+    StateIdentity lp3;
+    lp3.loop_passes = 3;
+    StateIdentity lp5 = lp3;
+    lp5.loop_passes = 5;
+    expect(!(lp3 == lp5) && hash_state_identity(lp3) != hash_state_identity(lp5),
+           "StateIdentity loop_passes isolation");
+#if INGINE_BACKEND_CUDA
+    expect(compute_disk_producer_sha256(lp3) != compute_disk_producer_sha256(lp5),
+           "producer SHA distinguishes loop_passes 3 vs 5");
+    KvCheckpointInfo info_l5;
+    info_l5.act_dtype = static_cast<std::uint32_t>(ingine::DType::BF16);
+    info_l5.kv_format = 0u;
+    info_l5.kv_cache_mode = KvCacheMode::PerPass;
+    info_l5.loop_passes = 5;
+    info_l5.num_full_slots = 12;
+    expect(kv_checkpoint_runtime_matches(info_l5, lp5), "runtime match same loop_passes=5");
+    expect(!kv_checkpoint_runtime_matches(info_l5, lp3), "runtime reject loop_passes=5 ckpt on L=3 engine");
+#endif
+  }
+  for (int L = 1; L <= MAX_PASSES; ++L) {
+    const VisitPlan plan = make_visit_plan(L);
+    expect(plan.passes == L && plan.last_pass() == L - 1, "VisitPlan passes/last_pass");
+    expect(plan.num_visits == 12 + 12 * L, "VisitPlan num_visits == 12 + 12*L");
+    expect(plan.num_full_visits == 2 + 2 * L, "VisitPlan num_full_visits == 2 + 2*L");
+    expect(plan.num_sliding_visits == 10 + 10 * L, "VisitPlan num_sliding_visits == 10 + 10*L");
+    expect(int(plan.visits.size()) == plan.num_visits, "VisitPlan visits size");
+    int vf = 0, vs = 0;
+    for (int i = 0; i < plan.num_visits; ++i) {
+      const bool full = is_full_layer(plan.visits[std::size_t(i)].layer);
+      expect(full ? (plan.full_index[std::size_t(i)] == vf++ && plan.ring_index[std::size_t(i)] == -1)
+                  : (plan.ring_index[std::size_t(i)] == vs++ && plan.full_index[std::size_t(i)] == -1),
+             "VisitPlan index partitioning");
+    }
+    expect(vf == plan.num_full_visits && vs == plan.num_sliding_visits, "VisitPlan index counts");
+    if (L == PASSES) {
+      expect(plan.num_visits == NUM_VISITS && plan.num_full_visits == NUM_FULL_VISITS &&
+                 plan.num_sliding_visits == NUM_SLIDING_VISITS,
+             "VisitPlan L=3 matches compile-time counts");
+      for (int i = 0; i < NUM_VISITS; ++i) {
+        expect(plan.visits[std::size_t(i)].layer == VISITS[std::size_t(i)].layer &&
+                   plan.visits[std::size_t(i)].pass == VISITS[std::size_t(i)].pass &&
+                   plan.full_index[std::size_t(i)] == FULL_INDEX[std::size_t(i)] &&
+                   plan.ring_index[std::size_t(i)] == RING_INDEX[std::size_t(i)],
+               "VisitPlan L=3 exact parity with VISITS/FULL_INDEX/RING_INDEX");
+      }
+    }
+  }
+  auto expect_throws = [&](int bad_L, const char* what) {
+    bool threw = false;
+    try {
+      (void)make_visit_plan(bad_L);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    expect(threw, what);
+  };
+  expect_throws(0, "VisitPlan rejects L=0");
+  expect_throws(-1, "VisitPlan rejects L=-1");
+  expect_throws(MAX_PASSES + 1, "VisitPlan rejects L=MAX_PASSES+1");
+
+  // Offload prefill VRAM budgeting tracks pass-dependent B2[p]/E[p] buffers (18 KiB/tok per pass)
+  constexpr int kChunk = 1024;
+  const std::size_t prefill_l3 = offload_prefill_vram_bytes(kChunk, 3);
+  const std::size_t prefill_l8 = offload_prefill_vram_bytes(kChunk, 8);
+  const std::size_t prefill_l1 = offload_prefill_vram_bytes(kChunk, 1);
+  expect(prefill_l3 == std::size_t(kChunk) * 280 * 1024 + (std::size_t(48) << 20),
+         "offload_prefill_vram_bytes L=3 matches baseline");
+  expect(prefill_l8 - prefill_l3 == (std::size_t(90) << 20),
+         "offload_prefill_vram_bytes L=8 adds +90 MiB vs L=3 at chunk=1024");
+  expect(prefill_l3 - prefill_l1 == (std::size_t(36) << 20),
+         "offload_prefill_vram_bytes L=1 saves 36 MiB vs L=3 at chunk=1024");
+
   std::printf("%s model_data constants\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }

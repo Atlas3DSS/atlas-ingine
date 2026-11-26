@@ -32,7 +32,7 @@ struct PagedKvConfig {
   int vram_mb = 0;               // VRAM budget for hot KV pages + staging (<= 0 disables paging)
   int ram_mb = 12288;            // pinned UVA host RAM cap in MiB before spilling to Tier-2 NVMe SwapFile
   int prefill_chunk = 512;       // max T for FP32 online-softmax partial buffers
-  int num_full_slots = NUM_FULL_VISITS;  // 8 (per_pass) or 4 (last_full)
+  int num_full_slots = NUM_FULL_VISITS;  // 2 + 2*loop_passes (per_pass) or 4 (last_full, L=3)
   std::filesystem::path swap_dir;  // optional directory for SwapFile (empty -> system temp dir)
 };
 
@@ -167,10 +167,10 @@ class PagedKvCache {
   DeviceBuffer dec_proj16_, dec_q_, dec_rel16_, dec_rel_, decode_ws_;
   MappedHostBuffer dec_pos_host_;
 
-  // Per-visit fixed device page tables [max_pages]
-  std::array<DeviceBuffer, NUM_FULL_VISITS> dev_k_ptrs_, dev_v_ptrs_;
-  std::array<std::vector<void*>, NUM_FULL_VISITS> host_k_ptrs_, host_v_ptrs_;
-  std::array<bool, NUM_FULL_VISITS> table_dirty_{};
+  // Per-visit fixed device page tables [num_full_visits_][max_pages]
+  std::vector<DeviceBuffer> dev_k_ptrs_, dev_v_ptrs_;
+  std::vector<std::vector<void*>> host_k_ptrs_, host_v_ptrs_;
+  std::vector<bool> table_dirty_;
 
   // Tier 1: Lazy chunked pinned UVA HostRegion slabs
   std::vector<HostRegion> ram_chunks_;
@@ -184,8 +184,8 @@ class PagedKvCache {
   std::uint64_t ram_page_count_ = 0;
   std::uint64_t swap_page_count_ = 0;
 
-  // Page metadata [NUM_FULL_VISITS][max_pages]
-  std::array<std::vector<PageMeta>, NUM_FULL_VISITS> meta_;
+  // Page metadata [num_full_visits_][max_pages]
+  std::vector<std::vector<PageMeta>> meta_;
 
   TieredDmaStream dma_;
   cudaEvent_t compute_ready_ = nullptr;

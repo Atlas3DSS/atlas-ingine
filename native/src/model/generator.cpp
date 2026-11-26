@@ -142,9 +142,11 @@ class EngineGenerator final : public Generator {
   KvCacheMode kv_cache_mode() const override { return options_.kv_cache_mode; }
 
   std::vector<KvCacheMode> supported_kv_cache_modes() const override {
-    if (options_.spec) return {KvCacheMode::PerPass};
+    if (options_.spec || options_.loop_passes != PASSES) return {KvCacheMode::PerPass};
     return {KvCacheMode::PerPass, KvCacheMode::LastFull};
   }
+
+  int loop_passes() const override { return options_.loop_passes; }
 
   std::string offload_summary() const override {
     std::string out;
@@ -181,7 +183,7 @@ class EngineGenerator final : public Generator {
       : options_(runtime->options()),
         runtime_(std::move(runtime)),
         rt_(*runtime_),
-        prefiller_(rt_.weights(), rt_.ablation(), rt_.options().prefill_chunk, rt_.stream()),
+        prefiller_(rt_.weights(), rt_.ablation(), rt_.options().prefill_chunk, rt_.stream(), rt_.options().loop_passes),
         chunk_tokens_(std::size_t(rt_.options().prefill_chunk) * sizeof(std::int32_t)),
         logits_(std::size_t(UNPADDED_VOCAB) * sizeof(float)),
         token_(sizeof(std::int32_t)),
@@ -215,6 +217,7 @@ class EngineGenerator final : public Generator {
     base_identity_.dense_fp8 = options_.dense_fp8;
     base_identity_.kv_format = options_.kv_q4 ? 2u : (options_.kv_fp8 ? 1u : 0u);
     base_identity_.kv_cache_mode = static_cast<std::uint32_t>(options_.kv_cache_mode);
+    base_identity_.loop_passes = options_.loop_passes;
     base_identity_.max_ctx = options_.max_ctx;
     base_identity_.prefill_chunk = options_.prefill_chunk;
     base_identity_.spec_enabled = (drafter_ != nullptr);
@@ -1406,12 +1409,21 @@ class EngineGenerator final : public Generator {
 }  // namespace
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
+  if (options.loop_passes < 1 || options.loop_passes > MAX_PASSES) {
+    throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
+  }
 #if INGINE_TP_SIZE > 1
+  if (options.loop_passes != PASSES) {
+    throw std::invalid_argument("--loop-passes != 3 currently requires TP=1");
+  }
   return make_tp_generator(options);
 #endif
   if (options.max_batch > 1) {
     if (options.kv_cache_mode != KvCacheMode::PerPass) {
       throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
+    }
+    if (options.loop_passes != PASSES) {
+      throw std::invalid_argument("--loop-passes != 3 currently requires --max-batch 1");
     }
     if (options.enable_persona_hooks) {
       throw std::invalid_argument("persona hooks require --max-batch 1 (continuous batching with hooked persona tables is not yet enabled)");
@@ -1422,9 +1434,15 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
 }
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options, Weights weights, Ablation ablation) {
+  if (options.loop_passes < 1 || options.loop_passes > MAX_PASSES) {
+    throw std::invalid_argument("loop_passes must be in 1.." + std::to_string(MAX_PASSES));
+  }
   if (options.max_batch > 1) {
     if (options.kv_cache_mode != KvCacheMode::PerPass) {
       throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
+    }
+    if (options.loop_passes != PASSES) {
+      throw std::invalid_argument("--loop-passes != 3 currently requires --max-batch 1");
     }
     if (options.enable_persona_hooks) {
       throw std::invalid_argument("persona hooks require --max-batch 1 (continuous batching with hooked persona tables is not yet enabled)");

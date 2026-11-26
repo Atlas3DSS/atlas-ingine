@@ -29,6 +29,7 @@ struct KvCheckpointInfo {
   std::uint32_t kv_format = 0;  // 0=ACT, 1=FP8, 2=Q4_0
   KvCacheMode kv_cache_mode = KvCacheMode::PerPass;
   int num_full_slots = NUM_FULL_VISITS;
+  int loop_passes = PASSES;
   bool has_logits = false;
   // Optional v1 extended producer identity inside the zero-padded 4096-byte header page.
   // Legacy checkpoints leave these bytes zero (has_producer_identity=false) and cannot establish weights,
@@ -67,11 +68,12 @@ inline constexpr bool kv_checkpoint_act_dtype_matches(std::uint32_t disk_act_dty
 
 inline constexpr bool kv_checkpoint_runtime_matches(const KvCheckpointInfo& info,
                                                     const StateIdentity& req_identity) noexcept {
-  const int expected_slots = (req_identity.kv_cache_mode == 1u) ? NUM_FULL_SLOTS_LAST_FULL : NUM_FULL_VISITS;
+  const int expected_slots =
+      (req_identity.kv_cache_mode == 1u) ? NUM_FULL_SLOTS_LAST_FULL : (2 + 2 * req_identity.loop_passes);
   return kv_checkpoint_act_dtype_matches(info.act_dtype, req_identity.act_dtype) &&
          info.kv_format == req_identity.kv_format &&
          static_cast<std::uint32_t>(info.kv_cache_mode) == req_identity.kv_cache_mode &&
-         info.num_full_slots == expected_slots;
+         info.loop_passes == req_identity.loop_passes && info.num_full_slots == expected_slots;
 }
 
 // Auto-resume eligibility predicate (evaluated on the same opened checkpoint fd used to restore):

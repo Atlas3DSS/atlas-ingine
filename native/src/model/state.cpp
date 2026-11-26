@@ -39,7 +39,8 @@ Tensor State::v_full_at(int full) const {
   return rm(ptr<char>(v_full) + std::size_t(full) * max_ctx * KV_DIM * es, v_full.dtype, {max_ctx, KV_HEADS, HEAD_DIM});
 }
 
-State make_state(int max_ctx, bool kv_fp8, bool kv_q4, const PagedKvConfig& paged_kv, bool kv_last_full) {
+State make_state(int max_ctx, bool kv_fp8, bool kv_q4, const PagedKvConfig& paged_kv, bool kv_last_full,
+                 int loop_passes) {
   // the attention kernel keeps positions in int32 and caps full caches at 2^30 rows
   if (max_ctx < 1 || max_ctx > (1 << 30)) throw std::invalid_argument("max_ctx must be in 1..2^30");
   if (kv_fp8 && kv_q4) throw std::invalid_argument("kv_fp8 and kv_q4 are mutually exclusive");
@@ -49,11 +50,17 @@ State make_state(int max_ctx, bool kv_fp8, bool kv_q4, const PagedKvConfig& page
   st.max_ctx = max_ctx;
   st.kv_fp8 = kv_fp8;
   st.kv_q4 = kv_q4;
+  if (kv_last_full && loop_passes != PASSES) {
+    throw std::invalid_argument("--kv-cache-mode last_full requires --loop-passes 3");
+  }
   st.kv_last_full = kv_last_full;
+  st.plan = make_visit_plan(loop_passes);
+  const int nv = st.plan.num_visits;
   const int nfull = st.num_full_slots();
-  st.k_ring = zeros(st.storage, kActDType, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
-  st.v_ring = zeros(st.storage, kActDType, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
-  st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
+  const int ns = st.plan.num_sliding_visits;
+  st.k_ring = zeros(st.storage, kActDType, {ns, WINDOW, KV_HEADS, HEAD_DIM});
+  st.v_ring = zeros(st.storage, kActDType, {ns, WINDOW, KV_HEADS, HEAD_DIM});
+  st.ring_pos = zeros(st.storage, DType::I64, {ns, WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
   if (use_paged) {
     PagedKvConfig cfg = paged_kv;
@@ -68,10 +75,10 @@ State make_state(int max_ctx, bool kv_fp8, bool kv_q4, const PagedKvConfig& page
     st.k_full = zeros(st.storage, full, {nfull, max_ctx, KV_HEADS, HEAD_DIM});
     st.v_full = zeros(st.storage, full, {nfull, max_ctx, KV_HEADS, HEAD_DIM});
   }
-  st.conv_k = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
-  st.conv_v = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
-  st.conv_attn = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, HIDDEN});
-  st.conv_mlp = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, HIDDEN});
+  st.conv_k = zeros(st.storage, DType::FP32, {nv, CONV_K - 1, KV_DIM});
+  st.conv_v = zeros(st.storage, DType::FP32, {nv, CONV_K - 1, KV_DIM});
+  st.conv_attn = zeros(st.storage, DType::FP32, {nv, CONV_K - 1, HIDDEN});
+  st.conv_mlp = zeros(st.storage, DType::FP32, {nv, CONV_K - 1, HIDDEN});
   st.length = 0;
   return st;
 }
@@ -84,16 +91,18 @@ void reset_state(State& st, cudaStream_t stream) {
   st.length = 0;
 }
 
-Buffers make_buffers(int m) {
+Buffers make_buffers(int m, int loop_passes) {
   if (m < 1 || m > 8) throw std::invalid_argument("call width must be in 1..8");
+  const VisitPlan plan = make_visit_plan(loop_passes);
   Buffers b;
   b.m = m;
+  b.passes = plan.passes;
   auto& s = b.storage;
   const int H = HIDDEN;
   b.token = zeros(s, DType::I64, {m});
   b.B0 = zeros(s, DType::FP32, {m, H});
   b.B1 = zeros(s, DType::FP32, {m, H});
-  for (int p = 0; p < PASSES; ++p) {
+  for (int p = 0; p < plan.passes; ++p) {
     b.B2[p] = zeros(s, DType::FP32, {m, H});
     b.E[p] = zeros(s, DType::FP32, {m, H});
   }
@@ -115,20 +124,21 @@ Buffers make_buffers(int m) {
   b.xf = zeros(s, kActDType, {1, m, H});
   b.logits = zeros(s, DType::FP32, {m, UNPADDED_VOCAB});
   b.taps = zeros(s, kActDType, {m, NUM_TAPS, H});
-  b.hist_attn = zeros(s, DType::FP32, {NUM_VISITS, m, H});
-  b.hist_mlp = zeros(s, DType::FP32, {NUM_VISITS, m, H});
-  b.hist_k = zeros(s, DType::FP32, {NUM_VISITS, m, KV_DIM});
-  b.hist_v = zeros(s, DType::FP32, {NUM_VISITS, m, KV_DIM});
+  b.hist_attn = zeros(s, DType::FP32, {plan.num_visits, m, H});
+  b.hist_mlp = zeros(s, DType::FP32, {plan.num_visits, m, H});
+  b.hist_k = zeros(s, DType::FP32, {plan.num_visits, m, KV_DIM});
+  b.hist_v = zeros(s, DType::FP32, {plan.num_visits, m, KV_DIM});
   return b;
 }
 
 std::vector<const float*> Buffers::blocks(int l, int p) const {
   auto f = [](const Tensor& t) { return static_cast<const float*>(t.data); };
+  const int last_pass = passes - 1;
   if (l < 1) return {};
   if (l < 7) return {f(B0)};
   if (l < 13) return {f(B0), f(B1)};
-  if (l < 19) return {f(B0), f(B1), f(B2[l < LOOP_END ? p : 2])};
-  return {f(B0), f(B1), f(B2[2]), f(E[2])};
+  if (l < 19) return {f(B0), f(B1), f(B2[l < LOOP_END ? p : last_pass])};
+  return {f(B0), f(B1), f(B2[last_pass]), f(E[last_pass])};
 }
 
 }  // namespace ingine::model

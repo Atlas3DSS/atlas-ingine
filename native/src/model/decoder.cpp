@@ -129,8 +129,14 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  for (int v = 0; v < NUM_VISITS; ++v) {
-    const int l = VISITS[v].layer, p = VISITS[v].pass;
+  const VisitPlan& plan = st.plan;
+  const int last_pass = plan.last_pass();
+  if (b.passes != plan.passes) {
+    throw std::invalid_argument("Decoder::decode: Buffers loop_passes mismatch");
+  }
+
+  for (int v = 0; v < plan.num_visits; ++v) {
+    const int l = plan.visits[std::size_t(v)].layer, p = plan.visits[std::size_t(v)].pass;
     const Layer& layer = w.layers[l];
     const bool loop = is_loop_layer(l);
     const bool msgs = loop && p > 0;
@@ -146,12 +152,12 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     } else if (l == LOOP_START && p > 0) {
       hid = f32m(b.B1), base = f32p(b.B1), write = nullptr;
     } else {
-      hid = l == 6 ? f32m(b.B1) : l == 12 ? f32m(b.B2[p]) : l == 18 ? f32m(b.E[2]) : f32m(b.hid);
+      hid = l == 6 ? f32m(b.B1) : l == 12 ? f32m(b.B2[p]) : l == 18 ? f32m(b.E[last_pass]) : f32m(b.hid);
       base = f32p(b.part), write = f32p(b.y2);
     }
     const int pv = prev_v >= 0 ? prev_v : 0;
-    const float* r_prev = mlp_dirs + std::size_t(pv) * H;
-    const float* w_prev = mlp_w + 4 * std::size_t(pv);
+    const float* r_prev = abl.active ? (mlp_dirs + std::size_t(pv) * H) : mlp_dirs;
+    const float* w_prev = abl.active ? (mlp_w + 4 * std::size_t(pv)) : mlp_w;
     dense::MixParams msg_mix;  // message visits: launched together with the attention read (independent of it)
     if (msgs) {
       const int i = l - LOOP_START;
@@ -234,7 +240,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
         attn::attn_decode(a, stream);
       }
     } else {
-      const int ri = RING_INDEX[v];
+      const int ri = plan.ring_index[std::size_t(v)];
       a.k_conv = f32p(layer.k_conv);
       a.v_conv = f32p(layer.v_conv);
       a.k_cache = st.k_ring_at(ri).data;
@@ -254,10 +260,12 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     std::vector<const float*> mlp_blocks = blocks;
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
+    const float* r_attn = abl.active ? (attn_dirs + std::size_t(v) * H) : attn_dirs;
+    const float* w_attn = abl.active ? (attn_w + 4 * std::size_t(v)) : attn_w;
     dense::MixParams mp =
-        msgs ? mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), f32m(b.part),
+        msgs ? mix_params(mlp_blocks, mbase, f32p(b.y), r_attn, w_attn, f32m(b.part),
                           &layer.mlp_query, nullptr, nullptr, f32m(b.mixm))
-             : mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), f32m(b.part),
+             : mix_params(mlp_blocks, mbase, f32p(b.y), r_attn, w_attn, f32m(b.part),
                           &layer.mlp_query, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr);
     if (history) {  // b.hist_k/hist_v[v] = proj_out[:, K/V segment]
       int c = 0;
@@ -320,9 +328,11 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   }
   // ---- final read; the same launch writes b.taps[:, 3] = b.xf
   const Tensor final_norm1 = rm(w.final_norm.data, DType::FP32, {1, H});
-  dense::MixParams fp = mix_params({f32p(b.B0), f32p(b.B1), f32p(b.B2[2]), f32p(b.E[2])}, f32p(b.part), f32p(b.y2),
-                                   mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr, &w.final_query,
-                                   f32p(final_norm1), bf16m(b.xf), nullptr);
+  const float* r_last = abl.active ? (mlp_dirs + std::size_t(prev_v) * H) : mlp_dirs;
+  const float* w_last = abl.active ? (mlp_w + 4 * std::size_t(prev_v)) : mlp_w;
+  dense::MixParams fp = mix_params({f32p(b.B0), f32p(b.B1), f32p(b.B2[last_pass]), f32p(b.E[last_pass])}, f32p(b.part),
+                                   f32p(b.y2), r_last, w_last, nullptr, &w.final_query, f32p(final_norm1), bf16m(b.xf),
+                                   nullptr);
   fp.out_copy = taps + std::size_t(tap) * H;
   fp.out_copy_stride = std::int64_t(NUM_TAPS) * H;
   if (hooks) dense::mix_hooked(fp, &hooks->depth_output, pos, 0, false, stream);

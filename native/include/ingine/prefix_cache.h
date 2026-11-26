@@ -23,7 +23,8 @@ struct StateIdentity {
   std::uint32_t act_dtype = 0;                  // 0 = BF16, 1 = FP16
   bool dense_fp8 = true;
   std::uint32_t kv_format = 0;                  // 0 = ACT (BF16/FP16), 1 = FP8, 2 = Q4_0
-  std::uint32_t kv_cache_mode = 0;              // 0 = per_pass (8 full slots), 1 = last_full (4 full slots)
+  std::uint32_t kv_cache_mode = 0;              // 0 = per_pass (2+2*L full slots), 1 = last_full (4 full slots, L=3)
+  int loop_passes = 3;                          // recurrent loop passes (1..8, default 3)
   int max_ctx = 0;
   int prefill_chunk = 0;
   bool spec_enabled = false;
@@ -53,6 +54,7 @@ inline std::uint64_t hash_state_identity(const StateIdentity& id) noexcept {
   h = detail::fnv1a_mix(h, &id.dense_fp8, sizeof(id.dense_fp8));
   h = detail::fnv1a_mix(h, &id.kv_format, sizeof(id.kv_format));
   h = detail::fnv1a_mix(h, &id.kv_cache_mode, sizeof(id.kv_cache_mode));
+  h = detail::fnv1a_mix(h, &id.loop_passes, sizeof(id.loop_passes));
   h = detail::fnv1a_mix(h, &id.max_ctx, sizeof(id.max_ctx));
   h = detail::fnv1a_mix(h, &id.prefill_chunk, sizeof(id.prefill_chunk));
   h = detail::fnv1a_mix(h, &id.spec_enabled, sizeof(id.spec_enabled));

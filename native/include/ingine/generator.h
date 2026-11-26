@@ -194,6 +194,8 @@ struct RuntimeOptions {
   int max_batch = 1;
   // Shared paged full-attention KV pool capacity in tokens (0 = auto-size from free VRAM).
   int max_kv_tokens = 0;
+  // Number of recurrent passes over layers 6..17 (default 3 = 48 visits; 1..8 supported for varloop models).
+  int loop_passes = 3;
   // Mech-interp / persona hook options: pre-capture hooked CUDA graphs when enabled, and enforce refusal map.
   bool enable_persona_hooks = false;
   std::filesystem::path refusal_map;
@@ -236,9 +238,11 @@ class Generator {
   }
   virtual bool supports_images() const { return false; }
   virtual KvCacheMode kv_cache_mode() const { return KvCacheMode::PerPass; }
-  // Modes supported by this worker's execution profile (e.g. {"per_pass", "last_full"} for B=1 non-spec TP=1,
-  // or {"per_pass"} for speculative, continuous-batch B>1, or TP>1 workers). Active mode is fixed at worker init.
+  // Modes supported by this worker's execution profile (e.g. {"per_pass", "last_full"} for B=1 non-spec TP=1 L=3,
+  // or {"per_pass"} for speculative, continuous-batch B>1, TP>1, or --loop-passes != 3 workers). Active mode is fixed
+  // at worker init.
   virtual std::vector<KvCacheMode> supported_kv_cache_modes() const { return {kv_cache_mode()}; }
+  virtual int loop_passes() const { return 3; }
   virtual std::string offload_summary() const { return {}; }
   virtual PrefixCacheStats cache_stats() const { return {}; }
 

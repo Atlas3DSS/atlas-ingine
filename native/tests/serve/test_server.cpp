@@ -90,10 +90,10 @@ struct Served {
 
 std::unique_ptr<Served> serve(std::string text = THINK_TEXT, double delay = 0.0, int max_queue = 4,
                               int max_model_len = 0, FakeGenerator::Responder responder = {},
-                              ingine::model::Sampling sampling = {}) {
+                              ingine::model::Sampling sampling = {}, int loop_passes = 3) {
   auto s = std::make_unique<Served>();
   if (!responder) responder = [text](std::span<const int32_t>) { return FakeGenerator::Output(text); };
-  s->gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-test", 1 << 20, responder, delay);
+  s->gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-test", 1 << 20, responder, delay, loop_passes);
   ingine::serve::ServerOptions options;
   options.max_queue = max_queue;
   options.max_model_len = max_model_len;
@@ -327,7 +327,7 @@ void test_models_and_health() {
   CHECK(body["data"].size() == 1);
   const Json& m = body["data"][0];
   CHECK(m["id"] == "inkling-test" && m["object"] == "model" && m["created"].is_number_integer());
-  CHECK(m["owned_by"].is_string() && m["max_model_len"] == (1 << 20));
+  CHECK(m["owned_by"].is_string() && m["max_model_len"] == (1 << 20) && m["loop_passes"] == 3);
   CHECK(m["kv_cache_mode"] == "per_pass");
   CHECK(m["supported_kv_cache_modes"] == Json::array({"per_pass", "last_full"}));
   CHECK(m["kv_cache_mode_mutable"] == false);
@@ -336,7 +336,8 @@ void test_models_and_health() {
   Response hr = request(s->port(), "GET", "/health");
   CHECK(hr.status == 200 && header(hr.headers, "X-Ingine-Kv-Cache-Mode") == "per_pass");
   Json h = Json::parse(hr.body);
-  CHECK(h["status"] == "ok" && h["model"] == "inkling-test" && h["kv_cache_mode"] == "per_pass" &&
+  CHECK(h["status"] == "ok" && h["model"] == "inkling-test" && h["loop_passes"] == 3 &&
+        h["kv_cache_mode"] == "per_pass" &&
         h["supported_kv_cache_modes"] == Json::array({"per_pass", "last_full"}) &&
         h["kv_cache_mode_mutable"] == false && h["waiting"] == 0 && h["running"] == false && h["max_queue"] == 4);
   CHECK(request(s->port(), "GET", "/health/").status == 200);
@@ -344,6 +345,13 @@ void test_models_and_health() {
   CHECK(nope.status == 404 && Json::parse(nope.body)["error"]["type"] == "not_found_error");
   CHECK(Json::parse(nope.body)["error"]["message"] == "no route for GET /nope");
   CHECK(request(s->port(), "POST", "/v1/completions", "{}").status == 404);
+
+  // Non-default loop_passes metadata propagation (/health, /v1/models, /v1/models/<id>)
+  auto s5 = serve(THINK_TEXT, 0.0, 4, 0, {}, {}, 5);
+  Json m5 = Json::parse(request(s5->port(), "GET", "/v1/models").body)["data"][0];
+  CHECK(m5["loop_passes"] == 5);
+  CHECK(Json::parse(request(s5->port(), "GET", "/v1/models/inkling-test").body)["loop_passes"] == 5);
+  CHECK(health(s5->port())["loop_passes"] == 5);
 }
 
 void test_non_streaming() {

@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
   std::string concurrency_csv;
   int max_ctx = 32768, prefill_chunk = 3072, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0,
       forced_free = -1;
-  int max_batch = 0, max_kv_tokens = 0, park_mb = -1, park_host_mb = 0;
+  int max_batch = 0, max_kv_tokens = 0, park_mb = -1, park_host_mb = 0, loop_passes = 3;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false, vision = false, atlas_6g = false,
@@ -232,6 +232,7 @@ int main(int argc, char** argv) {
             &concurrency_csv);
   ap.option("--max-batch", "", "override max batch slots (default: max of --concurrency, or 1)", &max_batch);
   ap.option("--max-kv-tokens", "", "shared paged full-KV token pool capacity (0 = auto)", &max_kv_tokens);
+  ap.option("--loop-passes", "", "recurrent loop passes over layers 6..17 (1..8, default 3 = 48 visits)", &loop_passes);
   ap.flag("--ignore-eos", "with --concurrency: decode full --tokens per request (steady-state peak throughput)", &ignore_eos);
   ap.flag("--staggered", "with --concurrency: also run a staggered mid-generation continuous-batching arrival pass", &staggered);
   ap.flag("--no-prefix-cache", "disable prefix checkpoint caching (cache-off parity baseline)", &no_prefix_cache);
@@ -292,13 +293,14 @@ int main(int argc, char** argv) {
     options.max_batch = resolved_max_batch;
     options.max_kv_tokens = max_kv_tokens;
     options.prefix_cache = !no_prefix_cache;
+    options.loop_passes = loop_passes;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;
     cudaMemGetInfo(&free1, &total);
     const double vram_gb = double(free0 > free1 ? free0 - free1 : 0) / 1e9;
-    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s)\n", load_s, vram_gb,
-                gen->max_batch_size(), ingine::model::to_string(gen->kv_cache_mode()));
+    std::printf("load+capture %.1fs, GPU %.2f GB (max_batch=%d, kv_cache_mode=%s, loop_passes=%d)\n", load_s, vram_gb,
+                gen->max_batch_size(), ingine::model::to_string(gen->kv_cache_mode()), gen->loop_passes());
     std::fflush(stdout);
     if (!forced.empty()) {
       std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace, forced_free).c_str());

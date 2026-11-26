@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
   std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
-  int max_batch = 1, max_kv_tokens = 0;
+  int max_batch = 1, max_kv_tokens = 0, loop_passes = 3;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
@@ -165,6 +165,7 @@ int main(int argc, char** argv) {
             "trusted proxy header scoping prefix cache per tenant (default: single trusted server scope; requests "
             "with Authorization/user/prompt_cache_key fail-closed bypass reuse when unset)",
             &cache_namespace_header);
+  ap.option("--loop-passes", "", "recurrent loop passes over layers 6..17 (1..8, default 3 = 48 visits)", &loop_passes);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
   ap.option("--log-level", "", "", &log_level);
@@ -177,6 +178,10 @@ int main(int argc, char** argv) {
   if (image_max_tokens < 1 || image_max_tokens > ingine::image::MAX_TOKENS || max_images < 0 || max_image_tokens < 0) {
     std::cerr << "ingine-serve: error: --image-max-tokens must be in [1, " << ingine::image::MAX_TOKENS
               << "] and --max-images, --max-image-tokens at least 0\n";
+    return 2;
+  }
+  if (loop_passes < 1 || loop_passes > 8) {
+    std::cerr << "ingine-serve: error: --loop-passes must be in [1, 8]\n";
     return 2;
   }
   if (temperature > 2 || top_p == 0 || top_p > 1) {
@@ -220,7 +225,7 @@ int main(int argc, char** argv) {
     if (fake) {
       generator = std::make_unique<ingine::engine::FakeGenerator>(
           fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir), ingine::engine::FakeGenerator::Responder{},
-          fake_delay);
+          fake_delay, loop_passes);
     } else {
 #ifdef INGINE_WITH_MODEL
       ingine::model::RuntimeOptions options;
@@ -262,6 +267,7 @@ int main(int argc, char** argv) {
       options.dump_router_stats = dump_router_stats;
       options.max_batch = max_batch;
       options.max_kv_tokens = max_kv_tokens;
+      options.loop_passes = loop_passes;
       options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
       options.refusal_map = refusal_map;
       generator = ingine::model::make_generator(options);

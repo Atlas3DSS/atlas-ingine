@@ -39,7 +39,7 @@ struct EmbedRows {
 
 class Prefiller {
  public:
-  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream);
+  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int loop_passes = PASSES);
   ~Prefiller();
   Prefiller(const Prefiller&) = delete;
   Prefiller& operator=(const Prefiller&) = delete;
@@ -57,13 +57,14 @@ class Prefiller {
   const Weights& w_;
   const Ablation& abl_;
   int max_chunk_;
+  int loop_passes_;
   cudaStream_t stream_;
   std::unique_ptr<kernels::prefill::Gemm> gemm_;
   std::vector<DeviceBuffer> storage_;
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
 
   // activations (rows = max_chunk), see prefill.cpp
-  float *B0_, *B1_, *B2_[PASSES], *E_[PASSES], *hid_, *part_, *y_, *y2_;
+  float *B0_, *B1_, *B2_[MAX_PASSES]{}, *E_[MAX_PASSES]{}, *hid_, *part_, *y_, *y2_;
   ActT *xin_, *xm_, *xf_;
   float *mixf_, *msgs_, *mixm_;
   ActT *proj_, *q_, *rel16_, *rel_, *krows_, *vrows_, *attn_out_, *wo_out_;

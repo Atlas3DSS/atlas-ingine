@@ -60,10 +60,11 @@ std::optional<std::pair<std::string, std::string>> match_call(std::string_view s
 }  // namespace
 
 FakeGenerator::FakeGenerator(const text::Tokenizer& tokenizer, std::string model_id, int max_model_len,
-                             Responder responder, double token_delay)
+                             Responder responder, double token_delay, int loop_passes)
     : tokenizer_(tokenizer),
       model_id_(std::move(model_id)),
       max_model_len_(max_model_len),
+      loop_passes_(loop_passes),
       responder_(std::move(responder)),
       token_delay_(token_delay) {}
 

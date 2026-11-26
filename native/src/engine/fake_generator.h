@@ -42,10 +42,12 @@ class FakeGenerator final : public model::Generator {
   };
 
   explicit FakeGenerator(const text::Tokenizer& tokenizer, std::string model_id = "Inkling-2-Mini-fake",
-                         int max_model_len = 1 << 20, Responder responder = {}, double token_delay = 0.0);
+                         int max_model_len = 1 << 20, Responder responder = {}, double token_delay = 0.0,
+                         int loop_passes = 3);
 
   std::string model_id() const override { return model_id_; }
   int max_model_len() const override { return max_model_len_; }
+  int loop_passes() const override { return loop_passes_; }
   model::GenerateStats generate(std::span<const int32_t> prompt, int max_new_tokens,
                                 const model::Sampling& sampling, std::span<const int32_t> stop_ids,
                                 const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
@@ -77,6 +79,7 @@ class FakeGenerator final : public model::Generator {
   const text::Tokenizer& tokenizer_;
   std::string model_id_;
   int max_model_len_;
+  int loop_passes_;
   Responder responder_;
   double token_delay_;
   model::KvCacheMode kv_cache_mode_ = model::KvCacheMode::PerPass;
