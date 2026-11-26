@@ -44,23 +44,56 @@ int main() {
   expect(VISITS[TAP_VISITS[0]].layer == 5 && VISITS[TAP_VISITS[1]].layer == 11 && VISITS[TAP_VISITS[1]].pass == 1 &&
              VISITS[TAP_VISITS[2]].layer == 17 && VISITS[TAP_VISITS[2]].pass == 2,
          "tap visits");
-  // SPEC row order: q 3072 | gate 3072 | rel 384 | sink 24 | k 1024 | v 1024 | k_dyn 32 | v_dyn 32
-  const int begin[] = {0, 3072, 6144, 6528, 6552, 7576, 8600, 8632, 8664};
+  // SPEC row order: q | gate | rel | sink (padded to mult of 8) | k | v | k_dyn | v_dyn.
+  // Per-rank counts scale with HEADS = TOTAL_HEADS / TP_SIZE and KV_HEADS = TOTAL_KV_HEADS / TP_SIZE.
+  static_assert(TP_SIZE == 1 || TP_SIZE == 2 || TP_SIZE == 4);
+  constexpr int q_rows = (TOTAL_HEADS / TP_SIZE) * HEAD_DIM;
+  constexpr int rel_rows = (TOTAL_HEADS / TP_SIZE) * D_REL;
+  constexpr int sink_rows = ((TOTAL_HEADS / TP_SIZE) + 7) & ~7;
+  constexpr int kv_rows = (TOTAL_KV_HEADS / TP_SIZE) * HEAD_DIM;
+  constexpr int dyn_rows = (TOTAL_KV_HEADS / TP_SIZE) * CONV_K;
+  const int begin[] = {
+      0,
+      q_rows,
+      2 * q_rows,
+      2 * q_rows + rel_rows,
+      2 * q_rows + rel_rows + sink_rows,
+      2 * q_rows + rel_rows + sink_rows + kv_rows,
+      2 * q_rows + rel_rows + sink_rows + 2 * kv_rows,
+      2 * q_rows + rel_rows + sink_rows + 2 * kv_rows + dyn_rows,
+      2 * q_rows + rel_rows + sink_rows + 2 * kv_rows + 2 * dyn_rows,
+  };
   for (int s = 0; s <= NUM_SEGS; ++s) expect(SEG_BEGIN[s] == begin[s], "projection layout");
-  expect(PROJ_ROWS_SLIDING == 8600 && PROJ_ROWS_FULL == 8664, "projection rows");
-  expect(KV_Q4_ROW_BYTES == 576 && NUM_FULL_VISITS * 2 * KV_Q4_ROW_BYTES == 9216, "q4 kv row bytes (9 KiB/tok)");
+  if constexpr (TP_SIZE == 1) {
+    expect(PROJ_ROWS_SLIDING == 8600 && PROJ_ROWS_FULL == 8664, "projection rows (TP1)");
+  } else if constexpr (TP_SIZE == 2) {
+    expect(PROJ_ROWS_SLIDING == 4304 && PROJ_ROWS_FULL == 4336, "projection rows (TP2)");
+  } else {
+    expect(PROJ_ROWS_SLIDING == begin[SEG_K_DYN] && PROJ_ROWS_FULL == begin[NUM_SEGS], "projection rows (TP4)");
+  }
+  expect(KV_Q4_ROW_BYTES == 576 / TP_SIZE && NUM_FULL_VISITS * 2 * KV_Q4_ROW_BYTES == 9216 / TP_SIZE,
+         "q4 kv row bytes (9 KiB/tok global, per-rank / TP_SIZE)");
 
   // 1M-token (1,048,576) 64-bit byte-size, pitch, and offset overflow checks (no GPU needed)
   constexpr int kOneM = 1 << 20;
   const ingine::Tensor kq4 = rm(nullptr, ingine::DType::U8, {NUM_FULL_VISITS, kOneM, KV_Q4_ROW_BYTES});
-  expect(kq4.bytes() == 4831838208ull, "1M q4_0 k_full == 4.50 GiB");
-  expect(kq4.bytes() * 2 == 9663676416ull, "1M q4_0 k+v == 9.00 GiB");
-  // Visit 7 offset exceeds 32-bit uint32_t max (4,294,967,295): verify 64-bit pointer arithmetic
+  expect(kq4.bytes() == 4831838208ull / TP_SIZE && kq4.bytes() * TP_SIZE == 4831838208ull,
+         "1M q4_0 k_full == 4.50 GiB / TP_SIZE");
+  expect(kq4.bytes() * 2 == 9663676416ull / TP_SIZE && kq4.bytes() * 2 * TP_SIZE == 9663676416ull,
+         "1M q4_0 k+v == 9.00 GiB / TP_SIZE");
+  // Visit 7 offset (full model exceeds 32-bit uint32_t max 4,294,967,295): verify 64-bit pointer arithmetic
   const std::size_t q4_visit7 = std::size_t(NUM_FULL_VISITS - 1) * std::size_t(kOneM) * KV_Q4_ROW_BYTES;
-  expect(q4_visit7 == 4227858432ull, "1M q4_0 visit 7 byte offset");
+  expect(q4_visit7 == 4227858432ull / TP_SIZE && q4_visit7 * TP_SIZE == 4227858432ull,
+         "1M q4_0 visit 7 byte offset");
   const ingine::Tensor kbf16 = rm(nullptr, ingine::DType::BF16, {NUM_FULL_VISITS, kOneM, KV_HEADS, HEAD_DIM});
-  expect(kbf16.bytes() == 17179869184ull, "1M bf16 k_full == 16.00 GiB");
-  expect(kbf16.bytes() / NUM_FULL_VISITS == 2147483648ull, "1M bf16 per-visit pitch == 2.00 GiB (> INT32_MAX)");
+  expect(kbf16.bytes() == 17179869184ull / TP_SIZE && kbf16.bytes() * TP_SIZE == 17179869184ull,
+         "1M bf16 k_full == 16.00 GiB / TP_SIZE");
+  expect(kbf16.bytes() / NUM_FULL_VISITS == 2147483648ull / TP_SIZE,
+         "1M bf16 per-visit pitch == 2.00 GiB / TP_SIZE");
+  const ingine::Tensor kbf16_full =
+      rm(nullptr, ingine::DType::BF16, {NUM_FULL_VISITS, kOneM, TOTAL_KV_HEADS, HEAD_DIM});
+  expect(kbf16_full.bytes() == 17179869184ull && kbf16_full.bytes() / NUM_FULL_VISITS == 2147483648ull,
+         "1M bf16 global per-visit pitch == 2.00 GiB (> INT32_MAX)");
   // log_scale at 1M: float(pos + 1) exact (< 2^24), tau = 1 + 0.1 * ln(128) ~= 1.485203
   const float pos_f = float(kOneM);
   const float tau_1m = 1.f + 0.1f * std::log(std::fmax(pos_f * (1.f / 8192.f), 1.f));
@@ -481,10 +514,12 @@ int main() {
          "L11 passes 0,1,2 share slot 1");
   expect(FULL_INDEX_LAST_FULL[17] == 2 && FULL_INDEX_LAST_FULL[29] == 2 && FULL_INDEX_LAST_FULL[41] == 2,
          "L17 passes 0,1,2 share slot 2");
-  // Verify projected 1M-token Q4_0 full-KV buffer size: 9.00 GiB -> 4.50 GiB (exact 50% of full-KV buffer).
+  // Verify projected 1M-token Q4_0 full-KV buffer size: 9.00 GiB -> 4.50 GiB global (per-rank / TP_SIZE).
   const ingine::Tensor kq4_lf = rm(nullptr, ingine::DType::U8, {NUM_FULL_SLOTS_LAST_FULL, kOneM, KV_Q4_ROW_BYTES});
-  expect(kq4_lf.bytes() == 2415919104ull, "1M q4_0 last_full k_full == 2.25 GiB");
-  expect(kq4_lf.bytes() * 2 == 4831838208ull, "1M q4_0 last_full k+v == 4.50 GiB");
+  expect(kq4_lf.bytes() == 2415919104ull / TP_SIZE && kq4_lf.bytes() * TP_SIZE == 2415919104ull,
+         "1M q4_0 last_full k_full == 2.25 GiB / TP_SIZE");
+  expect(kq4_lf.bytes() * 2 == 4831838208ull / TP_SIZE && kq4_lf.bytes() * 2 * TP_SIZE == 4831838208ull,
+         "1M q4_0 last_full k+v == 4.50 GiB / TP_SIZE");
   // State helper methods match mode.
   State st_pp;
   st_pp.kv_last_full = false;
