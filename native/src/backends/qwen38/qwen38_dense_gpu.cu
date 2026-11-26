@@ -357,7 +357,7 @@ struct Qwen38DenseBackend::Impl {
   void forward_range(Qwen38DenseSession& sess, std::span<const std::int32_t> token_ids,
                      std::span<const int> sorted_capture_positions, bool use_chunk_prefill,
                      const ingine::model::LogitCallback& on_logits, double* prefill_ms_out,
-                     std::span<const std::uint8_t> token_mask = {}) {
+                     std::span<const std::uint8_t> token_mask = {}, bool capture_tip_logits = true) {
     ctx.bind_to_current_thread();
     const auto& c = manifest.config;
     const int S = static_cast<int>(token_ids.size());
@@ -443,14 +443,24 @@ struct Qwen38DenseBackend::Impl {
 
       std::vector<int> local_rows;
       std::vector<int> global_rows;
+      std::vector<bool> emit_cb;
+      const int tip_gp = pos_start + S - 1;
       while (cap_idx < sorted_capture_positions.size() && sorted_capture_positions[cap_idx] < global_pos + M) {
         const int gp = sorted_capture_positions[cap_idx];
-        local_rows.push_back(gp - global_pos);
-        global_rows.push_back(gp);
+        if (on_logits || gp == tip_gp) {
+          local_rows.push_back(gp - global_pos);
+          global_rows.push_back(gp);
+          emit_cb.push_back(static_cast<bool>(on_logits));
+        }
         ++cap_idx;
       }
+      if (capture_tip_logits && (off + M == S) && (global_rows.empty() || global_rows.back() != tip_gp)) {
+        local_rows.push_back(M - 1);
+        global_rows.push_back(tip_gp);
+        emit_cb.push_back(false);
+      }
 
-      if (!local_rows.empty() && on_logits) {
+      if (!local_rows.empty()) {
         for (std::size_t b0 = 0; b0 < local_rows.size(); b0 += kLogitBatchMax) {
           const int bc = static_cast<int>(std::min<std::size_t>(kLogitBatchMax, local_rows.size() - b0));
           const float* x_cap = nullptr;
@@ -469,14 +479,17 @@ struct Qwen38DenseBackend::Impl {
                                      cudaMemcpyDeviceToHost, ctx.stream));
           ctx.synchronize();
           for (int r = 0; r < bc; ++r) {
-            const int gp = global_rows[b0 + static_cast<std::size_t>(r)];
+            const std::size_t row_idx = b0 + static_cast<std::size_t>(r);
+            const int gp = global_rows[row_idx];
             const std::span<const float> row_logits(
                 host_logits_stage.data() + static_cast<std::size_t>(r) * V, static_cast<std::size_t>(V));
-            if (gp == pos_start + S - 1) {
+            if (gp == tip_gp) {
               sess.state_->tip_logits.assign(row_logits.begin(), row_logits.end());
               sess.state_->index.set_tip_logits(gp);
             }
-            on_logits(ingine::model::LogitStep{gp, row_logits});
+            if (on_logits && emit_cb[row_idx]) {
+              on_logits(ingine::model::LogitStep{gp, row_logits});
+            }
           }
         }
       }
@@ -1418,11 +1431,13 @@ void Qwen38DenseBackend::evaluate_teacher_forced_on_session(Qwen38DenseSession& 
         sess.state_->index.tip_logits_pos() == caps.front() &&
         sess.state_->tip_logits.size() == static_cast<std::size_t>(V);
     if (!tip_covers_only_last) {
+      const std::size_t pre_restore_tip = sess.committed_tokens().size();
       const std::size_t prev = sess.restorable_prefix_len(static_cast<std::size_t>(caps.front()));
       if (prev > 0 && sess.try_restore_prefix(prev)) {
         lk.reused_tokens = prev;
-        lk.reuse = (prev == sess.committed_tokens().size()) ? ingine::model::Reuse::Extend
-                                                           : ingine::model::Reuse::Checkpoint;
+        lk.reuse =
+            (prev == pre_restore_tip) ? ingine::model::Reuse::Extend : ingine::model::Reuse::Checkpoint;
+        lk.reason = (lk.reuse == ingine::model::Reuse::Extend) ? "exact_prefix_match" : "exact_checkpoint_match";
       } else {
         lk = ingine::model::SessionLookupResult{false, 0, ingine::model::Reuse::None,
                                                 "capture_before_reused_prefix"};
@@ -1629,6 +1644,7 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate_request_on_session(
       if (prev > 0 && sess.try_restore_prefix(prev)) {
         lookup.reused_tokens = prev;
         lookup.reuse = ingine::model::Reuse::Checkpoint;
+        lookup.reason = "exact_checkpoint_match";
       } else {
         lookup = ingine::model::SessionLookupResult{false, 0, ingine::model::Reuse::None, "tip_logits_unavailable"};
       }

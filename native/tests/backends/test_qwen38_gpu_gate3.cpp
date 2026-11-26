@@ -147,6 +147,7 @@ std::string read_text_file(const std::filesystem::path& p) {
 struct CapturedRun {
   GenerateStats stats;
   std::vector<std::int32_t> greedy_ids;
+  std::vector<int> step_positions;
   std::vector<std::vector<float>> step_logits;
   double elapsed_ms = 0.0;
 };
@@ -157,6 +158,7 @@ CapturedRun run_session_request(Qwen38DenseBackend& backend, Qwen38DenseSession&
   Sampling samp;
   samp.temperature = 0.0f;
   samp.top_k = 1;
+  out.step_positions.reserve(static_cast<std::size_t>(steps));
   out.step_logits.reserve(static_cast<std::size_t>(steps));
   out.greedy_ids.reserve(static_cast<std::size_t>(steps));
   const auto t0 = std::chrono::steady_clock::now();
@@ -167,17 +169,31 @@ CapturedRun run_session_request(Qwen38DenseBackend& backend, Qwen38DenseSession&
         return true;
       },
       {},
-      [&](const LogitStep& st) { out.step_logits.emplace_back(st.logits.begin(), st.logits.end()); });
+      [&](const LogitStep& st) {
+        out.step_positions.push_back(st.position);
+        out.step_logits.emplace_back(st.logits.begin(), st.logits.end());
+      });
   out.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   return out;
 }
 
-std::vector<Gate3StepComparison> compare_runs(const CapturedRun& cold, const CapturedRun& warm, int base_pos) {
+std::vector<Gate3StepComparison> compare_runs(const CapturedRun& cold, const CapturedRun& warm, std::string& note) {
+  if (cold.step_positions.size() != cold.step_logits.size() || warm.step_positions.size() != warm.step_logits.size()) {
+    if (!note.empty()) note += "; ";
+    note += "step_positions count does not match step_logits count";
+  }
+  if (cold.step_logits.size() != warm.step_logits.size()) {
+    if (!note.empty()) note += "; ";
+    note += "cold step_logits count (" + std::to_string(cold.step_logits.size()) + ") != warm step_logits count (" +
+            std::to_string(warm.step_logits.size()) + ")";
+  }
   std::vector<Gate3StepComparison> cmps;
-  const std::size_t n = std::min(cold.step_logits.size(), warm.step_logits.size());
+  const std::size_t n = std::min({cold.step_logits.size(), warm.step_logits.size(), cold.step_positions.size(),
+                                  warm.step_positions.size()});
   cmps.reserve(n);
   for (std::size_t i = 0; i < n; ++i) {
-    cmps.push_back(compare_logits_bit_exact(cold.step_logits[i], warm.step_logits[i], base_pos + static_cast<int>(i)));
+    cmps.push_back(
+        compare_logits_bit_exact(cold.step_logits[i], warm.step_logits[i], cold.step_positions[i], warm.step_positions[i]));
   }
   return cmps;
 }
@@ -190,17 +206,28 @@ Gate3ReuseCaseResult assemble_reuse_case(std::string name, Reuse expected_reuse,
   r.executed = true;
   r.expected_reuse = expected_reuse;
   r.actual_reuse = warm.stats.reuse;
-  r.expected_reused_tokens = static_cast<int>(expected_reused);
+  r.expected_reused_tokens = expected_reused;
   r.actual_reused_tokens = static_cast<std::size_t>(warm.stats.reused_tokens);
+  r.prompt_len = prompt_len;
+  r.cold_step_count = cold.step_logits.size();
+  r.warm_step_count = warm.step_logits.size();
+  r.warm_prefill_seconds = warm.stats.prefill_seconds;
   r.restored_bytes = warm.stats.restored_bytes.value_or(0ull);
   r.restore_seconds = warm.stats.restore_seconds.value_or(0.0);
   r.cold_elapsed_ms = cold.elapsed_ms;
   r.warm_elapsed_ms = warm.elapsed_ms;
   r.cold_greedy_ids = cold.greedy_ids;
   r.warm_greedy_ids = warm.greedy_ids;
-  r.step_comparisons = compare_runs(cold, warm, static_cast<int>(prompt_len) - 1);
   r.failure_note = std::move(note);
+  r.step_comparisons = compare_runs(cold, warm, r.failure_note);
   return r;
+}
+
+std::uint64_t sample_vram_used_bytes() {
+  std::size_t free_b = 0;
+  std::size_t total_b = 0;
+  if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b < free_b) return 0ull;
+  return static_cast<std::uint64_t>(total_b - free_b);
 }
 
 nlohmann::ordered_json reuse_case_to_json(const Gate3ReuseCaseResult& rc) {
@@ -218,6 +245,11 @@ nlohmann::ordered_json reuse_case_to_json(const Gate3ReuseCaseResult& rc) {
     }
     steps.push_back({
         {"position", sc.position},
+        {"cold_position", sc.cold_position},
+        {"warm_position", sc.warm_position},
+        {"vocab_size", sc.vocab_size},
+        {"cold_vocab_size", sc.cold_vocab_size},
+        {"warm_vocab_size", sc.warm_vocab_size},
         {"all_finite", sc.all_finite},
         {"memcmp_equal", sc.memcmp_equal},
         {"argmax_match", sc.argmax_match},
@@ -234,6 +266,10 @@ nlohmann::ordered_json reuse_case_to_json(const Gate3ReuseCaseResult& rc) {
       {"actual_reuse", to_string(rc.actual_reuse)},
       {"expected_reused_tokens", rc.expected_reused_tokens},
       {"actual_reused_tokens", rc.actual_reused_tokens},
+      {"prompt_len", rc.prompt_len},
+      {"cold_step_count", rc.cold_step_count},
+      {"warm_step_count", rc.warm_step_count},
+      {"warm_prefill_seconds", rc.warm_prefill_seconds},
       {"restored_bytes", rc.restored_bytes},
       {"restore_seconds", rc.restore_seconds},
       {"cold_elapsed_ms", rc.cold_elapsed_ms},
@@ -358,6 +394,11 @@ int main_impl(int argc, char** argv) {
   double protected_misses_ms = 0.0;
   double warm_prefix_lookup_ms = 0.0;
   double warm_reset_ms = 0.0;
+  std::uint64_t load_only_peak_vram_bytes = 0;
+  std::uint64_t two_session_simultaneous_vram_bytes = 0;
+  std::uint64_t two_session_state_device_bytes = 0;
+  std::uint64_t two_session_residency_device_bytes = 0;
+  std::uint64_t max_runtime_vram_bytes = 0;
 
   std::vector<Gate3ReuseCaseResult> reuse_cases;
   std::vector<Gate3ProtectedMissResult> protected_misses;
@@ -432,6 +473,7 @@ int main_impl(int argc, char** argv) {
           {"weights_device_bytes", load_stats->weights_device_bytes},
           {"state_device_bytes", load_stats->state_device_bytes},
           {"scratch_device_bytes", load_stats->scratch_device_bytes},
+          {"load_only_peak_vram_bytes", load_stats->peak_vram_bytes},
           {"peak_vram_bytes", load_stats->peak_vram_bytes},
           {"host_rss_bytes", std::max(load_stats->host_rss_bytes, rss_bytes)},
           {"pins_verified", load_stats->pins_verified},
@@ -447,7 +489,12 @@ int main_impl(int argc, char** argv) {
       };
     }
     root["host_rss_bytes"] = rss_bytes;
-    root["peak_vram_bytes"] = load_stats.has_value() ? load_stats->peak_vram_bytes : 0ull;
+    root["load_only_peak_vram_bytes"] = load_only_peak_vram_bytes;
+    root["two_session_simultaneous_vram_bytes"] = two_session_simultaneous_vram_bytes;
+    root["two_session_state_device_bytes"] = two_session_state_device_bytes;
+    root["two_session_residency_device_bytes"] = two_session_residency_device_bytes;
+    root["peak_vram_bytes"] =
+        std::max({load_only_peak_vram_bytes, two_session_simultaneous_vram_bytes, max_runtime_vram_bytes});
 
     root["timings_ms"] = {
         {"gemm_self_check_ms", gemm_self_check_ms},
@@ -474,6 +521,14 @@ int main_impl(int argc, char** argv) {
           {"reuse", to_string(pm.reuse)},
           {"reused_tokens", pm.reused_tokens},
           {"reason", pm.reason},
+          {"cold_position", pm.cold_position},
+          {"warm_position", pm.warm_position},
+          {"post_miss_position", pm.post_miss_position},
+          {"post_miss_vocab_size", pm.post_miss_vocab_size},
+          {"cold_argmax", pm.cold_argmax},
+          {"warm_argmax", pm.warm_argmax},
+          {"cold_greedy_id", pm.cold_greedy_id},
+          {"warm_greedy_id", pm.warm_greedy_id},
           {"post_miss_bit_exact", pm.post_miss_bit_exact},
           {"max_abs_diff", pm.max_abs_diff},
           {"failure_note", pm.failure_note},
@@ -570,12 +625,14 @@ int main_impl(int argc, char** argv) {
 
     Qwen38DenseBackend backend(opts);
     load_stats = backend.load_stats();
+    load_only_peak_vram_bytes = load_stats->peak_vram_bytes;
+    max_runtime_vram_bytes = std::max(load_only_peak_vram_bytes, sample_vram_used_bytes());
     residency = backend.residency_report();
     state_id = backend.state_identity();
     q27_pins_verified_actual = load_stats->pins_verified;
     const int vocab_size = backend.config().vocab_size;
 
-    std::printf("  [load_qwen27b] pins=%s sha_ms=%.1f load_ms=%.1f peak_vram=%.1f MiB\n",
+    std::printf("  [load_qwen27b] pins=%s sha_ms=%.1f load_ms=%.1f load_vram=%.1f MiB\n",
                 q27_pins_verified_actual ? "verified" : "UNVERIFIED", load_stats->cold_manifest_sha_ms,
                 load_stats->cold_safetensors_load_ms,
                 static_cast<double>(load_stats->peak_vram_bytes) / (1024.0 * 1024.0));
@@ -590,15 +647,17 @@ int main_impl(int argc, char** argv) {
     const auto p2 = json_prompt_ids(short_doc.at("prompts").at(2).at("prompt_ids"), vocab_size);
     const auto l0 = json_prompt_ids(long_doc.at("prompts").at(0).at("prompt_ids"), vocab_size);
     const auto l1 = json_prompt_ids(long_doc.at("prompts").at(1).at("prompt_ids"), vocab_size);
-    if (p0.size() < 32 || p1.size() < 12 || p2.size() < 12 || l0.size() < 320 || l1.size() < 64) {
+    if (p0.size() < 32 || p1.size() < 12 || p2.size() < 12 || l0.size() < 608 || l1.size() < 288) {
       throw std::runtime_error("unexpected short/long reference prompt lengths");
     }
 
     const std::vector<std::int32_t> p0_20(p0.begin(), p0.begin() + 20);
-    std::vector<std::int32_t> fork_32 = p0;
-    fork_32.insert(fork_32.end(), p1.begin(), p1.begin() + 12);
     std::vector<std::int32_t> fork_20 = p0_20;
-    fork_20.insert(fork_20.end(), p2.begin(), p2.begin() + 12);
+    {
+      const std::int32_t f20_div = (p2[0] != p0[20]) ? p2[0] : ((p0[20] + 1) % vocab_size);
+      fork_20.push_back(f20_div);
+      fork_20.insert(fork_20.end(), p2.begin() + 1, p2.begin() + 12);
+    }
     // Construct a fork diverging strictly at position 26 while checkpoints exist only at 20 and 32.
     std::vector<std::int32_t> fork_26(p0.begin(), p0.begin() + 26);
     {
@@ -607,16 +666,9 @@ int main_impl(int argc, char** argv) {
       fork_26.insert(fork_26.end(), p1.begin() + 1, p1.begin() + 6);
     }
 
-    // Multi-chunk crossing prefill_chunk=256: 320-token prefix + 32-token suffix + 32-token extension.
+    // Multi-chunk prompts crossing prefill_chunk=256 (320 prefix + 288 suffix -> len 608).
     const std::vector<std::int32_t> code_320(l0.begin(), l0.begin() + 320);
-    std::vector<std::int32_t> code_fork_352 = code_320;
-    {
-      const std::int32_t div_tok = (l1[0] != l0[320]) ? l1[0] : ((l0[320] + 1) % vocab_size);
-      code_fork_352.push_back(div_tok);
-      code_fork_352.insert(code_fork_352.end(), l1.begin() + 1, l1.begin() + 32);
-    }
-    std::vector<std::int32_t> code_ext_384 = code_fork_352;
-    code_ext_384.insert(code_ext_384.end(), l1.begin() + 32, l1.begin() + 64);
+    const std::vector<std::int32_t> code_ext_608(l0.begin(), l0.begin() + 608);
 
     auto* sess0 = dynamic_cast<Qwen38DenseSession*>(backend.acquire_session(0));
     if (!sess0) throw std::runtime_error("acquire_session(0) returned null");
@@ -631,7 +683,33 @@ int main_impl(int argc, char** argv) {
       return r;
     };
 
-    // Phase 4: Execute all 8 Reuse & Isolation Cases
+    // Determine decode-divergent fork_32 guaranteed distinct from p0's first generated token.
+    backend.reset_session();
+    const auto seed_p0 = run_session_request(backend, *sess0, make_req(p0, true), 8);
+    std::vector<std::int32_t> fork_32 = p0;
+    {
+      std::int32_t div_32 = p1[0];
+      if (!seed_p0.greedy_ids.empty() && div_32 == seed_p0.greedy_ids[0]) {
+        div_32 = (div_32 + 1) % vocab_size;
+      }
+      fork_32.push_back(div_32);
+      fork_32.insert(fork_32.end(), p1.begin() + 1, p1.begin() + 12);
+    }
+
+    // Determine multi-chunk checkpoint fork guaranteed distinct from both l0[320] and code_320 decode step 0.
+    backend.reset_session();
+    const auto seed_code = run_session_request(backend, *sess0, make_req(code_320, true), 4);
+    std::vector<std::int32_t> code_fork_608 = code_320;
+    {
+      std::int32_t div_mc = l1[0];
+      while (div_mc == l0[320] || (!seed_code.greedy_ids.empty() && div_mc == seed_code.greedy_ids[0])) {
+        div_mc = (div_mc + 1) % vocab_size;
+      }
+      code_fork_608.push_back(div_mc);
+      code_fork_608.insert(code_fork_608.end(), l1.begin() + 1, l1.begin() + 288);
+    }
+
+    // Phase 4: Execute all 9 Reuse & Isolation Cases
     std::printf("[phase] start=reuse_and_isolation\n");
     checkpoint_json("reuse_and_isolation");
     const auto tru0 = std::chrono::steady_clock::now();
@@ -648,18 +726,24 @@ int main_impl(int argc, char** argv) {
     }
     check_interrupted("reuse_and_isolation");
 
-    // Case 2: extend_exact_tip (32 == tip, 0 suffix prefill, 8 resumed steps)
+    // Case 2: extend_exact_tip (32 == tip via teacher-forced empty callback, 0 suffix prefill, 8 resumed steps)
     {
       backend.reset_session();
       const auto cold = run_session_request(backend, *sess0, make_req(p0, false), 8);
       backend.reset_session();
       backend.evaluate_teacher_forced_on_session(*sess0, make_req(p0, true), std::array<int, 1>{31}, {});
+      std::string tip_note;
+      if (sess0->committed_tokens().size() != p0.size() || !sess0->checkpoint_index().has_tip_logits() ||
+          sess0->checkpoint_index().tip_logits_pos() != static_cast<int>(p0.size()) - 1) {
+        tip_note = "exact-tip seed did not populate committed tip_logits";
+      }
       const auto warm = run_session_request(backend, *sess0, make_req(p0, true), 8);
-      reuse_cases.push_back(assemble_reuse_case("extend_exact_tip", Reuse::Extend, 32, p0.size(), cold, warm));
+      reuse_cases.push_back(
+          assemble_reuse_case("extend_exact_tip", Reuse::Extend, 32, p0.size(), cold, warm, std::move(tip_note)));
     }
     check_interrupted("reuse_and_isolation");
 
-    // Case 3: checkpoint_after_decode_fork (prefill 32 + decode 8 -> tip 39 -> fork to 44 via ckpt 32 + 8 steps)
+    // Case 3: checkpoint_after_decode_fork (prefill 32 + decode 8 -> fork to 44 via ckpt 32 + 8 steps)
     {
       backend.reset_session();
       const auto cold = run_session_request(backend, *sess0, make_req(fork_32, false), 8);
@@ -697,50 +781,31 @@ int main_impl(int argc, char** argv) {
     }
     check_interrupted("reuse_and_isolation");
 
-    // Case 6: multichunk_extend_and_checkpoint (crossing prefill_chunk=256: ckpt @ 320 -> fork 352 -> extend 384)
+    // Case 6: multichunk_checkpoint_fork (ckpt @ 320 -> decode -> fork 288 suffix crossing prefill_chunk=256 -> len 608 + 8 steps)
     {
       backend.reset_session();
-      const auto cold_fork = run_session_request(backend, *sess0, make_req(code_fork_352, false), 4);
+      const auto cold = run_session_request(backend, *sess0, make_req(code_fork_608, false), 8);
       backend.reset_session();
-      const auto cold_ext = run_session_request(backend, *sess0, make_req(code_ext_384, false), 4);
-
-      backend.reset_session();
-      (void)run_session_request(backend, *sess0, make_req(code_320, true), 4);  // ckpt @ 320, tip @ 323
-      const auto warm_fork = run_session_request(backend, *sess0, make_req(code_fork_352, true), 1);  // ckpt -> 320, tip 352
-      const auto warm_ext = run_session_request(backend, *sess0, make_req(code_ext_384, true), 4);    // extend 352 -> 384
-
-      Gate3ReuseCaseResult mc;
-      mc.name = "multichunk_extend_and_checkpoint";
-      mc.executed = true;
-      mc.expected_reuse = Reuse::Extend;
-      mc.actual_reuse = (warm_fork.stats.reuse == Reuse::Checkpoint && warm_ext.stats.reuse == Reuse::Extend)
-                            ? Reuse::Extend
-                            : warm_ext.stats.reuse;
-      mc.expected_reused_tokens = 352;
-      mc.actual_reused_tokens = (warm_fork.stats.reused_tokens == 320) ? static_cast<std::size_t>(warm_ext.stats.reused_tokens)
-                                                                       : static_cast<std::size_t>(warm_fork.stats.reused_tokens);
-      mc.restored_bytes = warm_fork.stats.restored_bytes.value_or(0ull);
-      mc.restore_seconds = warm_fork.stats.restore_seconds.value_or(0.0);
-      mc.cold_elapsed_ms = cold_fork.elapsed_ms + cold_ext.elapsed_ms;
-      mc.warm_elapsed_ms = warm_fork.elapsed_ms + warm_ext.elapsed_ms;
-      mc.cold_greedy_ids.push_back(cold_fork.greedy_ids.front());
-      mc.cold_greedy_ids.insert(mc.cold_greedy_ids.end(), cold_ext.greedy_ids.begin(), cold_ext.greedy_ids.end());
-      mc.warm_greedy_ids.push_back(warm_fork.greedy_ids.front());
-      mc.warm_greedy_ids.insert(mc.warm_greedy_ids.end(), warm_ext.greedy_ids.begin(), warm_ext.greedy_ids.end());
-      mc.step_comparisons.push_back(
-          compare_logits_bit_exact(cold_fork.step_logits[0], warm_fork.step_logits[0], 351));
-      for (std::size_t si = 0; si < 4; ++si) {
-        mc.step_comparisons.push_back(
-            compare_logits_bit_exact(cold_ext.step_logits[si], warm_ext.step_logits[si], 383 + static_cast<int>(si)));
-      }
-      if (warm_fork.stats.reuse != Reuse::Checkpoint || warm_fork.stats.reused_tokens != 320) {
-        mc.failure_note = "intermediate multichunk checkpoint did not hit 320 tokens";
-      }
-      reuse_cases.push_back(std::move(mc));
+      (void)run_session_request(backend, *sess0, make_req(code_320, true), 4);
+      const auto warm = run_session_request(backend, *sess0, make_req(code_fork_608, true), 8);
+      reuse_cases.push_back(
+          assemble_reuse_case("multichunk_checkpoint_fork", Reuse::Checkpoint, 320, code_fork_608.size(), cold, warm));
     }
     check_interrupted("reuse_and_isolation");
 
-    // Case 7: session_reset_isolation
+    // Case 7: multichunk_extend_suffix (tip @ 320 -> extend 288 suffix crossing prefill_chunk=256 -> len 608 + 8 steps)
+    {
+      backend.reset_session();
+      const auto cold = run_session_request(backend, *sess0, make_req(code_ext_608, false), 8);
+      backend.reset_session();
+      (void)run_session_request(backend, *sess0, make_req(code_320, true), 1);
+      const auto warm = run_session_request(backend, *sess0, make_req(code_ext_608, true), 8);
+      reuse_cases.push_back(
+          assemble_reuse_case("multichunk_extend_suffix", Reuse::Extend, 320, code_ext_608.size(), cold, warm));
+    }
+    check_interrupted("reuse_and_isolation");
+
+    // Case 8: session_reset_isolation
     {
       backend.reset_session();
       const auto cold = run_session_request(backend, *sess0, make_req(p0, false), 8);
@@ -753,7 +818,7 @@ int main_impl(int argc, char** argv) {
     }
     check_interrupted("reuse_and_isolation");
 
-    // Case 8: multi_session_isolation (standalone Session B does not contaminate Session A)
+    // Case 9: multi_session_isolation (standalone Session B live simultaneously; does not contaminate Session A)
     {
       backend.reset_session();
       const auto cold = run_session_request(backend, *sess0, make_req(p0, false), 8);
@@ -764,11 +829,17 @@ int main_impl(int argc, char** argv) {
         backend.reset_session();
         (void)run_session_request(backend, *sess0, make_req(p0_20, true), 1);
         (void)run_session_request(backend, *sess_b, make_req(p1, true), 4);
+        two_session_simultaneous_vram_bytes = sample_vram_used_bytes();
+        max_runtime_vram_bytes = std::max(max_runtime_vram_bytes, two_session_simultaneous_vram_bytes);
+        two_session_state_device_bytes = sess0->state_bytes() + sess_b->state_bytes();
+        two_session_residency_device_bytes =
+            load_stats->weights_device_bytes + two_session_state_device_bytes + load_stats->scratch_device_bytes;
         sess_b->reset();
         const auto warm = run_session_request(backend, *sess0, make_req(p0, true), 8);
         reuse_cases.push_back(assemble_reuse_case("multi_session_isolation", Reuse::Extend, 20, p0.size(), cold, warm));
       }
     }
+    max_runtime_vram_bytes = std::max(max_runtime_vram_bytes, sample_vram_used_bytes());
     reuse_cases_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tru0).count();
     for (const auto& rc : reuse_cases) {
       std::size_t eq_cnt = 0;
@@ -792,8 +863,9 @@ int main_impl(int argc, char** argv) {
                             const CapturedRun& cold_ref) {
       setup_fn();
       const auto warm = run_session_request(backend, *sess0, miss_req, 1);
-      const auto cmp = compare_logits_bit_exact(cold_ref.step_logits[0], warm.step_logits[0],
-                                                static_cast<int>(miss_req.prompt.ids.size()) - 1);
+      const int cpos = cold_ref.step_positions.empty() ? -1 : cold_ref.step_positions[0];
+      const int wpos = warm.step_positions.empty() ? -1 : warm.step_positions[0];
+      const auto cmp = compare_logits_bit_exact(cold_ref.step_logits[0], warm.step_logits[0], cpos, wpos);
       Gate3ProtectedMissResult pm;
       pm.name = std::move(name);
       pm.executed = true;
@@ -801,7 +873,16 @@ int main_impl(int argc, char** argv) {
       pm.reuse = warm.stats.reuse;
       pm.reused_tokens = static_cast<std::size_t>(warm.stats.reused_tokens);
       pm.reason = backend.last_lookup().reason;
-      pm.post_miss_bit_exact = cmp.all_finite && cmp.memcmp_equal && (cold_ref.greedy_ids == warm.greedy_ids);
+      pm.cold_position = cmp.cold_position;
+      pm.warm_position = cmp.warm_position;
+      pm.post_miss_position = cmp.position;
+      pm.post_miss_vocab_size = cmp.vocab_size;
+      pm.cold_argmax = cmp.cold_argmax;
+      pm.warm_argmax = cmp.warm_argmax;
+      pm.cold_greedy_id = cold_ref.greedy_ids.empty() ? -1 : cold_ref.greedy_ids[0];
+      pm.warm_greedy_id = warm.greedy_ids.empty() ? -1 : warm.greedy_ids[0];
+      pm.post_miss_bit_exact = cmp.all_finite && cmp.memcmp_equal && cmp.argmax_match &&
+                               (pm.cold_position == pm.warm_position) && (pm.cold_greedy_id == pm.warm_greedy_id);
       pm.max_abs_diff = cmp.max_abs_diff;
       protected_misses.push_back(std::move(pm));
     };
@@ -910,7 +991,9 @@ int main_impl(int argc, char** argv) {
     auto run_identity_miss = [&](std::string name, BackendStateIdentity qid) {
       const auto lk = restore_session_prefix(*sess0, SessionLookupQuery{qid, p0, {}, {}, true});
       const auto post_warm = run_session_request(backend, *sess0, make_req(p0, false), 1);
-      const auto cmp = compare_logits_bit_exact(cold_p0.step_logits[0], post_warm.step_logits[0], 31);
+      const int cpos = cold_p0.step_positions.empty() ? -1 : cold_p0.step_positions[0];
+      const int wpos = post_warm.step_positions.empty() ? -1 : post_warm.step_positions[0];
+      const auto cmp = compare_logits_bit_exact(cold_p0.step_logits[0], post_warm.step_logits[0], cpos, wpos);
       Gate3ProtectedMissResult pm;
       pm.name = std::move(name);
       pm.executed = true;
@@ -918,7 +1001,16 @@ int main_impl(int argc, char** argv) {
       pm.reuse = lk.reuse;
       pm.reused_tokens = lk.reused_tokens;
       pm.reason = lk.reason;
-      pm.post_miss_bit_exact = cmp.all_finite && cmp.memcmp_equal;
+      pm.cold_position = cmp.cold_position;
+      pm.warm_position = cmp.warm_position;
+      pm.post_miss_position = cmp.position;
+      pm.post_miss_vocab_size = cmp.vocab_size;
+      pm.cold_argmax = cmp.cold_argmax;
+      pm.warm_argmax = cmp.warm_argmax;
+      pm.cold_greedy_id = cold_p0.greedy_ids.empty() ? -1 : cold_p0.greedy_ids[0];
+      pm.warm_greedy_id = post_warm.greedy_ids.empty() ? -1 : post_warm.greedy_ids[0];
+      pm.post_miss_bit_exact = cmp.all_finite && cmp.memcmp_equal && cmp.argmax_match &&
+                               (pm.cold_position == pm.warm_position) && (pm.cold_greedy_id == pm.warm_greedy_id);
       pm.max_abs_diff = cmp.max_abs_diff;
       protected_misses.push_back(std::move(pm));
       // Re-warm session for next identity check.
@@ -992,12 +1084,13 @@ int main_impl(int argc, char** argv) {
 
     const bool ok = diagnostic_mode ? verdict.executed_checks_passed : verdict.qualification_passed;
     std::printf(
-        "qwen38_gpu_gate3: %s | mode=%s reuse=%s(%zu/8) misses=%s(%zu/14) pins=%s peak_vram=%.1f MiB wall_ms=%.1f\n",
+        "qwen38_gpu_gate3: %s | mode=%s reuse=%s(%zu/9) misses=%s(%zu/14) pins=%s load_vram=%.1f MiB two_sess_vram=%.1f MiB wall_ms=%.1f\n",
         verdict.qualification_passed ? "PASS" : (diagnostic_mode && verdict.executed_checks_passed ? "DIAG_PASS" : "FAIL"),
         diagnostic_mode ? "diagnostic" : "qualification", verdict.reuse_cases_passed ? "PASS" : "FAIL",
         reuse_cases.size(), verdict.protected_misses_passed ? "PASS" : "FAIL", protected_misses.size(),
         q27_pins_verified_actual ? "verified" : "unverified",
-        static_cast<double>(load_stats->peak_vram_bytes) / (1024.0 * 1024.0),
+        static_cast<double>(load_only_peak_vram_bytes) / (1024.0 * 1024.0),
+        static_cast<double>(two_session_simultaneous_vram_bytes) / (1024.0 * 1024.0),
         final_doc["timings_ms"]["total_wall_ms"].get<double>());
     if (!verdict.failures.empty()) {
       for (const auto& f : verdict.failures) std::fprintf(stderr, "  failure: %s\n", f.c_str());

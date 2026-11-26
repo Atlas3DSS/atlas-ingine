@@ -18,17 +18,65 @@ inline constexpr std::string_view kGate3ShortRefJsonSha256 =
     "277f47825bac44feba200dfab6ab555d637b66a30d31c2bfdfa2f0f09afcc5a3";
 inline constexpr std::string_view kGate3LongRefJsonSha256 =
     "663ab9262b33ae26a4f07dbbd08ac02ea188990dbc1cc7c8df1effa474e0f15a";
+inline constexpr std::size_t kGate3PinnedVocabSize = 248320;
+inline constexpr std::size_t kGate3RequiredSteps = 8;
 
-inline constexpr std::array<std::string_view, 8> kGate3RequiredReuseCaseNames = {
+struct Gate3CaseContract {
+  std::string_view name;
+  ingine::model::Reuse required_reuse;
+  std::size_t required_reused_tokens;
+  std::size_t required_prompt_len;
+  std::size_t required_steps;
+  int first_step_position;
+  bool require_nonzero_restore_bytes;
+  bool require_zero_prefill_seconds;
+};
+
+inline constexpr std::array<Gate3CaseContract, 9> kGate3CaseContracts = {{
+    {"extend_suffix", ingine::model::Reuse::Extend, 20, 32, 8, 31, false, false},
+    {"extend_exact_tip", ingine::model::Reuse::Extend, 32, 32, 8, 31, false, true},
+    {"checkpoint_after_decode_fork", ingine::model::Reuse::Checkpoint, 32, 44, 8, 43, true, false},
+    {"checkpoint_multiturn_rollback", ingine::model::Reuse::Checkpoint, 20, 32, 8, 31, true, false},
+    {"checkpoint_midfork_earlier_ckpt", ingine::model::Reuse::Checkpoint, 20, 32, 8, 31, true, false},
+    {"multichunk_checkpoint_fork", ingine::model::Reuse::Checkpoint, 320, 608, 8, 607, true, false},
+    {"multichunk_extend_suffix", ingine::model::Reuse::Extend, 320, 608, 8, 607, false, false},
+    {"session_reset_isolation", ingine::model::Reuse::None, 0, 32, 8, 31, false, false},
+    {"multi_session_isolation", ingine::model::Reuse::Extend, 20, 32, 8, 31, false, false},
+}};
+
+inline constexpr std::array<std::string_view, 9> kGate3RequiredReuseCaseNames = {
     "extend_suffix",
     "extend_exact_tip",
     "checkpoint_after_decode_fork",
     "checkpoint_multiturn_rollback",
     "checkpoint_midfork_earlier_ckpt",
-    "multichunk_extend_and_checkpoint",
+    "multichunk_checkpoint_fork",
+    "multichunk_extend_suffix",
     "session_reset_isolation",
     "multi_session_isolation",
 };
+
+struct Gate3ProtectedMissContract {
+  std::string_view name;
+  int expected_position;
+};
+
+inline constexpr std::array<Gate3ProtectedMissContract, 14> kGate3ProtectedMissContracts = {{
+    {"miss_explicit_bypass", 31},
+    {"miss_empty_common_prefix", 31},
+    {"miss_cache_namespace_mismatch", 31},
+    {"miss_token_mask_presence_mismatch", 31},
+    {"miss_token_mask_bit_flip_at_pos0", 31},
+    {"miss_uncheckpointed_short_fork", 19},
+    {"miss_unverified_identity", 31},
+    {"miss_headers_only_identity", 31},
+    {"miss_self_hashed_identity", 31},
+    {"miss_mutated_shard_set_sha256", 31},
+    {"miss_mutated_weight_manifest_sha256", 31},
+    {"miss_mutated_numeric_abi", 31},
+    {"miss_mutated_media_sha256", 31},
+    {"miss_evicted_checkpoint_fork", 43},
+}};
 
 inline constexpr std::array<std::string_view, 14> kGate3RequiredProtectedMissNames = {
     "miss_explicit_bypass",
@@ -97,8 +145,12 @@ class Qwen38CheckpointIndex {
 };
 
 struct Gate3StepComparison {
-  int position = 0;
+  int position = -1;
+  int cold_position = -1;
+  int warm_position = -1;
   std::size_t vocab_size = 0;
+  std::size_t cold_vocab_size = 0;
+  std::size_t warm_vocab_size = 0;
   bool all_finite = false;
   bool memcmp_equal = false;
   std::size_t first_diff_vocab_idx = 0;
@@ -110,7 +162,7 @@ struct Gate3StepComparison {
 
 // Compares full-vocabulary logit vectors strictly bitwise (memcmp == 0 + zero NaN/Inf).
 Gate3StepComparison compare_logits_bit_exact(std::span<const float> cold_logits, std::span<const float> warm_logits,
-                                             int position = 0);
+                                             int cold_position = 0, int warm_position = -1);
 
 struct Gate3ReuseCaseResult {
   std::string name;
@@ -119,6 +171,10 @@ struct Gate3ReuseCaseResult {
   ingine::model::Reuse actual_reuse = ingine::model::Reuse::None;
   std::size_t expected_reused_tokens = 0;
   std::size_t actual_reused_tokens = 0;
+  std::size_t prompt_len = 0;
+  std::size_t cold_step_count = 0;
+  std::size_t warm_step_count = 0;
+  double warm_prefill_seconds = 0.0;
   std::uint64_t restored_bytes = 0;
   double restore_seconds = 0.0;
   double cold_elapsed_ms = 0.0;
@@ -136,6 +192,14 @@ struct Gate3ProtectedMissResult {
   ingine::model::Reuse reuse = ingine::model::Reuse::Extend;
   std::size_t reused_tokens = 0;
   std::string reason;
+  int cold_position = -1;
+  int warm_position = -1;
+  int post_miss_position = -1;
+  std::size_t post_miss_vocab_size = 0;
+  std::int32_t cold_argmax = -1;
+  std::int32_t warm_argmax = -1;
+  std::int32_t cold_greedy_id = -1;
+  std::int32_t warm_greedy_id = -1;
   bool post_miss_bit_exact = false;
   double max_abs_diff = 0.0;
   std::string failure_note;

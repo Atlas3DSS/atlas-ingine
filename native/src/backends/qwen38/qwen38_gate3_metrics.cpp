@@ -117,13 +117,18 @@ bool Qwen38CheckpointIndex::can_truncate_to(std::size_t new_len) const noexcept 
 }
 
 Gate3StepComparison compare_logits_bit_exact(std::span<const float> cold_logits, std::span<const float> warm_logits,
-                                             int position) {
+                                             int cold_position, int warm_position) {
   Gate3StepComparison cmp;
-  cmp.position = position;
+  cmp.cold_position = cold_position;
+  cmp.warm_position = (warm_position < 0) ? cold_position : warm_position;
+  cmp.position = cold_position;
+  cmp.cold_vocab_size = cold_logits.size();
+  cmp.warm_vocab_size = warm_logits.size();
   cmp.vocab_size = cold_logits.size();
   if (cold_logits.empty() || cold_logits.size() != warm_logits.size()) {
     cmp.all_finite = false;
     cmp.memcmp_equal = false;
+    cmp.argmax_match = false;
     cmp.max_abs_diff = std::numeric_limits<float>::infinity();
     return cmp;
   }
@@ -205,16 +210,29 @@ Qwen38Gate3Verdict evaluate_gate3_verdict(const Qwen38Gate3Input& input) {
   bool reuse_ok = true;
   std::unordered_map<std::string_view, const Gate3ReuseCaseResult*> reuse_by_name;
   for (const auto& rc : input.reuse_cases) {
+    const bool known = std::any_of(kGate3CaseContracts.begin(), kGate3CaseContracts.end(),
+                                   [&](const Gate3CaseContract& cc) { return cc.name == rc.name; });
+    if (!known) {
+      reuse_ok = false;
+      v.failures.push_back("unexpected reuse case: " + rc.name);
+      continue;
+    }
     if (!reuse_by_name.emplace(rc.name, &rc).second) {
       reuse_ok = false;
       v.failures.push_back("duplicate reuse case: " + rc.name);
     }
   }
-  for (const std::string_view req_name : kGate3RequiredReuseCaseNames) {
-    const auto it = reuse_by_name.find(req_name);
+  if (input.reuse_cases.size() != kGate3CaseContracts.size()) {
+    reuse_ok = false;
+    v.failures.push_back("reuse case count mismatch: expected " + std::to_string(kGate3CaseContracts.size()) +
+                         ", got " + std::to_string(input.reuse_cases.size()));
+  }
+
+  for (const Gate3CaseContract& cc : kGate3CaseContracts) {
+    const auto it = reuse_by_name.find(cc.name);
     if (it == reuse_by_name.end()) {
       reuse_ok = false;
-      v.failures.push_back("missing required reuse/isolation case: " + std::string(req_name));
+      v.failures.push_back("missing required reuse/isolation case: " + std::string(cc.name));
       continue;
     }
     const Gate3ReuseCaseResult& rc = *it->second;
@@ -223,43 +241,99 @@ Qwen38Gate3Verdict evaluate_gate3_verdict(const Qwen38Gate3Input& input) {
       v.failures.push_back("reuse case not executed: " + rc.name);
       continue;
     }
-    if (!std::isfinite(rc.restore_seconds) || !std::isfinite(rc.cold_elapsed_ms) || !std::isfinite(rc.warm_elapsed_ms)) {
+    if (!std::isfinite(rc.restore_seconds) || rc.restore_seconds < 0.0 || !std::isfinite(rc.cold_elapsed_ms) ||
+        rc.cold_elapsed_ms < 0.0 || !std::isfinite(rc.warm_elapsed_ms) || rc.warm_elapsed_ms < 0.0 ||
+        !std::isfinite(rc.warm_prefill_seconds) || rc.warm_prefill_seconds < 0.0) {
       reuse_ok = false;
-      v.failures.push_back("non-finite timing in reuse case: " + rc.name);
+      v.failures.push_back("invalid or non-finite timing in reuse case: " + rc.name);
     }
     if (!rc.failure_note.empty()) {
       reuse_ok = false;
       v.failures.push_back("reuse case " + rc.name + " error: " + rc.failure_note);
     }
-    if (rc.actual_reuse != rc.expected_reuse) {
+    if (rc.expected_reuse != cc.required_reuse || rc.actual_reuse != cc.required_reuse) {
       reuse_ok = false;
-      v.failures.push_back("reuse case " + rc.name + " reuse mismatch: expected " +
-                           ingine::model::to_string(rc.expected_reuse) + ", got " +
+      v.failures.push_back("reuse case " + rc.name + " contract reuse mismatch: required " +
+                           ingine::model::to_string(cc.required_reuse) + ", expected=" +
+                           ingine::model::to_string(rc.expected_reuse) + ", actual=" +
                            ingine::model::to_string(rc.actual_reuse));
     }
-    if (rc.actual_reused_tokens != rc.expected_reused_tokens) {
+    if (rc.expected_reused_tokens != cc.required_reused_tokens ||
+        rc.actual_reused_tokens != cc.required_reused_tokens) {
       reuse_ok = false;
-      v.failures.push_back("reuse case " + rc.name + " reused_tokens mismatch: expected " +
-                           std::to_string(rc.expected_reused_tokens) + ", got " +
+      v.failures.push_back("reuse case " + rc.name + " contract reused_tokens mismatch: required " +
+                           std::to_string(cc.required_reused_tokens) + ", expected=" +
+                           std::to_string(rc.expected_reused_tokens) + ", actual=" +
                            std::to_string(rc.actual_reused_tokens));
     }
-    if (rc.step_comparisons.empty()) {
+    if (rc.prompt_len != cc.required_prompt_len) {
       reuse_ok = false;
-      v.failures.push_back("reuse case " + rc.name + " has zero logit comparisons");
+      v.failures.push_back("reuse case " + rc.name + " prompt_len mismatch: required " +
+                           std::to_string(cc.required_prompt_len) + ", got " + std::to_string(rc.prompt_len));
     }
-    for (std::size_t si = 0; si < rc.step_comparisons.size(); ++si) {
+    if (cc.require_nonzero_restore_bytes && rc.restored_bytes == 0) {
+      reuse_ok = false;
+      v.failures.push_back("reuse case " + rc.name + " Checkpoint reported zero restored_bytes");
+    }
+    if (!cc.require_nonzero_restore_bytes && rc.restored_bytes != 0) {
+      reuse_ok = false;
+      v.failures.push_back("reuse case " + rc.name + " non-Checkpoint reported nonzero restored_bytes=" +
+                           std::to_string(rc.restored_bytes));
+    }
+    if (cc.require_zero_prefill_seconds && rc.warm_prefill_seconds != 0.0) {
+      reuse_ok = false;
+      v.failures.push_back("reuse case " + rc.name + " expected zero suffix prefill seconds on exact tip");
+    }
+    if (rc.cold_step_count != cc.required_steps || rc.warm_step_count != cc.required_steps ||
+        rc.step_comparisons.size() != cc.required_steps) {
+      reuse_ok = false;
+      v.failures.push_back("reuse case " + rc.name + " step count mismatch: required " +
+                           std::to_string(cc.required_steps) + ", cold=" + std::to_string(rc.cold_step_count) +
+                           ", warm=" + std::to_string(rc.warm_step_count) +
+                           ", comparisons=" + std::to_string(rc.step_comparisons.size()));
+    }
+    if (rc.cold_greedy_ids.size() != cc.required_steps || rc.warm_greedy_ids.size() != cc.required_steps ||
+        rc.cold_greedy_ids != rc.warm_greedy_ids) {
+      reuse_ok = false;
+      v.failures.push_back("reuse case " + rc.name + " greedy token sequence mismatch or wrong count");
+    }
+    const std::size_t n_cmp = std::min(cc.required_steps, rc.step_comparisons.size());
+    for (std::size_t si = 0; si < n_cmp; ++si) {
       const auto& sc = rc.step_comparisons[si];
-      if (!sc.all_finite || !sc.memcmp_equal || !sc.argmax_match) {
+      const int exp_pos = cc.first_step_position + static_cast<int>(si);
+      if (sc.cold_position != exp_pos || sc.warm_position != exp_pos || sc.position != exp_pos) {
+        reuse_ok = false;
+        v.failures.push_back("reuse case " + rc.name + " step " + std::to_string(si) +
+                             " position mismatch: required=" + std::to_string(exp_pos) +
+                             ", cold=" + std::to_string(sc.cold_position) +
+                             ", warm=" + std::to_string(sc.warm_position));
+      }
+      if (sc.cold_vocab_size != kGate3PinnedVocabSize || sc.warm_vocab_size != kGate3PinnedVocabSize ||
+          sc.vocab_size != kGate3PinnedVocabSize) {
+        reuse_ok = false;
+        v.failures.push_back("reuse case " + rc.name + " step " + std::to_string(si) +
+                             " vocab_size mismatch: required=" + std::to_string(kGate3PinnedVocabSize) +
+                             ", cold=" + std::to_string(sc.cold_vocab_size) +
+                             ", warm=" + std::to_string(sc.warm_vocab_size));
+      }
+      if (!sc.all_finite || !sc.memcmp_equal || !sc.argmax_match || !std::isfinite(sc.max_abs_diff) ||
+          sc.max_abs_diff != 0.0f) {
         reuse_ok = false;
         v.failures.push_back("reuse case " + rc.name + " step " + std::to_string(si) +
                              " failed bitwise parity (finite=" + std::to_string(sc.all_finite) +
                              ", memcmp=" + std::to_string(sc.memcmp_equal) +
                              ", argmax_match=" + std::to_string(sc.argmax_match) + ")");
       }
-    }
-    if (rc.cold_greedy_ids.empty() || rc.cold_greedy_ids != rc.warm_greedy_ids) {
-      reuse_ok = false;
-      v.failures.push_back("reuse case " + rc.name + " greedy token sequence mismatch or empty");
+      if (sc.cold_argmax < 0 || sc.cold_argmax >= static_cast<std::int32_t>(kGate3PinnedVocabSize) ||
+          sc.warm_argmax < 0 || sc.warm_argmax >= static_cast<std::int32_t>(kGate3PinnedVocabSize)) {
+        reuse_ok = false;
+        v.failures.push_back("reuse case " + rc.name + " step " + std::to_string(si) + " argmax out of range");
+      } else if (si < rc.cold_greedy_ids.size() && si < rc.warm_greedy_ids.size() &&
+                 (sc.cold_argmax != rc.cold_greedy_ids[si] || sc.warm_argmax != rc.warm_greedy_ids[si])) {
+        reuse_ok = false;
+        v.failures.push_back("reuse case " + rc.name + " step " + std::to_string(si) +
+                             " greedy ID does not match logit argmax");
+      }
     }
   }
   v.reuse_cases_passed = reuse_ok;
@@ -267,16 +341,30 @@ Qwen38Gate3Verdict evaluate_gate3_verdict(const Qwen38Gate3Input& input) {
   bool miss_ok = true;
   std::unordered_map<std::string_view, const Gate3ProtectedMissResult*> miss_by_name;
   for (const auto& pm : input.protected_misses) {
+    const bool known = std::any_of(kGate3ProtectedMissContracts.begin(), kGate3ProtectedMissContracts.end(),
+                                   [&](const Gate3ProtectedMissContract& mc) { return mc.name == pm.name; });
+    if (!known) {
+      miss_ok = false;
+      v.failures.push_back("unexpected protected miss case: " + pm.name);
+      continue;
+    }
     if (!miss_by_name.emplace(pm.name, &pm).second) {
       miss_ok = false;
       v.failures.push_back("duplicate protected miss case: " + pm.name);
     }
   }
-  for (const std::string_view req_miss : kGate3RequiredProtectedMissNames) {
-    const auto it = miss_by_name.find(req_miss);
+  if (input.protected_misses.size() != kGate3ProtectedMissContracts.size()) {
+    miss_ok = false;
+    v.failures.push_back("protected miss count mismatch: expected " +
+                         std::to_string(kGate3ProtectedMissContracts.size()) + ", got " +
+                         std::to_string(input.protected_misses.size()));
+  }
+
+  for (const Gate3ProtectedMissContract& mc : kGate3ProtectedMissContracts) {
+    const auto it = miss_by_name.find(mc.name);
     if (it == miss_by_name.end()) {
       miss_ok = false;
-      v.failures.push_back("missing required protected miss case: " + std::string(req_miss));
+      v.failures.push_back("missing required protected miss case: " + std::string(mc.name));
       continue;
     }
     const Gate3ProtectedMissResult& pm = *it->second;
@@ -285,9 +373,13 @@ Qwen38Gate3Verdict evaluate_gate3_verdict(const Qwen38Gate3Input& input) {
       v.failures.push_back("protected miss case not executed: " + pm.name);
       continue;
     }
-    if (!std::isfinite(pm.max_abs_diff)) {
+    if (pm.reason.empty()) {
       miss_ok = false;
-      v.failures.push_back("non-finite diff in protected miss case: " + pm.name);
+      v.failures.push_back("protected miss case missing lookup reason: " + pm.name);
+    }
+    if (!std::isfinite(pm.max_abs_diff) || pm.max_abs_diff != 0.0) {
+      miss_ok = false;
+      v.failures.push_back("non-zero or non-finite diff in protected miss case: " + pm.name);
     }
     if (!pm.failure_note.empty()) {
       miss_ok = false;
@@ -297,6 +389,25 @@ Qwen38Gate3Verdict evaluate_gate3_verdict(const Qwen38Gate3Input& input) {
       miss_ok = false;
       v.failures.push_back("protected miss case " + pm.name + " failed closed check (hit=" + std::to_string(pm.hit) +
                            ", reused=" + std::to_string(pm.reused_tokens) + ")");
+    }
+    if (pm.cold_position != mc.expected_position || pm.warm_position != mc.expected_position ||
+        pm.post_miss_position != mc.expected_position) {
+      miss_ok = false;
+      v.failures.push_back("protected miss case " + pm.name + " position mismatch: expected=" +
+                           std::to_string(mc.expected_position) + ", cold=" + std::to_string(pm.cold_position) +
+                           ", warm=" + std::to_string(pm.warm_position) +
+                           ", post=" + std::to_string(pm.post_miss_position));
+    }
+    if (pm.post_miss_vocab_size != kGate3PinnedVocabSize) {
+      miss_ok = false;
+      v.failures.push_back("protected miss case " + pm.name + " vocab_size mismatch: expected=" +
+                           std::to_string(kGate3PinnedVocabSize) + ", got=" + std::to_string(pm.post_miss_vocab_size));
+    }
+    if (pm.cold_argmax < 0 || pm.cold_argmax >= static_cast<std::int32_t>(kGate3PinnedVocabSize) ||
+        pm.cold_argmax != pm.warm_argmax || pm.cold_argmax != pm.cold_greedy_id ||
+        pm.warm_argmax != pm.warm_greedy_id) {
+      miss_ok = false;
+      v.failures.push_back("protected miss case " + pm.name + " argmax/greedy ID mismatch");
     }
     if (!pm.post_miss_bit_exact) {
       miss_ok = false;
