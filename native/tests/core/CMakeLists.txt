@@ -1,4 +1,5 @@
 ingine_add_test(NAME core_safetensors SOURCES test_safetensors.cpp LIBS ingine_core)
+ingine_add_test(NAME core_gguf SOURCES test_gguf.cpp LIBS ingine_core)
 ingine_add_test(NAME core_safetensors_model SOURCES test_safetensors_model.cpp LIBS ingine_core
   LABELS model)
 ingine_add_test(NAME core_oracle_precision_bf16 SOURCES test_scalar_oracle_precision.cpp)

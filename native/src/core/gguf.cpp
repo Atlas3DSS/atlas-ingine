@@ -10,6 +10,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace ingine {
@@ -20,12 +21,38 @@ enum : std::uint32_t {
     T_U64 = 10, T_I64 = 11, T_F64 = 12,
 };
 
+struct FdGuard {
+    int fd = -1;
+    explicit FdGuard(int f) noexcept : fd(f) {}
+    ~FdGuard() {
+        if (fd >= 0) ::close(fd);
+    }
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+};
+
+std::uint64_t checked_mul_u64(std::uint64_t a, std::uint64_t b, const char* what) {
+    if (a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a) throw std::runtime_error(what);
+    return a * b;
+}
+
+std::size_t gguf_scalar_min_bytes(std::uint32_t t) noexcept {
+    switch (t) {
+        case T_U8: case T_I8: case T_BOOL: return 1;
+        case T_U16: case T_I16: return 2;
+        case T_U32: case T_I32: case T_F32: return 4;
+        case T_U64: case T_I64: case T_F64: case T_STR: return 8;
+        default: return 0;
+    }
+}
+
 struct Reader {
     const std::byte* p;
     const std::byte* end;
+    std::size_t remaining() const noexcept { return std::size_t(end - p); }
     template <class T>
     T get() {
-        if (std::size_t(end - p) < sizeof(T)) throw std::runtime_error("gguf: truncated header");
+        if (remaining() < sizeof(T)) throw std::runtime_error("gguf: truncated header");
         T v;
         std::memcpy(&v, p, sizeof(T));
         p += sizeof(T);
@@ -33,9 +60,9 @@ struct Reader {
     }
     std::string str() {
         const auto n = get<std::uint64_t>();
-        if (std::uint64_t(end - p) < n) throw std::runtime_error("gguf: truncated string");
+        if (n > remaining()) throw std::runtime_error("gguf: truncated string");
         std::string s(reinterpret_cast<const char*>(p), std::size_t(n));
-        p += n;
+        p += std::size_t(n);
         return s;
     }
 };
@@ -148,8 +175,11 @@ const char* ggml_type_name(GgmlType t) noexcept {
 std::size_t ggml_row_bytes(GgmlType t, std::int64_t n) {
     const int bv = ggml_block_values(t), bb = ggml_block_bytes(t);
     if (!bv || !bb) throw std::runtime_error(std::string("gguf: unsupported ggml type ") + ggml_type_name(t));
-    if (n % bv) throw std::runtime_error("gguf: row length is not a whole number of blocks");
-    return std::size_t(n / bv) * std::size_t(bb);
+    if (n < 0 || n % bv != 0) throw std::runtime_error("gguf: row length is not a whole number of blocks");
+    const std::uint64_t bytes =
+        checked_mul_u64(std::uint64_t(n / bv), std::uint64_t(bb), "gguf: row byte size overflow");
+    if (bytes > std::numeric_limits<std::size_t>::max()) throw std::runtime_error("gguf: row byte size overflow");
+    return std::size_t(bytes);
 }
 
 std::int64_t GgufTensor::numel() const noexcept {
@@ -158,27 +188,35 @@ std::int64_t GgufTensor::numel() const noexcept {
     return n;
 }
 
+void GgufFile::Mapping::reset() noexcept {
+    if (data && bytes > 0) ::munmap(data, bytes);
+    data = nullptr;
+    bytes = 0;
+}
+
+GgufFile::Mapping::~Mapping() { reset(); }
+
 GgufFile::GgufFile(const std::filesystem::path& path) : path_(path) {
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) throw std::runtime_error("gguf: cannot open " + path.string());
+    FdGuard fd(::open(path.c_str(), O_RDONLY));
+    if (fd.fd < 0) throw std::runtime_error("gguf: cannot open " + path.string());
     struct stat st {};
-    if (::fstat(fd, &st) != 0) {
-        ::close(fd);
-        throw std::runtime_error("gguf: cannot stat " + path.string());
-    }
-    map_bytes_ = std::size_t(st.st_size);
-    map_ = ::mmap(nullptr, map_bytes_, PROT_READ, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (map_ == MAP_FAILED) {
-        map_ = nullptr;
-        throw std::runtime_error("gguf: cannot map " + path.string());
-    }
-    const auto* base = static_cast<const std::byte*>(map_);
-    Reader rd{base, base + map_bytes_};
+    if (::fstat(fd.fd, &st) != 0) throw std::runtime_error("gguf: cannot stat " + path.string());
+    if (!S_ISREG(st.st_mode)) throw std::runtime_error("gguf: not a regular file: " + path.string());
+    if (st.st_size <= 0) throw std::runtime_error("gguf: empty or invalid file size: " + path.string());
+    const std::size_t map_bytes = std::size_t(st.st_size);
+    void* raw = ::mmap(nullptr, map_bytes, PROT_READ, MAP_SHARED, fd.fd, 0);
+    if (raw == MAP_FAILED) throw std::runtime_error("gguf: cannot map " + path.string());
+    mapping_ = Mapping(raw, map_bytes);
+
+    const auto* base = static_cast<const std::byte*>(mapping_.data);
+    Reader rd{base, base + mapping_.bytes};
     if (rd.get<std::uint32_t>() != 0x46554747u) throw std::runtime_error("gguf: bad magic in " + path.string());
     version_ = rd.get<std::uint32_t>();
     if (version_ < 2 || version_ > 3) throw std::runtime_error("gguf: unsupported version");
     const auto n_tensors = rd.get<std::uint64_t>(), n_kv = rd.get<std::uint64_t>();
+    // Minimum serialized sizes: KV entry >= 12B (8B key len + 4B value type); tensor >= 24B (8B name + 4B nd + 4B type + 8B off).
+    if (n_kv > rd.remaining() / 12u) throw std::runtime_error("gguf: metadata count exceeds file size");
+    if (n_tensors > rd.remaining() / 24u) throw std::runtime_error("gguf: tensor count exceeds file size");
 
     auto scalar = [&](std::uint32_t t, Value& v) {
         switch (t) {
@@ -204,6 +242,11 @@ GgufFile::GgufFile(const std::filesystem::path& path) : path_(path) {
         if (v.type == T_ARR) {
             const auto at = rd.get<std::uint32_t>();
             const auto n = rd.get<std::uint64_t>();
+            const std::size_t emin = gguf_scalar_min_bytes(at);
+            if (emin == 0) throw std::runtime_error("gguf: bad array value type");
+            if (n > rd.remaining() / emin) throw std::runtime_error("gguf: truncated metadata array");
+            if (at == T_F32 || at == T_F64) v.fa.reserve(std::size_t(n));
+            else if (at != T_STR) v.ia.reserve(std::size_t(n));
             for (std::uint64_t j = 0; j < n; ++j) {
                 Value e;
                 scalar(at, e);
@@ -216,32 +259,68 @@ GgufFile::GgufFile(const std::filesystem::path& path) : path_(path) {
         }
         kv_.emplace(std::move(key), std::move(v));
     }
+    if (n_tensors > rd.remaining() / 24u) throw std::runtime_error("gguf: tensor count exceeds remaining file size");
     tensors_.reserve(std::size_t(n_tensors));
     for (std::uint64_t i = 0; i < n_tensors; ++i) {
         GgufTensor t;
         t.name = rd.str();
         const auto nd = rd.get<std::uint32_t>();
-        for (std::uint32_t d = 0; d < nd; ++d) t.ne.push_back(std::int64_t(rd.get<std::uint64_t>()));
+        if (nd == 0 || nd > 4)
+            throw std::runtime_error("gguf: tensor " + t.name + " has invalid rank " + std::to_string(nd));
+        if (std::size_t(nd) * sizeof(std::uint64_t) > rd.remaining())
+            throw std::runtime_error("gguf: truncated tensor dimensions for " + t.name);
+        t.ne.reserve(nd);
+        for (std::uint32_t d = 0; d < nd; ++d) {
+            const auto dim_u = rd.get<std::uint64_t>();
+            if (dim_u == 0 || dim_u > std::uint64_t(std::numeric_limits<std::int64_t>::max()))
+                throw std::runtime_error("gguf: tensor " + t.name + " has invalid dimension");
+            t.ne.push_back(std::int64_t(dim_u));
+        }
         t.type = static_cast<GgmlType>(rd.get<std::uint32_t>());
         t.offset = rd.get<std::uint64_t>();
         const int bv = ggml_block_values(t.type), bb = ggml_block_bytes(t.type);
         if (!bv || !bb) throw std::runtime_error("gguf: tensor " + t.name + " has unsupported type " + std::to_string(int(t.type)));
-        t.bytes = std::uint64_t(t.numel() / bv) * std::uint64_t(bb);
-        index_.emplace(t.name, tensors_.size());
+        const std::uint64_t row_len_u = std::uint64_t(t.ne[0]);
+        if (row_len_u % std::uint64_t(bv) != 0)
+            throw std::runtime_error("gguf: tensor " + t.name + " row width " + std::to_string(row_len_u) +
+                                     " is not block-aligned to " + std::to_string(bv));
+        std::uint64_t rows_u = 1;
+        for (std::size_t d = 1; d < t.ne.size(); ++d)
+            rows_u = checked_mul_u64(rows_u, std::uint64_t(t.ne[d]), "gguf: tensor row count overflow");
+        const std::uint64_t numel_u = checked_mul_u64(row_len_u, rows_u, "gguf: tensor element count overflow");
+        if (numel_u > std::uint64_t(std::numeric_limits<std::int64_t>::max()))
+            throw std::runtime_error("gguf: tensor element count exceeds int64");
+        const std::uint64_t row_bytes_u =
+            checked_mul_u64(row_len_u / std::uint64_t(bv), std::uint64_t(bb), "gguf: tensor row byte size overflow");
+        t.bytes = checked_mul_u64(row_bytes_u, rows_u, "gguf: tensor byte size overflow");
+        if (!index_.emplace(t.name, tensors_.size()).second)
+            throw std::runtime_error("gguf: duplicate tensor " + t.name);
         tensors_.push_back(std::move(t));
     }
-    const std::int64_t align = get_int("general.alignment").value_or(32);
+    std::uint64_t align_u = 32;
+    if (has("general.alignment")) {
+        const auto align_opt = get_int("general.alignment");
+        if (!align_opt || *align_opt <= 0)
+            throw std::runtime_error("gguf: invalid general.alignment");
+        align_u = std::uint64_t(*align_opt);
+        if ((align_u & (align_u - 1)) != 0 || align_u > (std::uint64_t(1) << 20))
+            throw std::runtime_error("gguf: general.alignment must be a power of two <= 1 MiB");
+    }
     const std::size_t hdr = std::size_t(rd.p - base);
-    const std::size_t data0 = (hdr + std::size_t(align) - 1) / std::size_t(align) * std::size_t(align);
+    const std::size_t align = std::size_t(align_u);
+    const std::size_t rem = hdr % align;
+    const std::size_t pad = rem ? (align - rem) : 0;
+    if (pad > mapping_.bytes - hdr) throw std::runtime_error("gguf: aligned data section past end of file");
+    const std::size_t data0 = hdr + pad;
+    const std::uint64_t avail = std::uint64_t(mapping_.bytes - data0);
     for (auto& t : tensors_) {
-        if (data0 + t.offset + t.bytes > map_bytes_) throw std::runtime_error("gguf: tensor " + t.name + " past the end");
-        t.data = base + data0 + t.offset;
+        if (t.offset > avail || t.bytes > avail - t.offset)
+            throw std::runtime_error("gguf: tensor " + t.name + " past the end");
+        t.data = base + data0 + std::size_t(t.offset);
     }
 }
 
-GgufFile::~GgufFile() {
-    if (map_) ::munmap(map_, map_bytes_);
-}
+GgufFile::~GgufFile() = default;
 
 const GgufTensor* GgufFile::find(std::string_view name) const noexcept {
     const auto it = index_.find(name);

@@ -74,6 +74,30 @@ public:
     std::int64_t require_int(std::string_view key) const;
 
 private:
+    struct Mapping {
+        void* data = nullptr;
+        std::size_t bytes = 0;
+        Mapping() = default;
+        Mapping(void* d, std::size_t b) noexcept : data(d), bytes(b) {}
+        ~Mapping();
+        Mapping(const Mapping&) = delete;
+        Mapping& operator=(const Mapping&) = delete;
+        Mapping(Mapping&& o) noexcept : data(o.data), bytes(o.bytes) {
+            o.data = nullptr;
+            o.bytes = 0;
+        }
+        Mapping& operator=(Mapping&& o) noexcept {
+            if (this != &o) {
+                reset();
+                data = o.data;
+                bytes = o.bytes;
+                o.data = nullptr;
+                o.bytes = 0;
+            }
+            return *this;
+        }
+        void reset() noexcept;
+    };
     struct Value {
         std::uint32_t type = 0;  // gguf_type
         std::int64_t i = 0;
@@ -85,8 +109,7 @@ private:
     };
     std::filesystem::path path_;
     std::uint32_t version_ = 0;
-    void* map_ = nullptr;
-    std::size_t map_bytes_ = 0;
+    Mapping mapping_;
     std::map<std::string, Value, std::less<>> kv_;
     std::vector<GgufTensor> tensors_;
     std::map<std::string, std::size_t, std::less<>> index_;
