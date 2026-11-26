@@ -87,6 +87,26 @@
       }
     },
     {
+      "name": "sm121",
+      "displayName": "NVIDIA DGX Spark GB10 (sm_121a, aarch64/CUDA 12.9+) release binaries (physically unmeasured on GB10)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-sm121",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "121a",
+        "INGINE_BUILD_APPS": "ON",
+        "INGINE_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "sm121-dev",
+      "displayName": "NVIDIA DGX Spark GB10 (sm_121a) binaries and tests (physically unmeasured on GB10)",
+      "inherits": "sm121",
+      "cacheVariables": {
+        "INGINE_BUILD_TESTS": "ON"
+      }
+    },
+    {
       "name": "cpu-dev",
       "displayName": "CPU/host-only build (zero CUDA discovery, --fake server + HAL/Ops/host CTests)",
       "generator": "Ninja",
@@ -108,6 +128,8 @@
     { "name": "sm70-dev", "configurePreset": "sm70-dev" },
     { "name": "sm70-simt-dev", "configurePreset": "sm70-simt-dev" },
     { "name": "legacy-fp16", "configurePreset": "legacy-fp16" },
+    { "name": "sm121", "configurePreset": "sm121" },
+    { "name": "sm121-dev", "configurePreset": "sm121-dev" },
     { "name": "cpu-dev", "configurePreset": "cpu-dev" }
   ],
   "testPresets": [
@@ -129,6 +151,11 @@
     {
       "name": "sm70-simt-dev",
       "configurePreset": "sm70-simt-dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "sm121-dev",
+      "configurePreset": "sm121-dev",
       "output": { "outputOnFailure": true }
     },
     {

@@ -8,7 +8,7 @@ if(NOT INGINE_BACKEND STREQUAL "CUDA" AND NOT INGINE_BACKEND STREQUAL "CPU")
 endif()
 
 if(INGINE_BACKEND STREQUAL "CUDA")
-  # Multi-arch build: supports Ampere (86), Ada (89), Hopper (90a), and Blackwell (120a).
+  # Multi-arch build: supports Ampere (86), Ada (89), Hopper (90a), Blackwell (120a), and DGX Spark GB10 (121a).
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES "86;89;120a" CACHE STRING "CUDA architectures to build")
   endif()
