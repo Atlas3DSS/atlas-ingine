@@ -73,6 +73,10 @@ BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights
       commit_meta_host_(std::size_t(max_batch) * sizeof(kd::BatchSlotCommitMeta)) {
   if (max_batch < 1) throw std::invalid_argument("BatchDrafter: max_batch must be >= 1");
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("BatchDrafter: max_ctx must hold two blocks");
+  if (w.embed_q8())
+    throw std::invalid_argument("BatchDrafter: Q8_0 embedding tables are not supported (set INGINE_GGUF_Q8_EMBED=0)");
+  if (w.unembed.blocked())
+    throw std::invalid_argument("BatchDrafter: blocked/Q6_K unembedding tables are not supported (set INGINE_GGUF_Q6_HEAD=0)");
   if (vram_budget_bytes.has_value()) {
     // Header-only inspection (0 GPU bytes — BEFORE pk::Gemm 32 MiB workspace or raw mtp.safetensors upload buffer!)
     // using the exact compile-time production geometry of this build.

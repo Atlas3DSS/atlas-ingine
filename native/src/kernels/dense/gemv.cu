@@ -544,7 +544,7 @@ __device__ __forceinline__ void q8x4_f32s_h2(uint32_t w, float d, uint32_t& lo, 
   lo = *reinterpret_cast<const uint32_t*>(&a), hi = *reinterpret_cast<const uint32_t*>(&b);
 }
 
-template <int K, int M, int SPLITK, class Epi>
+template <int K, int M, int SPLITK, class Epi, int UFP8 = MMA_U_FP8, int UBF16 = MMA_U_BF16>
 __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t* __restrict__ w, int rows,
                                                                   const std::int64_t* __restrict__ blk_off,
                                                                   const std::int32_t* __restrict__ blk_soff,
@@ -572,7 +572,7 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_blk_v70_kernel(const uint8_t
     // (Q8 rows: as many bytes in flight a warp as the activation-type rows - 6 steps of 1 KB - where the K slice
     //  allows it; 3 steps measured half the bandwidth: the stream is bound by the bytes in flight)
     constexpr int CPL = Q8 ? 16 : 8, SPAN = 4 * CPL;
-    constexpr int U = Q8 ? (KS % (SPAN * 6) == 0 ? 6 : MMA_U_FP8) : MMA_U_BF16, NJ = KS / SPAN;
+    constexpr int U = Q8 ? (KS % (SPAN * 6) == 0 ? 6 : UFP8) : UBF16, NJ = KS / SPAN;
     static_assert(KS % (SPAN * U) == 0, "K slice must split into unrolled steps");
     constexpr size_t ROW_BYTES = size_t(K) * (Q8 ? 1 : 2);
     const int c0_v = warp * KS + (qp & 1) * (2 * CPL);
@@ -725,8 +725,8 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     auto epi = make(std::integral_constant<int, MM>{});
     using E = decltype(epi);
     if (w.blk_off) {  // block-table matrix (GGUF dense on Volta): every M on the HMMA.884 kernel
-      launch_ex(gemv_blk_v70_kernel<K, MM, SPLITK, E>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, rows,
-                w.blk_off, w.blk_soff, w.q8_scale, 0u, epi);
+      launch_ex(gemv_blk_v70_kernel<K, MM, SPLITK, E, UFP8, UBF16>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl,
+                stream, wp, rows, w.blk_off, w.blk_soff, w.q8_scale, 0u, epi);
       return;
     }
     if constexpr (MM == 1 && (BLOCK > 0 || kActIsFP16)) {
@@ -1385,6 +1385,12 @@ void head_loopcd(const ActT* x_strong, const ActT* x_weak, int M, Matrix w, floa
   require(w.w != nullptr && w.rows > 0, "head_loopcd: weight matrix is empty");
   require(M >= 1 && M <= 8, "head_loopcd: M must be in 1..8");
   require(omega_max >= 0.f, "head_loopcd: omega_max must be non-negative");
+  if (w.blk_off != nullptr) {
+    head(x_strong, M, w, out, pdl, stream);
+    head(x_weak, M, w, ws_weak, false, stream);
+    loopcd_adaptive_combine(out, ws_weak, M, w.rows, omega_max, ws_reduce, stream);
+    return;
+  }
   const bool fp8 = w.scale != nullptr;
   const int rows = w.rows;
   const float* sc = w.scale;

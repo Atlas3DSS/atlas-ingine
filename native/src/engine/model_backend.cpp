@@ -193,6 +193,7 @@ ModelFamily classify_safetensors_tag(std::string_view tag) {
 // Exact supported GGUF general.architecture tags ONLY.
 ModelFamily classify_gguf_arch(std::string_view arch) {
   const std::string lower = to_lower_ascii(arch);
+  if (lower == "inkling2_loop") return ModelFamily::Inkling2;
   if (lower == "qwen35") return ModelFamily::Qwen3_5;
   if (lower == "deepseek41") return ModelFamily::DeepSeekV4;
   if (lower == "glm5-next" || lower == "glm5_next") return ModelFamily::GlmFlash;
