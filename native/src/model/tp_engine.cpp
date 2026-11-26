@@ -660,7 +660,8 @@ class TpPrefiller {
     moe_f32_ = at_f32(off_moe_f32);
   }
 
-  void run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits_out, Tensor* taps) {
+  void run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits_out, Tensor* taps,
+           bool compute_logits = true) {
     const Weights& w = w_;
     const cudaStream_t s = stream_;
     const std::size_t slab = std::size_t(T) * H;
@@ -891,8 +892,8 @@ class TpPrefiller {
       prev_v = v;
     }
 
-    // ---- Final read + sharded LM head + AllGather
-    {
+    // ---- Final read + sharded LM head + AllGather (skip head + AllGather on non-final chunks)
+    if (compute_logits || tap_out) {
       dense::MixParams fp;
       const std::vector<const float*> fblocks = {B0_, B1_, B2_[2], E_[2]};
       fp.blocks = block_table(fblocks);
@@ -913,18 +914,20 @@ class TpPrefiller {
       }
       dense::mix(fp, false, s);
     }
-    if (w.unembed.blocked())  // (Q6_K head kept as int8 codes: the block-table GEMV)
-      dense::head(xf_ + std::size_t(T - 1) * H, 1, matrix(w.unembed), local_logits_, false, s);
-    else
-      pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), LOCAL_VOCAB_CHUNK,
-                      local_logits_, s);
-    NCCL_CHECK(ncclAllGather(local_logits_, gathered_logits_, LOCAL_VOCAB_CHUNK, ncclFloat32, comm_, s));
-    rinfo_.allgather_calls.fetch_add(1, std::memory_order_relaxed);
-    rinfo_.prefill_steps.fetch_add(1, std::memory_order_relaxed);
-    if (logits_out) {
-      CUDA_CHECK(cudaMemcpyAsync(logits_out, gathered_logits_, std::size_t(UNPADDED_VOCAB) * sizeof(float),
-                                 cudaMemcpyDeviceToDevice, s));
+    if (compute_logits) {
+      if (w.unembed.blocked())  // (Q6_K head kept as int8 codes: the block-table GEMV)
+        dense::head(xf_ + std::size_t(T - 1) * H, 1, matrix(w.unembed), local_logits_, false, s);
+      else
+        pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), LOCAL_VOCAB_CHUNK,
+                        local_logits_, s);
+      NCCL_CHECK(ncclAllGather(local_logits_, gathered_logits_, LOCAL_VOCAB_CHUNK, ncclFloat32, comm_, s));
+      rinfo_.allgather_calls.fetch_add(1, std::memory_order_relaxed);
+      if (logits_out) {
+        CUDA_CHECK(cudaMemcpyAsync(logits_out, gathered_logits_, std::size_t(UNPADDED_VOCAB) * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, s));
+      }
     }
+    rinfo_.prefill_steps.fetch_add(1, std::memory_order_relaxed);
     st.length = pos0 + T;
   }
 
@@ -2138,6 +2141,7 @@ class TpBatchGenerator final : public Generator {
     slot_pos_host_.assign(options_.max_batch, 0);
     slot_in_use_.assign(options_.max_batch, false);
     slot_meta_.resize(options_.max_batch);
+    slot_prefill_.resize(options_.max_batch);
 
     // Step 2: allocate uniform paged pools + batch decoders on all ranks
     pool_.run_all([&](int r) {
@@ -2296,8 +2300,17 @@ class TpBatchGenerator final : public Generator {
     return int(free_pages_.size()) >= need;
   }
 
-  int start_slot(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
-                 std::int32_t& first_token, GenerateStats& stats) override {
+  bool supports_chunked_prefill() const override { return options_.prefill_interleave_chunk > 0; }
+  int prefill_interleave_chunk() const override { return options_.prefill_interleave_chunk; }
+  float mixed_decode_ratio() const override { return options_.mixed_decode_ratio; }
+
+  int prefill_remaining_tokens(int slot) const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (slot < 0 || slot >= options_.max_batch || !slot_prefill_[slot].active) return 0;
+    return std::max(0, int(slot_prefill_[slot].prompt_ids.size()) - slot_prefill_[slot].next_pos);
+  }
+
+  int begin_prefill_slot(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling) override {
     validate_tp_request(full_prompt, sampling);
     const std::span<const std::int32_t> prompt = full_prompt.ids;
     const int n = int(prompt.size());
@@ -2313,40 +2326,79 @@ class TpBatchGenerator final : public Generator {
       return -1;
     }
 
-    const auto t0 = std::chrono::steady_clock::now();
     try {
-      const std::size_t chunk = std::size_t(prefill_chunk_);
       pool_.run_all([&](int r) {
         auto& rk = ranks_[r];
         State st = rk.kv_pool.prefill_view(s);
         reset_state(st, pool_.stream(r));
         if (r == 0 && batch_drafter_) batch_drafter_->reset_slot(s);
-        for (std::size_t start = 0; start < std::size_t(n); start += chunk) {
-          const int T = int(std::min(chunk, std::size_t(n) - start));
-          CUDA_CHECK(cudaMemcpyAsync(rk.chunk_tokens.p, prompt.data() + start, std::size_t(T) * sizeof(std::int32_t),
-                                     cudaMemcpyHostToDevice, pool_.stream(r)));
-          float* out_l = (r == 0) ? static_cast<float*>(prefill_logits_.p) : nullptr;
-          ActT* tap_p = (r == 0 && batch_drafter_) ? static_cast<ActT*>(prefill_taps_.p) : nullptr;
-          Tensor tap_view = tap_p ? rm(tap_p, kActDType, {T, NUM_TAPS, HIDDEN}) : Tensor{};
-          rk.prefiller->run(st, static_cast<const std::int32_t*>(rk.chunk_tokens.p), T, int(start), out_l,
-                            tap_p ? &tap_view : nullptr);
-          if (r == 0 && batch_drafter_) batch_drafter_->commit_slot(s, tap_p, T, int(start));
-        }
-        const std::int64_t pos64 = n;
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int64_t*>(rk.kv_pool.slot_pos.p) + s, &pos64, sizeof(pos64),
-                                   cudaMemcpyHostToDevice, pool_.stream(r)));
       });
+      SlotPrefillState& ps = slot_prefill_[s];
+      ps.active = true;
+      ps.prompt_ids.assign(prompt.begin(), prompt.end());
+      ps.next_pos = 0;
+      ps.max_new_tokens = max_new_tokens;
+      ps.params = to_head_params(sampling);
+      ps.seed = sampling.seed;
+      ps.forced.assign(sampling.forced.begin(), sampling.forced.end());
+      ps.t0 = std::chrono::steady_clock::now();
+      ps.prefill_seconds = 0.0;
+      return s;
+    } catch (...) {
+      pool_.run_all([&](int r) { cudaStreamSynchronize(pool_.stream(r)); });
+      free_slot_unlocked(s);
+      throw;
+    }
+  }
+
+  bool step_prefill_slot(int s, int max_chunk_tokens, std::int32_t& first_token, GenerateStats& stats) override {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (s < 0 || s >= options_.max_batch || !slot_in_use_[s] || !slot_prefill_[s].active)
+      throw std::invalid_argument("step_prefill_slot: invalid or inactive prefill slot");
+
+    SlotPrefillState& ps = slot_prefill_[s];
+    const int n = int(ps.prompt_ids.size());
+    const int start = ps.next_pos;
+    const int cap = (max_chunk_tokens > 0) ? std::min(prefill_chunk_, max_chunk_tokens) : prefill_chunk_;
+    const int T = std::min(cap, n - start);
+    const bool is_last = (start + T >= n);
+    const auto tc0 = std::chrono::steady_clock::now();
+
+    try {
+      pool_.run_all([&](int r) {
+        auto& rk = ranks_[r];
+        State st = rk.kv_pool.prefill_view(s);
+        st.length = start;
+        CUDA_CHECK(cudaMemcpyAsync(rk.chunk_tokens.p, ps.prompt_ids.data() + start,
+                                   std::size_t(T) * sizeof(std::int32_t), cudaMemcpyHostToDevice, pool_.stream(r)));
+        float* out_l = (r == 0 && is_last) ? static_cast<float*>(prefill_logits_.p) : nullptr;
+        ActT* tap_p = (r == 0 && batch_drafter_) ? static_cast<ActT*>(prefill_taps_.p) : nullptr;
+        Tensor tap_view = tap_p ? rm(tap_p, kActDType, {T, NUM_TAPS, HIDDEN}) : Tensor{};
+        rk.prefiller->run(st, static_cast<const std::int32_t*>(rk.chunk_tokens.p), T, start, out_l,
+                          tap_p ? &tap_view : nullptr, is_last);
+        if (r == 0 && batch_drafter_) batch_drafter_->commit_slot(s, tap_p, T, start);
+        if (is_last) {
+          const std::int64_t pos64 = n;
+          CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int64_t*>(rk.kv_pool.slot_pos.p) + s, &pos64, sizeof(pos64),
+                                     cudaMemcpyHostToDevice, pool_.stream(r)));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(pool_.stream(r)));
+      });
+      ps.next_pos = start + T;
+      ps.prefill_seconds += seconds_since(tc0);
+      if (!is_last) return false;
+
       slot_pos_host_[s] = n;
 
       // Sample first token on rank 0
       CUDA_CHECK(cudaSetDevice(0));
       SlotMeta& meta = slot_meta_[s];
-      meta.params = to_head_params(sampling);
-      meta.rng.seed = sampling.seed ? *sampling.seed : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
+      meta.params = ps.params;
+      meta.rng.seed = ps.seed ? *ps.seed : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
       meta.rng.counter = 0;
-      meta.forced.assign(sampling.forced.begin(), sampling.forced.end());
+      meta.forced = std::move(ps.forced);
       meta.forced_idx = 0;
-      meta.spec_eligible = (batch_drafter_ != nullptr && sampling.temperature <= 0.f && sampling.forced.empty());
+      meta.spec_eligible = (batch_drafter_ != nullptr && meta.params.temperature <= 0.f && meta.forced.empty());
       meta.has_draft = false;
 
       auto* sampled = static_cast<std::int32_t*>(sampled_dev_.p);
@@ -2361,7 +2413,7 @@ class TpBatchGenerator final : public Generator {
       }
 
       if (meta.spec_eligible) {
-        batch_drafter_->note_tokens(prompt);
+        batch_drafter_->note_tokens(ps.prompt_ids);
         batch_drafter_->note_tokens(std::span<const std::int32_t>(&first_token, 1));
         const int act1[1] = {s};
         const std::int32_t anc1[1] = {first_token};
@@ -2385,11 +2437,27 @@ class TpBatchGenerator final : public Generator {
       stats.prompt_tokens = n;
       stats.reused_tokens = 0;
       stats.reuse = Reuse::None;
-      stats.prefill_seconds = seconds_since(t0);
-      return s;
+      stats.prefill_seconds = ps.prefill_seconds;
+      ps = SlotPrefillState{};
+      return true;
     } catch (...) {
       pool_.run_all([&](int r) { cudaStreamSynchronize(pool_.stream(r)); });
       free_slot_unlocked(s);
+      throw;
+    }
+  }
+
+  int start_slot(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
+                 std::int32_t& first_token, GenerateStats& stats) override {
+    const int s = begin_prefill_slot(full_prompt, max_new_tokens, sampling);
+    if (s < 0) return -1;
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+      while (!step_prefill_slot(s, prefill_chunk_, first_token, stats)) {}
+      stats.prefill_seconds = seconds_since(t0);
+      return s;
+    } catch (...) {
+      release_slot(s);
       throw;
     }
   }
@@ -2925,6 +2993,7 @@ class TpBatchGenerator final : public Generator {
     slot_in_use_[s] = false;
     slot_meta_[s].has_draft = false;
     slot_meta_[s].spec_eligible = false;
+    slot_prefill_[s] = SlotPrefillState{};
     if (batch_drafter_ && free_slot_count_unlocked() == options_.max_batch) {
       CUDA_CHECK(cudaSetDevice(0));
       batch_drafter_->reset_context_shortlist();
@@ -3024,7 +3093,19 @@ class TpBatchGenerator final : public Generator {
   std::vector<std::vector<int>> slot_pages_;
   std::vector<int> slot_pos_host_;
   std::vector<bool> slot_in_use_;
+  struct SlotPrefillState {
+    bool active = false;
+    std::vector<std::int32_t> prompt_ids;
+    int next_pos = 0;
+    int max_new_tokens = 0;
+    head::SamplingParams params{};
+    std::optional<std::uint64_t> seed;
+    std::vector<std::int32_t> forced;
+    std::chrono::steady_clock::time_point t0{};
+    double prefill_seconds = 0.0;
+  };
   std::vector<SlotMeta> slot_meta_;
+  std::vector<SlotPrefillState> slot_prefill_;
   mutable std::mutex mu_;
 };
 

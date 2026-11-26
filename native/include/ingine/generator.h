@@ -203,6 +203,12 @@ struct RuntimeOptions {
   int max_batch = 1;
   // Shared paged full-attention KV pool capacity in tokens (0 = auto-size from free VRAM).
   int max_kv_tokens = 0;
+  // Interleaved chunked prefill when other slots are actively decoding: max prefill tokens per
+  // slice during mixed read+decode (0 disables interleaving; full prefill_chunk is used when idle).
+  int prefill_interleave_chunk = 512;
+  // Target per-stream decode speed floor during mixed read+decode, as a fraction of full-batch
+  // (max_batch) decode speed (e.g. 0.80 => keep each active decoder >= 80% of 4-stream decode).
+  float mixed_decode_ratio = 0.80f;
   // Number of recurrent passes over layers 6..17 (default 3 = 48 visits; 1..8 supported for varloop models).
   int loop_passes = 3;
   // Mech-interp / persona hook options: pre-capture hooked CUDA graphs when enabled, and enforce refusal map.
@@ -277,6 +283,24 @@ class Generator {
                          int32_t& /*first_token*/, GenerateStats& /*stats*/) {
     throw std::logic_error("this generator does not support batched decoding");
   }
+  // Optional incremental chunked prefill interface so Scheduler::loop_batched() can interleave
+  // bounded prefill slices with active decode steps (preventing multi-second decode stalls).
+  virtual bool supports_chunked_prefill() const { return false; }
+  virtual int prefill_interleave_chunk() const { return 0; }
+  virtual float mixed_decode_ratio() const { return 0.80f; }
+  // Allocates a slot, reserves KV pages, resets slot state, and queues `prompt` for chunked prefill.
+  // Returns slot id >= 0, or -1 if no slot / KV pages are available. Fast (< 1 ms, no prefill compute).
+  virtual int begin_prefill_slot(const Prompt& /*prompt*/, int /*max_new_tokens*/, const Sampling& /*sampling*/) {
+    throw std::logic_error("this generator does not support chunked prefill");
+  }
+  // Executes one prefill chunk of up to `max_chunk_tokens` (<= 0 => full prefill_chunk).
+  // Returns false while prompt tokens remain; returns true on the final chunk with `first_token` and `stats` filled.
+  virtual bool step_prefill_slot(int /*slot*/, int /*max_chunk_tokens*/, int32_t& /*first_token*/,
+                                 GenerateStats& /*stats*/) {
+    throw std::logic_error("this generator does not support chunked prefill");
+  }
+  // Returns remaining unprefilled prompt tokens for an in-flight chunked-prefill slot (0 if none).
+  virtual int prefill_remaining_tokens(int /*slot*/) const { return 0; }
   // Runs one batched decode step across `inputs` (1..max_batch_size() active slots), sampling each slot's
   // next token into `out_tokens[i]` and advancing each slot's position.
   virtual void step_slots(std::span<const BatchSlotStep> /*inputs*/, std::span<int32_t> /*out_tokens*/) {

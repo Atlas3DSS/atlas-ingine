@@ -73,6 +73,8 @@ int main(int argc, char** argv) {
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
   int max_batch = 1, max_kv_tokens = 0, loop_passes = 3, draft_ctx = 16384;
+  int prefill_interleave_chunk = 512;
+  double mixed_decode_ratio = 0.80;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_fp4v = false, kv_q4 = false, kv_paged = false, spec = false,
@@ -102,6 +104,12 @@ int main(int argc, char** argv) {
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
   ap.option("--prefill-chunk", "", "tokens per prefill chunk (default 3072; use 512 on 12 GB GPUs for 262K ctx)",
             &prefill_chunk);
+  ap.option("--prefill-interleave-chunk", "",
+            "max prefill tokens per slice interleaved with active decode slots (default 512; 0 disables interleaving)",
+            &prefill_interleave_chunk);
+  ap.option("--mixed-decode-ratio", "",
+            "target per-stream decode speed floor during mixed read+decode as fraction of max_batch decode (default 0.80)",
+            &mixed_decode_ratio);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
@@ -298,6 +306,8 @@ int main(int argc, char** argv) {
       options.dump_router_stats = dump_router_stats;
       options.max_batch = max_batch;
       options.max_kv_tokens = max_kv_tokens;
+      options.prefill_interleave_chunk = prefill_interleave_chunk;
+      options.mixed_decode_ratio = float(mixed_decode_ratio);
       options.loop_passes = loop_passes;
       options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
       options.refusal_map = refusal_map;
