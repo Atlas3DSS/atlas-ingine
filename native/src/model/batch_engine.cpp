@@ -1071,7 +1071,7 @@ class BatchDecoder {
     run_mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H,
             mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr,
             nullptr, final_tap);
-    const bool head_gemv = use_gemv || (w.unembed.fp8() && M <= 32);
+    const bool head_gemv = use_gemv || (w.unembed.fp8() && M <= 32) || w.unembed.blocked();
     if (head_gemv) {
       if (M == 1 && max_rows_ >= 2) {
         CUDA_CHECK(cudaMemsetAsync(xf_ + H, 0, std::size_t(H) * sizeof(ActT), stream));

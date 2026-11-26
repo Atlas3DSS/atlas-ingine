@@ -514,6 +514,12 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   if (tap_out)
     CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
+  auto blocked_head_mat = [&]() {
+    const Dense& u = w.unembed;
+    return dense::Matrix{u.w.data, nullptr, UNPADDED_VOCAB, static_cast<const std::int64_t*>(u.blk_off.data),
+                         static_cast<const std::int32_t*>(u.blk_soff.data),
+                         static_cast<const std::uint16_t*>(u.q8_scale.data)};
+  };
   if (loopcd_mode_ == LoopCdMode::LogitsAdaptive && last_pass > 0) {
     const int ref_pass = last_pass - 1;
     // Shared-coda approximation (reuses final coda residual part+y2 while substituting earlier loop blocks
@@ -521,9 +527,17 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     // coda layers 18..23 twice). Uses pk::head_logits_dual so prefill FP8 rounding matches pk::head_logits bit-for-bit.
     mix({B0_, B1_, B2_[ref_pass], E_[ref_pass]}, part_, y2_, r_last, w_last, nullptr, f32p(w.final_query), 1,
         f32p(w.final_norm), xm_, nullptr, nullptr);
-    pk::head_logits_dual(xf_ + std::size_t(T - 1) * H, xm_ + std::size_t(T - 1) * H, w.unembed.w.data,
-                         f32p(w.unembed.scale), UNPADDED_VOCAB, logits, logits_weak_, s);
+    if (w.unembed.blocked()) {
+      const dense::Matrix m = blocked_head_mat();
+      dense::head(xf_ + std::size_t(T - 1) * H, 1, m, logits, false, s);
+      dense::head(xm_ + std::size_t(T - 1) * H, 1, m, logits_weak_, false, s);
+    } else {
+      pk::head_logits_dual(xf_ + std::size_t(T - 1) * H, xm_ + std::size_t(T - 1) * H, w.unembed.w.data,
+                           f32p(w.unembed.scale), UNPADDED_VOCAB, logits, logits_weak_, s);
+    }
     dense::loopcd_adaptive_combine(logits, logits_weak_, 1, UNPADDED_VOCAB, loopcd_omega_, loopcd_reduce_, s);
+  } else if (w.unembed.blocked()) {  // (Q6_K head kept as int8 codes: the block-table GEMV)
+    dense::head(xf_ + std::size_t(T - 1) * H, 1, blocked_head_mat(), logits, false, s);
   } else {
     pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
   }
