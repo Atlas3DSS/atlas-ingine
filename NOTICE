@@ -136,3 +136,10 @@ Modifications by Atlas3DSS:
     E4M3->FP16x2 shift-decode, and per-group INT8-activation dp4a streaming GEMV
     design adapted from ashalliants/ninfer-3090
     (https://github.com/ashalliants/ninfer-3090, commit 8ea67ce, Apache License 2.0).
+- Native DFlash2 block-diffusion speculative drafter, Anthropic Messages API
+  (/v1/messages, /v1/messages/count_tokens), and DGX Spark GB10 (sm_121a) preset:
+  * DFlash2DraftModel architecture, dynamic grouped convolution, and conditional
+    candidate selector implement the published incoai/Inkling-2-Mini-DFlash2
+    checkpoint specification (https://huggingface.co/incoai/Inkling-2-Mini-DFlash2,
+    revision 4f9088ea, Apache License 2.0) and z-lab/dflash
+    (https://github.com/z-lab/dflash, Apache License 2.0).

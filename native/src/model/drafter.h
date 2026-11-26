@@ -48,11 +48,13 @@ class Drafter {
   static constexpr int SHORTLIST_ROWS = 32768;         // ranked tokens in the shortlist head
   static constexpr int CONTEXT_ROWS = 16384;           // context tokens added to it (until reset())
 
-  // Loads mtp.safetensors from model_dir; `w` supplies the embedding, its norm and the unembedding (the
-  // base logits use w.unembed as stored: FP8 rows with dense_fp8). `w` must outlive the drafter.
+  // Loads mtp.safetensors from model_dir (DSpark), or when dflash2_dir is non-empty loads a native
+  // DFlash2DraftModel (config.json + model.safetensors) from dflash2_dir. `w` supplies the embedding,
+  // its norm and the unembedding (the base logits use w.unembed as stored: FP8 rows with dense_fp8).
+  // `w` must outlive the drafter.
   // shortlist_rows: ranked rows of the shortlist head (tests use fewer to leave tokens of a small vocabulary out).
   Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream,
-          int shortlist_rows = SHORTLIST_ROWS);
+          int shortlist_rows = SHORTLIST_ROWS, const std::filesystem::path& dflash2_dir = {});
   ~Drafter();
   Drafter(const Drafter&) = delete;
   Drafter& operator=(const Drafter&) = delete;
@@ -124,6 +126,7 @@ class Drafter {
   void adopt_checkpoint(const void* src, int length, std::span<const std::int32_t> context);
 
   int vocab() const { return V_; }
+  bool is_dflash2() const { return dflash2_; }
 
   // Device scratch of the acceptance step (engine._accept), owned here so it is allocated once.
   struct AcceptScratch {
@@ -147,17 +150,32 @@ class Drafter {
     std::int32_t* ctx_pos;                // local layers: int32 [WINDOW]; null for the global layer
   };
 
+  struct DFlash2Layer {
+    const ActT *in_norm = nullptr, *post_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr;
+    const ActT *attn_conv_base = nullptr, *mlp_conv_base = nullptr;  // [2, 2, H]
+    kernels::dense::Matrix attn_conv_proj{}, mlp_conv_proj{};        // FP8 [576, H]
+    kernels::dense::Matrix qkv{}, wo{}, gate_up{}, w_down{};         // FP8 [6144,H], [H,4096], [13824,H], [H,6912]
+    const ActT* wkv_ctx = nullptr;                                   // ActT [2048, H] for large commits
+    ActT *k_ctx = nullptr, *v_ctx = nullptr;                         // [DF2_LOCAL_SLOTS, 8, 128]
+    std::int32_t* ctx_pos = nullptr;                                 // [DF2_WINDOW]
+  };
+
   void* alloc(std::size_t bytes);
   void load(const std::filesystem::path& model_dir);
+  void load_dflash2(const std::filesystem::path& dflash2_dir);
   void run_draft(int bucket);
   void run_layers(int bucket);                                                  // a draft after its input rows
+  void run_layers_dflash2();
   void run_commit(const ActT* feats, int n, int row0, bool last_piece);  // large commits
+  void run_commit_dflash2(const ActT* feats, int n, int row0);
   void run_small_commit();                                                      // from params_
+  void run_small_commit_dflash2();
   void run_advance(int bucket);                                                 // round transition
   int bucket_for(int P) const;
 
   const Weights& w_;
   cudaStream_t stream_;
+  bool dflash2_ = false;
   int ctx_ = 0;
   int V_ = 0;
   int inter_ = 0;
@@ -172,6 +190,19 @@ class Drafter {
   kernels::draft::Bf16Gemm gemm_;
 
   std::array<DraftLayer, 3> layers_{};
+  std::array<DFlash2Layer, kernels::draft::DF2_LAYERS> df2_layers_{};
+  kernels::draft::DFlash2CtxLayers df2_ctx_layers_{};
+  const ActT *df2_fc_bf16_ = nullptr, *df2_hidden_norm_ = nullptr;
+  const ActT *df2_pred_cb_ = nullptr, *df2_succ_cb_ = nullptr;
+  kernels::dense::Matrix df2_fc_{}, df2_wkv_all_{}, df2_sel_proj_{};
+  float df2_rope_theta_ = kernels::draft::DF2_ROPE_THETA;
+  float df2_softcap_ = kernels::draft::DF2_SOFTCAP;
+  bool df2_softcap_after_correction_ = true;
+  int df2_mask_token_id_ = 200056;
+  ActT *df2_q_ = nullptr, *df2_attn_o_ = nullptr, *df2_conv_in_ = nullptr;
+  ActT *df2_commit_taps_ = nullptr, *df2_fc_out_act_ = nullptr, *df2_c_small_ = nullptr;
+  float *df2_qkv_out_ = nullptr, *df2_conv_dyn_ = nullptr, *df2_commit_kv_ = nullptr, *df2_g_out_ = nullptr;
+  int *df2_seg_qkv_ = nullptr, *df2_seg_conv_ = nullptr, *df2_seg_kv_ = nullptr, *df2_seg_sel_ = nullptr;
   const ActT* alpha_ = nullptr;  // bf16 [4, 4] softmax(fuse_weight)
   const ActT *final_norm_ = nullptr, *mask_embed_ = nullptr, *f_norm_ = nullptr;
   const ActT *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;

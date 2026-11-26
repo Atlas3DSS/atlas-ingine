@@ -66,7 +66,7 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
+  std::string model_dir, host = "127.0.0.1", ablation, dflash2_dir, backend = "fast", model_id, log_level = "INFO";
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   std::string kv_cache_mode = "per_pass";
   std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
@@ -104,7 +104,9 @@ int main(int argc, char** argv) {
             &prefill_chunk);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
-  ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
+  ap.flag("--spec", "speculative decoding (DSpark mtp.safetensors, or DFlash2 with --dflash2-dir)", &spec);
+  ap.option("--dflash2-dir", "", "native Apache-2.0 DFlash2DraftModel directory (config.json + model.safetensors; implies --spec)",
+            &dflash2_dir);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
   ap.flag("--kv-q4", "Q4_0 4-bit full-attention KV caches (9 KiB/tok per_pass, 4.5 KiB/tok last_full; SWA stays BF16)",
@@ -175,6 +177,7 @@ int main(int argc, char** argv) {
   ap.option("--top-k", "", "top_k of requests that omit it, 0 = off (default: generation_config.json, else 0)",
             &top_k);
   ap.parse(argc, argv);
+  if (!dflash2_dir.empty()) spec = true;
   if (image_max_tokens < 1 || image_max_tokens > ingine::image::MAX_TOKENS || max_images < 0 || max_image_tokens < 0) {
     std::cerr << "ingine-serve: error: --image-max-tokens must be in [1, " << ingine::image::MAX_TOKENS
               << "] and --max-images, --max-image-tokens at least 0\n";
@@ -320,6 +323,7 @@ int main(int argc, char** argv) {
       options.kv_ckpt_every = kv_ckpt_every;
       options.kv_ckpt_resume = kv_ckpt_resume;
       options.spec = spec;
+      options.dflash2_dir = dflash2_dir;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
       options.park_host_mb = park_host_mb;

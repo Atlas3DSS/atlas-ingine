@@ -176,7 +176,7 @@ std::string default_model_dir() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
+  std::string model_dir = default_model_dir(), backend = "fast", ablation, dflash2_dir, effort = "low", forced, forced_trace;
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   std::string kv_cache_mode = "per_pass";
   std::string concurrency_csv, arrival_trace_csv;
@@ -220,7 +220,9 @@ int main(int argc, char** argv) {
   ap.option("--kv-ckpt-resume", "", "explicit disk KV checkpoint file to resume from (fails loudly on mismatch)",
             &kv_ckpt_resume);
   ap.exclusive({"--kv-fp8", "--kv-q4"}, false);
-  ap.flag("--spec", "DSpark speculative decoding", &spec);
+  ap.flag("--spec", "DSpark speculative decoding (or DFlash2 when --dflash2-dir is set)", &spec);
+  ap.option("--dflash2-dir", "", "native Apache-2.0 DFlash2DraftModel directory (config.json + model.safetensors; implies --spec)",
+            &dflash2_dir);
   ap.flag("--atlas-6g", "6 GB VRAM preset (offload-vram-mb=5888, offload-ram-mb=12288, dense-fp8, kv-fp8, prefill-chunk=1024)",
           &atlas_6g);
   ap.option("--offload-vram-mb", "", "tiered MoE offloading VRAM cap in MiB (0 = off, e.g. 5888 for 6 GB GPU)",
@@ -335,7 +337,12 @@ int main(int argc, char** argv) {
     options.kv_ckpt_path = kv_ckpt_path;
     options.kv_ckpt_every = kv_ckpt_every;
     options.kv_ckpt_resume = kv_ckpt_resume;
+    if (!dflash2_dir.empty()) spec = true;
+    if (!dflash2_dir.empty() && resolved_max_batch > 1) {
+      throw std::invalid_argument("--dflash2-dir currently requires --max-batch 1 (batched speculation uses DSpark BatchDrafter)");
+    }
     options.spec = spec;
+    options.dflash2_dir = dflash2_dir;
     options.spec_threshold = float(spec_threshold);
     options.park_mb = park_mb;
     options.park_host_mb = park_host_mb;

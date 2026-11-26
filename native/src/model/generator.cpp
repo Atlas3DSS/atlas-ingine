@@ -61,12 +61,19 @@ const RuntimeOptions& without_spec(const RuntimeOptions& options) {
 }
 
 std::array<std::uint8_t, 32> compute_model_identity_sha(const RuntimeOptions& opt, const Weights& weights) {
-  std::array<std::uint8_t, 64> buf{};
+  std::array<std::uint8_t, 128> buf{};
   if (weights.content_sha256.has_value()) {
     std::memcpy(buf.data(), weights.content_sha256->data(), 32);
   }
   const auto abl_sha = opt.ablation.empty() ? std::array<std::uint8_t, 32>{} : sha256_file_or_zero(opt.ablation);
   std::memcpy(buf.data() + 32, abl_sha.data(), 32);
+  if (opt.dflash2_dir.empty()) {
+    return sha256_bytes(buf.data(), 64);
+  }
+  const auto df2_cfg = sha256_file_or_zero(opt.dflash2_dir / "config.json");
+  const auto df2_wt = sha256_file_or_zero(opt.dflash2_dir / "model.safetensors");
+  std::memcpy(buf.data() + 64, df2_cfg.data(), 32);
+  std::memcpy(buf.data() + 96, df2_wt.data(), 32);
   return sha256_bytes(buf.data(), buf.size());
 }
 
@@ -195,7 +202,8 @@ class EngineGenerator final : public Generator {
     refusal_map_ = options_.refusal_map.empty() ? persona::RefusalMap::default_map()
                                                 : persona::RefusalMap::load(options_.refusal_map);
     if (options_.spec) {
-      drafter_ = std::make_unique<Drafter>(options_.model_dir, rt_.weights(), options_.max_ctx, rt_.stream());
+      drafter_ = std::make_unique<Drafter>(options_.model_dir, rt_.weights(), options_.max_ctx, rt_.stream(),
+                                           Drafter::SHORTLIST_ROWS, options_.dflash2_dir);
       drafter_->capture();
       taps_ = DeviceBuffer(std::size_t(options_.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
       spec_ = std::make_unique<SpecLoop>(rt_, *drafter_);

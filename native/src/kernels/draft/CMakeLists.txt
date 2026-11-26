@@ -18,6 +18,7 @@ add_library(ingine_kernels_draft STATIC
   attention.cu
   batch_draft.cu
   block.cu
+  dflash2.cu
   fold.cu
   gemm.cpp
   markov.cu

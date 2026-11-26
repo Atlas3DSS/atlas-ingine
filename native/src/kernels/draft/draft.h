@@ -33,6 +33,23 @@ inline constexpr int CANDIDATES = 1024;             // Markov-head vocabulary pe
 inline constexpr float ROPE_THETA = 1e6f;
 inline constexpr float EPS = 1e-6f;
 
+// DFlash2 block-diffusion drafter constants (incoai/Inkling-2-Mini-DFlash2, rev 4f9088ea, Apache-2.0).
+inline constexpr int DF2_LAYERS = 5;
+inline constexpr int DF2_HEADS = 32;
+inline constexpr int DF2_Q_DIM = DF2_HEADS * HEAD_DIM;            // 4096
+inline constexpr int DF2_QKV_ROWS = DF2_Q_DIM + 2 * KV_DIM;       // 6144
+inline constexpr int DF2_INTER = 6912;
+inline constexpr int DF2_WINDOW = 2048;
+inline constexpr int DF2_LOCAL_SLOTS = DF2_WINDOW + BLOCK;        // 2056
+inline constexpr int DF2_CONV_K = 2;
+inline constexpr int DF2_CONV_GROUP = 16;
+inline constexpr int DF2_CONV_GROUPS = H / DF2_CONV_GROUP;        // 144
+inline constexpr int DF2_CONV_PROJ_ROWS = 2 * DF2_CONV_K * DF2_CONV_GROUPS;  // 576
+inline constexpr int DF2_RANK = 256;
+inline constexpr int DF2_TOPK = 16;
+inline constexpr float DF2_ROPE_THETA = 10000.f;
+inline constexpr float DF2_SOFTCAP = 30.f;
+
 // Per-call scalars, device resident (the graphs read them).
 struct DraftParams {
   std::int32_t anchor = 0;      // token at position P (sampled, not yet processed)
@@ -226,5 +243,74 @@ std::size_t sampled_accept_workspace_floats(int V);
 void sampled_accept(const float* p, const float* draft_logits, int V, const std::int32_t* drafts, int n,
                     float temperature, const float* qstats, const float* u, float* ws, float* resid,
                     AcceptResult* out, cudaStream_t stream);
+
+// ---- DFlash2 block-diffusion drafter (incoai/Inkling-2-Mini-DFlash2) -----------------------------------
+
+struct DFlash2CtxLayers {
+  const ActT* k_norm[DF2_LAYERS] = {};    // [128]
+  ActT* k_cache[DF2_LAYERS] = {};         // [DF2_LOCAL_SLOTS, 8, 128]
+  ActT* v_cache[DF2_LAYERS] = {};         // [DF2_LOCAL_SLOTS, 8, 128]
+  std::int32_t* ctx_pos[DF2_LAYERS] = {}; // [DF2_WINDOW]
+};
+
+// Precomputes one normalized target embedding row (e.g. mask_token_id = 200056) into `out` [H].
+void dflash2_embed_token(const ActT* embed, const float* embed_norm, int token_id, ActT* out,
+                         cudaStream_t stream, bool embed_q4 = false);
+
+// Plain RMSNorm over width H: out[r] = ActT(rms(in[r]) * w).
+void dflash2_rmsnorm(const ActT* in, int rows, const ActT* w, ActT* out, cudaStream_t stream);
+void dflash2_rmsnorm_f32(const float* in, int rows, const ActT* w, ActT* out, cudaStream_t stream);
+
+// Copies the n = p->ncommit tap rows [n, 4*H] from p->commit_feats into fixed-address taps_out [BLOCK, 4*H]
+// (zero-padding rows >= n) so the small-commit fc GEMV runs at a fixed graph-captured address.
+void dflash2_commit_prep(const DraftParams* p, ActT* taps_out, cudaStream_t stream);
+
+// Large commit store for one DFlash2 local layer (ring size DF2_WINDOW, RoPE theta = rope_theta).
+void dflash2_ctx_kv_store(const ActT* kv, int n, const DraftParams* p, int row0, int keep_from,
+                          const ActT* k_norm, ActT* k_cache, ActT* v_cache, int size,
+                          std::int32_t* ctx_pos, float rope_theta, cudaStream_t stream);
+
+// Small commit store across all 5 DFlash2 layers from stacked kv fp32 [BLOCK, 5 * 2048].
+void dflash2_commit_store(const float* kv, const DraftParams* p, const DFlash2CtxLayers& L,
+                          float rope_theta, cudaStream_t stream);
+
+// Round transition in one launch: updates *p from `in`, copies commit_feats[0..n-1] to taps_out [BLOCK, 4*H]
+// (zero-padding >= n), embeds res[0] = anchor & res[1..7] = mask_embed, and computes xn = rms(res) * in_norm.
+void dflash2_round_begin(DraftParams* p, const RoundInputs& in, const ActT* embed, const float* embed_norm,
+                         const ActT* mask_embed, const ActT* in_norm, ActT* taps_out, ActT* res, ActT* xn,
+                         cudaStream_t stream, bool embed_q4 = false);
+
+// Dynamic grouped causal 2-tap conv, input side (side = 0).
+// base_kernel: [2 sides, 2 taps, H]; dyn: [rows, 2 sides * 2 taps * 144 groups] (output of kernel_projection).
+void dflash2_conv_prepare(const ActT* x, const ActT* base_kernel, const float* dyn, ActT* out, int rows,
+                          cudaStream_t stream);
+
+// Fused output-side (side = 1) dynamic grouped causal 2-tap conv + residual add + RMSNorm.
+void dflash2_conv_finish_add_rmsnorm(ActT* res, const float* delta, const ActT* base_kernel, const float* dyn,
+                                     const ActT* norm_w, ActT* xn, int rows, cudaStream_t stream);
+
+// DFlash2 block QKV head-RMSNorm + RoPE (32 Q + 8 K + 8 V heads, local slots DF2_WINDOW + 0..7).
+void dflash2_qkv_rope(const float* qkv, const ActT* q_norm, const ActT* k_norm, const DraftParams* p,
+                      ActT* q_out, ActT* k_cache, ActT* v_cache, float rope_theta, cudaStream_t stream);
+
+// DFlash2 bidirectional local sliding-window block attention (QH = 4, exact per-query |p_key - p_query| < 2048).
+std::size_t dflash2_attention_workspace_floats();
+void dflash2_block_attention(const ActT* q, const ActT* k_cache, const ActT* v_cache,
+                             const std::int32_t* ctx_pos, const DraftParams* p, float* ws, ActT* out,
+                             cudaStream_t stream);
+
+// Exact per-row top-16 selection over base [rows, V] (ties broken by lowest index; remapped via map if non-null).
+std::size_t dflash2_topk16_workspace_bytes(int rows);
+void dflash2_topk16(const float* base, int rows, int V, const std::int32_t* map, float* cand_val,
+                    std::int32_t* cand_idx, void* ws, cudaStream_t stream);
+
+// Single-CTA left-to-right conditional candidate selector over GAMMA=7 steps, top-16 candidates, rank 256.
+// Writes sparse draft_logits [7, V] (clearing prev_cand first), tokens [7], conf [7], qstats [7, 2],
+// updates prev_cand [7, 16], and advances p->draws / p->round_start.
+void dflash2_select_path(const float* cand_val, const std::int32_t* cand_idx, const float* g_proj,
+                         const ActT* pred_cb, const ActT* succ_cb, std::int32_t* prev_cand,
+                         float* draft_logits, int V, float softcap, bool softcap_after_correction,
+                         std::int32_t* tokens, float* conf, float* qstats, DraftParams* p,
+                         cudaStream_t stream);
 
 }  // namespace ingine::kernels::draft

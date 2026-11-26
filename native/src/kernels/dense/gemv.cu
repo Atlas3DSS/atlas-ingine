@@ -253,7 +253,7 @@ __device__ __forceinline__ uint32_t e4m3x2_to_mma_act2(uint32_t u) {
   return e4m3x2_to_half2_m8(u);
 #elif INGINE_ACT_FP16
   return act::e4m3x2_to_half2_bits(u);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
   uint32_t r;
   asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
   return r;
@@ -529,7 +529,7 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
 // BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
 // whole row per lane would not fit in registers); SPLITK: warps per 16-row block of the M >= 2 kernel;
 // UFP8: steps per load batch of its FP8 instantiation.
-template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, class Make>
+template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, int UBF16 = MMA_U_BF16, class Make>
 void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make) {
   const bool fp8 = w.scale != nullptr;
   require(w.w != nullptr && w.rows > 0, "weight matrix is empty");
@@ -564,7 +564,7 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     } else {
       const dim3 blocks((rows + 15) / 16);
       if (fp8) launch_ex(gemv_mma_kernel<true, K, MM, SPLITK, UFP8, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
-      else launch_ex(gemv_mma_kernel<false, K, MM, SPLITK, MMA_U_BF16, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
+      else launch_ex(gemv_mma_kernel<false, K, MM, SPLITK, UBF16, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
     }
   };
   switch (M) {
@@ -679,10 +679,12 @@ void gemv(const ActT* x, int M, int K, Matrix w, float* out, bool pdl, cudaStrea
   // bytes in flight (measured M = 8, BF16: K = 3072 10.4 -> 8.4 us, K = 9216 28.3 -> 26.0 us vs 8 warps).
   // For BF16, K = 3072, M = 1: as proj_conv; K = 9216: 36 chunks per lane would spill, so M = 1 uses tensor cores.
   if (K == 3072) launch_gemv<3072, 32, 16, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
+  else if (K == 4096) launch_gemv<4096, 0, 16, 2, GemvEpi, 4>(w, M, pdl, stream, make);
+  else if (K == 6912) launch_gemv<6912, 0, 12, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
   else if (K == 1536) launch_gemv<1536, 32, 8, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
   else if (K == 768) launch_gemv<768, 32, 4, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
   else if (K == 9216) launch_gemv<9216, 0, 16, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
-  else require(false, "gemv: K must be 768, 1536, 3072 or 9216");
+  else require(false, "gemv: K must be 768, 1536, 3072, 4096, 6912 or 9216");
 }
 
 void fp8_rows(const ActT* w, int rows, int K, void* q, float* scale, cudaStream_t stream) {
