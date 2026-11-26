@@ -139,7 +139,9 @@ inline void pack_scale_min_k4(const std::uint8_t sc[kSubBlocks], const std::uint
 //      d = f16(max_j(need_sc[j]) / 63), and round sc_q[j] = ceil(need_sc[j] / d) so
 //      31 * d * sc_q[j] - dmin * m_q[j] >= mx_j (no upper-tail clipping).
 // This eliminates sub-block scale/min clipping when an outlier inflates another sub-block in the same
-// 256-element super-block, enforcing <= 2.5% per-32-value source-range reconstruction error.
+// 256-element super-block, achieving <= 2.5% per-32-value source-range reconstruction error on the tested
+// BF16 and FP8 weight fixtures (note: shared 6-bit super-block scales cannot guarantee 2.5% for arbitrary
+// unbounded input ranges).
 inline void quantize_block_cpu(const float* src, BlockQ5K& dst) noexcept {
   float sb_mn[kSubBlocks];
   float sb_mx[kSubBlocks];

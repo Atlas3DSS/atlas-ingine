@@ -13,6 +13,8 @@ if(TARGET ingine_model)
   # Stage 3 (#826): verified root-prefix checkpoint, forks, exact-root, byte-capped pinned host-RAM parking,
   # LRU eviction, memory-pressure fallback, and restore-vs-recompute latency crossover
   ingine_add_test(NAME model_cache_stage3 SOURCES test_cache_stage3.cpp LIBS ingine_model ingine_text GPU MODEL TIMEOUT 1200)
+  # Gate 1 (#888): Q5_K vs FP8 microbench, bidirectional disk checkpoint isolation, real GPU ExpertCache 0-ULP test
+  ingine_add_test(NAME model_small_card_888_gate1 SOURCES test_small_card_888_gate1.cpp LIBS ingine_model ingine_text nlohmann_json::nlohmann_json GPU MODEL TIMEOUT 1200)
   if(UNIX AND NOT APPLE)
     # Test-only deterministic synchronization wrappers for Suite 2h-consumed-weight-toctou (mutates private embed_norm
     # immediately after SafetensorsModel::read returns its payload and records actual GPU norm[0] + content_sha256).

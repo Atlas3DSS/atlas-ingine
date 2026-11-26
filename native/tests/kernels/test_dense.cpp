@@ -5,6 +5,7 @@
 // forget/gain weights, embed, fp8_rows and dequant_rows).
 #include "kernels/oracle.h"
 
+#include "core/q5_k.h"
 #include "kernels/dense/dense.h"
 
 #include <cuda_runtime.h>
@@ -492,6 +493,188 @@ bool test_fp8_rows(Rng& rng) {
   return ok;
 }
 
+// #888 Gate 1: GPU quantize_q5_k_rows / dequant_q5_k_rows vs pinned GGML CPU oracle (K=2304, 3072; ActT & FP8).
+bool test_q5_k_rows(Rng& rng) {
+  bool ok = true;
+  for (int K : {2304, 3072}) {
+    for (int src_fp8 = 0; src_fp8 <= 1; ++src_fp8) {
+      const int rows = 32;
+      std::vector<float> w = randn_bf16(rng, size_t(rows) * K, src_fp8 ? 0.04 : 0.03);
+      if (src_fp8) {
+        // Pre-quantize through GPU fp8_rows -> dequant_rows to match real pre-packed FP8 checkpoint weights.
+        DeviceArray<ingine::ActT> dw0(to_bf16(w));
+        DeviceArray<uint8_t> fq(size_t(rows) * K);
+        DeviceArray<float> fs(rows);
+        DeviceArray<ingine::ActT> fd(size_t(rows) * K);
+        dense::fp8_rows(dw0.get(), rows, K, fq.get(), fs.get(), g_stream);
+        dense::dequant_rows(fq.get(), fs.get(), rows, K, fd.get(), g_stream);
+        sync();
+        w = bf16_download(fd);
+      }
+      // All-zero row check
+      for (int k = 0; k < K; ++k) w[size_t(5) * K + k] = 0.f;
+
+      const size_t q_bytes = size_t(rows) * ingine::q5k::row_bytes(K);
+      DeviceArray<ingine::ActT> dw(to_bf16(w));
+      DeviceArray<uint8_t> dq(q_bytes);
+      DeviceArray<ingine::ActT> dback(size_t(rows) * K);
+      dense::quantize_q5_k_rows(dw.get(), rows, K, dq.get(), g_stream);
+      dense::dequant_q5_k_rows(dq.get(), rows, K, dback.get(), g_stream);
+      sync();
+
+      const auto gpu_q = dq.download();
+      const auto gpu_back = bf16_download(dback);
+
+      std::vector<uint8_t> cpu_q(q_bytes, 0);
+      ingine::q5k::quantize_rows_cpu(w.data(), rows, K, cpu_q.data());
+      std::vector<float> cpu_back(size_t(rows) * K, 0.f);
+      ingine::q5k::dequant_rows_cpu(gpu_q.data(), rows, K, cpu_back.data());
+
+      size_t byte_diff = 0;
+      for (size_t i = 0; i < q_bytes; ++i) byte_diff += (gpu_q[i] != cpu_q[i]);
+      double max_oracle_abs = 0.0;
+      size_t deq_diff = 0;
+      for (size_t i = 0; i < w.size(); ++i) {
+        const float want = round_bf16(cpu_back[i]);
+        if (gpu_back[i] != want) ++deq_diff;
+        max_oracle_abs = std::max(max_oracle_abs, std::fabs(double(gpu_back[i]) - double(want)));
+      }
+      // Sub-block relative error on the tested fixture (shared super-block scales do not bound arbitrary ranges).
+      const int nb = K / ingine::q5k::kBlockElems;
+      int fail_sb = 0;
+      double worst_rel = 0.0;
+      for (int r = 0; r < rows; ++r) {
+        for (int b = 0; b < nb; ++b) {
+          for (int j = 0; j < ingine::q5k::kSubBlocks; ++j) {
+            const int off = b * ingine::q5k::kBlockElems + j * ingine::q5k::kSubBlockElems;
+            double mn = w[size_t(r) * K + off], mx = mn, err = 0.0;
+            for (int i = 0; i < ingine::q5k::kSubBlockElems; ++i) {
+              const double sv = w[size_t(r) * K + off + i];
+              const double dv = cpu_back[size_t(r) * K + off + i];
+              mn = std::min(mn, sv);
+              mx = std::max(mx, sv);
+              err = std::max(err, std::fabs(sv - dv));
+            }
+            const double rng_v = mx - mn;
+            if (rng_v > 0.0) {
+              const double rel = err / rng_v;
+              worst_rel = std::max(worst_rel, rel);
+              if (rel > 0.025) ++fail_sb;
+            } else if (err > 0.0) {
+              ++fail_sb;
+            }
+          }
+        }
+      }
+      // Allow 0 byte diffs on exact IEEE paths; if FP rounding in rint differs by 1 code on exact half-tie,
+      // dequant must still match CPU oracle within 1 ULP and sub-block error <= 2.5% on tested fixtures.
+      const bool case_ok = (deq_diff == 0) && (byte_diff == 0) && (fail_sb == 0) && (worst_rel <= 0.025);
+      std::printf("%s q5_k_rows K=%d src=%s: cuda_vs_cpu_byte_diff=%zu deq_diff=%zu max_oracle_abs=%.3e "
+                  "fixture_worst_sb_rel=%.3f%% fail_sb=%d\n",
+                  case_ok ? "PASS" : "FAIL", K, src_fp8 ? "fp8" : "act", byte_diff, deq_diff, max_oracle_abs,
+                  worst_rel * 100.0, fail_sb);
+      ok &= case_ok;
+    }
+  }
+  return ok;
+}
+
+bool test_proj_q5_k(Rng& rng, int M, bool full, bool single) {
+  const std::vector<int> seg = layout(full, single);
+  const int nseg = int(seg.size() / 3), R = seg[seg.size() - 2];
+  const std::vector<float> w_src = randn_bf16(rng, size_t(R) * H, 0.03);
+  const size_t q_bytes = size_t(R) * ingine::q5k::row_bytes(H);
+  DeviceArray<ingine::ActT> dw_src(to_bf16(w_src));
+  DeviceArray<uint8_t> dq(q_bytes);
+  dense::quantize_q5_k_rows(dw_src.get(), R, H, dq.get(), g_stream);
+  sync();
+  const auto q_host = dq.download();
+  std::vector<float> w_deq(size_t(R) * H, 0.f);
+  ingine::q5k::dequant_rows_cpu(q_host.data(), R, H, w_deq.data());
+
+  const std::vector<float> x = randn_bf16(rng, size_t(3) * M * H, 1.0);
+  DeviceArray<ingine::ActT> dx(to_bf16(x));
+  DeviceArray<int> dseg(seg);
+  DeviceArray<float> out(size_t(M) * R);
+  dense::Matrix mat{dq.get(), nullptr, R, /*q5_k=*/true};
+  dense::proj(dx.get(), M, mat, dseg.get(), nseg, out.get(), true, g_stream);
+  sync();
+  const auto got = out.download();
+
+  std::vector<double> ref(got.size()), rnd(got.size());
+  double max_abs = 0.0;
+  for (int s = 0; s < nseg; ++s) {
+    for (int r = seg[3 * s]; r < seg[3 * s + 1]; ++r) {
+      const float* wrow = &w_deq[size_t(r) * H];
+      for (int m = 0; m < M; ++m) {
+        const float* xrow = &x[(size_t(seg[3 * s + 2]) * M + m) * H];
+        double acc = 0.0;
+        for (int k = 0; k < H; ++k) acc += double(wrow[k]) * double(xrow[k]);
+        ref[size_t(m) * R + r] = acc;
+        rnd[size_t(m) * R + r] = rbf(acc);
+        max_abs = std::max(max_abs, std::fabs(double(got[size_t(m) * R + r]) - rnd[size_t(m) * R + r]));
+      }
+    }
+  }
+  char what[96];
+  std::snprintf(what, sizeof what, "proj_q5_k M=%d %s%s (max_abs=%.3e)", M, full ? "full" : "sliding",
+                single ? " single-input" : "", max_abs);
+  return Check{what, 1.0 / 128, 1e-3, 0.01}(got, ref, &rnd) && (max_abs <= 1e-3);
+}
+
+bool test_proj_conv_q5_k(Rng& rng, int M) {
+  const int K = 3072;
+  const std::vector<float> w_src = randn_bf16(rng, size_t(H) * K, 0.02);
+  const size_t q_bytes = size_t(H) * ingine::q5k::row_bytes(K);
+  DeviceArray<ingine::ActT> dw_src(to_bf16(w_src));
+  DeviceArray<uint8_t> dq(q_bytes);
+  dense::quantize_q5_k_rows(dw_src.get(), H, K, dq.get(), g_stream);
+  sync();
+  const auto q_host = dq.download();
+  std::vector<float> w_deq(size_t(H) * K, 0.f);
+  ingine::q5k::dequant_rows_cpu(q_host.data(), H, K, w_deq.data());
+
+  const std::vector<float> x = randn_bf16(rng, size_t(M) * K, 1.0);
+  const std::vector<float> cw = randn(rng, size_t(H) * 4, 0.5);
+  const std::vector<float> st0 = randn_bf16(rng, size_t(3) * H, 1.0);
+  DeviceArray<ingine::ActT> dx(to_bf16(x));
+  DeviceArray<float> dcw(cw), dst(st0), out(size_t(M) * H), hist(size_t(M) * H);
+  dense::Matrix mat{dq.get(), nullptr, H, /*q5_k=*/true};
+  dense::proj_conv(dx.get(), M, mat, dcw.get(), dst.get(), out.get(), hist.get(), true, g_stream);
+  sync();
+  const auto y = hist.download(), o = out.download(), st = dst.download();
+
+  std::vector<double> ry(y.size()), rr(y.size());
+  double max_abs = 0.0;
+  for (int m = 0; m < M; ++m) {
+    for (int c = 0; c < H; ++c) {
+      double acc = 0.0;
+      for (int k = 0; k < K; ++k) acc += double(w_deq[size_t(c) * K + k]) * double(x[size_t(m) * K + k]);
+      ry[size_t(m) * H + c] = acc;
+      rr[size_t(m) * H + c] = rbf(acc);
+      max_abs = std::max(max_abs, std::fabs(double(y[size_t(m) * H + c]) - rr[size_t(m) * H + c]));
+    }
+  }
+  char what[96];
+  std::snprintf(what, sizeof what, "proj_conv_q5_k M=%d inputs (max_abs=%.3e)", M, max_abs);
+  bool ok = Check{what, 1.0 / 128, 1e-3, 0.01}(y, ry, &rr) && (max_abs <= 1e-3);
+  std::vector<double> ro(o.size()), rs(st.size());
+  for (int c = 0; c < H; ++c) {
+    std::vector<double> ext(M + 3);
+    for (int j = 0; j < 3; ++j) ext[j] = st0[size_t(j) * H + c];
+    for (int m = 0; m < M; ++m) ext[3 + m] = y[size_t(m) * H + c];
+    for (int m = 0; m < M; ++m) {
+      double s = 0;
+      for (int j = 0; j < 4; ++j) s += double(cw[size_t(c) * 4 + j]) * ext[m + j];
+      ro[size_t(m) * H + c] = (s + ext[m + 3]) / std::sqrt(5.0);
+    }
+    for (int j = 0; j < 3; ++j) rs[size_t(j) * H + c] = ext[M + j];
+  }
+  ok &= Check{"proj_conv_q5_k out", 1e-5, 1e-6, 1.0}(o, ro);
+  ok &= Check{"proj_conv_q5_k state", 0, 0, 0}(st, rs);
+  return ok;
+}
+
 // ---- Bitwise lock. mix, message_gates and router are exact: on fixed inputs they must keep giving the bits
 // recorded in kLock (taken from kernels checked byte for byte against the implementation they were ported
 // from). A changed hash means the arithmetic changed (order of a sum, an FMA contraction the compiler chose
@@ -758,6 +941,9 @@ int main() {
   ok &= test_gates(rng, 1, 5, true);  // FP32 forget/gain with several tokens: one staging buffer
   for (int M : {1, 3, 8}) ok &= test_embed(rng, M);
   ok &= test_fp8_rows(rng);
+  ok &= test_q5_k_rows(rng);
+  for (int M = 1; M <= 8; ++M) ok &= test_proj_q5_k(rng, M, (M % 2) == 0, (M % 3) == 0);
+  for (int M : {1, 4, 8}) ok &= test_proj_conv_q5_k(rng, M);
   ok &= test_bit_lock();
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

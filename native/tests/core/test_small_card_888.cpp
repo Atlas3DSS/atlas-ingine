@@ -1,7 +1,7 @@
 // Gate 0 pure-CPU verification for #888 (opt-in small-card knobs, strictly NO silent --tail-skip):
 //   1. Pinned GGML BlockQ5K (176 B / 256 elems) pack/unpack + multi-block K=2304 & K=3072 oracle
-//      covering both BF16 and pre-packed FP8-E4M3FN sources, strictly enforcing the frozen <= 2.5%
-//      per-32-value sub-block source-range bound (0 failures across all 5,376 sub-blocks) + FP64 GEMV.
+//      covering both BF16 and pre-packed FP8-E4M3FN fixtures, verifying <= 2.5% per-32-value
+//      sub-block source-range error on all 5,376 tested fixture sub-blocks + FP64 GEMV.
 //   2. Recomputed persistent, scratch, and packed-payload byte accounting.
 //   3. Production LruSlotIndex + BoundedSwapQueue + ExpertCache host/device dispatch-pointer lifecycle
 //      for BOTH decode and prefill (Pass 0 / Pass 1):
@@ -183,7 +183,8 @@ int main() {
   }
 
   // ------------------------------------------------------------------ 2. Multi-block K=2304 & K=3072 (BF16 + FP8)
-  // Strictly enforces the frozen <= 2.5% per-32-value sub-block source-range bound (0/5376 failures).
+  // Verifies <= 2.5% per-32-value sub-block source-range error on the tested fixtures (0/5376 failures;
+  // shared super-block scales do not guarantee 2.5% for arbitrary unbounded input ranges).
   for (int K : {2304, 3072}) {
     const int R = 16;
     const int M = 3;
@@ -221,7 +222,7 @@ int main() {
       }
       expect(nonzero > int(src.size() * 9 / 10), label);
 
-      // Frozen per-32-value sub-block source-range bound: max|src - deq| <= 2.5% * (max - min) in every sub-block.
+      // Tested-fixture per-32-value sub-block source-range bound: max|src - deq| <= 2.5% * (max - min).
       const int nb = K / kBlockElems;
       int total_sb = 0;
       int fail_sb = 0;
@@ -252,8 +253,8 @@ int main() {
           }
         }
       }
-      expect(fail_sb == 0, "Q5_K frozen <= 2.5% per-32-value source-range bound across all sub-blocks");
-      expect(worst_rel <= 0.025, "Q5_K worst sub-block relative error <= 2.5%");
+      expect(fail_sb == 0, "Q5_K <= 2.5% per-32-value source-range bound across all tested fixture sub-blocks");
+      expect(worst_rel <= 0.025, "Q5_K worst tested-fixture sub-block relative error <= 2.5%");
 
       // Compare FP64 GEMV over packed BlockQ5K vs original FP64 GEMV
       std::vector<double> ref_orig(std::size_t(M) * R, 0.0);
