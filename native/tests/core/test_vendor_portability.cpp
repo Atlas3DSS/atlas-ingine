@@ -192,6 +192,29 @@ void test_mlx_and_sycl_policies() {
   VP_CHECK(!can_async_blit_d2d(true, 2048u, 0u, 4096u));
   VP_CHECK(can_async_blit_d2d(true, 128u, 128u, 0u));
 
+  // Metal registered-range lookup: distinguish unregistered host pointers, valid offset subspans,
+  // and out-of-bounds spans that cross past either end of a registered MTLBuffer.
+  const std::vector<RegisteredRange> mtl_spans = {
+      {0x100000u, 16384u},
+      {0x200000u, 32768u},
+  };
+  const auto unreg_lo = classify_registered_range(mtl_spans, 0x050000u, 4096u);
+  VP_CHECK(unreg_lo.status == BufferRangeMatch::Unregistered);
+  const auto unreg_adj = classify_registered_range(mtl_spans, 0x104000u, 16u);  // right after first buffer end
+  VP_CHECK(unreg_adj.status == BufferRangeMatch::Unregistered);
+  const auto valid_base = classify_registered_range(mtl_spans, 0x100000u, 16384u);
+  VP_CHECK(valid_base.status == BufferRangeMatch::Valid && valid_base.index == 0u && valid_base.offset == 0u);
+  const auto valid_sub = classify_registered_range(mtl_spans, 0x201000u, 4096u);
+  VP_CHECK(valid_sub.status == BufferRangeMatch::Valid && valid_sub.index == 1u && valid_sub.offset == 0x1000u);
+  const auto valid_tail = classify_registered_range(mtl_spans, 0x207f00u, 256u);
+  VP_CHECK(valid_tail.status == BufferRangeMatch::Valid && valid_tail.index == 1u && valid_tail.offset == 0x7f00u);
+  const auto oob_end = classify_registered_range(mtl_spans, 0x207f00u, 257u);  // crosses end by 1 byte
+  VP_CHECK(oob_end.status == BufferRangeMatch::OutOfBounds && oob_end.index == 1u && oob_end.offset == 0x7f00u);
+  const auto oob_whole = classify_registered_range(mtl_spans, 0x100000u, 16385u);
+  VP_CHECK(oob_whole.status == BufferRangeMatch::OutOfBounds && oob_whole.index == 0u && oob_whole.offset == 0u);
+  const auto oob_front = classify_registered_range(mtl_spans, 0x0fff00u, 512u);  // starts before buffer, crosses in
+  VP_CHECK(oob_front.status == BufferRangeMatch::OutOfBounds && oob_front.index == 0u);
+
   // Intel SYCL GPU enumeration strictly rejects CPUs and non-Intel GPUs and prefers Level Zero over OpenCL.
   const std::vector<SyclDeviceCandidate> cands = {
       {false, false, "intel(r) corporation", 0x8086u},      // idx 0: Intel CPU -> reject

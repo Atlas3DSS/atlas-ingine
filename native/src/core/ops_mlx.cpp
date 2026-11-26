@@ -16,7 +16,8 @@
 namespace ingine {
 id<MTLDevice> shared_mtl_device();
 id<MTLCommandQueue> metal_queue_for_stream(hal::StreamHandle stream);
-id<MTLBuffer> lookup_metal_buffer_for_range(const void* ptr, std::size_t bytes, std::size_t& out_offset);
+id<MTLBuffer> lookup_metal_buffer_for_range(const void* ptr, std::size_t bytes, std::size_t& out_offset,
+                                            const char* caller);
 }
 
 namespace ingine::ops {
@@ -161,8 +162,8 @@ void decode_q4_0(const void* table_q4, int rows, int hidden_size, float* out_f32
   const std::size_t tbl_bytes = static_cast<std::size_t>(rows) * row_bytes;
   const std::size_t out_bytes = static_cast<std::size_t>(rows) * static_cast<std::size_t>(hidden_size) * sizeof(float);
   std::size_t tbl_off = 0, out_off = 0;
-  id<MTLBuffer> b_tbl = lookup_metal_buffer_for_range(table_q4, tbl_bytes, tbl_off);
-  id<MTLBuffer> b_out = lookup_metal_buffer_for_range(out_f32, out_bytes, out_off);
+  id<MTLBuffer> b_tbl = lookup_metal_buffer_for_range(table_q4, tbl_bytes, tbl_off, "decode_q4_0(MLX) table_q4");
+  id<MTLBuffer> b_out = lookup_metal_buffer_for_range(out_f32, out_bytes, out_off, "decode_q4_0(MLX) out_f32");
   if (!b_tbl || !b_out) {
     throw std::invalid_argument("decode_q4_0(MLX): buffers must be HAL-allocated Metal shared buffers");
   }
@@ -193,16 +194,24 @@ DispatchPath run_embed_q4_rmsnorm(const EmbedQ4RmsNormDesc& desc, const EmbedQ4R
     throw std::invalid_argument("embed_q4_rmsnorm(MLX): null buffer argument");
   }
   std::size_t tok_off = 0, tbl_off = 0, norm_off = 0, out_off = 0, oob_off = 0;
+  const std::size_t row_bytes =
+      static_cast<std::size_t>(desc.hidden_size / 2) + static_cast<std::size_t>(desc.hidden_size / 32) * 2u;
   const std::size_t tok_bytes = static_cast<std::size_t>(desc.tokens) * sizeof(std::int64_t);
+  const std::size_t tbl_bytes = static_cast<std::size_t>(desc.vocab_size) * row_bytes;
   const std::size_t norm_bytes = static_cast<std::size_t>(desc.hidden_size) * sizeof(float);
-  const std::size_t out_bytes = static_cast<std::size_t>(desc.tokens) * static_cast<std::size_t>(desc.hidden_size) * sizeof(float);
-  id<MTLBuffer> b_tok = lookup_metal_buffer_for_range(args.token_ids, tok_bytes, tok_off);
-  id<MTLBuffer> b_tbl = lookup_metal_buffer_for_range(args.table_q4, 1u, tbl_off);
-  id<MTLBuffer> b_norm = lookup_metal_buffer_for_range(args.norm_weight, norm_bytes, norm_off);
-  id<MTLBuffer> b_out = lookup_metal_buffer_for_range(args.out, out_bytes, out_off);
-  id<MTLBuffer> b_oob = args.invalid_token_flag
-                            ? lookup_metal_buffer_for_range(args.invalid_token_flag, sizeof(std::uint32_t), oob_off)
-                            : nil;
+  const std::size_t out_elems =
+      static_cast<std::size_t>(desc.tokens - 1) * static_cast<std::size_t>(desc.out_row_stride) +
+      static_cast<std::size_t>(desc.hidden_size);
+  const std::size_t out_bytes = out_elems * sizeof(float);
+  id<MTLBuffer> b_tok = lookup_metal_buffer_for_range(args.token_ids, tok_bytes, tok_off, "embed_q4_rmsnorm(MLX) token_ids");
+  id<MTLBuffer> b_tbl = lookup_metal_buffer_for_range(args.table_q4, tbl_bytes, tbl_off, "embed_q4_rmsnorm(MLX) table_q4");
+  id<MTLBuffer> b_norm = lookup_metal_buffer_for_range(args.norm_weight, norm_bytes, norm_off, "embed_q4_rmsnorm(MLX) norm_weight");
+  id<MTLBuffer> b_out = lookup_metal_buffer_for_range(args.out, out_bytes, out_off, "embed_q4_rmsnorm(MLX) out");
+  id<MTLBuffer> b_oob =
+      args.invalid_token_flag
+          ? lookup_metal_buffer_for_range(args.invalid_token_flag, sizeof(std::uint32_t), oob_off,
+                                          "embed_q4_rmsnorm(MLX) invalid_token_flag")
+          : nil;
 
   if (!force_fallback && res.path == DispatchPath::Native && b_tok && b_tbl && b_norm && b_out) {
     if (desc.token_bounds == TokenBoundsMode::Validate) {

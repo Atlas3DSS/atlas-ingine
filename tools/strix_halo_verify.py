@@ -223,6 +223,24 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def read_ingpack_header_identities(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("rb") as f:
+            hdr = f.read(256)
+    except OSError:
+        return None
+    if len(hdr) < 160 or hdr[:8] != b"INGPACK1":
+        return None
+    flags = int.from_bytes(hdr[12:16], "little")
+    header_sha = hdr[96:128].hex()
+    content_sha = hdr[128:160].hex() if (flags & 1) else None
+    return {
+        "pack_header_sha256": header_sha,
+        "pack_content_sha256": content_sha,
+        "has_content_sha256": bool(flags & 1),
+    }
+
+
 def collect_model_provenance(model_dir: Path | None, hash_packs: bool = False) -> dict[str, Any]:
     if model_dir is None:
         return {"present": False, "path": None}
@@ -230,6 +248,8 @@ def collect_model_provenance(model_dir: Path | None, hash_packs: bool = False) -
         return {"present": False, "path": str(model_dir), "error": "directory does not exist"}
 
     entries: list[dict[str, Any]] = []
+    pack_content_sha256: str | None = None
+    pack_header_sha256: str | None = None
     small_meta_names = {
         "config.json",
         "generation_config.json",
@@ -242,6 +262,14 @@ def collect_model_provenance(model_dir: Path | None, hash_packs: bool = False) -
             continue
         st = p.stat()
         row: dict[str, Any] = {"name": p.name, "size_bytes": st.st_size, "mtime_ns": st.st_mtime_ns}
+        if p.suffix == ".ingpack":
+            ident = read_ingpack_header_identities(p)
+            if ident:
+                row.update(ident)
+                if pack_content_sha256 is None and ident.get("pack_content_sha256"):
+                    pack_content_sha256 = ident["pack_content_sha256"]
+                if pack_header_sha256 is None and ident.get("pack_header_sha256"):
+                    pack_header_sha256 = ident["pack_header_sha256"]
         if p.name in small_meta_names or (hash_packs and p.suffix == ".ingpack"):
             row["sha256"] = sha256_file(p)
         entries.append(row)
@@ -250,6 +278,8 @@ def collect_model_provenance(model_dir: Path | None, hash_packs: bool = False) -
         "path": str(model_dir.resolve()),
         "file_count": len(entries),
         "has_ingpack": any(e["name"].endswith(".ingpack") for e in entries),
+        "pack_content_sha256": pack_content_sha256,
+        "pack_header_sha256": pack_header_sha256,
         "files": entries,
     }
 
@@ -616,15 +646,47 @@ def wait_for_health(base_url: str, proc: subprocess.Popen[str] | None, timeout_s
     raise TimeoutError(f"Server at {base_url}/health did not become ready within {timeout_s}s")
 
 
+def detect_server_runtime_info(base_url: str, model_id_override: str | None) -> dict[str, Any]:
+    model_id = model_id_override or "ingine"
+    backend: str | None = None
+    selected_device_arch: str | None = None
+    model_sha256: str | None = None
+
+    def extract_meta(obj: Any) -> None:
+        nonlocal backend, selected_device_arch, model_sha256
+        if not isinstance(obj, dict):
+            return
+        if backend is None and isinstance(obj.get("backend"), str):
+            backend = obj["backend"].strip().lower()
+        for k in ("selected_device_arch", "device_arch", "arch_name", "gpu_arch"):
+            if selected_device_arch is None and isinstance(obj.get(k), str) and obj[k].strip():
+                selected_device_arch = obj[k].strip().lower().split(":")[0]
+        for k in ("content_sha256", "model_sha256", "pack_content_sha256"):
+            if model_sha256 is None and isinstance(obj.get(k), str) and obj[k].strip():
+                model_sha256 = obj[k].strip().lower()
+
+    status_h, data_h = http_get_json(base_url, "/health", timeout_s=10.0)
+    if status_h == 200:
+        extract_meta(data_h)
+    status_m, data_m = http_get_json(base_url, "/v1/models", timeout_s=10.0)
+    if status_m == 200 and isinstance(data_m, dict):
+        extract_meta(data_m)
+        items = data_m.get("data")
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            if not model_id_override and items[0].get("id"):
+                model_id = str(items[0]["id"])
+            extract_meta(items[0])
+
+    return {
+        "model_id": model_id,
+        "backend": backend,
+        "selected_device_arch": selected_device_arch,
+        "content_sha256": model_sha256,
+    }
+
+
 def detect_model_id(base_url: str, override: str | None) -> str:
-    if override:
-        return override
-    status, data = http_get_json(base_url, "/v1/models", timeout_s=10.0)
-    if status == 200 and isinstance(data, dict):
-        items = data.get("data")
-        if isinstance(items, list) and items and isinstance(items[0], dict) and items[0].get("id"):
-            return str(items[0]["id"])
-    return "ingine"
+    return str(detect_server_runtime_info(base_url, override)["model_id"])
 
 
 def find_free_port() -> int:
@@ -892,6 +954,10 @@ def extract_verified_metrics(bench: dict[str, Any]) -> tuple[dict[str, float | N
     return verified, notes
 
 
+def _is_sha256_hex(value: str | None) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-fA-F]{64}", value.strip()))
+
+
 def run_benchmark_suite(
     base_url: str | None,
     serve_bin: Path | None,
@@ -904,6 +970,9 @@ def run_benchmark_suite(
     agent_lengths: list[int],
     cold_tokens: int,
     startup_timeout_s: float,
+    expected_model_sha256: str | None = None,
+    selected_device_arch: str | None = None,
+    selected_backend: str | None = None,
 ) -> dict[str, Any]:
     managed_proc: subprocess.Popen[str] | None = None
     active_url = base_url
@@ -920,7 +989,8 @@ def run_benchmark_suite(
         wait_for_health(active_url, None, min(startup_timeout_s, 30.0))
 
     try:
-        model_id = detect_model_id(active_url, model_id_override)
+        runtime_info = detect_server_runtime_info(active_url, model_id_override)
+        model_id = str(runtime_info["model_id"])
         words_per_tok = calibrate_words_per_token(active_url, model_id)
         margin = lambda target: 1.02 if target >= 1024 else 1.0  # noqa: E731
 
@@ -1070,10 +1140,25 @@ def run_benchmark_suite(
         },
     }
 
+    pack_prov = collect_model_provenance(model_dir, hash_packs=False) if model_dir is not None else {}
+    observed_sha = runtime_info.get("content_sha256") or pack_prov.get("pack_content_sha256")
+    resolved_arch = (selected_device_arch or runtime_info.get("selected_device_arch") or "").strip().lower().split(":")[0] or None
+    resolved_backend = (selected_backend or runtime_info.get("backend") or "").strip().lower() or None
+
     bench_payload: dict[str, Any] = {
         "mode": "smoke_fake_only" if fake_smoke else "live_engine",
         "fake_smoke": fake_smoke,
         "model_id": model_id,
+        "accelerator": {
+            "backend": resolved_backend,
+            "selected_device_arch": resolved_arch,
+        },
+        "model_identity": {
+            "model_id": model_id,
+            "content_sha256": observed_sha.lower() if isinstance(observed_sha, str) else None,
+            "pack_header_sha256": pack_prov.get("pack_header_sha256"),
+            "expected_model_sha256": expected_model_sha256.strip().lower() if expected_model_sha256 else None,
+        },
         "startup_ready_s": round(startup_ready_s, 4) if startup_ready_s is not None else None,
         "words_per_token_calibrated": round(words_per_tok, 4),
         "decode_runs": decode_runs,
@@ -1096,12 +1181,31 @@ def evaluate_metric(rule: MetricRule, value: float | None) -> str:
     return "PASS" if (value > 0.0 and value < rule.threshold) else "FAIL"
 
 
-def score_report(report: dict[str, Any]) -> dict[str, Any]:
+def score_report(report: dict[str, Any], expected_model_sha256: str | None = None) -> dict[str, Any]:
     preflight = report.get("preflight") or {}
     bench = report.get("bench") or {}
     mode = bench.get("mode", "unmeasured")
     fake_smoke = bool(bench.get("fake_smoke", mode == "smoke_fake_only"))
     gfx1151 = bool((preflight.get("rocm") or {}).get("gfx1151_detected", False))
+
+    accel = bench.get("accelerator") if isinstance(bench.get("accelerator"), dict) else {}
+    selected_backend = str(accel.get("backend") or "").strip().lower() or None
+    selected_arch_raw = str(accel.get("selected_device_arch") or "").strip().lower()
+    selected_arch = selected_arch_raw.split(":")[0] if selected_arch_raw else None
+    selected_accelerator_verified = (selected_backend == "hip" and selected_arch == "gfx1151")
+
+    model_ident = bench.get("model_identity") if isinstance(bench.get("model_identity"), dict) else {}
+    preflight_model = preflight.get("model") if isinstance(preflight.get("model"), dict) else {}
+    observed_sha_raw = model_ident.get("content_sha256") or preflight_model.get("pack_content_sha256")
+    observed_model_sha = str(observed_sha_raw).strip().lower() if _is_sha256_hex(observed_sha_raw) else None
+    expected_sha_raw = expected_model_sha256 or model_ident.get("expected_model_sha256")
+    expected_model_sha = str(expected_sha_raw).strip().lower() if _is_sha256_hex(expected_sha_raw) else None
+    model_identity_mismatch = (
+        expected_model_sha is not None and observed_model_sha is not None and observed_model_sha != expected_model_sha
+    )
+    model_identity_verified = (
+        expected_model_sha is not None and observed_model_sha is not None and observed_model_sha == expected_model_sha
+    )
 
     # Always recompute eligible metrics from raw run evidence so bare/short labels cannot spoof floors.
     verified_metrics, eligibility_notes = extract_verified_metrics(bench)
@@ -1138,24 +1242,40 @@ def score_report(report: dict[str, Any]) -> dict[str, Any]:
         )
 
     all_metrics_pass = (not fake_smoke) and (passed_count == len(STRIX_HALO_TARGET_FLOOR))
-    hardware_verified = all_metrics_pass and gfx1151 and mode == "live_engine"
+    hardware_verified = (
+        all_metrics_pass
+        and mode == "live_engine"
+        and gfx1151
+        and selected_accelerator_verified
+        and model_identity_verified
+    )
 
     if fake_smoke:
         verdict = "UNMEASURED_FAKE_MODE"
     elif unmeasured_count > 0:
         verdict = "INCOMPLETE_UNMEASURED"
-    elif hardware_verified:
-        verdict = "PASS_STRIX_HALO_FLOOR"
-    elif all_metrics_pass:
-        verdict = "PASS_FLOOR_NON_GFX1151"
-    else:
+    elif not all_metrics_pass:
         verdict = "FAIL_STRIX_HALO_FLOOR"
+    elif not gfx1151 or (selected_arch is not None and selected_arch != "gfx1151") or (selected_backend is not None and selected_backend != "hip"):
+        verdict = "PASS_FLOOR_NON_GFX1151"
+    elif model_identity_mismatch:
+        verdict = "PASS_FLOOR_MODEL_IDENTITY_MISMATCH"
+    elif not selected_accelerator_verified or not model_identity_verified:
+        verdict = "PASS_FLOOR_UNBOUND_IDENTITY"
+    else:
+        verdict = "PASS_STRIX_HALO_FLOOR"
 
     return {
         "verdict": verdict,
         "hardware_verified": hardware_verified,
         "all_metrics_pass": all_metrics_pass,
         "gfx1151_detected": gfx1151,
+        "selected_backend": selected_backend,
+        "selected_device_arch": selected_arch,
+        "selected_accelerator_verified": selected_accelerator_verified,
+        "observed_model_sha256": observed_model_sha,
+        "expected_model_sha256": expected_model_sha,
+        "model_identity_verified": model_identity_verified,
         "mode": mode,
         "passed": passed_count,
         "failed": failed_count,
@@ -1175,6 +1295,8 @@ def render_scorecard_markdown(report: dict[str, Any], score: dict[str, Any]) -> 
         f"- **Verdict:** `{score['verdict']}` (`hardware_verified={score['hardware_verified']}`, `mode={score['mode']}`)",
         f"- **Host / Kernel:** `{preflight.get('hostname')}` / `{preflight.get('kernel')}`",
         f"- **ROCm Targets:** `{rocm.get('gfx_targets')}` (`gfx1151_detected={rocm.get('gfx1151_detected')}`)",
+        f"- **Selected Accelerator:** `backend={score.get('selected_backend')}`, `arch={score.get('selected_device_arch')}` (`verified={score.get('selected_accelerator_verified')}`)",
+        f"- **Model Pack SHA-256:** `observed={score.get('observed_model_sha256')}`, `expected={score.get('expected_model_sha256')}` (`verified={score.get('model_identity_verified')}`)",
         f"- **Git HEAD:** `{((preflight.get('git') or {}).get('head'))}` (dirty=`{((preflight.get('git') or {}).get('dirty'))}`)",
     ]
     if bt:
@@ -1243,10 +1365,14 @@ def build_parser() -> argparse.ArgumentParser:
     bn.add_argument("--agent-lengths", default="32768,65536,96000")
     bn.add_argument("--cold-tokens", type=int, default=34816)
     bn.add_argument("--startup-timeout-s", type=float, default=180.0)
+    bn.add_argument("--expected-model-sha256", default=None)
+    bn.add_argument("--selected-device-arch", default=None)
+    bn.add_argument("--selected-backend", default=None)
     bn.add_argument("--out", type=Path, default=None)
 
     sc = sub.add_parser("score", help="Score a saved verification report JSON against the Strix Halo floor.")
     sc.add_argument("report_json", type=Path)
+    sc.add_argument("--expected-model-sha256", default=None)
     sc.add_argument("--markdown-out", type=Path, default=None)
     sc.add_argument("--allow-unmeasured", action="store_true")
 
@@ -1258,6 +1384,9 @@ def build_parser() -> argparse.ArgumentParser:
     al.add_argument("--extra-cmake-args", default="")
     al.add_argument("--model-dir", type=Path, required=True)
     al.add_argument("--model-id", default=None)
+    al.add_argument("--expected-model-sha256", default=None)
+    al.add_argument("--selected-device-arch", default=None)
+    al.add_argument("--selected-backend", default=None)
     al.add_argument("--require-gfx1151", action="store_true")
     al.add_argument("--hash-packs", action="store_true")
     al.add_argument("--fake-smoke", action="store_true")
@@ -1314,13 +1443,16 @@ def main(argv: list[str] | None = None) -> int:
             agent_lengths=parse_csv_ints(args.agent_lengths),
             cold_tokens=args.cold_tokens,
             startup_timeout_s=args.startup_timeout_s,
+            expected_model_sha256=args.expected_model_sha256,
+            selected_device_arch=args.selected_device_arch,
+            selected_backend=args.selected_backend,
         )
         write_json(args.out, res)
         return 0
 
     if args.command == "score":
         report = json.loads(args.report_json.read_text(encoding="utf-8"))
-        score = score_report(report)
+        score = score_report(report, expected_model_sha256=args.expected_model_sha256)
         md = render_scorecard_markdown(report, score)
         if args.markdown_out is not None:
             args.markdown_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1329,7 +1461,12 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(md)
         if score["hardware_verified"]:
             return 0
-        if args.allow_unmeasured and score["verdict"] in ("UNMEASURED_FAKE_MODE", "INCOMPLETE_UNMEASURED", "PASS_FLOOR_NON_GFX1151"):
+        if args.allow_unmeasured and score["verdict"] in (
+            "UNMEASURED_FAKE_MODE",
+            "INCOMPLETE_UNMEASURED",
+            "PASS_FLOOR_NON_GFX1151",
+            "PASS_FLOOR_UNBOUND_IDENTITY",
+        ):
             return 0
         return 2
 
@@ -1366,9 +1503,12 @@ def main(argv: list[str] | None = None) -> int:
             agent_lengths=parse_csv_ints(args.agent_lengths),
             cold_tokens=args.cold_tokens,
             startup_timeout_s=args.startup_timeout_s,
+            expected_model_sha256=args.expected_model_sha256,
+            selected_device_arch=args.selected_device_arch,
+            selected_backend=args.selected_backend,
         )
         report["bench"] = bench
-        score = score_report(report)
+        score = score_report(report, expected_model_sha256=args.expected_model_sha256)
         report["score"] = score
 
         write_json(args.out_dir / "strix_halo_report.json", report)
@@ -1377,7 +1517,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if score["hardware_verified"]:
             return 0
-        if args.allow_unmeasured and score["verdict"] in ("UNMEASURED_FAKE_MODE", "INCOMPLETE_UNMEASURED", "PASS_FLOOR_NON_GFX1151"):
+        if args.allow_unmeasured and score["verdict"] in (
+            "UNMEASURED_FAKE_MODE",
+            "INCOMPLETE_UNMEASURED",
+            "PASS_FLOOR_NON_GFX1151",
+            "PASS_FLOOR_UNBOUND_IDENTITY",
+        ):
             return 0
         return 2
 

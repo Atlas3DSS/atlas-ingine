@@ -202,6 +202,47 @@ constexpr bool can_async_blit_d2d(bool same_buffer, std::size_t src_offset, std:
   return bytes <= (src_offset - dst_offset);
 }
 
+enum class BufferRangeMatch : std::uint8_t {
+  Unregistered = 0,
+  Valid = 1,
+  OutOfBounds = 2,
+};
+
+struct RegisteredRange {
+  std::uintptr_t base = 0;
+  std::size_t length = 0;
+};
+
+struct BufferRangeLookup {
+  BufferRangeMatch status = BufferRangeMatch::Unregistered;
+  std::size_t index = 0;
+  std::size_t offset = 0;
+};
+
+// Distinguishes an unregistered host pointer from a pointer touching a registered MTLBuffer whose
+// requested [ptr_addr, ptr_addr + bytes) span stays in-bounds (Valid) vs crosses either boundary (OutOfBounds).
+inline BufferRangeLookup classify_registered_range(const std::vector<RegisteredRange>& spans,
+                                                   std::uintptr_t ptr_addr,
+                                                   std::size_t bytes) noexcept {
+  if (ptr_addr == 0) return {};
+  for (std::size_t i = 0; i < spans.size(); ++i) {
+    const RegisteredRange& s = spans[i];
+    if (s.length == 0) continue;
+    if (ptr_addr >= s.base) {
+      const std::size_t off = static_cast<std::size_t>(ptr_addr - s.base);
+      if (off < s.length) {
+        if (bytes <= s.length - off) {
+          return BufferRangeLookup{BufferRangeMatch::Valid, i, off};
+        }
+        return BufferRangeLookup{BufferRangeMatch::OutOfBounds, i, off};
+      }
+    } else if (bytes > static_cast<std::size_t>(s.base - ptr_addr)) {
+      return BufferRangeLookup{BufferRangeMatch::OutOfBounds, i, 0};
+    }
+  }
+  return {};
+}
+
 // Plans unified-memory full residency vs fixed 2.3–3.0 GiB streaming staging ring (for 4–8 GB Apple Silicon /
 // iPhone / iPad alongside our ~9 GB EXL3 pack and up to ~14 GB 3-bit S quant packs).
 constexpr StreamingBudgetPlan plan_streaming_budget(std::size_t total_ram_bytes,

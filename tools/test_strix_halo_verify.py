@@ -230,6 +230,15 @@ def _make_qualifying_bench() -> dict[str, Any]:
     bench: dict[str, Any] = {
         "mode": "live_engine",
         "fake_smoke": False,
+        "accelerator": {
+            "backend": "hip",
+            "selected_device_arch": "gfx1151",
+        },
+        "model_identity": {
+            "model_id": "Qwen3.8-Flash-Next",
+            "content_sha256": "a" * 64,
+            "expected_model_sha256": "a" * 64,
+        },
         "decode_runs": decode_runs,
         "prefill_runs": prefill_runs,
         "agent_runs": agent_runs,
@@ -332,6 +341,44 @@ class TestStrixHaloVerify(unittest.TestCase):
         s_non = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": False}}, "bench": bench})
         self.assertEqual(s_non["verdict"], "PASS_FLOOR_NON_GFX1151")
         self.assertFalse(s_non["hardware_verified"])
+        self.assertEqual(s_non["passed"], 11)
+
+        # Even if rocminfo lists gfx1151, running on another backend/arch (e.g. cuda or gfx1100) must not verify.
+        b_wrong_arch = copy.deepcopy(bench)
+        b_wrong_arch["accelerator"] = {"backend": "hip", "selected_device_arch": "gfx1100"}
+        s_wa = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_wrong_arch})
+        self.assertEqual(s_wa["verdict"], "PASS_FLOOR_NON_GFX1151")
+        self.assertFalse(s_wa["hardware_verified"])
+        self.assertEqual(s_wa["passed"], 11)
+
+        b_wrong_be = copy.deepcopy(bench)
+        b_wrong_be["accelerator"] = {"backend": "cpu", "selected_device_arch": "cpu"}
+        s_wb = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_wrong_be})
+        self.assertEqual(s_wb["verdict"], "PASS_FLOOR_NON_GFX1151")
+        self.assertFalse(s_wb["hardware_verified"])
+
+        # Unbound model identity or unbound selected accelerator preserves observations but blocks PASS_STRIX_HALO_FLOOR.
+        b_unbound_model = copy.deepcopy(bench)
+        b_unbound_model["model_identity"] = {"model_id": "Qwen3.8-Flash-Next", "content_sha256": None, "expected_model_sha256": None}
+        s_um = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_unbound_model})
+        self.assertEqual(s_um["verdict"], "PASS_FLOOR_UNBOUND_IDENTITY")
+        self.assertFalse(s_um["hardware_verified"])
+        self.assertEqual(s_um["passed"], 11)
+
+        b_unbound_dev = copy.deepcopy(bench)
+        b_unbound_dev["accelerator"] = {"backend": None, "selected_device_arch": None}
+        s_ud = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_unbound_dev})
+        self.assertEqual(s_ud["verdict"], "PASS_FLOOR_UNBOUND_IDENTITY")
+        self.assertFalse(s_ud["hardware_verified"])
+
+        # Model pack SHA-256 mismatch is caught explicitly while preserving all 11 observed rows.
+        s_mm = shv.score_report(
+            {"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": bench},
+            expected_model_sha256="b" * 64,
+        )
+        self.assertEqual(s_mm["verdict"], "PASS_FLOOR_MODEL_IDENTITY_MISMATCH")
+        self.assertFalse(s_mm["hardware_verified"])
+        self.assertEqual(s_mm["passed"], 11)
 
         # Fake smoke mode MUST ALWAYS be rejected as UNMEASURED_FAKE_MODE even with full evidence.
         fake_bench = copy.deepcopy(bench)
@@ -497,6 +544,22 @@ class TestStrixHaloVerify(unittest.TestCase):
         b_ext["cold_run"] = {"measured": False, "reason": "UNMEASURED_EXTERNAL_SERVER", "cold_total_s": None}
         s_ext = shv.score_report({"preflight": {"rocm": {"gfx1151_detected": True}}, "bench": b_ext})
         self.assertEqual(s_ext["verdict"], "INCOMPLETE_UNMEASURED")
+
+    def test_ingpack_header_identity_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td)
+            pack_path = model_dir / "model.ingpack"
+            hdr = bytearray(256)
+            hdr[0:8] = b"INGPACK1"
+            hdr[8:12] = (1).to_bytes(4, "little")
+            hdr[12:16] = (1).to_bytes(4, "little")  # kWeightPackFlagHasContentSha256
+            hdr[96:128] = bytes.fromhex("11" * 32)
+            hdr[128:160] = bytes.fromhex("22" * 32)
+            pack_path.write_bytes(bytes(hdr))
+            prov = shv.collect_model_provenance(model_dir, hash_packs=False)
+            self.assertTrue(prov["has_ingpack"])
+            self.assertEqual(prov["pack_header_sha256"], "11" * 32)
+            self.assertEqual(prov["pack_content_sha256"], "22" * 32)
 
     def test_rocminfo_gfx1151_parser(self) -> None:
         sample = """

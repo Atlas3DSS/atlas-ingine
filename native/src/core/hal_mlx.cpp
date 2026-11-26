@@ -131,20 +131,30 @@ id<MTLCommandQueue> metal_queue_for_stream(hal::StreamHandle stream) {
   return st->queue;
 }
 
-id<MTLBuffer> lookup_metal_buffer_for_range(const void* ptr, std::size_t bytes, std::size_t& out_offset) {
+id<MTLBuffer> lookup_metal_buffer_for_range(const void* ptr, std::size_t bytes, std::size_t& out_offset,
+                                            const char* caller) {
   if (!ptr) return nil;
   std::lock_guard<std::mutex> lock(alloc_table().mutex);
-  const auto base_addr = reinterpret_cast<std::uintptr_t>(ptr);
+  const auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+  std::vector<vendor::mlx::RegisteredRange> spans;
+  std::vector<id<MTLBuffer>> bufs;
+  spans.reserve(alloc_table().buffers.size());
+  bufs.reserve(alloc_table().buffers.size());
   for (const auto& [base_ptr, buf] : alloc_table().buffers) {
-    const auto start = reinterpret_cast<std::uintptr_t>(base_ptr);
-    const std::size_t len = static_cast<std::size_t>([buf length]);
-    if (base_addr >= start && (base_addr - start) < len) {
-      const std::size_t off = static_cast<std::size_t>(base_addr - start);
-      if (bytes <= len - off) {
-        out_offset = off;
-        return buf;
-      }
-    }
+    spans.push_back(vendor::mlx::RegisteredRange{reinterpret_cast<std::uintptr_t>(base_ptr),
+                                                 static_cast<std::size_t>([buf length])});
+    bufs.push_back(buf);
+  }
+  const vendor::mlx::BufferRangeLookup res = vendor::mlx::classify_registered_range(spans, addr, bytes);
+  if (res.status == vendor::mlx::BufferRangeMatch::Valid) {
+    out_offset = res.offset;
+    return bufs[res.index];
+  }
+  if (res.status == vendor::mlx::BufferRangeMatch::OutOfBounds) {
+    throw std::out_of_range(std::string(caller ? caller : "HAL(MLX/Metal)") +
+                            ": requested byte range exceeds registered MTLBuffer bounds (offset=" +
+                            std::to_string(res.offset) + ", bytes=" + std::to_string(bytes) +
+                            ", length=" + std::to_string(spans[res.index].length) + ")");
   }
   return nil;
 }
@@ -615,6 +625,9 @@ void require_conditional_switch_or_eager(const DeviceCaps& caps, bool allow_eage
 void memcpy_h2d_async(void* dst_dev, const void* src_host, std::size_t bytes, StreamHandle stream) {
   if (bytes == 0) return;
   if (!dst_dev || !src_host) throw std::invalid_argument("hal::memcpy_h2d_async(MLX): null pointer");
+  std::size_t dst_off = 0, src_off = 0;
+  (void)lookup_metal_buffer_for_range(dst_dev, bytes, dst_off, "hal::memcpy_h2d_async(MLX) dst");
+  (void)lookup_metal_buffer_for_range(src_host, bytes, src_off, "hal::memcpy_h2d_async(MLX) src");
   // Drain prior GPU work on `stream` so unified-memory write does not race earlier commands and is visible
   // before any subsequent command committed on `stream`.
   stream_synchronize(stream);
@@ -624,6 +637,9 @@ void memcpy_h2d_async(void* dst_dev, const void* src_host, std::size_t bytes, St
 void memcpy_d2h_async(void* dst_host, const void* src_dev, std::size_t bytes, StreamHandle stream) {
   if (bytes == 0) return;
   if (!dst_host || !src_dev) throw std::invalid_argument("hal::memcpy_d2h_async(MLX): null pointer");
+  std::size_t dst_off = 0, src_off = 0;
+  (void)lookup_metal_buffer_for_range(src_dev, bytes, src_off, "hal::memcpy_d2h_async(MLX) src");
+  (void)lookup_metal_buffer_for_range(dst_host, bytes, dst_off, "hal::memcpy_d2h_async(MLX) dst");
   stream_synchronize(stream);
   std::memcpy(dst_host, src_dev, bytes);
 }
@@ -632,8 +648,8 @@ void memcpy_d2d_async(void* dst_dev, const void* src_dev, std::size_t bytes, Str
   if (bytes == 0) return;
   if (!dst_dev || !src_dev) throw std::invalid_argument("hal::memcpy_d2d_async(MLX): null pointer");
   std::size_t src_off = 0, dst_off = 0;
-  id<MTLBuffer> b_src = lookup_metal_buffer_for_range(src_dev, bytes, src_off);
-  id<MTLBuffer> b_dst = lookup_metal_buffer_for_range(dst_dev, bytes, dst_off);
+  id<MTLBuffer> b_src = lookup_metal_buffer_for_range(src_dev, bytes, src_off, "hal::memcpy_d2d_async(MLX) src");
+  id<MTLBuffer> b_dst = lookup_metal_buffer_for_range(dst_dev, bytes, dst_off, "hal::memcpy_d2d_async(MLX) dst");
   if (b_src && b_dst && vendor::mlx::can_async_blit_d2d(b_src == b_dst, src_off, dst_off, bytes)) {
     id<MTLCommandQueue> q = metal_queue_for_stream(stream);
     @autoreleasepool {
@@ -653,7 +669,7 @@ void memset_async(void* dst_dev, int byte_value, std::size_t bytes, StreamHandle
   if (bytes == 0) return;
   if (!dst_dev) throw std::invalid_argument("hal::memset_async(MLX): null pointer");
   std::size_t dst_off = 0;
-  id<MTLBuffer> b_dst = lookup_metal_buffer_for_range(dst_dev, bytes, dst_off);
+  id<MTLBuffer> b_dst = lookup_metal_buffer_for_range(dst_dev, bytes, dst_off, "hal::memset_async(MLX) dst");
   if (b_dst) {
     id<MTLCommandQueue> q = metal_queue_for_stream(stream);
     @autoreleasepool {
