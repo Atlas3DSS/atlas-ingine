@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
   std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
-  int max_batch = 1, max_kv_tokens = 0, loop_passes = 3;
+  int max_batch = 1, max_kv_tokens = 0, loop_passes = 3, draft_ctx = 16384;
   int offload_vram_mb = 0, offload_ram_mb = 12288;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_fp4v = false, kv_q4 = false, kv_paged = false, spec = false,
@@ -136,6 +136,7 @@ int main(int argc, char** argv) {
   ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
+  ap.option("--draft-ctx", "", "batched DSpark global ring slots per stream (default 16384; 0 = 65536). Lower it to free VRAM for verify CUDA graphs (8192 is the 4x256K setting)", &draft_ctx);
   ap.option("--park-mb", "",
             "device memory (MiB) for conversations displaced by another one, released when memory runs short, "
             "0 = off (default: min(3072, free memory after start-up - 4096))",
@@ -285,6 +286,7 @@ int main(int argc, char** argv) {
       options.kv_ckpt_resume = kv_ckpt_resume;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
+      options.draft_ctx = draft_ctx;
       options.park_mb = park_mb;
       options.park_host_mb = park_host_mb;
       options.prefix_cache = !no_prefix_cache;
