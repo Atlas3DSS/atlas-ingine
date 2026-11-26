@@ -3,9 +3,12 @@
 //
 // For each selected real backend arm, verifies via live ChatServer HTTP:
 //   1. Cold baseline (unset warm-start): /health warm_start=false, warm_start_tokens=0, Turn-1 cached_tokens=0.
-//   2. Warm-started server #1 (matching namespace): /health warm_start=true, warm_start_tokens==W > 0,
-//      first matching request reports cached_tokens == W and produces bit-identical raw greedy token IDs vs cold.
-//   3. Fresh warm-started server #2 (mismatched namespace): /health warm_start=true, warm_start_tokens==W,
+//   2. On SM70 FP16 live-extend (max_batch==1), an ordinary live-extend control with startup warm-start disabled
+//      primes the same system prefix tokens and records the exact ordinary-reuse reference tokens/message.
+//   3. Warm-started server #1 (matching namespace): /health warm_start=true, warm_start_tokens==W > 0,
+//      first matching request reports cached_tokens == W and produces bit-identical raw greedy token IDs vs cold
+//      (on SM80+ and paged B>1 paths) or vs the ordinary live-extend control (on SM70 FP16 B=1).
+//   4. Fresh warm-started server #2 (mismatched namespace): /health warm_start=true, warm_start_tokens==W,
 //      first mismatched request reports cached_tokens == 0 and produces bit-identical raw greedy token IDs vs cold.
 #include "ingine/generator.h"
 #include "serve/chat_server.h"
@@ -23,6 +26,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -218,10 +222,11 @@ RunCapture run_server_on_generator(RecordingGenerator& gen, const ChatFormat& fm
 }
 
 Json run_arm(const std::string& arm_name, const RuntimeOptions& rt_opts, const std::string& sys_prompt,
-             bool disable_thinking, int max_tokens) {
+             bool disable_thinking, int max_tokens, int sm_version) {
   const ChatFormat fmt = ChatFormat::load(rt_opts.model_dir);
   const int expected_ws_tokens = int(fmt.render_system_prefix(sys_prompt).ids.size());
   CHECK(expected_ws_tokens > 0);
+  const bool use_ordinary_live_extend_ref = (sm_version < 80 && rt_opts.max_batch == 1);
 
   Json body = {
       {"messages",
@@ -237,12 +242,14 @@ Json run_arm(const std::string& arm_name, const RuntimeOptions& rt_opts, const s
     body["chat_template_kwargs"] = {{"enable_thinking", false}};
   }
 
-  std::printf("=== ARM %s (model=%s, max_batch=%d, expected_ws_tokens=%d) ===\n", arm_name.c_str(),
-              rt_opts.model_dir.c_str(), rt_opts.max_batch, expected_ws_tokens);
+  std::printf("=== ARM %s (model=%s, max_batch=%d, sm=%d, expected_ws_tokens=%d, warm_ref=%s) ===\n", arm_name.c_str(),
+              rt_opts.model_dir.c_str(), rt_opts.max_batch, sm_version, expected_ws_tokens,
+              use_ordinary_live_extend_ref ? "ordinary_live_extend" : "cold");
   std::fflush(stdout);
 
-  // Load immutable GPU weights once per arm, then construct three separate ChatServer lifecycles with
-  // mutually disjoint namespaces (cold -> ns-cold, warm_hit -> ns-warm-1, fresh_mismatch -> ns-warm-2 vs ns-mismatch).
+  // Load immutable GPU weights once per arm, then construct separate ChatServer lifecycles with mutually
+  // disjoint namespaces (cold -> ns-cold, optional ordinary live-extend -> ns-ord-ext, warm_hit -> ns-warm-1,
+  // fresh_mismatch -> ns-warm-2 vs ns-mismatch).
   auto raw_gen = ingine::model::make_generator(rt_opts);
   RecordingGenerator gen(std::move(raw_gen));
 
@@ -255,19 +262,49 @@ Json run_arm(const std::string& arm_name, const RuntimeOptions& rt_opts, const s
   CHECK(cold.cached_tokens == 0);
   CHECK(!cold.token_ids.empty());
 
-  // 2. Warm-started server #1: disjoint namespace ns-warm-1 -> warm_start prefills fresh (reused=0),
-  //    first matching request reports cached_tokens == warm_start_tokens and matches cold greedy token IDs.
+  // 2. On SM70 FP16 live-extend (max_batch == 1), run an ordinary live-extend control with startup warm-start
+  //    disabled so warm_start is verified bit-exact against existing ordinary reuse on the same split boundary,
+  //    while SM80+ controls and all fresh namespace misses preserve strict cold equality.
+  std::optional<RunCapture> ord_ext;
+  if (use_ordinary_live_extend_ref) {
+    const auto rendered_prefix = fmt.render_system_prefix(sys_prompt);
+    Prompt p_prefix;
+    p_prefix.ids = rendered_prefix.ids;
+    p_prefix.cache_namespace = "ns-ord-ext";
+    Sampling greedy_s;
+    greedy_s.temperature = 0.0f;
+    greedy_s.top_k = 1;
+    greedy_s.seed = 42;
+    const GenerateStats prime_st =
+        gen.generate(p_prefix, /*max_new_tokens=*/0, greedy_s, {}, [](std::span<const int32_t>) { return true; });
+    cudaDeviceSynchronize();
+    CHECK(prime_st.prompt_tokens == expected_ws_tokens);
+    CHECK(prime_st.reused_tokens == 0);
+
+    ord_ext = run_server_on_generator(gen, fmt, "", "", "ns-ord-ext", body);
+    cudaDeviceSynchronize();
+    CHECK(ord_ext->health["status"] == "ok");
+    CHECK(ord_ext->health["warm_start"] == false);
+    CHECK(ord_ext->health["warm_start_tokens"] == 0);
+    CHECK(ord_ext->cached_tokens == expected_ws_tokens);
+    CHECK(!ord_ext->token_ids.empty());
+  }
+
+  // 3. Warm-started server #1: disjoint namespace ns-warm-1 -> warm_start prefills fresh (reused=0),
+  //    first matching request reports cached_tokens == warm_start_tokens and matches its exact greedy reference.
   const RunCapture warm_hit = run_server_on_generator(gen, fmt, sys_prompt, "ns-warm-1", "ns-warm-1", body);
   cudaDeviceSynchronize();
+  const RunCapture& expected_warm_ref = use_ordinary_live_extend_ref ? *ord_ext : cold;
+  const char* ref_label = use_ordinary_live_extend_ref ? "ordinary_live_extend" : "cold";
   CHECK(warm_hit.health["status"] == "ok");
   CHECK(warm_hit.health["warm_start"] == true);
   CHECK(warm_hit.health["warm_start_tokens"] == expected_ws_tokens);
   CHECK(warm_hit.warm_start_reused_tokens == 0);
   CHECK(warm_hit.cached_tokens == expected_ws_tokens);
-  CHECK(warm_hit.token_ids == cold.token_ids);
-  CHECK(warm_hit.response["choices"][0]["message"] == cold.response["choices"][0]["message"]);
+  CHECK(warm_hit.token_ids == expected_warm_ref.token_ids);
+  CHECK(warm_hit.response["choices"][0]["message"] == expected_warm_ref.response["choices"][0]["message"]);
 
-  // 3. Fresh warm-started server #2: brand-new namespace ns-warm-2 -> warm_start prefills fresh (reused=0),
+  // 4. Fresh warm-started server #2: brand-new namespace ns-warm-2 -> warm_start prefills fresh (reused=0),
   //    first request in unseen mismatched namespace ns-mismatch reports cached_tokens == 0 and matches cold greedy IDs.
   const RunCapture warm_miss = run_server_on_generator(gen, fmt, sys_prompt, "ns-warm-2", "ns-mismatch", body);
   cudaDeviceSynchronize();
@@ -280,17 +317,18 @@ Json run_arm(const std::string& arm_name, const RuntimeOptions& rt_opts, const s
   CHECK(warm_miss.response["choices"][0]["message"] == cold.response["choices"][0]["message"]);
 
   std::printf(
-      "PASS %s: ws_tokens=%d cold_cached=%d warm_hit_cached=%d fresh_mismatch_cached=%d greedy_ids=%zu/%zu exact_match=true "
-      "cold_ms=%.1f warm_hit_ms=%.1f\n",
+      "PASS %s: ws_tokens=%d cold_cached=%d warm_hit_cached=%d fresh_mismatch_cached=%d warm_ref=%s greedy_ids=%zu/%zu "
+      "exact_match_ref=true cold_ms=%.1f warm_hit_ms=%.1f\n",
       arm_name.c_str(), expected_ws_tokens, cold.cached_tokens, warm_hit.cached_tokens, warm_miss.cached_tokens,
-      warm_hit.token_ids.size(), cold.token_ids.size(), cold.http_ms, warm_hit.http_ms);
+      ref_label, warm_hit.token_ids.size(), expected_warm_ref.token_ids.size(), cold.http_ms, warm_hit.http_ms);
   std::fflush(stdout);
 
-  return Json{
+  Json out = {
       {"arm", arm_name},
       {"model_dir", rt_opts.model_dir.string()},
       {"max_batch", rt_opts.max_batch},
       {"expected_warm_start_tokens", expected_ws_tokens},
+      {"warm_hit_reference", ref_label},
       {"cold",
        {{"health", cold.health},
         {"prompt_tokens", cold.prompt_tokens},
@@ -299,26 +337,57 @@ Json run_arm(const std::string& arm_name, const RuntimeOptions& rt_opts, const s
         {"http_ms", cold.http_ms},
         {"token_ids", cold.token_ids},
         {"message", cold.response["choices"][0]["message"]}}},
-      {"warm_hit",
-       {{"health", warm_hit.health},
-        {"warm_start_reused_tokens", warm_hit.warm_start_reused_tokens},
-        {"prompt_tokens", warm_hit.prompt_tokens},
-        {"cached_tokens", warm_hit.cached_tokens},
-        {"completion_tokens", warm_hit.completion_tokens},
-        {"http_ms", warm_hit.http_ms},
-        {"token_ids", warm_hit.token_ids},
-        {"exact_token_id_match_vs_cold", warm_hit.token_ids == cold.token_ids},
-        {"message", warm_hit.response["choices"][0]["message"]}}},
-      {"fresh_namespace_mismatch",
-       {{"health", warm_miss.health},
-        {"warm_start_reused_tokens", warm_miss.warm_start_reused_tokens},
-        {"prompt_tokens", warm_miss.prompt_tokens},
-        {"cached_tokens", warm_miss.cached_tokens},
-        {"completion_tokens", warm_miss.completion_tokens},
-        {"http_ms", warm_miss.http_ms},
-        {"token_ids", warm_miss.token_ids},
-        {"exact_token_id_match_vs_cold", warm_miss.token_ids == cold.token_ids}}},
   };
+  if (ord_ext.has_value()) {
+    out["ordinary_live_extend"] = {
+        {"health", ord_ext->health},
+        {"prompt_tokens", ord_ext->prompt_tokens},
+        {"cached_tokens", ord_ext->cached_tokens},
+        {"completion_tokens", ord_ext->completion_tokens},
+        {"http_ms", ord_ext->http_ms},
+        {"token_ids", ord_ext->token_ids},
+        {"exact_token_id_match_vs_cold", ord_ext->token_ids == cold.token_ids},
+        {"message", ord_ext->response["choices"][0]["message"]},
+    };
+  }
+  out["warm_hit"] = {
+      {"health", warm_hit.health},
+      {"warm_start_reused_tokens", warm_hit.warm_start_reused_tokens},
+      {"prompt_tokens", warm_hit.prompt_tokens},
+      {"cached_tokens", warm_hit.cached_tokens},
+      {"completion_tokens", warm_hit.completion_tokens},
+      {"http_ms", warm_hit.http_ms},
+      {"token_ids", warm_hit.token_ids},
+      {"exact_token_id_match_vs_reference", warm_hit.token_ids == expected_warm_ref.token_ids},
+      {"exact_token_id_match_vs_cold", warm_hit.token_ids == cold.token_ids},
+      {"message", warm_hit.response["choices"][0]["message"]},
+  };
+  out["fresh_namespace_mismatch"] = {
+      {"health", warm_miss.health},
+      {"warm_start_reused_tokens", warm_miss.warm_start_reused_tokens},
+      {"prompt_tokens", warm_miss.prompt_tokens},
+      {"cached_tokens", warm_miss.cached_tokens},
+      {"completion_tokens", warm_miss.completion_tokens},
+      {"http_ms", warm_miss.http_ms},
+      {"token_ids", warm_miss.token_ids},
+      {"exact_token_id_match_vs_cold", warm_miss.token_ids == cold.token_ids},
+  };
+  return out;
+}
+
+std::filesystem::path default_inkling_dir() {
+  if (const char* env_ink = std::getenv("INGINE_MODEL_DIR"); env_ink && *env_ink) {
+    return std::filesystem::path(env_ink);
+  }
+#ifdef INGINE_MODEL_DIR
+  if (std::filesystem::is_directory(INGINE_MODEL_DIR)) {
+    return std::filesystem::path(INGINE_MODEL_DIR);
+  }
+#endif
+  if (std::filesystem::is_directory("/mnt/storage/models/Inkling-2-Mini-ingine")) {
+    return std::filesystem::path("/mnt/storage/models/Inkling-2-Mini-ingine");
+  }
+  return std::filesystem::path("/mnt/nvme/models/Inkling-2-Mini-ingine");
 }
 
 }  // namespace
@@ -331,10 +400,8 @@ int main(int argc, char** argv) {
   }
 
   std::string arm = "all";
-  const char* env_ink = std::getenv("INGINE_MODEL_DIR");
   const char* env_qwen = std::getenv("INGINE_QWEN38_MODEL_DIR");
-  std::filesystem::path ink_dir =
-      (env_ink && *env_ink) ? std::filesystem::path(env_ink) : std::filesystem::path("/mnt/storage/models/Inkling-2-Mini-ingine");
+  std::filesystem::path ink_dir = default_inkling_dir();
   std::filesystem::path qwen_dir = (env_qwen && *env_qwen)
                                        ? std::filesystem::path(env_qwen)
                                        : std::filesystem::path("/home/orwel/dev_genius/models/Qwen3.8-27B-NVFP4-482ca0f");
@@ -356,6 +423,7 @@ int main(int argc, char** argv) {
 
   cudaDeviceProp prop{};
   CHECK(cudaGetDeviceProperties(&prop, 0) == cudaSuccess);
+  const int sm_version = prop.major * 10 + prop.minor;
   std::printf("CUDA device 0: %s (sm_%d%d, %.2f GiB)\n", prop.name, prop.major, prop.minor,
               double(prop.totalGlobalMem) / (1024.0 * 1024.0 * 1024.0));
 
@@ -367,7 +435,7 @@ int main(int argc, char** argv) {
 
   Json report = {
       {"gpu", prop.name},
-      {"sm", prop.major * 10 + prop.minor},
+      {"sm", sm_version},
       {"arms", Json::array()},
   };
 
@@ -384,7 +452,7 @@ int main(int argc, char** argv) {
       opts.prefix_cache = true;
       opts.park_mb = 256;
       opts.max_batch = 1;
-      report["arms"].push_back(run_arm("inkling-b1", opts, sys_prompt, /*disable_thinking=*/true, max_tokens));
+      report["arms"].push_back(run_arm("inkling-b1", opts, sys_prompt, /*disable_thinking=*/true, max_tokens, sm_version));
       ++ran;
     } else if (arm == "inkling-b1") {
       std::fprintf(stderr, "inkling model dir missing: %s\n", ink_dir.c_str());
@@ -405,7 +473,7 @@ int main(int argc, char** argv) {
       opts.prefix_cache = true;
       opts.park_mb = 256;
       opts.max_batch = 2;
-      report["arms"].push_back(run_arm("inkling-b2", opts, sys_prompt, /*disable_thinking=*/true, max_tokens));
+      report["arms"].push_back(run_arm("inkling-b2", opts, sys_prompt, /*disable_thinking=*/true, max_tokens, sm_version));
       ++ran;
     } else if (arm == "inkling-b2") {
       std::fprintf(stderr, "inkling model dir missing: %s\n", ink_dir.c_str());
@@ -424,7 +492,8 @@ int main(int argc, char** argv) {
       opts.prefix_cache = true;
       opts.park_mb = 0;
       opts.max_batch = 1;
-      report["arms"].push_back(run_arm("qwen38-pinned", opts, sys_prompt, /*disable_thinking=*/false, max_tokens));
+      report["arms"].push_back(
+          run_arm("qwen38-pinned", opts, sys_prompt, /*disable_thinking=*/false, max_tokens, sm_version));
       ++ran;
     } else if (arm == "qwen38") {
       std::fprintf(stderr, "qwen38 model dir missing or GPU < sm_80: %s\n", qwen_dir.c_str());
