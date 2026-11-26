@@ -110,10 +110,11 @@ struct Response {
   std::string body;
 };
 
-Response request(int port, const std::string& method, const std::string& path, const std::string& body = "") {
+Response request(int port, const std::string& method, const std::string& path, const std::string& body = "",
+                 const httplib::Headers& headers = {}) {
   httplib::Client cli("127.0.0.1", port);
   cli.set_read_timeout(20, 0);
-  httplib::Result r = method == "GET" ? cli.Get(path) : cli.Post(path, body, "application/json");
+  httplib::Result r = method == "GET" ? cli.Get(path, headers) : cli.Post(path, headers, body, "application/json");
   if (!r) throw std::runtime_error("request failed: " + httplib::to_string(r.error()));
   return {r->status, r->headers, r->body};
 }
@@ -372,6 +373,31 @@ void test_models_and_health() {
   FakeGenerator fg_lf(g_fmt->tokenizer(), "inkling-test", 1 << 20, {}, 0.0, 3, ingine::model::KvCacheMode::LastFull);
   CHECK(fg_lf.kv_cache_mode() == ingine::model::KvCacheMode::LastFull);
   CHECK(fg_lf.supported_kv_cache_modes().size() == 2);
+
+  // X-Ingine-Loop-Passes response header + completion body field + X-Ingine-Expected-Loop-Passes precondition.
+  CHECK(header(r.headers, "X-Ingine-Loop-Passes") == "3");
+  CHECK(header(hr.headers, "X-Ingine-Loop-Passes") == "3");
+  Response c5_mismatch = request(
+      s5->port(), "POST", "/v1/chat/completions",
+      Json{{"model", "inkling-test"}, {"messages", MSGS}}.dump(),
+      {{"Content-Type", "application/json"}, {"X-Ingine-Expected-Loop-Passes", "1"}});
+  CHECK(c5_mismatch.status == 409);
+  CHECK(header(c5_mismatch.headers, "X-Ingine-Loop-Passes") == "5");
+  CHECK(s5->gen->calls().empty());  // rejected BEFORE generation!
+  Response c5_bad = request(
+      s5->port(), "POST", "/v1/chat/completions",
+      Json{{"model", "inkling-test"}, {"messages", MSGS}}.dump(),
+      {{"Content-Type", "application/json"}, {"X-Ingine-Expected-Loop-Passes", "99"}});
+  CHECK(c5_bad.status == 400);
+  CHECK(s5->gen->calls().empty());
+  Response c5_ok = request(
+      s5->port(), "POST", "/v1/chat/completions",
+      Json{{"model", "inkling-test"}, {"messages", MSGS}}.dump(),
+      {{"Content-Type", "application/json"}, {"X-Ingine-Expected-Loop-Passes", "5"}});
+  CHECK(c5_ok.status == 200);
+  CHECK(header(c5_ok.headers, "X-Ingine-Loop-Passes") == "5");
+  CHECK(Json::parse(c5_ok.body)["loop_passes"] == 5);
+  CHECK(s5->gen->calls().size() == 1);
 }
 
 void test_non_streaming() {

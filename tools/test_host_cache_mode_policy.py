@@ -27,6 +27,10 @@ def start_mock_worker(
     omit_cached_tokens: bool = False,
     loop_passes: int | None = None,
     models_loop_passes_override: int | None = None,
+    explicit_null_loop_passes: bool = False,
+    models_supported_override: list[str] | None = None,
+    completion_loop_passes_override: object = ...,
+    enforce_expected_loop_passes: bool = True,
 ):
     received: list[dict] = []
 
@@ -34,18 +38,21 @@ def start_mock_worker(
         def log_message(self, format, *args):
             return
 
-        def _send(self, code: int, obj: dict, mode_hdr: str | None = None):
+        def _send(self, code: int, obj: dict, mode_hdr: str | None = None, lp_hdr: str | None = None):
             raw = json.dumps(obj).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
             if mode_hdr is not None:
                 self.send_header("X-Ingine-Kv-Cache-Mode", mode_hdr)
+            if lp_hdr is not None:
+                self.send_header("X-Ingine-Loop-Passes", lp_hdr)
             self.end_headers()
             self.wfile.write(raw)
 
         def do_GET(self):
             hdr = header_override if header_override is not None else active_mode
+            lp_hdr = str(loop_passes) if loop_passes is not None else None
             if self.path == "/health":
                 health_obj = {
                     "status": "ok",
@@ -57,21 +64,28 @@ def start_mock_worker(
                     "waiting": 0,
                     "running": False,
                 }
-                if loop_passes is not None:
+                if explicit_null_loop_passes:
+                    health_obj["loop_passes"] = None
+                elif loop_passes is not None:
                     health_obj["loop_passes"] = loop_passes
-                self._send(200, health_obj, mode_hdr=hdr)
+                self._send(200, health_obj, mode_hdr=hdr, lp_hdr=lp_hdr)
             elif self.path == "/v1/models":
                 card_obj = {
                     "id": model_id,
                     "object": "model",
                     "max_model_len": max_model_len,
                     "kv_cache_mode": active_mode,
-                    "supported_kv_cache_modes": supported_modes,
+                    "supported_kv_cache_modes": (
+                        models_supported_override if models_supported_override is not None else supported_modes
+                    ),
                     "kv_cache_mode_mutable": False,
                 }
-                card_lp = models_loop_passes_override if models_loop_passes_override is not None else loop_passes
-                if card_lp is not None:
-                    card_obj["loop_passes"] = card_lp
+                if explicit_null_loop_passes:
+                    card_obj["loop_passes"] = None
+                else:
+                    card_lp = models_loop_passes_override if models_loop_passes_override is not None else loop_passes
+                    if card_lp is not None:
+                        card_obj["loop_passes"] = card_lp
                 self._send(
                     200,
                     {
@@ -79,6 +93,7 @@ def start_mock_worker(
                         "data": [card_obj],
                     },
                     mode_hdr=hdr,
+                    lp_hdr=lp_hdr if models_loop_passes_override is None else None,
                 )
             else:
                 self._send(404, {"error": "not found"})
@@ -86,39 +101,55 @@ def start_mock_worker(
         def do_POST(self):
             n = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(n).decode("utf-8"))
+            req_headers = {k.lower(): v for k, v in self.headers.items()}
             received.append(
                 {
-                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "headers": req_headers,
                     "body": body,
                 }
             )
             hdr = header_override if header_override is not None else active_mode
+            if enforce_expected_loop_passes and loop_passes is not None:
+                exp_lp = req_headers.get("x-ingine-expected-loop-passes")
+                if exp_lp is not None and exp_lp != str(loop_passes):
+                    self._send(
+                        409,
+                        {"error": {"message": f"worker loop_passes mismatch: expected={exp_lp}, server={loop_passes}"}},
+                        mode_hdr=hdr,
+                        lp_hdr=str(loop_passes),
+                    )
+                    return
             reported = body_mode_override if body_mode_override is not None else active_mode
             details = {} if omit_cached_tokens else {"cached_tokens": cached_tokens}
             ptoks = max(128, cached_tokens) if type(cached_tokens) is int else 128
-            self._send(
-                200,
-                {
-                    "id": "chatcmpl-mock-1",
-                    "object": "chat.completion",
-                    "model": model_id,
-                    "kv_cache_mode": reported,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": f"ok:{reported}"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": ptoks,
-                        "completion_tokens": 8,
-                        "total_tokens": ptoks + 8,
-                        "prompt_tokens_details": details,
-                    },
+            resp_obj: dict = {
+                "id": "chatcmpl-mock-1",
+                "object": "chat.completion",
+                "model": model_id,
+                "kv_cache_mode": reported,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": f"ok:{reported}"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": ptoks,
+                    "completion_tokens": 8,
+                    "total_tokens": ptoks + 8,
+                    "prompt_tokens_details": details,
                 },
-                mode_hdr=hdr,
-            )
+            }
+            resp_lp_hdr: str | None = None
+            if completion_loop_passes_override is not ...:
+                if completion_loop_passes_override is not None:
+                    resp_obj["loop_passes"] = completion_loop_passes_override
+                    resp_lp_hdr = str(completion_loop_passes_override)
+            elif loop_passes is not None:
+                resp_obj["loop_passes"] = loop_passes
+                resp_lp_hdr = str(loop_passes)
+            self._send(200, resp_obj, mode_hdr=hdr, lp_hdr=resp_lp_hdr)
 
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = srv.server_address[1]
@@ -626,9 +657,149 @@ class TestHostCacheModePolicy(unittest.TestCase):
                     )
                     out_l6_ok = reg.dispatch_chat_completion([w_l6], req_l6_replay, [{"role": "user", "content": "hi"}])
                     self.assertTrue(out_l6_ok["admitted"])
+                    self.assertEqual(out_l6_ok["server_loop_passes"], 6)
                     self.assertEqual(reg.get_session_state("s-id"), ("per_pass", 6))
         finally:
             for s in (srv_l1, srv_l3, srv_l6, srv_legacy, srv_bad_lf, srv_mismatch):
+                s.shutdown()
+                s.server_close()
+
+    def test_depth_precondition_stale_restart_opaque_scopes_positional_and_discovery_strictness(self):
+        # 1. Backwards-compatible positional 9th arg of WorkerCapability MUST bind spec_enabled=True (not loop_passes).
+        w_pos = pol.WorkerCapability(
+            "w-pos",
+            "http://127.0.0.1:9999",
+            "inkling-2-mini",
+            "per_pass",
+            ("per_pass", "last_full"),
+            False,
+            65536,
+            1,
+            True,  # 9th positional arg == spec_enabled
+        )
+        self.assertTrue(w_pos.spec_enabled)
+        self.assertEqual(w_pos.loop_passes, 3)
+        self.assertFalse(w_pos.supports_mode("last_full"))
+
+        # 2. Opaque caller scopes with literal :loop_passes=<n> suffixes MUST stay distinct at the same worker depth.
+        raw_scopes = ("tenant-a", "tenant-a:loop_passes=6", "tenant-a:kv_mode=per_pass:loop_passes=6")
+        for depth in (1, 3, 6):
+            scoped = [pol.mode_scoped_namespace(s, "per_pass", loop_passes=depth) for s in raw_scopes]
+            self.assertEqual(len(set(scoped)), 3, f"Namespace collision at depth {depth}: {scoped}")
+            digests = [
+                pol.CheckpointIdentity(
+                    model_id="inkling-2-mini",
+                    kv_format="fp8",
+                    kv_cache_mode="per_pass",
+                    cache_namespace=ns,
+                    prefix_tokens=8064,
+                    prefix_sha256="deadbeef",
+                    loop_passes=depth,
+                ).identity_digest()
+                for ns in scoped
+            ]
+            self.assertEqual(len(set(digests)), 3, f"Digest collision at depth {depth}")
+
+        # 3. Discovery rejects explicit JSON null loop_passes and model-card supported_kv_cache_modes mismatches.
+        srv_null_lp, url_null_lp, _ = start_mock_worker("per_pass", ["per_pass"], explicit_null_loop_passes=True)
+        srv_card_bad_sup, url_card_bad_sup, _ = start_mock_worker(
+            "per_pass", ["per_pass"], loop_passes=5, models_supported_override=["per_pass", "last_full"]
+        )
+        # 4. Stale retained L1 capability dispatched against server restarted at L6 (HTTP 409 precondition)
+        #    AND against a misbehaving server ignoring precondition (returns L6 or omits depth for L1).
+        srv_restarted_l6, url_restarted_l6, _ = start_mock_worker("per_pass", ["per_pass"], loop_passes=6)
+        srv_lying_l6, url_lying_l6, _ = start_mock_worker(
+            "per_pass",
+            ["per_pass"],
+            loop_passes=6,
+            enforce_expected_loop_passes=False,
+        )
+        srv_omit_for_l1, url_omit_for_l1, _ = start_mock_worker(
+            "per_pass",
+            ["per_pass"],
+            loop_passes=1,
+            completion_loop_passes_override=None,
+            enforce_expected_loop_passes=False,
+        )
+        srv_legacy_l3, url_legacy_l3, _ = start_mock_worker("per_pass", ["per_pass", "last_full"], loop_passes=None)
+        try:
+            with self.assertRaises(ValueError):
+                pol.discover_worker_capability("w-null-lp", url_null_lp)
+            with self.assertRaisesRegex(RuntimeError, "inconsistent supported_kv_cache_modes"):
+                pol.discover_worker_capability("w-card-bad", url_card_bad_sup)
+
+            # Retained L1 capability pointing at URL now serving L6 -> HTTP 409 BEFORE generation, no ok/session update!
+            stale_l1_to_l6 = pol.WorkerCapability(
+                worker_id="w-stale",
+                base_url=url_restarted_l6,
+                model_id="inkling-2-mini",
+                active_kv_cache_mode="per_pass",
+                supported_kv_cache_modes=("per_pass",),
+                kv_format="fp8",
+                available_kv_vram_mib=2048.0,
+                loop_passes=1,
+            )
+            stale_l1_lying = pol.WorkerCapability(
+                worker_id="w-lying",
+                base_url=url_lying_l6,
+                model_id="inkling-2-mini",
+                active_kv_cache_mode="per_pass",
+                supported_kv_cache_modes=("per_pass",),
+                kv_format="fp8",
+                available_kv_vram_mib=2048.0,
+                loop_passes=1,
+            )
+            stale_l1_omit = pol.WorkerCapability(
+                worker_id="w-omit",
+                base_url=url_omit_for_l1,
+                model_id="inkling-2-mini",
+                active_kv_cache_mode="per_pass",
+                supported_kv_cache_modes=("per_pass",),
+                kv_format="fp8",
+                available_kv_vram_mib=2048.0,
+                loop_passes=1,
+            )
+            w_legacy = pol.discover_worker_capability(
+                "w-legacy", url_legacy_l3, kv_format="fp8", available_kv_vram_mib=2048.0
+            )
+            req_350 = pol.AdmissionRequest(
+                task_id="t-stale",
+                session_id="s-stale",
+                cache_namespace="tenant-a",
+                context_tokens=8064,
+                expected_new_tokens=128,
+                prefix_sha256="deadbeef",
+                budgets=pol.AdmissionBudgets(memory_budget_mib=350.0),
+            )
+            with tempfile.TemporaryDirectory() as td:
+                db = Path(td) / "stale_depth.sqlite"
+                with pol.HostCacheModeRegistry(db) as reg:
+                    with self.assertRaises(Exception):
+                        reg.dispatch_chat_completion([stale_l1_to_l6], req_350, [{"role": "user", "content": "hi"}])
+                    self.assertIsNone(reg.get_session_state("s-stale"))
+
+                    with self.assertRaisesRegex(RuntimeError, "loop_passes mismatch"):
+                        reg.dispatch_chat_completion([stale_l1_lying], req_350, [{"role": "user", "content": "hi"}])
+                    self.assertIsNone(reg.get_session_state("s-stale"))
+
+                    with self.assertRaisesRegex(RuntimeError, "loop_passes omitted"):
+                        reg.dispatch_chat_completion([stale_l1_omit], req_350, [{"role": "user", "content": "hi"}])
+                    self.assertIsNone(reg.get_session_state("s-stale"))
+
+                    conn = sqlite3.connect(str(db))
+                    verified_ok = conn.execute(
+                        "SELECT COUNT(*) FROM results WHERE status = 'ok' OR verified_mode_match = 1"
+                    ).fetchone()[0]
+                    conn.close()
+                    self.assertEqual(verified_ok, 0)
+
+                    # Legacy L=3 server omitting depth fields on /health, /v1/models, and completion STILL works!
+                    out_leg = reg.dispatch_chat_completion([w_legacy], req_350, [{"role": "user", "content": "hi"}])
+                    self.assertTrue(out_leg["admitted"])
+                    self.assertEqual(out_leg["server_loop_passes"], 3)
+                    self.assertEqual(reg.get_session_state("s-stale"), ("per_pass", 3))
+        finally:
+            for s in (srv_null_lp, srv_card_bad_sup, srv_restarted_l6, srv_lying_l6, srv_omit_for_l1, srv_legacy_l3):
                 s.shutdown()
                 s.server_close()
 

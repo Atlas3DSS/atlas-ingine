@@ -257,6 +257,7 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
   if (path == "/health") {
     const engine::SchedulerStats st = scheduler_.stats();
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+    res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
     send_json(res, 200,
               Json{{"status", "ok"},
                    {"model", model_id_},
@@ -271,9 +272,11 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                    {"max_queue", st.max_queue}});
   } else if (path == "/v1/models") {
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+    res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
     send_json(res, 200, Json{{"object", "list"}, {"data", Json::array({model_card()})}});
   } else if (path == "/v1/models/" + model_id_) {
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+    res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
     send_json(res, 200, model_card());
   } else if (path == "/v1/personas") {
     send_json(res, 200, personas_list());
@@ -292,6 +295,38 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
     res.set_header("Connection", "close");
     send_error(res, 411, "Content-Length required");
     return;
+  }
+  if (req.has_header("X-Ingine-Expected-Loop-Passes")) {
+    const std::string raw_lp = req.get_header_value("X-Ingine-Expected-Loop-Passes");
+    int expected_lp = 0;
+    bool valid_lp = !raw_lp.empty();
+    for (char c : raw_lp) {
+      if (c < '0' || c > '9') {
+        valid_lp = false;
+        break;
+      }
+      expected_lp = expected_lp * 10 + (c - '0');
+      if (expected_lp > 8) {
+        valid_lp = false;
+        break;
+      }
+    }
+    if (!valid_lp || expected_lp < 1 || expected_lp > 8) {
+      res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+      res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+      send_error(res, 400, "invalid X-Ingine-Expected-Loop-Passes header: expected integer in 1..8",
+                 "X-Ingine-Expected-Loop-Passes");
+      return;
+    }
+    if (expected_lp != loop_passes_) {
+      res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+      res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
+      send_error(res, 409,
+                 "worker loop_passes mismatch: expected=" + std::to_string(expected_lp) +
+                     ", server=" + std::to_string(loop_passes_),
+                 "X-Ingine-Expected-Loop-Passes");
+      return;
+    }
   }
   ChatRequest request;
   try {
@@ -383,6 +418,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
               {"created", x->created},
               {"model", model_id_},
               {"kv_cache_mode", model::to_string(kv_cache_mode_)},
+              {"loop_passes", loop_passes_},
               {"system_fingerprint", nullptr},
               {"choices", Json::array({Json{{"index", 0},
                                             {"message", std::move(message)},
@@ -392,6 +428,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
               {"usage", usage(*x)}};
     if (x->req.sampling.persona) resp["persona_metadata"] = persona_meta_json(*x->req.sampling.persona);
     res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+    res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
     send_json(res, 200, resp);
     return;
   }
@@ -399,6 +436,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
   auto state = std::make_shared<StreamState>(std::move(x));
   res.set_header("Cache-Control", "no-cache");
   res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
+  res.set_header("X-Ingine-Loop-Passes", std::to_string(loop_passes_));
   res.set_chunked_content_provider(
       "text/event-stream",
       [this, state](size_t, httplib::DataSink& sink) -> bool {

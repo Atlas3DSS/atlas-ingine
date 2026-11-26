@@ -152,20 +152,20 @@ def mode_scoped_namespace(
     validate_kv_cache_mode(kv_cache_mode)
     lp = validate_loop_passes(loop_passes)
     base = (base_namespace or "default").strip()
-    # Strip any prior :loop_passes=<n> and :kv_mode=<m> suffixes for idempotence.
-    lp_tag = ":loop_passes="
-    idx = base.rfind(lp_tag)
-    if idx != -1 and base[idx + len(lp_tag) :].isdigit():
-        base = base[:idx]
-    for m in VALID_KV_CACHE_MODES:
-        suffix = f":kv_mode={m}"
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
-            break
-    scoped = f"{base}:kv_mode={kv_cache_mode}"
-    if lp != DEFAULT_LOOP_PASSES:
-        scoped = f"{scoped}:loop_passes={lp}"
-    return scoped
+    # Preserve opaque caller scopes (including literal `:loop_passes=<n>` suffixes) verbatim:
+    # never strip a depth suffix from the caller input, and only match the legacy #829
+    # `:kv_mode=<m>` suffix when applying the default L=3 scope.
+    if lp == DEFAULT_LOOP_PASSES:
+        marker = f":kv_mode={kv_cache_mode}"
+        if base.endswith(marker):
+            return base
+        for m in VALID_KV_CACHE_MODES:
+            suffix = f":kv_mode={m}"
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        return f"{base}{marker}"
+    return f"{base}:kv_mode={kv_cache_mode}:loop_passes={lp}"
 
 
 @dataclass(frozen=True)
@@ -207,7 +207,6 @@ class WorkerCapability:
     kv_cache_mode_mutable: bool = False
     max_model_len: int = 65536
     max_batch: int = 1
-    loop_passes: int = DEFAULT_LOOP_PASSES
     spec_enabled: bool = False
     tp_size: int = 1
     kv_format: str = "q4_0"
@@ -216,6 +215,7 @@ class WorkerCapability:
     decode_tok_per_s: float = 40.0
     measured_last_full_nll_delta: float = 0.01056  # measured #829 reference delta unless overridden
     cache_namespace_header: Optional[str] = None
+    loop_passes: int = DEFAULT_LOOP_PASSES
 
     def __post_init__(self) -> None:
         validate_kv_cache_mode(self.active_kv_cache_mode)
@@ -388,8 +388,31 @@ def discover_worker_capability(
             f"worker {worker_id} X-Ingine-Kv-Cache-Mode header={hdr_mode!r} != body={active_health!r}"
         )
 
-    raw_supported = health.get("supported_kv_cache_modes") or card.get("supported_kv_cache_modes") or [active_health]
-    supported = tuple(validate_kv_cache_mode(m) for m in raw_supported)
+    def _parse_supported_list(src_name: str, raw_val: Any) -> tuple[str, ...]:
+        if not isinstance(raw_val, list) or not raw_val:
+            raise RuntimeError(
+                f"worker {worker_id} invalid {src_name} supported_kv_cache_modes: {raw_val!r}"
+            )
+        return tuple(validate_kv_cache_mode(m) for m in raw_val)
+
+    has_health_sup = "supported_kv_cache_modes" in health
+    has_card_sup = "supported_kv_cache_modes" in card
+    if has_health_sup and has_card_sup:
+        sup_health = _parse_supported_list("/health", health["supported_kv_cache_modes"])
+        sup_card = _parse_supported_list("/v1/models", card["supported_kv_cache_modes"])
+        if set(sup_health) != set(sup_card):
+            raise RuntimeError(
+                f"worker {worker_id} inconsistent supported_kv_cache_modes: "
+                f"/health={sup_health!r}, /v1/models={sup_card!r}"
+            )
+        supported = sup_health
+    elif has_health_sup:
+        supported = _parse_supported_list("/health", health["supported_kv_cache_modes"])
+    elif has_card_sup:
+        supported = _parse_supported_list("/v1/models", card["supported_kv_cache_modes"])
+    else:
+        supported = (active_health,)
+
     if active_health not in supported:
         raise RuntimeError(
             f"worker {worker_id} active kv_cache_mode {active_health!r} absent from supported {supported!r}"
@@ -399,8 +422,9 @@ def discover_worker_capability(
     max_model_len = int(card.get("max_model_len", 65536))
     model_id = str(card.get("id") or health.get("model") or "unknown")
 
-    has_health_lp = "loop_passes" in health and health["loop_passes"] is not None
-    has_card_lp = "loop_passes" in card and card["loop_passes"] is not None
+    # Reserve L=3 default strictly for genuinely absent legacy fields; explicit null or non-int fails closed.
+    has_health_lp = "loop_passes" in health
+    has_card_lp = "loop_passes" in card
     if has_health_lp and has_card_lp:
         lp_health = validate_loop_passes(health["loop_passes"])
         lp_card = validate_loop_passes(card["loop_passes"])
@@ -415,6 +439,20 @@ def discover_worker_capability(
         loop_passes = validate_loop_passes(card["loop_passes"])
     else:
         loop_passes = DEFAULT_LOOP_PASSES
+
+    for hdr_src, hdrs in (("/health", h_headers), ("/v1/models", m_headers)):
+        hdr_lp_raw = hdrs.get("x-ingine-loop-passes")
+        if hdr_lp_raw is not None:
+            try:
+                hdr_lp = validate_loop_passes(int(hdr_lp_raw))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"worker {worker_id} invalid {hdr_src} X-Ingine-Loop-Passes header={hdr_lp_raw!r}"
+                ) from exc
+            if hdr_lp != loop_passes:
+                raise RuntimeError(
+                    f"worker {worker_id} {hdr_src} X-Ingine-Loop-Passes header={hdr_lp!r} != body={loop_passes!r}"
+                )
 
     if loop_passes != DEFAULT_LOOP_PASSES and (active_health == "last_full" or "last_full" in supported):
         raise RuntimeError(
@@ -924,7 +962,11 @@ class HostCacheModeRegistry:
             }
 
         worker = worker_map[decision.worker_id]
-        extra_headers: dict[str, str] = {}
+        extra_headers: dict[str, str] = {
+            # Pre-generation depth precondition: #838 servers reject mismatched depths with HTTP 409
+            # before generating a token; legacy L=3 servers ignore unknown request headers.
+            "X-Ingine-Expected-Loop-Passes": str(worker.loop_passes),
+        }
         if worker.cache_namespace_header and decision.effective_cache_namespace:
             if not decision.bypass_prefix_cache:
                 extra_headers[worker.cache_namespace_header] = decision.effective_cache_namespace
@@ -962,6 +1004,7 @@ class HostCacheModeRegistry:
                 status="http_error",
                 elapsed_seconds=elapsed,
                 error_detail=str(exc),
+                loop_passes=worker.loop_passes,
             )
             raise
 
@@ -977,6 +1020,7 @@ class HostCacheModeRegistry:
                 status="mode_mismatch",
                 elapsed_seconds=elapsed,
                 error_detail="response header and body kv_cache_mode disagree",
+                loop_passes=worker.loop_passes,
             )
             raise RuntimeError(
                 f"server kv_cache_mode conflict on {dispatch_id}: header={hdr_mode!r} body={body_mode!r}"
@@ -991,10 +1035,101 @@ class HostCacheModeRegistry:
                 status="mode_mismatch",
                 elapsed_seconds=elapsed,
                 error_detail=f"expected={decision.selected_mode!r}, got={server_mode!r}",
+                loop_passes=worker.loop_passes,
             )
             raise RuntimeError(
                 f"server kv_cache_mode mismatch on {dispatch_id}: admitted={decision.selected_mode!r}, "
                 f"server={server_mode!r}"
+            )
+
+        # Post-response loop_passes verification (preserves legacy L=3 servers that omit depth fields;
+        # fails closed on any explicit mismatch, malformed depth, or omitted depth for L != 3).
+        hdr_lp_raw = resp_headers.get("x-ingine-loop-passes")
+        has_body_lp = "loop_passes" in body
+        parsed_hdr_lp: Optional[int] = None
+        parsed_body_lp: Optional[int] = None
+        if hdr_lp_raw is not None:
+            try:
+                if not hdr_lp_raw.isdigit():
+                    raise ValueError(hdr_lp_raw)
+                parsed_hdr_lp = validate_loop_passes(int(hdr_lp_raw))
+            except (TypeError, ValueError):
+                self.record_result(
+                    dispatch_id=dispatch_id,
+                    session_id=eff_req.session_id,
+                    admitted_mode=decision.selected_mode,
+                    server_mode=server_mode,
+                    status="depth_mismatch",
+                    elapsed_seconds=elapsed,
+                    error_detail=f"invalid response X-Ingine-Loop-Passes header={hdr_lp_raw!r}",
+                    loop_passes=worker.loop_passes,
+                )
+                raise RuntimeError(
+                    f"invalid server loop_passes header on {dispatch_id}: {hdr_lp_raw!r}"
+                )
+        if has_body_lp:
+            try:
+                parsed_body_lp = validate_loop_passes(body["loop_passes"])
+            except (TypeError, ValueError):
+                self.record_result(
+                    dispatch_id=dispatch_id,
+                    session_id=eff_req.session_id,
+                    admitted_mode=decision.selected_mode,
+                    server_mode=server_mode,
+                    status="depth_mismatch",
+                    elapsed_seconds=elapsed,
+                    error_detail=f"invalid response body loop_passes={body['loop_passes']!r}",
+                    loop_passes=worker.loop_passes,
+                )
+                raise RuntimeError(
+                    f"invalid server body loop_passes on {dispatch_id}: {body['loop_passes']!r}"
+                )
+        if parsed_hdr_lp is not None and parsed_body_lp is not None and parsed_hdr_lp != parsed_body_lp:
+            self.record_result(
+                dispatch_id=dispatch_id,
+                session_id=eff_req.session_id,
+                admitted_mode=decision.selected_mode,
+                server_mode=server_mode,
+                status="depth_mismatch",
+                elapsed_seconds=elapsed,
+                error_detail=f"response header loop_passes={parsed_hdr_lp} != body={parsed_body_lp}",
+                loop_passes=worker.loop_passes,
+            )
+            raise RuntimeError(
+                f"server loop_passes conflict on {dispatch_id}: header={parsed_hdr_lp} body={parsed_body_lp}"
+            )
+        server_lp = parsed_hdr_lp if parsed_hdr_lp is not None else parsed_body_lp
+        if server_lp is None:
+            if worker.loop_passes != DEFAULT_LOOP_PASSES:
+                self.record_result(
+                    dispatch_id=dispatch_id,
+                    session_id=eff_req.session_id,
+                    admitted_mode=decision.selected_mode,
+                    server_mode=server_mode,
+                    status="depth_mismatch",
+                    elapsed_seconds=elapsed,
+                    error_detail=(
+                        f"non-default loop_passes={worker.loop_passes} requires explicit completion depth confirmation"
+                    ),
+                    loop_passes=worker.loop_passes,
+                )
+                raise RuntimeError(
+                    f"server loop_passes omitted on {dispatch_id} for non-default admitted depth {worker.loop_passes}"
+                )
+            server_lp = DEFAULT_LOOP_PASSES
+        elif server_lp != worker.loop_passes:
+            self.record_result(
+                dispatch_id=dispatch_id,
+                session_id=eff_req.session_id,
+                admitted_mode=decision.selected_mode,
+                server_mode=server_mode,
+                status="depth_mismatch",
+                elapsed_seconds=elapsed,
+                error_detail=f"expected loop_passes={worker.loop_passes}, got={server_lp}",
+                loop_passes=worker.loop_passes,
+            )
+            raise RuntimeError(
+                f"server loop_passes mismatch on {dispatch_id}: admitted={worker.loop_passes}, server={server_lp}"
             )
 
         usage = body.get("usage") or {}
@@ -1044,6 +1179,7 @@ class HostCacheModeRegistry:
             "admitted": True,
             "decision": decision.to_dict(),
             "server_kv_cache_mode": server_mode,
+            "server_loop_passes": server_lp,
             "bound_max_tokens": bound_max_tokens,
             "elapsed_seconds": round(elapsed, 4),
             "response": body,
