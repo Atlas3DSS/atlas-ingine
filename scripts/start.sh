@@ -177,7 +177,17 @@ fi
 
 if (( FORCE_BUILD )) || [[ ! -x "$SERVER" ]]; then
   printf 'start.sh: building ingine-serve with preset %s (%s)\n' "$PRESET" "$BUILD_DIR" >&2
-  cmake -S "$NATIVE" --preset "$PRESET"
+  CMAKE_EXTRA=()
+  if [[ "$PRESET" != "cpu-dev" && -z "${CUDACXX:-}" ]] && ! command -v nvcc >/dev/null 2>&1; then
+    for cand in /usr/local/cuda/bin/nvcc /usr/local/cuda-13.*/bin/nvcc /usr/local/cuda-12.*/bin/nvcc; do
+      if [[ -x "$cand" ]]; then
+        export CUDACXX="$cand"
+        CMAKE_EXTRA+=("-DCUDAToolkit_ROOT=$(dirname "$(dirname "$cand")")")
+        break
+      fi
+    done
+  fi
+  cmake -S "$NATIVE" --preset "$PRESET" "${CMAKE_EXTRA[@]}"
   cmake --build "$BUILD_DIR" --target ingine-serve
 fi
 

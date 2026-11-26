@@ -27,7 +27,7 @@ __device__ __forceinline__ void store_cache(void* cache, size_t at, float x, boo
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
 #if INGINE_ACT_FP16
   return act::e4m3x2_to_half2_bits(u);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
   uint32_t r;
   asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
   return r;
