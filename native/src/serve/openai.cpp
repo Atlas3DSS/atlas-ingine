@@ -445,7 +445,7 @@ bool truthy(const Json& value) {
 
 ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
                           const model::Sampling& defaults, const ImageOptions& image_options,
-                          std::string_view raw_body) {
+                          std::string_view raw_body, bool allow_logit_masker) {
   if (num_int(body, "n", Bound{1, "1"}, Bound{1, "1"}).value_or(1) != 1) {
     throw BadRequest("only n=1 is supported", "n");
   }
@@ -483,6 +483,11 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   const auto tools = body.find("tools");
   static const Json kAbsent;  // null: no messages/tools key (passed by reference, not a deep copy of the body)
   const ParsedResponseFormat parsed_rf = parse_response_format(body, raw_body);
+  if (parsed_rf.spec.mode != text::JsonFormatMode::None && !allow_logit_masker) {
+    throw BadRequest(
+        "structured JSON response_format ('json_object'/'json_schema') is not supported by this model backend",
+        "response_format");
+  }
   const std::string& rf_suffix = parsed_rf.instruction;
   const Json& raw_messages = messages == body.end() ? kAbsent : *messages;
   const Json augmented_messages = rf_suffix.empty() ? Json() : append_format_instruction(raw_messages, rf_suffix);

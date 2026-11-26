@@ -44,6 +44,23 @@ DEFAULT_KV_CACHE_MODE = "per_pass"
 DEFAULT_LOOP_PASSES = 3
 MIN_LOOP_PASSES = 1
 MAX_LOOP_PASSES = 8
+VALID_MODEL_FAMILIES = ("inkling2", "qwen3_5")
+DEFAULT_MODEL_FAMILY = "inkling2"
+
+# Exact Qwen3.8-27B dense GDN + BF16 full-KV state geometry (mirrors native/src/backends/qwen38/qwen38_dense_gpu.cu):
+#   - 48 linear (GDN) layers: conv_state [10240, 4] FP32 (163,840 B) + rec_state [48, 128, 128] FP32 (3,145,728 B)
+#     = 3,309,568 B/layer -> 48 * 3,309,568 = 158,859,264 B (151.50 MiB fixed per session; zero sliding rings).
+#   - 16 full-attention layers: K+V BF16 (num_kv_heads=4, head_dim=256 -> kv_stride=1024)
+#     = 16 * 2 * 1024 * 2 = 65,536 B/tok (64 KiB/tok).
+#   - Non-looped single-pass dense architecture: loop_passes == 1, kv_cache_mode == "per_pass" only.
+QWEN38_NUM_LINEAR_LAYERS = 48
+QWEN38_NUM_FULL_LAYERS = 16
+QWEN38_GDN_FIXED_BYTES = QWEN38_NUM_LINEAR_LAYERS * (10240 * 4 + 48 * 128 * 128) * 4  # 158,859,264 B (151.50 MiB)
+QWEN38_GDN_FIXED_STATE_MIB = QWEN38_GDN_FIXED_BYTES / (1024.0 * 1024.0)
+QWEN38_FULL_KV_BYTES_PER_TOKEN: dict[str, int] = {
+    "bf16": QWEN38_NUM_FULL_LAYERS * 2 * 1024 * 2,                      # 65,536 B/tok (64 KiB/tok)
+    "gdn_f32_conv_bf16_kv_bf16": QWEN38_NUM_FULL_LAYERS * 2 * 1024 * 2, # 65,536 B/tok (64 KiB/tok)
+}
 
 # Exact Inkling-2-Mini KV/state geometry (mirrors native/src/model/model_data.h & state.cpp):
 #   - VisitPlan(L): visits = 12 + 12*L, sliding = 10 + 10*L, full(per_pass) = 2 + 2*L, full(last_full, L=3) = 4.
@@ -144,6 +161,55 @@ def estimate_total_state_mib(
     return estimate_pass_local_state_mib(lp) + estimate_full_kv_mib(context_tokens, kv_format, kv_cache_mode, lp)
 
 
+def estimate_qwen38_state_mib(
+    context_tokens: int,
+    kv_format: str = "bf16",
+    kv_cache_mode: str = "per_pass",
+    loop_passes: int = 1,
+) -> float:
+    validate_kv_cache_mode(kv_cache_mode)
+    if kv_cache_mode != "per_pass":
+        raise ValueError(f"qwen3_5 does not support Inkling kv_cache_mode {kv_cache_mode!r} (only 'per_pass')")
+    lp = validate_loop_passes(loop_passes)
+    if lp != 1:
+        raise ValueError(f"qwen3_5 is a non-looped architecture and requires loop_passes=1 (got {lp})")
+    fmt = kv_format.lower()
+    if fmt not in QWEN38_FULL_KV_BYTES_PER_TOKEN:
+        raise ValueError(
+            f"unsupported qwen3_5 kv_format {kv_format!r} (expected one of {tuple(QWEN38_FULL_KV_BYTES_PER_TOKEN)})"
+        )
+    if context_tokens < 0:
+        raise ValueError("context_tokens must be non-negative")
+    return QWEN38_GDN_FIXED_STATE_MIB + (context_tokens * QWEN38_FULL_KV_BYTES_PER_TOKEN[fmt]) / (1024.0 * 1024.0)
+
+
+def infer_model_family(model_id: str, declared_family: Optional[str] = None) -> str:
+    if declared_family is not None:
+        if not isinstance(declared_family, str) or not declared_family.strip():
+            raise ValueError(f"invalid model_family {declared_family!r}")
+        return declared_family.strip().lower()
+    if "qwen" in (model_id or "").lower():
+        return "qwen3_5"
+    return DEFAULT_MODEL_FAMILY
+
+
+def estimate_worker_state_mib(worker: "WorkerCapability", context_tokens: int, kv_cache_mode: str) -> float:
+    fam = worker.model_family
+    if fam == "inkling2":
+        if "qwen" in worker.model_id.lower():
+            raise ValueError(
+                f"worker {worker.worker_id} ({worker.model_id!r}) must not use Inkling-2 state geometry"
+            )
+        return estimate_total_state_mib(context_tokens, worker.kv_format, kv_cache_mode, loop_passes=worker.loop_passes)
+    if fam == "qwen3_5":
+        return estimate_qwen38_state_mib(
+            context_tokens, worker.kv_format, kv_cache_mode, loop_passes=worker.loop_passes
+        )
+    raise ValueError(
+        f"unsupported model_family {fam!r} for worker {worker.worker_id}: refusing to apply Inkling-2 state geometry"
+    )
+
+
 def mode_scoped_namespace(
     base_namespace: str,
     kv_cache_mode: str,
@@ -216,19 +282,47 @@ class WorkerCapability:
     measured_last_full_nll_delta: float = 0.01056  # measured #829 reference delta unless overridden
     cache_namespace_header: Optional[str] = None
     loop_passes: int = DEFAULT_LOOP_PASSES
+    model_family: str = DEFAULT_MODEL_FAMILY
 
     def __post_init__(self) -> None:
         validate_kv_cache_mode(self.active_kv_cache_mode)
         lp = validate_loop_passes(self.loop_passes)
         for m in self.supported_kv_cache_modes:
             validate_kv_cache_mode(m)
+        if not isinstance(self.model_family, str) or not self.model_family.strip():
+            raise ValueError(f"worker {self.worker_id} has invalid model_family {self.model_family!r}")
+        if self.model_family == "inkling2" and "qwen" in self.model_id.lower():
+            raise ValueError(
+                f"worker {self.worker_id} ({self.model_id!r}) cannot use model_family='inkling2' "
+                f"(refusing Inkling-only state geometry for Qwen; use model_family='qwen3_5')"
+            )
+        if self.model_family == "qwen3_5":
+            if self.active_kv_cache_mode != "per_pass" or "last_full" in self.supported_kv_cache_modes:
+                raise ValueError(
+                    f"worker {self.worker_id} (qwen3_5) does not support Inkling last_full kv_cache_mode"
+                )
+            if lp != 1:
+                raise ValueError(
+                    f"worker {self.worker_id} (qwen3_5) is non-looped and requires loop_passes=1 (got {lp})"
+                )
+            if self.kv_format.lower() not in QWEN38_FULL_KV_BYTES_PER_TOKEN:
+                raise ValueError(
+                    f"worker {self.worker_id} (qwen3_5) does not support Inkling kv_format {self.kv_format!r} "
+                    f"(expected one of {tuple(QWEN38_FULL_KV_BYTES_PER_TOKEN)})"
+                )
         if self.active_kv_cache_mode == "last_full" and lp != DEFAULT_LOOP_PASSES:
             raise ValueError(f"worker {self.worker_id} cannot use active last_full with loop_passes={lp}")
 
     def supports_mode(self, mode: str) -> bool:
         validate_kv_cache_mode(mode)
         if mode == "last_full":
-            if self.max_batch > 1 or self.spec_enabled or self.tp_size > 1 or self.loop_passes != DEFAULT_LOOP_PASSES:
+            if (
+                self.model_family != "inkling2"
+                or self.max_batch > 1
+                or self.spec_enabled
+                or self.tp_size > 1
+                or self.loop_passes != DEFAULT_LOOP_PASSES
+            ):
                 return False
         return mode in self.supported_kv_cache_modes
 
@@ -354,7 +448,7 @@ def _http_json_with_headers(
 def discover_worker_capability(
     worker_id: str,
     base_url: str,
-    kv_format: str = "q4_0",
+    kv_format: Optional[str] = None,
     available_kv_vram_mib: float = 16384.0,
     spec_enabled: bool = False,
     tp_size: int = 1,
@@ -422,7 +516,34 @@ def discover_worker_capability(
     max_model_len = int(card.get("max_model_len", 65536))
     model_id = str(card.get("id") or health.get("model") or "unknown")
 
-    # Reserve L=3 default strictly for genuinely absent legacy fields; explicit null or non-int fails closed.
+    has_health_fam = "model_family" in health
+    has_card_fam = "model_family" in card
+    if has_health_fam and has_card_fam:
+        fam_health = infer_model_family(model_id, health["model_family"])
+        fam_card = infer_model_family(model_id, card["model_family"])
+        if fam_health != fam_card:
+            raise RuntimeError(
+                f"worker {worker_id} inconsistent model_family: /health={fam_health!r}, /v1/models={fam_card!r}"
+            )
+        model_family = fam_health
+    elif has_health_fam:
+        model_family = infer_model_family(model_id, health["model_family"])
+    elif has_card_fam:
+        model_family = infer_model_family(model_id, card["model_family"])
+    else:
+        model_family = infer_model_family(model_id, None)
+
+    if model_family not in VALID_MODEL_FAMILIES:
+        raise RuntimeError(
+            f"worker {worker_id} advertises unsupported model_family {model_family!r}: "
+            f"refusing to apply Inkling-2 state geometry"
+        )
+    if model_family == "inkling2" and "qwen" in model_id.lower():
+        raise RuntimeError(
+            f"worker {worker_id} ({model_id!r}) advertises Inkling-2 model_family for a Qwen model"
+        )
+
+    # Reserve L=3 default strictly for genuinely absent legacy Inkling fields; non-looped qwen3_5 defaults to 1.
     has_health_lp = "loop_passes" in health
     has_card_lp = "loop_passes" in card
     if has_health_lp and has_card_lp:
@@ -438,7 +559,7 @@ def discover_worker_capability(
     elif has_card_lp:
         loop_passes = validate_loop_passes(card["loop_passes"])
     else:
-        loop_passes = DEFAULT_LOOP_PASSES
+        loop_passes = 1 if model_family == "qwen3_5" else DEFAULT_LOOP_PASSES
 
     for hdr_src, hdrs in (("/health", h_headers), ("/v1/models", m_headers)):
         hdr_lp_raw = hdrs.get("x-ingine-loop-passes")
@@ -454,11 +575,24 @@ def discover_worker_capability(
                     f"worker {worker_id} {hdr_src} X-Ingine-Loop-Passes header={hdr_lp!r} != body={loop_passes!r}"
                 )
 
-    if loop_passes != DEFAULT_LOOP_PASSES and (active_health == "last_full" or "last_full" in supported):
-        raise RuntimeError(
-            f"worker {worker_id} advertises incompatible last_full with loop_passes={loop_passes}: "
-            f"active={active_health!r}, supported={supported!r}"
-        )
+    if model_family == "qwen3_5":
+        if loop_passes != 1:
+            raise RuntimeError(
+                f"worker {worker_id} (qwen3_5) advertises unsupported Inkling loop_passes={loop_passes} (expected 1)"
+            )
+        if active_health != "per_pass" or "last_full" in supported:
+            raise RuntimeError(
+                f"worker {worker_id} (qwen3_5) advertises unsupported last_full kv_cache_mode: "
+                f"active={active_health!r}, supported={supported!r}"
+            )
+        resolved_kv_format = kv_format if kv_format is not None else "bf16"
+    else:
+        if loop_passes != DEFAULT_LOOP_PASSES and (active_health == "last_full" or "last_full" in supported):
+            raise RuntimeError(
+                f"worker {worker_id} advertises incompatible last_full with loop_passes={loop_passes}: "
+                f"active={active_health!r}, supported={supported!r}"
+            )
+        resolved_kv_format = kv_format if kv_format is not None else "q4_0"
 
     return WorkerCapability(
         worker_id=worker_id,
@@ -472,12 +606,13 @@ def discover_worker_capability(
         loop_passes=loop_passes,
         spec_enabled=spec_enabled,
         tp_size=tp_size,
-        kv_format=kv_format,
+        kv_format=resolved_kv_format,
         available_kv_vram_mib=available_kv_vram_mib,
         prefill_tok_per_s=prefill_tok_per_s,
         decode_tok_per_s=decode_tok_per_s,
         measured_last_full_nll_delta=measured_last_full_nll_delta,
         cache_namespace_header=cache_namespace_header,
+        model_family=model_family,
     )
 
 
@@ -578,7 +713,17 @@ def evaluate_worker_for_mode(
                 worker_supported_modes=worker.supported_kv_cache_modes,
             )
 
-    state_mib = estimate_total_state_mib(total_tokens, worker.kv_format, mode, loop_passes=worker.loop_passes)
+    if worker.model_family not in VALID_MODEL_FAMILIES:
+        return AdmissionDecision(
+            admitted=False,
+            worker_id=worker.worker_id,
+            selected_mode=None,
+            reason=f"unsupported_model_family:{worker.model_family}",
+            worker_supported_modes=worker.supported_kv_cache_modes,
+            worker_loop_passes=worker.loop_passes,
+        )
+
+    state_mib = estimate_worker_state_mib(worker, total_tokens, mode)
     eff_mem_limit = worker.available_kv_vram_mib - req.budgets.vram_headroom_mib
     if req.budgets.memory_budget_mib is not None:
         eff_mem_limit = min(eff_mem_limit, req.budgets.memory_budget_mib)

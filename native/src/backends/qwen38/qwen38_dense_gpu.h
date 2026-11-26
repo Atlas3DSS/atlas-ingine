@@ -98,7 +98,13 @@ class Qwen38DenseBackend final : public ingine::model::ModelBackend {
 
   // ingine::model::Generator
   std::string model_id() const override;
+  std::string model_family() const override { return "qwen3_5"; }
   int max_model_len() const override;
+  bool supports_logit_masker() const override { return false; }
+  std::vector<ingine::model::KvCacheMode> supported_kv_cache_modes() const override {
+    return {ingine::model::KvCacheMode::PerPass};
+  }
+  int loop_passes() const override { return 1; }
   ingine::model::PrefixCacheStats cache_stats() const override;
   using ingine::model::ModelBackend::generate;
   ingine::model::GenerateStats generate(std::span<const std::int32_t> prompt, int max_new_tokens,

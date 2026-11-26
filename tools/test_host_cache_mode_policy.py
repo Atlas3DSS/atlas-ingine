@@ -31,6 +31,8 @@ def start_mock_worker(
     models_supported_override: list[str] | None = None,
     completion_loop_passes_override: object = ...,
     enforce_expected_loop_passes: bool = True,
+    model_family: str | None = None,
+    models_family_override: str | None = None,
 ):
     received: list[dict] = []
 
@@ -68,6 +70,8 @@ def start_mock_worker(
                     health_obj["loop_passes"] = None
                 elif loop_passes is not None:
                     health_obj["loop_passes"] = loop_passes
+                if model_family is not None:
+                    health_obj["model_family"] = model_family
                 self._send(200, health_obj, mode_hdr=hdr, lp_hdr=lp_hdr)
             elif self.path == "/v1/models":
                 card_obj = {
@@ -86,6 +90,9 @@ def start_mock_worker(
                     card_lp = models_loop_passes_override if models_loop_passes_override is not None else loop_passes
                     if card_lp is not None:
                         card_obj["loop_passes"] = card_lp
+                card_fam = models_family_override if models_family_override is not None else model_family
+                if card_fam is not None:
+                    card_obj["model_family"] = card_fam
                 self._send(
                     200,
                     {
@@ -800,6 +807,169 @@ class TestHostCacheModePolicy(unittest.TestCase):
                     self.assertEqual(reg.get_session_state("s-stale"), ("per_pass", 3))
         finally:
             for s in (srv_null_lp, srv_card_bad_sup, srv_restarted_l6, srv_lying_l6, srv_omit_for_l1, srv_legacy_l3):
+                s.shutdown()
+                s.server_close()
+
+    def test_qwen38_non_inkling_geometry_and_fail_closed(self):
+        # 1. Exact Qwen3.8-27B state geometry: 48 GDN layers fixed (151.50 MiB) + 16 BF16 full layers (64 KiB/tok).
+        self.assertAlmostEqual(pol.QWEN38_GDN_FIXED_STATE_MIB, 151.5, places=6)
+        self.assertAlmostEqual(pol.estimate_qwen38_state_mib(0, "bf16"), 151.5, places=6)
+        self.assertAlmostEqual(pol.estimate_qwen38_state_mib(8192, "bf16"), 151.5 + 512.0, places=6)
+        self.assertAlmostEqual(
+            pol.estimate_qwen38_state_mib(8192, "gdn_f32_conv_bf16_kv_bf16"), 663.5, places=6
+        )
+        # Inkling-only options/formats must fail closed on Qwen.
+        with self.assertRaises(ValueError):
+            pol.estimate_qwen38_state_mib(8192, "q4_0")
+        with self.assertRaises(ValueError):
+            pol.estimate_qwen38_state_mib(8192, "fp8")
+        with self.assertRaises(ValueError):
+            pol.estimate_qwen38_state_mib(8192, "bf16", kv_cache_mode="last_full")
+        with self.assertRaises(ValueError):
+            pol.estimate_qwen38_state_mib(8192, "bf16", loop_passes=3)
+
+        # 2. WorkerCapability refuses applying Inkling-2 model_family/geometry to Qwen model IDs.
+        with self.assertRaises(ValueError):
+            pol.WorkerCapability(
+                worker_id="w-bad-fam",
+                base_url="http://127.0.0.1:9999",
+                model_id="Qwen3.8-27B-NVFP4",
+                kv_format="q4_0",
+                loop_passes=3,
+                model_family="inkling2",
+            )
+        with self.assertRaises(ValueError):
+            pol.WorkerCapability(
+                worker_id="w-bad-qwen-lp",
+                base_url="http://127.0.0.1:9999",
+                model_id="Qwen3.8-27B-NVFP4",
+                kv_format="bf16",
+                loop_passes=3,
+                model_family="qwen3_5",
+            )
+        with self.assertRaises(ValueError):
+            pol.WorkerCapability(
+                worker_id="w-bad-qwen-lf",
+                base_url="http://127.0.0.1:9999",
+                model_id="Qwen3.8-27B-NVFP4",
+                active_kv_cache_mode="per_pass",
+                supported_kv_cache_modes=("per_pass", "last_full"),
+                kv_format="bf16",
+                loop_passes=1,
+                model_family="qwen3_5",
+            )
+
+        # 3. Unknown model family fails closed at admission (never silently applies Inkling state geometry).
+        w_unknown = pol.WorkerCapability(
+            worker_id="w-unk",
+            base_url="http://127.0.0.1:9999",
+            model_id="mystery-model",
+            active_kv_cache_mode="per_pass",
+            supported_kv_cache_modes=("per_pass",),
+            kv_format="bf16",
+            loop_passes=1,
+            model_family="mystery_arch",
+        )
+        req_small = pol.AdmissionRequest(
+            task_id="t-unk",
+            session_id="s-unk",
+            cache_namespace="tenant-q",
+            context_tokens=1024,
+            expected_new_tokens=64,
+            prefix_sha256="abcd",
+            budgets=pol.AdmissionBudgets(memory_budget_mib=4096.0),
+        )
+        dec_unk = pol.evaluate_worker_for_mode(w_unknown, req_small, "per_pass")
+        self.assertFalse(dec_unk.admitted)
+        self.assertIn("unsupported_model_family:mystery_arch", dec_unk.reason)
+
+        # 4. Live mock Qwen worker discovery + admission + dispatch:
+        #    At 8192 total tokens, Qwen state is 663.50 MiB whereas Inkling L=3 q4_0 would be 236.7 MiB.
+        #    A 500 MiB budget MUST reject Qwen (proving Inkling geometry is not used); 700 MiB MUST admit.
+        srv_qwen, url_qwen, recv_qwen = start_mock_worker(
+            "per_pass",
+            ["per_pass"],
+            model_id="Qwen3.8-27B-NVFP4",
+            max_model_len=8192,
+            loop_passes=1,
+            model_family="qwen3_5",
+        )
+        srv_qwen_bad_lp, url_qwen_bad_lp, _ = start_mock_worker(
+            "per_pass",
+            ["per_pass"],
+            model_id="Qwen3.8-27B-NVFP4",
+            max_model_len=8192,
+            loop_passes=3,
+            model_family="qwen3_5",
+        )
+        srv_qwen_bad_lf, url_qwen_bad_lf, _ = start_mock_worker(
+            "per_pass",
+            ["per_pass", "last_full"],
+            model_id="Qwen3.8-27B-NVFP4",
+            max_model_len=8192,
+            loop_passes=1,
+            model_family="qwen3_5",
+        )
+        srv_qwen_fam_mis, url_qwen_fam_mis, _ = start_mock_worker(
+            "per_pass",
+            ["per_pass"],
+            model_id="Qwen3.8-27B-NVFP4",
+            max_model_len=8192,
+            loop_passes=1,
+            model_family="qwen3_5",
+            models_family_override="inkling2",
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "unsupported Inkling loop_passes"):
+                pol.discover_worker_capability("w-q-bad-lp", url_qwen_bad_lp)
+            with self.assertRaisesRegex(RuntimeError, "unsupported last_full"):
+                pol.discover_worker_capability("w-q-bad-lf", url_qwen_bad_lf)
+            with self.assertRaisesRegex(RuntimeError, "inconsistent model_family"):
+                pol.discover_worker_capability("w-q-fam-mis", url_qwen_fam_mis)
+            with self.assertRaises(ValueError):
+                pol.discover_worker_capability("w-q-bad-fmt", url_qwen, kv_format="q4_0")
+
+            w_qwen = pol.discover_worker_capability("w-qwen", url_qwen, available_kv_vram_mib=4096.0)
+            self.assertEqual(w_qwen.model_family, "qwen3_5")
+            self.assertEqual(w_qwen.kv_format, "bf16")
+            self.assertEqual(w_qwen.loop_passes, 1)
+            self.assertFalse(w_qwen.supports_mode("last_full"))
+
+            req_500 = pol.AdmissionRequest(
+                task_id="t-q500",
+                session_id="s-q500",
+                cache_namespace="tenant-q",
+                context_tokens=8064,
+                expected_new_tokens=128,
+                prefix_sha256="deadbeef",
+                budgets=pol.AdmissionBudgets(memory_budget_mib=500.0),
+            )
+            dec_500 = pol.evaluate_worker_for_mode(w_qwen, req_500, "per_pass")
+            self.assertFalse(dec_500.admitted)
+            self.assertAlmostEqual(dec_500.estimated_state_mib, 663.5, places=4)
+            self.assertIn("memory_budget_exceeded", dec_500.reason)
+
+            req_700 = pol.AdmissionRequest(
+                task_id="t-q700",
+                session_id="s-q700",
+                cache_namespace="tenant-q",
+                context_tokens=8064,
+                expected_new_tokens=128,
+                prefix_sha256="deadbeef",
+                budgets=pol.AdmissionBudgets(memory_budget_mib=700.0),
+            )
+            with tempfile.TemporaryDirectory() as td:
+                db = Path(td) / "qwen_policy.sqlite"
+                with pol.HostCacheModeRegistry(db) as reg:
+                    out = reg.dispatch_chat_completion([w_qwen], req_700, [{"role": "user", "content": "hi"}])
+                    self.assertTrue(out["admitted"])
+                    self.assertEqual(out["server_kv_cache_mode"], "per_pass")
+                    self.assertEqual(out["server_loop_passes"], 1)
+                    self.assertAlmostEqual(out["decision"]["estimated_state_mib"], 663.5, places=4)
+                    self.assertEqual(recv_qwen[-1]["headers"].get("x-ingine-expected-loop-passes"), "1")
+                    self.assertEqual(reg.get_session_state("s-q700"), ("per_pass", 1))
+        finally:
+            for s in (srv_qwen, srv_qwen_bad_lp, srv_qwen_bad_lf, srv_qwen_fam_mis):
                 s.shutdown()
                 s.server_close()
 

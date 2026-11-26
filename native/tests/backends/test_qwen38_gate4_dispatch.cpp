@@ -170,6 +170,9 @@ void test_resolve_qwen38_runtime_options() {
   // Every unsupported Inkling flag must fail closed with std::invalid_argument.
   const std::vector<std::function<void(RuntimeOptions&)>> invalid_mutators = {
       [](auto& o) { o.kv_cache_mode = KvCacheMode::LastFull; },
+      [](auto& o) { o.loop_passes = 1; },
+      [](auto& o) { o.loop_passes = 6; },
+      [](auto& o) { o.loop_passes_explicit = true; },
       [](auto& o) { o.park_host_mb = 512; },
       [](auto& o) { o.park_mb = 512; },
       [](auto& o) { o.vision = true; },
@@ -268,7 +271,11 @@ std::vector<Json> parse_sse(const std::string& data) {
 
 void test_qwen_fake_http_server(const std::filesystem::path& qwen_dir) {
   const ChatFormat fmt = ChatFormat::load(qwen_dir);
-  FakeGenerator gen(fmt.tokenizer(), "Qwen3.8-27B-NVFP4-fake", 262144, {}, 0.0);
+  FakeGenerator gen(fmt.tokenizer(), "Qwen3.8-27B-NVFP4-fake", 262144, {}, 0.0, /*loop_passes=*/1,
+                    KvCacheMode::PerPass, /*allow_last_full=*/false);
+  gen.set_model_family("qwen3_5");
+  gen.set_supports_logit_masker(false);
+  gen.set_supports_images(false);
   ServerOptions so;
   so.images.enabled = false;
   ChatServer srv(gen, fmt, so);
@@ -278,21 +285,76 @@ void test_qwen_fake_http_server(const std::filesystem::path& qwen_dir) {
   httplib::Client cli("127.0.0.1", srv.port());
   cli.set_read_timeout(20, 0);
 
-  // 1. /health and /v1/models
+  // 1. /health and /v1/models advertise accurate non-looped qwen3_5 capabilities
   {
     const auto r_health = cli.Get("/health");
     CHECK(r_health && r_health->status == 200);
     const Json jh = Json::parse(r_health->body);
     CHECK(jh["status"] == "ok");
-    CHECK(jh["kv_cache_mode"] == "per_pass");
     CHECK(jh["model"] == "Qwen3.8-27B-NVFP4-fake");
+    CHECK(jh["model_family"] == "qwen3_5");
+    CHECK(jh["kv_cache_mode"] == "per_pass");
+    CHECK(jh["supported_kv_cache_modes"] == Json::array({"per_pass"}));
+    CHECK(jh["loop_passes"] == 1);
+    CHECK(jh["supports_structured_output"] == false);
+    CHECK(r_health->get_header_value("X-Ingine-Loop-Passes") == "1");
 
     const auto r_models = cli.Get("/v1/models");
     CHECK(r_models && r_models->status == 200);
     const Json jm = Json::parse(r_models->body);
     CHECK(jm["data"].size() == 1);
     CHECK(jm["data"][0]["id"] == "Qwen3.8-27B-NVFP4-fake");
+    CHECK(jm["data"][0]["model_family"] == "qwen3_5");
+    CHECK(jm["data"][0]["supported_kv_cache_modes"] == Json::array({"per_pass"}));
+    CHECK(jm["data"][0]["loop_passes"] == 1);
+    CHECK(jm["data"][0]["supports_structured_output"] == false);
     CHECK(jm["data"][0]["input_modalities"] == Json::array({"text"}));
+  }
+
+  // 1b. Stale-depth precondition returns HTTP 409 before generation; matching depth 1 succeeds.
+  {
+    const std::size_t before_calls = gen.calls().size();
+    const Json body{{"messages", Json::array({{{"role", "user"}, {"content", "depth check"}}})}};
+    const auto r_409 = cli.Post("/v1/chat/completions", httplib::Headers{{"X-Ingine-Expected-Loop-Passes", "3"}},
+                                body.dump(), "application/json");
+    CHECK(r_409 && r_409->status == 409);
+    CHECK(gen.calls().size() == before_calls);
+
+    const auto r_ok = cli.Post("/v1/chat/completions", httplib::Headers{{"X-Ingine-Expected-Loop-Passes", "1"}},
+                               body.dump(), "application/json");
+    CHECK(r_ok && r_ok->status == 200);
+    CHECK(gen.calls().size() == before_calls + 1);
+  }
+
+  // 1c. Structured JSON response_format is rejected explicitly with HTTP 400 BEFORE generation; type="text" passes.
+  {
+    const std::size_t before_calls = gen.calls().size();
+    const Json j_obj{{"messages", Json::array({{{"role", "user"}, {"content", "return json"}}})},
+                     {"response_format", {{"type", "json_object"}}}};
+    const auto r_obj = cli.Post("/v1/chat/completions", j_obj.dump(), "application/json");
+    CHECK(r_obj && r_obj->status == 400);
+    const Json e_obj = Json::parse(r_obj->body);
+    CHECK(e_obj["error"]["param"] == "response_format");
+    CHECK(gen.calls().size() == before_calls);
+
+    const Json j_schema{
+        {"messages", Json::array({{{"role", "user"}, {"content", "return schema json"}}})},
+        {"response_format",
+         {{"type", "json_schema"},
+          {"json_schema",
+           {{"name", "s"},
+            {"schema", {{"type", "object"}, {"properties", {{"ok", {{"type", "boolean"}}}}}, {"required", {"ok"}}}}}}}}};
+    const auto r_schema = cli.Post("/v1/chat/completions", j_schema.dump(), "application/json");
+    CHECK(r_schema && r_schema->status == 400);
+    const Json e_schema = Json::parse(r_schema->body);
+    CHECK(e_schema["error"]["param"] == "response_format");
+    CHECK(gen.calls().size() == before_calls);
+
+    const Json j_text{{"messages", Json::array({{{"role", "user"}, {"content", "plain text ok"}}})},
+                      {"response_format", {{"type", "text"}}}};
+    const auto r_text = cli.Post("/v1/chat/completions", j_text.dump(), "application/json");
+    CHECK(r_text && r_text->status == 200);
+    CHECK(gen.calls().size() == before_calls + 1);
   }
 
   // 2. Non-stream thinking enabled + zero negative banned_tokens

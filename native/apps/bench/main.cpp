@@ -276,7 +276,12 @@ int main(int argc, char** argv) {
       resolved_max_batch = 1;
     }
 
+    const bool loop_passes_explicit = ap.given("--loop-passes");
     if (ingine::model::detect_model_family(model_dir) == ingine::model::ModelFamily::Qwen3_5) {
+      if (loop_passes_explicit) {
+        throw std::invalid_argument(
+            "qwen38-dense is a non-looped dense architecture and does not support --loop-passes");
+      }
       if (!ap.given("--max-ctx")) max_ctx = 8192;
       if (!ap.given("--prefill-chunk")) prefill_chunk = 256;
     }
@@ -345,6 +350,7 @@ int main(int argc, char** argv) {
     options.max_kv_tokens = max_kv_tokens;
     options.loop_passes = loop_passes;
     options.vram_limit_mb = vram_limit_mb;
+    options.loop_passes_explicit = loop_passes_explicit;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     vram.mark_after_load();

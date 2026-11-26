@@ -198,6 +198,8 @@ struct RuntimeOptions {
   int loop_passes = 3;
   // Optional VRAM lease cap in MiB for batched pool/drafter/prefix-cache auto-sizing (0 = unbounded).
   int vram_limit_mb = 0;
+  // True when caller explicitly passed --loop-passes (non-looped backends reject explicit loop overrides fail-closed).
+  bool loop_passes_explicit = false;
   // Mech-interp / persona hook options: pre-capture hooked CUDA graphs when enabled, and enforce refusal map.
   bool enable_persona_hooks = false;
   std::filesystem::path refusal_map;
@@ -250,6 +252,8 @@ class Generator {
     return stats;
   }
   virtual bool supports_images() const { return false; }
+  virtual bool supports_logit_masker() const { return true; }
+  virtual std::string model_family() const { return "inkling2"; }
   virtual KvCacheMode kv_cache_mode() const { return KvCacheMode::PerPass; }
   // Modes supported by this worker's execution profile (e.g. {"per_pass", "last_full"} for B=1 non-spec TP=1 L=3,
   // or {"per_pass"} for speculative, continuous-batch B>1, TP>1, or --loop-passes != 3 workers). Active mode is fixed

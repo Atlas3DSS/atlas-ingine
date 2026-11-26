@@ -136,6 +136,9 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
   if (config.weight_precision == Qwen38WeightPrecision::Bf16 && options.dense_fp8) {
     throw std::invalid_argument("qwen38-dense BF16 checkpoint rejects dense_fp8=true (effective numeric ABI mismatch)");
   }
+  if (options.loop_passes_explicit || options.loop_passes != 3) {
+    throw std::invalid_argument("qwen38-dense is a non-looped dense architecture and does not support --loop-passes");
+  }
   if (options.kv_cache_mode != ingine::model::KvCacheMode::PerPass) {
     throw std::invalid_argument("qwen38-dense does not support kv_cache_mode '" +
                                 std::string(ingine::model::to_string(options.kv_cache_mode)) +

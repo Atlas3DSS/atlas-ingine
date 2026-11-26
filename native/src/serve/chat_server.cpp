@@ -169,10 +169,12 @@ struct StreamState {
 ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt, ServerOptions options)
     : fmt_(fmt),
       model_id_(options.model_id.empty() ? generator.model_id() : options.model_id),
+      model_family_(generator.model_family()),
       max_model_len_(options.max_model_len ? options.max_model_len : generator.max_model_len()),
       kv_cache_mode_(generator.kv_cache_mode()),
       supported_kv_cache_modes_(generator.supported_kv_cache_modes()),
       loop_passes_(generator.loop_passes()),
+      supports_logit_masker_(generator.supports_logit_masker()),
       sampling_defaults_(options.sampling),
       image_options_([&] {
         ImageOptions images = options.images;
@@ -217,11 +219,13 @@ Json ChatServer::model_card() const {
               {"object", "model"},
               {"created", created_},
               {"owned_by", "ingine"},
+              {"model_family", model_family_},
               {"max_model_len", max_model_len_},
               {"kv_cache_mode", model::to_string(kv_cache_mode_)},
               {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
               {"kv_cache_mode_mutable", false},
               {"loop_passes", loop_passes_},
+              {"supports_structured_output", supports_logit_masker_},
               {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
 }
 
@@ -261,10 +265,12 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
     send_json(res, 200,
               Json{{"status", "ok"},
                    {"model", model_id_},
+                   {"model_family", model_family_},
                    {"kv_cache_mode", model::to_string(kv_cache_mode_)},
                    {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
                    {"kv_cache_mode_mutable", false},
                    {"loop_passes", loop_passes_},
+                   {"supports_structured_output", supports_logit_masker_},
                    {"waiting", st.waiting},
                    {"running", st.running},
                    {"active", st.active},
@@ -338,7 +344,13 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
       return;
     }
     if (!body.is_object()) throw BadRequest("request body must be a JSON object");
-    request = parse_request(body, fmt_, max_model_len_, sampling_defaults_, image_options_, req.body);
+    request = parse_request(body, fmt_, max_model_len_, sampling_defaults_, image_options_, req.body,
+                            supports_logit_masker_);
+    if (request.sampling.logit_masker && !supports_logit_masker_) {
+      throw BadRequest(
+          "structured JSON response_format ('json_object'/'json_schema') is not supported by this model backend",
+          "response_format");
+    }
     if (personas_) {
       try {
         request.sampling.persona = personas_->resolve(request.persona_name);

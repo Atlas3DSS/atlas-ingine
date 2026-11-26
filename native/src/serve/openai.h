@@ -61,7 +61,7 @@ struct ChatRequest {
 // (image::token_id), so prompt_ids, the context check and the usage count the expanded prompt.
 ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
                           const model::Sampling& defaults = {}, const ImageOptions& images = {},
-                          std::string_view raw_body = {});
+                          std::string_view raw_body = {}, bool allow_logit_masker = true);
 
 // {"error": {"message", "type", "param", "code"}} with the type server.py maps from the status.
 Json error_body(int status, std::string_view message, const std::optional<std::string>& param = std::nullopt);

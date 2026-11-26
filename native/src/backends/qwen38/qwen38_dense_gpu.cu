@@ -1561,6 +1561,9 @@ ingine::model::GenerateStats Qwen38DenseBackend::generate_request_on_session(
     const ingine::model::Sampling& sampling, std::span<const std::int32_t> stop_ids,
     const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
     const ingine::model::PrefillCallback& on_prefill, const ingine::model::LogitCallback& on_step_logits) {
+  if (sampling.logit_masker) {
+    throw std::invalid_argument("qwen38-dense does not support token-level logit_masker constrained decoding");
+  }
   ingine::model::validate_request_against_capabilities(profile_.capabilities, profile_.max_ctx, req.prompt,
                                                        max_new_tokens, sampling);
   if (!req.token_mask.empty() && req.token_mask.size() != req.prompt.ids.size()) {

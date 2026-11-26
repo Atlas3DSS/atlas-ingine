@@ -222,7 +222,12 @@ int main(int argc, char** argv) {
 
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
     const bool is_qwen35 = (fmt.kind() == ingine::text::ChatFormatKind::Qwen3_5);
+    const bool loop_passes_explicit = ap.given("--loop-passes");
     if (is_qwen35) {
+      if (loop_passes_explicit) {
+        throw std::invalid_argument(
+            "qwen38-dense is a non-looped dense architecture and does not support --loop-passes");
+      }
       if (!ap.given("--max-ctx")) max_ctx = 8192;
       if (!ap.given("--prefill-chunk")) prefill_chunk = 256;
       // Phase 1 Qwen3.8 backend is text-only (ingine-serve defaults vision enabled for Inkling).
@@ -231,36 +236,61 @@ int main(int argc, char** argv) {
     std::unique_ptr<ingine::model::Generator> generator;
     if (fake) {
       const auto parsed_kv_mode = ingine::model::parse_kv_cache_mode(kv_cache_mode);
-      if (loop_passes != 3) {
+      if (is_qwen35) {
+        if (parsed_kv_mode != ingine::model::KvCacheMode::PerPass) {
+          throw std::invalid_argument("qwen38-dense does not support --kv-cache-mode " + kv_cache_mode +
+                                      " (only per_pass is supported)");
+        }
+        if (spec) throw std::invalid_argument("qwen38-dense does not support --spec");
+        if (max_batch > 1) throw std::invalid_argument("qwen38-dense Phase 1 requires --max-batch 1");
+        if (kv_fp8 || kv_q4 || kv_paged || kv_vram_mb != 0) {
+          throw std::invalid_argument("qwen38-dense does not support Inkling --kv-fp8/--kv-q4/--kv-paged options");
+        }
+        if (offload_vram_mb != 0 || park_mb > 0 || park_host_mb > 0) {
+          throw std::invalid_argument("qwen38-dense does not support Inkling offload/parking options");
+        }
+        if (!ablation.empty() || personas != nullptr || persona_probe_mode || !refusal_map.empty()) {
+          throw std::invalid_argument("qwen38-dense does not support Inkling ablation/persona hooks");
+        }
+        auto qfake = std::make_unique<ingine::engine::FakeGenerator>(
+            fmt.tokenizer(), "Qwen3.8-27B-NVFP4-fake", tokenizer_max_length(model_dir),
+            ingine::engine::FakeGenerator::Responder{}, fake_delay, /*loop_passes=*/1,
+            ingine::model::KvCacheMode::PerPass, /*allow_last_full=*/false);
+        qfake->set_model_family("qwen3_5");
+        qfake->set_supports_logit_masker(false);
+        qfake->set_supports_images(false);
+        generator = std::move(qfake);
+      } else {
+        if (loop_passes != 3) {
+          if (parsed_kv_mode == ingine::model::KvCacheMode::LastFull) {
+            throw std::invalid_argument("--loop-passes != 3 is not supported with --kv-cache-mode last_full");
+          }
+          if (spec) {
+            throw std::invalid_argument("--loop-passes != 3 is not supported with --spec (DSpark drafter requires 3 passes)");
+          }
+          if (!ablation.empty()) {
+            throw std::invalid_argument("--loop-passes != 3 is not supported with --ablation (48-visit ablation file)");
+          }
+          if (personas != nullptr || persona_probe_mode) {
+            throw std::invalid_argument("--loop-passes != 3 is not supported with persona hooks (fixed 48-visit hook ABI)");
+          }
+          if (max_batch > 1) {
+            throw std::invalid_argument("--loop-passes != 3 currently requires --max-batch 1");
+          }
+        }
         if (parsed_kv_mode == ingine::model::KvCacheMode::LastFull) {
-          throw std::invalid_argument("--loop-passes != 3 is not supported with --kv-cache-mode last_full");
+          if (spec) {
+            throw std::invalid_argument("--kv-cache-mode last_full cannot be combined with --spec (B=1 non-spec control)");
+          }
+          if (max_batch > 1) {
+            throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
+          }
         }
-        if (spec) {
-          throw std::invalid_argument("--loop-passes != 3 is not supported with --spec (DSpark drafter requires 3 passes)");
-        }
-        if (!ablation.empty()) {
-          throw std::invalid_argument("--loop-passes != 3 is not supported with --ablation (48-visit ablation file)");
-        }
-        if (personas != nullptr || persona_probe_mode) {
-          throw std::invalid_argument("--loop-passes != 3 is not supported with persona hooks (fixed 48-visit hook ABI)");
-        }
-        if (max_batch > 1) {
-          throw std::invalid_argument("--loop-passes != 3 currently requires --max-batch 1");
-        }
+        const bool fake_allow_last_full = (loop_passes == 3) && !spec && (max_batch <= 1);
+        generator = std::make_unique<ingine::engine::FakeGenerator>(
+            fmt.tokenizer(), "Inkling-2-Mini-fake", tokenizer_max_length(model_dir),
+            ingine::engine::FakeGenerator::Responder{}, fake_delay, loop_passes, parsed_kv_mode, fake_allow_last_full);
       }
-      if (parsed_kv_mode == ingine::model::KvCacheMode::LastFull) {
-        if (spec) {
-          throw std::invalid_argument("--kv-cache-mode last_full cannot be combined with --spec (B=1 non-spec control)");
-        }
-        if (max_batch > 1) {
-          throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
-        }
-      }
-      const bool fake_allow_last_full = (loop_passes == 3) && !spec && (max_batch <= 1);
-      generator = std::make_unique<ingine::engine::FakeGenerator>(
-          fmt.tokenizer(), is_qwen35 ? "Qwen3.8-27B-NVFP4-fake" : "Inkling-2-Mini-fake",
-          tokenizer_max_length(model_dir), ingine::engine::FakeGenerator::Responder{}, fake_delay, loop_passes,
-          parsed_kv_mode, fake_allow_last_full);
     } else {
 #ifdef INGINE_WITH_MODEL
       ingine::model::RuntimeOptions options;
@@ -303,6 +333,7 @@ int main(int argc, char** argv) {
       options.max_batch = max_batch;
       options.max_kv_tokens = max_kv_tokens;
       options.loop_passes = loop_passes;
+      options.loop_passes_explicit = loop_passes_explicit;
       options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
       options.refusal_map = refusal_map;
       generator = ingine::model::make_generator(options);

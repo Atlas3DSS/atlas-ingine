@@ -64,13 +64,18 @@ class FakeGenerator final : public model::Generator {
                                 std::span<const int32_t> stop_ids,
                                 const std::function<bool(std::span<const int32_t>)>& on_tokens,
                                 const model::PrefillCallback& on_prefill) override;
-  bool supports_images() const override { return true; }
+  bool supports_images() const override { return supports_images_; }
+  bool supports_logit_masker() const override { return supports_logit_masker_; }
+  std::string model_family() const override { return model_family_; }
   model::KvCacheMode kv_cache_mode() const override { return kv_cache_mode_; }
   std::vector<model::KvCacheMode> supported_kv_cache_modes() const override { return supported_kv_cache_modes_; }
   void set_kv_cache_mode(model::KvCacheMode mode);
   void set_supported_kv_cache_modes(std::vector<model::KvCacheMode> modes) {
     supported_kv_cache_modes_ = std::move(modes);
   }
+  void set_model_family(std::string family) { model_family_ = std::move(family); }
+  void set_supports_logit_masker(bool enabled) { supports_logit_masker_ = enabled; }
+  void set_supports_images(bool enabled) { supports_images_ = enabled; }
 
   void set_prefill_stats_hook(PrefillStatsFn hook);
   std::string echo(std::span<const int32_t> prompt_ids) const;
@@ -79,8 +84,11 @@ class FakeGenerator final : public model::Generator {
  private:
   const text::Tokenizer& tokenizer_;
   std::string model_id_;
+  std::string model_family_ = "inkling2";
   int max_model_len_;
   int loop_passes_;
+  bool supports_images_ = true;
+  bool supports_logit_masker_ = true;
   Responder responder_;
   double token_delay_;
   model::KvCacheMode kv_cache_mode_ = model::KvCacheMode::PerPass;

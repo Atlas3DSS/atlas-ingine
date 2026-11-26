@@ -180,6 +180,9 @@ model::GenerateStats FakeGenerator::generate(const model::Prompt& full_prompt, i
                                              const model::Sampling& sampling, std::span<const int32_t> stop_ids,
                                              const std::function<bool(std::span<const int32_t>)>& on_tokens,
                                              const model::PrefillCallback& on_prefill) {
+  if (sampling.logit_masker && !supports_logit_masker_) {
+    throw std::invalid_argument("this generator does not support token-level logit_masker constrained decoding");
+  }
   const std::span<const int32_t> prompt = full_prompt.ids;
   int image_tokens = 0;
   for (const model::PromptImage& image : full_prompt.images) image_tokens += image.tokens();
