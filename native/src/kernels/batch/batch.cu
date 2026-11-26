@@ -1244,6 +1244,30 @@ void dispatch_attn(const BatchedAttnKernelParams& kp, cudaStream_t stream) {
   CUDA_CHECK(cudaGetLastError());
 }
 
+
+__global__ void __launch_bounds__(128) p2p_allreduce2_kernel(float4* __restrict__ data, int n4, const float4* my_recv,
+                                                               float4* peer_recv, unsigned* my_flag, unsigned* peer_flag,
+                                                               unsigned* my_seq) {
+  const int b = blockIdx.x, per = (n4 + int(gridDim.x) - 1) / int(gridDim.x);
+  const int i0 = b * per, i1 = min(n4, i0 + per);
+  for (int i = i0 + int(threadIdx.x); i < i1; i += blockDim.x) peer_recv[i] = data[i];
+  __threadfence_system();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const unsigned seq = my_seq[b] + 1u;
+    my_seq[b] = seq;
+    *reinterpret_cast<volatile unsigned*>(peer_flag + b) = seq;
+    while (int(*reinterpret_cast<volatile unsigned*>(my_flag + b) - seq) < 0) __nanosleep(32);
+    __threadfence();
+  }
+  __syncthreads();
+  for (int i = i0 + int(threadIdx.x); i < i1; i += blockDim.x) {
+    const float4 r = __ldcg(my_recv + i);
+    float4 d = data[i];
+    d.x += r.x, d.y += r.y, d.z += r.z, d.w += r.w;
+    data[i] = d;
+  }
+}
 }  // namespace
 
 AttnWorkspaceLayout attn_workspace_layout(int B) {
@@ -2590,6 +2614,16 @@ void batched_verify_rollback(const BatchedVerifyStatePtrs& st, const BatchedVeri
   }
   // Separate post-grid launch guarantees every rollback block finished reading old slot_pos[s] before advancing!
   batched_advance_pos_by_kernel<<<(B + 63) / 64, 64, 0, stream>>>(slot_ids, commit_counts, B, st.slot_pos);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void p2p_allreduce2(float* data, int n, const P2pAllReduce2& ar, int slot, cudaStream_t stream) {
+  require(ar.active() && n % 4 == 0 && n <= ar.cap && slot >= 0 && slot < ar.slots, "p2p_allreduce2: bad call");
+  const std::size_t off = std::size_t(slot) * std::size_t(ar.cap);
+  const std::size_t foff = std::size_t(slot) * P2pAllReduce2::kBlocks;
+  p2p_allreduce2_kernel<<<P2pAllReduce2::kBlocks, 128, 0, stream>>>(
+      reinterpret_cast<float4*>(data), n / 4, reinterpret_cast<const float4*>(ar.my_recv + off),
+      reinterpret_cast<float4*>(ar.peer_recv + off), ar.my_flag + foff, ar.peer_flag + foff, ar.my_seq + foff);
   CUDA_CHECK(cudaGetLastError());
 }
 

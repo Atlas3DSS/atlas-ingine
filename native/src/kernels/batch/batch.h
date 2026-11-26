@@ -246,4 +246,20 @@ void batched_verify_rollback(const BatchedVerifyStatePtrs& st, const BatchedVeri
                              const std::int32_t* slot_w_limit, const std::int32_t* commit_counts, int B, int W,
                              cudaStream_t stream);
 
+// Two-GPU in-place FP32 all-reduce over CUDA peer access (TP2 decode): `data` [n] (n % 4 == 0, n <= cap) on this
+// rank; slot s of a ring of slots that both ranks use in the same order. Block b pushes its chunk into the peer's
+// slot, fences, raises the peer's flag (s, b) to the next sequence number, waits for its own, then adds the peer's
+// chunk: data = local + peer on both ranks (IEEE addition commutes: bit-identical on both).
+struct P2pAllReduce2 {
+  static constexpr int kBlocks = 8;
+  float* my_recv = nullptr;        // [slots][cap] on this device
+  float* peer_recv = nullptr;      // [slots][cap] on the peer
+  unsigned* my_flag = nullptr;     // [slots][kBlocks] on this device (the peer raises them)
+  unsigned* peer_flag = nullptr;   // [slots][kBlocks] on the peer
+  unsigned* my_seq = nullptr;      // [slots][kBlocks] on this device
+  int slots = 0, cap = 0;          // cap: floats per slot
+  bool active() const { return my_recv != nullptr; }
+};
+void p2p_allreduce2(float* data, int n, const P2pAllReduce2& ar, int slot, cudaStream_t stream);
+
 }  // namespace ingine::kernels::batch
