@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Hardware-aware atlas-ingine self-setup, GPU auto-tuner, and localhost Chat/API launcher.
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "atlas-setup: python3 is required (no extra pip packages needed)." >&2
+  exit 1
+fi
+exec python3 -B "$ROOT/scripts/atlas_setup.py" "$@"

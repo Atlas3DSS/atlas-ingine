@@ -4,8 +4,12 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export PATH="$ROOT/.tools/bin:$PATH"
 
+if [[ "${1:-}" == --auto ]]; then
+  shift
+  exec bash "$ROOT/atlas-setup" "$@"
+fi
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
-  printf 'Usage: bash setup.sh [--update]\n\nChoose 1 to install atlas-ingine (build tools and a private CUDA 13.4 toolkit, then build the\nmulti-arch sm_86/sm_89/sm_120a C++ server) and download the pinned Inkling-2-Mini checkpoint.\nChoose 2 to download or resume the model download.\nChoose 3 to start the server in the foreground with the manifest profile.\nChoose 4, or run bash setup.sh --update, to update this installer, rebuild the server (only\nwhat changed) and rerun the install steps; the model is downloaded again only when its\npinned revision changed (mismatching files are moved to <model folder>.previous-<time>/,\nnot deleted).\nChoose 5 to install the ingine command (start, stop, status, logs, update) as\n~/.local/bin/ingine.\n\nINGINE_MODEL_DIR reuses an existing download of the model (or an Elastic atlas-12g/atlas-10g\ncheckpoint). Serving requires Linux x86_64, an NVIDIA sm_86/sm_89/sm_120a GPU (RTX 3090 / 4090 /\n5090 / RTX PRO Blackwell) and an NVIDIA driver for CUDA 13 (580 or newer). On 24 GB GPUs,\nset INGINE_CTX=65536 in ~/.config/ingine/env. Allow about 20.2 GB for the model plus ~3 GB.\n'
+  printf 'Usage: bash setup.sh [--auto [atlas-setup args...] | --update]\n\nChoose 1 to install atlas-ingine (build tools and a private CUDA 13.4 toolkit, then build the\nmulti-arch sm_86/sm_89/sm_120a C++ server) and download the pinned Inkling-2-Mini checkpoint.\nChoose 2 to download or resume the model download.\nChoose 3 to start the server in the foreground with the manifest profile.\nChoose 4, or run bash setup.sh --update, to update this installer, rebuild the server (only\nwhat changed) and rerun the install steps; the model is downloaded again only when its\npinned revision changed (mismatching files are moved to <model folder>.previous-<time>/,\nnot deleted).\nChoose 5 to install the ingine command (start, stop, status, logs, update) as\n~/.local/bin/ingine.\nChoose 6, or run ./atlas-setup (bash setup.sh --auto), to open the hardware-aware GPU\nauto-tuner and localhost Multimodal Chat / OpenAI API launcher.\n\nINGINE_MODEL_DIR reuses an existing download of the model (or an Elastic atlas-12g/atlas-10g\ncheckpoint). Serving requires Linux x86_64, an NVIDIA sm_86/sm_89/sm_120a GPU (RTX 3090 / 4090 /\n5090 / RTX PRO Blackwell) and an NVIDIA driver for CUDA 13 (580 or newer). On 24 GB GPUs,\nset INGINE_CTX=65536 in ~/.config/ingine/env. Allow about 20.2 GB for the model plus ~3 GB.\n'
   exit 0
 fi
 # --update-continue is internal: after --update (or option 4) pulls the installer, the pulled
@@ -244,6 +248,7 @@ while true; do
   printf '  3) Start the server (Ctrl-C to stop)\n'
   printf '  4) Update to the latest version\n'
   printf '  5) Install the ingine command (~/.local/bin/ingine)\n'
+  printf '  6) Hardware-aware GPU auto-tuner & localhost Web UI (./atlas-setup)\n'
   printf '  0) Exit\n\n'
   printf 'Space: ~20.2 GB model files, plus ~3 GB software.\n'
   if ! read -r -p "Choose an option: " choice; then
@@ -281,7 +286,10 @@ while true; do
         printf '\nThe ingine command was not installed. Fix the error above, then choose 5 again.\n' >&2
       fi
       ;;
+    6)
+      exec bash "$ROOT/atlas-setup"
+      ;;
     0|q|Q) exit 0 ;;
-    *) echo "Choose 1, 2, 3, 4, 5, or 0." ;;
+    *) echo "Choose 1, 2, 3, 4, 5, 6, or 0." ;;
   esac
 done

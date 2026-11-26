@@ -342,24 +342,25 @@ Start the server on a 24 GB card (RTX 3090 / RTX 4090, 64K context with vision +
 
 Add `--no-vision` to save ~0.6 GiB VRAM on text-only workloads, or `--ablation /path/to/inkling-2-mini-abliterated.safetensors` to apply the optional abliteration patch (omitting `--ablation` serves the original model as `inkling-2-mini`).
 
-### Option B: One-line interactive installer (private CUDA 13.4 toolkit + model download)
+### Option B: Hardware-aware auto-tuner & interactive installer
+
+Launch the zero-dependency hardware-aware setup & GPU auto-tuner (detects GPU generation `sm_60`–`sm_120a`, VRAM, host RAM, disk, `iommu=pt`, and local checkpoints; computes exact flags and VRAM/download footprint; asks explicit permission before downloading weights or launching `ingine-serve`; includes a localhost Multimodal Chat UI and OpenAI API snippets):
+
+```bash
+git clone https://github.com/Atlas3DSS/atlas-ingine
+cd atlas-ingine
+./atlas-setup              # localhost Web UI (http://127.0.0.1:8088)
+./atlas-setup --plan       # print detected hardware + recommended flags without launching
+./atlas-setup --cli        # terminal-only fallback (add --yes to approve non-interactively)
+```
+
+Or use the one-line private CUDA 13.4 installer directly:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Atlas3DSS/atlas-ingine/main/get.sh | bash
 ```
 
-Or manually:
-
-```bash
-git clone https://github.com/Atlas3DSS/atlas-ingine
-cd atlas-ingine
-bash setup.sh
-```
-
-Choose **1** to install build tools, a private CUDA 13.4 toolkit, build `ingine-serve` (`sm_86;89;120a`), and download the
-pinned model from [satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine)
-(20.2 GB), then **5** to link `~/.local/bin/ingine`. On 24 GB GPUs (RTX 3090 / 4090), set `INGINE_CTX=65536` in
-`~/.config/ingine/env` (the default `262144` targets 32+ GB cards):
+Or manually via `bash setup.sh` (choose **1** to install build tools, a private CUDA 13.4 toolkit, build `ingine-serve` (`sm_86;89;120a`), and download the pinned model from [satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine) (20.2 GB); **5** to link `~/.local/bin/ingine`; **6** for `./atlas-setup`). On 24 GB GPUs (RTX 3090 / 4090), set `INGINE_CTX=65536` in `~/.config/ingine/env` (the default `262144` targets 32+ GB cards):
 
 ```bash
 mkdir -p ~/.config/ingine
