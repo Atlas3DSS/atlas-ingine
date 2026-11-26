@@ -34,6 +34,7 @@ enum class ModelFamily : std::uint8_t {
   Qwen3_5 = 2,
   DeepSeekV4 = 3,
   GlmFlash = 4,
+  Qwen4Exp = 5,
 };
 
 enum class CheckpointFormat : std::uint8_t {

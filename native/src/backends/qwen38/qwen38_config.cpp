@@ -96,6 +96,8 @@ const char* to_string(Qwen38LinearQuantKind quant) noexcept {
     case Qwen38LinearQuantKind::Bf16: return "bf16";
     case Qwen38LinearQuantKind::Fp8E4M3: return "fp8_e4m3";
     case Qwen38LinearQuantKind::Nvfp4: return "nvfp4";
+    case Qwen38LinearQuantKind::Atlas3: return "atlas3";
+    case Qwen38LinearQuantKind::Atlas2: return "atlas2";
     default: return "unknown";
   }
 }

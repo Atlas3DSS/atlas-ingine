@@ -28,6 +28,42 @@ ingine_add_test(
 )
 
 ingine_add_test(
+  NAME qwen4exp_phase0
+  SOURCES test_qwen4exp_phase0.cpp
+  LIBS ingine_qwen4exp_cpu ingine_engine
+  LABELS backend qwen4exp cpu
+  ORACLE
+  TIMEOUT 180
+)
+
+add_executable(qwen4exp_oracle_dump qwen4exp_oracle_dump.cpp)
+ingine_internal_includes(qwen4exp_oracle_dump)
+target_link_libraries(qwen4exp_oracle_dump PRIVATE ingine_qwen4exp_cpu ingine_engine nlohmann_json::nlohmann_json)
+target_compile_options(qwen4exp_oracle_dump PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${INGINE_ORACLE_FLAGS}>)
+
+if(INGINE_BACKEND STREQUAL "CUDA")
+  ingine_add_test(
+    NAME qwen4exp_cuda_ops
+    SOURCES test_qwen4exp_cuda_ops.cpp
+    LIBS ingine_qwen4exp_cuda ingine_qwen4exp_cpu ingine_core CUDA::cudart
+    LABELS backend qwen4exp gpu
+    GPU
+    ORACLE
+    TIMEOUT 180
+  )
+
+  ingine_add_test(
+    NAME qwen4exp_gpu_e2e
+    SOURCES test_qwen4exp_gpu_e2e.cpp
+    LIBS ingine_model ingine_qwen4exp_cuda ingine_qwen4exp_cpu ingine_core CUDA::cudart
+    LABELS backend qwen4exp gpu
+    GPU
+    ORACLE
+    TIMEOUT 300
+  )
+endif()
+
+ingine_add_test(
   NAME backend_multifamily_tokenizer
   SOURCES test_multifamily_tokenizer.cpp
   LIBS ingine_text nlohmann_json::nlohmann_json
@@ -105,4 +141,8 @@ if(INGINE_BACKEND STREQUAL "CUDA")
     GPU
     TIMEOUT 600
   )
+
+  add_executable(qwen38_elastic_eval test_qwen38_elastic_eval.cpp)
+  ingine_internal_includes(qwen38_elastic_eval)
+  target_link_libraries(qwen38_elastic_eval PRIVATE ingine_qwen38_cuda ingine_qwen38_cpu ingine_core ingine_text nlohmann_json::nlohmann_json)
 endif()

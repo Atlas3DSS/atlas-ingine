@@ -23,6 +23,8 @@ enum class Qwen38LinearQuantKind : std::uint8_t {
   Bf16 = 0,
   Fp8E4M3 = 1,
   Nvfp4 = 2,
+  Atlas3 = 3,
+  Atlas2 = 4,
 };
 
 const char* to_string(Qwen38LayerKind kind) noexcept;
