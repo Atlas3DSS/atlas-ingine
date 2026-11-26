@@ -30,6 +30,14 @@ main() {
     git clone --quiet "$repo" "$dir"
   fi
 
+  if [[ "${1:-}" == --auto ]]; then
+    cd "$dir"
+    if [[ -r /dev/tty ]] && { true </dev/tty; } 2>/dev/null; then
+      exec bash setup.sh "$@" </dev/tty
+    fi
+    exec bash setup.sh "$@"
+  fi
+
   # Piped into bash, standard input is this script, not the keyboard: give the menu the terminal.
   if ! { true </dev/tty; } 2>/dev/null; then
     printf 'No terminal for the menu. Run it yourself:\n  cd %q && bash setup.sh\n' "$dir"

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -19,6 +20,11 @@ ROOT = SCRIPTS_DIR.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import atlas_setup as mod  # noqa: E402
+
+
+def _write_test_shard(path: Path, tensor: str = "w") -> None:
+    header = json.dumps({tensor: {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}).encode()
+    path.write_bytes(len(header).to_bytes(8, "little") + header + bytes(1))
 
 
 def _make_hw(
@@ -157,7 +163,7 @@ class AutoTunerTests(unittest.TestCase):
             (ckpt / "config.json").write_text("{}", encoding="utf-8")
             (ckpt / "tokenizer.json").write_text("{}", encoding="utf-8")
             (ckpt / "chat_template.jinja").write_text("{{ messages }}", encoding="utf-8")
-            (ckpt / "model-00001-of-00001.safetensors").write_bytes(b"\x00" * 16)
+            _write_test_shard(ckpt / "model.safetensors")
             (ckpt / "mtp.safetensors").write_bytes(b"\x00" * 16)
             info = mod.inspect_checkpoint_dir(ckpt)
             self.assertIsNotNone(info)
@@ -181,7 +187,7 @@ class AutoTunerTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("tokenizer.json", missing)
             self.assertIn("chat_template.jinja", missing)
-            self.assertIn("model-*.safetensors", missing)
+            self.assertIn("model.safetensors or model.safetensors.index.json", missing)
 
             # Indexed checkpoint missing shard 2
             indexed = Path(td) / "Inkling-2-Mini-indexed"
@@ -201,6 +207,18 @@ class AutoTunerTests(unittest.TestCase):
             # Fake assets alone suffice for CPU --fake mode
             ok_fake, _ = mod.verify_checkpoint_dir(indexed, require_weights=False)
             self.assertTrue(ok_fake)
+
+    def test_empty_vram_and_truncated_shards(self) -> None:
+        gpu = mod.parse_nvidia_smi_csv("0, RTX 3090, 24576, 0, 8.6, 580.95, 0000:01:00.0")[0]
+        plan = mod.build_plan(_make_hw([gpu]), tier_id="small")
+        self.assertFalse(plan["hardware_ready"])
+        with tempfile.TemporaryDirectory() as tmp:
+            shard = Path(tmp) / "model.safetensors"
+            _write_test_shard(shard)
+            self.assertTrue(mod._shard_complete(shard, ["w"]))
+            self.assertFalse(mod._shard_complete(shard, ["other"]))
+            shard.write_bytes(shard.read_bytes()[:-1])
+            self.assertFalse(mod._shard_complete(shard, ["w"]))
 
     def test_free_vram_controls_sizing_and_per_gpu_dp_cap(self) -> None:
         # 24 GB card with only 9.5 GB free must size to free VRAM (--atlas-6g) and warn.
@@ -290,6 +308,53 @@ class AutoTunerTests(unittest.TestCase):
         valid_presets = {p["name"] for p in presets_json["configurePresets"]}
         for p_name in ("cpu-dev", "sm70", "legacy-fp16", "install"):
             self.assertIn(p_name, valid_presets)
+
+
+class SetupProcessTests(unittest.TestCase):
+    def test_approved_cpu_download_requests_only_displayed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = mod.AtlasSetupController()
+            plan = mod.build_plan(_make_hw([]), model_dir=tmp)
+            self.assertTrue(plan["needs_download"])
+            self.assertTrue(plan["download_files"])
+            with mock.patch.object(mod.shutil, "which", return_value="/bin/echo"):
+                controller.start_download(plan, approved=True)
+            try:
+                proc = controller._download_proc
+                self.assertIsNotNone(proc)
+                self.assertEqual(proc.wait(timeout=3), 0)
+                self.assertEqual(proc.args[3:-2], plan["download_files"])
+                with self.assertRaisesRegex(RuntimeError, "missing"):
+                    controller.launch_workers(dict(plan, binary_ready=True), approved=True)
+            finally:
+                controller.stop_all()
+
+    def test_worker_replacement_and_partial_launch_are_reaped(self) -> None:
+        controller = mod.AtlasSetupController()
+        worker = dict(worker_index=0, cuda_visible_devices="", host="127.0.0.1", port=1,
+                      base_url="http://127.0.0.1:1/v1", shell="test worker",
+                      argv=[sys.executable, "-c", "import time; time.sleep(30)"])
+        plan = dict(binary_ready=True, needs_download=False, workers=[worker])
+        children = []
+        popen = subprocess.Popen
+
+        def spawn(*args, **kwargs):
+            proc = popen(*args, **kwargs)
+            children.append(proc)
+            return proc
+
+        try:
+            with mock.patch.object(mod.subprocess, "Popen", side_effect=spawn):
+                controller.launch_workers(plan, approved=True)
+                self.assertIsNone(children[0].poll())
+                failing = dict(worker, worker_index=1, argv=["/does-not-exist/ingine-serve"])
+                with self.assertRaises(FileNotFoundError):
+                    controller.launch_workers(dict(plan, workers=[worker, failing]), approved=True)
+            self.assertEqual(len(children), 2)
+            self.assertTrue(all(proc.poll() is not None for proc in children))
+            self.assertEqual(controller._worker_procs, [])
+        finally:
+            controller.stop_all()
 
 
 class HttpUiAndProxyTests(unittest.TestCase):
@@ -383,6 +448,11 @@ class HttpUiAndProxyTests(unittest.TestCase):
         self.assertEqual(code, 403)
         self.assertIn("approval", err["error"].lower())
 
+        code, _ = self._req("/api/download", {"approved": "false", "tier": "large"})
+        self.assertEqual(code, 403)
+        code, _ = self._req("/api/launch", {"approved": True, "plan_id": "superseded", "tier": "large"})
+        self.assertEqual(code, 409)
+
         code, err = self._req("/api/launch", {"approved": False, "tier": "large"})
         self.assertEqual(code, 403)
         self.assertIn("approval", err["error"].lower())
@@ -431,6 +501,17 @@ class HttpUiAndProxyTests(unittest.TestCase):
 
 
 class CliSmokeTests(unittest.TestCase):
+    def test_bootstrap_forwards_auto_arguments_from_an_existing_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "-C", tmp, "init", "-q"], check=True)
+            subprocess.run(["git", "-C", tmp, "remote", "add", "origin",
+                            "https://github.com/Atlas3DSS/atlas-ingine"], check=True)
+            (Path(tmp) / "setup.sh").write_text("printf 'arg=%s\\n' \"$@\"\n")
+            result = subprocess.run(["bash", str(ROOT / "get.sh"), "--auto", "--plan"],
+                                    env={**os.environ, "INGINE_DIR": tmp}, stdin=subprocess.DEVNULL,
+                                    start_new_session=True, capture_output=True, text=True, check=True)
+            self.assertIn("arg=--auto\narg=--plan\n", result.stdout)
+
     def test_cli_plan_json_and_setup_help(self) -> None:
         res = subprocess.run(
             [sys.executable, "-B", str(SCRIPTS_DIR / "atlas_setup.py"), "--json"],

@@ -344,23 +344,15 @@ Add `--no-vision` to save ~0.6 GiB VRAM on text-only workloads, or `--ablation /
 
 ### Option B: Hardware-aware auto-tuner & interactive installer
 
-Launch the zero-dependency hardware-aware setup & GPU auto-tuner (detects GPU generation `sm_60`–`sm_120a`, VRAM, host RAM, disk, `iommu=pt`, and local checkpoints; computes exact flags and VRAM/download footprint; asks explicit permission before downloading weights or launching `ingine-serve`; includes a localhost Multimodal Chat UI and OpenAI API snippets):
+Open the local setup page to select a model, inspect the recommended server flags and estimated memory use, and approve the download or launch.
 
 ```bash
-git clone https://github.com/Atlas3DSS/atlas-ingine
-cd atlas-ingine
-./atlas-setup              # localhost Web UI (http://127.0.0.1:8088)
-./atlas-setup --plan       # print detected hardware + recommended flags without launching
-./atlas-setup --cli        # terminal-only fallback (add --yes to approve non-interactively)
+curl -fsSL https://raw.githubusercontent.com/Atlas3DSS/atlas-ingine/main/get.sh | bash -s -- --auto
 ```
 
-Or use the one-line private CUDA 13.4 installer directly:
+From an existing checkout, run `./atlas-setup` to open the page, `./atlas-setup --plan` to inspect the configuration, or `./atlas-setup --cli` to use the terminal. When a build is needed, the plan includes the command for the selected hardware.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Atlas3DSS/atlas-ingine/main/get.sh | bash
-```
-
-Or manually via `bash setup.sh` (choose **1** to install build tools, a private CUDA 13.4 toolkit, build `ingine-serve` (`sm_86;89;120a`), and download the pinned model from [satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine) (20.2 GB); **5** to link `~/.local/bin/ingine`; **6** for `./atlas-setup`). On 24 GB GPUs (RTX 3090 / 4090), set `INGINE_CTX=65536` in `~/.config/ingine/env` (the default `262144` targets 32+ GB cards):
+The `bash setup.sh` menu also offers the private CUDA 13.4 installer. Option **1** builds the server for SM86, SM89 and SM120a and downloads the pinned 20.2 GB checkpoint. Option **5** links `~/.local/bin/ingine`, and **6** opens the setup page. On a 24 GB RTX 3090 or 4090, set `INGINE_CTX=65536` in `~/.config/ingine/env`. The default of 262144 targets cards with at least 32 GB.
 
 ```bash
 mkdir -p ~/.config/ingine

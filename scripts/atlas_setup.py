@@ -279,11 +279,25 @@ FAKE_DOWNLOAD_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json",
 
 
 def _effective_vram_gb(gpu: dict[str, Any]) -> float:
-    free_gb = float(gpu.get("vram_free_gb") or 0.0)
     total_gb = float(gpu.get("vram_total_gb") or 0.0)
-    if free_gb > 0.0:
-        return min(free_gb, total_gb) if total_gb > 0.0 else free_gb
-    return total_gb
+    free = gpu.get("vram_free_gb")
+    return total_gb if free is None else min(total_gb, max(0.0, float(free)))
+
+
+def _shard_complete(path: Path, tensors: tuple[str, ...] | list[str] = ()) -> bool:
+    try:
+        with path.open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            header_len = int.from_bytes(stream.read(8), "little")
+            if not 0 < header_len <= min(size - 8, 100_000_000):
+                return False
+            header = json.loads(stream.read(header_len))
+        if not isinstance(header, dict) or any(name not in header for name in tensors):
+            return False
+        ends = [entry["data_offsets"][1] for name, entry in header.items() if name != "__metadata__"]
+        return bool(ends) and max(ends) == size - 8 - header_len
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return False
 
 
 def inspect_checkpoint_dir(path: Path) -> dict[str, Any] | None:
@@ -310,39 +324,25 @@ def inspect_checkpoint_dir(path: Path) -> dict[str, Any] | None:
         missing_files.append("chat_template.jinja")
 
     safetensors = sorted(path.glob("*.safetensors"))
-    primary_shards = [
-        f
-        for f in safetensors
-        if f.name != "mtp.safetensors"
-        and "abliterated" not in f.name.lower()
-        and f.is_file()
-        and f.stat().st_size > 0
-    ]
-
     index_path = path / "model.safetensors.index.json"
-    complete_weights = False
+    weight_errors = []
     if index_path.is_file():
         try:
-            idx_data = json.loads(index_path.read_text(encoding="utf-8"))
-            weight_map = idx_data.get("weight_map") if isinstance(idx_data, dict) else None
-            if isinstance(weight_map, dict) and weight_map:
-                expected_shards = sorted({str(v) for v in weight_map.values()})
-                missing_shards = [
-                    s for s in expected_shards if not ((path / s).is_file() and (path / s).stat().st_size > 0)
-                ]
-                if missing_shards:
-                    missing_files.extend(missing_shards)
-                else:
-                    complete_weights = True
-            else:
-                missing_files.append("model.safetensors.index.json (empty weight_map)")
-        except Exception:
-            missing_files.append("model.safetensors.index.json (unreadable JSON)")
-    else:
-        if primary_shards:
-            complete_weights = True
-        else:
-            missing_files.append("model-*.safetensors")
+            weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ValueError("empty weight_map")
+            shards: dict[str, list[str]] = {}
+            for tensor, shard in weight_map.items():
+                shards.setdefault(shard, []).append(tensor)
+            for shard, tensors in shards.items():
+                if not _shard_complete(path / shard, tensors):
+                    weight_errors.append(shard)
+        except (OSError, ValueError, TypeError, KeyError):
+            weight_errors.append("model.safetensors.index.json (invalid weight map)")
+    elif not _shard_complete(path / "model.safetensors"):
+        weight_errors.append("model.safetensors or model.safetensors.index.json")
+    complete_weights = not weight_errors
+    missing_files.extend(weight_errors)
 
     complete_fake_assets = has_tokenizer and has_chat_template and not any(
         m.startswith("config.json") for m in missing_files
@@ -351,7 +351,7 @@ def inspect_checkpoint_dir(path: Path) -> dict[str, Any] | None:
     if not safetensors and not complete_fake_assets:
         return None
 
-    total_bytes = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    total_bytes = sum(f.stat().st_size for f in safetensors if f.is_file())
     size_gb = round(total_bytes / 1e9, 2)
     has_mtp = (path / "mtp.safetensors").is_file() and (path / "mtp.safetensors").stat().st_size > 0
     has_ablation = (
@@ -388,7 +388,7 @@ def inspect_checkpoint_dir(path: Path) -> dict[str, Any] | None:
 def verify_checkpoint_dir(path: Path, *, require_weights: bool = True) -> tuple[bool, list[str]]:
     info = inspect_checkpoint_dir(path)
     if info is None:
-        return False, list(FAKE_REQUIRED_FILES) + (["model-*.safetensors"] if require_weights else [])
+        return False, list(FAKE_REQUIRED_FILES) + (["model.safetensors or model.safetensors.index.json"] if require_weights else [])
     if require_weights:
         ok = bool(info["usable_engine"])
     else:
@@ -413,7 +413,7 @@ def scan_local_checkpoints(root: Path = ROOT, extra_dirs: list[Path] | None = No
     if env_dir:
         add_dir(Path(env_dir))
 
-    search_roots = [root / "models", Path.home() / "models", Path("/mnt/nvme/models")]
+    search_roots = [root / "models", Path.home() / "models", Path("/mnt/nvme/models"), Path("/mnt/storage/models")]
     if extra_dirs:
         search_roots.extend(extra_dirs)
 
@@ -1307,6 +1307,9 @@ def build_plan(
         est_vram_gb = tuned["estimated_vram_gb"]
         est_ram_gb = tuned["estimated_ram_gb"]
 
+    hardware_ready = resolved_layout not in ("single", "batch") or _gpu_dp_slots(primary, tier, ctx) > 0
+    if not hardware_ready:
+        warnings.append(f"{primary['name']} has insufficient free GPU memory for {tier['label']}.")
     binary_path = workers[0]["binary_path"]
     binary_ready = all(w["binary_ready"] for w in workers)
     build_command = " && ".join(build_commands)
@@ -1316,6 +1319,7 @@ def build_plan(
         "ctx": ctx,
         "array_count": clamped_array,
         "requested_array": requested_array,
+        "hardware_ready": hardware_ready,
         "layout": resolved_layout,
         "tp_size": tp_size,
         "mode": mode,
@@ -1399,16 +1403,17 @@ class AtlasSetupController:
             tier = plan["tier"]
             dest = Path(plan["model_dir"])
             dest.parent.mkdir(parents=True, exist_ok=True)
+            files = plan.get("download_files", [])
             hf_bin = shutil.which("hf") or shutil.which("huggingface-cli")
             if hf_bin:
-                cmd = [hf_bin, "download", tier["repo_id"], "--local-dir", str(dest)]
+                cmd = [hf_bin, "download", tier["repo_id"], *files, "--local-dir", str(dest)]
             else:
                 cmd = [
                     sys.executable,
                     "-c",
                     (
                         "from huggingface_hub import snapshot_download; "
-                        f"snapshot_download(repo_id={tier['repo_id']!r}, local_dir={str(dest)!r})"
+                        f"snapshot_download(repo_id={tier['repo_id']!r}, local_dir={str(dest)!r}, allow_patterns={files or None!r})"
                     ),
                 ]
             self.log(f"Starting approved download: {' '.join(cmd)}")
@@ -1429,10 +1434,12 @@ class AtlasSetupController:
     def launch_workers(self, plan: dict[str, Any], *, approved: bool) -> dict[str, Any]:
         if approved is not True:
             raise PermissionError("Explicit user approval (approved=true) is required before launching ingine-serve.")
+        if not plan.get("hardware_ready", True):
+            raise RuntimeError("Insufficient free GPU memory for the selected plan.")
         if not plan.get("binary_ready"):
             raise RuntimeError(f"ingine-serve binary not built yet. Run: {plan['build_command']}")
-        if plan.get("needs_download") and plan.get("layout") != "cpu_fake":
-            raise RuntimeError(f"Model weights missing at {plan['model_dir']}. Approve download first.")
+        if plan.get("needs_download"):
+            raise RuntimeError(f"Model files missing at {plan['model_dir']}. Approve download first.")
 
         with self._lock:
             self.stop_workers()
@@ -1912,7 +1919,7 @@ function syncButtons() {
   const approved = document.getElementById('approveCheck').checked;
   const p = state.plan;
   document.getElementById('downloadBtn').disabled = !(approved && p && p.needs_download);
-  document.getElementById('launchBtn').disabled = !(approved && p && p.binary_ready && (!p.needs_download || p.layout === 'cpu_fake'));
+  document.getElementById('launchBtn').disabled = !(approved && p && p.hardware_ready && p.binary_ready && !p.needs_download);
 }
 
 function renderMode() {
@@ -2065,7 +2072,10 @@ document.getElementById('chatForm').addEventListener('submit', async (ev) => {
 """
 
 
-def make_http_handler(controller: AtlasSetupController, serve_host: str, serve_port: int) -> type[http.server.BaseHTTPRequestHandler]:
+def make_http_handler(
+    controller: AtlasSetupController, serve_host: str, serve_port: int, *,
+    defaults: dict[str, Any] | None = None, model_dir: str | None = None, kv_cache_mode: str = "per_pass",
+) -> type[http.server.BaseHTTPRequestHandler]:
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
             return
@@ -2120,7 +2130,7 @@ def make_http_handler(controller: AtlasSetupController, serve_host: str, serve_p
                         "hardware": hw,
                         "tiers": MODEL_TIERS,
                         "upcoming": UPCOMING_FAMILIES,
-                        "defaults": recommend_defaults(hw),
+                        "defaults": {**recommend_defaults(hw), **(defaults or {})},
                     },
                 )
                 return
@@ -2149,13 +2159,14 @@ def make_http_handler(controller: AtlasSetupController, serve_host: str, serve_p
                     array_count=req_body.get("array_count"),
                     layout=req_body.get("layout", "auto"),
                     mode=req_body.get("mode", "chat"),
-                    kv_cache_mode=req_body.get("kv_cache_mode", "per_pass"),
+                    kv_cache_mode=req_body.get("kv_cache_mode", kv_cache_mode),
+                    model_dir=model_dir,
                     host=serve_host,
                     port=serve_port,
                     vision=req_body.get("vision"),
                     spec=req_body.get("spec"),
                 )
-                actions = (plan["tier"]["repo_id"], plan["model_dir"], plan["needs_download"],
+                actions = (plan["tier"]["repo_id"], plan["model_dir"], plan["needs_download"], plan["download_files"], plan["hardware_ready"],
                            [(w["cuda_visible_devices"], w["argv"]) for w in plan["workers"]])
                 plan["plan_id"] = hashlib.sha256(json.dumps(actions).encode()).hexdigest()
                 return plan
@@ -2361,7 +2372,10 @@ def main(argv: list[str] | None = None) -> int:
             controller.stop_all()
         return 0
 
-    handler = make_http_handler(controller, args.host, args.port)
+    defaults = {key: getattr(args, key) for key in ("tier", "ctx", "array_count", "layout", "mode")
+                if getattr(args, key) is not None}
+    handler = make_http_handler(controller, args.host, args.port, defaults=defaults,
+                                model_dir=args.model_dir, kv_cache_mode=args.kv_cache_mode)
     httpd = http.server.ThreadingHTTPServer((args.ui_host, args.ui_port), handler)
     url = f"http://{args.ui_host}:{httpd.server_address[1]}/"
     print(f"Atlas Ingine Setup UI running at {url}  (Ctrl-C to stop)", flush=True)
