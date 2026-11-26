@@ -310,13 +310,23 @@ int main() {
     expect(dead_router_f32 == 28311552ull, "dead FP32 router duplicates == 27.00 MiB");
     expect(dead_ctrl_f32 + dead_router_f32 == 84934656ull, "--loop-bf16 reclaim == 81.00 MiB");
 
+    // Small-card Q5_K attention requantization is TP=1; derive global TP=1 projection rows from TOTAL_HEADS/TOTAL_KV_HEADS
+    // so byte-budget assertions remain exact even when tests are compiled with INGINE_TP_SIZE > 1.
+    const std::size_t tp1_sink_pad = (TOTAL_HEADS + 7) & ~7;
+    const std::size_t tp1_proj_sliding =
+        std::size_t(2 * TOTAL_HEADS * HEAD_DIM + TOTAL_HEADS * D_REL + tp1_sink_pad + 2 * TOTAL_KV_HEADS * HEAD_DIM);
+    const std::size_t tp1_proj_full = tp1_proj_sliding + std::size_t(2 * TOTAL_KV_HEADS * CONV_K);
+    if constexpr (TP_SIZE == 1) {
+      expect(tp1_proj_sliding == std::size_t(PROJ_ROWS_SLIDING) && tp1_proj_full == std::size_t(PROJ_ROWS_FULL),
+             "TP=1 global projection rows match PROJ_ROWS_{SLIDING,FULL}");
+    }
     const std::size_t attn_elems =
-        (20ull * PROJ_ROWS_SLIDING + 4ull * PROJ_ROWS_FULL) * HIDDEN + 24ull * HIDDEN * (TOTAL_HEADS * HEAD_DIM);
+        (20ull * tp1_proj_sliding + 4ull * tp1_proj_full) * HIDDEN + 24ull * HIDDEN * (TOTAL_HEADS * HEAD_DIM);
     const std::size_t attn_bf16_bytes = attn_elems * 2;
     const std::size_t attn_fp8_bytes =
-        attn_elems + (20ull * PROJ_ROWS_SLIDING + 4ull * PROJ_ROWS_FULL + 24ull * HIDDEN) * 4;
+        attn_elems + (20ull * tp1_proj_sliding + 4ull * tp1_proj_full + 24ull * HIDDEN) * 4;
     const std::size_t attn_q5k_bytes =
-        (20ull * PROJ_ROWS_SLIDING + 4ull * PROJ_ROWS_FULL) * row_bytes(HIDDEN) +
+        (20ull * tp1_proj_sliding + 4ull * tp1_proj_full) * row_bytes(HIDDEN) +
         24ull * HIDDEN * row_bytes(TOTAL_HEADS * HEAD_DIM);
     expect(attn_bf16_bytes == 1292009472ull, "wproj+wo BF16 == 1232.16 MiB");
     expect(attn_fp8_bytes == 647052544ull, "wproj+wo FP8 == 617.08 MiB");
@@ -324,7 +334,7 @@ int main() {
     const double payload_red = 1.0 - double(kBlockBytes) / double(kBlockElems);
     expect(std::fabs(payload_red - 0.3125) < 1e-12, "Q5_K packed payload reduction vs FP8 == 31.25%");
     const std::size_t wscratch_bytes =
-        std::max(std::size_t(PROJ_ROWS_FULL) * HIDDEN, std::size_t(HIDDEN) * TOTAL_HEADS * HEAD_DIM) * 2;
+        std::max(tp1_proj_full * HIDDEN, std::size_t(HIDDEN) * TOTAL_HEADS * HEAD_DIM) * 2;
     expect(wscratch_bytes == 39923712ull, "Prefiller::wscratch_ == 38.07 MiB");
   }
 
