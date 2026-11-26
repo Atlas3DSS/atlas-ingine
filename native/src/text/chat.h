@@ -199,6 +199,10 @@ class ChatFormat {
   // (a few conversations): only the text after the last added token of the shared rendered prefix is encoded.
   RenderedPrompt render(const nlohmann::ordered_json& messages, const nlohmann::ordered_json& tools,
                         const ChatOptions& options) const;
+  // Renders only the leading system-prompt token prefix that matches Turn-1 chat requests carrying the same
+  // leading system message (stops before Inkling's effort block and before Qwen3.5's user turn). Throws ChatError
+  // if `system_prompt` is empty/whitespace-only or cannot produce a valid system block.
+  RenderedPrompt render_system_prefix(std::string_view system_prompt, const ChatOptions& options = {}) const;
   // Forget the cached renders (shared by copies of this ChatFormat): the next render tokenises from scratch.
   void clear_render_cache() const;
   // Snapshot of the CPU RenderCache occupancy and approximate heap bytes (for profiling).

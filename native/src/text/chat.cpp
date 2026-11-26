@@ -584,6 +584,51 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
   return prompt;
 }
 
+RenderedPrompt ChatFormat::render_system_prefix(std::string_view system_prompt, const ChatOptions& options) const {
+  if (system_prompt.find_first_not_of(" \t\r\n") == std::string_view::npos) {
+    throw ChatError("warm-start system prompt must contain non-whitespace text", "warm_start_prompt");
+  }
+  const Json msgs = Json::array(
+      {{{"role", "system"}, {"content", std::string(system_prompt)}}, {{"role", "user"}, {"content", ""}}});
+  RenderedPrompt full = render(msgs, nullptr, options);
+
+  std::size_t prefix_end = 0;
+  if (data_->kind == ChatFormatKind::Inkling2) {
+    // Capture strictly the first <|message_system|> ... <|end_message|> block (before the effort block)
+    // so Turn-1 requests match regardless of reasoning_effort or enable_thinking.
+    if (!full.ids.empty() && full.ids[0] == data_->message_system) {
+      std::size_t pos = 1;
+      while (pos < full.ids.size() && full.ids[pos] != data_->end_message) ++pos;
+      if (pos < full.ids.size() && full.ids[pos] == data_->end_message) {
+        prefix_end = pos + 1;
+      }
+    }
+  } else if (data_->kind == ChatFormatKind::Qwen3_5) {
+    // Capture the leading <|im_start|>system\n...<|im_end|>\n block strictly before the user turn's <|im_start|>.
+    if (!full.ids.empty() && full.ids[0] == data_->im_start) {
+      std::size_t pos = 1;
+      while (pos < full.ids.size() && full.ids[pos] != data_->im_end) ++pos;
+      if (pos < full.ids.size() && full.ids[pos] == data_->im_end) {
+        ++pos;
+        while (pos < full.ids.size() && full.ids[pos] != data_->im_start) ++pos;
+        if (pos < full.ids.size() && full.ids[pos] == data_->im_start) {
+          prefix_end = pos;
+        }
+      }
+    }
+  }
+  if (prefix_end == 0 || prefix_end >= full.ids.size()) {
+    throw ChatError("chat template did not emit a reusable leading system prefix", "warm_start_prompt");
+  }
+
+  RenderedPrompt out;
+  out.ids.assign(full.ids.begin(), full.ids.begin() + static_cast<std::ptrdiff_t>(prefix_end));
+  out.text = data_->tokenizer.decode_lossy(out.ids);
+  out.stats = full.stats;
+  out.root_prefix_tokens = int(out.ids.size());
+  return out;
+}
+
 StreamParser ChatFormat::parser(std::span<const int32_t> prefill_ids, std::vector<std::string> stop,
                                 std::function<std::string()> id_factory) const {
   StreamParser p(data_, std::move(stop), std::move(id_factory));

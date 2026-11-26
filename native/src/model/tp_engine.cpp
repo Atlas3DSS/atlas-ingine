@@ -1580,6 +1580,9 @@ class TpBatchGenerator final : public Generator {
     return options_.ablation.empty() ? "inkling-2-mini" : "inkling-2-mini-abliterated";
   }
   int max_model_len() const override { return options_.max_ctx; }
+  GenerateStats warm_start(const Prompt& /*prompt*/, const Sampling& /*sampling*/) override {
+    throw std::invalid_argument("warm_start is not supported by TP4 generators (no prefix cache)");
+  }
   bool supports_images() const override { return false; }
   int max_batch_size() const override { return options_.max_batch; }
 
@@ -2217,6 +2220,9 @@ class TpSpecGenerator final : public Generator {
     return options_.ablation.empty() ? "inkling-2-mini" : "inkling-2-mini-abliterated";
   }
   int max_model_len() const override { return options_.max_ctx; }
+  GenerateStats warm_start(const Prompt& /*prompt*/, const Sampling& /*sampling*/) override {
+    throw std::invalid_argument("warm_start is not supported by TP4 generators (no prefix cache)");
+  }
   bool supports_images() const override { return false; }
 
   std::string offload_summary() const override {

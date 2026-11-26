@@ -297,6 +297,11 @@ class Generator {
     if (on_prefill) on_prefill(stats);
     return stats;
   }
+  // Pre-prefills `prompt` into the backend prefix cache at startup without emitting output tokens (#887).
+  // Defaults fail-closed to unsupported so generators without a verified prefix cache cannot advertise warm_start=true.
+  virtual GenerateStats warm_start(const Prompt& /*prompt*/, const Sampling& /*sampling*/) {
+    throw std::invalid_argument("warm_start is not supported by this generator backend (no prefix cache)");
+  }
   virtual bool supports_images() const { return false; }
   virtual bool supports_logit_masker() const { return true; }
   virtual std::string model_family() const { return "inkling2"; }

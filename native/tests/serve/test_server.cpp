@@ -340,7 +340,8 @@ void test_models_and_health() {
   CHECK(h["status"] == "ok" && h["model"] == "inkling-test" && h["loop_passes"] == 3 &&
         h["kv_cache_mode"] == "per_pass" &&
         h["supported_kv_cache_modes"] == Json::array({"per_pass", "last_full"}) &&
-        h["kv_cache_mode_mutable"] == false && h["waiting"] == 0 && h["running"] == false && h["max_queue"] == 4);
+        h["kv_cache_mode_mutable"] == false && h["warm_start"] == false && h["warm_start_tokens"] == 0 &&
+        h["waiting"] == 0 && h["running"] == false && h["max_queue"] == 4);
   CHECK(request(s->port(), "GET", "/health/").status == 200);
   Response nope = request(s->port(), "GET", "/nope");
   CHECK(nope.status == 404 && Json::parse(nope.body)["error"]["type"] == "not_found_error");
@@ -1956,6 +1957,232 @@ void test_loopcd_advertisement() {
   }
 }
 
+void test_warm_start_system_prompt() {
+  const std::string sys_prompt = "You are a concise, accurate systems engineering assistant.";
+
+  // 1. Unset baseline: warm_start=false, warm_start_tokens=0, zero warm_start calls, Turn-1 cached_tokens=0.
+  {
+    FakeGenerator gen(g_fmt->tokenizer(), "inkling-ws-off", 1 << 20);
+    ingine::serve::ServerOptions opts;
+    opts.model_id = "inkling-ws-off";
+    ingine::serve::ChatServer srv(gen, *g_fmt, opts);
+    CHECK(srv.bind("127.0.0.1", 0));
+    srv.start();
+    CHECK(gen.warm_start_calls().empty());
+    const Json h = health(srv.port());
+    CHECK(h["warm_start"] == false && h["warm_start_tokens"] == 0);
+    const Json body = {
+        {"model", "inkling-ws-off"},
+        {"messages", Json::array({{{"role", "system"}, {"content", sys_prompt}}, {{"role", "user"}, {"content", "Hi"}}})},
+        {"max_tokens", 16}};
+    const Response r = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(body));
+    CHECK(r.status == 200);
+    CHECK(Json::parse(r.body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+    const Json abody = {{"model", "inkling-ws-off"},
+                        {"max_tokens", 16},
+                        {"system", sys_prompt},
+                        {"messages", Json::array({{{"role", "user"}, {"content", "Hi"}}})}};
+    const Response ra = request(srv.port(), "POST", "/v1/messages", ingine::serve::dump(abody));
+    CHECK(ra.status == 200);
+    CHECK(Json::parse(ra.body)["usage"]["cache_read_input_tokens"] == 0);
+    srv.stop();
+  }
+
+  // 2. Warm-start enabled (single trusted scope): /health reports warm_start=true + tokens, Turn-1 hits across
+  //    default effort, explicit reasoning_effort="medium", and enable_thinking=false; mismatched system misses;
+  //    Authorization header still fails closed to cached_tokens=0.
+  {
+    FakeGenerator gen(g_fmt->tokenizer(), "inkling-ws-on", 1 << 20);
+    ingine::serve::ServerOptions opts;
+    opts.model_id = "inkling-ws-on";
+    opts.warm_start_prompt = sys_prompt;
+    ingine::serve::ChatServer srv(gen, *g_fmt, opts);
+    CHECK(srv.bind("127.0.0.1", 0));
+    srv.start();
+    CHECK(gen.warm_start_calls().size() == 1);
+    const Json h = health(srv.port());
+    CHECK(h["warm_start"] == true);
+    const int ws_toks = h["warm_start_tokens"].get<int>();
+    CHECK(ws_toks > 0 && ws_toks == int(gen.warm_start_calls().front().prompt_ids.size()));
+
+    // Turn-1 hit (default effort)
+    const Json b1 = {
+        {"model", "inkling-ws-on"},
+        {"messages", Json::array({{{"role", "system"}, {"content", sys_prompt}}, {{"role", "user"}, {"content", "Explain RAII."}}})},
+        {"max_tokens", 16}};
+    const Response r1 = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(b1));
+    CHECK(r1.status == 200);
+    CHECK(Json::parse(r1.body)["usage"]["prompt_tokens_details"]["cached_tokens"] == ws_toks);
+
+    // Turn-1 hit with different reasoning_effort and enable_thinking=false
+    Json b_med = b1;
+    b_med["reasoning_effort"] = "medium";
+    const Response r_med = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(b_med));
+    CHECK(r_med.status == 200);
+    CHECK(Json::parse(r_med.body)["usage"]["prompt_tokens_details"]["cached_tokens"] == ws_toks);
+
+    Json b_nt = b1;
+    b_nt["chat_template_kwargs"] = {{"enable_thinking", false}};
+    const Response r_nt = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(b_nt));
+    CHECK(r_nt.status == 200);
+    CHECK(Json::parse(r_nt.body)["usage"]["prompt_tokens_details"]["cached_tokens"] == ws_toks);
+
+    // Anthropic /v1/messages Turn-1 with matching system prompt also hits the warmed prefix cache.
+    const Json ab1 = {{"model", "inkling-ws-on"},
+                      {"max_tokens", 16},
+                      {"system", sys_prompt},
+                      {"messages", Json::array({{{"role", "user"}, {"content", "Explain RAII."}}})}};
+    const Response ra1 = request(srv.port(), "POST", "/v1/messages", ingine::serve::dump(ab1));
+    CHECK(ra1.status == 200);
+    CHECK(Json::parse(ra1.body)["usage"]["cache_read_input_tokens"] == ws_toks);
+
+    // Different system prompt misses
+    const Json b_diff = {
+        {"model", "inkling-ws-on"},
+        {"messages", Json::array({{{"role", "system"}, {"content", "Different persona."}}, {{"role", "user"}, {"content", "Hi"}}})},
+        {"max_tokens", 16}};
+    const Response r_diff = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(b_diff));
+    CHECK(r_diff.status == 200);
+    CHECK(Json::parse(r_diff.body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+
+    // Fail-closed Authorization isolation still holds on warm-started server
+    const Response r_auth = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(b1),
+                                    {{"Authorization", "Bearer tenant-token"}});
+    CHECK(r_auth.status == 200);
+    CHECK(Json::parse(r_auth.body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+    srv.stop();
+  }
+
+  // 3. Namespace-scoped warm-start: hits matching tenant (even with Authorization), misses other tenant / missing header.
+  {
+    FakeGenerator gen(g_fmt->tokenizer(), "inkling-ws-ns", 1 << 20);
+    ingine::serve::ServerOptions opts;
+    opts.model_id = "inkling-ws-ns";
+    opts.cache_namespace_header = "X-Tenant";
+    opts.warm_start_prompt = sys_prompt;
+    opts.warm_start_namespace = "team-a";
+    ingine::serve::ChatServer srv(gen, *g_fmt, opts);
+    CHECK(srv.bind("127.0.0.1", 0));
+    srv.start();
+    const int ws_toks = health(srv.port())["warm_start_tokens"].get<int>();
+    CHECK(health(srv.port())["warm_start"] == true && ws_toks > 0);
+    const Json b = {
+        {"model", "inkling-ws-ns"},
+        {"messages", Json::array({{{"role", "system"}, {"content", sys_prompt}}, {{"role", "user"}, {"content", "Hi"}}})},
+        {"max_tokens", 16}};
+    const Response r_hit = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(b),
+                                   {{"X-Tenant", "team-a"}, {"Authorization", "Bearer none"}});
+    CHECK(r_hit.status == 200);
+    CHECK(Json::parse(r_hit.body)["usage"]["prompt_tokens_details"]["cached_tokens"] == ws_toks);
+
+    const Response r_other = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(b),
+                                     {{"X-Tenant", "team-b"}});
+    CHECK(r_other.status == 200);
+    CHECK(Json::parse(r_other.body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+
+    const Response r_missing = request(srv.port(), "POST", "/v1/chat/completions", ingine::serve::dump(b));
+    CHECK(r_missing.status == 200);
+    CHECK(Json::parse(r_missing.body)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0);
+    srv.stop();
+  }
+
+  // 4. Fail-closed invalid warm-start configurations throw in ChatServer constructor.
+  auto expect_throws = [&](ingine::serve::ServerOptions bad, int max_len = 1 << 20) {
+    FakeGenerator gen(g_fmt->tokenizer(), "inkling-ws-bad", max_len);
+    bool threw = false;
+    try {
+      ingine::serve::ChatServer srv(gen, *g_fmt, std::move(bad));
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw);
+  };
+  {
+    ingine::serve::ServerOptions o;
+    o.warm_start_prompt = "   \n ";
+    expect_throws(o);
+  }
+  {
+    ingine::serve::ServerOptions o;
+    o.cache_namespace_header = "X-Tenant";
+    o.warm_start_prompt = sys_prompt;
+    expect_throws(o);  // missing warm_start_namespace
+  }
+  {
+    ingine::serve::ServerOptions o;
+    o.warm_start_prompt = sys_prompt;
+    o.warm_start_namespace = "team-a";
+    expect_throws(o);  // warm_start_namespace without cache_namespace_header
+  }
+  {
+    ingine::serve::ServerOptions o;
+    o.cache_namespace_header = "X-Tenant";
+    o.warm_start_namespace = "team-a";
+    expect_throws(o);  // warm_start_namespace without warm_start_prompt
+  }
+  {
+    ingine::serve::ServerOptions o;
+    o.warm_start_prompt = sys_prompt;
+    expect_throws(o, /*max_len=*/4);  // exceeds max_model_len
+  }
+
+  // 5. Ordinary Generator subclass with no prefix cache (inherits default Generator::warm_start):
+  //    must fail closed when warm_start_prompt is configured and never advertise warm_start=true,
+  //    while continuing to serve cleanly with warm_start=false when unset.
+  {
+    class NoCacheCpuGenerator final : public ingine::model::Generator {
+     public:
+      explicit NoCacheCpuGenerator(const ingine::text::Tokenizer& tok) : tok_(tok) {}
+      std::string model_id() const override { return "nocache-cpu-test"; }
+      int max_model_len() const override { return 4096; }
+      ingine::model::GenerateStats generate(
+          std::span<const int32_t> prompt, int max_new_tokens, const ingine::model::Sampling&,
+          std::span<const int32_t>,
+          const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
+        const std::vector<int32_t> out = tok_.encode(
+            "<|message_model|><|content_text|>ok<|end_message|><|content_model_end_sampling|>", /*special=*/true);
+        const std::size_t lim = std::min(out.size(), std::size_t(std::max(max_new_tokens, 0)));
+        for (std::size_t i = 0; i < lim; ++i) {
+          if (!on_tokens(std::span<const int32_t>(&out[i], 1))) break;
+        }
+        ingine::model::GenerateStats st;
+        st.prompt_tokens = int(prompt.size());
+        st.generated_tokens = int(lim);
+        st.reuse = ingine::model::Reuse::None;
+        st.reused_tokens = 0;
+        return st;
+      }
+
+     private:
+      const ingine::text::Tokenizer& tok_;
+    };
+
+    NoCacheCpuGenerator nc_gen(g_fmt->tokenizer());
+    {
+      ingine::serve::ServerOptions o;
+      o.model_id = "nocache-cpu-test";
+      o.warm_start_prompt = sys_prompt;
+      bool threw = false;
+      try {
+        ingine::serve::ChatServer srv(nc_gen, *g_fmt, std::move(o));
+      } catch (const std::invalid_argument&) {
+        threw = true;
+      }
+      CHECK(threw);
+    }
+    {
+      ingine::serve::ServerOptions o;
+      o.model_id = "nocache-cpu-test";
+      ingine::serve::ChatServer srv(nc_gen, *g_fmt, std::move(o));
+      CHECK(srv.bind("127.0.0.1", 0));
+      srv.start();
+      const Json h = health(srv.port());
+      CHECK(h["warm_start"] == false && h["warm_start_tokens"] == 0);
+      srv.stop();
+    }
+  }
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -1996,6 +2223,7 @@ int main() {
       {"kv_cache_mode_advertisement", test_kv_cache_mode_advertisement},
       {"anthropic_messages_api", test_anthropic_messages_api},
       {"loopcd_advertisement", test_loopcd_advertisement},
+      {"warm_start_system_prompt", test_warm_start_system_prompt},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {
