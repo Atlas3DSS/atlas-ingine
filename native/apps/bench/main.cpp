@@ -337,7 +337,6 @@ int main(int argc, char** argv) {
     options.dump_router_stats = dump_router_stats;
     options.max_batch = resolved_max_batch;
     options.max_kv_tokens = max_kv_tokens;
-    options.prefix_cache = !no_prefix_cache;
     options.loop_passes = loop_passes;
     options.vram_limit_mb = vram_limit_mb;
     auto gen = ingine::model::make_generator(options);

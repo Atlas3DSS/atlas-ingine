@@ -1172,6 +1172,10 @@ class BatchGenerator final : public Generator {
       : options_(options), sampled_host_(std::size_t(std::max(1, options.max_batch)) * sizeof(std::int32_t)) {
     if (options.max_batch < 1) throw std::invalid_argument("max_batch must be >= 1");
     if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be >= 16");
+    if (options.kv_cache_mode != KvCacheMode::PerPass)
+      throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
+    if (options.loop_passes != PASSES)
+      throw std::invalid_argument("--loop-passes != 3 currently requires --max-batch 1");
     if (options.kv_q4 || options.kv_paged || options.kv_vram_mb > 0)
       throw std::invalid_argument("continuous batching (--max-batch > 1) supports BF16 or --kv-fp8 KV cache (not --kv-q4/--kv-paged)");
     if (options.offload_vram_mb > 0)
@@ -1212,6 +1216,10 @@ class BatchGenerator final : public Generator {
         sampled_host_(std::size_t(std::max(1, options.max_batch)) * sizeof(std::int32_t)) {
     if (options.max_batch < 1) throw std::invalid_argument("max_batch must be >= 1");
     if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be >= 16");
+    if (options.kv_cache_mode != KvCacheMode::PerPass)
+      throw std::invalid_argument("--kv-cache-mode last_full requires --max-batch 1 (B=1 qualification control)");
+    if (options.loop_passes != PASSES)
+      throw std::invalid_argument("--loop-passes != 3 currently requires --max-batch 1");
     if (options.kv_q4 || options.kv_paged || options.kv_vram_mb > 0)
       throw std::invalid_argument("continuous batching (--max-batch > 1) supports BF16 or --kv-fp8 KV cache (not --kv-q4/--kv-paged)");
     if (options.offload_vram_mb > 0)
@@ -1800,7 +1808,9 @@ class BatchGenerator final : public Generator {
       const SlotMeta& meta = slot_meta_[s];
 
       int lead = 0;
-      if (meta.forced_idx < meta.forced.size() && options_.spec_threshold <= 0.f) {
+      if (meta.logit_masker != nullptr) {
+        lead = 0;  // Constrained decoding (#830 JSON/JSON-Schema FSM): 1-token-at-a-time masked sampling.
+      } else if (meta.forced_idx < meta.forced.size() && options_.spec_threshold <= 0.f) {
         lead = kd::GAMMA;
       } else {
         while (lead < kd::GAMMA && h_conf[std::size_t(b) * kd::GAMMA + lead] > options_.spec_threshold) ++lead;
@@ -1865,7 +1875,8 @@ class BatchGenerator final : public Generator {
     const head::BannedTokens& b0 = slot_meta_[slot_ids[0]].params.banned;
     for (int b = 0; b < B; ++b) {
       const SlotMeta& meta = slot_meta_[slot_ids[std::size_t(b)]];
-      if (meta.params.temperature > 0.f || !same_banned(meta.params.banned, b0) || meta.forced_idx < meta.forced.size()) {
+      if (meta.params.temperature > 0.f || !same_banned(meta.params.banned, b0) || meta.forced_idx < meta.forced.size() ||
+          meta.logit_masker != nullptr) {
         all_greedy_uniform = false;
         break;
       }
@@ -1905,8 +1916,8 @@ class BatchGenerator final : public Generator {
           if (meta.forced_idx + std::size_t(acc) < meta.forced.size()) {
             next_tok = meta.forced[meta.forced_idx + std::size_t(acc)];
           } else {
-            head::argmax(slot_logits + std::size_t(acc) * UNPADDED_VOCAB, 1, UNPADDED_VOCAB, UNPADDED_VOCAB,
-                         ascr.target_argmax, stream_, meta.params.banned);
+            const float* row_logits = apply_slot_mask(slot_logits + std::size_t(acc) * UNPADDED_VOCAB, meta.logit_masker);
+            head::argmax(row_logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, ascr.target_argmax, stream_, meta.params.banned);
             CUDA_CHECK(cudaMemcpyAsync(&next_tok, ascr.target_argmax, sizeof(std::int32_t), cudaMemcpyDeviceToHost,
                                        stream_));
             CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -1915,6 +1926,18 @@ class BatchGenerator final : public Generator {
           h_next[std::size_t(b)] = next_tok;
           h_commit[std::size_t(b)] = acc + 1;
           meta.forced_idx = std::min(meta.forced.size(), meta.forced_idx + std::size_t(acc + 1));
+        } else if (meta.logit_masker != nullptr) {
+          // Constrained decoding (#830): wl == 1; apply bitmask before greedy/sampled selection.
+          std::int32_t next_tok = 0;
+          const float* row_logits = apply_slot_mask(slot_logits, meta.logit_masker);
+          head::sample(row_logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, meta.params, meta.rng, ascr.target_argmax,
+                       stream_);
+          CUDA_CHECK(cudaMemcpyAsync(&next_tok, ascr.target_argmax, sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                     stream_));
+          CUDA_CHECK(cudaStreamSynchronize(stream_));
+          h_acc[std::size_t(b)] = 0;
+          h_next[std::size_t(b)] = next_tok;
+          h_commit[std::size_t(b)] = 1;
         } else if (meta.params.temperature <= 0.f) {
           head::argmax(slot_logits, wl, UNPADDED_VOCAB, UNPADDED_VOCAB, ascr.target_argmax, stream_, meta.params.banned);
           std::int32_t h_targ[kd::BLOCK] = {};
@@ -2037,6 +2060,9 @@ class BatchGenerator final : public Generator {
         tr.commit = commit;
       }
 
+      if (meta.logit_masker) {
+        for (int k = 0; k < res.count; ++k) meta.logit_masker->advance(res.tokens[k]);
+      }
       drafter_->note_tokens_slot(s, std::span<const std::int32_t>(res.tokens, std::size_t(res.count)));
     }
     if (trace_cfg.on_step) trace_cfg.on_step(traces);
@@ -2123,6 +2149,8 @@ class BatchGenerator final : public Generator {
     id.act_dtype = INGINE_ACT_FP16 ? 1u : 0u;
     id.dense_fp8 = options_.dense_fp8;
     id.kv_format = options_.kv_fp8 ? 1u : 0u;
+    id.kv_cache_mode = static_cast<std::uint32_t>(options_.kv_cache_mode);
+    id.loop_passes = options_.loop_passes;
     id.max_ctx = options_.max_ctx;
     id.prefill_chunk = prefill_chunk_;
     id.spec_enabled = options_.spec;
