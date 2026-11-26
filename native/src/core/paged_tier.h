@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/host_memory.h"
+#include "core/lru_index.h"
 
 #include <cuda_runtime.h>
 
@@ -128,7 +129,7 @@ class PinnedBounceRing {
 // (e.g. (layer << 8) | expert for MoE, or (visit << 20) | page_id for paged KV).
 class VramLruSlab {
  public:
-  static constexpr std::uint64_t kEmptyKey = std::numeric_limits<std::uint64_t>::max();
+  static constexpr std::uint64_t kEmptyKey = LruSlotIndex::kEmptyKey;
 
   struct AcquireResult {
     int slot = -1;
@@ -141,19 +142,23 @@ class VramLruSlab {
   VramLruSlab() = default;
   VramLruSlab(int num_slots, std::size_t slot_bytes);
 
-  [[nodiscard]] int capacity() const noexcept { return int(slots_.size()); }
+  [[nodiscard]] int capacity() const noexcept { return lru_.capacity(); }
   [[nodiscard]] std::size_t slot_bytes() const noexcept { return slot_bytes_; }
   [[nodiscard]] std::size_t total_bytes() const noexcept { return storage_.bytes; }
 
   // Look up `key` without mutating residency; returns slot index or -1.
   [[nodiscard]] int find(std::uint64_t key) const noexcept;
-  [[nodiscard]] std::uint8_t* slot_ptr(int slot) const noexcept { return slots_[slot].vram_ptr; }
+  [[nodiscard]] std::uint8_t* slot_ptr(int slot) const noexcept { return slot_ptrs_[std::size_t(slot)]; }
 
   // Pin an already-resident key for the current generation `pin_gen` so it cannot be evicted
   // by other acquires in the same step/visit. When `priority` is true, boosts LRU recency by
   // slab capacity so high-reuse (e.g. 3x looped) entries survive single-pass layer sweeps.
   // Returns slot index on hit, -1 on miss.
   int touch_and_pin(std::uint64_t key, std::uint64_t pin_gen, bool priority = false) noexcept;
+
+  // Evict/invalidate `key` from the staging LRU without disturbing its pin_gen guard (used when an
+  // expert is promoted into the permanent HOT tier so subsequent demotion cannot hit a stale LRU key).
+  bool erase(std::uint64_t key) noexcept;
 
   // Acquire a VRAM slot for `key`, pinning it at `pin_gen`. Hits return hit=true without copying;
   // misses evict the least-recently-used slot whose pin_gen != current `pin_gen`.
@@ -162,18 +167,10 @@ class VramLruSlab {
   void clear() noexcept;
 
  private:
-  struct Slot {
-    std::uint64_t key = kEmptyKey;
-    std::uint64_t last_use = 0;
-    std::uint64_t pin_gen = 0;
-    std::uint8_t* vram_ptr = nullptr;
-  };
-
   std::size_t slot_bytes_ = 0;
   DeviceBuffer storage_;
-  std::vector<Slot> slots_;
-  std::unordered_map<std::uint64_t, int> index_;
-  std::uint64_t tick_ = 0;
+  std::vector<std::uint8_t*> slot_ptrs_;
+  LruSlotIndex lru_;
 };
 
 // Dedicated non-blocking transfer stream + completion event for overlapping PCIe H2D/D2H copies

@@ -96,15 +96,16 @@ int main(int argc, char** argv) {
   std::string offload_mode = "auto", expert_ranking, dump_router_stats, kv_swap_dir, kv_ckpt_path, kv_ckpt_resume;
   std::string kv_cache_mode = "per_pass";
   std::string loopcd_mode = "off";
+  std::string attn_requant = "off";
   std::string persona_spec, refusal_map, prompt_renderer = "ingine_chat_format_v1", cache_namespace_header;
   std::string warm_start_prompt, warm_start_file, warm_start_namespace;
   int port = 8003, max_ctx = 65536, prefill_chunk = 3072, max_queue = 4, max_model_len = 0, park_mb = -1,
       park_host_mb = 0;
   int max_batch = 1, max_kv_tokens = 0, loop_passes = 3;
-  int offload_vram_mb = 0, offload_ram_mb = 12288;
+  int offload_vram_mb = 0, offload_ram_mb = 12288, expert_swaps = 0;
   int kv_vram_mb = 0, kv_ram_mb = 12288, kv_ckpt_every = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, kv_paged = false, spec = false,
-       no_vision = false, atlas_6g = false, persona_probe_mode = false, no_prefix_cache = false;
+       no_vision = false, atlas_6g = false, loop_bf16 = false, persona_probe_mode = false, no_prefix_cache = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02, loopcd_omega = -1.0;
   // sampling defaults; negative: from generation_config.json
@@ -163,6 +164,15 @@ int main(int argc, char** argv) {
             {"auto", "dma-lru", "uva"});
   ap.option("--expert-ranking", "", "optional JSON with per-layer [24][128] homology/frequency scores", &expert_ranking);
   ap.option("--dump-router-stats", "", "write observed [24][128] router hits JSON on exit", &dump_router_stats);
+  ap.flag("--loop-bf16",
+          "opt-in small-card knob: elide unused FP32 controller & router duplicates (-81.0 MiB VRAM, 0-ULP parity)",
+          &loop_bf16);
+  ap.option("--attn-requant", "{off,q5_k}",
+            "opt-in small-card attention requantization for wproj+wo: off (default) or q5_k (GGML Q5_K 5.5 b/w)",
+            &attn_requant, {"off", "q5_k"});
+  ap.option("--expert-swaps", "",
+            "opt-in bounded async GPU<->RAM HOT-promotion swap queue capacity (default 0 = static HOT + LRU; >0 requires offload and non-uva; NO expert dropping)",
+            &expert_swaps);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--park-mb", "",
@@ -236,6 +246,11 @@ int main(int argc, char** argv) {
     return 2;
   }
   const auto parsed_loopcd_mode = ingine::model::parse_loopcd_mode(loopcd_mode);
+  const auto parsed_attn_requant = ingine::model::parse_attn_requant_mode(attn_requant);
+  if (expert_swaps < 0) {
+    std::cerr << "ingine-serve: error: --expert-swaps must be >= 0\n";
+    return 2;
+  }
   if (ap.given("--loopcd-omega") && (!std::isfinite(loopcd_omega) || loopcd_omega < 0.0 || loopcd_omega > 4.0)) {
     std::cerr << "ingine-serve: error: --loopcd-omega must be finite and in [0, 4]\n";
     return 2;
@@ -324,6 +339,16 @@ int main(int argc, char** argv) {
         throw std::invalid_argument(
             "qwen38-dense is a non-looped dense architecture and does not support --loopcd");
       }
+      if (loop_bf16) {
+        throw std::invalid_argument(
+            "qwen38-dense is a non-looped dense architecture and does not support --loop-bf16");
+      }
+      if (parsed_attn_requant != ingine::model::AttnRequantMode::Off) {
+        throw std::invalid_argument("qwen38-dense does not support --attn-requant");
+      }
+      if (expert_swaps != 0) {
+        throw std::invalid_argument("qwen38-dense has no MoE experts and does not support --expert-swaps");
+      }
       if (!ap.given("--max-ctx")) max_ctx = 8192;
       if (!ap.given("--prefill-chunk")) prefill_chunk = 256;
       // Phase 1 Qwen3.8 backend is text-only (ingine-serve defaults vision enabled for Inkling).
@@ -396,6 +421,22 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("--loopcd hidden cannot be combined with --ablation");
           }
         }
+        const int eff_offload_vram = (atlas_6g && offload_vram_mb == 0) ? 5888 : offload_vram_mb;
+        if (expert_swaps > 0) {
+          if (eff_offload_vram <= 0) {
+            throw std::invalid_argument("--expert-swaps > 0 requires --offload-vram-mb > 0 or --atlas-6g");
+          }
+          if (offload_mode == "uva") {
+            throw std::invalid_argument(
+                "--expert-swaps > 0 is not supported with --offload-mode uva (use auto or dma-lru)");
+          }
+          if (max_batch > 1) {
+            throw std::invalid_argument("--expert-swaps > 0 currently requires --max-batch 1");
+          }
+        }
+        if (parsed_attn_requant != ingine::model::AttnRequantMode::Off && max_batch > 1) {
+          throw std::invalid_argument("--attn-requant q5_k currently requires --max-batch 1");
+        }
         const bool fake_allow_last_full =
             (loop_passes == 3) && !spec && (max_batch <= 1) && (parsed_loopcd_mode == ingine::model::LoopCdMode::Off);
         auto ifake = std::make_unique<ingine::engine::FakeGenerator>(
@@ -450,6 +491,9 @@ int main(int argc, char** argv) {
       options.loop_passes_explicit = loop_passes_explicit;
       options.loopcd_mode = parsed_loopcd_mode;
       options.loopcd_omega = ap.given("--loopcd-omega") ? float(loopcd_omega) : -1.0f;
+      options.loop_bf16 = loop_bf16;
+      options.attn_requant = parsed_attn_requant;
+      options.expert_swaps = expert_swaps;
       options.enable_persona_hooks = (personas != nullptr) || persona_probe_mode;
       options.refusal_map = refusal_map;
       generator = ingine::model::make_generator(options);

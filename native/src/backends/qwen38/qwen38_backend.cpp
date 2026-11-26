@@ -181,6 +181,15 @@ void validate_qwen38_runtime_options(const Qwen38Config& config, const ingine::m
   if (options.loopcd_mode != ingine::model::LoopCdMode::Off) {
     throw std::invalid_argument("qwen38-dense is a non-looped dense architecture and does not support --loopcd");
   }
+  if (options.loop_bf16) {
+    throw std::invalid_argument("qwen38-dense is a non-looped dense architecture and does not support --loop-bf16");
+  }
+  if (options.attn_requant != ingine::model::AttnRequantMode::Off) {
+    throw std::invalid_argument("qwen38-dense does not support --attn-requant");
+  }
+  if (options.expert_swaps != 0) {
+    throw std::invalid_argument("qwen38-dense has no MoE experts and does not support --expert-swaps");
+  }
 }
 
 Qwen38RuntimeDispatchPlan resolve_qwen38_runtime_options(const ingine::model::RuntimeOptions& options,

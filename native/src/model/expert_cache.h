@@ -9,7 +9,9 @@
 #include "core/host_memory.h"
 #include "core/paged_tier.h"
 #include "core/safetensors.h"
+#include "ingine/generator.h"
 #include "kernels/moe/moe.h"
+#include "model/expert_swap_queue.h"
 #include "model/model_data.h"
 
 #include <cuda_runtime.h>
@@ -44,6 +46,10 @@ struct OffloadConfig {
   bool spec = false;
   int kv_vram_mb = 0;  // when > 0, full KV cache is paged and capped to kv_vram_mb MiB of VRAM
   int loop_passes = PASSES;
+  // Opt-in small-card knobs (#888, all default off / 0):
+  bool loop_bf16 = false;
+  AttnRequantMode attn_requant = AttnRequantMode::Off;
+  int expert_swaps = 0;  // bounded async HOT-promotion queue capacity (0 = disabled/default, >0 = opt-in)
 };
 
 struct OffloadStats {
@@ -57,10 +63,16 @@ struct OffloadStats {
   int warm_experts = 0;
   int cold_experts = 0;
   int lru_slots_total = 0;
+  int expert_swaps_cap = 0;
   std::size_t hot_vram_bytes = 0;
   std::size_t lru_vram_bytes = 0;
   std::size_t warm_ram_bytes = 0;
   std::size_t cold_nvme_bytes = 0;
+  std::uint64_t hot_evictions = 0;
+  std::uint64_t async_swaps_queued = 0;
+  std::uint64_t async_swaps_completed = 0;
+  std::uint64_t async_swaps_dropped_bound = 0;  // dropped promotion requests when bounded queue is full
+  std::uint64_t experts_dropped = 0;            // invariant == 0 (strictly NO silent tail-skip)
 };
 
 class ExpertCache {
@@ -128,11 +140,27 @@ class ExpertCache {
 
   struct ExpertMeta {
     Tier tier = Tier::ColdNvme;
+    bool has_warm_backing = false;
+    bool has_cold_backing = false;
+    bool evictable_hot = false;
+    int hot_slot = -1;       // index into hot_slots_[layer_slab_[l]] when tier == Tier::HotVram
+    int inflight_slot = -1;  // index into inflight_[] when async HOT promotion is in flight
     float score = 0.f;
     std::uint8_t* hot_ptr = nullptr;
     std::size_t warm_offset = 0;
     FileSlice cold_w13, cold_w13_s, cold_w13_rout, cold_w2, cold_w2_s, cold_w2_rout;
   };
+
+  struct InflightSwap {
+    bool active = false;
+    int bucket = -1;
+    int hot_slot = -1;
+    int new_layer = -1;
+    int new_expert = -1;
+    std::uint8_t* dst_vram = nullptr;
+    cudaEvent_t done = nullptr;
+  };
+  static constexpr int kMaxInflightSwaps = 2;
 
   struct LayerDeviceTables {
     DeviceBuffer dev;
@@ -163,9 +191,15 @@ class ExpertCache {
   static ExpertLayout layout_for(ExpertFormat w13_fmt, ExpertFormat w2_fmt);
   void set_host_ptrs(int l, int e, std::uint8_t* base);
   void clear_host_ptrs(int l, int e);
+  void verify_hot_hit_ptrs(int l, int e) const;
+  void verify_staged_hit_ptrs(int l, int e, int slot) const;
   bool stage_expert(int l, int e, std::uint64_t pin_gen);
   void flush_layer_table(int l);
   void read_cold_to_host(int l, int e, std::uint8_t* dst);
+  void complete_inflight_swap(int inf_idx, cudaStream_t compute_stream);
+  void poll_inflight_swaps(cudaStream_t compute_stream);
+  void finalize_all_inflight_swaps(cudaStream_t compute_stream);
+  void drain_swap_queue_async(int current_layer, std::uint64_t cur_pin_gen, cudaStream_t compute_stream);
 
   OffloadMode mode_ = OffloadMode::DmaLru;
   std::filesystem::path dump_router_stats_;
@@ -178,6 +212,8 @@ class ExpertCache {
 
   // Tier 0: permanent HOT VRAM pool + per-record-size dynamic VRAM LRU slabs
   DeviceBuffer hot_vram_;
+  std::vector<std::vector<BoundedSwapQueue::HotSlotState>> hot_slots_;
+  std::vector<std::vector<std::uint8_t*>> hot_slot_ptrs_;
   std::vector<VramLruSlab> slabs_;
   // Tier 1: WARM pinned host RAM (2 MiB hugepages, CUDA-registered)
   HostRegion warm_ram_;
@@ -190,6 +226,10 @@ class ExpertCache {
   TieredDmaStream dma_;
   cudaEvent_t idx_ready_ = nullptr;
   cudaEvent_t pass0_done_ = nullptr;
+  cudaEvent_t victim_release_ev_ = nullptr;
+  BoundedSwapQueue swap_queue_{0};
+  std::array<InflightSwap, kMaxInflightSwaps> inflight_{};
+  std::uint64_t swap_tick_ = 0;
   MappedHostBuffer host_idx_;                  // int32 [8 * TOP_K]
   MappedHostBuffer host_counts_;               // int32 [EXPERTS]
   std::array<MappedHostBuffer, 2> host_mask_;  // uint8 [EXPERTS] x 2 for overlapped HOT/LRU vs WARM passes

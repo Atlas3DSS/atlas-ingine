@@ -82,6 +82,27 @@ inline constexpr float effective_loopcd_omega(LoopCdMode mode, float requested) 
   return requested >= 0.0f ? requested : default_loopcd_omega(mode);
 }
 
+// Opt-in attention projection requantization (#888): applies only to Inkling-2-Mini attention projections
+// (wproj + wo). Off (default) preserves baseline BF16/FP8 bit-for-bit.
+enum class AttnRequantMode : std::uint8_t {
+  Off = 0,
+  Q5K = 1,
+};
+
+inline const char* to_string(AttnRequantMode mode) {
+  switch (mode) {
+    case AttnRequantMode::Q5K: return "q5_k";
+    default: return "off";
+  }
+}
+
+inline AttnRequantMode parse_attn_requant_mode(std::string_view s) {
+  if (s == "off") return AttnRequantMode::Off;
+  if (s == "q5_k") return AttnRequantMode::Q5K;
+  throw std::invalid_argument("invalid attn_requant mode '" + std::string(s) +
+                              "' (expected 'off' or 'q5_k')");
+}
+
 struct Sampling {
   float temperature = 1.0f;  // 0 => greedy
   float top_p = 1.0f;
@@ -240,6 +261,14 @@ struct RuntimeOptions {
   LoopCdMode loopcd_mode = LoopCdMode::Off;
   // Contrastive strength omega_max (logits-adaptive) or omega (hidden); < 0 uses mode default (0.5 / 0.3), 0 = no-op control.
   float loopcd_omega = -1.0f;
+  // Opt-in small-card knobs (#888, all default off / 0 so unmodified behavior is 0-ULP preserved):
+  //   loop_bf16:     elide unused FP32 controller & router duplicates (-81.0 MiB persistent VRAM, 0-ULP parity).
+  //   attn_requant:  opt-in GGML Q5_K (5.50 b/w) requantization of attention wproj + wo (-193.5 MiB vs FP8).
+  //   expert_swaps:  bounded async GPU<->RAM HOT-promotion swap queue capacity (0 = disabled/default, >0 = opt-in;
+  //                  strictly NO expert dropping / tail-skip).
+  bool loop_bf16 = false;
+  AttnRequantMode attn_requant = AttnRequantMode::Off;
+  int expert_swaps = 0;
   // Optional VRAM lease cap in MiB for batched pool/drafter/prefix-cache auto-sizing (0 = unbounded).
   int vram_limit_mb = 0;
   // True when caller explicitly passed --loop-passes (non-looped backends reject explicit loop overrides fail-closed).
@@ -310,6 +339,7 @@ class Generator {
   virtual std::vector<KvCacheMode> supported_kv_cache_modes() const { return {kv_cache_mode()}; }
   virtual int loop_passes() const { return 3; }
   virtual LoopCdMode loopcd_mode() const { return LoopCdMode::Off; }
+  virtual AttnRequantMode attn_requant_mode() const { return AttnRequantMode::Off; }
   virtual std::string offload_summary() const { return {}; }
   virtual PrefixCacheStats cache_stats() const { return {}; }
 
