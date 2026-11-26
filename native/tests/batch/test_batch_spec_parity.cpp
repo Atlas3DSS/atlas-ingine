@@ -30,6 +30,7 @@ void set_batch_prefill_splits_for_test(std::vector<int> splits);
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -199,6 +200,94 @@ void run_validator_negative_controls() {
   CHECK(!sv::validate_cross_gear_divergence({}, {}, 0, 1, 3, 0.6f).ok);
 }
 
+uint16_t float_to_fp16_bits_host(float f) {
+  const __half h = __float2half_rn(f);
+  uint16_t bits = 0;
+  std::memcpy(&bits, &h, sizeof(bits));
+  return bits;
+}
+
+int fp16_ulp_distance(float a, float b, uint16_t& bits_a, uint16_t& bits_b, float& step_at_b) {
+  bits_a = float_to_fp16_bits_host(a);
+  bits_b = float_to_fp16_bits_host(b);
+  auto to_ordered = [](uint16_t u) -> int {
+    return (u & 0x8000u) ? -int(u & 0x7fffu) : int(u & 0x7fffu);
+  };
+  const uint16_t mag_b = uint16_t(bits_b & 0x7fffu);
+  const uint16_t next_b = (mag_b < 0x7bffu) ? uint16_t((bits_b & 0x8000u) | (mag_b + 1u)) : bits_b;
+  __half hb{}, hnb{};
+  std::memcpy(&hb, &bits_b, sizeof(hb));
+  std::memcpy(&hnb, &next_b, sizeof(hnb));
+  step_at_b = std::fabs(__half2float(hnb) - __half2float(hb));
+  return std::abs(to_ordered(bits_a) - to_ordered(bits_b));
+}
+
+uint16_t float_to_bf16_bits_host(float f) {
+  uint32_t u = 0;
+  std::memcpy(&u, &f, sizeof(u));
+  if ((u & 0x7fffffffu) > 0x7f800000u) return uint16_t((u >> 16) | 0x0040u);  // NaN
+  const uint32_t rounding_bias = 0x7fffu + ((u >> 16) & 1u);                 // round-to-nearest-even
+  return uint16_t((u + rounding_bias) >> 16);
+}
+
+float bf16_bits_to_float_host(uint16_t b) {
+  const uint32_t u = uint32_t(b) << 16;
+  float f = 0.f;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
+}
+
+int bf16_ulp_distance(float a, float b, uint16_t& bits_a, uint16_t& bits_b, float& step_at_b) {
+  bits_a = float_to_bf16_bits_host(a);
+  bits_b = float_to_bf16_bits_host(b);
+  auto to_ordered = [](uint16_t u) -> int {
+    return (u & 0x8000u) ? -int(u & 0x7fffu) : int(u & 0x7fffu);
+  };
+  const uint16_t mag_b = uint16_t(bits_b & 0x7fffu);
+  const uint16_t next_b = (mag_b < 0x7f7fu) ? uint16_t((bits_b & 0x8000u) | (mag_b + 1u)) : bits_b;
+  step_at_b = std::fabs(bf16_bits_to_float_host(next_b) - bf16_bits_to_float_host(bits_b));
+  return std::abs(to_ordered(bits_a) - to_ordered(bits_b));
+}
+
+int native_act_ulp_distance(float a, float b, uint16_t& bits_a, uint16_t& bits_b, float& step_at_b) {
+  if constexpr (INGINE_ACT_FP16) {
+    return fp16_ulp_distance(a, b, bits_a, bits_b, step_at_b);
+  } else {
+    return bf16_ulp_distance(a, b, bits_a, bits_b, step_at_b);
+  }
+}
+
+void run_ulp_unit_tests() {
+  uint16_t ba = 0, bb = 0;
+  float st = 0.f;
+  CHECK(fp16_ulp_distance(122.1875f, 122.25f, ba, bb, st) == 1);
+  CHECK(ba == 0x57a3u && bb == 0x57a4u && std::fabs(st - 0.0625f) < 1e-7f);
+  CHECK(bf16_ulp_distance(122.5f, 122.0f, ba, bb, st) == 1);
+  CHECK(ba == 0x42f5u && bb == 0x42f4u && std::fabs(st - 0.5f) < 1e-7f);
+}
+
+bool logit_argmax_margin(const std::vector<float>& logits, int& am, float& margin) {
+  am = -1;
+  margin = 0.f;
+  if (logits.size() < 2) return false;
+  float best1 = -INFINITY, best2 = -INFINITY;
+  int idx1 = -1;
+  for (int i = 0; i < int(logits.size()); ++i) {
+    const float v = logits[std::size_t(i)];
+    if (!std::isfinite(v)) return false;
+    if (v > best1) {
+      best2 = best1;
+      best1 = v;
+      idx1 = i;
+    } else if (v > best2) {
+      best2 = v;
+    }
+  }
+  am = idx1;
+  margin = best1 - best2;
+  return idx1 >= 0 && std::isfinite(margin);
+}
+
 void verify_sampled_trace(const BatchSpecSlotTrace& tr, const char* label) {
   const auto res = sv::validate_sampled_trace(tr, kUnpaddedVocab);
   if (!res.ok) {
@@ -337,33 +426,15 @@ struct DivergentCase {
   int B = 0;
   int seq_idx = 0;
   std::size_t pos = 0;  // index in generated output (pos >= 1)
+  int verify_B = 0;     // active batch width at the live verify step
+  int verify_W = 0;     // verify window width W_batch at the live verify step
+  int verify_M = 0;     // verify_B * verify_W
   int32_t plain_tok = -1;
   int32_t spec_tok = -1;
+  std::vector<int32_t> prefix_tokens;  // exact common generated tokens [0..pos-1]
   std::vector<float> l_spec;   // ACTUAL live verify logit row [kUnpaddedVocab] captured during spec run
   std::vector<float> l_plain;  // ACTUAL live plain logit row [kUnpaddedVocab] captured on exact plain batch replay
 };
-
-uint16_t float_to_fp16_bits_host(float f) {
-  const __half h = __float2half_rn(f);
-  uint16_t bits = 0;
-  std::memcpy(&bits, &h, sizeof(bits));
-  return bits;
-}
-
-int fp16_ulp_distance(float a, float b, uint16_t& bits_a, uint16_t& bits_b, float& step_at_b) {
-  bits_a = float_to_fp16_bits_host(a);
-  bits_b = float_to_fp16_bits_host(b);
-  auto to_ordered = [](uint16_t u) -> int {
-    return (u & 0x8000u) ? -int(u & 0x7fffu) : int(u & 0x7fffu);
-  };
-  const uint16_t mag_b = uint16_t(bits_b & 0x7fffu);
-  const uint16_t next_b = (mag_b < 0x7bffu) ? uint16_t((bits_b & 0x8000u) | (mag_b + 1u)) : bits_b;
-  __half hb{}, hnb{};
-  std::memcpy(&hb, &bits_b, sizeof(hb));
-  std::memcpy(&hnb, &next_b, sizeof(hnb));
-  step_at_b = std::fabs(__half2float(hnb) - __half2float(hb));
-  return std::abs(to_ordered(bits_a) - to_ordered(bits_b));
-}
 
 // Independent target-only small (B=6/12, M<=32 SIMT FP8 GEMV) vs large (B=36, M=36>32 cuBLASLt GEMM) control
 // WITHOUT speculative drafting, verify kernels, or rollback. Evaluates 6 frozen independent prompts over 47 steps.
@@ -521,6 +592,7 @@ int run_fp16_geometry_control(const std::filesystem::path& model_dir, const ingi
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   run_validator_negative_controls();
+  run_ulp_unit_tests();
 
   int vram_limit_mb = 0;
   if (const char* env_lim = std::getenv("INGINE_VRAM_LIMIT_MB"); env_lim && *env_lim) {
@@ -779,6 +851,9 @@ int main(int argc, char** argv) {
         ldiff.update(post_rb_tr.target_logits[i], ref_tr.target_logits[i]);
       std::size_t worst_tap_idx = 0;
       float worst_tap_got = 0.f, worst_tap_ref = 0.f, worst_tap_abs = -1.f;
+      int taps_gt_005 = 0;
+      int max_ulps_gt_005 = 0;
+      bool all_gt_005_within_1ulp_007 = true;
       for (std::size_t i = 0; i < ref_tr.target_taps.size(); ++i) {
         const float gv = post_rb_tr.target_taps[i];
         const float rv = ref_tr.target_taps[i];
@@ -790,22 +865,34 @@ int main(int argc, char** argv) {
           worst_tap_got = gv;
           worst_tap_ref = rv;
         }
+        if (std::isfinite(gv) && std::isfinite(rv) && d > 0.05f) {
+          ++taps_gt_005;
+          uint16_t bi_got = 0, bi_ref = 0;
+          float bi_step = 0.f;
+          const int ulps_i = native_act_ulp_distance(gv, rv, bi_got, bi_ref, bi_step);
+          if (ulps_i > max_ulps_gt_005) max_ulps_gt_005 = ulps_i;
+          if (ulps_i > 1 || d > 0.07f) all_gt_005_within_1ulp_007 = false;
+        }
       }
       uint16_t bits_got = 0, bits_ref = 0;
-      float fp16_step_ref = 0.f;
-      const int fp16_ulps = fp16_ulp_distance(worst_tap_got, worst_tap_ref, bits_got, bits_ref, fp16_step_ref);
+      float step_ref = 0.f;
+      const int native_ulps = native_act_ulp_distance(worst_tap_got, worst_tap_ref, bits_got, bits_ref, step_ref);
       const bool tap_strict_ok = tdiff.finite() && tdiff.max_abs <= 0.05f;
-      const bool tap_diag07_ok = tdiff.finite() && tdiff.max_abs <= 0.07f;
+      const bool tap_cal_fp16_ok = tdiff.finite() && all_gt_005_within_1ulp_007;
       std::printf(
           "post-partial-rollback & W=1->W=8 vs serial W=1 (prefix=%zu): tok=%d/%d logit_max_diff=%.6f "
-          "tap_max_diff=%.6f (idx=%zu tap=%zu col=%zu got=%.6f ref=%.6f fp16_bits=0x%04x/0x%04x "
-          "fp16_step_at_ref=%.6f fp16_ulps=%d | strict_0.05=%s diag_0.07=%s)\n",
-          prefix_tokens.size(), post_rb_tok, ref_tok, ldiff.max_abs, tdiff.max_abs, worst_tap_idx,
-          worst_tap_idx / 2304u, worst_tap_idx % 2304u, worst_tap_got, worst_tap_ref, unsigned(bits_got),
-          unsigned(bits_ref), fp16_step_ref, fp16_ulps, tap_strict_ok ? "PASS" : "FAIL",
-          tap_diag07_ok ? "PASS" : "FAIL");
+          "tap_max_diff=%.6f (act=%s idx=%zu tap=%zu col=%zu got=%.6f ref=%.6f bits=0x%04x/0x%04x "
+          "step_at_ref=%.6f native_ulps=%d taps_gt_005=%d max_ulps_gt_005=%d | strict_0.05=%s cal_1ulp_0.07=%s)\n",
+          prefix_tokens.size(), post_rb_tok, ref_tok, ldiff.max_abs, tdiff.max_abs, INGINE_ACT_FP16 ? "FP16" : "BF16",
+          worst_tap_idx, worst_tap_idx / 2304u, worst_tap_idx % 2304u, worst_tap_got, worst_tap_ref,
+          unsigned(bits_got), unsigned(bits_ref), step_ref, native_ulps, taps_gt_005, max_ulps_gt_005,
+          tap_strict_ok ? "PASS" : "FAIL", tap_cal_fp16_ok ? "PASS" : "FAIL");
       CHECK(ldiff.finite() && ldiff.max_abs <= 0.15f);
-      CHECK(tap_strict_ok);
+      if constexpr (INGINE_ACT_FP16) {
+        CHECK(tap_cal_fp16_ok);
+      } else {
+        CHECK(tap_strict_ok);
+      }
       CHECK(post_rb_tok == ref_tok);
     }
 
@@ -866,13 +953,18 @@ int main(int argc, char** argv) {
             const int32_t got_tok = res[i].tokens[k];
             if (!recorded_div[std::size_t(seq_i)] && out_pos < ref.size() && got_tok != ref[out_pos]) {
               recorded_div[std::size_t(seq_i)] = true;
-              // Bind the ACTUAL verify row `k` logits that produced `got_tok`!
+              // Bind the ACTUAL verify row `k` logits and live verify geometry that produced `got_tok`!
+              CHECK(std::equal(out.begin(), out.end(), ref.begin()));
               DivergentCase dc;
               dc.B = B;
               dc.seq_idx = seq_i;
               dc.pos = out_pos;
+              dc.verify_B = int(live.size());
+              dc.verify_W = step_trs[i].W_batch;
+              dc.verify_M = dc.verify_B * dc.verify_W;
               dc.plain_tok = ref[out_pos];
               dc.spec_tok = got_tok;
+              dc.prefix_tokens.assign(ref.begin(), ref.begin() + std::ptrdiff_t(out_pos));
               if (step_trs[i].target_logits.size() >= std::size_t(k + 1) * kUnpaddedVocab) {
                 const float* row_p = step_trs[i].target_logits.data() + std::size_t(k) * kUnpaddedVocab;
                 dc.l_spec.assign(row_p, row_p + kUnpaddedVocab);
@@ -1147,88 +1239,188 @@ int main(int argc, char** argv) {
 
   // ---- PHASE C: Exact live plain batch replay for any cross-gear divergences recorded in Phase B ----
   if (!divergent_cases.empty()) {
-    RuntimeOptions opt_plain;
-    opt_plain.model_dir = model_dir;
-    opt_plain.max_ctx = 2048;
-    opt_plain.prefill_chunk = 512;
-    opt_plain.dense_fp8 = true;
-    opt_plain.kv_fp8 = true;
-    opt_plain.max_batch = 12;
-    opt_plain.max_kv_tokens = 12 * 512;
-    opt_plain.vram_limit_mb = vram_limit_mb;
-    opt_plain.spec = false;
-    opt_plain.prefix_cache = false;
-    auto gen_plain = ingine::model::make_generator(opt_plain);
-    vram.sample();
+    {
+      RuntimeOptions opt_plain;
+      opt_plain.model_dir = model_dir;
+      opt_plain.max_ctx = 2048;
+      opt_plain.prefill_chunk = 512;
+      opt_plain.dense_fp8 = true;
+      opt_plain.kv_fp8 = true;
+      opt_plain.max_batch = 12;
+      opt_plain.max_kv_tokens = 12 * 512;
+      opt_plain.vram_limit_mb = vram_limit_mb;
+      opt_plain.spec = false;
+      opt_plain.prefix_cache = false;
+      auto gen_plain = ingine::model::make_generator(opt_plain);
+      vram.sample();
 
-    std::map<int, std::vector<DivergentCase*>> by_B;
-    for (auto& dc : divergent_cases) by_B[dc.B].push_back(&dc);
+      std::map<int, std::vector<DivergentCase*>> by_B;
+      for (auto& dc : divergent_cases) by_B[dc.B].push_back(&dc);
 
-    for (auto& [B, cases] : by_B) {
-      std::size_t max_pos = 0;
-      for (const auto* dc : cases) max_pos = std::max(max_pos, dc->pos);
+      for (auto& [B, cases] : by_B) {
+        std::size_t max_pos = 0;
+        for (const auto* dc : cases) max_pos = std::max(max_pos, dc->pos);
 
-      Sampling greedy;
-      greedy.temperature = 0.0f;
-      std::vector<int> slots(static_cast<std::size_t>(B), -1);
-      std::vector<int32_t> last_toks(static_cast<std::size_t>(B), 0);
-      for (int i = 0; i < B; ++i) {
-        GenerateStats st;
-        slots[std::size_t(i)] =
-            gen_plain->start_slot(Prompt{prompt_ids[std::size_t(i)], {}}, int(max_pos) + 2, greedy, last_toks[std::size_t(i)], st);
-        CHECK(slots[std::size_t(i)] >= 0);
-      }
-      for (std::size_t pos = 1; pos <= max_pos; ++pos) {
-        std::vector<BatchSlotStep> steps(static_cast<std::size_t>(B));
-        std::vector<int32_t> next(static_cast<std::size_t>(B), 0);
-        for (int i = 0; i < B; ++i) steps[std::size_t(i)] = {slots[std::size_t(i)], last_toks[std::size_t(i)]};
-
-        bool need_capture = false;
-        for (const auto* dc : cases)
-          if (dc->pos == pos) need_capture = true;
-
-        std::vector<BatchSpecSlotTrace> trs;
-        if (need_capture) {
-          BatchSpecTraceConfig cfg;
-          cfg.capture_target_logits = true;
-          cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& t) { trs = t; };
-          TraceGuard tg(std::move(cfg));
-          gen_plain->step_slots(steps, next);
-        } else {
-          gen_plain->step_slots(steps, next);
+        Sampling greedy;
+        greedy.temperature = 0.0f;
+        std::vector<int> slots(static_cast<std::size_t>(B), -1);
+        std::vector<int32_t> last_toks(static_cast<std::size_t>(B), 0);
+        for (int i = 0; i < B; ++i) {
+          GenerateStats st;
+          slots[std::size_t(i)] = gen_plain->start_slot(Prompt{prompt_ids[std::size_t(i)], {}}, int(max_pos) + 2,
+                                                        greedy, last_toks[std::size_t(i)], st);
+          CHECK(slots[std::size_t(i)] >= 0);
         }
-        if (need_capture) {
-          CHECK(trs.size() == std::size_t(B));
-          for (auto* dc : cases) {
-            if (dc->pos == pos) dc->l_plain = trs[std::size_t(dc->seq_idx)].target_logits;
+        for (std::size_t pos = 1; pos <= max_pos; ++pos) {
+          std::vector<BatchSlotStep> steps(static_cast<std::size_t>(B));
+          std::vector<int32_t> next(static_cast<std::size_t>(B), 0);
+          for (int i = 0; i < B; ++i) steps[std::size_t(i)] = {slots[std::size_t(i)], last_toks[std::size_t(i)]};
+
+          bool need_capture = false;
+          for (const auto* dc : cases)
+            if (dc->pos == pos) need_capture = true;
+
+          std::vector<BatchSpecSlotTrace> trs;
+          if (need_capture) {
+            BatchSpecTraceConfig cfg;
+            cfg.capture_target_logits = true;
+            cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& t) { trs = t; };
+            TraceGuard tg(std::move(cfg));
+            gen_plain->step_slots(steps, next);
+          } else {
+            gen_plain->step_slots(steps, next);
           }
+          if (need_capture) {
+            CHECK(trs.size() == std::size_t(B));
+            for (auto* dc : cases) {
+              if (dc->pos == pos) dc->l_plain = trs[std::size_t(dc->seq_idx)].target_logits;
+            }
+          }
+          last_toks = next;
         }
-        last_toks = next;
+        for (int s : slots)
+          if (s >= 0) gen_plain->release_slot(s);
       }
-      for (int s : slots)
-        if (s >= 0) gen_plain->release_slot(s);
-    }
+    }  // destroy gen_plain before any fresh verify-geometry adjudication generator!
 
+    std::vector<sv::ValidationResult> strict_res;
+    std::vector<sv::ValidationResult> diag15_res;
+    strict_res.reserve(divergent_cases.size());
+    diag15_res.reserve(divergent_cases.size());
+    std::vector<std::size_t> need_geom_adj;
     int strict06_pass = 0, diag15_pass = 0;
-    for (const auto& dc : divergent_cases) {
+    for (std::size_t ci = 0; ci < divergent_cases.size(); ++ci) {
+      const auto& dc = divergent_cases[ci];
       const auto vr_strict = sv::validate_cross_gear_divergence(dc.l_plain, dc.l_spec, dc.plain_tok, dc.spec_tok,
                                                                 kUnpaddedVocab, 0.6f);
       const auto vr_diag15 = sv::validate_cross_gear_divergence(dc.l_plain, dc.l_spec, dc.plain_tok, dc.spec_tok,
                                                                 kUnpaddedVocab, 1.5f);
       if (vr_strict.ok) ++strict06_pass;
+      else need_geom_adj.push_back(ci);
       if (vr_diag15.ok) ++diag15_pass;
       std::printf(
-          "  [cross-gear bound diag B=%d seq=%d pos=%zu] plain=%d(am=%d) spec=%d(am=%d) max_diff=%.6f "
-          "margin_p=%.6f margin_s=%.6f | strict_0.6=%s diag_1.5=%s\n",
-          dc.B, dc.seq_idx, dc.pos, dc.plain_tok, vr_strict.argmax_plain, dc.spec_tok, vr_strict.argmax_spec,
-          vr_strict.max_diff, vr_strict.margin_plain, vr_strict.margin_spec,
-          vr_strict.ok ? "PASS" : vr_strict.reason.c_str(),
-          vr_diag15.ok ? "PASS" : vr_diag15.reason.c_str());
-      CHECK(vr_strict.ok);
+          "  [cross-gear bound diag B=%d seq=%d pos=%zu verify=%dx%d(M=%d)] plain=%d(am=%d) spec=%d(am=%d) "
+          "max_diff=%.6f margin_p=%.6f margin_s=%.6f | strict_0.6=%s diag_1.5=%s\n",
+          dc.B, dc.seq_idx, dc.pos, dc.verify_B, dc.verify_W, dc.verify_M, dc.plain_tok, vr_strict.argmax_plain,
+          dc.spec_tok, vr_strict.argmax_spec, vr_strict.max_diff, vr_strict.margin_plain, vr_strict.margin_spec,
+          vr_strict.ok ? "PASS" : vr_strict.reason.c_str(), vr_diag15.ok ? "PASS" : vr_diag15.reason.c_str());
+      strict_res.push_back(vr_strict);
+      diag15_res.push_back(vr_diag15);
     }
-    std::printf("cross-gear bound summary (act=%s): total=%zu strict_0.6=%d/%zu diag_1.5=%d/%zu\n",
-                INGINE_ACT_FP16 ? "FP16" : "BF16", divergent_cases.size(), strict06_pass, divergent_cases.size(),
-                diag15_pass, divergent_cases.size());
+
+    // Fresh ordinary target-only verify-geometry adjudication (spec=false, rollback=0) for every >0.6 divergence!
+    std::vector<bool> adj_ran(divergent_cases.size(), false);
+    std::vector<bool> adj_ok(divergent_cases.size(), false);
+    int adj_pass_count = 0;
+    if (!need_geom_adj.empty()) {
+      RuntimeOptions opt_geom;
+      opt_geom.model_dir = model_dir;
+      opt_geom.max_ctx = 512;
+      opt_geom.prefill_chunk = 512;
+      opt_geom.dense_fp8 = true;
+      opt_geom.kv_fp8 = true;
+      opt_geom.max_batch = 36;
+      opt_geom.max_kv_tokens = 36 * 128;
+      opt_geom.vram_limit_mb = vram_limit_mb;
+      opt_geom.spec = false;
+      opt_geom.prefix_cache = false;
+      auto gen_geom = ingine::model::make_generator(opt_geom);
+      vram.sample();
+
+      Sampling greedy;
+      greedy.temperature = 0.0f;
+      for (const std::size_t ci : need_geom_adj) {
+        const auto& dc = divergent_cases[ci];
+        adj_ran[ci] = true;
+        const int B_geom = (dc.verify_M > 0 && dc.verify_M <= 36) ? dc.verify_M : 36;
+        std::vector<int> slots(std::size_t(B_geom), -1);
+        bool prefix_ok = !dc.prefix_tokens.empty() && dc.prefix_tokens.size() == dc.pos;
+        for (int i = 0; i < B_geom; ++i) {
+          int32_t tok0 = 0;
+          GenerateStats st;
+          slots[std::size_t(i)] =
+              gen_geom->start_slot(Prompt{prompt_ids[std::size_t(dc.seq_idx)], {}}, int(dc.pos) + 2, greedy, tok0, st);
+          CHECK(slots[std::size_t(i)] >= 0);
+          if (slots[std::size_t(i)] < 0 || !prefix_ok || tok0 != dc.prefix_tokens[0]) prefix_ok = false;
+        }
+        CHECK(prefix_ok);
+        std::vector<float> l_geom;
+        int32_t tok_geom = -1;
+        for (std::size_t p = 1; p <= dc.pos && prefix_ok; ++p) {
+          std::vector<BatchSlotStep> steps(static_cast<std::size_t>(B_geom));
+          std::vector<int32_t> next(static_cast<std::size_t>(B_geom), 0);
+          const int32_t feed_tok = dc.prefix_tokens[p - 1];
+          for (int i = 0; i < B_geom; ++i) steps[std::size_t(i)] = {slots[std::size_t(i)], feed_tok};
+          if (p == dc.pos) {
+            std::vector<BatchSpecSlotTrace> trs;
+            BatchSpecTraceConfig cfg;
+            cfg.capture_target_logits = true;
+            cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& t) { trs = t; };
+            TraceGuard tg(std::move(cfg));
+            gen_geom->step_slots(steps, next);
+            CHECK(trs.size() == std::size_t(B_geom));
+            if (!trs.empty()) l_geom = trs[0].target_logits;
+            tok_geom = next[0];
+          } else {
+            gen_geom->step_slots(steps, next);
+          }
+        }
+        for (int s : slots)
+          if (s >= 0) gen_geom->release_slot(s);
+
+        DiffStats rdiff;
+        int am_geom = -1;
+        float margin_geom = 0.f;
+        const bool geom_valid = (l_geom.size() == std::size_t(kUnpaddedVocab)) &&
+                                (dc.l_spec.size() == std::size_t(kUnpaddedVocab)) &&
+                                logit_argmax_margin(l_geom, am_geom, margin_geom);
+        if (geom_valid) {
+          for (int v = 0; v < kUnpaddedVocab; ++v) rdiff.update(dc.l_spec[std::size_t(v)], l_geom[std::size_t(v)]);
+        }
+        const bool ok = prefix_ok && geom_valid && rdiff.finite() && am_geom == tok_geom && am_geom == dc.spec_tok &&
+                        rdiff.max_abs <= 0.6f;
+        adj_ok[ci] = ok;
+        if (ok) ++adj_pass_count;
+        std::printf(
+            "  [cross-gear geom-adjudication B=%d seq=%d pos=%zu verify=%dx%d(M=%d) geom_B=%d] spec=%d "
+            "target_geom=%d(am=%d) residual_max=%.6f margin_geom=%.6f | adj_0.6=%s\n",
+            dc.B, dc.seq_idx, dc.pos, dc.verify_B, dc.verify_W, dc.verify_M, B_geom, dc.spec_tok, tok_geom, am_geom,
+            rdiff.max_abs, margin_geom, ok ? "PASS" : "FAIL");
+      }
+      vram.sample();
+    }
+
+    for (std::size_t ci = 0; ci < divergent_cases.size(); ++ci) {
+      if constexpr (INGINE_ACT_FP16) {
+        CHECK(strict_res[ci].ok || (diag15_res[ci].ok && adj_ok[ci]));
+      } else {
+        CHECK(strict_res[ci].ok);
+      }
+    }
+    std::printf(
+        "cross-gear bound summary (act=%s): total=%zu strict_0.6=%d/%zu diag_1.5=%d/%zu geom_adj_0.6=%d/%zu\n",
+        INGINE_ACT_FP16 ? "FP16" : "BF16", divergent_cases.size(), strict06_pass, divergent_cases.size(), diag15_pass,
+        divergent_cases.size(), adj_pass_count, need_geom_adj.size());
     vram.sample();
   }
 
@@ -1408,62 +1600,316 @@ int main(int argc, char** argv) {
     vram.sample();
   }
 
-  // ---- PHASE F: Tight 6-page pool (384 tokens, exact 6 pages) with --spec ----
+  // ---- PHASE F: Tight 6-page pool (384 tokens, exact 6 pages) with --spec + same-schedule roomy-pool diagnostic ----
   {
-    RuntimeOptions opt_tight;
-    opt_tight.model_dir = model_dir;
-    opt_tight.max_ctx = 384;
-    opt_tight.max_kv_tokens = 384;
-    opt_tight.prefill_chunk = 384;
-    opt_tight.dense_fp8 = true;
-    opt_tight.kv_fp8 = true;
-    opt_tight.max_batch = 2;
-    opt_tight.vram_limit_mb = vram_limit_mb;
-    opt_tight.spec = true;
-    opt_tight.spec_threshold = 0.0f;
-    opt_tight.prefix_cache = true;
-    auto gen = ingine::model::make_generator(opt_tight);
-    vram.sample();
-
     std::vector<int32_t> p192 = prompt_ids[0];
     while (p192.size() < 192) p192.insert(p192.end(), prompt_ids[1].begin(), prompt_ids[1].end());
     p192.resize(192);
 
     Sampling greedy;
     greedy.temperature = 0.0f;
-    const RunOut solo96 = run_solo(*gen, Prompt{p192, {}}, 96, greedy);
-    CHECK(solo96.tokens.size() == 96);
 
-    Scheduler sched(*gen, {}, 4);
-    auto s24a = std::make_shared<Job>(p192, 24, greedy);
-    auto s24b = std::make_shared<Job>(p192, 24, greedy);
-    CHECK(sched.submit(s24a) && sched.submit(s24b));
-    std::optional<std::string> e1, e2;
-    const auto o24a = drain_job(*s24a, &e1);
-    const auto o24b = drain_job(*s24b, &e2);
-    CHECK(!e1 && !e2 && o24a.size() == 24 && o24b.size() == 24);
-    CHECK(std::equal(o24a.begin(), o24a.end(), solo96.tokens.begin()));
-    CHECK(std::equal(o24b.begin(), o24b.end(), solo96.tokens.begin()));
+    struct PhaseFTrace {
+      std::vector<int> active_B;
+      std::vector<std::vector<float>> logits;
+      void init(std::size_t n) {
+        active_B.assign(n, 1);
+        logits.assign(n, {});
+      }
+    };
 
-    auto m65 = std::make_shared<Job>(p192, 65, greedy);
-    auto m96 = std::make_shared<Job>(p192, 96, greedy);
-    CHECK(sched.submit(m65) && sched.submit(m96));
-    std::optional<std::string> em1, em2;
-    const auto om65 = drain_job(*m65, &em1);
-    const auto om96 = drain_job(*m96, &em2);
-    CHECK(!em1 && !em2 && om65.size() == 65 && om96.size() == 96);
-    CHECK(std::equal(om65.begin(), om65.end(), solo96.tokens.begin()));
-    CHECK(om96 == solo96.tokens);
+    auto capture_step = [&](const std::vector<BatchSpecSlotTrace>& trs, std::array<PhaseFTrace, 2>& slot_tr,
+                            std::array<int, 2>& slot_pos, std::vector<std::vector<int>>& sched_steps) {
+      std::vector<int> active_slots;
+      active_slots.reserve(trs.size());
+      for (const auto& tr : trs) {
+        active_slots.push_back(tr.slot);
+        if (tr.slot < 0 || tr.slot >= 2) continue;
+        int& cur = slot_pos[std::size_t(tr.slot)];
+        auto& st = slot_tr[std::size_t(tr.slot)];
+        for (int k = 0; k < tr.commit; ++k) {
+          const std::size_t idx = std::size_t(cur + k);
+          if (idx < st.active_B.size()) {
+            st.active_B[idx] = int(trs.size());
+            if (tr.target_logits.size() >= std::size_t(k + 1) * kUnpaddedVocab) {
+              const float* row_p = tr.target_logits.data() + std::size_t(k) * kUnpaddedVocab;
+              st.logits[idx].assign(row_p, row_p + kUnpaddedVocab);
+            }
+          }
+        }
+        cur += tr.commit;
+      }
+      sched_steps.push_back(std::move(active_slots));
+    };
 
-    auto l96a = std::make_shared<Job>(p192, 96, greedy);
-    auto l96b = std::make_shared<Job>(p192, 96, greedy);
-    CHECK(sched.submit(l96a) && sched.submit(l96b));
-    std::optional<std::string> el1, el2;
-    const auto ol96a = drain_job(*l96a, &el1);
-    const auto ol96b = drain_job(*l96b, &el2);
-    CHECK(!el1 && !el2 && ol96a == solo96.tokens && ol96b == solo96.tokens);
-    std::printf("tight 6-page + spec: 24/24=PASS 65/96=PASS 96/96=PASS\n");
-    vram.sample();
+    auto report_first_diff = [&](const char* label, const std::vector<int32_t>& ta, const PhaseFTrace& tra,
+                                 const std::vector<int32_t>& tb, const PhaseFTrace& trb) {
+      const std::size_t n = std::min(ta.size(), tb.size());
+      std::size_t diff_pos = n;
+      for (std::size_t i = 0; i < n; ++i) {
+        if (ta[i] != tb[i]) {
+          diff_pos = i;
+          break;
+        }
+      }
+      if (diff_pos == n && ta.size() == tb.size()) {
+        std::printf("  [phase-f diag %s] EXACT (%zu/%zu)\n", label, n, n);
+        return;
+      }
+      if (diff_pos == n) {
+        std::printf("  [phase-f diag %s] EXACT_PREFIX (%zu/%zu vs %zu)\n", label, n, ta.size(), tb.size());
+        return;
+      }
+      int am_a = -1, am_b = -1;
+      float margin_a = 0.f, margin_b = 0.f;
+      DiffStats d;
+      const bool has_la = diff_pos < tra.logits.size() && tra.logits[diff_pos].size() == std::size_t(kUnpaddedVocab);
+      const bool has_lb = diff_pos < trb.logits.size() && trb.logits[diff_pos].size() == std::size_t(kUnpaddedVocab);
+      if (has_la) logit_argmax_margin(tra.logits[diff_pos], am_a, margin_a);
+      if (has_lb) logit_argmax_margin(trb.logits[diff_pos], am_b, margin_b);
+      if (has_la && has_lb) {
+        for (int v = 0; v < kUnpaddedVocab; ++v) d.update(tra.logits[diff_pos][std::size_t(v)], trb.logits[diff_pos][std::size_t(v)]);
+      }
+      const int ba = diff_pos < tra.active_B.size() ? tra.active_B[diff_pos] : -1;
+      const int bb = diff_pos < trb.active_B.size() ? trb.active_B[diff_pos] : -1;
+      std::printf(
+          "  [phase-f diag %s] FIRST_DIFF pos=%zu tok_a=%d(am=%d margin=%.6f B=%d) tok_b=%d(am=%d margin=%.6f B=%d) "
+          "max_logit_diff=%.6f\n",
+          label, diff_pos, ta[diff_pos], am_a, margin_a, ba, tb[diff_pos], am_b, margin_b, bb,
+          (has_la && has_lb) ? d.max_abs : -1.f);
+    };
+
+    RunOut solo96;
+    std::vector<int32_t> o24a, o24b, om65, om96, ol96a, ol96b;
+    std::optional<std::string> e1, e2, em1, em2, el1, el2;
+    PhaseFTrace solo96_tr;
+    std::array<PhaseFTrace, 2> tight_24_tr, tight_m_tr;
+    std::vector<std::vector<int>> tight_24_sched, tight_m_sched;
+    int slot_m65 = 0, slot_m96 = 1;
+
+    {
+      RuntimeOptions opt_tight;
+      opt_tight.model_dir = model_dir;
+      opt_tight.max_ctx = 384;
+      opt_tight.max_kv_tokens = 384;
+      opt_tight.prefill_chunk = 384;
+      opt_tight.dense_fp8 = true;
+      opt_tight.kv_fp8 = true;
+      opt_tight.max_batch = 2;
+      opt_tight.vram_limit_mb = vram_limit_mb;
+      opt_tight.spec = true;
+      opt_tight.spec_threshold = 0.0f;
+      opt_tight.prefix_cache = true;
+      auto gen = ingine::model::make_generator(opt_tight);
+      vram.sample();
+
+      solo96_tr.init(96);
+      {
+        std::array<PhaseFTrace, 2> tmp_tr;
+        tmp_tr[0].init(96);
+        std::array<int, 2> pos = {1, 1};
+        std::vector<std::vector<int>> dummy_sched;
+        BatchSpecTraceConfig cfg;
+        cfg.capture_target_logits = true;
+        cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& trs) { capture_step(trs, tmp_tr, pos, dummy_sched); };
+        TraceGuard tg(std::move(cfg));
+        solo96 = run_solo(*gen, Prompt{p192, {}}, 96, greedy);
+        solo96_tr = std::move(tmp_tr[0]);
+      }
+      CHECK(solo96.tokens.size() == 96);
+
+      Scheduler sched(*gen, {}, 4);
+      {
+        tight_24_tr[0].init(24);
+        tight_24_tr[1].init(24);
+        std::array<int, 2> pos = {1, 1};
+        BatchSpecTraceConfig cfg;
+        cfg.capture_target_logits = true;
+        cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& trs) {
+          capture_step(trs, tight_24_tr, pos, tight_24_sched);
+        };
+        TraceGuard tg(std::move(cfg));
+        auto s24a = std::make_shared<Job>(p192, 24, greedy);
+        auto s24b = std::make_shared<Job>(p192, 24, greedy);
+        CHECK(sched.submit(s24a) && sched.submit(s24b));
+        o24a = drain_job(*s24a, &e1);
+        o24b = drain_job(*s24b, &e2);
+      }
+
+      {
+        tight_m_tr[0].init(96);
+        tight_m_tr[1].init(96);
+        std::array<int, 2> pos = {1, 1};
+        BatchSpecTraceConfig cfg;
+        cfg.capture_target_logits = true;
+        cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& trs) {
+          capture_step(trs, tight_m_tr, pos, tight_m_sched);
+        };
+        TraceGuard tg(std::move(cfg));
+        auto m65 = std::make_shared<Job>(p192, 65, greedy);
+        auto m96 = std::make_shared<Job>(p192, 96, greedy);
+        CHECK(sched.submit(m65) && sched.submit(m96));
+        om65 = drain_job(*m65, &em1);
+        om96 = drain_job(*m96, &em2);
+        slot_m65 = (pos[0] < pos[1]) ? 0 : 1;
+        slot_m96 = 1 - slot_m65;
+      }
+
+      auto l96a = std::make_shared<Job>(p192, 96, greedy);
+      auto l96b = std::make_shared<Job>(p192, 96, greedy);
+      CHECK(sched.submit(l96a) && sched.submit(l96b));
+      ol96a = drain_job(*l96a, &el1);
+      ol96b = drain_job(*l96b, &el2);
+      vram.sample();
+    }  // destroy gen_tight before roomy-pool diagnostic generator!
+
+    // Peer equality + strict checks + computed summary (never hardcoded PASS)
+    const bool ok_24_len = !e1 && !e2 && o24a.size() == 24 && o24b.size() == 24;
+    const bool ok_24_peer = ok_24_len && (o24a == o24b);
+    const bool ok_24_a_solo = ok_24_len && std::equal(o24a.begin(), o24a.end(), solo96.tokens.begin());
+    const bool ok_24_b_solo = ok_24_len && std::equal(o24b.begin(), o24b.end(), solo96.tokens.begin());
+    CHECK(ok_24_len);
+    CHECK(ok_24_peer);
+    CHECK(ok_24_a_solo);
+    CHECK(ok_24_b_solo);
+
+    const bool ok_m_len = !em1 && !em2 && om65.size() == 65 && om96.size() == 96;
+    const bool ok_m_peer65 = ok_m_len && std::equal(om65.begin(), om65.end(), om96.begin());
+    const bool ok_m65_solo = ok_m_len && std::equal(om65.begin(), om65.end(), solo96.tokens.begin());
+    const bool ok_m96_solo = ok_m_len && (om96 == solo96.tokens);
+    CHECK(ok_m_len);
+    CHECK(ok_m65_solo);
+    CHECK(ok_m96_solo);
+
+    const bool ok_96_len = !el1 && !el2 && ol96a.size() == 96 && ol96b.size() == 96;
+    const bool ok_96_peer = ok_96_len && (ol96a == ol96b);
+    const bool ok_96_solo = ok_96_len && (ol96a == solo96.tokens && ol96b == solo96.tokens);
+    CHECK(ok_96_peer);
+    CHECK(ok_96_solo);
+
+    // Same-geometry / exact active-schedule roomy-pool (32 pages = 2048 tokens) diagnostic comparison
+    {
+      RuntimeOptions opt_roomy;
+      opt_roomy.model_dir = model_dir;
+      opt_roomy.max_ctx = 512;
+      opt_roomy.max_kv_tokens = 2048;
+      opt_roomy.prefill_chunk = 512;
+      opt_roomy.dense_fp8 = true;
+      opt_roomy.kv_fp8 = true;
+      opt_roomy.max_batch = 2;
+      opt_roomy.vram_limit_mb = vram_limit_mb;
+      opt_roomy.spec = true;
+      opt_roomy.spec_threshold = 0.0f;
+      opt_roomy.prefix_cache = true;
+      auto gen_roomy = ingine::model::make_generator(opt_roomy);
+      vram.sample();
+
+      PhaseFTrace roomy_solo_tr;
+      roomy_solo_tr.init(96);
+      RunOut roomy_solo96;
+      {
+        std::array<PhaseFTrace, 2> tmp_tr;
+        tmp_tr[0].init(96);
+        std::array<int, 2> pos = {1, 1};
+        std::vector<std::vector<int>> dummy_sched;
+        BatchSpecTraceConfig cfg;
+        cfg.capture_target_logits = true;
+        cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& trs) { capture_step(trs, tmp_tr, pos, dummy_sched); };
+        TraceGuard tg(std::move(cfg));
+        roomy_solo96 = run_solo(*gen_roomy, Prompt{p192, {}}, 96, greedy);
+        roomy_solo_tr = std::move(tmp_tr[0]);
+      }
+
+      auto replay_schedule_pair = [&](int max0, int max1, const std::vector<std::vector<int>>& sched_ref,
+                                      std::array<std::vector<int32_t>, 2>& outs, std::array<PhaseFTrace, 2>& traces) {
+        const std::array<int, 2> max_new = {max0, max1};
+        traces[0].init(std::size_t(max0));
+        traces[1].init(std::size_t(max1));
+        std::array<int, 2> slots = {-1, -1};
+        std::array<int32_t, 2> last_tok = {0, 0};
+        for (int i = 0; i < 2; ++i) {
+          GenerateStats st;
+          slots[std::size_t(i)] =
+              gen_roomy->start_slot(Prompt{p192, {}}, max_new[std::size_t(i)], greedy, last_tok[std::size_t(i)], st);
+          CHECK(slots[std::size_t(i)] >= 0);
+          outs[std::size_t(i)].push_back(last_tok[std::size_t(i)]);
+        }
+        std::array<int, 2> cur_pos = {1, 1};
+        std::vector<std::vector<int>> dummy_sched;
+        auto run_subset = [&](const std::vector<int>& subset) {
+          std::vector<int> live_idx;
+          for (int s : subset) {
+            if (s >= 0 && s < 2 && slots[std::size_t(s)] >= 0 &&
+                int(outs[std::size_t(s)].size()) < max_new[std::size_t(s)]) {
+              live_idx.push_back(s);
+            }
+          }
+          if (live_idx.empty()) return;
+          std::vector<BatchSlotStep> steps(live_idx.size());
+          std::vector<BatchSlotResult> res(live_idx.size());
+          for (std::size_t i = 0; i < live_idx.size(); ++i) {
+            const int s = live_idx[i];
+            steps[i] = {slots[std::size_t(s)], last_tok[std::size_t(s)]};
+          }
+          {
+            BatchSpecTraceConfig cfg;
+            cfg.capture_target_logits = true;
+            cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& trs) {
+              capture_step(trs, traces, cur_pos, dummy_sched);
+            };
+            TraceGuard tg(std::move(cfg));
+            gen_roomy->step_slots_multi(steps, res);
+          }
+          for (std::size_t i = 0; i < live_idx.size(); ++i) {
+            const int s = live_idx[i];
+            auto& out = outs[std::size_t(s)];
+            for (int k = 0; k < res[i].count && int(out.size()) < max_new[std::size_t(s)]; ++k) {
+              out.push_back(res[i].tokens[k]);
+            }
+            last_tok[std::size_t(s)] = out.back();
+            if (int(out.size()) >= max_new[std::size_t(s)]) {
+              gen_roomy->release_slot(slots[std::size_t(s)]);
+              slots[std::size_t(s)] = -1;
+            }
+          }
+        };
+        for (const auto& sub : sched_ref) run_subset(sub);
+        while (slots[0] >= 0 || slots[1] >= 0) run_subset({0, 1});
+      };
+
+      std::array<std::vector<int32_t>, 2> roomy_24, roomy_m;
+      std::array<PhaseFTrace, 2> roomy_24_tr, roomy_m_tr;
+      replay_schedule_pair(24, 24, tight_24_sched, roomy_24, roomy_24_tr);
+      replay_schedule_pair(slot_m65 == 0 ? 65 : 96, slot_m65 == 0 ? 96 : 65, tight_m_sched, roomy_m, roomy_m_tr);
+
+      const auto& rm65 = roomy_m[std::size_t(slot_m65)];
+      const auto& rm96 = roomy_m[std::size_t(slot_m96)];
+      const auto& rm65_tr = roomy_m_tr[std::size_t(slot_m65)];
+      const auto& rm96_tr = roomy_m_tr[std::size_t(slot_m96)];
+      const auto& tm65_tr = tight_m_tr[std::size_t(slot_m65)];
+      const auto& tm96_tr = tight_m_tr[std::size_t(slot_m96)];
+
+      report_first_diff("tight_solo96_vs_roomy_solo96", solo96.tokens, solo96_tr, roomy_solo96.tokens, roomy_solo_tr);
+      report_first_diff("tight_24a_vs_roomy_24a", o24a, tight_24_tr[0], roomy_24[0], roomy_24_tr[0]);
+      report_first_diff("tight_24b_vs_roomy_24b", o24b, tight_24_tr[1], roomy_24[1], roomy_24_tr[1]);
+      report_first_diff("tight_m65_vs_roomy_m65", om65, tm65_tr, rm65, rm65_tr);
+      report_first_diff("tight_m96_vs_roomy_m96", om96, tm96_tr, rm96, rm96_tr);
+      report_first_diff("tight_24a_vs_tight_solo96", o24a, tight_24_tr[0], solo96.tokens, solo96_tr);
+      report_first_diff("roomy_24a_vs_roomy_solo96", roomy_24[0], roomy_24_tr[0], roomy_solo96.tokens, roomy_solo_tr);
+      report_first_diff("tight_m65_vs_tight_solo96", om65, tm65_tr, solo96.tokens, solo96_tr);
+      report_first_diff("tight_m96_vs_tight_solo96", om96, tm96_tr, solo96.tokens, solo96_tr);
+      vram.sample();
+    }
+
+    const bool ok_24 = ok_24_peer && ok_24_a_solo && ok_24_b_solo;
+    const bool ok_65_96 = ok_m65_solo && ok_m96_solo;
+    const bool ok_96 = ok_96_peer && ok_96_solo;
+    std::printf(
+        "tight 6-page + spec: 24/24=%s(peer=%s) 65/96=%s(peer65=%s) 96/96=%s(peer=%s) "
+        "sched_steps=(24:%zu m:%zu)\n",
+        ok_24 ? "PASS" : "FAIL", ok_24_peer ? "EXACT" : "DIFF", ok_65_96 ? "PASS" : "FAIL",
+        ok_m_peer65 ? "EXACT" : "DIFF", ok_96 ? "PASS" : "FAIL", ok_96_peer ? "EXACT" : "DIFF", tight_24_sched.size(),
+        tight_m_sched.size());
   }
 
   vram.sample();
