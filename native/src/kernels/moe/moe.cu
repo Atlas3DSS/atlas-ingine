@@ -1683,16 +1683,18 @@ __device__ __forceinline__ int dp4a_s8(int32_t a, int32_t b, int c) {
 #endif
 }
 
-// Layout inside caller-owned fixed-address scratch for M > 1 NVFP4 dp4a pre-quantization.
-// Each Runtime/Decoder (or standalone multi-stream caller) owns its own fixed-address scratch buffer so
-// concurrent generators and concurrently replayed CUDA graphs never alias intermediate INT8 activations.
-constexpr std::size_t kDp4aUpQ8Elems = static_cast<std::size_t>(MAXM) * 72 * 8;
-constexpr std::size_t kDp4aUpXsElems = static_cast<std::size_t>(MAXM) * 144;
-constexpr std::size_t kDp4aDownQ8Elems = static_cast<std::size_t>(MAXM) * TOPK * 36 * 8;
-constexpr std::size_t kDp4aDownXsElems = static_cast<std::size_t>(MAXM) * TOPK * 72;
-static_assert(kDp4aUpQ8Elems * sizeof(int32_t) + kDp4aUpXsElems * sizeof(float) <= kDp4aScratchBytes);
-static_assert(kDp4aDownQ8Elems * sizeof(int32_t) + kDp4aDownXsElems * sizeof(float) <= kDp4aScratchBytes);
-static_assert((kDp4aUpQ8Elems * sizeof(int32_t)) % 16 == 0 && (kDp4aDownQ8Elems * sizeof(int32_t)) % 16 == 0);
+// Per-token layout inside caller-owned fixed-address scratch for M > 1 NVFP4 dp4a pre-quantization.
+// Partitioned by actual M so callers supplying the existing moe_down ActT[M * 8 * H] buffer (M * 36,864 B;
+// e.g. 73,728 B at M = 2) always have ample headroom (moe_down needs M * 11,520 B; moe_up needs M * 2,880 B),
+// and each Runtime/Decoder (or standalone multi-stream caller) isolates its own intermediates.
+constexpr std::size_t kDp4aUpQ8PerTok = 72 * 8;              // 576 int32 = 2,304 B / tok (16-byte aligned)
+constexpr std::size_t kDp4aUpXsPerTok = 144;                 // 144 float = 576 B / tok
+constexpr std::size_t kDp4aDownQ8PerTok = TOPK * 36 * 8;     // 2,304 int32 = 9,216 B / tok (16-byte aligned)
+constexpr std::size_t kDp4aDownXsPerTok = TOPK * 72;         // 576 float = 2,304 B / tok
+static_assert(kDp4aUpQ8PerTok * sizeof(int32_t) + kDp4aUpXsPerTok * sizeof(float) <= dp4a_scratch_bytes(1));
+static_assert(kDp4aDownQ8PerTok * sizeof(int32_t) + kDp4aDownXsPerTok * sizeof(float) == dp4a_scratch_bytes(1));
+static_assert(dp4a_scratch_bytes(1) <= static_cast<std::size_t>(TOPK) * H * sizeof(ActT));
+static_assert((kDp4aUpQ8PerTok * sizeof(int32_t)) % 16 == 0 && (kDp4aDownQ8PerTok * sizeof(int32_t)) % 16 == 0);
 
 template <int K_CHUNKS>
 __global__ void __launch_bounds__(128)
@@ -2989,7 +2991,7 @@ void moe_up(const ActT* x, int M, const int* idx, const void* w13, const void* w
                         require((reinterpret_cast<std::uintptr_t>(workspace) & 15u) == 0,
                                 "moe_up: workspace must be 16-byte aligned");
                         int32_t* q8_ptr = static_cast<int32_t*>(workspace);
-                        float* xs_ptr = reinterpret_cast<float*>(q8_ptr + kDp4aUpQ8Elems);
+                        float* xs_ptr = reinterpret_cast<float*>(q8_ptr + static_cast<std::size_t>(M) * kDp4aUpQ8PerTok);
                         moe_quant_i8_kernel<72><<<M, 128, 0, stream>>>(x, q8_ptr, xs_ptr);
                         CUDA_CHECK(cudaGetLastError());
                         if (M == 2) {
@@ -3072,7 +3074,7 @@ void moe_down(const ActT* act, int M, const int* idx, const float* wts, const vo
                         require((reinterpret_cast<std::uintptr_t>(workspace) & 15u) == 0,
                                 "moe_down: workspace must be 16-byte aligned");
                         int32_t* q8_ptr = reinterpret_cast<int32_t*>(workspace);
-                        float* xs_ptr = reinterpret_cast<float*>(q8_ptr + kDp4aDownQ8Elems);
+                        float* xs_ptr = reinterpret_cast<float*>(q8_ptr + static_cast<std::size_t>(M) * kDp4aDownQ8PerTok);
                         moe_quant_i8_kernel<36><<<M * TOPK, 128, 0, stream>>>(act, q8_ptr, xs_ptr);
                         CUDA_CHECK(cudaGetLastError());
                         if (M == 2) {

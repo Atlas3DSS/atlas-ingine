@@ -273,7 +273,7 @@ bool test_up(Rng& rng, const ExpertWeight& w13, int M) {
   const std::vector<int> idx = routing(rng, M);
   DeviceArray<ingine::ActT> dx(to_bf16(x)), out(size_t(M) * TOPK * I);
   DeviceArray<int> didx(idx);
-  DeviceArray<uint8_t> dp4a_ws(moe::kDp4aScratchBytes);
+  DeviceArray<uint8_t> dp4a_ws(moe::dp4a_scratch_bytes(M));
   const bool is_exl3 = w13.fmt == moe::Format::EXL3_2 || w13.fmt == moe::Format::EXL3_3;
   moe::moe_up(dx.get(), M, didx.get(), w13.codes->get(),
               is_exl3 ? static_cast<const void*>(w13.rin->get()) : static_cast<const void*>(w13.scales->get()),
@@ -349,9 +349,8 @@ bool test_down(Rng& rng, const ExpertWeight& w2, int M) {
   DeviceArray<int> didx(idx);
   DeviceArray<float> dw(wts), dcw(cw), dst(st0), out(size_t(M) * H), hist(size_t(M) * H);
   const bool is_exl3 = w2.fmt == moe::Format::EXL3_2 || w2.fmt == moe::Format::EXL3_3;
-  DeviceArray<uint8_t> dp4a_ws(moe::kDp4aScratchBytes);
-  ingine::ActT* ws_arg = is_exl3 ? dws.get()
-                                 : (w2.fmt == moe::Format::NVFP4 ? reinterpret_cast<ingine::ActT*>(dp4a_ws.get()) : nullptr);
+  // Pass the original ActT[M * 8 * H] workspace (e.g. 73,728 B at M = 2) for both EXL3 and NVFP4.
+  ingine::ActT* ws_arg = (is_exl3 || w2.fmt == moe::Format::NVFP4) ? dws.get() : nullptr;
   moe::moe_down(dact.get(), M, didx.get(), dw.get(), w2.codes->get(),
                 is_exl3 ? static_cast<const void*>(w2.rin->get()) : static_cast<const void*>(w2.scales->get()),
                 (!is_exl3 && w2.fmt != moe::Format::MXFP8) ? w2.factor->get() : nullptr, w2.fmt, dcw.get(), dst.get(),
@@ -496,22 +495,33 @@ bool test_concurrent_streams_and_graphs(Rng& rng, const ExpertWeight& w13, const
     DeviceArray<ingine::ActT> dxa(to_bf16(xa)), dxb(to_bf16(xb));
     DeviceArray<int> didxa(idxa), didxb(idxb);
     DeviceArray<ingine::ActT> out_a(size_t(M) * TOPK * I), out_b(size_t(M) * TOPK * I);
-    DeviceArray<uint8_t> ws_a(moe::kDp4aScratchBytes), ws_b(moe::kDp4aScratchBytes);
+    // Exact-sized raw cudaMalloc buffers (no +16 padding) so memcheck catches any byte past dp4a_scratch_bytes(M)
+    // for moe_up or past the original ActT[M * 8 * H] contract (73,728 B at M = 2) for moe_down.
+    void* ws_up_a = nullptr;
+    void* ws_up_b = nullptr;
+    ingine::ActT* ws_dn_a = nullptr;
+    ingine::ActT* ws_dn_b = nullptr;
+    const size_t up_ws_bytes = moe::dp4a_scratch_bytes(M);
+    const size_t dn_orig_bytes = size_t(M) * TOPK * H * sizeof(ingine::ActT);
+    INGINE_TEST_CUDA(cudaMalloc(&ws_up_a, up_ws_bytes));
+    INGINE_TEST_CUDA(cudaMalloc(&ws_up_b, up_ws_bytes));
+    INGINE_TEST_CUDA(cudaMalloc(&ws_dn_a, dn_orig_bytes));
+    INGINE_TEST_CUDA(cudaMalloc(&ws_dn_b, dn_orig_bytes));
 
-    // Sequential references with per-stream workspace
+    // Sequential references with exact per-M workspace
     moe::moe_up(dxa.get(), M, didxa.get(), w13.codes->get(), w13.scales->get(), w13.factor->get(),
-                moe::Format::NVFP4, out_a.get(), false, g_stream, nullptr, nullptr, ws_a.get());
+                moe::Format::NVFP4, out_a.get(), false, g_stream, nullptr, nullptr, ws_up_a);
     sync();
     const auto ref_up_a = out_a.download();
     moe::moe_up(dxb.get(), M, didxb.get(), w13.codes->get(), w13.scales->get(), w13.factor->get(),
-                moe::Format::NVFP4, out_b.get(), false, g_stream, nullptr, nullptr, ws_b.get());
+                moe::Format::NVFP4, out_b.get(), false, g_stream, nullptr, nullptr, ws_up_b);
     sync();
     const auto ref_up_b = out_b.download();
 
     // Check both per-stream workspace and scratch-free (nullptr) paths
     for (int use_ws : {1, 0}) {
-      void* pa = use_ws ? static_cast<void*>(ws_a.get()) : nullptr;
-      void* pb = use_ws ? static_cast<void*>(ws_b.get()) : nullptr;
+      void* pa = use_ws ? ws_up_a : nullptr;
+      void* pb = use_ws ? ws_up_b : nullptr;
 
       // 1) Concurrent eager two-stream launches (interleaved back-to-back)
       for (int r = 0; r < kRounds; ++r) {
@@ -579,22 +589,22 @@ bool test_concurrent_streams_and_graphs(Rng& rng, const ExpertWeight& w13, const
     DeviceArray<float> douta(size_t(M) * H), doutb(size_t(M) * H);
     DeviceArray<float> dhista(size_t(M) * H), dhistb(size_t(M) * H);
 
-    // Sequential references with per-stream workspace
+    // Sequential references with exact original ActT[M * 8 * H] workspace (73,728 B at M = 2)
     moe::moe_down(dacta.get(), M, d_idxa.get(), dwa.get(), w2.codes->get(), w2.scales->get(), w2.factor->get(),
                   moe::Format::NVFP4, dcw.get(), dsta.get(), douta.get(), dhista.get(), false, g_stream,
-                  nullptr, reinterpret_cast<ingine::ActT*>(ws_a.get()));
+                  nullptr, ws_dn_a);
     sync();
     const auto ref_dn_oa = douta.download(), ref_dn_ha = dhista.download(), ref_dn_sa = dsta.download();
 
     moe::moe_down(dactb.get(), M, d_idxb.get(), dwb.get(), w2.codes->get(), w2.scales->get(), w2.factor->get(),
                   moe::Format::NVFP4, dcw.get(), dstb.get(), doutb.get(), dhistb.get(), false, g_stream,
-                  nullptr, reinterpret_cast<ingine::ActT*>(ws_b.get()));
+                  nullptr, ws_dn_b);
     sync();
     const auto ref_dn_ob = doutb.download(), ref_dn_hb = dhistb.download(), ref_dn_sb = dstb.download();
 
     for (int use_ws : {1, 0}) {
-      ingine::ActT* pa = use_ws ? reinterpret_cast<ingine::ActT*>(ws_a.get()) : nullptr;
-      ingine::ActT* pb = use_ws ? reinterpret_cast<ingine::ActT*>(ws_b.get()) : nullptr;
+      ingine::ActT* pa = use_ws ? ws_dn_a : nullptr;
+      ingine::ActT* pb = use_ws ? ws_dn_b : nullptr;
 
       // 1) Concurrent eager two-stream launches
       for (int r = 0; r < kRounds; ++r) {
@@ -652,11 +662,16 @@ bool test_concurrent_streams_and_graphs(Rng& rng, const ExpertWeight& w13, const
       INGINE_TEST_CUDA(cudaGraphDestroy(gb));
 
       const bool pass_dn = (dn_eager_bad == 0 && dn_graph_bad == 0);
-      std::printf("%s moe_down nvfp4 M=%d two-stream (%s): eager_bad=%zu graph_bad=%zu\n",
-                  pass_dn ? "PASS" : "FAIL", M, use_ws ? "per-stream ws" : "scratch-free",
-                  dn_eager_bad, dn_graph_bad);
+      std::printf("%s moe_down nvfp4 M=%d two-stream (%s, %zu B): eager_bad=%zu graph_bad=%zu\n",
+                  pass_dn ? "PASS" : "FAIL", M, use_ws ? "orig ActT[M*8*H] ws" : "scratch-free",
+                  use_ws ? dn_orig_bytes : size_t(0), dn_eager_bad, dn_graph_bad);
       ok &= pass_dn;
     }
+
+    INGINE_TEST_CUDA(cudaFree(ws_up_a));
+    INGINE_TEST_CUDA(cudaFree(ws_up_b));
+    INGINE_TEST_CUDA(cudaFree(ws_dn_a));
+    INGINE_TEST_CUDA(cudaFree(ws_dn_b));
   }
 
   INGINE_TEST_CUDA(cudaStreamDestroy(sa));
