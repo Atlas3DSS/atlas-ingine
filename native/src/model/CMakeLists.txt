@@ -3,6 +3,7 @@ add_library(ingine_model STATIC
   kv_checkpoint.cpp
   paged_kv.cpp
   weights.cpp
+  weights_gguf.cpp
   state.cpp
   decoder.cpp
   persona_runtime.cpp

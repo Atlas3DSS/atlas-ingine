@@ -29,6 +29,10 @@ namespace {
 
 enum class Mode { Up, Down };
 constexpr int FMT_NVFP4 = 0, FMT_MXFP8 = 1, FMT_ATLAS2 = 2, FMT_ATLAS3 = 3, FMT_EXL3_2 = 4, FMT_EXL3_3 = 5;
+// GGUF experts (model/weights_gguf.cpp): codes as NVFP4's nibbles; per 32-value group Q5L 12 B (FP32 scale, FP32
+// min, the 32 fifth bits: value = scale * code + min), IQ4 4 B (FP32 scale: value = scale * iq4nl[code]).
+constexpr int FMT_GQ5 = 6, FMT_GQI4 = 7;
+constexpr bool is_gguf_fmt(int f) { return f == FMT_GQ5 || f == FMT_GQI4; }
 
 constexpr int TN = 128, BK = 64;
 constexpr int AS = INGINE_ACT_FP16 ? 2 : 3;  // activation stages (2 fits Volta 96 KiB shared memory)
@@ -38,18 +42,20 @@ constexpr int KCH = BK / 8;  // 16-byte chunks per activation tile row
 __constant__ float kE2M1[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
 __constant__ float kAtlas2[4] = {-1.5f, -0.453125f, 0.453125f, 1.5f};
 __constant__ float kAtlas3[8] = {-2.0f, -1.25f, -0.703125f, -0.2265625f, 0.2265625f, 0.703125f, 1.25f, 2.0f};
+__constant__ float kIq4nl[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+                                 1.f,    13.f,   25.f,  38.f,  53.f,  69.f,  89.f,  113.f};
 
 template <int FMT, int K, int TM, bool LOW_SMEM = false>
 struct Cfg {
-  static constexpr int CODE_ROW = FMT == FMT_NVFP4 ? K / 2 : (FMT == FMT_MXFP8 ? K : (FMT == FMT_ATLAS2 ? K / 4 : (K * 3) / 8));
-  static constexpr int SCALE_ROW = FMT == FMT_MXFP8 ? K / 32 : K / 16;
+  static constexpr int CODE_ROW = (FMT == FMT_NVFP4 || is_gguf_fmt(FMT)) ? K / 2 : (FMT == FMT_MXFP8 ? K : (FMT == FMT_ATLAS2 ? K / 4 : (K * 3) / 8));
+  static constexpr int SCALE_ROW = FMT == FMT_GQ5 ? (K / 32) * 12 : (FMT == FMT_GQI4 ? (K / 32) * 4 : (FMT == FMT_MXFP8 ? K / 32 : K / 16));
   // weight chunk: 128 elements for NVFP4/ATLAS2/ATLAS3 (64/32/48 code bytes per row, all multiples of 16), 64 for MXFP8
   static constexpr int WK = FMT == FMT_MXFP8 ? 64 : 128;
   static constexpr int R = WK / BK;  // activation steps per weight chunk
   static constexpr int KC = K / WK;  // weight chunks
   static constexpr int AS_STG = LOW_SMEM ? 2 : AS;
   // On Volta sm_70 native HMMA (INGINE_ACT_FP16 && !LOW_SMEM && !INGINE_FORCE_SIMT_MMA), each warp owns
-  // its 16 weight rows exclusively and cp.async does not exist. Streaming NVFP4/MXFP8 weights + scales
+  // its 16 weight rows exclusively and cp.async does not exist. Streaming NVFP4/MXFP8/GGUF weights + scales
   // directly via __ldg into registers eliminates w_smem (20 KiB) and sc_smem (18 KiB), dropping TM=32 SMEM
   // from 88 KiB -> 8.2 KiB. When INGINE_FORCE_SIMT_MMA is enabled, the kernel takes the #else SIMT loop
   // which reads staged w_smem/sc_smem, so VOLTA_DIRECT/VOLTA_COMPACT must be disabled to keep SMEM sized.
@@ -58,15 +64,15 @@ struct Cfg {
 #else
   static constexpr bool VOLTA_NATIVE = INGINE_ACT_FP16 && !LOW_SMEM;
 #endif
-  static constexpr bool VOLTA_DIRECT = VOLTA_NATIVE && (FMT == FMT_NVFP4 || FMT == FMT_MXFP8);
+  static constexpr bool VOLTA_DIRECT = VOLTA_NATIVE && (FMT == FMT_NVFP4 || FMT == FMT_MXFP8 || is_gguf_fmt(FMT));
   static constexpr bool VOLTA_COMPACT = VOLTA_NATIVE;
   static constexpr bool STAGE_W = !VOLTA_DIRECT;
-  static constexpr bool STAGE_SC = !VOLTA_COMPACT;
+  static constexpr bool STAGE_SC = !VOLTA_COMPACT && !is_gguf_fmt(FMT);
   static constexpr int WS = (LOW_SMEM || VOLTA_COMPACT) ? (FMT == FMT_MXFP8 ? 3 : 2)
                                      : (TM <= 32 ? (FMT == FMT_MXFP8 ? 7 : 6)
                                                  : (INGINE_ACT_FP16 ? 3 : (FMT == FMT_MXFP8 ? 4 : 3)));
   static_assert(R * (WS - 1) >= AS_STG);
-  static constexpr int WCODE = FMT == FMT_NVFP4 ? WK / 2 : (FMT == FMT_MXFP8 ? WK : (FMT == FMT_ATLAS2 ? WK / 4 : (WK * 3) / 8));
+  static constexpr int WCODE = (FMT == FMT_NVFP4 || is_gguf_fmt(FMT)) ? WK / 2 : (FMT == FMT_MXFP8 ? WK : (FMT == FMT_ATLAS2 ? WK / 4 : (WK * 3) / 8));
   static constexpr int WSTRIDE = WCODE + 16;                    // padded: fragment loads on distinct banks
   static constexpr int W_BYTES = STAGE_W ? (TN * WSTRIDE) : 0;
   static constexpr int A_BYTES = TM * BK * 2;
@@ -220,6 +226,8 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
     if (tid < 4) lut[tid] = kAtlas2[tid];
   } else if constexpr (FMT == FMT_ATLAS3) {
     if (tid < 8) lut[tid] = kAtlas3[tid];
+  } else if constexpr (FMT == FMT_GQI4) {
+    if (tid < 16) lut[tid] = kIq4nl[tid];
   }
 
   // activation rows of this thread's cp.async chunks: rows tid / 8 + 32 i, chunk tid % 8
@@ -431,6 +439,95 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
           w0_cur[nt] = w0_nxt[nt];
           w1_cur[nt] = w1_nxt[nt];
           s4_cur[nt] = s4_nxt[nt];
+        }
+      }
+    }
+  } else if constexpr (C::VOLTA_DIRECT && is_gguf_fmt(FMT)) {
+    // Direct __ldg Volta path for the GGUF expert formats: the NVFP4 path's code stream (32 B a row a step), the
+    // step's two 32-value groups' scales (Q5L: scale, min, fifth bits each; IQ4: scale), each value formed in FP32
+    // (scale * code + min, or scale * iq4nl[code]) and rounded once to FP16.
+    constexpr int SB = FMT == FMT_GQ5 ? 24 : 8;  // scale bytes a step (two groups)
+    const uint8_t* wrow[2] = {
+        code_tile + int64_t(warp * 16 + v_idx) * C::CODE_ROW,
+        code_tile + int64_t(warp * 16 + 8 + v_idx) * C::CODE_ROW,
+    };
+    const uint8_t* srow[2] = {
+        scale_tile + int64_t(warp * 16 + v_idx) * C::SCALE_ROW,
+        scale_tile + int64_t(warp * 16 + 8 + v_idx) * C::SCALE_ROW,
+    };
+    uint4 w0_cur[2], w1_cur[2];
+    uint2 s_cur[2][3];
+    auto load_step = [&](int ks, uint4 (&w0)[2], uint4 (&w1)[2], uint2 (&sv)[2][3]) {
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+        w0[nt] = __ldg(reinterpret_cast<const uint4*>(wrow[nt] + ks * 32));
+        w1[nt] = __ldg(reinterpret_cast<const uint4*>(wrow[nt] + ks * 32 + 16));
+        const uint2* sp = reinterpret_cast<const uint2*>(srow[nt] + ks * SB);
+        sv[nt][0] = __ldg(sp);
+        if constexpr (FMT == FMT_GQ5) sv[nt][1] = __ldg(sp + 1), sv[nt][2] = __ldg(sp + 2);
+      }
+    };
+    load_step(0, w0_cur, w1_cur, s_cur);
+#pragma unroll 1
+    for (int ks = 0; ks < KS; ++ks) {
+      __syncthreads();
+      issue(ks + C::AS_STG - 1);
+      const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % C::AS_STG) * C::A_BYTES);
+      uint4 w0_nxt[2], w1_nxt[2];
+      uint2 s_nxt[2][3];
+      if (ks + 1 < KS) load_step(ks + 1, w0_nxt, w1_nxt, s_nxt);
+      auto decode_v = [&](int kk, unsigned (&b)[2][4]) {
+        const int grp = kk >> 1, base = (kk & 1) * 16 + v_kh;  // the group and the lane's first value in it
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          const uint32_t wx = (kk == 0) ? w0_cur[nt].x : (kk == 1) ? w0_cur[nt].z : (kk == 2) ? w1_cur[nt].x : w1_cur[nt].z;
+          const uint32_t wy = (kk == 0) ? w0_cur[nt].y : (kk == 1) ? w0_cur[nt].w : (kk == 2) ? w1_cur[nt].y : w1_cur[nt].w;
+          const uint32_t ca = wx >> (v_kh * 4), cb = wy >> (v_kh * 4);  // values base + j, base + 8 + j
+          float sc, mn = 0.f;
+          uint32_t hb = 0;
+          if constexpr (FMT == FMT_GQ5) {
+            // step layout: s0 m0 h0 | s1 m1 h1 as three 8-byte words
+            sc = __uint_as_float(grp ? s_cur[nt][1].y : s_cur[nt][0].x);
+            mn = __uint_as_float(grp ? s_cur[nt][2].x : s_cur[nt][0].y);
+            hb = grp ? s_cur[nt][2].y : s_cur[nt][1].x;
+          } else {
+            sc = __uint_as_float(grp ? s_cur[nt][0].y : s_cur[nt][0].x);
+          }
+          float v[8];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const uint32_t qa = (ca >> (4 * j)) & 15u, qb = (cb >> (4 * j)) & 15u;
+            if constexpr (FMT == FMT_GQ5) {
+              const uint32_t a5 = qa | (((hb >> (base + j)) & 1u) << 4), b5 = qb | (((hb >> (base + 8 + j)) & 1u) << 4);
+              v[j] = __fadd_rn(__fmul_rn(sc, float(a5)), mn);
+              v[4 + j] = __fadd_rn(__fmul_rn(sc, float(b5)), mn);
+            } else {
+              v[j] = __fmul_rn(sc, lut[qa]);
+              v[4 + j] = __fmul_rn(sc, lut[qb]);
+            }
+          }
+#pragma unroll
+          for (int bi = 0; bi < 4; ++bi) {
+            const __half2 h = __floats2half2_rn(v[2 * bi], v[2 * bi + 1]);
+            b[nt][bi] = *reinterpret_cast<const unsigned*>(&h);
+          }
+        }
+      };
+      switch (mact) {
+        case 1: if constexpr (1 <= TM / 16) mma_step_sm70<1, TM>(acc_v, A, lane, decode_v); break;
+        case 2: if constexpr (2 <= TM / 16) mma_step_sm70<2, TM>(acc_v, A, lane, decode_v); break;
+        case 3: if constexpr (3 <= TM / 16) mma_step_sm70<3, TM>(acc_v, A, lane, decode_v); break;
+        case 4: if constexpr (4 <= TM / 16) mma_step_sm70<4, TM>(acc_v, A, lane, decode_v); break;
+        case 5: if constexpr (5 <= TM / 16) mma_step_sm70<5, TM>(acc_v, A, lane, decode_v); break;
+        case 6: if constexpr (6 <= TM / 16) mma_step_sm70<6, TM>(acc_v, A, lane, decode_v); break;
+        case 7: if constexpr (7 <= TM / 16) mma_step_sm70<7, TM>(acc_v, A, lane, decode_v); break;
+        default: mma_step_sm70<TM / 16, TM>(acc_v, A, lane, decode_v); break;
+      }
+      if (ks + 1 < KS) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          w0_cur[nt] = w0_nxt[nt], w1_cur[nt] = w1_nxt[nt];
+          s_cur[nt][0] = s_nxt[nt][0], s_cur[nt][1] = s_nxt[nt][1], s_cur[nt][2] = s_nxt[nt][2];
         }
       }
     }
@@ -1068,6 +1165,10 @@ void moe_gate_up(const MoeExperts& e, const ActT* x, int T, const MoeWork& w, Ac
   if (e.fmt == FMT_NVFP4) launch_rows<FMT_NVFP4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
   else if (e.fmt == FMT_MXFP8) launch_rows<FMT_MXFP8, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
   else if (e.fmt == FMT_ATLAS2) launch_rows<FMT_ATLAS2, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+#if INGINE_ACT_FP16
+  else if (e.fmt == FMT_GQ5) launch_rows<FMT_GQ5, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+  else if (e.fmt == FMT_GQI4) launch_rows<FMT_GQI4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
+#endif
   else launch_rows<FMT_ATLAS3, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
 }
 
@@ -1100,6 +1201,10 @@ void moe_down(const MoeExperts& e, const ActT* act, int T, const MoeWork& w, Act
   if (w2_fmt == FMT_NVFP4) launch_rows<FMT_NVFP4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
   else if (w2_fmt == FMT_MXFP8) launch_rows<FMT_MXFP8, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
   else if (w2_fmt == FMT_ATLAS2) launch_rows<FMT_ATLAS2, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+#if INGINE_ACT_FP16
+  else if (w2_fmt == FMT_GQ5) launch_rows<FMT_GQ5, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+  else if (w2_fmt == FMT_GQI4) launch_rows<FMT_GQI4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
+#endif
   else launch_rows<FMT_ATLAS3, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
 }
 

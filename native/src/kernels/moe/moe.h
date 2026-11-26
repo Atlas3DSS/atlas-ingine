@@ -15,7 +15,7 @@
 
 namespace ingine::kernels::moe {
 
-enum class Format : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5 };
+enum class Format : int { NVFP4 = 0, MXFP8 = 1, ATLAS2 = 2, ATLAS3 = 3, EXL3_2 = 4, EXL3_3 = 5 , GGUF_Q5L = 6, GGUF_IQ4 = 7 };
 
 // Minimum size (bytes, 16-byte aligned) of caller-owned fixed-address device scratch for pre-SM80 M > 1 NVFP4
 // dp4a activation pre-quantization, partitioned by actual M:

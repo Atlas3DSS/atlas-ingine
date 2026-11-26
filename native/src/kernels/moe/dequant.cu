@@ -207,6 +207,7 @@ __global__ void dequant_exl3_kernel(const uint8_t* __restrict__ codes, const __h
 // or [128, R/16, C/16, 32*bits] (EXL3_2 / EXL3_3); experts int32 [n]; out ActT [n, R, C].
 void dequant_experts(const void* codes, const void* scales, const float* factor, const std::int32_t* experts, int n,
                      int rows, int cols, Format fmt, ActT* out, cudaStream_t stream, const void* rout) {
+    if (static_cast<int>(fmt) > 5) throw std::invalid_argument("dequant_experts: GGUF expert formats are not supported here");
     if (fmt == Format::EXL3_2 || fmt == Format::EXL3_3) {
         if (n < 0 || rows <= 0 || cols <= 0 || rows % 128 != 0 || cols % 128 != 0 || !codes || !scales || !rout ||
             !experts || !out)
