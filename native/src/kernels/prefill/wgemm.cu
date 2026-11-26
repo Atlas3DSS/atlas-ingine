@@ -390,10 +390,12 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
       for (int nt = 0; nt < 2; ++nt) {
         const float2 lo = e4m3x2_to_float2(uint16_t(s4_cur[nt] & 0xffff));
         const float2 hi = e4m3x2_to_float2(uint16_t(s4_cur[nt] >> 16));
-        sfh_v[nt][0] = __float2half2_rn(lo.x * factor);
-        sfh_v[nt][1] = __float2half2_rn(lo.y * factor);
-        sfh_v[nt][2] = __float2half2_rn(hi.x * factor);
-        sfh_v[nt][3] = __float2half2_rn(hi.y * factor);
+        // (the E4M3 scale alone: code x scale is exact in FP16; scale x factor underflowed FP16 for small block scales
+        //  - the expert factor multiplies the FP32 sums in the epilogue instead)
+        sfh_v[nt][0] = __float2half2_rn(lo.x);
+        sfh_v[nt][1] = __float2half2_rn(lo.y);
+        sfh_v[nt][2] = __float2half2_rn(hi.x);
+        sfh_v[nt][3] = __float2half2_rn(hi.y);
       }
       auto decode_v = [&](int kk, unsigned (&b)[2][4]) {
 #pragma unroll
@@ -650,7 +652,10 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
 #pragma unroll
       for (int nt = 0; nt < 2; ++nt) {
         const int cl = warp * 16 + nt * 8 + c * 2;  // column inside the tile
-        const float c0 = acc[mt][nt][2 * half], c1 = acc[mt][nt][2 * half + 1];
+        float c0 = acc[mt][nt][2 * half], c1 = acc[mt][nt][2 * half + 1];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(INGINE_FORCE_SIMT_MMA)
+        if constexpr (C::VOLTA_DIRECT && FMT == FMT_NVFP4) c0 *= factor, c1 *= factor;
+#endif
         if constexpr (MODE == Mode::Up) {
           const float gt = round_bf16(c0), u = round_bf16(c1);
           const float sig = 1.f / (1.f + expf(-gt));
