@@ -425,6 +425,7 @@ class BatchDecoder {
     bytes += M * (3 * 2 * H + 3 * GATE_RANK) * sizeof(ActT);
     if (M > 8) {
       bytes += M * std::size_t(kHeadChunk) * sizeof(float);
+      bytes += std::size_t(3) * 8 * H * sizeof(ActT);
     }
     if (dense_fp8 && M > 32) bytes += std::size_t(kHeadChunk) * H * sizeof(ActT);
     if (spec_enabled) {
@@ -478,7 +479,7 @@ class BatchDecoder {
     for (int p = 0; p < PASSES; ++p) B2_[p] = f32(M * H), E_[p] = f32(M * H);
     hid_ = f32(M * H), part_ = f32(M * H), y_ = f32(M * H), y2_ = f32(M * H);
     xin_ = bf16(3 * M * H), xm_ = bf16(M * H), xf_ = bf16(M * H);
-    xin_chunk_ = (w.dense_fp8 && M > 8) ? bf16(3 * 8 * H) : nullptr;
+    xin_chunk_ = M > 8 ? bf16(3 * 8 * H) : nullptr;
     mixf_ = f32(3 * M * H), msgs_ = f32(4 * M * H), mixm_ = f32(M * H);
     proj_fp32_ = f32(M * PROJ_ROWS_FULL);
     attn_out_ = bf16(M * HEADS * HEAD_DIM);
@@ -788,12 +789,6 @@ class BatchDecoder {
       dense::mix(p, false, stream);
     };
 
-    auto unscaled_rows = [&](const Dense& d) -> const ActT* {
-      if (!d.fp8()) return bf16p(d.w);
-      bk::dequant_e4m3_unscaled(d.w.data, d.rows(), d.cols(), wscratch_, stream);
-      return wscratch_;
-    };
-
     auto next_gemv_chunk = [](int rem) -> int {
       if (rem <= 8) return rem;
       if (rem == 9) return 5;  // keep every chunk in {2..8} so M >= 2 stays on gemv_mma_kernel
@@ -862,52 +857,30 @@ class BatchDecoder {
       }
 
       // ---- Attention projections over M = B * W rows
+      // Always use chunked dense::proj (chunks in {2..8} for M >= 2) so wproj is 0-ULP M-invariant across
+      // decode and verify batch sizes and cannot trigger cuBLASLt heuristic-dependent MoE router flips.
       const int R = proj_rows(layer.full);
       const bool single = !layer.full && !msgs;
-      const bool proj_gemv = use_gemv || (layer.wproj.fp8() && M <= 32);
-      if (proj_gemv) {
-        const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
-        if (M <= 8) {
-          dense::proj(xin_, M, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_,
-                      false, stream);
-        } else {
-          for (int m0 = 0; m0 < M;) {
-            const int cm = next_gemv_chunk(M - m0);
-            const ActT* xptr = xin_ + std::size_t(m0) * H;
-            if (!single) {
-              for (int g = 0; g < 3; ++g) {
-                CUDA_CHECK(cudaMemcpyAsync(xin_chunk_ + std::size_t(g) * cm * H,
-                                           xin_ + std::size_t(g) * slab + std::size_t(m0) * H,
-                                           std::size_t(cm) * H * sizeof(ActT), cudaMemcpyDeviceToDevice, stream));
-              }
-              xptr = xin_chunk_;
-            }
-            dense::proj(xptr, cm, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full),
-                        proj_fp32_ + std::size_t(m0) * R, false, stream);
-            m0 += cm;
-          }
-        }
+      const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
+      if (M <= 8) {
+        dense::proj(xin_, M, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full), proj_fp32_,
+                    false, stream);
       } else {
-        const ActT* wp = unscaled_rows(layer.wproj);
-        if (single) {
-          gemm_->run(xin_, H, wp, H, proj_fp32_, R, true, M, R, H, stream);
-        } else {
-          struct Part {
-            int begin, end, input;
-          };
-          const Part parts[] = {{SEG_BEGIN[SEG_Q], SEG_BEGIN[SEG_K], 0},
-                                {SEG_BEGIN[SEG_K], SEG_BEGIN[SEG_V], 1},
-                                {SEG_BEGIN[SEG_V], SEG_BEGIN[SEG_K_DYN], 2},
-                                {SEG_BEGIN[SEG_K_DYN], SEG_BEGIN[SEG_V_DYN], 1},
-                                {SEG_BEGIN[SEG_V_DYN], SEG_BEGIN[NUM_SEGS], 2}};
-          for (const Part& part : parts) {
-            if (part.begin >= R) break;
-            gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H,
-                       proj_fp32_ + part.begin, R, true, M, part.end - part.begin, H, stream);
+        for (int m0 = 0; m0 < M;) {
+          const int cm = next_gemv_chunk(M - m0);
+          const ActT* xptr = xin_ + std::size_t(m0) * H;
+          if (!single) {
+            for (int g = 0; g < 3; ++g) {
+              CUDA_CHECK(cudaMemcpyAsync(xin_chunk_ + std::size_t(g) * cm * H,
+                                         xin_ + std::size_t(g) * slab + std::size_t(m0) * H,
+                                         std::size_t(cm) * H * sizeof(ActT), cudaMemcpyDeviceToDevice, stream));
+            }
+            xptr = xin_chunk_;
           }
+          dense::proj(xptr, cm, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full),
+                      proj_fp32_ + std::size_t(m0) * R, false, stream);
+          m0 += cm;
         }
-        bk::batched_scale_round_fp32(proj_fp32_, R, layer.wproj.fp8() ? f32p(layer.wproj.scale) : nullptr, M, R,
-                                     stream);
       }
 
       // ---- Batched per-slot attention (1-tok fast path when !verify_mode or W==1 vs multi-token verify path)
@@ -1003,20 +976,14 @@ class BatchDecoder {
       }
 
       // ---- Output projection + per-slot post-attention 4-tap conv
+      // Always use chunked dense::gemv (chunks in {2..8} for M >= 2) so wo is 0-ULP M-invariant before MoE routers.
       float* conv_attn_v = static_cast<float*>(pool_.conv_attn.p) + std::size_t(v) * (CONV_K - 1) * H;
       float* hist_attn_v = save_hist ? (hist_attn_ + std::size_t(v) * hist_h_visit_stride_) : nullptr;
-      const bool wo_gemv = use_gemv || (layer.wo.fp8() && M <= 32);
-      if (wo_gemv) {
-        for (int m0 = 0; m0 < M;) {
-          const int cm = next_gemv_chunk(M - m0);
-          dense::gemv(attn_out_ + std::size_t(m0) * HEADS * HEAD_DIM, cm, HEADS * HEAD_DIM, matrix(layer.wo),
-                      wo_fp32_ + std::size_t(m0) * H, false, stream);
-          m0 += cm;
-        }
-      } else {
-        const ActT* wo = unscaled_rows(layer.wo);
-        gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_fp32_, H, true, M, H, HEADS * HEAD_DIM, stream);
-        bk::batched_scale_round_fp32(wo_fp32_, H, layer.wo.fp8() ? f32p(layer.wo.scale) : nullptr, M, H, stream);
+      for (int m0 = 0; m0 < M;) {
+        const int cm = next_gemv_chunk(M - m0);
+        dense::gemv(attn_out_ + std::size_t(m0) * HEADS * HEAD_DIM, cm, HEADS * HEAD_DIM, matrix(layer.wo),
+                    wo_fp32_ + std::size_t(m0) * H, false, stream);
+        m0 += cm;
       }
       if (!use_verify_kernels) {
         bk::batched_static_conv_step(wo_fp32_, true, H, B, H, slot_ids_dev_, f32p(layer.attn_conv), conv_attn_v,
