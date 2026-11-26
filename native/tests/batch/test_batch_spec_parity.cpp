@@ -25,6 +25,7 @@ namespace ingine::model {
 void set_batch_prefill_splits_for_test(std::vector<int> splits);
 }  // namespace ingine::model
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
@@ -342,6 +343,179 @@ struct DivergentCase {
   std::vector<float> l_plain;  // ACTUAL live plain logit row [kUnpaddedVocab] captured on exact plain batch replay
 };
 
+uint16_t float_to_fp16_bits_host(float f) {
+  const __half h = __float2half_rn(f);
+  uint16_t bits = 0;
+  std::memcpy(&bits, &h, sizeof(bits));
+  return bits;
+}
+
+int fp16_ulp_distance(float a, float b, uint16_t& bits_a, uint16_t& bits_b, float& step_at_b) {
+  bits_a = float_to_fp16_bits_host(a);
+  bits_b = float_to_fp16_bits_host(b);
+  auto to_ordered = [](uint16_t u) -> int {
+    return (u & 0x8000u) ? -int(u & 0x7fffu) : int(u & 0x7fffu);
+  };
+  const uint16_t mag_b = uint16_t(bits_b & 0x7fffu);
+  const uint16_t next_b = (mag_b < 0x7bffu) ? uint16_t((bits_b & 0x8000u) | (mag_b + 1u)) : bits_b;
+  __half hb{}, hnb{};
+  std::memcpy(&hb, &bits_b, sizeof(hb));
+  std::memcpy(&hnb, &next_b, sizeof(hnb));
+  step_at_b = std::fabs(__half2float(hnb) - __half2float(hb));
+  return std::abs(to_ordered(bits_a) - to_ordered(bits_b));
+}
+
+// Independent target-only small (B=6/12, M<=32 SIMT FP8 GEMV) vs large (B=36, M=36>32 cuBLASLt GEMM) control
+// WITHOUT speculative drafting, verify kernels, or rollback. Evaluates 6 frozen independent prompts over 47 steps.
+int run_fp16_geometry_control(const std::filesystem::path& model_dir, const ingine::text::ChatFormat& fmt,
+                              int vram_limit_mb, VramTracker& vram) {
+  const std::vector<std::string> ctrl_users = {
+      "Explain how a Bloom filter achieves space-efficient probabilistic set membership.",
+      "Describe the difference between optimistic and pessimistic concurrency control.",
+      "Write a short Python generator that yields Fibonacci numbers indefinitely.",
+      "Explain how TLS 1.3 handshake reduces round trips compared to TLS 1.2.",
+      "Summarize how garbage collection mark-and-sweep handles cyclic references.",
+      "Explain how consistent hashing minimizes key remapping when nodes join.",
+  };
+  std::vector<std::vector<int32_t>> ctrl_prompts;
+  for (const auto& u : ctrl_users) ctrl_prompts.push_back(render_prompt(fmt, "", u));
+
+  constexpr int kS = 6;
+  constexpr int kSteps = 48;  // pos 0 from prefill, pos 1..47 from teacher-forced step_slots (282 logit rows)
+
+  RuntimeOptions opt;
+  opt.model_dir = model_dir;
+  opt.max_ctx = 512;
+  opt.prefill_chunk = 512;
+  opt.dense_fp8 = true;
+  opt.kv_fp8 = true;
+  opt.max_batch = 36;
+  opt.max_kv_tokens = 36 * 128;
+  opt.vram_limit_mb = vram_limit_mb;
+  opt.spec = false;
+  opt.prefix_cache = false;
+  auto gen = ingine::model::make_generator(opt);
+  vram.sample();
+
+  // Helper: run B = kS * reps slots on the 6 frozen prompts. If teacher_force is empty, records greedy ref_toks;
+  // otherwise feeds exact teacher_force[s][pos-1] so every geometry evaluates identical prefixes.
+  auto run_plain_geom = [&](int reps, const std::vector<std::vector<int32_t>>& teacher_force,
+                            std::vector<std::vector<int32_t>>& out_toks,
+                            std::vector<std::vector<std::vector<float>>>& out_logits) {
+    const int B = kS * reps;
+    Sampling greedy;
+    greedy.temperature = 0.0f;
+    std::vector<int> slots(std::size_t(B), -1);
+    std::vector<int32_t> last_toks(std::size_t(B), 0);
+    out_toks.assign(kS, {});
+    out_logits.assign(kS, std::vector<std::vector<float>>(kSteps));
+    for (int i = 0; i < B; ++i) {
+      const int s = i % kS;
+      int32_t tok0 = 0;
+      GenerateStats st;
+      slots[std::size_t(i)] = gen->start_slot(Prompt{ctrl_prompts[std::size_t(s)], {}}, kSteps + 2, greedy, tok0, st);
+      CHECK(slots[std::size_t(i)] >= 0);
+      last_toks[std::size_t(i)] = teacher_force.empty() ? tok0 : teacher_force[std::size_t(s)][0];
+      if (i < kS) out_toks[std::size_t(s)].push_back(tok0);
+    }
+    for (int pos = 1; pos < kSteps; ++pos) {
+      std::vector<BatchSlotStep> steps(static_cast<std::size_t>(B));
+      std::vector<int32_t> next(std::size_t(B), 0);
+      for (int i = 0; i < B; ++i) {
+        const int s = i % kS;
+        const int32_t in_tok = teacher_force.empty() ? last_toks[std::size_t(i)] : teacher_force[std::size_t(s)][std::size_t(pos - 1)];
+        steps[std::size_t(i)] = {slots[std::size_t(i)], in_tok};
+      }
+      std::vector<BatchSpecSlotTrace> trs;
+      {
+        BatchSpecTraceConfig cfg;
+        cfg.capture_target_logits = true;
+        cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& t) { trs = t; };
+        TraceGuard tg(std::move(cfg));
+        gen->step_slots(steps, next);
+      }
+      CHECK(trs.size() == std::size_t(B));
+      for (int s = 0; s < kS; ++s) {
+        out_logits[std::size_t(s)][std::size_t(pos)] = trs[std::size_t(s)].target_logits;
+        out_toks[std::size_t(s)].push_back(next[std::size_t(s)]);
+      }
+      last_toks = next;
+    }
+    for (int sl : slots)
+      if (sl >= 0) gen->release_slot(sl);
+    vram.sample();
+  };
+
+  std::vector<std::vector<int32_t>> ref_toks, toks_b12, toks_b36;
+  std::vector<std::vector<std::vector<float>>> logits_b6, logits_b12, logits_b36;
+  run_plain_geom(1, {}, ref_toks, logits_b6);        // B=6  (M=6:  all GEMV + dense::message_gates)
+  run_plain_geom(2, ref_toks, toks_b12, logits_b12); // B=12 (M=12: gates GEMM + proj/wo/head GEMV)
+  run_plain_geom(6, ref_toks, toks_b36, logits_b36); // B=36 (M=36: ALL cuBLASLt GEMM + dequant_rows + softcap)
+
+  auto summarize = [&](const char* label, const std::vector<std::vector<std::vector<float>>>& a_log,
+                       const std::vector<std::vector<std::vector<float>>>& b_log) {
+    std::vector<float> row_maxes;
+    row_maxes.reserve(kS * (kSteps - 1));
+    int gt_06 = 0, gt_15 = 0, flips = 0;
+    float global_max = 0.f;
+    int worst_s = -1, worst_pos = -1;
+    for (int s = 0; s < kS; ++s) {
+      float seq_max = 0.f;
+      for (int pos = 1; pos < kSteps; ++pos) {
+        const auto& la = a_log[std::size_t(s)][std::size_t(pos)];
+        const auto& lb = b_log[std::size_t(s)][std::size_t(pos)];
+        CHECK(la.size() == std::size_t(kUnpaddedVocab) && lb.size() == std::size_t(kUnpaddedVocab));
+        float md = 0.f;
+        for (int v = 0; v < kUnpaddedVocab; ++v) {
+          const float d = std::fabs(lb[std::size_t(v)] - la[std::size_t(v)]);
+          CHECK(std::isfinite(d));
+          if (d > md) md = d;
+        }
+        row_maxes.push_back(md);
+        if (md > seq_max) seq_max = md;
+        if (md > global_max) {
+          global_max = md;
+          worst_s = s;
+          worst_pos = pos;
+        }
+        if (md > 0.6f) ++gt_06;
+        if (md > 1.5f) ++gt_15;
+        const int32_t ama = sv::head_argmax(la);
+        const int32_t amb = sv::head_argmax(lb);
+        if (ama != amb) {
+          ++flips;
+          const float ma = la[std::size_t(ama)] - la[std::size_t(amb)];
+          const float mb = lb[std::size_t(amb)] - lb[std::size_t(ama)];
+          std::printf("  [%s argmax flip seq=%d pos=%d] small=%d large=%d max_diff=%.6f margin_small=%.6f margin_large=%.6f\n",
+                      label, s, pos, ama, amb, md, ma, mb);
+        }
+      }
+      std::printf("  [%s seq=%d] max_logit_diff=%.6f\n", label, s, seq_max);
+    }
+    std::sort(row_maxes.begin(), row_maxes.end());
+    auto pct = [&](double q) {
+      const std::size_t idx = std::min(row_maxes.size() - 1, std::size_t(q * double(row_maxes.size() - 1)));
+      return row_maxes[idx];
+    };
+    std::printf(
+        "TARGET-ONLY GEOMETRY CONTROL [%s] (act=%s, rows=%zu, spec=false, rollback=0): "
+        "p50=%.6f p95=%.6f p99=%.6f max=%.6f (seq=%d pos=%d) | >0.6=%d/%zu >1.5=%d/%zu flips=%d\n",
+        label, INGINE_ACT_FP16 ? "FP16" : "BF16", row_maxes.size(), pct(0.50), pct(0.95), pct(0.99), global_max,
+        worst_s, worst_pos, gt_06, row_maxes.size(), gt_15, row_maxes.size(), flips);
+  };
+
+  summarize("B6_vs_B12", logits_b6, logits_b12);
+  summarize("B6_vs_B36", logits_b6, logits_b36);
+  summarize("B12_vs_B36", logits_b12, logits_b36);
+
+  std::printf("geometry-control VRAM summary: peak_delta=%.1f MiB (%.2f GB), peak_device_used=%.2f GB, limit=%d MiB [%s]\n",
+              vram.peak_delta_mib(), vram.peak_delta_mib() / 1024.0, vram.peak_device_used_gb(),
+              vram_limit_mb, (vram_limit_mb <= 0 || vram.peak_delta_mib() <= double(vram_limit_mb)) ? "OK" : "EXCEEDED");
+  if (vram_limit_mb > 0) CHECK(vram.peak_delta_mib() <= double(vram_limit_mb));
+  std::printf(g_failures ? "FAILED (%d checks)\n" : "fp16_geometry_control ok\n", g_failures);
+  return g_failures ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -352,9 +526,12 @@ int main(int argc, char** argv) {
   if (const char* env_lim = std::getenv("INGINE_VRAM_LIMIT_MB"); env_lim && *env_lim) {
     vram_limit_mb = std::atoi(env_lim);
   }
+  bool fp16_geometry_control = false;
   for (int a = 1; a < argc; ++a) {
     if (std::strcmp(argv[a], "--vram-limit-mb") == 0 && a + 1 < argc) {
       vram_limit_mb = std::atoi(argv[++a]);
+    } else if (std::strcmp(argv[a], "--fp16-geometry-control") == 0) {
+      fp16_geometry_control = true;
     }
   }
 
@@ -374,6 +551,9 @@ int main(int argc, char** argv) {
   vram.init();
 
   const auto fmt = ingine::text::ChatFormat::load(model_dir);
+  if (fp16_geometry_control) {
+    return run_fp16_geometry_control(model_dir, fmt, vram_limit_mb, vram);
+  }
   const auto& tok = fmt.tokenizer();
   const int32_t eos_id = *tok.token_id("<|content_model_end_sampling|>");
 
@@ -597,12 +777,35 @@ int main(int argc, char** argv) {
       DiffStats ldiff, tdiff;
       for (std::size_t i = 0; i < ref_tr.target_logits.size(); ++i)
         ldiff.update(post_rb_tr.target_logits[i], ref_tr.target_logits[i]);
-      for (std::size_t i = 0; i < ref_tr.target_taps.size(); ++i)
-        tdiff.update(post_rb_tr.target_taps[i], ref_tr.target_taps[i]);
-      std::printf("post-partial-rollback & W=1->W=8 vs serial W=1 (prefix=%zu): tok=%d/%d logit_max_diff=%g tap_max_diff=%g\n",
-                  prefix_tokens.size(), post_rb_tok, ref_tok, ldiff.max_abs, tdiff.max_abs);
+      std::size_t worst_tap_idx = 0;
+      float worst_tap_got = 0.f, worst_tap_ref = 0.f, worst_tap_abs = -1.f;
+      for (std::size_t i = 0; i < ref_tr.target_taps.size(); ++i) {
+        const float gv = post_rb_tr.target_taps[i];
+        const float rv = ref_tr.target_taps[i];
+        tdiff.update(gv, rv);
+        const float d = std::fabs(gv - rv);
+        if (std::isfinite(d) && d > worst_tap_abs) {
+          worst_tap_abs = d;
+          worst_tap_idx = i;
+          worst_tap_got = gv;
+          worst_tap_ref = rv;
+        }
+      }
+      uint16_t bits_got = 0, bits_ref = 0;
+      float fp16_step_ref = 0.f;
+      const int fp16_ulps = fp16_ulp_distance(worst_tap_got, worst_tap_ref, bits_got, bits_ref, fp16_step_ref);
+      const bool tap_strict_ok = tdiff.finite() && tdiff.max_abs <= 0.05f;
+      const bool tap_diag07_ok = tdiff.finite() && tdiff.max_abs <= 0.07f;
+      std::printf(
+          "post-partial-rollback & W=1->W=8 vs serial W=1 (prefix=%zu): tok=%d/%d logit_max_diff=%.6f "
+          "tap_max_diff=%.6f (idx=%zu tap=%zu col=%zu got=%.6f ref=%.6f fp16_bits=0x%04x/0x%04x "
+          "fp16_step_at_ref=%.6f fp16_ulps=%d | strict_0.05=%s diag_0.07=%s)\n",
+          prefix_tokens.size(), post_rb_tok, ref_tok, ldiff.max_abs, tdiff.max_abs, worst_tap_idx,
+          worst_tap_idx / 2304u, worst_tap_idx % 2304u, worst_tap_got, worst_tap_ref, unsigned(bits_got),
+          unsigned(bits_ref), fp16_step_ref, fp16_ulps, tap_strict_ok ? "PASS" : "FAIL",
+          tap_diag07_ok ? "PASS" : "FAIL");
       CHECK(ldiff.finite() && ldiff.max_abs <= 0.15f);
-      CHECK(tdiff.finite() && tdiff.max_abs <= 0.05f);
+      CHECK(tap_strict_ok);
       CHECK(post_rb_tok == ref_tok);
     }
 
@@ -822,7 +1025,7 @@ int main(int argc, char** argv) {
                   solo2_sampled_verified, hetero_sampled_verified);
     }
 
-    // ---- 5. Deep multi-tenant shortlist isolation (cold concurrent)
+    // ---- 5. Deep multi-tenant shortlist isolation (cold concurrent, strict lockstep B=2 until Tenant A hits 32)
     {
       Sampling greedy;
       greedy.temperature = 0.0f;
@@ -831,21 +1034,50 @@ int main(int argc, char** argv) {
       Prompt pCleanB{prompt_ids[1], {}, 0, "tenant-B-clean", true};
       const RunOut soloA = run_solo(*gen_spec, pA, 32, greedy);
 
-      // Equal-batch B=2 clean control (same M=16 geometry as dirty run, 0 rare neighbor extras):
-      std::vector<BatchSpecSlotTrace> cleanA_traces;
-      int rc = 0, ac = 0;
-      std::vector<std::vector<int32_t>> clean_paired;
-      {
-        BatchSpecTraceConfig cfg;
-        cfg.capture_candidates = true;
-        cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& trs) {
-          for (const auto& tr : trs) {
-            if (tr.slot == 0) cleanA_traces.push_back(tr);
+      // Keep neighbor slot B active (budget=96) for EVERY round until Tenant A emits 32 tokens, asserting B==2
+      // on every step and releasing both slots cleanly at the end.
+      auto run_lockstep_b2 = [&](const Prompt& neighbor, std::vector<BatchSpecSlotTrace>& outA_traces,
+                                 std::vector<BatchSpecSlotTrace>* outB_traces, std::vector<int>& out_step_bs) {
+        std::vector<int32_t> outA, outB;
+        int32_t tA0 = 0, tB0 = 0;
+        GenerateStats stA, stB;
+        const int sA = gen_spec->start_slot(pA, 32, greedy, tA0, stA);
+        const int sB = gen_spec->start_slot(neighbor, 96, greedy, tB0, stB);
+        CHECK(sA >= 0 && sB >= 0 && sA != sB);
+        outA.push_back(tA0);
+        outB.push_back(tB0);
+        {
+          BatchSpecTraceConfig cfg;
+          cfg.capture_candidates = true;
+          cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& trs) {
+            const int step_b = int(trs.size());
+            for (const auto& tr : trs) {
+              if (tr.slot == sA) {
+                outA_traces.push_back(tr);
+                out_step_bs.push_back(step_b);
+              } else if (tr.slot == sB && outB_traces) {
+                outB_traces->push_back(tr);
+              }
+            }
+          };
+          TraceGuard tg(std::move(cfg));
+          while (int(outA.size()) < 32) {
+            CHECK(int(outB.size()) < 96);
+            const BatchSlotStep steps[2] = {{sA, outA.back()}, {sB, outB.back()}};
+            BatchSlotResult res[2] = {};
+            gen_spec->step_slots_multi(steps, res);
+            for (int k = 0; k < res[0].count && int(outA.size()) < 32; ++k) outA.push_back(res[0].tokens[k]);
+            for (int k = 0; k < res[1].count && int(outB.size()) < 96; ++k) outB.push_back(res[1].tokens[k]);
           }
-        };
-        TraceGuard tg(std::move(cfg));
-        clean_paired = run_batch_greedy_multi(*gen_spec, {pA, pCleanB}, 32, rc, ac);
-      }
+        }
+        gen_spec->release_slot(sA);
+        gen_spec->release_slot(sB);
+        return outA;
+      };
+
+      std::vector<BatchSpecSlotTrace> cleanA_traces;
+      std::vector<int> clean_step_bs;
+      const auto clean_outA = run_lockstep_b2(pCleanB, cleanA_traces, nullptr, clean_step_bs);
 
       // Dirty Tenant B with 350 rare tail token IDs (guaranteed >= 100 outside immutable 32768 shortlist):
       std::vector<int32_t> rare_b = prompt_ids[1];
@@ -853,37 +1085,47 @@ int main(int argc, char** argv) {
       Prompt pB{rare_b, {}, 0, "tenant-B", true};
 
       std::vector<BatchSpecSlotTrace> pairA_traces, pairB_traces;
-      int r = 0, a = 0;
-      std::vector<std::vector<int32_t>> paired;
-      {
-        BatchSpecTraceConfig cfg;
-        cfg.capture_candidates = true;
-        cfg.on_step = [&](const std::vector<BatchSpecSlotTrace>& trs) {
-          for (const auto& tr : trs) {
-            if (tr.slot == 0) pairA_traces.push_back(tr);
-            else pairB_traces.push_back(tr);
-          }
-        };
-        TraceGuard tg(std::move(cfg));
-        paired = run_batch_greedy_multi(*gen_spec, {pA, pB}, 32, r, a);
-      }
+      std::vector<int> pair_step_bs;
+      const auto dirty_outA = run_lockstep_b2(pB, pairA_traces, &pairB_traces, pair_step_bs);
 
       CHECK(!pairB_traces.empty() && pairB_traces[0].slot_extra_ids.size() >= 100);
-      CHECK(paired[0] == soloA.tokens);
-      CHECK(paired[0] == clean_paired[0]);
-      CHECK(pairA_traces.size() == cleanA_traces.size());
+      const bool tokens_exact = (dirty_outA == soloA.tokens) && (dirty_outA == clean_outA);
+      CHECK(dirty_outA == soloA.tokens);
+      CHECK(dirty_outA == clean_outA);
+      bool proposals_exact =
+          !pairA_traces.empty() && (pairA_traces.size() == cleanA_traces.size()) &&
+          (pair_step_bs.size() == pairA_traces.size()) && (clean_step_bs.size() == cleanA_traces.size());
+      CHECK(proposals_exact);
       for (std::size_t k = 0; k < std::min(pairA_traces.size(), cleanA_traces.size()); ++k) {
-        CHECK(pairA_traces[k].slot_extra_ids == cleanA_traces[k].slot_extra_ids);
-        CHECK(pairA_traces[k].accepted == cleanA_traces[k].accepted);
-        CHECK(pairA_traces[k].next_token == cleanA_traces[k].next_token);
+        const bool b_ok = (pair_step_bs[k] == 2 && clean_step_bs[k] == 2);
+        const bool w_ok =
+            (pairA_traces[k].W_batch == cleanA_traces[k].W_batch) && (pairA_traces[k].w_cap == cleanA_traces[k].w_cap);
+        const bool ex_ok = (pairA_traces[k].slot_extra_ids == cleanA_traces[k].slot_extra_ids);
+        const bool acc_ok = (pairA_traces[k].accepted == cleanA_traces[k].accepted);
+        const bool nxt_ok = (pairA_traces[k].next_token == cleanA_traces[k].next_token);
+        const bool cand_ok = (pairA_traces[k].draft_cand_idx == cleanA_traces[k].draft_cand_idx);
+        CHECK(b_ok);
+        CHECK(w_ok);
+        CHECK(ex_ok);
+        CHECK(acc_ok);
+        CHECK(nxt_ok);
+        bool g_ok = true;
         for (int g = 0; g < sv::kGamma; ++g) {
-          CHECK(pairA_traces[k].draft_tokens[g] == cleanA_traces[k].draft_tokens[g]);
-          CHECK(pairA_traces[k].draft_conf[g] == cleanA_traces[k].draft_conf[g]);
+          const bool dt_ok = (pairA_traces[k].draft_tokens[g] == cleanA_traces[k].draft_tokens[g]);
+          const bool dc_ok = (pairA_traces[k].draft_conf[g] == cleanA_traces[k].draft_conf[g]);
+          CHECK(dt_ok);
+          CHECK(dc_ok);
+          g_ok = g_ok && dt_ok && dc_ok;
         }
-        CHECK(pairA_traces[k].draft_cand_idx == cleanA_traces[k].draft_cand_idx);
+        CHECK(cand_ok);
+        proposals_exact = proposals_exact && b_ok && w_ok && ex_ok && acc_ok && nxt_ok && cand_ok && g_ok;
       }
-      std::printf("tenant shortlist isolation (cold): neighbor_extra=%zu tenantA_extra=%zu proposals=EXACT tokens=EXACT\n",
-                  pairB_traces[0].slot_extra_ids.size(), pairA_traces[0].slot_extra_ids.size());
+      std::printf(
+          "tenant shortlist isolation (cold, lockstep B=2 rounds=%zu): neighbor_extra=%zu tenantA_extra=%zu "
+          "proposals=%s tokens=%s\n",
+          pairA_traces.size(), pairB_traces.empty() ? std::size_t(0) : pairB_traces[0].slot_extra_ids.size(),
+          pairA_traces.empty() ? std::size_t(0) : pairA_traces[0].slot_extra_ids.size(),
+          proposals_exact ? "EXACT" : "MISMATCH", tokens_exact ? "EXACT" : "MISMATCH");
     }
 
     // ---- 6. Mid-block stop-token truncation
@@ -967,17 +1209,26 @@ int main(int argc, char** argv) {
         if (s >= 0) gen_plain->release_slot(s);
     }
 
-    const float kCrossGearMaxDiff = INGINE_ACT_FP16 ? 1.5f : 0.6f;
+    int strict06_pass = 0, diag15_pass = 0;
     for (const auto& dc : divergent_cases) {
-      const auto vr = sv::validate_cross_gear_divergence(dc.l_plain, dc.l_spec, dc.plain_tok, dc.spec_tok,
-                                                         kUnpaddedVocab, kCrossGearMaxDiff);
+      const auto vr_strict = sv::validate_cross_gear_divergence(dc.l_plain, dc.l_spec, dc.plain_tok, dc.spec_tok,
+                                                                kUnpaddedVocab, 0.6f);
+      const auto vr_diag15 = sv::validate_cross_gear_divergence(dc.l_plain, dc.l_spec, dc.plain_tok, dc.spec_tok,
+                                                                kUnpaddedVocab, 1.5f);
+      if (vr_strict.ok) ++strict06_pass;
+      if (vr_diag15.ok) ++diag15_pass;
       std::printf(
-          "  [cross-gear bound diag B=%d seq=%d pos=%zu] plain=%d(am=%d) spec=%d(am=%d) max_diff=%.4f "
-          "margin_p=%.4f margin_s=%.4f -> %s\n",
-          dc.B, dc.seq_idx, dc.pos, dc.plain_tok, vr.argmax_plain, dc.spec_tok, vr.argmax_spec, vr.max_diff,
-          vr.margin_plain, vr.margin_spec, vr.ok ? "BOUND_NEAR_TIE" : vr.reason.c_str());
-      CHECK(vr.ok);
+          "  [cross-gear bound diag B=%d seq=%d pos=%zu] plain=%d(am=%d) spec=%d(am=%d) max_diff=%.6f "
+          "margin_p=%.6f margin_s=%.6f | strict_0.6=%s diag_1.5=%s\n",
+          dc.B, dc.seq_idx, dc.pos, dc.plain_tok, vr_strict.argmax_plain, dc.spec_tok, vr_strict.argmax_spec,
+          vr_strict.max_diff, vr_strict.margin_plain, vr_strict.margin_spec,
+          vr_strict.ok ? "PASS" : vr_strict.reason.c_str(),
+          vr_diag15.ok ? "PASS" : vr_diag15.reason.c_str());
+      CHECK(vr_strict.ok);
     }
+    std::printf("cross-gear bound summary (act=%s): total=%zu strict_0.6=%d/%zu diag_1.5=%d/%zu\n",
+                INGINE_ACT_FP16 ? "FP16" : "BF16", divergent_cases.size(), strict06_pass, divergent_cases.size(),
+                diag15_pass, divergent_cases.size());
     vram.sample();
   }
 
