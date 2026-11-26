@@ -83,6 +83,25 @@ struct ProjEpi {
   __device__ void store1(int row, int m, float v) const { out[size_t(m) * R + row] = round_bf16(v); }
 };
 
+template <int M, int KStride>
+struct ProjRawEpi {
+  static constexpr int kInputs = 3;
+  static constexpr bool kScatter = true;
+  const ActT* xin;
+  const int* segments;
+  int nseg, R;
+  float* out;
+  __device__ int input_of(int row) const {
+    for (int s = 0; s < nseg; ++s) {
+      const int b = __ldg(segments + 3 * s), e = __ldg(segments + 3 * s + 1);
+      if (row >= b && row < e) return __ldg(segments + 3 * s + 2);
+    }
+    return -1;
+  }
+  __device__ const ActT* x_of(int i) const { return xin + size_t(i) * M * KStride; }
+  __device__ void store1(int row, int m, float v) const { out[size_t(m) * R + row] = v; }
+};
+
 template <int M>
 struct HeadEpi {
   static constexpr int kInputs = 1;
@@ -1269,6 +1288,37 @@ void proj(const ActT* xin, int M, Matrix w, const int* segments, int nseg, float
     constexpr int MM = decltype(mc)::value;
     return ProjEpi<MM>{xin, segments, nseg, R, out};
   });
+}
+
+void proj_q5_k_raw_f32(const ActT* xin, int M, int K, Matrix w, const int* segments, int nseg, float* out, bool pdl,
+                       cudaStream_t stream) {
+  require(xin && segments && out && nseg > 0 && w.q5_k && w.w != nullptr && w.rows > 0,
+          "proj_q5_k_raw_f32: bad argument");
+  require(K == H || K == 3072, "proj_q5_k_raw_f32: K must be 2304 or 3072");
+  const int R = w.rows;
+  const uint8_t* wp = static_cast<const uint8_t*>(w.w);
+  auto go = [&](auto mc) {
+    constexpr int MM = decltype(mc)::value;
+    if (K == H) {
+      ProjRawEpi<MM, H> epi{xin, segments, nseg, R, out};
+      launch_ex(gemv_q5_k_kernel<H, MM, ProjRawEpi<MM, H>>, dim3((R + 3) / 4), 128, 0, 1, pdl, stream, wp, R, 0u, epi);
+    } else {
+      ProjRawEpi<MM, 3072> epi{xin, segments, nseg, R, out};
+      launch_ex(gemv_q5_k_kernel<3072, MM, ProjRawEpi<MM, 3072>>, dim3((R + 3) / 4), 128, 0, 1, pdl, stream, wp, R, 0u,
+                epi);
+    }
+  };
+  switch (M) {
+    case 1: go(std::integral_constant<int, 1>{}); break;
+    case 2: go(std::integral_constant<int, 2>{}); break;
+    case 3: go(std::integral_constant<int, 3>{}); break;
+    case 4: go(std::integral_constant<int, 4>{}); break;
+    case 5: go(std::integral_constant<int, 5>{}); break;
+    case 6: go(std::integral_constant<int, 6>{}); break;
+    case 7: go(std::integral_constant<int, 7>{}); break;
+    case 8: go(std::integral_constant<int, 8>{}); break;
+    default: require(false, "proj_q5_k_raw_f32: M must be in 1..8");
+  }
 }
 
 void proj_conv(const ActT* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,

@@ -29,6 +29,11 @@ struct Matrix {
 void proj(const ActT* xin, int M, Matrix w, const int* segments, int nseg, float* out, bool pdl,
           cudaStream_t stream);
 
+// Diagnostic raw pre-ActT FP32 accumulator output for Q5_K proj (K=2304) and proj_conv (K=3072).
+// Runs the identical gemv_q5_k_kernel accumulation loop without the epilogue round_bf16/ActT cast.
+void proj_q5_k_raw_f32(const ActT* xin, int M, int K, Matrix w, const int* segments, int nseg, float* out, bool pdl,
+                       cudaStream_t stream);
+
 // proj_conv: attention output projection (w [H, 3072]) + post-attention conv with state update.
 // x bf16 [M, 3072]; conv_w fp32 [H, 4]; conv_state fp32 [3, H]; out fp32 [M, H]; conv_hist fp32 [M, H]
 // (BF16-rounded conv inputs, for speculative rollback) or nullptr.
