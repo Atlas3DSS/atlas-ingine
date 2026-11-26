@@ -141,6 +141,11 @@ class EngineGenerator final : public Generator {
 
   KvCacheMode kv_cache_mode() const override { return options_.kv_cache_mode; }
 
+  std::vector<KvCacheMode> supported_kv_cache_modes() const override {
+    if (options_.spec) return {KvCacheMode::PerPass};
+    return {KvCacheMode::PerPass, KvCacheMode::LastFull};
+  }
+
   std::string offload_summary() const override {
     std::string out;
     if (rt_.weights().expert_cache) out = rt_.weights().expert_cache->summary();

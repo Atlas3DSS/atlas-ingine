@@ -63,12 +63,14 @@ class ChatServer {
   void handle_post(const httplib::Request& req, httplib::Response& res);
   void complete(const httplib::Request& req, httplib::Response& res, ChatRequest request);
   Json model_card() const;
+  Json supported_kv_cache_modes_json() const;
   Json personas_list() const;
 
   const text::ChatFormat& fmt_;
   const std::string model_id_;
   const int max_model_len_;
   const model::KvCacheMode kv_cache_mode_;
+  const std::vector<model::KvCacheMode> supported_kv_cache_modes_;
   const model::Sampling sampling_defaults_;
   const ImageOptions image_options_;
   const std::shared_ptr<const persona::PersonaCatalog> personas_;

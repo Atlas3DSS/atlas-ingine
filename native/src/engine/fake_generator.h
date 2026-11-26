@@ -62,6 +62,12 @@ class FakeGenerator final : public model::Generator {
                                 const std::function<bool(std::span<const int32_t>)>& on_tokens,
                                 const model::PrefillCallback& on_prefill) override;
   bool supports_images() const override { return true; }
+  model::KvCacheMode kv_cache_mode() const override { return kv_cache_mode_; }
+  std::vector<model::KvCacheMode> supported_kv_cache_modes() const override { return supported_kv_cache_modes_; }
+  void set_kv_cache_mode(model::KvCacheMode mode) { kv_cache_mode_ = mode; }
+  void set_supported_kv_cache_modes(std::vector<model::KvCacheMode> modes) {
+    supported_kv_cache_modes_ = std::move(modes);
+  }
 
   void set_prefill_stats_hook(PrefillStatsFn hook);
   std::string echo(std::span<const int32_t> prompt_ids) const;
@@ -73,6 +79,9 @@ class FakeGenerator final : public model::Generator {
   int max_model_len_;
   Responder responder_;
   double token_delay_;
+  model::KvCacheMode kv_cache_mode_ = model::KvCacheMode::PerPass;
+  std::vector<model::KvCacheMode> supported_kv_cache_modes_ = {model::KvCacheMode::PerPass,
+                                                                model::KvCacheMode::LastFull};
   mutable std::mutex mutex_;
   PrefillStatsFn prefill_stats_hook_;
   std::vector<Call> calls_;

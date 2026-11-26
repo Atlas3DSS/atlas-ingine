@@ -107,7 +107,7 @@ Json usage(const Exchange& x) {
               {"prompt_tokens_details", std::move(details)}};
 }
 
-void log_done(const Exchange& x) {
+void log_done(const Exchange& x, model::KvCacheMode kv_cache_mode) {
   const Clock::time_point now = Clock::now();
   const engine::Job& job = *x.job;
   const double queued = seconds(job.t_start().value_or(now) - job.t_submit);
@@ -124,11 +124,11 @@ void log_done(const Exchange& x) {
   const std::string ttft = x.t_first ? fmt::format("{:.3f}s", seconds(*x.t_first - job.t_submit)) : "-";
   const auto& finish = x.parser.finish_reason();
   engine::server_log().info(
-      "{}: prompt={} cached={} recomputed={} reuse={} restored_bytes={} render_reused={} render_ms={:.2f} "
-      "completion={} finish={} queued={:.3f}s ttft={} decode={}{}",
-      job.id, prompt, cached, recomputed, reuse, restored_bytes, x.req.render_stats.reused_text_tokens,
-      x.req.render_stats.render_ms, n, finish ? *finish : std::string("None"), queued, ttft, rate,
-      x.failure ? " error=" + *x.failure : std::string());
+      "{}: kv_cache_mode={} prompt={} cached={} recomputed={} reuse={} restored_bytes={} render_reused={} "
+      "render_ms={:.2f} completion={} finish={} queued={:.3f}s ttft={} decode={}{}",
+      job.id, model::to_string(kv_cache_mode), prompt, cached, recomputed, reuse, restored_bytes,
+      x.req.render_stats.reused_text_tokens, x.req.render_stats.render_ms, n, finish ? *finish : std::string("None"),
+      queued, ttft, rate, x.failure ? " error=" + *x.failure : std::string());
 }
 
 void log_disconnected(const Exchange& x) {
@@ -171,6 +171,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       model_id_(options.model_id.empty() ? generator.model_id() : options.model_id),
       max_model_len_(options.max_model_len ? options.max_model_len : generator.max_model_len()),
       kv_cache_mode_(generator.kv_cache_mode()),
+      supported_kv_cache_modes_(generator.supported_kv_cache_modes()),
       sampling_defaults_(options.sampling),
       image_options_([&] {
         ImageOptions images = options.images;
@@ -199,6 +200,17 @@ void ChatServer::register_routes() {
   server_.Post(R"(.*)", [this](const httplib::Request& req, httplib::Response& res) { handle_post(req, res); });
 }
 
+Json ChatServer::supported_kv_cache_modes_json() const {
+  Json arr = Json::array();
+  for (model::KvCacheMode m : supported_kv_cache_modes_) {
+    const std::string s = model::to_string(m);
+    if (std::find(arr.begin(), arr.end(), s) == arr.end()) arr.push_back(s);
+  }
+  const std::string active = model::to_string(kv_cache_mode_);
+  if (std::find(arr.begin(), arr.end(), active) == arr.end()) arr.push_back(active);
+  return arr;
+}
+
 Json ChatServer::model_card() const {
   return Json{{"id", model_id_},
               {"object", "model"},
@@ -206,6 +218,8 @@ Json ChatServer::model_card() const {
               {"owned_by", "ingine"},
               {"max_model_len", max_model_len_},
               {"kv_cache_mode", model::to_string(kv_cache_mode_)},
+              {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
+              {"kv_cache_mode_mutable", false},
               {"input_modalities", image_options_.enabled ? Json::array({"text", "image"}) : Json::array({"text"})}};
 }
 
@@ -240,18 +254,23 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
   const std::string path = route_path(req);
   if (path == "/health") {
     const engine::SchedulerStats st = scheduler_.stats();
+    res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     send_json(res, 200,
               Json{{"status", "ok"},
                    {"model", model_id_},
                    {"kv_cache_mode", model::to_string(kv_cache_mode_)},
+                   {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
+                   {"kv_cache_mode_mutable", false},
                    {"waiting", st.waiting},
                    {"running", st.running},
                    {"active", st.active},
                    {"max_batch", st.max_batch},
                    {"max_queue", st.max_queue}});
   } else if (path == "/v1/models") {
+    res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     send_json(res, 200, Json{{"object", "list"}, {"data", Json::array({model_card()})}});
   } else if (path == "/v1/models/" + model_id_) {
+    res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     send_json(res, 200, model_card());
   } else if (path == "/v1/personas") {
     send_json(res, 200, personas_list());
@@ -337,7 +356,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
       return;
     }
     x->prefill_stats = x->job->wait_prefill_stats();
-    log_done(*x);
+    log_done(*x, kv_cache_mode_);
     if (x->failure) {
       send_error(res, 500, *x->failure);
       return;
@@ -360,6 +379,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
               {"object", "chat.completion"},
               {"created", x->created},
               {"model", model_id_},
+              {"kv_cache_mode", model::to_string(kv_cache_mode_)},
               {"system_fingerprint", nullptr},
               {"choices", Json::array({Json{{"index", 0},
                                             {"message", std::move(message)},
@@ -368,12 +388,14 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
                                                                                    : Json()}}})},
               {"usage", usage(*x)}};
     if (x->req.sampling.persona) resp["persona_metadata"] = persona_meta_json(*x->req.sampling.persona);
+    res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
     send_json(res, 200, resp);
     return;
   }
 
   auto state = std::make_shared<StreamState>(std::move(x));
   res.set_header("Cache-Control", "no-cache");
+  res.set_header("X-Ingine-Kv-Cache-Mode", model::to_string(kv_cache_mode_));
   res.set_chunked_content_provider(
       "text/event-stream",
       [this, state](size_t, httplib::DataSink& sink) -> bool {
@@ -397,7 +419,7 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
           return false;
         }
         x.prefill_stats = x.job->wait_prefill_stats();
-        log_done(x);
+        log_done(x, kv_cache_mode_);
         try {
           if (x.failure) {
             transport.write(sse(dump(error_body(500, *x.failure))));

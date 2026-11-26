@@ -329,10 +329,16 @@ void test_models_and_health() {
   CHECK(m["id"] == "inkling-test" && m["object"] == "model" && m["created"].is_number_integer());
   CHECK(m["owned_by"].is_string() && m["max_model_len"] == (1 << 20));
   CHECK(m["kv_cache_mode"] == "per_pass");
+  CHECK(m["supported_kv_cache_modes"] == Json::array({"per_pass", "last_full"}));
+  CHECK(m["kv_cache_mode_mutable"] == false);
+  CHECK(header(r.headers, "X-Ingine-Kv-Cache-Mode") == "per_pass");
   CHECK(Json::parse(request(s->port(), "GET", "/v1/models/inkling-test").body) == m);
-  Json h = health(s->port());
+  Response hr = request(s->port(), "GET", "/health");
+  CHECK(hr.status == 200 && header(hr.headers, "X-Ingine-Kv-Cache-Mode") == "per_pass");
+  Json h = Json::parse(hr.body);
   CHECK(h["status"] == "ok" && h["model"] == "inkling-test" && h["kv_cache_mode"] == "per_pass" &&
-        h["waiting"] == 0 && h["running"] == false && h["max_queue"] == 4);
+        h["supported_kv_cache_modes"] == Json::array({"per_pass", "last_full"}) &&
+        h["kv_cache_mode_mutable"] == false && h["waiting"] == 0 && h["running"] == false && h["max_queue"] == 4);
   CHECK(request(s->port(), "GET", "/health/").status == 200);
   Response nope = request(s->port(), "GET", "/nope");
   CHECK(nope.status == 404 && Json::parse(nope.body)["error"]["type"] == "not_found_error");
@@ -1575,6 +1581,64 @@ void test_cache_scope_isolation() {
   }
 }
 
+void test_kv_cache_mode_advertisement() {
+  // 1. Active last_full worker advertising both per_pass and last_full.
+  {
+    auto s = std::make_unique<Served>();
+    auto responder = [](std::span<const int32_t>) { return FakeGenerator::Output(THINK_TEXT); };
+    s->gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-lf", 1 << 20, responder, 0.0);
+    s->gen->set_kv_cache_mode(ingine::model::KvCacheMode::LastFull);
+    s->gen->set_supported_kv_cache_modes({ingine::model::KvCacheMode::PerPass, ingine::model::KvCacheMode::LastFull});
+    s->srv = std::make_unique<ChatServer>(*s->gen, *g_fmt, ingine::serve::ServerOptions{});
+    CHECK(s->srv->bind("127.0.0.1", 0));
+    s->srv->start();
+
+    Response hr = request(s->port(), "GET", "/health");
+    CHECK(hr.status == 200 && header(hr.headers, "X-Ingine-Kv-Cache-Mode") == "last_full");
+    Json h = Json::parse(hr.body);
+    CHECK(h["kv_cache_mode"] == "last_full");
+    CHECK(h["supported_kv_cache_modes"] == Json::array({"per_pass", "last_full"}));
+    CHECK(h["kv_cache_mode_mutable"] == false);
+
+    Response mr = request(s->port(), "GET", "/v1/models");
+    CHECK(mr.status == 200 && header(mr.headers, "X-Ingine-Kv-Cache-Mode") == "last_full");
+    const Json m = Json::parse(mr.body)["data"][0];
+    CHECK(m["kv_cache_mode"] == "last_full");
+    CHECK(m["supported_kv_cache_modes"] == Json::array({"per_pass", "last_full"}));
+    CHECK(m["kv_cache_mode_mutable"] == false);
+
+    Chat r = chat(s->port(), {{"model", "inkling-lf"}});
+    CHECK(r.status == 200);
+    CHECK(header(r.headers, "X-Ingine-Kv-Cache-Mode") == "last_full");
+    CHECK(r.body["kv_cache_mode"] == "last_full");
+
+    Chat sr = chat(s->port(), {{"model", "inkling-lf"}, {"stream", true}});
+    CHECK(sr.status == 200);
+    CHECK(header(sr.headers, "X-Ingine-Kv-Cache-Mode") == "last_full");
+  }
+
+  // 2. Restricted worker (e.g. --spec, B>1, or TP>1) advertising only per_pass.
+  {
+    auto s = std::make_unique<Served>();
+    auto responder = [](std::span<const int32_t>) { return FakeGenerator::Output(THINK_TEXT); };
+    s->gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-pp-only", 1 << 20, responder, 0.0);
+    s->gen->set_kv_cache_mode(ingine::model::KvCacheMode::PerPass);
+    s->gen->set_supported_kv_cache_modes({ingine::model::KvCacheMode::PerPass});
+    s->srv = std::make_unique<ChatServer>(*s->gen, *g_fmt, ingine::serve::ServerOptions{});
+    CHECK(s->srv->bind("127.0.0.1", 0));
+    s->srv->start();
+
+    Json h = health(s->port());
+    CHECK(h["kv_cache_mode"] == "per_pass");
+    CHECK(h["supported_kv_cache_modes"] == Json::array({"per_pass"}));
+    CHECK(h["kv_cache_mode_mutable"] == false);
+
+    Chat r = chat(s->port(), {{"model", "inkling-pp-only"}});
+    CHECK(r.status == 200 && header(r.headers, "X-Ingine-Kv-Cache-Mode") == "per_pass");
+    CHECK(r.body["kv_cache_mode"] == "per_pass");
+  }
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -1612,6 +1676,7 @@ int main() {
       {"legacy_generator_early_stop_cached_tokens", test_legacy_generator_early_stop_cached_tokens},
       {"prompt_stability_and_render_stats", test_prompt_stability_and_render_stats},
       {"cache_scope_isolation", test_cache_scope_isolation},
+      {"kv_cache_mode_advertisement", test_kv_cache_mode_advertisement},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {

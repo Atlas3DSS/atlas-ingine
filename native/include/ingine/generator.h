@@ -236,6 +236,9 @@ class Generator {
   }
   virtual bool supports_images() const { return false; }
   virtual KvCacheMode kv_cache_mode() const { return KvCacheMode::PerPass; }
+  // Modes supported by this worker's execution profile (e.g. {"per_pass", "last_full"} for B=1 non-spec TP=1,
+  // or {"per_pass"} for speculative, continuous-batch B>1, or TP>1 workers). Active mode is fixed at worker init.
+  virtual std::vector<KvCacheMode> supported_kv_cache_modes() const { return {kv_cache_mode()}; }
   virtual std::string offload_summary() const { return {}; }
   virtual PrefixCacheStats cache_stats() const { return {}; }
 
