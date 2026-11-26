@@ -160,9 +160,12 @@ struct Gate3StepComparison {
   bool argmax_match = false;
 };
 
-// Compares full-vocabulary logit vectors strictly bitwise (memcmp == 0 + zero NaN/Inf).
+// Compares full-vocabulary logit vectors strictly bitwise (memcmp == 0 + zero NaN/Inf)
+// while preserving explicit cold and warm step positions verbatim.
 Gate3StepComparison compare_logits_bit_exact(std::span<const float> cold_logits, std::span<const float> warm_logits,
-                                             int cold_position = 0, int warm_position = -1);
+                                             int cold_position, int warm_position);
+Gate3StepComparison compare_logits_bit_exact(std::span<const float> cold_logits, std::span<const float> warm_logits,
+                                             int position = 0);
 
 struct Gate3ReuseCaseResult {
   std::string name;

@@ -117,10 +117,15 @@ bool Qwen38CheckpointIndex::can_truncate_to(std::size_t new_len) const noexcept 
 }
 
 Gate3StepComparison compare_logits_bit_exact(std::span<const float> cold_logits, std::span<const float> warm_logits,
+                                             int position) {
+  return compare_logits_bit_exact(cold_logits, warm_logits, position, position);
+}
+
+Gate3StepComparison compare_logits_bit_exact(std::span<const float> cold_logits, std::span<const float> warm_logits,
                                              int cold_position, int warm_position) {
   Gate3StepComparison cmp;
   cmp.cold_position = cold_position;
-  cmp.warm_position = (warm_position < 0) ? cold_position : warm_position;
+  cmp.warm_position = warm_position;
   cmp.position = cold_position;
   cmp.cold_vocab_size = cold_logits.size();
   cmp.warm_vocab_size = warm_logits.size();
@@ -187,6 +192,10 @@ Gate3StepComparison compare_logits_bit_exact(std::span<const float> cold_logits,
   cmp.memcmp_equal = (std::memcmp(cold_logits.data(), warm_logits.data(), cold_logits.size() * sizeof(float)) == 0);
   if (cmp.memcmp_equal && any_raw_diff) {
     cmp.memcmp_equal = false;
+  }
+  if (cold_position < 0 || warm_position < 0 || cold_position != warm_position) {
+    cmp.memcmp_equal = false;
+    cmp.argmax_match = false;
   }
   return cmp;
 }

@@ -859,32 +859,51 @@ int main_impl(int argc, char** argv) {
     backend.reset_session();
     const auto cold_p0 = run_session_request(backend, *sess0, make_req(p0, false), 1);
 
-    auto run_e2e_miss = [&](std::string name, auto setup_fn, const BackendRequest& miss_req,
-                            const CapturedRun& cold_ref) {
-      setup_fn();
-      const auto warm = run_session_request(backend, *sess0, miss_req, 1);
-      const int cpos = cold_ref.step_positions.empty() ? -1 : cold_ref.step_positions[0];
-      const int wpos = warm.step_positions.empty() ? -1 : warm.step_positions[0];
-      const auto cmp = compare_logits_bit_exact(cold_ref.step_logits[0], warm.step_logits[0], cpos, wpos);
+    auto build_protected_miss_result = [](std::string name, bool hit, Reuse reuse, std::size_t reused_tokens,
+                                          std::string reason, const CapturedRun& cold_ref,
+                                          const CapturedRun& warm_ref) -> Gate3ProtectedMissResult {
       Gate3ProtectedMissResult pm;
       pm.name = std::move(name);
       pm.executed = true;
-      pm.hit = (warm.stats.reuse != Reuse::None);
-      pm.reuse = warm.stats.reuse;
-      pm.reused_tokens = static_cast<std::size_t>(warm.stats.reused_tokens);
-      pm.reason = backend.last_lookup().reason;
+      pm.hit = hit;
+      pm.reuse = reuse;
+      pm.reused_tokens = reused_tokens;
+      pm.reason = std::move(reason);
+      const bool have_rows = !cold_ref.step_logits.empty() && !warm_ref.step_logits.empty() &&
+                             !cold_ref.step_positions.empty() && !warm_ref.step_positions.empty() &&
+                             !cold_ref.greedy_ids.empty() && !warm_ref.greedy_ids.empty();
+      if (!have_rows) {
+        pm.post_miss_bit_exact = false;
+        pm.max_abs_diff = std::numeric_limits<double>::infinity();
+        pm.failure_note = "missing cold or warm logit/position/greedy row in protected miss check";
+        return pm;
+      }
+      const int cpos = cold_ref.step_positions[0];
+      const int wpos = warm_ref.step_positions[0];
+      const auto cmp = compare_logits_bit_exact(cold_ref.step_logits[0], warm_ref.step_logits[0], cpos, wpos);
       pm.cold_position = cmp.cold_position;
       pm.warm_position = cmp.warm_position;
       pm.post_miss_position = cmp.position;
       pm.post_miss_vocab_size = cmp.vocab_size;
       pm.cold_argmax = cmp.cold_argmax;
       pm.warm_argmax = cmp.warm_argmax;
-      pm.cold_greedy_id = cold_ref.greedy_ids.empty() ? -1 : cold_ref.greedy_ids[0];
-      pm.warm_greedy_id = warm.greedy_ids.empty() ? -1 : warm.greedy_ids[0];
+      pm.cold_greedy_id = cold_ref.greedy_ids[0];
+      pm.warm_greedy_id = warm_ref.greedy_ids[0];
       pm.post_miss_bit_exact = cmp.all_finite && cmp.memcmp_equal && cmp.argmax_match &&
-                               (pm.cold_position == pm.warm_position) && (pm.cold_greedy_id == pm.warm_greedy_id);
+                               cpos >= 0 && wpos >= 0 && cpos == wpos &&
+                               (pm.cold_greedy_id == pm.warm_greedy_id) &&
+                               (pm.cold_argmax == pm.cold_greedy_id);
       pm.max_abs_diff = cmp.max_abs_diff;
-      protected_misses.push_back(std::move(pm));
+      return pm;
+    };
+
+    auto run_e2e_miss = [&](std::string name, auto setup_fn, const BackendRequest& miss_req,
+                            const CapturedRun& cold_ref) {
+      setup_fn();
+      const auto warm = run_session_request(backend, *sess0, miss_req, 1);
+      protected_misses.push_back(build_protected_miss_result(
+          std::move(name), warm.stats.reuse != Reuse::None, warm.stats.reuse,
+          static_cast<std::size_t>(warm.stats.reused_tokens), backend.last_lookup().reason, cold_ref, warm));
     };
 
     // 1. miss_explicit_bypass
@@ -991,28 +1010,8 @@ int main_impl(int argc, char** argv) {
     auto run_identity_miss = [&](std::string name, BackendStateIdentity qid) {
       const auto lk = restore_session_prefix(*sess0, SessionLookupQuery{qid, p0, {}, {}, true});
       const auto post_warm = run_session_request(backend, *sess0, make_req(p0, false), 1);
-      const int cpos = cold_p0.step_positions.empty() ? -1 : cold_p0.step_positions[0];
-      const int wpos = post_warm.step_positions.empty() ? -1 : post_warm.step_positions[0];
-      const auto cmp = compare_logits_bit_exact(cold_p0.step_logits[0], post_warm.step_logits[0], cpos, wpos);
-      Gate3ProtectedMissResult pm;
-      pm.name = std::move(name);
-      pm.executed = true;
-      pm.hit = lk.hit;
-      pm.reuse = lk.reuse;
-      pm.reused_tokens = lk.reused_tokens;
-      pm.reason = lk.reason;
-      pm.cold_position = cmp.cold_position;
-      pm.warm_position = cmp.warm_position;
-      pm.post_miss_position = cmp.position;
-      pm.post_miss_vocab_size = cmp.vocab_size;
-      pm.cold_argmax = cmp.cold_argmax;
-      pm.warm_argmax = cmp.warm_argmax;
-      pm.cold_greedy_id = cold_p0.greedy_ids.empty() ? -1 : cold_p0.greedy_ids[0];
-      pm.warm_greedy_id = post_warm.greedy_ids.empty() ? -1 : post_warm.greedy_ids[0];
-      pm.post_miss_bit_exact = cmp.all_finite && cmp.memcmp_equal && cmp.argmax_match &&
-                               (pm.cold_position == pm.warm_position) && (pm.cold_greedy_id == pm.warm_greedy_id);
-      pm.max_abs_diff = cmp.max_abs_diff;
-      protected_misses.push_back(std::move(pm));
+      protected_misses.push_back(build_protected_miss_result(std::move(name), lk.hit, lk.reuse, lk.reused_tokens,
+                                                             lk.reason, cold_p0, post_warm));
       // Re-warm session for next identity check.
       backend.reset_session();
       (void)run_session_request(backend, *sess0, make_req(p0_20, true), 1);

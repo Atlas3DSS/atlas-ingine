@@ -197,8 +197,28 @@ void test_compare_logits_bit_exact() {
   const auto inf_cmp = compare_logits_bit_exact(a, b, 0, 0);
   CHECK(!inf_cmp.all_finite && !inf_cmp.memcmp_equal);
 
-  // Empty and size mismatch fail closed.
-  CHECK(!compare_logits_bit_exact({}, {}, 0, 0).all_finite);
+  // Preserve explicit negative/mismatched positions and fail comparison (att-da9a8771).
+  a = {1.0f, -2.5f, 3.25f, 0.0f};
+  b = a;
+  const auto neg_warm = compare_logits_bit_exact(a, b, 31, -1);
+  CHECK(neg_warm.all_finite && neg_warm.cold_position == 31 && neg_warm.warm_position == -1 &&
+        !neg_warm.memcmp_equal && !neg_warm.argmax_match);
+
+  const auto mis_pos = compare_logits_bit_exact(a, b, 31, 32);
+  CHECK(mis_pos.all_finite && mis_pos.cold_position == 31 && mis_pos.warm_position == 32 &&
+        !mis_pos.memcmp_equal && !mis_pos.argmax_match);
+
+  const auto both_neg = compare_logits_bit_exact(a, b, -1, -1);
+  CHECK(both_neg.all_finite && both_neg.cold_position == -1 && both_neg.warm_position == -1 &&
+        !both_neg.memcmp_equal && !both_neg.argmax_match);
+
+  const auto overload_3arg = compare_logits_bit_exact(a, b, 5);
+  CHECK(overload_3arg.all_finite && overload_3arg.cold_position == 5 && overload_3arg.warm_position == 5 &&
+        overload_3arg.memcmp_equal && overload_3arg.argmax_match);
+
+  // Empty and size mismatch fail closed while preserving explicit positions.
+  const auto empty_pos = compare_logits_bit_exact({}, {}, 31, -1);
+  CHECK(!empty_pos.all_finite && empty_pos.cold_position == 31 && empty_pos.warm_position == -1);
   CHECK(!compare_logits_bit_exact(a, std::span<const float>(b.data(), 3), 0, 0).memcmp_equal);
 }
 
