@@ -138,13 +138,39 @@ struct ScopedFd {
     }
 };
 
+inline constexpr std::uint64_t kFullFileShaThresholdBytes = 32ull << 20;
+
 struct ShardFingerprint {
     std::uint64_t file_size  = 0;
+    std::uint64_t dev        = 0;
+    std::uint64_t ino        = 0;
     std::int64_t mtime_sec   = 0;
     std::int64_t mtime_nsec  = 0;
-    std::array<std::uint8_t, 32> header_sha256{};
-    std::array<std::uint8_t, 32> sample_sha256{};
+    std::int64_t ctime_sec   = 0;
+    std::int64_t ctime_nsec  = 0;
+    bool has_full_sha256     = false;
+    std::array<std::uint8_t, 32> full_sha256{};
 };
+
+bool timespec_strictly_less(std::int64_t a_sec, std::int64_t a_nsec,
+                            std::int64_t b_sec, std::int64_t b_nsec) noexcept {
+    return a_sec < b_sec || (a_sec == b_sec && a_nsec < b_nsec);
+}
+
+bool stat_regular_file(const std::filesystem::path& path, ShardFingerprint& out) noexcept {
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) { return false; }
+    out.file_size       = static_cast<std::uint64_t>(st.st_size);
+    out.dev             = static_cast<std::uint64_t>(st.st_dev);
+    out.ino             = static_cast<std::uint64_t>(st.st_ino);
+    out.mtime_sec       = static_cast<std::int64_t>(st.st_mtim.tv_sec);
+    out.mtime_nsec      = static_cast<std::int64_t>(st.st_mtim.tv_nsec);
+    out.ctime_sec       = static_cast<std::int64_t>(st.st_ctim.tv_sec);
+    out.ctime_nsec      = static_cast<std::int64_t>(st.st_ctim.tv_nsec);
+    out.has_full_sha256 = false;
+    out.full_sha256     = {};
+    return true;
+}
 
 bool pread_exact(int fd, std::uint64_t offset, void* dst, std::size_t len) noexcept {
     auto* out = static_cast<std::uint8_t*>(dst);
@@ -182,86 +208,38 @@ bool sha256_regular_file(const std::filesystem::path& path, std::array<std::uint
 }
 
 bool fingerprint_safetensors_file(const std::filesystem::path& path, ShardFingerprint& out) noexcept {
-    static constexpr std::uint64_t kMaxSafetensorsHeaderBytes = 100ull << 20;
-    static constexpr std::uint64_t kFullHashThreshold         = 1024ull * 1024ull;
-    static constexpr std::uint64_t kWindowBytes               = 16ull * 1024ull;
-    static constexpr std::uint64_t kNumWindows                = 8ull;
-
-    ScopedFd sfd;
-    sfd.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (sfd.fd < 0) { return false; }
-    struct stat st {};
-    if (::fstat(sfd.fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 8) { return false; }
-
-    out.file_size  = static_cast<std::uint64_t>(st.st_size);
-    out.mtime_sec  = static_cast<std::int64_t>(st.st_mtim.tv_sec);
-    out.mtime_nsec = static_cast<std::int64_t>(st.st_mtim.tv_nsec);
-
-    unsigned char len_bytes[8]{};
-    if (!pread_exact(sfd.fd, 0, len_bytes, sizeof(len_bytes))) { return false; }
-    std::uint64_t header_len = 0;
-    for (int i = 7; i >= 0; --i) { header_len = (header_len << 8) | len_bytes[i]; }
-    if (header_len > kMaxSafetensorsHeaderBytes || header_len > out.file_size - 8) { return false; }
-
-    std::uint8_t buf[65536];
-    {
-        Sha256 hctx;
-        hctx.update(len_bytes, sizeof(len_bytes));
-        std::uint64_t rem = header_len;
-        std::uint64_t off = 8;
-        while (rem > 0) {
-            const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(rem, sizeof(buf)));
-            if (!pread_exact(sfd.fd, off, buf, take)) { return false; }
-            hctx.update(buf, take);
-            off += take;
-            rem -= take;
-        }
-        out.header_sha256 = hctx.finish();
-    }
-
-    const std::uint64_t data_offset = 8 + header_len;
-    const std::uint64_t data_size   = out.file_size - data_offset;
-    {
-        Sha256 sctx;
-        sctx.update(&data_size, sizeof(data_size));
-        if (data_size <= kFullHashThreshold) {
-            std::uint64_t rem = data_size;
-            std::uint64_t off = data_offset;
-            while (rem > 0) {
-                const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(rem, sizeof(buf)));
-                if (!pread_exact(sfd.fd, off, buf, take)) { return false; }
-                sctx.update(buf, take);
-                off += take;
-                rem -= take;
-            }
-        } else {
-            const std::uint64_t max_off = data_size - kWindowBytes;
-            for (std::uint64_t i = 0; i < kNumWindows; ++i) {
-                const std::uint64_t win_off = (i * max_off) / (kNumWindows - 1);
-                sctx.update(&win_off, sizeof(win_off));
-                if (!pread_exact(sfd.fd, data_offset + win_off, buf, kWindowBytes)) { return false; }
-                sctx.update(buf, kWindowBytes);
-            }
-        }
-        out.sample_sha256 = sctx.finish();
+    if (!stat_regular_file(path, out) || out.file_size < 8u) { return false; }
+    if (out.file_size <= kFullFileShaThresholdBytes) {
+        if (!sha256_regular_file(path, out.full_sha256)) { return false; }
+        out.has_full_sha256 = true;
     }
     return true;
 }
 
 std::string format_shard_fingerprint_line(std::string_view rel_path, const ShardFingerprint& fp) {
     std::string line;
-    line.reserve(rel_path.size() + 180);
+    line.reserve(rel_path.size() + 144);
     line.append(rel_path);
     line.push_back('\t');
     line.append(std::to_string(fp.file_size));
+    line.push_back('\t');
+    line.append(std::to_string(fp.dev));
+    line.push_back('\t');
+    line.append(std::to_string(fp.ino));
     line.push_back('\t');
     line.append(std::to_string(fp.mtime_sec));
     line.push_back('\t');
     line.append(std::to_string(fp.mtime_nsec));
     line.push_back('\t');
-    line.append(sha256_hex(fp.header_sha256));
+    line.append(std::to_string(fp.ctime_sec));
     line.push_back('\t');
-    line.append(sha256_hex(fp.sample_sha256));
+    line.append(std::to_string(fp.ctime_nsec));
+    line.push_back('\t');
+    if (fp.has_full_sha256) {
+        line.append(sha256_hex(fp.full_sha256));
+    } else {
+        line.push_back('-');
+    }
     return line;
 }
 
@@ -693,6 +671,11 @@ bool weight_pack_matches_safetensors_dir(const WeightPack& pack, const std::file
         const auto shards_meta = pack.find_metadata("ingpack.source_shards");
         if (!shards_meta) { return false; }
 
+        struct stat pack_st {};
+        if (pack.fd() < 0 || ::fstat(pack.fd(), &pack_st) != 0) { return false; }
+        const std::int64_t pack_csec  = static_cast<std::int64_t>(pack_st.st_ctim.tv_sec);
+        const std::int64_t pack_cnsec = static_cast<std::int64_t>(pack_st.st_ctim.tv_nsec);
+
         std::size_t num_records = 0;
         std::size_t pos         = 0;
         while (pos < shards_meta->size()) {
@@ -704,16 +687,16 @@ bool weight_pack_matches_safetensors_dir(const WeightPack& pack, const std::file
             if (line.empty()) { continue; }
             ++num_records;
 
-            std::string_view fields[6]{};
+            std::string_view fields[9]{};
             std::size_t fpos = 0;
-            for (int f = 0; f < 5; ++f) {
+            for (int f = 0; f < 8; ++f) {
                 const std::size_t tab = line.find('\t', fpos);
                 if (tab == std::string_view::npos) { return false; }
                 fields[f] = line.substr(fpos, tab - fpos);
                 fpos      = tab + 1;
             }
             if (line.find('\t', fpos) != std::string_view::npos) { return false; }
-            fields[5] = line.substr(fpos);
+            fields[8] = line.substr(fpos);
 
             const std::string_view rel_path = fields[0];
             if (rel_path.empty()) { return false; }
@@ -724,25 +707,38 @@ bool weight_pack_matches_safetensors_dir(const WeightPack& pack, const std::file
             }
             if (dir_kind == "single" && rel_path != "model.safetensors") { return false; }
 
-            std::uint64_t exp_size = 0;
-            std::int64_t exp_sec   = 0;
-            std::int64_t exp_nsec  = 0;
-            if (!parse_exact_int(fields[1], exp_size) || !parse_exact_int(fields[2], exp_sec) ||
-                !parse_exact_int(fields[3], exp_nsec)) {
+            std::uint64_t exp_size  = 0;
+            std::uint64_t exp_dev   = 0;
+            std::uint64_t exp_ino   = 0;
+            std::int64_t exp_msec   = 0;
+            std::int64_t exp_mnsec  = 0;
+            std::int64_t exp_csec   = 0;
+            std::int64_t exp_cnsec  = 0;
+            if (!parse_exact_int(fields[1], exp_size) || !parse_exact_int(fields[2], exp_dev) ||
+                !parse_exact_int(fields[3], exp_ino) || !parse_exact_int(fields[4], exp_msec) ||
+                !parse_exact_int(fields[5], exp_mnsec) || !parse_exact_int(fields[6], exp_csec) ||
+                !parse_exact_int(fields[7], exp_cnsec)) {
                 return false;
             }
-            if (fields[4].size() != 64u || fields[5].size() != 64u) { return false; }
+            const std::string_view exp_sha_field = fields[8];
+            if (exp_sha_field != "-" && exp_sha_field.size() != 64u) { return false; }
 
             ShardFingerprint actual{};
-            if (!fingerprint_safetensors_file(dir / rel, actual)) { return false; }
-            if (actual.file_size != exp_size || actual.mtime_sec != exp_sec ||
-                actual.mtime_nsec != exp_nsec) {
-                return false;
-            }
-            if (sha256_hex(actual.header_sha256) != fields[4] ||
-                sha256_hex(actual.sample_sha256) != fields[5]) {
-                return false;
-            }
+            if (!stat_regular_file(dir / rel, actual)) { return false; }
+            if (actual.file_size != exp_size) { return false; }
+
+            const bool identity_matches =
+                actual.dev == exp_dev && actual.ino == exp_ino &&
+                actual.mtime_sec == exp_msec && actual.mtime_nsec == exp_mnsec &&
+                actual.ctime_sec == exp_csec && actual.ctime_nsec == exp_cnsec;
+            const bool strictly_older_than_pack =
+                timespec_strictly_less(actual.ctime_sec, actual.ctime_nsec, pack_csec, pack_cnsec);
+            if (identity_matches && strictly_older_than_pack) { continue; }
+
+            if (exp_sha_field == "-") { return false; }
+            std::array<std::uint8_t, 32> actual_sha{};
+            if (!sha256_regular_file(dir / rel, actual_sha)) { return false; }
+            if (sha256_hex(actual_sha) != exp_sha_field) { return false; }
         }
 
         if (dir_kind == "single") {
@@ -1168,6 +1164,10 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
         }
         builder.add_metadata("ingpack.source_index_sha256", sha256_hex(idx_sha));
     }
+    bool any_large_shard_without_sha = false;
+    bool has_max_ctime               = false;
+    std::int64_t max_csec            = 0;
+    std::int64_t max_cnsec           = 0;
     {
         std::vector<std::pair<std::string, fs::path>> shard_paths;
         shard_paths.reserve(model.files().size());
@@ -1196,6 +1196,12 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
             ShardFingerprint fp{};
             if (!fingerprint_safetensors_file(full_path, fp)) {
                 fail_pack(full_path, "cannot fingerprint source shard for provenance");
+            }
+            if (!fp.has_full_sha256) { any_large_shard_without_sha = true; }
+            if (!has_max_ctime || timespec_strictly_less(max_csec, max_cnsec, fp.ctime_sec, fp.ctime_nsec)) {
+                has_max_ctime = true;
+                max_csec      = fp.ctime_sec;
+                max_cnsec     = fp.ctime_nsec;
             }
             if (!shards_manifest.empty()) { shards_manifest.push_back('\n'); }
             shards_manifest.append(format_shard_fingerprint_line(rel_str, fp));
@@ -1231,7 +1237,22 @@ WeightPackBuildStats WeightPackBuilder::pack_from_safetensors(const std::filesys
                 });
         }
     }
-    return builder.write(output_path, opts);
+    WeightPackBuildStats stats = builder.write(output_path, opts);
+    if (any_large_shard_without_sha && has_max_ctime) {
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            struct stat pst {};
+            if (::stat(output_path.c_str(), &pst) == 0 &&
+                timespec_strictly_less(max_csec, max_cnsec,
+                                       static_cast<std::int64_t>(pst.st_ctim.tv_sec),
+                                       static_cast<std::int64_t>(pst.st_ctim.tv_nsec))) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            struct timespec ts[2] = {{0, UTIME_OMIT}, {0, UTIME_NOW}};
+            (void)::utimensat(AT_FDCWD, output_path.c_str(), ts, 0);
+        }
+    }
+    return stats;
 }
 
 }  // namespace ingine

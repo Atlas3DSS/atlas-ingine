@@ -13,6 +13,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -658,6 +661,99 @@ void test_weight_source_consistency(const std::filesystem::path& dir) {
         INGINE_CHECK(throws_runtime([&] {
             SafetensorsModel bad4(src_25 / "model.safetensors.index.json", SafetensorsOpenMode::WeightPackOnly);
         }));
+    }
+
+    // 6. Timestamp-preserving copy of same-shape release (shutil.copy2 / fixed mtime bypass check).
+    auto set_fixed_mtime = [](const std::filesystem::path& p, std::time_t sec) {
+        struct timespec ts[2] = {{sec, 0}, {sec, 0}};
+        INGINE_CHECK(::utimensat(AT_FDCWD, p.c_str(), ts, 0) == 0);
+    };
+    {
+        const auto rel_dir = consistency_root / "published_release_2m";
+        std::filesystem::create_directories(rel_dir);
+        const std::filesystem::path cur_st   = rel_dir / "model.safetensors";
+        const std::filesystem::path next_st  = consistency_root / "next_release_2m.safetensors";
+        const std::filesystem::path pack_out = rel_dir / "model.ingpack";
+
+        const std::size_t elems = 512u * 1024u;  // 2 MiB F32
+        std::vector<std::uint8_t> d1(elems * sizeof(float), 0u);
+        std::vector<std::uint8_t> d2 = d1;
+        const float one              = 1.0f;
+        const std::size_t mid_off    = (256u * 1024u) * sizeof(float);
+        std::memcpy(d2.data() + mid_off, &one, sizeof(one));
+
+        write_safetensors(cur_st, {{"matrix", "F32", {512, 1024}, std::move(d1)}});
+        set_fixed_mtime(cur_st, 1700000000);
+        write_safetensors(next_st, {{"matrix", "F32", {512, 1024}, std::move(d2)}});
+        set_fixed_mtime(next_st, 1700000000);
+
+        (void)WeightPackBuilder::pack_from_safetensors(rel_dir, pack_out);
+        {
+            SafetensorsModel orig(rel_dir);
+            INGINE_CHECK(orig.is_weight_pack());
+            const auto b = orig.read("matrix");
+            float v      = -1.0f;
+            std::memcpy(&v, b.data() + mid_off, sizeof(v));
+            INGINE_CHECK(v == 0.0f);
+        }
+
+        // Replace in-place with identical mtime/layout/header/size (single 1.0f interior edit).
+        std::filesystem::copy_file(next_st, cur_st, std::filesystem::copy_options::overwrite_existing);
+        set_fixed_mtime(cur_st, 1700000000);
+        {
+            SafetensorsModel updated(rel_dir);
+            SafetensorsModel source_only(rel_dir, SafetensorsOpenMode::SafetensorsOnly);
+            INGINE_CHECK(!updated.is_weight_pack());
+            INGINE_CHECK(updated.read("matrix") == source_only.read("matrix"));
+            float v = -1.0f;
+            std::memcpy(&v, updated.read("matrix").data() + mid_off, sizeof(v));
+            INGINE_CHECK(v == 1.0f);
+        }
+    }
+
+    // 7. Large (> 32 MiB) shard without full-file SHA: fast path on unchanged inode+ctime, fail-closed on copy2 overwrite.
+    {
+        const auto big_dir = consistency_root / "published_release_36m";
+        std::filesystem::create_directories(big_dir);
+        const std::filesystem::path cur_st   = big_dir / "model.safetensors";
+        const std::filesystem::path next_st  = consistency_root / "next_release_36m.safetensors";
+        const std::filesystem::path pack_out = big_dir / "model.ingpack";
+
+        const std::size_t rows    = 9216u;  // 9216 * 1024 * 4 = 36 MiB (> 32 MiB)
+        const std::size_t cols    = 1024u;
+        const std::size_t mid_off = (rows / 2u) * cols * sizeof(float);
+        std::vector<std::uint8_t> d1(rows * cols * sizeof(float), 0u);
+        std::vector<std::uint8_t> d2 = d1;
+        const float one              = 1.0f;
+        std::memcpy(d2.data() + mid_off, &one, sizeof(one));
+
+        write_safetensors(cur_st, {{"matrix", "F32", {static_cast<std::int64_t>(rows), static_cast<std::int64_t>(cols)}, std::move(d1)}});
+        set_fixed_mtime(cur_st, 1700000000);
+        write_safetensors(next_st, {{"matrix", "F32", {static_cast<std::int64_t>(rows), static_cast<std::int64_t>(cols)}, std::move(d2)}});
+        set_fixed_mtime(next_st, 1700000000);
+
+        (void)WeightPackBuilder::pack_from_safetensors(big_dir, pack_out);
+        {
+            SafetensorsModel orig(big_dir);
+            INGINE_CHECK(orig.is_weight_pack());
+            const auto wp = orig.files()[0]->weight_pack();
+            INGINE_CHECK(wp != nullptr);
+            INGINE_CHECK(ingine::weight_pack_matches_safetensors_dir(*wp, big_dir));
+        }
+
+        // Timestamp-preserving overwrite (> 32 MiB has '-' SHA field -> ctime change MUST fail closed to source).
+        std::filesystem::copy_file(next_st, cur_st, std::filesystem::copy_options::overwrite_existing);
+        set_fixed_mtime(cur_st, 1700000000);
+        {
+            SafetensorsModel updated(big_dir);
+            SafetensorsModel source_only(big_dir, SafetensorsOpenMode::SafetensorsOnly);
+            INGINE_CHECK(!updated.is_weight_pack());
+            const auto b = updated.read("matrix");
+            INGINE_CHECK(b == source_only.read("matrix"));
+            float v = -1.0f;
+            std::memcpy(&v, b.data() + mid_off, sizeof(v));
+            INGINE_CHECK(v == 1.0f);
+        }
     }
 }
 
