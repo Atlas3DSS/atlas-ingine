@@ -1,0 +1,34 @@
+{
+  "inkling_generation": {
+    "dry_run": false,
+    "enable_thinking": false,
+    "max_tokens": 1400,
+    "model_id": "inkling-2-mini",
+    "persona_spec": null,
+    "reasoning_content": null,
+    "seed": 20261127,
+    "system_prompt": "You are Omni-Inkling-2-Mini directing a matched Ledger-OFF vs Ledger-ON >=30s coherent 360-degree room turnaround permanence experiment. Return ONLY valid JSON with keys: orbit_seg0_0_to_120, orbit_seg1_120_to_240, orbit_seg2_240_to_360, seg0_pan_away_0_to_180, seg1_return_180_to_360, single_clip_full_360, h3_image_anchor_prompt. No markdown fences, no commentary.",
+    "temperature": 0.2,
+    "text": "{\"orbit_seg0_0_to_120\":\"MiniMax-H3 FL2VA, 30+ sec clockwise orbit, segment 0-120 deg: slow arc from front-left of Atlas Monkey Founder's workshop, warm amber lamp glow, emerald hardware workbench in sharp foreground, wall plaque centered with exact verbatim text: 'Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing', Monkey Founder seated at bench, cinematic shallow depth of field, smooth dolly-orbit, no text overlays beyond plaque\",\"orbit_seg1_120_to_240\":\"MiniMax-H3 FL2VA, 30+ sec clockwise orbit, segment 120-240 deg: continue arc past right side, keep plaque legible and centered, open studio door with warm amber lamp visible, emerald workbench edge sweeping through frame, Monkey Founder in soft backlight, steady 360-degree motion, photoreal, no extra captions\",\"orbit_seg2_240_to_360\":\"MiniMax-H3 FL2VA, 30+ sec clockwise orbit, segment 240-360 deg: arc back toward start, plaque remains readable, amber lamp and open door frame the composition, emerald workbench and Monkey Founder re-enter foreground, smooth continuous orbit, warm cinematic grade, no invented text\",\"seg0_pan_away_0_to_180\":\"MiniMax-H3 FL2VA, 30+ sec pan-away segment 0-180 deg: camera begins facing plaque and Monkey Founder, then pans away across workshop toward open door and amber lamp, emerald workbench recedes, plaque text kept sharp at start then softly out of focus, smooth 180-degree pan, no added typography\",\"seg1_return_180_to_360\":\"MiniMax-H3 FL2VA, 30+ sec return segment 180-360 deg: camera pans back from door/lamp side toward plaque and workbench, Monkey Founder re-enters frame, emerald bench and amber glow restore warmth, plaque text becomes crisp again at end, smooth continuous motion, no extra text\",\"single_clip_full_360\":\"MiniMax-H3 FL2VA, 30+ sec single continuous clockwise 360-degree orbit around Atlas Monkey Founder's workshop: plaque with exact verbatim text 'Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing', Monkey Founder, open studio door with warm amber lamp, emerald hardware workbench, smooth arc, cinematic lighting, no invented captions\",\"h3_image_anchor_prompt\":\"MiniMax-H3 image anchor: photoreal workshop interior, wall plaque centered with exact verbatim text 'Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing', Atlas Monkey Founder seated at emerald hardware workbench, open studio door with warm amber lamp, warm cinematic grade, crisp plaque typography, no extra text\"}",
+    "token_ids": [],
+    "top_p": 0.9,
+    "usage": {
+      "completion_tokens": 732,
+      "prompt_tokens": 254,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "total_tokens": 986
+    },
+    "user_prompt": "Write crisp MiniMax-H3 FL2VA cinematography prompts for a smooth 30+ second clockwise camera orbit around the Atlas Monkey Founder's workshop featuring a wall plaque with the exact verbatim text:\n'Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing'\nInclude the Monkey Founder, open studio door with warm amber lamp, and emerald hardware workbench."
+  },
+  "prompts": {
+    "h3_image_anchor_prompt": "MiniMax-H3 image anchor: photoreal workshop interior, wall plaque centered with exact verbatim text 'Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing', Atlas Monkey Founder seated at emerald hardware workbench, open studio door with warm amber lamp, warm cinematic grade, crisp plaque typography, no extra text",
+    "orbit_seg0_0_to_120": "MiniMax-H3 FL2VA, 30+ sec clockwise orbit, segment 0-120 deg: slow arc from front-left of Atlas Monkey Founder's workshop, warm amber lamp glow, emerald hardware workbench in sharp foreground, wall plaque centered with exact verbatim text: 'Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing', Monkey Founder seated at bench, cinematic shallow depth of field, smooth dolly-orbit, no text overlays beyond plaque",
+    "orbit_seg1_120_to_240": "MiniMax-H3 FL2VA, 30+ sec clockwise orbit, segment 120-240 deg: continue arc past right side, keep plaque legible and centered, open studio door with warm amber lamp visible, emerald workbench edge sweeping through frame, Monkey Founder in soft backlight, steady 360-degree motion, photoreal, no extra captions",
+    "orbit_seg2_240_to_360": "MiniMax-H3 FL2VA, 30+ sec clockwise orbit, segment 240-360 deg: arc back toward start, plaque remains readable, amber lamp and open door frame the composition, emerald workbench and Monkey Founder re-enter foreground, smooth continuous orbit, warm cinematic grade, no invented text",
+    "seg0_pan_away_0_to_180": "MiniMax-H3 FL2VA, 30+ sec pan-away segment 0-180 deg: camera begins facing plaque and Monkey Founder, then pans away across workshop toward open door and amber lamp, emerald workbench recedes, plaque text kept sharp at start then softly out of focus, smooth 180-degree pan, no added typography",
+    "seg1_return_180_to_360": "MiniMax-H3 FL2VA, 30+ sec return segment 180-360 deg: camera pans back from door/lamp side toward plaque and workbench, Monkey Founder re-enters frame, emerald bench and amber glow restore warmth, plaque text becomes crisp again at end, smooth continuous motion, no extra text",
+    "single_clip_full_360": "MiniMax-H3 FL2VA, 30+ sec single continuous clockwise 360-degree orbit around Atlas Monkey Founder's workshop: plaque with exact verbatim text 'Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing', Monkey Founder, open studio door with warm amber lamp, emerald hardware workbench, smooth arc, cinematic lighting, no invented captions"
+  }
+}

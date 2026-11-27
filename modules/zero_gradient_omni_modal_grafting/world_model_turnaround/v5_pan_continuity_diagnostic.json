@@ -1,0 +1,40 @@
+{
+  "official_v5_verdict_unchanged": "FAIL (3/4 Anti-Goodhart gates PASS; continuity_gate_passed=false on unshifted pixel SSIM)",
+  "schema_version": "turnaround-v5-pan-continuity-diagnostic/v1",
+  "v4_ledger_on": {
+    "max_abs_pan_dx_px": 12,
+    "median_abs_pan_dx_px": 1.0,
+    "n_frames": 804,
+    "pan_comp_max_adj_l1": 0.14119,
+    "pan_comp_median_adj_l1": 0.00875,
+    "pan_comp_p99_adj_l1": 0.01887,
+    "pan_comp_worst_dx_px": 12,
+    "pan_comp_worst_frame": 383,
+    "raw_max_adj_l1": 0.15912,
+    "raw_worst_frame": 383
+  },
+  "v5_ledger_off": {
+    "max_abs_pan_dx_px": 3,
+    "median_abs_pan_dx_px": 1.0,
+    "n_frames": 957,
+    "pan_comp_max_adj_l1": 0.0176,
+    "pan_comp_median_adj_l1": 0.00821,
+    "pan_comp_p99_adj_l1": 0.01427,
+    "pan_comp_worst_dx_px": 1,
+    "pan_comp_worst_frame": 766,
+    "raw_max_adj_l1": 0.04955,
+    "raw_worst_frame": 430
+  },
+  "v5_ledger_on": {
+    "max_abs_pan_dx_px": 3,
+    "median_abs_pan_dx_px": 1.0,
+    "n_frames": 957,
+    "pan_comp_max_adj_l1": 0.02083,
+    "pan_comp_median_adj_l1": 0.00937,
+    "pan_comp_p99_adj_l1": 0.01936,
+    "pan_comp_worst_dx_px": 1,
+    "pan_comp_worst_frame": 924,
+    "raw_max_adj_l1": 0.05001,
+    "raw_worst_frame": 934
+  }
+}

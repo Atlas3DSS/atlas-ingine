@@ -207,7 +207,7 @@ def fig0():
     # Column 3: Frozen Receivers
     rcards = [
         ('MiniMax-H3 (Confirm-160 + Dev-4 AV)', f'concat4 {pa_concat4_ret:.2f}% (90 MiB) · DINOv3 16/16 · 0 extra B to Dev-4 FL2VA', G),
-        ('Wave B Image DiTs (Dev-24, C-160 sealed)', f'FLUX.2-dev {f2d_ret:.2f}% (44.7 GiB Mistral off) · FLUX.2-klein {f2k9_ret:.2f}% · FLUX.1 {f1dev_ret:.1f}/{f1sch_ret:.1f}%', G),
+        ('Wave B DiTs (Dev-24 img; C-160 word 4/6)', f'FLUX.2-dev {f2d_ret:.2f}% (44.7 GiB off; C-160 R^2=0.652) · FLUX.2-klein {f2k9_ret:.2f}% · FLUX.1 {f1dev_ret:.1f}/{f1sch_ret:.1f}%', G),
         ('Qwen3.8 L31 (C-160) & 3-Way Word-Span', f'L31/64 (50 MiB): {qw_st_ret:.2f}% cu130 · 3-way word-span cos {b3_mk:.4f} (16/16 vs Qwen)', BLUE),
         ('Measured Failure Boundaries', f'SDXL Dev-24 ({sdxl_b_ret:.1f}%/{sdxl_t_ret:.1f}%) · OCR Dev-192 (2/48) · Mouth Confirm-80 FAIL (4/6)', RED),
     ]
@@ -225,7 +225,7 @@ def fig0():
     s += t(M + 16, y_bot + 23, 'SEAM-SPECIFIC CAUSAL CONTROLS (SEE PAPER SECTION 2):', 11.2, INK, 'start', 700, ls='0.06em')
     s += t(M + 16, y_bot + 44, '(1) 0.0 RMSE Native Reinjection Floor  |  (2) Shuffled B0 (matched to primary single_tap; dev-only on blends)  |  (3) Sealed Confirm Splits (Packet A, Qwen L31, 3-Way word-span, Mouth)  |  (4) Wave B Dev-24', 11.2, BODY)
 
-    f, H = footer(y_bot + 88, 'Summary architecture diagram combining JSON-loaded retention/cosine values (extra_sources.sha256.json) with Paper v0.9 seam annotations. Zero receiver text encoder weights are loaded for Plato Key or B0 inference arms.')
+    f, H = footer(y_bot + 88, 'Summary architecture diagram combining JSON-loaded retention/cosine values (extra_sources.sha256.json) with Paper v0.9.3 seam annotations. Zero receiver text encoder weights are loaded for Plato Key or B0 inference arms.')
     return doc(s + f, H)
 
 
@@ -262,7 +262,7 @@ def fig4():
         lbl = f'N={n}' if n <= 2 else ('N=3 / 3*' if n == 3 else f'N={n}*')
         s += t(xx, gy1 + 16, lbl, 10.0, INK if n <= 3 else SEC, 'middle', 700 if n <= 3 else 400)
     s += f'<rect x="{mx(2)+3:.1f}" y="{gy0:.1f}" width="{gx1 - mx(2) - 3:.1f}" height="{gy1-gy0:.1f}" fill="#ffffff" fill-opacity="0.02"/>'
-    s += t(mx(7) - 2, gy0 + 13, 'dashed: 2 real + clones from N=2', 9.5, SEC, 'end')
+    s += t(mx(7) - 2, gy0 + 11, 'dashed: 2 real + clones from N=2', 9.2, SEC, 'end')
 
     rb_real = NREAL['regression_boundary_summary']
     rb_str = NSTRESS['regression_boundary_summary']
@@ -286,9 +286,9 @@ def fig4():
             s += f'<circle cx="{mx(i+1):.1f}" cy="{my(v):.1f}" r="3.8" fill="{col}"/>'
 
     # Explicit non-overlapping callouts distinguishing real N=3 (0.962435) vs flat stress (0.961592)
-    s += t(mx(3) - 6, my(rb_real['stacked_multikernel']['cosine_by_n'][2]) - 8, 'real N=3: 0.96244', 9.5, G, 'end', 700)
-    s += t(mx(7) - 2, my(rb_str['stacked_multikernel']['cosine_by_n'][4]) - 5, 'stress flat: 0.96159', 9.3, G, 'end')
-    s += t(mx(7) - 2, my(0.935) - 6, 'raw drops to 0.873 (off-scale)', 9.3, RED, 'end', 700)
+    s += t(mx(3) - 6, my(rb_real['stacked_multikernel']['cosine_by_n'][2]) - 8, 'real N=3: 0.96244', 9.4, G, 'end', 700)
+    s += t(mx(7) - 2, my(rb_str['stacked_multikernel']['cosine_by_n'][4]) + 15, 'stress flat: 0.96159', 9.2, G, 'end')
+    s += t(mx(4.15), my(0.9372), 'raw drops to 0.873 (off-scale)', 9.2, RED, 'end', 700)
 
     # Compact inline curve legend
     leg_items = [('Multi-Kernel', G), ('OOF Convex', BLUE), ('RMS-Norm', AMBER), ('Energy-Norm', '#d98a4e'), ('Raw', RED)]
@@ -343,7 +343,7 @@ def fig4():
         lbl_x = bx1 + 8 if val >= 88.0 else bx0 + wbar + 8
         s += t(lbl_x, by + 17.5, f'{val:.2f}%', 11.5, col, 'start', 700, mono=True).replace('<text ', f'<text paint-order="stroke" stroke="{PANEL}" stroke-width="5" stroke-linejoin="round" ')
 
-    f, H = footer(P_TOP + P_H + 26, 'Left: real N=1..3 val_dev (solid) and separate 2-real + clone stress series from shared N=2 (dashed; convex_equal omitted at 0.622); Confirm-160 significance is vs Qwen3.8 alone (+0.000601 vs 2-way descriptive). Right: C-160 bars use B0-anchored (cand-B0)/(teach-B0); Wave B Dev-24 bars use cand_margin/native_margin with separate B0 gate (e.g. FLUX.2-dev 0.2711/0.2721=99.65%; Confirm-160 sealed).')
+    f, H = footer(P_TOP + P_H + 26, 'Left: real N=1..3 val_dev (solid) and separate 2-real + clone stress series from shared N=2 (dashed; convex_equal omitted at 0.622); Confirm-160 significance is vs Qwen3.8 alone (+0.000601 vs 2-way descriptive). Right: C-160 bars use B0-anchored (cand-B0)/(teach-B0); Wave B Dev-24 bars use cand_margin/native_margin with separate B0 gate (e.g. FLUX.2-dev 0.2711/0.2721=99.65%; Wave B Confirm-160 word bars 4/6 PASS incl. FLUX.2-dev R^2=0.6523, Confirm-160 image renders sealed).')
     return doc(s + f, H)
 
 

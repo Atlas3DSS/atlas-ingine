@@ -99,3 +99,11 @@ Rendered end-to-end on Colab `G4-4` Blackwell (`2188.56 s`, `2,130` frames @ `24
 ![Showcase 1 Flagship Anthem v5 QA Contact Sheet](figures/comparisons/showcase1_anthem_v5_qa_contact_sheet.png)
 
 ![Showcase 1 Flagship Anthem v5 7-Segment Continuity Strip](figures/comparisons/showcase1_anthem_v5_7seg_strip.png)
+
+---
+
+## 7. Flagship Showcase 2 — Verified Ledger 360° World-Model Turnaround ("This Is Not a Video")
+
+Controlled `360°` camera orbit (`39.875 s`, `957` frames @ `24 fps`, `1024×576` per arm, `48 kHz` stereo AAC, Packet C narration *"This is not a video. This is a world model being turned around."*, `zero_qwen_loaded = true`, `1,728.52 s` on Blackwell). Both arms share identical frames `0–651` (`0° → 240°`) and branch at `240° → 360°`: **`LEDGER-OFF`** forgets the starting wall plaque (`0.0%` OCR, `0.4147` anchor cos, `-2.08` wardrobe margin), whereas **`LEDGER-ON`** (`smooth-trajectory-v5`) recovers the painted plaque at `61.87%` mean non-pinned OCR (`81.6%` at `345°`, `92.0%` at `355°`, `93.6%` at `360°`, `0.0%` phantom leak at `180°`), `0.8877` anchor cos, `0.7394` founder cos, and `+11.88` wardrobe margin (`3/4` strict Anti-Goodhart gates PASS; official verdict remains `FAIL` on unshifted pixel-SSIM continuity, while pan-compensated continuity shows a `6.78×` reduction to `0.02083` max L1 / `3 px` max `dx`). Full standalone reproduction scripts & manifests: [WORLD_MODEL_TURNAROUND.md](world_model_turnaround/WORLD_MODEL_TURNAROUND.md).
+
+![Showcase 2 360° World-Model Turnaround v5 QA Contact Sheet](figures/comparisons/qa_contact_sheet_360_turnaround.png)

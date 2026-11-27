@@ -1,0 +1,1958 @@
+{
+  "anchor_plate": {
+    "anchors": [
+      {
+        "bytes": 1050856,
+        "filename": "yaw_000.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_000.png",
+        "sha256": "477fe0cfd5301982f905240ab361c7493f6f99877be220ef871350286d2e7775",
+        "width": 1344,
+        "yaw_deg": 0.0
+      },
+      {
+        "bytes": 1004224,
+        "filename": "yaw_030.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_030.png",
+        "sha256": "6f7c341c2c21c24f0af9a42ea14ab6992118660f88ef7ea0f2dc3285e8a04b4c",
+        "width": 1344,
+        "yaw_deg": 30.0
+      },
+      {
+        "bytes": 917159,
+        "filename": "yaw_060.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_060.png",
+        "sha256": "b5938967d209bb104d5570206a1009d432e76aabcfd97b1c3330a60b5fe9cef4",
+        "width": 1344,
+        "yaw_deg": 60.0
+      },
+      {
+        "bytes": 888795,
+        "filename": "yaw_090.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_090.png",
+        "sha256": "e57f6f35771ea4d2aabed064049359524ab5de2f3cdadf576c6aad9a6718e5b5",
+        "width": 1344,
+        "yaw_deg": 90.0
+      },
+      {
+        "bytes": 945312,
+        "filename": "yaw_120.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_120.png",
+        "sha256": "c4f9b7f1551df55700ea85d13a991ebafeacc1ee3ed4f42815b0781b293e1649",
+        "width": 1344,
+        "yaw_deg": 120.0
+      },
+      {
+        "bytes": 939421,
+        "filename": "yaw_150.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_150.png",
+        "sha256": "4670f48816a7c363f0f70cd5991512197de02ce7ccb554317b1bc163621a0bd6",
+        "width": 1344,
+        "yaw_deg": 150.0
+      },
+      {
+        "bytes": 901165,
+        "filename": "yaw_180.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_180.png",
+        "sha256": "da3a5488c678e46ca8d36b11747650b9d22c5f34854b67936f530e7c49eb6568",
+        "width": 1344,
+        "yaw_deg": 180.0
+      },
+      {
+        "bytes": 915495,
+        "filename": "yaw_210.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_210.png",
+        "sha256": "2eb344aaeb36dba8a4da55cf74b0bf52c4e05441b11ad3f5b102e7728bdc1fba",
+        "width": 1344,
+        "yaw_deg": 210.0
+      },
+      {
+        "bytes": 920263,
+        "filename": "yaw_240.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_240.png",
+        "sha256": "cc872e349e96d74e3b09a8c663de1cb5f892aa1b9a57f1cdfb5a4fa9861eb8dd",
+        "width": 1344,
+        "yaw_deg": 240.0
+      },
+      {
+        "bytes": 877652,
+        "filename": "yaw_270.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_270.png",
+        "sha256": "c50e3f1b2b5ab360524648efb6546d680baf77a4fd7fab6590143f163b8158ec",
+        "width": 1344,
+        "yaw_deg": 270.0
+      },
+      {
+        "bytes": 982099,
+        "filename": "yaw_300.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_300.png",
+        "sha256": "7b1c1f6d64479518ac1ef0855fa4e03cedca85ad3709854260eaecd58433934f",
+        "width": 1344,
+        "yaw_deg": 300.0
+      },
+      {
+        "bytes": 1042794,
+        "filename": "yaw_330.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_330.png",
+        "sha256": "58a5f31812533f995b90deba91be143d2618960fb56190c4ebfef167799dd685",
+        "width": 1344,
+        "yaw_deg": 330.0
+      }
+    ],
+    "blender_version": "5.2.5 LTS",
+    "by_yaw_str": {
+      "000": {
+        "bytes": 1050856,
+        "filename": "yaw_000.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_000.png",
+        "sha256": "477fe0cfd5301982f905240ab361c7493f6f99877be220ef871350286d2e7775",
+        "width": 1344,
+        "yaw_deg": 0.0
+      },
+      "030": {
+        "bytes": 1004224,
+        "filename": "yaw_030.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_030.png",
+        "sha256": "6f7c341c2c21c24f0af9a42ea14ab6992118660f88ef7ea0f2dc3285e8a04b4c",
+        "width": 1344,
+        "yaw_deg": 30.0
+      },
+      "060": {
+        "bytes": 917159,
+        "filename": "yaw_060.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_060.png",
+        "sha256": "b5938967d209bb104d5570206a1009d432e76aabcfd97b1c3330a60b5fe9cef4",
+        "width": 1344,
+        "yaw_deg": 60.0
+      },
+      "090": {
+        "bytes": 888795,
+        "filename": "yaw_090.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_090.png",
+        "sha256": "e57f6f35771ea4d2aabed064049359524ab5de2f3cdadf576c6aad9a6718e5b5",
+        "width": 1344,
+        "yaw_deg": 90.0
+      },
+      "120": {
+        "bytes": 945312,
+        "filename": "yaw_120.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_120.png",
+        "sha256": "c4f9b7f1551df55700ea85d13a991ebafeacc1ee3ed4f42815b0781b293e1649",
+        "width": 1344,
+        "yaw_deg": 120.0
+      },
+      "150": {
+        "bytes": 939421,
+        "filename": "yaw_150.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_150.png",
+        "sha256": "4670f48816a7c363f0f70cd5991512197de02ce7ccb554317b1bc163621a0bd6",
+        "width": 1344,
+        "yaw_deg": 150.0
+      },
+      "180": {
+        "bytes": 901165,
+        "filename": "yaw_180.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_180.png",
+        "sha256": "da3a5488c678e46ca8d36b11747650b9d22c5f34854b67936f530e7c49eb6568",
+        "width": 1344,
+        "yaw_deg": 180.0
+      },
+      "210": {
+        "bytes": 915495,
+        "filename": "yaw_210.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_210.png",
+        "sha256": "2eb344aaeb36dba8a4da55cf74b0bf52c4e05441b11ad3f5b102e7728bdc1fba",
+        "width": 1344,
+        "yaw_deg": 210.0
+      },
+      "240": {
+        "bytes": 920263,
+        "filename": "yaw_240.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_240.png",
+        "sha256": "cc872e349e96d74e3b09a8c663de1cb5f892aa1b9a57f1cdfb5a4fa9861eb8dd",
+        "width": 1344,
+        "yaw_deg": 240.0
+      },
+      "270": {
+        "bytes": 877652,
+        "filename": "yaw_270.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_270.png",
+        "sha256": "c50e3f1b2b5ab360524648efb6546d680baf77a4fd7fab6590143f163b8158ec",
+        "width": 1344,
+        "yaw_deg": 270.0
+      },
+      "300": {
+        "bytes": 982099,
+        "filename": "yaw_300.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_300.png",
+        "sha256": "7b1c1f6d64479518ac1ef0855fa4e03cedca85ad3709854260eaecd58433934f",
+        "width": 1344,
+        "yaw_deg": 300.0
+      },
+      "330": {
+        "bytes": 1042794,
+        "filename": "yaw_330.png",
+        "height": 768,
+        "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_330.png",
+        "sha256": "58a5f31812533f995b90deba91be143d2618960fb56190c4ebfef167799dd685",
+        "width": 1344,
+        "yaw_deg": 330.0
+      }
+    },
+    "bytes": 1050856,
+    "engine": "CYCLES",
+    "height": 768,
+    "manifest_path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/room_anchors_manifest.json",
+    "manifest_sha256": "e5a3dd7d8bb8329063aa32509ec5b7affcf3903a49f7c92e1e697288d027cf6a",
+    "path": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5/yaw_000.png",
+    "room_dir": "/content/omni912_showcases/showcase_scripts/blender_360_room_v5",
+    "sha256": "477fe0cfd5301982f905240ab361c7493f6f99877be220ef871350286d2e7775",
+    "source": "blender-room",
+    "width": 1344
+  },
+  "arm_mp4s": {
+    "ledger_off": {
+      "bytes": 10828625,
+      "path": "/content/omni912_showcases/turnaround_360_v5/render_clips/turnaround_ledger_off.mp4",
+      "probe": {
+        "avg_frame_rate": "24/1",
+        "channels": 2,
+        "duration_s": 39.875,
+        "has_audio": true,
+        "has_video": true,
+        "height": 576,
+        "nb_frames": 957,
+        "path": "/content/omni912_showcases/turnaround_360_v5/render_clips/turnaround_ledger_off.mp4",
+        "sample_rate": 48000,
+        "size_bytes": 10828625,
+        "width": 1024
+      },
+      "sha256": "0c30b114e0e9c2f4efb19a5095c981db5934f9dbb028f3906ff08ffcdfced56d"
+    },
+    "ledger_on": {
+      "bytes": 11818140,
+      "path": "/content/omni912_showcases/turnaround_360_v5/render_clips/turnaround_ledger_on.mp4",
+      "probe": {
+        "avg_frame_rate": "24/1",
+        "channels": 2,
+        "duration_s": 39.875,
+        "has_audio": true,
+        "has_video": true,
+        "height": 576,
+        "nb_frames": 957,
+        "path": "/content/omni912_showcases/turnaround_360_v5/render_clips/turnaround_ledger_on.mp4",
+        "sample_rate": 48000,
+        "size_bytes": 11818140,
+        "width": 1024
+      },
+      "sha256": "a894d4dc5d31b12d1d44adfe6f9637d8ed452a2d6c264b40c7f9973f126d9cf8"
+    }
+  },
+  "concat4_key_sha256": "cca1e5bc68b7c8632267ef909823d342922079453e1d151cb609d798556e88c0",
+  "dit_variant": "ref2va",
+  "dry_run": false,
+  "elapsed_seconds": 1728.52,
+  "host_visual_crop_gate_audit": {
+    "all_frames_passed": false,
+    "frames": [
+      {
+        "checkpoint": "yaw_000_start",
+        "composite_score": 0.74949,
+        "contact_sheet_path": null,
+        "contact_sheet_sha256": null,
+        "crops": [
+          {
+            "box_xyxy": [
+              384,
+              113,
+              640,
+              369
+            ],
+            "clipped_highlight_frac": 8e-05,
+            "crushed_black_frac": 0.00014,
+            "dynamic_range_p95_p05": 0.6048,
+            "fft_anisotropy": 3.3092,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.18919,
+            "name": "hero_center",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              468,
+              152,
+              724,
+              408
+            ],
+            "clipped_highlight_frac": 5e-05,
+            "crushed_black_frac": 0.00969,
+            "dynamic_range_p95_p05": 0.7081,
+            "fft_anisotropy": 3.1128,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.20826,
+            "name": "peak_detail_roi",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              384,
+              320,
+              640,
+              576
+            ],
+            "clipped_highlight_frac": 2e-05,
+            "crushed_black_frac": 0.0079,
+            "dynamic_range_p95_p05": 0.7739,
+            "fft_anisotropy": 984.0421,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.1074,
+            "name": "lower_seam_roi",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              23,
+              258,
+              279,
+              514
+            ],
+            "clipped_highlight_frac": 0.0,
+            "crushed_black_frac": 0.00162,
+            "dynamic_range_p95_p05": 0.5544,
+            "fft_anisotropy": 1.1794,
+            "fft_anisotropy_ok": true,
+            "laplacian_std": 0.09019,
+            "name": "shadow_texture_roi",
+            "sharpness_ok": true
+          }
+        ],
+        "frame_index": 0,
+        "full_frame": {
+          "center_mean_luma": 0.6549,
+          "clipped_highlight_frac": 0.00014,
+          "corner_mean_luma": 0.3175,
+          "corner_washout_excess": -0.3374,
+          "crushed_black_frac": 0.0206,
+          "dynamic_range_p95_p05": 0.7456,
+          "laplacian_std": 0.095,
+          "luma_p05": 0.1367,
+          "luma_p50": 0.3698,
+          "luma_p95": 0.8824
+        },
+        "gates": {
+          "all_crops_fft_anisotropy_ok": false,
+          "all_finite": true,
+          "corner_contrast_ok": true,
+          "detail_crops_sharpness_ok": true,
+          "dynamic_range_ok": true,
+          "highlight_clipping_ok": true,
+          "shadow_crush_ok": true
+        },
+        "hard_gates_passed": 6,
+        "hard_gates_total": 7,
+        "height": 576,
+        "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00000.png",
+        "image_sha256": "c85698031c850e8e788bf8f1a0b78f6d132219185fa4049fb18e2b2e26ccacdf",
+        "passed": false,
+        "schema_version": "atlas-host-visual-crop-gate/v1",
+        "thresholds": {
+          "max_clipped_highlight_frac": 0.035,
+          "max_corner_washout_excess": 0.22,
+          "max_crop_fft_anisotropy": 2.6,
+          "max_crushed_black_frac": 0.2,
+          "min_all_finite": true,
+          "min_crop_sharpness_lap_std": 0.008,
+          "min_dynamic_range_p95_p05": 0.25
+        },
+        "width": 1024,
+        "yaw_deg": 0.0
+      },
+      {
+        "checkpoint": "yaw_345_approach_nonpinned",
+        "composite_score": 0.74975,
+        "contact_sheet_path": null,
+        "contact_sheet_sha256": null,
+        "crops": [
+          {
+            "box_xyxy": [
+              384,
+              113,
+              640,
+              369
+            ],
+            "clipped_highlight_frac": 0.0002,
+            "crushed_black_frac": 0.0,
+            "dynamic_range_p95_p05": 0.7306,
+            "fft_anisotropy": 1.0107,
+            "fft_anisotropy_ok": true,
+            "laplacian_std": 0.10238,
+            "name": "hero_center",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              724,
+              151,
+              980,
+              407
+            ],
+            "clipped_highlight_frac": 0.00027,
+            "crushed_black_frac": 0.00444,
+            "dynamic_range_p95_p05": 0.6997,
+            "fft_anisotropy": 2.7237,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.16709,
+            "name": "peak_detail_roi",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              384,
+              320,
+              640,
+              576
+            ],
+            "clipped_highlight_frac": 0.0,
+            "crushed_black_frac": 0.00119,
+            "dynamic_range_p95_p05": 0.4446,
+            "fft_anisotropy": 1.7197,
+            "fft_anisotropy_ok": true,
+            "laplacian_std": 0.06017,
+            "name": "lower_seam_roi",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              0,
+              0,
+              256,
+              256
+            ],
+            "clipped_highlight_frac": 0.0,
+            "crushed_black_frac": 0.00859,
+            "dynamic_range_p95_p05": 0.2274,
+            "fft_anisotropy": 329.6907,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.02387,
+            "name": "shadow_texture_roi",
+            "sharpness_ok": true
+          }
+        ],
+        "frame_index": 908,
+        "full_frame": {
+          "center_mean_luma": 0.453,
+          "clipped_highlight_frac": 7e-05,
+          "corner_mean_luma": 0.2756,
+          "corner_washout_excess": -0.1773,
+          "crushed_black_frac": 0.00317,
+          "dynamic_range_p95_p05": 0.7285,
+          "laplacian_std": 0.08129,
+          "luma_p05": 0.153,
+          "luma_p50": 0.3418,
+          "luma_p95": 0.8815
+        },
+        "gates": {
+          "all_crops_fft_anisotropy_ok": false,
+          "all_finite": true,
+          "corner_contrast_ok": true,
+          "detail_crops_sharpness_ok": true,
+          "dynamic_range_ok": true,
+          "highlight_clipping_ok": true,
+          "shadow_crush_ok": true
+        },
+        "hard_gates_passed": 6,
+        "hard_gates_total": 7,
+        "height": 576,
+        "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00908.png",
+        "image_sha256": "2694f3e9a47485f3f6a713fe10ea954a17d4c0ba3f1d9815e1a0ee91fd97a81f",
+        "passed": false,
+        "schema_version": "atlas-host-visual-crop-gate/v1",
+        "thresholds": {
+          "max_clipped_highlight_frac": 0.035,
+          "max_corner_washout_excess": 0.22,
+          "max_crop_fft_anisotropy": 2.6,
+          "max_crushed_black_frac": 0.2,
+          "min_all_finite": true,
+          "min_crop_sharpness_lap_std": 0.008,
+          "min_dynamic_range_p95_p05": 0.25
+        },
+        "width": 1024,
+        "yaw_deg": 341.1
+      },
+      {
+        "checkpoint": "yaw_355_approach_nonpinned",
+        "composite_score": 0.74988,
+        "contact_sheet_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/visual_crop_gate_yaw_355_approach_nonpinned.png",
+        "contact_sheet_sha256": "1f40b07c3a1422410bc84acfac6b90e0ea500c8c9737f46610cc1b4040848ef3",
+        "crops": [
+          {
+            "box_xyxy": [
+              384,
+              113,
+              640,
+              369
+            ],
+            "clipped_highlight_frac": 0.00017,
+            "crushed_black_frac": 2e-05,
+            "dynamic_range_p95_p05": 0.6131,
+            "fft_anisotropy": 3.2194,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.11935,
+            "name": "hero_center",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              582,
+              153,
+              838,
+              409
+            ],
+            "clipped_highlight_frac": 0.00021,
+            "crushed_black_frac": 0.00606,
+            "dynamic_range_p95_p05": 0.7082,
+            "fft_anisotropy": 2.6574,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.1699,
+            "name": "peak_detail_roi",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              384,
+              320,
+              640,
+              576
+            ],
+            "clipped_highlight_frac": 2e-05,
+            "crushed_black_frac": 0.00218,
+            "dynamic_range_p95_p05": 0.7991,
+            "fft_anisotropy": 58.7637,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.07824,
+            "name": "lower_seam_roi",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              295,
+              320,
+              551,
+              576
+            ],
+            "clipped_highlight_frac": 0.0,
+            "crushed_black_frac": 0.00076,
+            "dynamic_range_p95_p05": 0.8053,
+            "fft_anisotropy": 1.2746,
+            "fft_anisotropy_ok": true,
+            "laplacian_std": 0.06434,
+            "name": "shadow_texture_roi",
+            "sharpness_ok": true
+          }
+        ],
+        "frame_index": 937,
+        "full_frame": {
+          "center_mean_luma": 0.5768,
+          "clipped_highlight_frac": 3e-05,
+          "corner_mean_luma": 0.3334,
+          "corner_washout_excess": -0.2434,
+          "crushed_black_frac": 0.0113,
+          "dynamic_range_p95_p05": 0.7314,
+          "laplacian_std": 0.08126,
+          "luma_p05": 0.1501,
+          "luma_p50": 0.3665,
+          "luma_p95": 0.8815
+        },
+        "gates": {
+          "all_crops_fft_anisotropy_ok": false,
+          "all_finite": true,
+          "corner_contrast_ok": true,
+          "detail_crops_sharpness_ok": true,
+          "dynamic_range_ok": true,
+          "highlight_clipping_ok": true,
+          "shadow_crush_ok": true
+        },
+        "hard_gates_passed": 6,
+        "hard_gates_total": 7,
+        "height": 576,
+        "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00937.png",
+        "image_sha256": "20b8b814d43f87dc401331c2707ec3549a5e0ed8d213da86866e27cef37f0423",
+        "passed": false,
+        "schema_version": "atlas-host-visual-crop-gate/v1",
+        "thresholds": {
+          "max_clipped_highlight_frac": 0.035,
+          "max_corner_washout_excess": 0.22,
+          "max_crop_fft_anisotropy": 2.6,
+          "max_crushed_black_frac": 0.2,
+          "min_all_finite": true,
+          "min_crop_sharpness_lap_std": 0.008,
+          "min_dynamic_range_p95_p05": 0.25
+        },
+        "width": 1024,
+        "yaw_deg": 352.5
+      },
+      {
+        "checkpoint": "yaw_360_return",
+        "composite_score": 0.74987,
+        "contact_sheet_path": null,
+        "contact_sheet_sha256": null,
+        "crops": [
+          {
+            "box_xyxy": [
+              384,
+              113,
+              640,
+              369
+            ],
+            "clipped_highlight_frac": 0.00023,
+            "crushed_black_frac": 0.0,
+            "dynamic_range_p95_p05": 0.5844,
+            "fft_anisotropy": 3.0494,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.15103,
+            "name": "hero_center",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              508,
+              154,
+              764,
+              410
+            ],
+            "clipped_highlight_frac": 0.0002,
+            "crushed_black_frac": 0.0061,
+            "dynamic_range_p95_p05": 0.691,
+            "fft_anisotropy": 2.7143,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.17539,
+            "name": "peak_detail_roi",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              384,
+              320,
+              640,
+              576
+            ],
+            "clipped_highlight_frac": 8e-05,
+            "crushed_black_frac": 0.00314,
+            "dynamic_range_p95_p05": 0.7739,
+            "fft_anisotropy": 978.8851,
+            "fft_anisotropy_ok": false,
+            "laplacian_std": 0.09725,
+            "name": "lower_seam_roi",
+            "sharpness_ok": true
+          },
+          {
+            "box_xyxy": [
+              23,
+              258,
+              279,
+              514
+            ],
+            "clipped_highlight_frac": 0.0,
+            "crushed_black_frac": 0.00281,
+            "dynamic_range_p95_p05": 0.5521,
+            "fft_anisotropy": 1.2859,
+            "fft_anisotropy_ok": true,
+            "laplacian_std": 0.07823,
+            "name": "shadow_texture_roi",
+            "sharpness_ok": true
+          }
+        ],
+        "frame_index": 956,
+        "full_frame": {
+          "center_mean_luma": 0.6535,
+          "clipped_highlight_frac": 4e-05,
+          "corner_mean_luma": 0.3168,
+          "corner_washout_excess": -0.3367,
+          "crushed_black_frac": 0.01961,
+          "dynamic_range_p95_p05": 0.7448,
+          "laplacian_std": 0.08292,
+          "luma_p05": 0.1367,
+          "luma_p50": 0.3703,
+          "luma_p95": 0.8815
+        },
+        "gates": {
+          "all_crops_fft_anisotropy_ok": false,
+          "all_finite": true,
+          "corner_contrast_ok": true,
+          "detail_crops_sharpness_ok": true,
+          "dynamic_range_ok": true,
+          "highlight_clipping_ok": true,
+          "shadow_crush_ok": true
+        },
+        "hard_gates_passed": 6,
+        "hard_gates_total": 7,
+        "height": 576,
+        "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00956.png",
+        "image_sha256": "10be1da843617feede63c3d0e7f5fd853d88ab09a2cada771f94c5567603b3a6",
+        "passed": false,
+        "schema_version": "atlas-host-visual-crop-gate/v1",
+        "thresholds": {
+          "max_clipped_highlight_frac": 0.035,
+          "max_corner_washout_excess": 0.22,
+          "max_crop_fft_anisotropy": 2.6,
+          "max_crushed_black_frac": 0.2,
+          "min_all_finite": true,
+          "min_crop_sharpness_lap_std": 0.008,
+          "min_dynamic_range_p95_p05": 0.25
+        },
+        "width": 1024,
+        "yaw_deg": 360.0
+      }
+    ],
+    "gate_module_sha256": "fd672ec7a972ce4cf8f250a5d048ee659941bd20c7748fd1fb08fa671b747742",
+    "mean_composite_score": 0.74975,
+    "n_frames_audited": 4
+  },
+  "ledger_injection_mode": "smooth-trajectory-v5",
+  "narration": {
+    "ambient_duck_db": -14.0,
+    "duration_s": 3.92,
+    "narration_start_s": 0.45,
+    "narration_text": "This is not a video. This is a world model being turned around.",
+    "sample_rate": 24000,
+    "source": "prebuilt_packetC_wav",
+    "wav_bytes": 188204,
+    "wav_path": "/content/omni912_showcases/showcase_scripts/turnaround_narration_24k.wav",
+    "wav_sha256": "4439a79d890825e9c612143ebf78c8d0a0e63639f95ea0b6d08f2d45ce5c68ce",
+    "whisper_check": {
+      "all_finite": true,
+      "dry_run": true,
+      "lyric_alignment": {
+        "case_insensitive_exact_match": true,
+        "cer": 0.0,
+        "char_accuracy": 1.0,
+        "char_edit_distance": 0,
+        "exact_verbatim_match": true,
+        "n_observed_words": 13,
+        "n_target_words": 13,
+        "observed_text": "This is not a video. This is a world model being turned around.",
+        "ordered_word_recall": 1.0,
+        "target_text": "This is not a video. This is a world model being turned around.",
+        "unique_word_recall": 1.0,
+        "wer": 0.0,
+        "word_edit_distance": 0
+      },
+      "wav_path": "/content/omni912_showcases/showcase_scripts/turnaround_narration_24k.wav",
+      "whisper_transcript": "This is not a video. This is a world model being turned around."
+    }
+  },
+  "ocr_permanence_audit": {
+    "ledger_off": {
+      "checkpoints": [
+        {
+          "checkpoint": "yaw_000_start",
+          "frame_index": 0,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 0.064,
+            "char_accuracy": 0.936,
+            "char_edit_distance": 8,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 0.088,
+              "char_accuracy": 0.912,
+              "char_edit_distance": 11,
+              "exact_verbatim_match": false,
+              "n_observed_words": 13,
+              "n_target_words": 23,
+              "observed_text": "ThankJensenfor1oYearsof Cuda, Tythinking machines for this model, and ty to theopen sourcecommunity forbeingamazing",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.34783,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.4,
+              "wer": 0.65217,
+              "word_edit_distance": 15
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_off/ledger_off_f00000.png",
+            "image_sha256": "c85698031c850e8e788bf8f1a0b78f6d132219185fa4049fb18e2b2e26ccacdf",
+            "n_observed_words": 16,
+            "n_target_words": 23,
+            "observed_text": "ThankJensenfor1oYearsof Cuda, Ty thinking machines for this model, and ty to the open sourcecommunity forbeing amazing",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.56522,
+            "plaque_roi": {
+              "area_frac": 0.1752,
+              "aspect": 1.719,
+              "box_xyxy": [
+                375,
+                142,
+                793,
+                386
+              ],
+              "fill_ratio": 0.917
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.6,
+            "wer": 0.43478,
+            "word_edit_distance": 10
+          },
+          "yaw_deg": 0.0
+        },
+        {
+          "checkpoint": "yaw_090_quarter",
+          "frame_index": 239,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_off/ledger_off_f00239.png",
+            "image_sha256": "b8adf588a35fbde99a6b9231806d213e00d6fdc164ecdfb51f0db9c9ed8a8c29",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": null,
+            "plaque_roi_detected": false,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 83.1
+        },
+        {
+          "checkpoint": "yaw_180_opposite",
+          "frame_index": 478,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_off/ledger_off_f00478.png",
+            "image_sha256": "9bd839c6c5c8e5dd72a8c6837906af99eb559742d76feb13b0f920bfcedf953a",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": null,
+            "plaque_roi_detected": false,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 172.2
+        },
+        {
+          "checkpoint": "yaw_270_three_quarter",
+          "frame_index": 717,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_off/ledger_off_f00717.png",
+            "image_sha256": "f8334431a8b15978bd4cfe257db950550ee70f933a0c59814f7b88be231a9fca",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": {
+              "area_frac": 0.0154,
+              "aspect": 1.24,
+              "box_xyxy": [
+                599,
+                310,
+                717,
+                406
+              ],
+              "fill_ratio": 0.733
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 266.0
+        },
+        {
+          "checkpoint": "yaw_325_approach_nonpinned",
+          "frame_index": 860,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_off/ledger_off_f00860.png",
+            "image_sha256": "9be0142d2b9c9305fd25b6249d53ffb42e1f860936e9eac6b7f4fa5714dd0a94",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": {
+              "area_frac": 0.064,
+              "aspect": 0.52,
+              "box_xyxy": [
+                291,
+                67,
+                441,
+                353
+              ],
+              "fill_ratio": 0.807
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 322.2
+        },
+        {
+          "checkpoint": "yaw_345_approach_nonpinned",
+          "frame_index": 908,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_off/ledger_off_f00908.png",
+            "image_sha256": "0e250c492f019304efabafc99440b568a86b8c3e0d44f085427c7e99936f2607",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": {
+              "area_frac": 0.0581,
+              "aspect": 0.5,
+              "box_xyxy": [
+                175,
+                47,
+                321,
+                337
+              ],
+              "fill_ratio": 0.741
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 341.1
+        },
+        {
+          "checkpoint": "yaw_355_approach_nonpinned",
+          "frame_index": 937,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_off/ledger_off_f00937.png",
+            "image_sha256": "3c8aaedd97d91cc23454dca1e48e8fee96570edee896633428a5ed25a93c3c75",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": null,
+            "plaque_roi_detected": false,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 352.5
+        },
+        {
+          "checkpoint": "yaw_360_return",
+          "frame_index": 956,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_off/ledger_off_f00956.png",
+            "image_sha256": "b9b56ccb50598633038eba625c4456aee61a3f6720aa3ee82f52f2b5d9fb56b7",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": {
+              "area_frac": 0.0127,
+              "aspect": 0.514,
+              "box_xyxy": [
+                105,
+                115,
+                175,
+                249
+              ],
+              "fill_ratio": 0.741
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 360.0
+        }
+      ],
+      "nonpinned_approach_mean_cer": 1.0,
+      "nonpinned_approach_mean_char_accuracy": 0.0,
+      "nonpinned_full_frame_mean_char_accuracy": 0.0,
+      "opposite_180_sign_absent": true,
+      "return_final_exact_match": false,
+      "return_mean_cer": 1.0,
+      "return_mean_char_accuracy": 0.0,
+      "simulated": false
+    },
+    "ledger_on": {
+      "checkpoints": [
+        {
+          "checkpoint": "yaw_000_start",
+          "frame_index": 0,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 0.064,
+            "char_accuracy": 0.936,
+            "char_edit_distance": 8,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 0.088,
+              "char_accuracy": 0.912,
+              "char_edit_distance": 11,
+              "exact_verbatim_match": false,
+              "n_observed_words": 13,
+              "n_target_words": 23,
+              "observed_text": "ThankJensenfor1oYearsof Cuda, Tythinking machines for this model, and ty to theopen sourcecommunity forbeingamazing",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.34783,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.4,
+              "wer": 0.65217,
+              "word_edit_distance": 15
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00000.png",
+            "image_sha256": "c85698031c850e8e788bf8f1a0b78f6d132219185fa4049fb18e2b2e26ccacdf",
+            "n_observed_words": 16,
+            "n_target_words": 23,
+            "observed_text": "ThankJensenfor1oYearsof Cuda, Ty thinking machines for this model, and ty to the open sourcecommunity forbeing amazing",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.56522,
+            "plaque_roi": {
+              "area_frac": 0.1752,
+              "aspect": 1.719,
+              "box_xyxy": [
+                375,
+                142,
+                793,
+                386
+              ],
+              "fill_ratio": 0.917
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.6,
+            "wer": 0.43478,
+            "word_edit_distance": 10
+          },
+          "yaw_deg": 0.0
+        },
+        {
+          "checkpoint": "yaw_090_quarter",
+          "frame_index": 239,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00239.png",
+            "image_sha256": "b8adf588a35fbde99a6b9231806d213e00d6fdc164ecdfb51f0db9c9ed8a8c29",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": null,
+            "plaque_roi_detected": false,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 83.1
+        },
+        {
+          "checkpoint": "yaw_180_opposite",
+          "frame_index": 478,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00478.png",
+            "image_sha256": "9bd839c6c5c8e5dd72a8c6837906af99eb559742d76feb13b0f920bfcedf953a",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": null,
+            "plaque_roi_detected": false,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 172.2
+        },
+        {
+          "checkpoint": "yaw_270_three_quarter",
+          "frame_index": 717,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 1.0,
+            "char_accuracy": 0.0,
+            "char_edit_distance": 125,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 1.0,
+              "char_accuracy": 0.0,
+              "char_edit_distance": 125,
+              "exact_verbatim_match": false,
+              "n_observed_words": 0,
+              "n_target_words": 23,
+              "observed_text": "",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.0,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.0,
+              "wer": 1.0,
+              "word_edit_distance": 23
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00717.png",
+            "image_sha256": "4baf041e4e02e1f048d12b40dce70881826aca7aeac8d27479b2066a5181cb14",
+            "n_observed_words": 0,
+            "n_target_words": 23,
+            "observed_text": "",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.0,
+            "plaque_roi": null,
+            "plaque_roi_detected": false,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.0,
+            "wer": 1.0,
+            "word_edit_distance": 23
+          },
+          "yaw_deg": 266.0
+        },
+        {
+          "checkpoint": "yaw_325_approach_nonpinned",
+          "frame_index": 860,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 0.88,
+            "char_accuracy": 0.12,
+            "char_edit_distance": 110,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 0.856,
+              "char_accuracy": 0.144,
+              "char_edit_distance": 107,
+              "exact_verbatim_match": false,
+              "n_observed_words": 5,
+              "n_target_words": 23,
+              "observed_text": "Than Cud fol the c",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.04348,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.05,
+              "wer": 0.95652,
+              "word_edit_distance": 22
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00860.png",
+            "image_sha256": "0a669ec7a1558738346bdf70d2ce71ef235869016792c2245e5941e2d9903257",
+            "n_observed_words": 4,
+            "n_target_words": 23,
+            "observed_text": "Than Cud fo the",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.04348,
+            "plaque_roi": {
+              "area_frac": 0.0571,
+              "aspect": 0.44,
+              "box_xyxy": [
+                895,
+                107,
+                1021,
+                393
+              ],
+              "fill_ratio": 0.851
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.05,
+            "wer": 0.95652,
+            "word_edit_distance": 22
+          },
+          "yaw_deg": 322.2
+        },
+        {
+          "checkpoint": "yaw_345_approach_nonpinned",
+          "frame_index": 908,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 0.184,
+            "char_accuracy": 0.816,
+            "char_edit_distance": 23,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 0.168,
+              "char_accuracy": 0.832,
+              "char_edit_distance": 21,
+              "exact_verbatim_match": false,
+              "n_observed_words": 15,
+              "n_target_words": 23,
+              "observed_text": "ThankJensenfor10Yea Cuda, Ty thinking machi for this model, and ty theopen source commu forbeing amazing",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.43478,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.45,
+              "wer": 0.56522,
+              "word_edit_distance": 13
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00908.png",
+            "image_sha256": "2694f3e9a47485f3f6a713fe10ea954a17d4c0ba3f1d9815e1a0ee91fd97a81f",
+            "n_observed_words": 14,
+            "n_target_words": 23,
+            "observed_text": "ThankJensenfor10Yea Cuda, Ty thinking mach for this model, and ty theopen source commu forbeingamazing",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.3913,
+            "plaque_roi": {
+              "area_frac": 0.1691,
+              "aspect": 1.431,
+              "box_xyxy": [
+                622,
+                115,
+                1014,
+                389
+              ],
+              "fill_ratio": 0.84
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.4,
+            "wer": 0.6087,
+            "word_edit_distance": 14
+          },
+          "yaw_deg": 341.1
+        },
+        {
+          "checkpoint": "yaw_355_approach_nonpinned",
+          "frame_index": 937,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 0.08,
+            "char_accuracy": 0.92,
+            "char_edit_distance": 10,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 0.056,
+              "char_accuracy": 0.944,
+              "char_edit_distance": 7,
+              "exact_verbatim_match": false,
+              "n_observed_words": 17,
+              "n_target_words": 23,
+              "observed_text": "ThankJensenfor10Yearsof Cuda,Ty thinking machines for this model, and ty to the open source community forbeing amazing",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.65217,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.7,
+              "wer": 0.34783,
+              "word_edit_distance": 8
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00937.png",
+            "image_sha256": "20b8b814d43f87dc401331c2707ec3549a5e0ed8d213da86866e27cef37f0423",
+            "n_observed_words": 14,
+            "n_target_words": 23,
+            "observed_text": "ThankJensenfor1oYearsof Cuda, Ty thinking machines forthis model, and tyto the open source community forbeingamazing",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.43478,
+            "plaque_roi": {
+              "area_frac": 0.1796,
+              "aspect": 1.785,
+              "box_xyxy": [
+                471,
+                134,
+                913,
+                382
+              ],
+              "fill_ratio": 0.878
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.5,
+            "wer": 0.56522,
+            "word_edit_distance": 13
+          },
+          "yaw_deg": 352.5
+        },
+        {
+          "checkpoint": "yaw_360_return",
+          "frame_index": 956,
+          "ocr": {
+            "backend": "blinded-plaque-rapidocr",
+            "case_insensitive_exact_match": false,
+            "cer": 0.064,
+            "char_accuracy": 0.936,
+            "char_edit_distance": 8,
+            "exact_verbatim_match": false,
+            "full_frame_baseline": {
+              "case_insensitive_exact_match": false,
+              "cer": 0.064,
+              "char_accuracy": 0.936,
+              "char_edit_distance": 8,
+              "exact_verbatim_match": false,
+              "n_observed_words": 16,
+              "n_target_words": 23,
+              "observed_text": "ThankJensenfor10Yearsof Cuda,Ty thinking machines for this model, and ty to the open source community forbeingamazing",
+              "ocr_engine": "rapidocr",
+              "ordered_word_recall": 0.6087,
+              "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+              "unique_word_recall": 0.65,
+              "wer": 0.3913,
+              "word_edit_distance": 9
+            },
+            "image_path": "/content/omni912_showcases/turnaround_360_v5/audit_frames/ledger_on/ledger_on_f00956.png",
+            "image_sha256": "10be1da843617feede63c3d0e7f5fd853d88ab09a2cada771f94c5567603b3a6",
+            "n_observed_words": 16,
+            "n_target_words": 23,
+            "observed_text": "ThankJensenfor10Yearsof Cuda,Ty thinking machines for this model, and ty to the open source community forbeingamazing",
+            "ocr_engine": "rapidocr",
+            "ordered_word_recall": 0.6087,
+            "plaque_roi": {
+              "area_frac": 0.1689,
+              "aspect": 1.82,
+              "box_xyxy": [
+                375,
+                142,
+                797,
+                374
+              ],
+              "fill_ratio": 0.92
+            },
+            "plaque_roi_detected": true,
+            "simulated": false,
+            "target_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+            "unique_word_recall": 0.65,
+            "wer": 0.3913,
+            "word_edit_distance": 9
+          },
+          "yaw_deg": 360.0
+        }
+      ],
+      "nonpinned_approach_mean_cer": 0.38133,
+      "nonpinned_approach_mean_char_accuracy": 0.61867,
+      "nonpinned_full_frame_mean_char_accuracy": 0.64,
+      "opposite_180_sign_absent": true,
+      "return_final_exact_match": false,
+      "return_mean_cer": 0.302,
+      "return_mean_char_accuracy": 0.698,
+      "simulated": false
+    }
+  },
+  "plan": {
+    "branch_frame_index": 651,
+    "branch_time_s": 27.125,
+    "chained": true,
+    "context_frames": 39,
+    "fps": 24,
+    "max_yaw_deg": 360.0,
+    "rtxp_30s_flagship": true,
+    "segment_end_frames": [
+      345,
+      651,
+      957
+    ],
+    "segment_end_yaws": [
+      120.0,
+      240.0,
+      360.0
+    ],
+    "segments": [
+      {
+        "audio_latent_steps": 575,
+        "clip_start_s": 0.0,
+        "duration_s": 14.375,
+        "exact_av_boundary": true,
+        "frames": 345,
+        "net_duration_s": 14.375,
+        "net_new_frames": 345,
+        "pcm_samples_32k": 460000,
+        "pcm_samples_48k": 690000,
+        "trim_prefix_audio_latents": 0,
+        "trim_prefix_frames": 0,
+        "trim_prefix_video_latents": 0,
+        "video_latent_steps": 102
+      },
+      {
+        "audio_latent_steps": 575,
+        "clip_start_s": 12.75,
+        "duration_s": 14.375,
+        "exact_av_boundary": true,
+        "frames": 345,
+        "net_duration_s": 12.75,
+        "net_new_frames": 306,
+        "pcm_samples_32k": 460000,
+        "pcm_samples_48k": 690000,
+        "trim_prefix_audio_latents": 65,
+        "trim_prefix_frames": 39,
+        "trim_prefix_video_latents": 12,
+        "video_latent_steps": 102
+      },
+      {
+        "audio_latent_steps": 575,
+        "clip_start_s": 25.5,
+        "duration_s": 14.375,
+        "exact_av_boundary": true,
+        "frames": 345,
+        "net_duration_s": 12.75,
+        "net_new_frames": 306,
+        "pcm_samples_32k": 460000,
+        "pcm_samples_48k": 690000,
+        "trim_prefix_audio_latents": 65,
+        "trim_prefix_frames": 39,
+        "trim_prefix_video_latents": 12,
+        "video_latent_steps": 102
+      }
+    ],
+    "shared_segment_count": 2,
+    "topology": "three-segment-orbit",
+    "total_duration_s": 39.875,
+    "total_frames": 957,
+    "total_pcm_samples_32k": 1276000,
+    "total_pcm_samples_48k": 1914000
+  },
+  "qa_contact_sheet": {
+    "bytes": 1302335,
+    "path": "/content/omni912_showcases/turnaround_360_v5/qa_contact_sheet_360_turnaround.png",
+    "sha256": "4fc8b7f1750e9306eb04245ef78259a7efeb5918fe3dfe55146cc2b5a2ac445b"
+  },
+  "quality_gates": {
+    "continuity_gate_passed": false,
+    "gate_failures": [
+      "CONTINUITY:MID_ORBIT_SCENE_CUT(frame=430,ssim=0.5548<0.65)",
+      "CONTINUITY:RETURN_JUMP_CUT(frame=934,ssim=0.5728<0.72)",
+      "CONTINUITY:TERMINAL_TELEPORT_DETECTED(tail20_ssim=0.3759<0.48)"
+    ],
+    "identity_gate_passed": true,
+    "nonpinned_ocr_gate_passed": true,
+    "opposite_wall_absence_passed": true,
+    "verdict": "FAIL"
+  },
+  "schema_version": "omni-912-showcase-360-turnaround-report/v2",
+  "side_by_side_mp4": {
+    "bytes": 19593468,
+    "path": "/content/omni912_showcases/turnaround_360_v5/turnaround_side_by_side_1920x1088.mp4",
+    "probe": {
+      "avg_frame_rate": "24/1",
+      "channels": 2,
+      "duration_s": 39.875,
+      "has_audio": true,
+      "has_video": true,
+      "height": 1088,
+      "nb_frames": 957,
+      "path": "/content/omni912_showcases/turnaround_360_v5/turnaround_side_by_side_1920x1088.mp4",
+      "sample_rate": 48000,
+      "size_bytes": 19593468,
+      "width": 1920
+    },
+    "sha256": "6fdde3812cbe7dd43089ad43e0f6687ceef8bddf3f81c757be37c6fb2b75a5b3"
+  },
+  "sign_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+  "subject_identity_audit": {
+    "arms": {
+      "ledger_off": {
+        "checkpoints": [
+          {
+            "checkpoint": "yaw_000_start",
+            "cos_anchor": 0.9674,
+            "cos_founder": 0.6841,
+            "nonpinned": false,
+            "wardrobe_margin": 9.9613,
+            "wardrobe_neg_logit": -8.128,
+            "wardrobe_pos_logit": 1.8332,
+            "yaw_deg": 0.0
+          },
+          {
+            "checkpoint": "yaw_325_approach_nonpinned",
+            "cos_anchor": 0.4322,
+            "cos_founder": 0.4024,
+            "nonpinned": true,
+            "wardrobe_margin": -0.9759,
+            "wardrobe_neg_logit": -25.9235,
+            "wardrobe_pos_logit": -26.8994,
+            "yaw_deg": 322.2
+          },
+          {
+            "checkpoint": "yaw_345_approach_nonpinned",
+            "cos_anchor": 0.4058,
+            "cos_founder": 0.3825,
+            "nonpinned": true,
+            "wardrobe_margin": -2.0222,
+            "wardrobe_neg_logit": -27.2695,
+            "wardrobe_pos_logit": -29.2917,
+            "yaw_deg": 341.1
+          },
+          {
+            "checkpoint": "yaw_355_approach_nonpinned",
+            "cos_anchor": 0.406,
+            "cos_founder": 0.3997,
+            "nonpinned": true,
+            "wardrobe_margin": -3.2557,
+            "wardrobe_neg_logit": -25.1587,
+            "wardrobe_pos_logit": -28.4144,
+            "yaw_deg": 352.5
+          },
+          {
+            "checkpoint": "yaw_360_return",
+            "cos_anchor": 0.3906,
+            "cos_founder": 0.3941,
+            "nonpinned": false,
+            "wardrobe_margin": -4.0279,
+            "wardrobe_neg_logit": -24.1939,
+            "wardrobe_pos_logit": -28.2217,
+            "yaw_deg": 360.0
+          }
+        ],
+        "failures": [
+          "IDENTITY_COS_FOUNDER_LOW(0.3949<0.68)",
+          "IDENTITY_COS_ANCHOR_LOW(0.4147<0.70)",
+          "SUBJECT_WARDROBE_MORPH_DETECTED(margin=-2.0846<=0.00)"
+        ],
+        "n_nonpinned_scored": 3,
+        "nonpinned_mean_cos_anchor": 0.4147,
+        "nonpinned_mean_cos_founder": 0.3949,
+        "nonpinned_mean_wardrobe_margin": -2.0846,
+        "passed": false
+      },
+      "ledger_on": {
+        "checkpoints": [
+          {
+            "checkpoint": "yaw_000_start",
+            "cos_anchor": 0.9674,
+            "cos_founder": 0.6841,
+            "nonpinned": false,
+            "wardrobe_margin": 9.9613,
+            "wardrobe_neg_logit": -8.128,
+            "wardrobe_pos_logit": 1.8332,
+            "yaw_deg": 0.0
+          },
+          {
+            "checkpoint": "yaw_325_approach_nonpinned",
+            "cos_anchor": 0.7735,
+            "cos_founder": 0.792,
+            "nonpinned": true,
+            "wardrobe_margin": 14.0474,
+            "wardrobe_neg_logit": -9.7724,
+            "wardrobe_pos_logit": 4.275,
+            "yaw_deg": 322.2
+          },
+          {
+            "checkpoint": "yaw_345_approach_nonpinned",
+            "cos_anchor": 0.938,
+            "cos_founder": 0.7309,
+            "nonpinned": true,
+            "wardrobe_margin": 11.0036,
+            "wardrobe_neg_logit": -8.2985,
+            "wardrobe_pos_logit": 2.7051,
+            "yaw_deg": 341.1
+          },
+          {
+            "checkpoint": "yaw_355_approach_nonpinned",
+            "cos_anchor": 0.9515,
+            "cos_founder": 0.6952,
+            "nonpinned": true,
+            "wardrobe_margin": 10.5923,
+            "wardrobe_neg_logit": -7.8782,
+            "wardrobe_pos_logit": 2.7141,
+            "yaw_deg": 352.5
+          },
+          {
+            "checkpoint": "yaw_360_return",
+            "cos_anchor": 0.9599,
+            "cos_founder": 0.6764,
+            "nonpinned": false,
+            "wardrobe_margin": 9.9701,
+            "wardrobe_neg_logit": -8.0269,
+            "wardrobe_pos_logit": 1.9432,
+            "yaw_deg": 360.0
+          }
+        ],
+        "failures": [],
+        "n_nonpinned_scored": 3,
+        "nonpinned_mean_cos_anchor": 0.8877,
+        "nonpinned_mean_cos_founder": 0.7394,
+        "nonpinned_mean_wardrobe_margin": 11.8811,
+        "passed": true
+      }
+    },
+    "backend": "siglip2",
+    "failures": [],
+    "passed": true,
+    "siglip2_dir": "/content/omni912_showcases/models/siglip2",
+    "simulated": false,
+    "thresholds": {
+      "min_cos_anchor": 0.7,
+      "min_cos_founder": 0.68,
+      "min_wardrobe_margin": 0.0
+    }
+  },
+  "temporal_continuity_audit": {
+    "ledger_off": {
+      "failures": [
+        "MID_ORBIT_SCENE_CUT(frame=430,ssim=0.5548<0.65)"
+      ],
+      "frame1_l1": 0.0055,
+      "frame1_ssim": 0.9931,
+      "full_max_adj_l1": 0.0496,
+      "full_median_adj_l1": 0.016,
+      "full_min_adj_ssim": 0.5548,
+      "full_worst_frame": 430,
+      "mp4_path": "/content/omni912_showcases/turnaround_360_v5/render_clips/turnaround_ledger_off.mp4",
+      "n_detected_cuts": 3,
+      "n_frames_scanned": 957,
+      "passed": false,
+      "return_l1_spike_ratio": 1.786,
+      "return_max_adj_l1": 0.0198,
+      "return_median_adj_l1": 0.0111,
+      "return_min_adj_ssim": 0.8939,
+      "return_window_start_frame": 806,
+      "return_worst_frame": 886,
+      "tail_20_to_final_ssim": 0.7169,
+      "tail_5_to_final_ssim": 0.8687,
+      "worst_cuts": [
+        {
+          "adj_l1": 0.0496,
+          "adj_ssim": 0.5548,
+          "frame_index": 430,
+          "in_return_window": false
+        },
+        {
+          "adj_l1": 0.0474,
+          "adj_ssim": 0.5577,
+          "frame_index": 382,
+          "in_return_window": false
+        },
+        {
+          "adj_l1": 0.0457,
+          "adj_ssim": 0.5779,
+          "frame_index": 406,
+          "in_return_window": false
+        }
+      ]
+    },
+    "ledger_on": {
+      "failures": [
+        "MID_ORBIT_SCENE_CUT(frame=430,ssim=0.5548<0.65)",
+        "RETURN_JUMP_CUT(frame=934,ssim=0.5728<0.72)",
+        "TERMINAL_TELEPORT_DETECTED(tail20_ssim=0.3759<0.48)"
+      ],
+      "frame1_l1": 0.0055,
+      "frame1_ssim": 0.9931,
+      "full_max_adj_l1": 0.05,
+      "full_median_adj_l1": 0.0204,
+      "full_min_adj_ssim": 0.5548,
+      "full_worst_frame": 430,
+      "mp4_path": "/content/omni912_showcases/turnaround_360_v5/render_clips/turnaround_ledger_on.mp4",
+      "n_detected_cuts": 6,
+      "n_frames_scanned": 957,
+      "passed": false,
+      "return_l1_spike_ratio": 1.575,
+      "return_max_adj_l1": 0.05,
+      "return_median_adj_l1": 0.0317,
+      "return_min_adj_ssim": 0.5728,
+      "return_window_start_frame": 806,
+      "return_worst_frame": 934,
+      "tail_20_to_final_ssim": 0.3759,
+      "tail_5_to_final_ssim": 0.5479,
+      "worst_cuts": [
+        {
+          "adj_l1": 0.0496,
+          "adj_ssim": 0.5548,
+          "frame_index": 430,
+          "in_return_window": false
+        },
+        {
+          "adj_l1": 0.0474,
+          "adj_ssim": 0.5577,
+          "frame_index": 382,
+          "in_return_window": false
+        },
+        {
+          "adj_l1": 0.05,
+          "adj_ssim": 0.5728,
+          "frame_index": 934,
+          "in_return_window": true
+        },
+        {
+          "adj_l1": 0.0457,
+          "adj_ssim": 0.5779,
+          "frame_index": 406,
+          "in_return_window": false
+        },
+        {
+          "adj_l1": 0.0464,
+          "adj_ssim": 0.6227,
+          "frame_index": 910,
+          "in_return_window": true
+        },
+        {
+          "adj_l1": 0.0415,
+          "adj_ssim": 0.6405,
+          "frame_index": 935,
+          "in_return_window": true
+        }
+      ]
+    }
+  },
+  "topology": "three-segment-orbit",
+  "trace_audit": {
+    "errors": [],
+    "n_steps": 10,
+    "stages": [
+      "preflight_pin_check",
+      "script_gen",
+      "packetA_project_conds",
+      "verified_ledger_commit",
+      "packetA_fl2va_av",
+      "packetB2_sight_inspect",
+      "packetB2_sight_inspect",
+      "packetB2_sight_inspect",
+      "packetC_mouth",
+      "ffmpeg_mux"
+    ],
+    "tail_step_sha256": "f0549d246259f198515c96f1fa52b9555f0d05f339f428601bcf1e4c551e91e8",
+    "trace_file_sha256": "5714b088b0062c713a14b32ac739bd721a08f77ff293fc970cb43fe050330774",
+    "verified": true
+  },
+  "verdict": "FAIL",
+  "verified_ledger_store": "/content/omni912_showcases/turnaround_360_v5/verified_ledger_store.json",
+  "zero_qwen_loaded": true
+}

@@ -106,7 +106,7 @@ def build_fig5():
         ("Inkling → H3", [23.5, 66.5, 6.2, 3.7]),
         ("DS-V4.1 → H3", [0.1, 36.7, 63.2, 0.0]),
         ("Inkling → Z-Img", [39.5, 7.4, 12.4, 40.7]),
-        ("Inkling → Mouth", [41.6, 2.8, 3.2, 52.3]),
+        ("Inkling → Mouth (inst)", [41.6, 2.8, 3.2, 52.3]),
     ]
 
     fig = plt.figure(figsize=(16.0, 10.6), facecolor=BG, dpi=220)
@@ -132,7 +132,7 @@ def build_fig5():
     ax_a.set_yticklabels(labels_a, color=TEXT, fontsize=8.5)
     ax_a.set_xlabel("FP16 Compression Ratio at -0.002 val_dev Cos Knee", color=TEXT, fontsize=9.0)
     ax_a.set_xlim(0, 41.0)
-    ax_a.set_title("A. Exact FP64 SVD Low-Rank Compression (#944 Part 1A)", color=TEXT, fontsize=10.6, fontweight="bold", pad=10)
+    ax_a.set_title("A. Exact FP64 SVD Low-Rank Compression (val_dev)", color=TEXT, fontsize=10.6, fontweight="bold", pad=10)
     for yi, v, txt in zip(y_a, comps_a, ann_a):
         ax_a.text(v + 0.5, yi, txt, va="center", ha="left", color=TEXT, fontsize=7.9)
 
@@ -167,20 +167,20 @@ def build_fig5():
     ax_b.set_yticklabels([r[0] for r in t2_rows], color=TEXT, fontsize=8.8)
     ax_b.set_xlim(0, 56)
     ax_b.set_xlabel("Blinded Judge Score (%)", color=TEXT, fontsize=9.0)
-    ax_b.set_title("C. 5-Family Expressive Open-Source TTS Shoot-Out (#942, 1,416 Blinded Clips, RMS >= 0.01 Gate)", color=TEXT, fontsize=10.6, fontweight="bold", pad=10)
+    ax_b.set_title("C. 5-Family Expressive Open-Source TTS Shoot-Out (60 Matched Texts, RMS >= 0.01 Gate)", color=TEXT, fontsize=10.6, fontweight="bold", pad=10)
     for yi, r in zip(y_b, t2_rows):
         ax_b.text(r[1] + 0.6, yi + h / 2, f"{r[1]:.1f}%  (WER {r[3]:.1f}%)", va="center", ha="left", color=TEXT, fontsize=8.0)
         ax_b.text(r[2] + 0.6, yi - h / 2, f"sad {r[2]:.1f}%", va="center", ha="left", color=MUTED, fontsize=7.8)
     ax_b.legend(loc="lower right", frameon=True, facecolor=BG, edgecolor=GRID, fontsize=8.5, labelcolor=TEXT)
 
     fig.suptitle(
-        "Ultra-Sparse Low-Rank Plato's Keys (#944 Part 1A) & 5-Family Expressive Open-Source TTS Shoot-Out (#942)",
+        "Spectral Rank Compression of Fitted Plato's Keys & 5-Family Expressive Open-Source TTS Shoot-Out",
         color=TEXT, fontsize=13.5, fontweight="bold", y=0.965,
     )
     fig.text(
         0.5, 0.012,
-        "Top: Exact FP64 SVD on strictly held-out val_dev (confirm_reserve_touched=0; att-3634267d).\n"
-        "Bottom: 60-item Track 2 blind shoot-out (emotion2vec+ & faster-whisper w/ RMS>=0.01 gate; att-aedf1343, att-213dab41):\n"
+        "Top: Exact FP64 SVD on strictly held-out val_dev (confirm_reserve_touched=0; report sha256 7aff2432).\n"
+        "Bottom: 60-item Track 2 blind shoot-out (emotion2vec+ & faster-whisper w/ RMS>=0.01 gate; 1,416-clip corpus sha256 72ae01e0):\n"
         "Qwen3-TTS + Qwen3.8 Plato's Key reached 24/60 (40.0%) vs 26/60 (43.3%) native ceiling (p=0.79053) and 6/14 (42.9%) sad recall vs 5/14 Orpheus-3B.",
         ha="center", color=MUTED, fontsize=8.0, linespacing=1.32,
     )
@@ -204,8 +204,8 @@ def build_fig6():
     n_benign = s["benign_control_total"]
 
     fig, (ax_arch, ax_bar) = plt.subplots(
-        1, 2, figsize=(17.5, 6.2), facecolor=BG, dpi=220,
-        gridspec_kw={"width_ratios": [1.65, 1.0], "wspace": 0.18, "left": 0.03, "right": 0.97, "top": 0.84, "bottom": 0.175},
+        1, 2, figsize=(17.5, 6.4), facecolor=BG, dpi=220,
+        gridspec_kw={"width_ratios": [1.65, 1.0], "wspace": 0.18, "left": 0.03, "right": 0.97, "top": 0.84, "bottom": 0.195},
     )
 
     # ---- Left: 4-Stage Closed-Loop Alignment Schematic ----
@@ -217,10 +217,10 @@ def build_fig6():
     boxes = [
         (0.3, 3.6, 4.2, 2.0, GREEN, "1. Deterministic Verified Data Factory",
          "MEASURED — Verified Ledger Hillclimber\n"
-         "• KernelBench CUDA, Blender/Godot/DragonFruit\n"
+         "• CUDA kernel, 3D geometry & code synthesis\n"
          "• Pliny 5-Invariant Adversarial Red-Team\n"
          "→ Host-verified (failure, proof, winner/refusal) traces"),
-        (5.4, 3.6, 4.3, 2.0, BLUE, "2. Proposed Gradient SFT via LoopRes (#951)",
+        (5.4, 3.6, 4.3, 2.0, BLUE, "2. Proposed Gradient SFT via LoopRes",
          "PROPOSED PILOT — Qwen3-1.7B Only (Unmeasured)\n"
          "• NUS-HPC-AI-Lab/LoopRes (arXiv:2611.31094, MIT)\n"
          "• Prelude → Looped Core (static_read, W=1) → Coda\n"
@@ -290,13 +290,13 @@ def build_fig6():
     ax_bar.set_title("B. Measured Live Pliny v2 Anchor (40 Adv + 10 Benign)", color=TEXT, fontsize=10.5, fontweight="bold", pad=8)
 
     fig.suptitle(
-        "Host-Enforced Verified Ledger (Measured) & Proposed LoopRes Closed-Loop Pilot (#951, Unmeasured)",
+        "Host-Enforced Verified Ledger (Measured) & Proposed LoopRes Closed-Loop Pilot (Unmeasured)",
         color=TEXT, fontsize=12.8, fontweight="bold", y=0.955,
     )
     fig.text(
-        0.5, 0.02,
-        "Measured anchor: single model Inkling-2-Mini-atlas-12g (--persona-probe-mode, 40 sequential Pliny proposals + 10 benign controls across 5 invariants; att-0be1ebd9).\n"
-        "Proposed pilot #951 tests gradient-trained LoopRes SFT (Zhao et al., arXiv:2611.31094) on Qwen3-1.7B for context-observable attacks vs matched stock SFT (unmeasured).",
+        0.5, 0.018,
+        "Measured anchor: single model Inkling-2-Mini-atlas-12g (--persona-probe-mode, 40 sequential Pliny proposals + 10 benign controls across 5 invariants; sha256 eb8b7923).\n"
+        "Proposed pilot tests gradient-trained LoopRes SFT (Zhao et al., arXiv:2611.31094) on Qwen3-1.7B for context-observable attacks vs matched stock SFT (unmeasured).",
         ha="center", color=MUTED, fontsize=8.0, linespacing=1.3,
     )
 
@@ -309,6 +309,74 @@ def build_fig6():
     return out_png
 
 
+def build_fig7_silicon():
+    summary_path = Path("/mnt/storage/omni_gate2_runs/phase0_912_spinup/master_charts/omni912_master_multicard_summary.json")
+    data = json.loads(summary_path.read_text())
+    cards = data["wave3_real_av_cards"]
+
+    labels = [c["label"] for c in cards]
+    img_s = [float(c["image_s"]) for c in cards]
+    av_s = [float(c["av_s"]) for c in cards]
+    cols = [c.get("arch_color", BLUE) for c in cards]
+
+    fig, (ax1, ax2) = plt.subplots(
+        1, 2, figsize=(16.5, 8.2), facecolor=BG, dpi=220,
+        gridspec_kw={"wspace": 0.42, "left": 0.21, "right": 0.97, "top": 0.88, "bottom": 0.11},
+    )
+    y = np.arange(len(cards))[::-1]
+
+    for ax in (ax1, ax2):
+        ax.set_facecolor(CARD)
+        ax.tick_params(colors=TEXT, labelsize=9.2)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        for sp in ("left", "bottom"):
+            ax.spines[sp].set_color(GRID)
+        ax.grid(axis="x", color=GRID, linestyle="--", alpha=0.45, linewidth=0.6)
+        ax.set_axisbelow(True)
+
+    ax1.barh(y, img_s, color=cols, height=0.68, alpha=0.95)
+    ax1.set_yticks(y)
+    ax1.set_yticklabels(labels, color=TEXT, fontsize=9.2)
+    ax1.set_xlim(0, 118)
+    ax1.set_xlabel("Warm DiT+VAE Time (s / 1024x1024 PNG)", color=TEXT, fontsize=9.8)
+    ax1.set_title("A. 1024x1024 Image (6-Step MiniMax-H3, Zero 32B Encoder)", color=TEXT, fontsize=10.8, fontweight="bold", pad=10)
+    for yi, c, v in zip(y, cards, img_s):
+        mode = "LOWVRAM" if "lowvram" in str(c.get("image_mode", "")).lower() else "RESIDENT"
+        fmt = "NVFP4" if "nvfp4" in str(c.get("image_dit_file", "")).lower() else "INT8"
+        ax1.text(v + 1.4, yi, f"{v:.1f}s | {c['image_peak_gib']:.1f} GiB | {fmt} ({mode})", va="center", ha="left", color=TEXT, fontsize=8.4)
+
+    ax2.barh(y, av_s, color=cols, height=0.68, alpha=0.95)
+    ax2.set_yticks(y)
+    ax2.set_yticklabels(labels, color=TEXT, fontsize=9.2)
+    ax2.set_xlim(0, 1480)
+    ax2.set_xlabel("Warm DiT+VAE Time (s / 5.875s 141f Video + 32kHz Audio)", color=TEXT, fontsize=9.8)
+    ax2.set_title("B. 5.875s Video + 32kHz Stereo Audio (12-Step FL2VA)", color=TEXT, fontsize=10.8, fontweight="bold", pad=10)
+    for yi, c, v in zip(y, cards, av_s):
+        mode = "LOWVRAM" if "lowvram" in str(c.get("av_mode", "")).lower() else "RESIDENT"
+        ax2.text(v + 16.0, yi, f"{v:.1f}s | {c['av_peak_gib']:.1f} GiB | rms={c['av_audio_rms']:.4f} ({mode})", va="center", ha="left", color=TEXT, fontsize=8.4)
+
+    fig.suptitle(
+        "Cross-Silicon Real Image & 5.875s Video+Audio Generation (16 Distinct GPUs, 5 CUDA Architectures, Zero 32B Encoder)",
+        color=TEXT, fontsize=12.6, fontweight="bold", y=0.955,
+    )
+    fig.text(
+        0.5, 0.022,
+        "17 verified runs across 16 distinct GPUs (Volta -> Turing -> Ampere -> Ada -> Blackwell; summary sha256 0a5d535f), including 12 GB RTX 5070 (9.00/9.33 GiB block offload) and RTX 5090 (5.72s/93.34s).\n"
+        "Timings measure warm DiT+VAE generation from saved 90 MiB Inkling concat4 conditioning (excluding cold load, donor forward, and mux); memory values are PyTorch peak CUDA allocated GiB.",
+        ha="center", color=MUTED, fontsize=8.4, linespacing=1.32,
+    )
+
+    out_png = FIG_DIR / "fig7_silicon_16gpu_av.png"
+    out_svg = FIG_DIR / "fig7_silicon_16gpu_av.svg"
+    fig.savefig(out_png, facecolor=BG, dpi=220)
+    fig.savefig(out_svg, facecolor=BG)
+    plt.close(fig)
+    print(f"WROTE {out_png} ({out_png.stat().st_size} B, sha256={sha256_file(out_png)[:16]}...)")
+    return out_png
+
+
 if __name__ == "__main__":
     build_fig5()
     build_fig6()
+    build_fig7_silicon()

@@ -1,0 +1,125 @@
+{
+  "anchors": [
+    {
+      "bytes": 1050856,
+      "filename": "yaw_000.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_000.png",
+      "sha256": "477fe0cfd5301982f905240ab361c7493f6f99877be220ef871350286d2e7775",
+      "width": 1344,
+      "yaw_deg": 0.0
+    },
+    {
+      "bytes": 1004224,
+      "filename": "yaw_030.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_030.png",
+      "sha256": "6f7c341c2c21c24f0af9a42ea14ab6992118660f88ef7ea0f2dc3285e8a04b4c",
+      "width": 1344,
+      "yaw_deg": 30.0
+    },
+    {
+      "bytes": 917159,
+      "filename": "yaw_060.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_060.png",
+      "sha256": "b5938967d209bb104d5570206a1009d432e76aabcfd97b1c3330a60b5fe9cef4",
+      "width": 1344,
+      "yaw_deg": 60.0
+    },
+    {
+      "bytes": 888795,
+      "filename": "yaw_090.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_090.png",
+      "sha256": "e57f6f35771ea4d2aabed064049359524ab5de2f3cdadf576c6aad9a6718e5b5",
+      "width": 1344,
+      "yaw_deg": 90.0
+    },
+    {
+      "bytes": 945312,
+      "filename": "yaw_120.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_120.png",
+      "sha256": "c4f9b7f1551df55700ea85d13a991ebafeacc1ee3ed4f42815b0781b293e1649",
+      "width": 1344,
+      "yaw_deg": 120.0
+    },
+    {
+      "bytes": 939421,
+      "filename": "yaw_150.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_150.png",
+      "sha256": "4670f48816a7c363f0f70cd5991512197de02ce7ccb554317b1bc163621a0bd6",
+      "width": 1344,
+      "yaw_deg": 150.0
+    },
+    {
+      "bytes": 901165,
+      "filename": "yaw_180.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_180.png",
+      "sha256": "da3a5488c678e46ca8d36b11747650b9d22c5f34854b67936f530e7c49eb6568",
+      "width": 1344,
+      "yaw_deg": 180.0
+    },
+    {
+      "bytes": 915495,
+      "filename": "yaw_210.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_210.png",
+      "sha256": "2eb344aaeb36dba8a4da55cf74b0bf52c4e05441b11ad3f5b102e7728bdc1fba",
+      "width": 1344,
+      "yaw_deg": 210.0
+    },
+    {
+      "bytes": 920263,
+      "filename": "yaw_240.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_240.png",
+      "sha256": "cc872e349e96d74e3b09a8c663de1cb5f892aa1b9a57f1cdfb5a4fa9861eb8dd",
+      "width": 1344,
+      "yaw_deg": 240.0
+    },
+    {
+      "bytes": 877652,
+      "filename": "yaw_270.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_270.png",
+      "sha256": "c50e3f1b2b5ab360524648efb6546d680baf77a4fd7fab6590143f163b8158ec",
+      "width": 1344,
+      "yaw_deg": 270.0
+    },
+    {
+      "bytes": 982099,
+      "filename": "yaw_300.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_300.png",
+      "sha256": "7b1c1f6d64479518ac1ef0855fa4e03cedca85ad3709854260eaecd58433934f",
+      "width": 1344,
+      "yaw_deg": 300.0
+    },
+    {
+      "bytes": 1042794,
+      "filename": "yaw_330.png",
+      "height": 768,
+      "path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/yaw_330.png",
+      "sha256": "58a5f31812533f995b90deba91be143d2618960fb56190c4ebfef167799dd685",
+      "width": 1344,
+      "yaw_deg": 330.0
+    }
+  ],
+  "blend_path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/studio_360_room_v4.blend",
+  "blender_version": "5.2.5 LTS",
+  "contact_sheet_path": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_scripts/blender_360_room_v5/qa_contact_sheet_blender_room.png",
+  "contact_sheet_sha256": "52c4c1f8811a3859b2c6cfe45457063b1a22cef8d6ce2af266c236a77b9e2c6e",
+  "engine": "CYCLES",
+  "focal_mm": 26.0,
+  "founder_ref_path": "/home/orwel/dev_genius/resin-mega-test-event/trailer/keyframes/kf_01_host_hook.png",
+  "founder_ref_sha256": "1f46b7e83a6671a6a3fe4e3e26296cfa6809f067578dc6b90f36458955b9ae61",
+  "height": 768,
+  "samples": 40,
+  "schema_version": "omni-912-blender-360-room-anchors/v1",
+  "sign_text": "Thank Jensen for 10 Years of Cuda, Ty thinking machines for this model, and ty to the open source community for being amazing",
+  "width": 1344
+}
