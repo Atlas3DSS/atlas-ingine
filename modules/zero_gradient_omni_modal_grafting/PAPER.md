@@ -1,29 +1,33 @@
 # Zero-Gradient Omni-Modal Grafting
 
-**Working Draft v0.2 (Living Manuscript — 2026-11-27)**
+**Working Draft v0.3 (Living Manuscript — 2026-11-27)**
 **Authors:** Neon & Atlas3D Research (`Atlas3DSS`)
-**Status:** Packet A Sealed Confirm-160 PASS (`att-7bea8414`) · Stage 1 Local Silicon Proof #1 (`V100 sm_70`) PASS · Packet B2/C/FL2VA Active · Stage 2 Vast Sweep Cleared (`att-787c159b`)
+**Status:** Packet A Sealed Confirm-160 PASS (`att-7bea8414`) & FL2VA/NVFP4 PASS (`att-b6a83a21`) · Packet C Mouth Prosody-vs-Lexeme Split (`att-6c4b19fe`, `att-b194ab6a`) & Visit Lace PASS (`att-d0e96537`) · Packet D `YuE2` 48 kHz Music PASS (`att-0fcf223c`) · 2-Way Multi-Model Blend & Cross-LLM Hubs PASS (`att-4aa9bbc3`) · 24-GPU Stage 2 (`att-41cf9f0c`) + 3-Gen Wave 3 Real AV (`V100 → 3090 → PRO 6000`) + 3-Device Android Voltron Neural Mesh (`att-111b1358`)
 
 ---
 
 ## Abstract
 
-Closed-form linear representation maps can graft generative vision conditioning, high-resolution sight, speech perception, and speech synthesis onto a frozen looped-MoE language model (`Inkling-2-Mini`) with zero gradient updates and zero changes to trunk weights. Replacing the `27.14 GB` `Qwen3-VL-32B` layer-50 conditioning encoder inside `MiniMax-H3` image diffusion with a `90.0 MiB` (`94.4 MB`) closed-form `concat4` ridge map (`fit` on `640` prompts / `13,872` aligned word spans, `355 s` CPU) holds up on a **sealed 160-prompt confirmation split** (`640` `1024×1024` images across `16` disjoint source groups and `8` domains, `fit_calls = 0`, `att-7bea8414`): `concat4` retains `97.50%` of the teacher's margin (`0.1982` SigLIP2 prompt adherence vs `0.2045` teacher — a small measured drop of `-0.0063`, 95% CI `[-0.0117, -0.0010]`, `4/16` groups above and `12/16` below teacher; `0.8942` image-vs-teacher cosine; `0.9228` word-span cosine / `R² = 0.9982` over `3,413` unseen words), while the pre-declared primary `22.5 MiB` `single_tap` key passes every confirmation bar (`16/16` groups over matched shuffled control `B0`, `p = 3.05e-5`, `80.02%` retention). On Quincy `Tesla V100` (`sm_70`), the `90.0 MiB` projection executes in `1.62 ms` per 32 tokens at `0.99996` cosine vs FP64 CPU (`att-cb2b03b4`). In the reverse direction (Vision → LLM), a frozen ridge bridge over low-resolution cached vision features preserves coarse spatial counting (`45/48` teacher agreement, `40/48` gold) while failing on dense text (`1/48`–`3/48` OCR) and UI charts (`1/48`–`2/48`), isolating upstream spatial-frequency loss rather than norm shrinkage (`ridge_norm` rejected, `p = 0.727`). On audio, native Gate 0 reinjection verified `0.0` drift across all three seams (`Gemma-4-E2B` Conformer Ears, `Qwen3-TTS-12Hz-1.7B` Mouth, and `Inkling-2-Mini` GPU `EmbedRows`), with continuous hidden-state substitution alone shifting blinded `faster-whisper-large-v3-turbo` output byte-identically from `"Order code 407 is confirmed."` to `"Sensor gate 928 is closed."` A zero-GPU Quincy CPU elastic trunk (`Inkling-2-Mini-atlas-exl3-8.4g`, `8.46 GB` decimal / `7.88 GiB` binary, `att-7c0c0098`) preserves all `12` `3×`-looped core layers byte-exact while fitting within the `<=8.5 GB` budget targeting `12 GB` consumer GPUs (`RTX 3060`).
+Closed-form linear representation maps can graft image diffusion, native video+audio diffusion, high-resolution sight, speech perception, expressive speech synthesis, and 48 kHz stereo music generation onto a frozen looped-MoE language model (`Inkling-2-Mini`) with zero gradient updates and zero changes to trunk weights. Replacing the `27.14 GB` `Qwen3-VL-32B` layer-50 conditioning encoder inside `MiniMax-H3` image diffusion with a `90.0 MiB` (`94.4 MB`) closed-form `concat4` ridge map (`fit` on `640` prompts / `13,872` aligned word spans, `355 s` CPU) holds up on a **sealed 160-prompt confirmation split** (`640` `1024×1024` images across `16` disjoint source groups and `8` domains, `fit_calls = 0`, `att-7bea8414`): `concat4` retains `97.50%` of the teacher's margin (`0.1982` SigLIP2 prompt adherence vs `0.2045` teacher; delta `-0.0063`, 95% CI `[-0.0117, -0.0010]`, `4/16` groups above and `12/16` below teacher; `0.8942` image-vs-teacher cosine; `0.9228` word-span cosine / `R² = 0.9982` over `3,413` unseen words), while the pre-declared primary `22.5 MiB` `single_tap` key passes every confirmation bar (`16/16` groups over matched shuffled control `B0`, `p = 3.05e-5`, `80.02%` retention). The **exact same `90.0 MiB` key** transfers at zero extra bridge bytes to `MiniMax-H3` `FL2VA` native video + `32 kHz` stereo audio (`0.18164` midframe SigLIP2 adherence vs `0.17745` 32B teacher, `0.94300` image-vs-teacher cosine, `att-b6a83a21`) and `12.54 GB` NVFP4 image DiT (`0.20060` vs `0.21319` teacher, `0.92993` image-vs-teacher cosine, `0.80–0.84 s/img` on RTX PRO 6000).
+
+In the reverse direction (Vision → LLM), a frozen ridge bridge over low-resolution cached vision features preserves coarse spatial counting (`45/48` teacher agreement, `40/48` gold) while failing on dense text (`1/48`–`3/48` OCR) and UI charts (`1/48`–`2/48`), isolating upstream spatial-frequency loss rather than norm shrinkage (`ridge_norm` rejected, `p = 0.727`). On speech synthesis (`Qwen3-TTS-12Hz-1.7B`), direct continuous ridge substitution exposes a parallel **prosody-vs-lexeme boundary** (`att-6c4b19fe`): delivery transfers linearly (`27/32` style, `p = 1.13e-4` vs swapped) while discrete words collapse (`0/32`). Supplying discrete LLM tokens for words alongside the continuous Plato's Key for style (`M_explicit_lexical_plus_hidden`, `att-b194ab6a`, `0/160` confirm touched) lifts lexical preservation to `28/32` (`103.7%` of native `27/32` ceiling, `p = 7.45e-9` vs zero `inst_emb`) and style transfer to `28/32` (`p = 1.93e-5` vs `4/32` swapped), while preserving the original run as `FAIL (5/6)` pending prospective pre-ASR RMS silence gating (`RMS <= 0.0028` across `16/16` silence controls). Across donor families (`#941`, `att-4aa9bbc3`), multi-kernel stacked FP64 ridge combining `Inkling-2-Mini` and `Qwen3.8-27B` beats both single models on sealed Confirm-160 (`cos = 0.96260`, `R² = 0.999285`, `16/16` groups and `8/8` domains, `p = 3.052e-5`), and a transitive `Qwen3.8 → Inkling → H3` hub (`cos = 0.93407`) outperforms Inkling's direct `concat4` key (`0.92282`). End-to-end real `1024×1024` image + `5.875 s` `141f` `FL2VA` video+audio generation with zero 32B encoder is verified across three local CUDA generations from a 2017 `Tesla V100` (`29.31 s` image / `796.01 s` AV, `att-717e4057`) through `RTX 3090` (`71.52 s` / `178.62 s`, `att-82078ba5`) to `RTX PRO 6000 Blackwell` (`27.68 s` NVFP4 / `99.61 s` AV, `att-af0ed07a`), alongside a 24-GPU Stage 2 sweep spanning Pascal through Blackwell (`att-41cf9f0c`) and a live 3-device local Android Wi-Fi LAN neural mesh (`att-111b1358`, `att-10b33ab9`).
 
 ---
 
 ## 1. Verified Results Summary (Current Snapshot)
 
-Every cell below comes from sealed or attested runs on local hardware. Remaining untouched sealed splits (`448` Packet B2 locked vision items, `160` Packet C audio items) are explicitly marked `PENDING`.
+Every cell below comes from sealed or attested runs on real hardware. Untouched sealed confirmation splits (`448` Packet B2 locked vision items, `160` Packet C audio items) are explicitly marked `SEALED`.
 
 | Track | Graft Seam & Frozen Donor/Receiver | Bridge Size (FP16) | Verified Metric (Exact Counts) | Control / Baseline | Status & Receipt |
 |---|---|---:|---|---|---|
 | **Packet A — SEALED Confirm-160 (`concat4`, separate analysis)** | `Inkling-2-Mini` (`concat4`, 9216→5120) → `MiniMax-H3` DiT (`0` fits) | **90.0 MiB** *(replaces 27.14 GB teacher)* | **Sealed `n = 160` (`16` groups, `640` imgs):** Word cos **0.9228** (`R² = 0.9982`, `n = 3,413`); SigLIP2 text-img **0.1982** (**97.50%** retention vs teacher `0.2045`; delta `-0.0063`, 95% CI `[-0.0117, -0.0010]`, `4/16` above / `12/16` below); img-vs-teacher **0.8942**; latent cos **0.7958** | Beats `single_tap` `16/16` (`p = 3.05e-5`) and `single_tap B0` (`-0.0463`) `16/16` (`p = 3.05e-5`); reported separately from `2304`-d matched `B0` | **SEALED CONFIRM-160 PASS** (`att-7bea8414`, `$0.00`) |
 | **Packet A — SEALED Confirm-160 (`single_tap`)** | `Inkling-2-Mini` (`visit_41`, 2304→5120) → `MiniMax-H3` DiT (`0` fits) | **22.5 MiB** | **Sealed `n = 160` (`16` groups):** Word cos **0.7961** (`R² = 0.9949`); SigLIP2 text-img **0.1544** (**80.02%** margin retention); img-vs-teacher **0.7669**; latent cos **0.6774** | Matched `2304`-d shuffled `B0`: `-0.0463` (**`16/16` groups**, `p = 3.05e-5`, img-vs-teacher `0.4873`) | **SEALED CONFIRM-160 PASS** (`att-7bea8414`) |
-| **Packet B** (Vision → LLM, Clean Negative) | Cached `B4@L42` (`4480→2304`) → `Inkling-2-Mini` `EmbedRows` (`ridge_frozen` / `ridge_norm`) | **20.6 MiB** | Overall `62/192` gold (`ridge_frozen`) vs `60/192` (`ridge_norm`, rejected `p = 0.727`). Counting: **45/48** agree / **40/48** gold. OCR: **1/48**–**3/48**. Charts/UI: **1/48**–**2/48** | Shuffled B0: `29/192` gold (`p = 1.03e-7`); Teacher ceiling: `89/192` gold (`41/48` counting, `21/48` OCR, `4/48` charts) | **Clean Negative / Rejected** (`att-07365411`); motivated Packet B2 |
-| **Packet B2** (High-Res Sight Repair) | Stripped `GOT-OCR2` (**191 MB**, `620M` decoder removed) + `SigLIP2-NaFlex` (**343 MB**) → `Inkling-2-Mini` | ~8–16 MiB *(shape)* | Stage 1 extraction complete (`186.8 s`, `1.56 GiB` peak VRAM, `0/448` locked test); Stage 2 FP64 ridge running on Quincy V100 native FP64 | Packet B cached baseline + shuffled B0 | **Stage 2 Running** (`att-5a611ab6`); Dev-192 & Locked-448 `PENDING` |
-| **Packet C** (Audio Gate 0, Stage 2, & Stage 3 Mouth `val_dev`) | `Gemma-4-E2B` Conformer (`1536`) · `Qwen3-TTS-12Hz-1.7B` (`2048`) · `Inkling-2-Mini` GPU `EmbedRows` | `7.1 MiB` / `9.4–37.7 MiB` *(split-head key `cd9a2158`)* | **Gate 0 PASS 3/3 (`0.0` drift):** Mouth swap shifts Whisper byte-identically (`"Order code 407..."` → `"Sensor gate 928..."`); **Stage 3 Mouth `val_dev` (`att-6c4b19fe`, `0/160` confirm):** **Prosody/Style PASS `27/32` (`84.4%`, `p = 1.13e-4` vs swapped)**; **Lexical FAIL `0/32`** (vs `27/32` native); EOS/zero `16/16` near-silent Whisper `"Thank you."` (`RMS 0.0008–0.0028`) | Swapped hidden: `5/32` style / `0/32` lexical; Zero hidden: `12/32` style / `0/32` lexical; Native ceiling: `30/32` style / `27/32` lexical | **Mechanistic Split (`all_val_dev_gates_passed = false`)** (`att-6c4b19fe`); Confirm-160 `SEALED` |
-| **Multi-Card Silicon Sweep** | Local (`V100 sm_70` PASS; `PRO 6000`, `3090`, `4090`) → Vast (`3060 12GB` through `5090 32GB`) | Unified stack + `8.46 GB` trunk | **Quincy V100 (`sm_70`) PASS (`att-cb2b03b4`):** `concat4` `1.62 ms`/32 tok (`0.99996` cos vs FP64), `single_tap` `0.44 ms`, Mouth TTS `4.48 GiB` VRAM; `atlas-exl3-8.4g` (`8.46 GB`, `att-7c0c0098`) & `atlas-10.5g` (`10.49 GB`, `att-444d65d1`) built | Watchdog v6 cleared (`att-787c159b`); Stage 2 Vast launches right after Stage 1 local | **1/4 Local Cards PASS** (`att-cb2b03b4`); FL2VA & remaining cards active |
+| **Packet A — Native `FL2VA` Video+Audio & NVFP4 Image** | Exact same frozen `90.0 MiB` `concat4` key (`0` extra bytes, `0` refits) → `FL2VA` & NVFP4 H3 | **0 extra bytes** | **FL2VA (`4` prompts, `56f`, `32 kHz` stereo):** SigLIP2 **0.18164** vs teacher `0.17745`, img-vs-teacher **0.94300**, video cos `0.678–0.844`, audio cos `0.505–0.977`; **NVFP4 Image:** **0.20060** vs `0.21319`, img-vs-teacher **0.92993**, `0.80–0.84 s/img` | Shuffled `B0`: `-0.04059` (FL2VA, img-vs-teacher `0.57243`) and `-0.04993` (NVFP4, img-vs-teacher `0.52890`) | **PASS 4/4** (`att-b6a83a21`) |
+| **Packet B → B2** (Vision → LLM) | Cached `B4@L42` (clean negative) → stripped `GOT-OCR2` (`191 MB`) + `SigLIP2-NaFlex` (`343 MB`) | `20.6 MiB` / ~8–16 MiB | **Packet B (`att-07365411`):** Counting `45/48` agree / `40/48` gold; OCR `1–3/48`; `ridge_norm` rejected (`p = 0.727`). **B2 Stage 3 Dev-192 (`att-6d3af8c2`):** `arm3a_masked_blank_pad` hit **`81/192`** exact teacher agree vs `64/192` pinned (`+17`, `p = 7.63e-5`) | Shuffled `B0`: `29/192` gold; B2 met `3/5` predeclared dev bars narrowly | **B Clean Negative; B2 Dev-192 Gain; Locked-448 `SEALED`** |
+| **Packet C** (Mouth Direct vs Hybrid, Visit Lace, Ears) | `Qwen3-TTS-12Hz-1.7B` · `Inkling-2-Mini` Visit Lace · `Whisper-turbo` Ears | `9.4–37.7 MiB` *(key `cd9a2158`)* | **Direct (`att-6c4b19fe`):** Style `27/32`, Lexical `0/32`. **Hybrid `M_explicit_lexical_plus_hidden` (`att-b194ab6a`):** Style **`28/32`** (`8/8` urgency, `8/8` pace; `p = 1.93e-5` vs `4/32` swapped), Lexical **`28/32`** (`103.7%` of `27/32` native; `p = 7.45e-9` vs `0/32` zero), exact `0.0` roundtrip. **Visit Lace (`att-d0e96537`):** `64/64` exact zero-dose replay, `0/32 → 26/32` steering, `32/32` arithmetic intact. **Ears (`att-773f320b`):** `1.00000` nonspeech ROC-AUC, `8/8` pace | Original Hybrid stays `FAIL (5/6)` on un-gated Whisper `"Thank you."` over `16/16` silent controls (`RMS 0.000794–0.002809`); prospective `RMS >= 0.01` rescorer running | **Direct `FAIL`; Hybrid `5/6` (`att-b194ab6a`); Lace & Ears PASS; Confirm-160 `SEALED`** |
+| **Packet D** (`YuE2-3B` 48 kHz Music) | Native `m-a-p/YuE2-3B` + `YuE2-Vae` Gate 0 & 16-step rollout parity | Native seam | `0.0` max abs diff seam parity; `60.639 s` `48 kHz` stereo anthem (`audio_rms = 0.1679`) in `31.59 s` warm (`0.521×` RTF, `8.65 GiB` peak) | Zero-drift exact rollout check (`att-c6acea7c`) | **Gate 0 & Rollout PASS** (`att-0fcf223c`, `att-c6acea7c`) |
+| **Multi-Model 2-Way Blend & Hubs (`#941`)** | `Inkling-2-Mini` + `Qwen3.8-27B` → `MiniMax-H3` (`stacked_multikernel_concat4` & Hubs) | `290 MiB` (`72.5 MiB` compact) | **Sealed Confirm-160 (`n = 3,413`, `0` fits):** Blend **`cos = 0.96260`**, **`R² = 0.999285`**, `rel_l2 = 0.02578` (`+0.00300` over Qwen3.8 alone, **`16/16` groups & `8/8` domains**, `p = 3.052e-5`); Transitive **`Qwen3.8 → Inkling → H3` `cos = 0.93407`** beats Inkling direct `0.92282` | Single `Qwen3.8`: `0.95958`; Single `Inkling`: `0.92282`; Naive `stacked_raw` regressed to `0.95622` | **SEALED CONFIRM-160 PASS** (`att-4aa9bbc3`, `$0.00`) |
+| **Cross-Silicon & Mobile Voltron** | 24 GPUs (`Pascal → Blackwell`) · 3-Gen Wave 3 Real AV · 3-Device Android LAN Mesh | Unified stack + `8.46 GB` trunk | **Wave 3 Real `1024×1024` Img + `5.875 s` FL2VA AV (zero 32B Qwen):** `V100` (`29.31 s` / `796.01 s`, `att-717e4057`), `3090` (`71.52 s` / `178.62 s`, `att-82078ba5`), `PRO 6000` (`27.68 s` NVFP4 / `99.61 s`, `att-af0ed07a`). **Stage 2:** 24 distinct real GPUs (`att-41cf9f0c`). **Android Voltron (`att-111b1358`):** Live S26 (`9.81 tok/s`) + Tab S8+ Kokoro (`1.40×` RT) + S24U SDXS-512 (`37.88 s`, `4.40 GB` PSS); S26 `VK_KHR_cooperative_matrix` `2.50–2.68` FP16 TFLOPS (`att-10b33ab9`) | Stage 2 Vast (`24` GPUs) explicitly scopes to Plato's Key + Sight + Voice + GEMM microbench; Wave 3 Vast real AV running | **3/3 Local Wave 3 + 24-GPU Stage 2 + 3-Phone Neural Mesh PASS** |
 
 ---
 
@@ -93,6 +97,19 @@ Unsealing `confirm_reserve` (`160` prompts / `16` disjoint source groups across 
 *(Methodological separation: `b0_shuffled_single_tap` is dimension-matched to `single_tap` `2304`-dim, not `concat4` `9216`-dim; `concat4` is therefore reported in its own block alongside its paired `16/16` wins over `single_tap` and direct paired comparison vs the `27.14 GB` teacher.)*
 
 ![Packet A Sealed Confirm-160 8-Domain Visual Contact Sheet](samples/h3_confirm160_contact_sheet_8domains.png)
+
+### 3.5 Zero-Extra-Byte Transfer to Native `FL2VA` Video+Audio & `12.54 GB` NVFP4 Image (`att-b6a83a21`)
+
+Because `MiniMax-H3`'s native video+audio diffusion transformer (`FL2VA`, `56` frames at `24 fps` + synchronized `32 kHz` stereo audio) and its `12.54 GB` NVFP4 image DiT both condition on the exact `Qwen3-VL-32B` layer-50 `5120`-dim space, the exact same frozen `90.0 MiB` `concat4` key (`cca1e5bc...`, `0` refits, `0` extra bridge bytes) drives both receivers directly (`4` pinned dev prompts, `0/160` confirm touched):
+
+| Receiver (`4` Pinned Dev Prompts, `0` Refits) | Arm | SigLIP2 Text-Image | SigLIP2 Img-vs-Teacher | Latent Cos vs Teacher | DiT Wall Time (PRO 6000) |
+|---|---|---:|---:|---:|---:|
+| **`FL2VA` Video (`56f`) + `32 kHz` Stereo Audio** | Teacher Reinject (`27.14 GB`) | `0.17745` | `1.00000` | `1.0000` | — |
+| **`FL2VA` Video (`56f`) + `32 kHz` Stereo Audio** | **Inkling `concat4` (`90.0 MiB`)** | **`0.18164`** | **`0.94300`** | Video `0.678–0.844` · Audio `0.505–0.977` | `6.99–14.13 s` |
+| **`FL2VA` Video (`56f`) + `32 kHz` Stereo Audio** | Shuffled `B0` (`22.5 MiB`) | `-0.04059` | `0.57243` | Audio `0.737` (h3p0_0080) | `14.02 s` |
+| **`MiniMax-H3` NVFP4 Image (`12.54 GB`)** | Teacher Reinject (`27.14 GB`) | `0.21319` | `1.00000` | `1.0000` | — |
+| **`MiniMax-H3` NVFP4 Image (`12.54 GB`)** | **Inkling `concat4` (`90.0 MiB`)** | **`0.20060`** | **`0.92993`** | `0.663–0.887` | **`0.80–0.84 s/img`** |
+| **`MiniMax-H3` NVFP4 Image (`12.54 GB`)** | Shuffled `B0` (`22.5 MiB`) | `-0.04993` | `0.52890` | `0.416` (h3p0_0080) | `0.77 s` |
 
 ---
 
@@ -176,15 +193,86 @@ Just as Packet B exposed a spatial-frequency boundary on vision (coarse grids ca
 
 1. **Continuous delivery axes align linearly across frozen models.** Speaking rate (`8/8`), urgency (`7/8`), and warmth (`7/8`) occupy smooth, low-frequency directions in `Qwen3-TTS`'s instruction space (`R² = 0.8805`), allowing a zero-gradient linear map from `Inkling-2-Mini` to retain `90%` of the native directional ceiling (`27/32` vs `30/32`).
 2. **Discrete lexical lookup does not tolerate ridge shrinkage.** `Qwen3-TTS`'s `text_projection` seam behaves like a sharp discrete vocabulary lookup (`R² = 0.2387` across mismatched tokenizers). Ridge shrinkage averages nearby subword vectors, leaving cadence intact while destroying exact digits, proper nouns, and negations (`0/32`).
-3. **Production speech architecture: discrete tokens for words, Plato's Key for delivery.** A frozen LLM already emits exact discrete text tokens. Routing discrete text tokens to `Qwen3-TTS`'s text input preserves `100%` lexical accuracy, while routing the closed-form Plato's Key strictly into the continuous style/instruction seam delivers zero-gradient prosodic and affective control (`27/32`, `p = 1.13e-4`) directly from the LLM's internal hidden states.
+3. **Production speech architecture: discrete tokens for words, Plato's Key for delivery.** A frozen LLM already emits exact discrete text tokens. Routing discrete text tokens to `Qwen3-TTS`'s text input preserves lexical accuracy, while routing the closed-form Plato's Key strictly into the continuous style/instruction seam delivers zero-gradient prosodic and affective control directly from the LLM's internal hidden states.
+
+### 5.3 Second Mouth Seam (`M_explicit_lexical_plus_hidden`, `att-b194ab6a`): Testing the Hybrid Architecture
+
+Under pre-registered authorization (`att-8745190b`) on `mouth_val_dev` (`400` clips on RTX PRO 6000 Blackwell, `1,693.49 s`, `4.34 GiB` peak VRAM, `0/160` confirm reserve touched, `key_sha256 cd9a2158...`, report `sha256 0d799309...`), we supplied identical declared discrete lexical token IDs across all arms while varying only the continuous Inkling-projected `inst_emb` (`matched`, `swapped`, `zero`). The prior direct continuous run (`att-6c4b19fe`) stays preserved as `FAIL`.
+
+| Track (`M_explicit_lexical_plus_hidden`, `val_dev`) | Native Ceiling | Inkling Matched `inst_emb` | Swapped `inst_emb` | Zero `inst_emb` | Paired Exact Test |
+|---|---:|---:|---:|---:|---|
+| **Style / Prosody Overall (`32` pairs)** | `30/32` (`93.8%`) | **`28/32` (`87.5%`)** | `4/32` (`12.5%`) | `11/32` (`34.4%`) | vs swapped **`p = 1.93e-5`**; vs zero **`p = 1.53e-5`** (`8/8` urgency, `8/8` pace, `6/8` intonation, `6/8` warmth) |
+| **Supplied Lexical Preservation (`32` pairs)** | `27/32` (`84.4%`) | **`28/32` (`87.5%`, `103.7%` native)** | `27/32` (`84.4%`) | `0/32` (`0.0%`) | `8/8` digits, `8/8` negation, `8/8` order, `4/8` names; vs zero **`p = 7.45e-9`** |
+| **Roundtrip Fit Check (`2` gold clips)** | `0.0` drift | **`0.0` max abs WAV diff** (`2/2`) | — | — | Exact sample-for-sample match (`65,280` & `80,640` samples) |
+| **EOS / Zero Silence Controls (`16` clips)** | `0/16` FP | `16/16` Whisper `"Thank you."` | — | — | All `16/16` physically near-silent (`RMS 0.000794–0.002809`) |
+
+Five of six pre-registered `val_dev` gates passed; `all_val_dev_gates_passed` remains `false` (`FAIL 5/6`) solely because un-gated `faster-whisper` hallucinates `"Thank you."` on all `16/16` physically silent controls (`max_rms = 0.002809`). A frozen prospective scorer amendment (`mono float32 16 kHz`, no gain normalization, `RMS >= 0.01 AND duration >= 0.20 s` applied blind across every arm/clip with gated speech counted missed plus a blinded listening pack) is running on the saved dev WAVs prior to any `confirm_reserve` decision.
+
+### 5.4 Visit Lace (`att-d0e96537`), Whisper Ears (`att-773f320b`), & Packet D `YuE2-3B` 48 kHz Music (`att-0fcf223c`)
+
+- **Visit Lace (`att-d0e96537`):** Zero-dose replay matched `64/64` tokens identically; monotonic causal steering scaled `0/32 → 26/32` at `alpha = 3.0` while preserving `32/32` (`100%`) arithmetic reasoning (`p = 1.0`).
+- **Whisper-Turbo Continuous Ears (`att-773f320b`):** Closed-form FP64 ridge from `Whisper-large-v3-turbo` continuous `1280`-dim audio features into `Inkling-2-Mini` `2304`-dim `EmbedRows` achieved `1.00000` nonspeech ROC-AUC and `8/8` speaking-pace discrimination.
+- **Packet D Native `YuE2-3B` + `YuE2-Vae` (`att-0fcf223c`, `att-c6acea7c`):** Native Gate 0 verified `0.0` max abs diff seam parity and 16-step exact rollout parity, synthesizing a `60.639 s` `48 kHz` stereo anthem (`audio_rms = 0.1679`) in `31.59 s` warm (`0.521×` real-time factor, `8.65 GiB` peak CUDA allocation).
 
 ---
 
-## 6. System Footprint, Native Video+Audio Diffusion, & Consumer-GPU Targets
+## 6. Multi-Model Closed-Form Plato's Key Blends & Cross-LLM Hubs (`#941`, `att-4aa9bbc3`)
+
+Using the exact same frozen `fit` / `val_dev` / sealed `confirm_reserve` split (`160` sealed prompts, `3,413` unseen words, `14/14` frozen SHA-256 pins verified before unsealing, `fit_calls_executed = 0`, `0` GPUs on Quincy CPU), we tested whether combining closed-form representations from heterogeneous donor families (`Inkling-2-Mini` looped MoE + `Qwen3.8-27B-NVFP4` dense) improves conditioning over either model alone, and whether cross-LLM hubs transfer transitively into `MiniMax-H3`.
+
+### 6.1 Sealed Confirm-160 Blend & Transitive Hub Results (`n = 3,413` Words, `16` Disjoint Groups)
+
+| Strategy (`Sealed Confirm-160`, `fit_calls = 0`) | Key Size (FP16) | Word Cos (`n=3413`) | Word `R²` | `rel_l2` | Paired Delta vs Best Single (`Qwen3.8`) |
+|---|---:|---:|---:|---:|---|
+| Single `Inkling-2-Mini` `concat4` | `90.0 MiB` | `0.92282` | `0.998218` | `0.04070` | baseline |
+| Single `Qwen3.8-27B` `concat4` | `200.1 MiB` | `0.95958` | `0.999216` | `0.02699` | best single baseline |
+| Single `Qwen3.8-27B` `layer_31` (middle-layer early exit) | `50.0 MiB` | `0.95274` | `0.999090` | `0.02914` | single middle layer retains `99.3%` of `concat4` cos |
+| **Mode A: Convex Blend** (`w = 0.1565 Ink + 0.8435 Qwen`) | `290.1 MiB` | **`0.96222`** | **`0.999266`** | `0.02612` | **`+0.00261`** (`CI95 [+0.00198, +0.00349]`, `16/16` groups, `p = 3.052e-5`) |
+| **Mode B: `stacked_multikernel_concat4`** (`alpha = [0.1, 0.9]`) | `290.1 MiB` | **`0.96260`** | **`0.999285`** | **`0.02578`** | **`+0.00300`** (`CI95 [+0.00232, +0.00377]`, **`16/16` groups & `8/8` domains**, `typography_signage +0.00641`, `p = 3.052e-5`) |
+| **Mode B: `stacked_single_tap_rms` (compact)** | **`72.5 MiB`** | **`0.95860`** | `0.999208` | `0.02714` | **`+0.00584`** vs `Qwen3.8` single tap (`16/16` groups, `p = 3.052e-5`) |
+| *Negative finding:* Naive `stacked_raw_concat4` (`val_dev`) | `290.1 MiB` | `0.95622` | — | — | **Regressed `-0.00301`** vs Qwen3.8 due to cross-model hidden-state norm imbalance |
+| **Mode C: Hub `Inkling → Qwen3.8(L31)` → `H3`** | `91 MiB` hub | `0.94177` (hub) · **`0.91739`** (→H3) | `0.998053` | — | Transitive conditioning via frozen Qwen3.8 middle layer |
+| **Mode C: Hub `Qwen3.8 → Inkling(V41)` → `H3`** | `91 MiB` hub | `0.92945` (hub) · **`0.93407`** (→H3) | **`0.998595`** | — | **Beats Inkling's own direct `concat4` (`0.92282`)** while routing through Inkling's latent space |
+
+### 6.2 Mechanistic Findings
+
+1. **Cross-model norm imbalance breaks naive concatenation.** Directly stacking raw hidden states from a looped MoE (`Inkling-2-Mini`) and a dense 27B model (`Qwen3.8-27B`) regressed `-0.00301` on `val_dev` (`0.95622` vs `0.95917`). Applying block-weighted multi-kernel ridge (`alpha = [0.1, 0.9]`, solved via Dual Woodbury in FP64) turned that regression into a uniform `16/16`-group, `8/8`-domain gain on sealed Confirm-160 (`+0.00300`, `p = 3.052e-5`), with the largest domain gain on `typography_signage` (`+0.00641`).
+2. **Half-depth single taps suffice for conditioning.** On 64-layer `Qwen3.8-27B`, a single tap at middle layer `31` already reaches `cos = 0.95274` / `R² = 0.99909` on sealed Confirm-160, motivating early-exit multimedia prefill (`#944`).
+
+---
+
+## 7. Cross-Silicon Validation: 2017 Volta V100 → Blackwell & 3-Device Mobile Mesh
+
+### 7.1 Wave 3 Real End-to-End Image + `5.875 s` Video+Audio (Zero 32B Encoder)
+
+Every local generation below ran real `1024×1024` `MiniMax-H3` image generation and real `5.875 s` (`141`-frame `768×448`) `FL2VA` video + `32 kHz` stereo audio generation conditioned solely by the frozen `90.0 MiB` Inkling `concat4` Plato's Key (`cos = 0.999996` vs FP64 CPU, zero `Qwen3-VL-32B` loaded):
+
+| GPU (Architecture, VRAM) | Plato's Key (`32` tok) | Real `1024×1024` Image (DiT Format, Peak) | Real `5.875 s` `141f` `FL2VA` Video + `32 kHz` Audio (Peak, RMS, Motion L1) | Receipt |
+|---|---:|---|---|---|
+| **2017 Tesla V100** (`sm_70`, `31.73 GiB`) | `1.566 ms` | **`29.31 s`** (`int8_convrot`, `22.32 GiB`) | **`796.01 s`** (`27.02 GiB`, `audio_rms = 0.012029`, `motion_l1 = 8.147`) | `att-717e4057` |
+| **RTX 3090** (`sm_86`, `23.56 GiB`) | `0.121 ms` | **`71.52 s`** (`int8_convrot`, `20.77 GiB`) | **`178.62 s`** (`22.09 GiB`, `audio_rms = 0.012009`, `motion_l1 = 8.153`) | `att-82078ba5` |
+| **RTX PRO 6000 Blackwell** (`sm_120`, `95 GiB`) | `0.022 ms` | **`27.68 s`** (`nvfp4`, `12.95 GiB`) | **`99.61 s`** (`22.97 GiB`, `audio_rms = 0.011936`, `motion_l1 = 8.157`) | `att-af0ed07a` |
+
+![Wave 3 Real Image & 5.875s Video+Audio Across Generations](figures/omni912_wave3_real_image_and_5s_av_benchmark.png)
+
+### 7.2 Stage 2 24-GPU Fleet Sweep (All 6 CUDA Generations, `att-41cf9f0c`)
+
+Across `4` local cards (`att-98b7c6d6`) plus `20` bounded Vast instances (`att-74557f1b` Wave 1 + `att-41cf9f0c` Wave 2; `all_teardowns_zero_confirmed = true`), **24 distinct real NVIDIA GPUs spanning all 6 CUDA generations (`Pascal → Volta → Turing → Ampere → Ada → Blackwell`)** verified Plato's Key projection parity, native `SigLIP2` Sight, native `Qwen3-TTS` Voice, and H3-width GEMM throughput (explicitly scoped to component parity + GEMM microbench; full Wave 3 real Image+FL2VA Vast sweep across Ampere/Ada/Blackwell is running separately).
+
+![24-GPU Multi-Card Omni-Modal Latencies](figures/omni912_multicard_omnimodal_latencies.png)
+
+### 7.3 On-Device Android Voltron 3-Device Neural Mesh & Adreno 840 Cooperative Matrix (`#914`)
+
+- **Live 3-Device Real Neural Pipeline Over Wi-Fi LAN (`att-111b1358`, zero cloud, zero server GPUs):** `Galaxy S26` Brain (`Inkling-2-Mini EXL3-9g` on Adreno 840, `9.81 tok/s`; Track 2 Iter 8 peak `10.463 tok/s` Pass 2, `att-81f2ecd2`) → `Galaxy Tab S8+` Neural Voice (`Kokoro-82M INT8 ONNX`, `8.03 s` `24 kHz` speech in `5.74 s` warm = `1.40×` faster than real-time) + `Galaxy S24 Ultra` Neural Artist (`1-step SDXS-512 Q8_0 GGUF` via `stable-diffusion.cpp`, `37.88 s` warm co-hosted alongside `Inkling-2-Mini` in `4.40 GB` total PSS, zero LMK kills; currently text-prompted while verifying the `64 KiB` packet SHA-256).
+- **Mobile DiT Silicon Measurement (`att-10b33ab9`) & VPKE v1 Interop (`att-320e7c1e`):** Live Vulkan benchmarks of `Tongyi-MAI/Z-Image-Turbo` (`6.15B` S3-DiT) linear shapes confirmed hardware `VK_KHR_cooperative_matrix` (`64×64×16 FP16`) on `Galaxy S26` Adreno 840 at `2.50–2.68` FP16 TFLOPS on `K=3840` projections and `1.04` TFLOPS on `W2` (`49.21 s` isolated 30-block × 8-forward `512px` linear subtotal, vs `218.32 s` SIMT on Adreno 750 `S24 Ultra` without coopmat). Python ↔ Kotlin VPKE v1 packet packing verified byte-identical (`328,233 B`, `seq_len=64, dim=2560`, `30/30` JVM tests) to receive the `#943` `Z-Image-Turbo` Plato's Key directly on device.
+
+---
+
+## 8. System Footprint & Consumer-GPU Targets
 
 All sizes below use **decimal GB (`10^9` bytes)** consistently and separate **measured files / peak VRAM** from **unmeasured projection targets**. Because `MiniMax-H3`'s full **Audio+Video DiT** (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, `21.0 GB` decimal / `20 GiB` on disk, plus `3.2 GB` video VAE and `0.61 GB` audio VAE) conditions on the **exact same `Qwen3-VL-32B` Layer-50 `5120`-dim space** as `MiniMax-H3` Image, the **exact same `94.4 MB` (`90.0 MiB`) Packet A Plato's Key** targets native video + synchronized audio generation at **zero extra bridge bytes** (functional video temporal-coherence gate `PENDING`). An already-quantized **`12.54 GB` (`11.68 GiB`, `12,537,569,802` bytes) NVFP4** H3 Image DiT (`minimax_h3_image_pruned_nvfp4.safetensors`) is also on disk.
 
-### 6.1 Measured Baseline vs Packet A Replacement (Decimal GB)
+### 8.1 Measured Baseline vs Packet A Replacement (Decimal GB)
 
 | Component | Measured Disk (GB) | Measured Peak VRAM (GB) | Status |
 |---|---:|---:|---|
@@ -196,7 +284,7 @@ All sizes below use **decimal GB (`10^9` bytes)** consistently and separate **me
 | Unstripped Ears (`Gemma-4-E2B` INT8) | **5.20** | — | Full checkpoint on disk (Conformer not yet stripped) |
 | Unquantized Mouth (`Qwen3-TTS-1.7B` BF16 + codec) | **~5.31** (`4.62 + 0.68`) | — | Full BF16 weights on disk (not yet quantized) |
 
-### 6.2 Projected Stripped + Quantized Deployment Targets (Not Yet Measured on Silicon)
+### 8.2 Projected Stripped + Quantized Deployment Targets (Not Yet Measured on Silicon)
 
 *(Bridge sizes for B2 Sight `~0.016 GB`, C Ears `0.007 GB`, and C Mouth `0.038 GB` are FP16 shape arithmetic until fitted; Packet A `0.094 GB` is a measured file. Disk weights always understate live VRAM due to KV cache and activations.)*
 
@@ -215,13 +303,12 @@ All sizes below use **decimal GB (`10^9` bytes)** consistently and separate **me
 
 ---
 
-## 7. Pending Sections (Auto-Populating as Gates Clear)
+## 9. Active & Remaining Work
 
-- **Section 7.1 — Packet A Sealed 160-Prompt Confirmation & Native `FL2VA` Video+Audio Check:** `PENDING` (`v4` floor cleared `att-615740cb`; priority 1 on Colab G4 / local PRO 6000; FL2VA 4-prompt native video+sound check uses the exact same `90.0 MiB` key).
-- **Section 7.2 — Packet B2 High-Res OCR Repair (Dev-192 & Locked-448):** `PENDING` (Quincy CPU Stage 2 fits running now; paired Stock vs Ours tile-mask visual proofs to follow).
-- **Section 7.3 — Packet C Direct Ears & Mouth Phase 0 + Unforced Representation Lace (`visits 41..47`):** `PENDING` (lexical minimal pairs, acoustic intonation pairs, silence controls, unforced greeting audio, and unscripted visual self-concept).
-- **Section 7.4 — Packet D Singing / Music (`m-a-p/YuE2-3B` + `YuE2-Vae`, 48 kHz Stereo):** `PENDING` (Native Gate 0 + continuous conditioning / ABC-notation score seam, including Inkling singing *The Star-Spangled Banner*, public domain).
-- **Section 7.5 — Two-Stage Multi-Card Silicon Sweep:**
-  - *Stage 1 (Local First):* `RTX PRO 6000` (`sm_120a`), `RTX 3090` (`sm_86`), `RTX 4090` (`sm_89`), `V100-32GB` (`sm_70`).
-  - *Stage 2 (Vast Full-Fleet Sweep):* `RTX 3060 12GB` through `RTX 5090 32GB` and full Pascal → Blackwell ladder.
-- **Section 7.6 — 100% Model-Authored Showcase Videos & Full Auditable Process Trace + Centaur History (`platonica`):** `PENDING` (see [PROCESS_LOG.md](PROCESS_LOG.md)).
+- **Showcase 1 v4 (`60.64 s` Anthem) & Showcase 2 v4 (Real Blender 5.2.5 Cycles 3D Room + `Ref2VA`):** Active on Devbox RTX PRO 6000 (`Showcase 2 v3` was logged honestly as visual-QA `FAIL` after human inspection caught 2D collage geometry drift and a hard jump-cut at `yaw=360°`, motivating v4's real 3D Blender anchor views and fail-closed jump-cut + SigLIP2 identity gates).
+- **Packet C Mouth Scorer Amendment (`val_dev`) & `#942` Public Expressive TTS / `YuE2` Singing Shoot-Out:** Frozen v2 `RMS >= 0.01` CPU audit running on Quincy (`confirm_reserve` `0/160` sealed); `#942` 5-engine TTS + `YuE2` melancholic singing shoot-out live on Vast L40S (`Inkling → IndexTTS-2` 8-float OOF `cos = 0.9144`, `Qwen3.8 → IndexTTS-2` `cos = 0.9362`).
+- **3-Way & 4-Way Multi-Model Atlas Blends (`#941`):** `DeepSeek-V4.1-Flash` and `GLM-5.3-Flash` taps completing to join `Inkling-2-Mini + Qwen3.8-27B`.
+- **Universal Nov-2026 Base/Turbo Image Plato's Key Sweep (`#943`, BYO-Quant, `V100 → Blackwell`):** Phase 0 frozen (`att-74ce97b4`); Wave A (`Qwen-Image-2.1`, `Krea-2`, `FLUX.3-Image-Klein`, `Z-Image-Turbo`, `FLUX.2-klein-4B`) + Wave B (`FLUX.2-klein-9B/dev`, `P-Image-OSS`, `MOSS-Image`, `FLUX.1-schnell`, `SDXL-Turbo`) queued on Quincy V100 / Blackwell.
+- **Ultra-Sparse Multimedia Mode Probe (`#944`):** Measuring Brain early-exit depth + MoE media-expert sparsity + Plato's Key SVD rank and Desktop GPU / S26 DiT block-skip, `2:4` / SwiGLU FFN sparsity, and `FL2VA` spatial-temporal patch sparsity.
+- **Wave 3 Vast Sweep:** Completing real Image + `5.875 s` `FL2VA` Video+Audio across 11 Ampere/Ada/Blackwell Vast SKUs.
+- **Process Trace & Centaur History:** Maintained in [PROCESS_LOG.md](PROCESS_LOG.md).
