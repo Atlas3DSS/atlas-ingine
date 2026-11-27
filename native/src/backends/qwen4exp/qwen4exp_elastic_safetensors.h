@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -43,6 +44,29 @@ struct ElasticShardInfo {
   std::shared_ptr<ingine::SafetensorsFile> file;
 };
 
+struct ElasticLinearLayout {
+  ElasticTensorKind kind = ElasticTensorKind::F32;
+  const SafetensorsEntry* weight = nullptr;
+  const SafetensorsEntry* scale = nullptr;
+  const SafetensorsEntry* scale_2 = nullptr;
+  int out_features = 0;
+  int in_features = 0;
+  std::uint64_t expected_weight_bytes = 0;
+  std::uint64_t expected_scale_bytes = 0;
+};
+
+struct ElasticExpertLayout {
+  ElasticTensorKind kind = ElasticTensorKind::Nvfp4;
+  const SafetensorsEntry* weight = nullptr;
+  const SafetensorsEntry* scale = nullptr;
+  const SafetensorsEntry* scale_2 = nullptr;
+  int expert_count = 0;
+  int out_features = 0;
+  int in_features = 0;
+  std::uint64_t per_expert_code_bytes = 0;
+  std::uint64_t per_expert_scale_bytes = 0;
+};
+
 class Qwen4ExpElasticSet {
  public:
   static bool is_elastic_dir(const std::filesystem::path& path);
@@ -56,17 +80,27 @@ class Qwen4ExpElasticSet {
 
   [[nodiscard]] const SafetensorsEntry* find_tensor(const std::string& name) const noexcept;
   [[nodiscard]] const SafetensorsEntry& require_tensor(const std::string& name) const;
+  [[nodiscard]] std::optional<ElasticTensorKind> find_layer_kind(const std::string& prefix) const noexcept;
   [[nodiscard]] ElasticTensorKind layer_kind(const std::string& prefix) const noexcept;
+
+  // Consumer-expected layout validators (used both at inspect_headers ingress and prior to GPU upload/dispatch).
+  [[nodiscard]] const SafetensorsEntry& validate_f32_tensor(const std::string& name,
+                                                            std::span<const std::int64_t> expected_shape) const;
+  [[nodiscard]] ElasticLinearLayout validate_dense_linear(const std::string& weight_name, int expected_out_features,
+                                                          int expected_in_features) const;
+  [[nodiscard]] ElasticExpertLayout validate_moe_experts(const std::string& prefix, int expected_expert_count,
+                                                         int expected_out_features, int expected_in_features) const;
+  void validate_qwen4exp_tensor_schema() const;
 
   void read_tensor_bytes(const SafetensorsEntry& entry, std::uint64_t rel_offset, std::span<std::uint8_t> dst) const;
   [[nodiscard]] std::vector<std::uint8_t> read_tensor_raw(const SafetensorsEntry& entry) const;
   [[nodiscard]] std::vector<float> read_tensor_f32(const SafetensorsEntry& entry) const;
   [[nodiscard]] float read_scalar_f32(const SafetensorsEntry& entry) const;
 
-  // O(1) host-side row lookup for token_embd (FP8 or NVFP4) and host-only PLE shards (NVFP4 or Q8_0).
+  // O(1) host-side row lookup for token_embd (FP8, NVFP4, BF16, or F32) and host-only PLE shards (NVFP4, Q8_0, or F32).
   void read_embed_row_f32(std::uint64_t row_idx, std::span<float> out) const;
   void read_ple_row_f32(std::uint64_t row_idx, std::span<float> out) const;
-  [[nodiscard]] bool has_embedded_ple() const noexcept { return ple_num_shards_ > 0; }
+  [[nodiscard]] bool has_embedded_ple() const noexcept { return ple_num_shards_ > 0 && ple_format_ != "external"; }
 
  private:
   Qwen4ExpConfig config_;

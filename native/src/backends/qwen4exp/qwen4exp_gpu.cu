@@ -10,12 +10,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <list>
 #include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 namespace ingine::backends::qwen4exp {
@@ -128,7 +130,9 @@ struct DevLayerWeights {
 
   // Routed MoE experts metadata (GGUF or Elastic Safetensors) + optional resident VRAM tensors
   bool elastic_moe = false;
-  ElasticWeightFormat moe_fmt = ElasticWeightFormat::Nvfp4;
+  ElasticWeightFormat gate_moe_fmt = ElasticWeightFormat::Nvfp4;
+  ElasticWeightFormat up_moe_fmt = ElasticWeightFormat::Nvfp4;
+  ElasticWeightFormat down_moe_fmt = ElasticWeightFormat::Nvfp4;
   const GgufTensorEntry* gate_exps_entry = nullptr;
   const GgufTensorEntry* up_exps_entry = nullptr;
   const GgufTensorEntry* down_exps_entry = nullptr;
@@ -531,54 +535,114 @@ Qwen4ExpGpuBackend::Qwen4ExpGpuBackend(const Qwen4ExpGpuLoadOptions& options) {
   const bool is_elastic = impl_->is_elastic;
   load_stats_.pins_verified = impl_->ckpt_id().shard_digests_verified;
 
-  auto upload_f32 = [&](const std::string& name) -> DevBuf {
-    const auto v = is_elastic ? impl_->elastic->read_tensor_f32(impl_->elastic->require_tensor(name))
-                              : impl_->gguf->read_tensor_f32(impl_->gguf->require_tensor(name));
+  auto is_supported_gpu_ggml_type = [](std::uint32_t tid) noexcept {
+    switch (tid) {
+      case 0:
+      case 1:
+      case 2:
+      case 7:
+      case 8:
+      case 12:
+      case 13:
+      case 14:
+      case 30: return true;
+      default: return false;
+    }
+  };
+  auto to_elastic_weight_format = [](ElasticTensorKind kind, const std::string& ctx) -> ElasticWeightFormat {
+    if (kind == ElasticTensorKind::Nvfp4) return ElasticWeightFormat::Nvfp4;
+    if (kind == ElasticTensorKind::Atlas3) return ElasticWeightFormat::Atlas3;
+    if (kind == ElasticTensorKind::Atlas2) return ElasticWeightFormat::Atlas2;
+    throw std::invalid_argument("Qwen4ExpGpuBackend: unsupported packed Elastic format on " + ctx);
+  };
+
+  auto upload_f32 = [&](const std::string& name, std::initializer_list<std::int64_t> expected_shape) -> DevBuf {
+    std::vector<std::int64_t> sh(expected_shape.begin(), expected_shape.end());
+    std::uint64_t expected_numel = 1;
+    for (std::int64_t d : sh) {
+      if (d <= 0) throw std::invalid_argument("Qwen4ExpGpuBackend: invalid expected shape on " + name);
+      expected_numel *= static_cast<std::uint64_t>(d);
+    }
+    std::vector<float> v;
+    if (is_elastic) {
+      const auto& e = impl_->elastic->validate_f32_tensor(name, sh);
+      v = impl_->elastic->read_tensor_f32(e);
+    } else {
+      const auto& e = impl_->gguf->require_tensor(name);
+      if (e.numel() != expected_numel) {
+        throw std::invalid_argument("Qwen4ExpGpuBackend: GGUF tensor numel mismatch on " + name);
+      }
+      v = impl_->gguf->read_tensor_f32(e);
+    }
+    if (v.size() != expected_numel) {
+      throw std::invalid_argument("Qwen4ExpGpuBackend: decoded F32 count mismatch on " + name);
+    }
     DevBuf b(v.size() * sizeof(float));
     CUDA_CHECK(cudaMemcpy(b.p, v.data(), b.bytes, cudaMemcpyHostToDevice));
     load_stats_.dense_device_bytes += b.bytes;
     return b;
   };
-  auto upload_quant = [&](const std::string& name) -> DevQuantWeight {
+  auto upload_quant = [&](const std::string& name, int expected_out, int expected_in) -> DevQuantWeight {
+    if (expected_out <= 0 || expected_in <= 0) {
+      throw std::invalid_argument("Qwen4ExpGpuBackend: invalid expected linear shape on " + name);
+    }
     if (!is_elastic) {
       const auto& e = impl_->gguf->require_tensor(name);
+      if (!is_supported_gpu_ggml_type(e.type_id)) {
+        throw std::invalid_argument("Qwen4ExpGpuBackend: unsupported GPU GGML type_id " + std::to_string(e.type_id) +
+                                    " on " + name);
+      }
+      if (e.dims.size() != 2 || e.dims[0] != static_cast<std::uint64_t>(expected_in) ||
+          e.dims[1] != static_cast<std::uint64_t>(expected_out)) {
+        throw std::invalid_argument("Qwen4ExpGpuBackend: GGUF linear shape mismatch on " + name);
+      }
+      const std::uint64_t expected_bytes = static_cast<std::uint64_t>(expected_out) * e.row_bytes();
+      if (e.byte_size != expected_bytes) {
+        throw std::invalid_argument("Qwen4ExpGpuBackend: GGUF linear byte size mismatch on " + name);
+      }
       const auto raw = impl_->gguf->read_tensor_raw(e);
+      if (raw.size() != expected_bytes) {
+        throw std::invalid_argument("Qwen4ExpGpuBackend: GGUF raw payload size mismatch on " + name);
+      }
       DevQuantWeight w;
       w.kind = DevQuantWeight::Kind::Ggml;
       w.type_id = e.type_id;
-      w.in_features = static_cast<int>(e.dims[0]);
-      w.out_features = static_cast<int>(e.num_rows());
+      w.in_features = expected_in;
+      w.out_features = expected_out;
       w.buf = DevBuf(raw.size());
       CUDA_CHECK(cudaMemcpy(w.buf.p, raw.data(), raw.size(), cudaMemcpyHostToDevice));
       load_stats_.dense_device_bytes += w.buf.bytes;
       return w;
     }
     const auto& es = *impl_->elastic;
-    const std::string prefix = (name.size() > 7 && name.ends_with(".weight")) ? name.substr(0, name.size() - 7) : name;
-    const ElasticTensorKind ek = es.layer_kind(prefix);
-    const auto& ew = es.require_tensor(name);
+    const ElasticLinearLayout lay = es.validate_dense_linear(name, expected_out, expected_in);
     DevQuantWeight w;
-    if (ek == ElasticTensorKind::Fp8) {
+    w.out_features = lay.out_features;
+    w.in_features = lay.in_features;
+    if (lay.kind == ElasticTensorKind::Fp8) {
       w.kind = DevQuantWeight::Kind::Fp8;
-      w.out_features = static_cast<int>(ew.shape.at(0));
-      w.in_features = static_cast<int>(ew.shape.at(1));
-      w.scale = es.read_scalar_f32(es.require_tensor(prefix + ".weight_scale"));
-      const auto raw = es.read_tensor_raw(ew);
+      w.scale = es.read_scalar_f32(*lay.scale);
+      const auto raw = es.read_tensor_raw(*lay.weight);
+      if (raw.size() != lay.expected_weight_bytes) {
+        throw std::invalid_argument("Qwen4ExpGpuBackend: FP8 weight byte size mismatch on " + name);
+      }
       w.buf = DevBuf(raw.size());
       CUDA_CHECK(cudaMemcpy(w.buf.p, raw.data(), raw.size(), cudaMemcpyHostToDevice));
       load_stats_.dense_device_bytes += w.buf.bytes;
       return w;
     }
-    if (ek == ElasticTensorKind::Nvfp4 || ek == ElasticTensorKind::Atlas3 || ek == ElasticTensorKind::Atlas2) {
-      w.kind = (ek == ElasticTensorKind::Nvfp4)
+    if (lay.kind == ElasticTensorKind::Nvfp4 || lay.kind == ElasticTensorKind::Atlas3 ||
+        lay.kind == ElasticTensorKind::Atlas2) {
+      w.kind = (lay.kind == ElasticTensorKind::Nvfp4)
                    ? DevQuantWeight::Kind::Nvfp4
-                   : (ek == ElasticTensorKind::Atlas3 ? DevQuantWeight::Kind::Atlas3 : DevQuantWeight::Kind::Atlas2);
-      const auto& esc = es.require_tensor(prefix + ".weight_scale");
-      w.out_features = static_cast<int>(esc.shape.at(0));
-      w.in_features = static_cast<int>(esc.shape.at(1)) * 16;
-      w.scale = es.read_scalar_f32(es.require_tensor(prefix + ".weight_scale_2"));
-      const auto raw_c = es.read_tensor_raw(ew);
-      const auto raw_s = es.read_tensor_raw(esc);
+                   : (lay.kind == ElasticTensorKind::Atlas3 ? DevQuantWeight::Kind::Atlas3
+                                                            : DevQuantWeight::Kind::Atlas2);
+      w.scale = es.read_scalar_f32(*lay.scale_2);
+      const auto raw_c = es.read_tensor_raw(*lay.weight);
+      const auto raw_s = es.read_tensor_raw(*lay.scale);
+      if (raw_c.size() != lay.expected_weight_bytes || raw_s.size() != lay.expected_scale_bytes) {
+        throw std::invalid_argument("Qwen4ExpGpuBackend: packed dense byte size mismatch on " + name);
+      }
       w.buf = DevBuf(raw_c.size());
       w.scales = DevBuf(raw_s.size());
       CUDA_CHECK(cudaMemcpy(w.buf.p, raw_c.data(), raw_c.size(), cudaMemcpyHostToDevice));
@@ -586,29 +650,34 @@ Qwen4ExpGpuBackend::Qwen4ExpGpuBackend(const Qwen4ExpGpuLoadOptions& options) {
       load_stats_.dense_device_bytes += w.buf.bytes + w.scales.bytes;
       return w;
     }
-    // Unquantized F32 or BF16 2D weight stored in Elastic pack (e.g. HC matrices, routers) -> GGML F32(0)/BF16(30)
-    w.kind = DevQuantWeight::Kind::Ggml;
-    w.type_id = (ew.dtype == "BF16") ? 30u : 0u;
-    w.out_features = static_cast<int>(ew.shape.at(0));
-    w.in_features = static_cast<int>(ew.shape.at(1));
-    const auto raw = es.read_tensor_raw(ew);
-    w.buf = DevBuf(raw.size());
-    CUDA_CHECK(cudaMemcpy(w.buf.p, raw.data(), raw.size(), cudaMemcpyHostToDevice));
-    load_stats_.dense_device_bytes += w.buf.bytes;
-    return w;
+    if (lay.kind == ElasticTensorKind::F32 || lay.kind == ElasticTensorKind::Bf16) {
+      w.kind = DevQuantWeight::Kind::Ggml;
+      w.type_id = (lay.kind == ElasticTensorKind::Bf16) ? 30u : 0u;
+      const auto raw = es.read_tensor_raw(*lay.weight);
+      if (raw.size() != lay.expected_weight_bytes) {
+        throw std::invalid_argument("Qwen4ExpGpuBackend: dense F32/BF16 byte size mismatch on " + name);
+      }
+      w.buf = DevBuf(raw.size());
+      CUDA_CHECK(cudaMemcpy(w.buf.p, raw.data(), raw.size(), cudaMemcpyHostToDevice));
+      load_stats_.dense_device_bytes += w.buf.bytes;
+      return w;
+    }
+    throw std::invalid_argument("Qwen4ExpGpuBackend: unsupported Elastic linear format on " + name);
   };
 
+  const int H = c.hidden_size, hc = c.hc_mult, hc_dim = c.hc_dim(), hc_lr = c.hc_low_rank;
+  const int conv_dim = c.gdn_conv_dim(), val_dim = c.gdn_value_dim(), v_heads = c.ssm_time_step_rank;
   if (!is_elastic) {
     impl_->tok_embd_entry = &impl_->gguf->require_tensor("token_embd.weight");
     impl_->ple_table_entry = impl_->gguf->find_tensor("per_layer_token_embd.weight");
   }
-  impl_->output_hc_norm = upload_f32("output_hc_norm.weight");
-  impl_->output_hc_down = upload_quant("output_hc_down.weight");
-  impl_->output_hc_up = upload_quant("output_hc_up.weight");
+  impl_->output_hc_norm = upload_f32("output_hc_norm.weight", {hc_dim});
+  impl_->output_hc_down = upload_quant("output_hc_down.weight", hc_lr, hc_dim);
+  impl_->output_hc_up = upload_quant("output_hc_up.weight", hc_dim, hc_lr);
   const bool has_output_w =
       is_elastic ? (impl_->elastic->find_tensor("output.weight") != nullptr)
                  : (impl_->gguf->find_tensor("output.weight") != nullptr);
-  impl_->output_weight = upload_quant(has_output_w ? "output.weight" : "token_embd.weight");
+  impl_->output_weight = upload_quant(has_output_w ? "output.weight" : "token_embd.weight", c.vocab_size, H);
 
   impl_->layers.resize(static_cast<std::size_t>(c.num_hidden_layers));
   std::uint64_t total_expert_bytes = 0;
@@ -621,88 +690,112 @@ Qwen4ExpGpuBackend::Qwen4ExpGpuBackend(const Qwen4ExpGpuLoadOptions& options) {
     L.has_ple = c.is_ple(il);
     L.has_qsa = c.has_qsa(il);
 
-    L.hc_attn_norm = upload_f32(p + "hc_attn_norm.weight");
-    L.hc_attn_down = upload_quant(p + "hc_attn_down.weight");
-    L.hc_attn_up = upload_quant(p + "hc_attn_up.weight");
-    L.hc_attn_inject = upload_quant(p + "hc_attn_inject.weight");
-    L.hc_ffn_norm = upload_f32(p + "hc_ffn_norm.weight");
-    L.hc_ffn_down = upload_quant(p + "hc_ffn_down.weight");
-    L.hc_ffn_up = upload_quant(p + "hc_ffn_up.weight");
-    L.hc_ffn_inject = upload_quant(p + "hc_ffn_inject.weight");
+    L.hc_attn_norm = upload_f32(p + "hc_attn_norm.weight", {hc_dim});
+    L.hc_attn_down = upload_quant(p + "hc_attn_down.weight", hc_lr, hc_dim);
+    L.hc_attn_up = upload_quant(p + "hc_attn_up.weight", hc_dim, hc_lr);
+    L.hc_attn_inject = upload_quant(p + "hc_attn_inject.weight", hc, hc_dim);
+    L.hc_ffn_norm = upload_f32(p + "hc_ffn_norm.weight", {hc_dim});
+    L.hc_ffn_down = upload_quant(p + "hc_ffn_down.weight", hc_lr, hc_dim);
+    L.hc_ffn_up = upload_quant(p + "hc_ffn_up.weight", hc_dim, hc_lr);
+    L.hc_ffn_inject = upload_quant(p + "hc_ffn_inject.weight", hc, hc_dim);
 
     if (L.has_ple) {
-      L.ple_key = upload_quant(p + "ple_key.weight");
-      L.ple_value = upload_quant(p + "ple_value.weight");
-      L.ple_norm_key = upload_f32(p + "ple_norm_key.weight");
-      L.ple_norm_query = upload_f32(p + "ple_norm_query.weight");
-      L.ple_norm_conv = upload_f32(p + "ple_norm_conv.weight");
-      L.ple_conv1d = upload_f32(p + "ple_conv1d.weight");
+      L.ple_key = upload_quant(p + "ple_key.weight", hc_dim, H);
+      L.ple_value = upload_quant(p + "ple_value.weight", H, H);
+      L.ple_norm_key = upload_f32(p + "ple_norm_key.weight", {hc_dim});
+      L.ple_norm_query = upload_f32(p + "ple_norm_query.weight", {hc_dim});
+      L.ple_norm_conv = upload_f32(p + "ple_norm_conv.weight", {hc_dim});
+      L.ple_conv1d = upload_f32(p + "ple_conv1d.weight", {hc_dim, c.ple_conv_kernel});
     }
 
     if (L.is_linear) {
-      L.attn_qkv = upload_quant(p + "attn_qkv.weight");
-      L.attn_gate = upload_quant(p + "attn_gate.weight");
-      L.ssm_alpha = upload_quant(p + "ssm_alpha.weight");
-      L.ssm_beta = upload_quant(p + "ssm_beta.weight");
-      L.ssm_out = upload_quant(p + "ssm_out.weight");
-      L.ssm_conv1d = upload_f32(p + "ssm_conv1d.weight");
-      L.ssm_dt_bias = upload_f32(p + "ssm_dt.bias");
-      L.ssm_a = upload_f32(p + "ssm_a");
-      L.ssm_norm = upload_f32(p + "ssm_norm.weight");
+      L.attn_qkv = upload_quant(p + "attn_qkv.weight", conv_dim, H);
+      L.attn_gate = upload_quant(p + "attn_gate.weight", val_dim, H);
+      L.ssm_alpha = upload_quant(p + "ssm_alpha.weight", v_heads, H);
+      L.ssm_beta = upload_quant(p + "ssm_beta.weight", v_heads, H);
+      L.ssm_out = upload_quant(p + "ssm_out.weight", H, val_dim);
+      L.ssm_conv1d = upload_f32(p + "ssm_conv1d.weight", {conv_dim, c.ssm_conv_kernel});
+      L.ssm_dt_bias = upload_f32(p + "ssm_dt.bias", {v_heads});
+      L.ssm_a = upload_f32(p + "ssm_a", {v_heads});
+      L.ssm_norm = upload_f32(p + "ssm_norm.weight", {c.ssm_state_size});
     } else {
-      L.attn_q = upload_quant(p + "attn_q.weight");
-      L.attn_k = upload_quant(p + "attn_k.weight");
-      L.attn_v = upload_quant(p + "attn_v.weight");
-      L.attn_output = upload_quant(p + "attn_output.weight");
-      L.attn_q_norm = upload_f32(p + "attn_q_norm.weight");
-      L.attn_k_norm = upload_f32(p + "attn_k_norm.weight");
+      L.attn_q = upload_quant(p + "attn_q.weight", c.full_q_out_dim(), H);
+      L.attn_k = upload_quant(p + "attn_k.weight", c.full_kv_out_dim(), H);
+      L.attn_v = upload_quant(p + "attn_v.weight", c.full_kv_out_dim(), H);
+      L.attn_output = upload_quant(p + "attn_output.weight", H, c.num_attention_heads * c.head_dim);
+      L.attn_q_norm = upload_f32(p + "attn_q_norm.weight", {c.head_dim});
+      L.attn_k_norm = upload_f32(p + "attn_k_norm.weight", {c.head_dim});
       if (L.has_qsa) {
-        L.idx_q_proj = upload_quant(p + "indexer.q_proj.weight");
-        L.idx_k_proj = upload_quant(p + "indexer.k_proj.weight");
-        L.idx_q_norm = upload_f32(p + "indexer.q_norm.weight");
-        L.idx_k_norm = upload_f32(p + "indexer.k_norm.weight");
+        L.idx_q_proj = upload_quant(p + "indexer.q_proj.weight", c.indexer_head_count * c.indexer_key_length, H);
+        L.idx_k_proj = upload_quant(p + "indexer.k_proj.weight", c.indexer_key_length, H);
+        L.idx_q_norm = upload_f32(p + "indexer.q_norm.weight", {c.indexer_key_length});
+        L.idx_k_norm = upload_f32(p + "indexer.k_norm.weight", {c.indexer_key_length});
       }
     }
 
-    L.ffn_gate_inp = upload_quant(p + "ffn_gate_inp.weight");
+    L.ffn_gate_inp = upload_quant(p + "ffn_gate_inp.weight", c.expert_count, H);
     if (c.shared_expert_ffn_length > 0) {
-      L.ffn_gate_inp_shexp = upload_f32(p + "ffn_gate_inp_shexp.weight");
-      L.ffn_gate_shexp = upload_quant(p + "ffn_gate_shexp.weight");
-      L.ffn_up_shexp = upload_quant(p + "ffn_up_shexp.weight");
-      L.ffn_down_shexp = upload_quant(p + "ffn_down_shexp.weight");
+      L.ffn_gate_inp_shexp = upload_f32(p + "ffn_gate_inp_shexp.weight", {H});
+      L.ffn_gate_shexp = upload_quant(p + "ffn_gate_shexp.weight", c.shared_expert_ffn_length, H);
+      L.ffn_up_shexp = upload_quant(p + "ffn_up_shexp.weight", c.shared_expert_ffn_length, H);
+      L.ffn_down_shexp = upload_quant(p + "ffn_down_shexp.weight", H, c.shared_expert_ffn_length);
     }
 
     if (!is_elastic) {
       L.elastic_moe = false;
-      L.gate_exps_entry = &impl_->gguf->require_tensor(p + "ffn_gate_exps.weight");
-      L.up_exps_entry = &impl_->gguf->require_tensor(p + "ffn_up_exps.weight");
-      L.down_exps_entry = &impl_->gguf->require_tensor(p + "ffn_down_exps.weight");
-      L.gate_exp_bytes = static_cast<std::size_t>(L.gate_exps_entry->byte_size / c.expert_count);
-      L.up_exp_bytes = static_cast<std::size_t>(L.up_exps_entry->byte_size / c.expert_count);
-      L.down_exp_bytes = static_cast<std::size_t>(L.down_exps_entry->byte_size / c.expert_count);
+      auto bind_gguf_exp = [&](const std::string& name, int exp_in, int exp_out) -> std::pair<const GgufTensorEntry*, std::size_t> {
+        const auto& e = impl_->gguf->require_tensor(name);
+        if (!is_supported_gpu_ggml_type(e.type_id)) {
+          throw std::invalid_argument("Qwen4ExpGpuBackend: unsupported GPU GGML expert type_id " +
+                                      std::to_string(e.type_id) + " on " + name);
+        }
+        if (e.dims.size() != 3 || e.dims[0] != static_cast<std::uint64_t>(exp_in) ||
+            e.dims[1] != static_cast<std::uint64_t>(exp_out) ||
+            e.dims[2] != static_cast<std::uint64_t>(c.expert_count)) {
+          throw std::invalid_argument("Qwen4ExpGpuBackend: GGUF expert shape mismatch on " + name);
+        }
+        const std::uint64_t per_exp = static_cast<std::uint64_t>(exp_out) * e.row_bytes();
+        if (e.byte_size != static_cast<std::uint64_t>(c.expert_count) * per_exp) {
+          throw std::invalid_argument("Qwen4ExpGpuBackend: GGUF expert byte size mismatch on " + name);
+        }
+        return {&e, static_cast<std::size_t>(per_exp)};
+      };
+      std::tie(L.gate_exps_entry, L.gate_exp_bytes) = bind_gguf_exp(p + "ffn_gate_exps.weight", H, c.expert_ffn_length);
+      std::tie(L.up_exps_entry, L.up_exp_bytes) = bind_gguf_exp(p + "ffn_up_exps.weight", H, c.expert_ffn_length);
+      std::tie(L.down_exps_entry, L.down_exp_bytes) = bind_gguf_exp(p + "ffn_down_exps.weight", c.expert_ffn_length, H);
       total_expert_bytes += L.gate_exps_entry->byte_size + L.up_exps_entry->byte_size + L.down_exps_entry->byte_size;
     } else {
       const auto& es = *impl_->elastic;
       L.elastic_moe = true;
-      const ElasticTensorKind ek = es.layer_kind(p + "ffn_gate_exps");
-      L.moe_fmt = (ek == ElasticTensorKind::Atlas2)
-                      ? ElasticWeightFormat::Atlas2
-                      : (ek == ElasticTensorKind::Atlas3 ? ElasticWeightFormat::Atlas3 : ElasticWeightFormat::Nvfp4);
-      L.e_gate_w = &es.require_tensor(p + "ffn_gate_exps.weight");
-      L.e_gate_s = &es.require_tensor(p + "ffn_gate_exps.weight_scale");
-      L.e_up_w = &es.require_tensor(p + "ffn_up_exps.weight");
-      L.e_up_s = &es.require_tensor(p + "ffn_up_exps.weight_scale");
-      L.e_down_w = &es.require_tensor(p + "ffn_down_exps.weight");
-      L.e_down_s = &es.require_tensor(p + "ffn_down_exps.weight_scale");
-      L.gate_scale2 = es.read_tensor_f32(es.require_tensor(p + "ffn_gate_exps.weight_scale_2"));
-      L.up_scale2 = es.read_tensor_f32(es.require_tensor(p + "ffn_up_exps.weight_scale_2"));
-      L.down_scale2 = es.read_tensor_f32(es.require_tensor(p + "ffn_down_exps.weight_scale_2"));
-      L.gate_code_bytes = static_cast<std::size_t>(L.e_gate_w->byte_size / c.expert_count);
-      L.gate_scale_bytes = static_cast<std::size_t>(L.e_gate_s->byte_size / c.expert_count);
-      L.up_code_bytes = static_cast<std::size_t>(L.e_up_w->byte_size / c.expert_count);
-      L.up_scale_bytes = static_cast<std::size_t>(L.e_up_s->byte_size / c.expert_count);
-      L.down_code_bytes = static_cast<std::size_t>(L.e_down_w->byte_size / c.expert_count);
-      L.down_scale_bytes = static_cast<std::size_t>(L.e_down_s->byte_size / c.expert_count);
+      const ElasticExpertLayout gate_lay = es.validate_moe_experts(p + "ffn_gate_exps", c.expert_count, c.expert_ffn_length, H);
+      const ElasticExpertLayout up_lay = es.validate_moe_experts(p + "ffn_up_exps", c.expert_count, c.expert_ffn_length, H);
+      const ElasticExpertLayout down_lay = es.validate_moe_experts(p + "ffn_down_exps", c.expert_count, H, c.expert_ffn_length);
+
+      L.gate_moe_fmt = to_elastic_weight_format(gate_lay.kind, p + "ffn_gate_exps");
+      L.up_moe_fmt = to_elastic_weight_format(up_lay.kind, p + "ffn_up_exps");
+      L.down_moe_fmt = to_elastic_weight_format(down_lay.kind, p + "ffn_down_exps");
+      L.e_gate_w = gate_lay.weight;
+      L.e_gate_s = gate_lay.scale;
+      L.e_up_w = up_lay.weight;
+      L.e_up_s = up_lay.scale;
+      L.e_down_w = down_lay.weight;
+      L.e_down_s = down_lay.scale;
+
+      L.gate_scale2 = es.read_tensor_f32(*gate_lay.scale_2);
+      L.up_scale2 = es.read_tensor_f32(*up_lay.scale_2);
+      L.down_scale2 = es.read_tensor_f32(*down_lay.scale_2);
+      const std::size_t exp_n = static_cast<std::size_t>(c.expert_count);
+      if (L.gate_scale2.size() != exp_n || L.up_scale2.size() != exp_n || L.down_scale2.size() != exp_n) {
+        throw std::invalid_argument("Qwen4ExpGpuBackend: expert weight_scale_2 count mismatch at layer " +
+                                    std::to_string(il));
+      }
+
+      L.gate_code_bytes = static_cast<std::size_t>(gate_lay.per_expert_code_bytes);
+      L.gate_scale_bytes = static_cast<std::size_t>(gate_lay.per_expert_scale_bytes);
+      L.up_code_bytes = static_cast<std::size_t>(up_lay.per_expert_code_bytes);
+      L.up_scale_bytes = static_cast<std::size_t>(up_lay.per_expert_scale_bytes);
+      L.down_code_bytes = static_cast<std::size_t>(down_lay.per_expert_code_bytes);
+      L.down_scale_bytes = static_cast<std::size_t>(down_lay.per_expert_scale_bytes);
       L.gate_exp_bytes = L.gate_code_bytes + L.gate_scale_bytes;
       L.up_exp_bytes = L.up_code_bytes + L.up_scale_bytes;
       L.down_exp_bytes = L.down_code_bytes + L.down_scale_bytes;
@@ -715,7 +808,6 @@ Qwen4ExpGpuBackend::Qwen4ExpGpuBackend(const Qwen4ExpGpuLoadOptions& options) {
   }
 
   // Allocate reusable GPU scratch buffers
-  const int H = c.hidden_size, hc = c.hc_mult, hc_dim = c.hc_dim(), hc_lr = c.hc_low_rank;
   auto alloc_f32 = [&](std::size_t n) {
     DevBuf b(n * sizeof(float));
     load_stats_.scratch_device_bytes += b.bytes;
@@ -831,18 +923,22 @@ Qwen4ExpGpuBackend::Qwen4ExpGpuBackend(const Qwen4ExpGpuLoadOptions& options) {
         CUDA_CHECK(cudaMemcpy(L.down_exps_dev.p, d_raw.data(), d_raw.size(), cudaMemcpyHostToDevice));
         load_stats_.expert_device_bytes += g_raw.size() + u_raw.size() + d_raw.size();
       } else {
-        auto up_dev = [&](const SafetensorsEntry& e, DevBuf& dst) {
+        auto up_dev = [&](const SafetensorsEntry& e, std::size_t expected_total, DevBuf& dst) {
           const auto raw = impl_->elastic->read_tensor_raw(e);
+          if (raw.size() != expected_total) {
+            throw std::invalid_argument("Qwen4ExpGpuBackend: resident expert payload size mismatch on " + e.name);
+          }
           dst = DevBuf(raw.size());
           CUDA_CHECK(cudaMemcpy(dst.p, raw.data(), raw.size(), cudaMemcpyHostToDevice));
           load_stats_.expert_device_bytes += raw.size();
         };
-        up_dev(*L.e_gate_w, L.gate_exps_dev);
-        up_dev(*L.e_gate_s, L.gate_exps_scales_dev);
-        up_dev(*L.e_up_w, L.up_exps_dev);
-        up_dev(*L.e_up_s, L.up_exps_scales_dev);
-        up_dev(*L.e_down_w, L.down_exps_dev);
-        up_dev(*L.e_down_s, L.down_exps_scales_dev);
+        const std::size_t exp_n = static_cast<std::size_t>(c.expert_count);
+        up_dev(*L.e_gate_w, exp_n * L.gate_code_bytes, L.gate_exps_dev);
+        up_dev(*L.e_gate_s, exp_n * L.gate_scale_bytes, L.gate_exps_scales_dev);
+        up_dev(*L.e_up_w, exp_n * L.up_code_bytes, L.up_exps_dev);
+        up_dev(*L.e_up_s, exp_n * L.up_scale_bytes, L.up_exps_scales_dev);
+        up_dev(*L.e_down_w, exp_n * L.down_code_bytes, L.down_exps_dev);
+        up_dev(*L.e_down_s, exp_n * L.down_scale_bytes, L.down_exps_scales_dev);
       }
     }
     load_stats_.all_experts_resident = true;
@@ -1095,6 +1191,9 @@ std::vector<float> Qwen4ExpGpuBackend::forward_token_logits_gpu(Qwen4ExpGpuSessi
     impl_->d_block_out.zero(s);
     for (int k = 0; k < c.expert_used_count; ++k) {
       const int e = h_exps[static_cast<std::size_t>(k)];
+      if (e < 0 || e >= c.expert_count) {
+        throw std::out_of_range("Qwen4ExpGpuBackend: routed expert id out of range");
+      }
       const float w = h_exp_w[static_cast<std::size_t>(k)];
       if (!L.elastic_moe) {
         const void* gate_ptr = nullptr;
@@ -1140,12 +1239,12 @@ std::vector<float> Qwen4ExpGpuBackend::forward_token_logits_gpu(Qwen4ExpGpuSessi
           d_c = static_cast<const std::uint8_t*>(ptrs.down);
           d_s = d_c + L.down_code_bytes;
         }
-        elastic_linear_f32_cuda(L.moe_fmt, g_c, g_s, nullptr, L.gate_scale2[static_cast<std::size_t>(e)],
+        elastic_linear_f32_cuda(L.gate_moe_fmt, g_c, g_s, nullptr, L.gate_scale2.at(static_cast<std::size_t>(e)),
                                 impl_->d_cur.f32(), impl_->d_ff_g.f32(), 1, c.expert_ffn_length, H, s);
-        elastic_linear_f32_cuda(L.moe_fmt, u_c, u_s, nullptr, L.up_scale2[static_cast<std::size_t>(e)],
+        elastic_linear_f32_cuda(L.up_moe_fmt, u_c, u_s, nullptr, L.up_scale2.at(static_cast<std::size_t>(e)),
                                 impl_->d_cur.f32(), impl_->d_ff_u.f32(), 1, c.expert_ffn_length, H, s);
         swiglu_mul_f32_cuda(impl_->d_ff_g.f32(), impl_->d_ff_u.f32(), impl_->d_ff_act.f32(), c.expert_ffn_length, s);
-        elastic_linear_f32_cuda(L.moe_fmt, d_c, d_s, nullptr, L.down_scale2[static_cast<std::size_t>(e)],
+        elastic_linear_f32_cuda(L.down_moe_fmt, d_c, d_s, nullptr, L.down_scale2.at(static_cast<std::size_t>(e)),
                                 impl_->d_ff_act.f32(), impl_->d_e_out.f32(), 1, H, c.expert_ffn_length, s);
       }
       axpy_f32_cuda(impl_->d_block_out.f32(), impl_->d_e_out.f32(), w, H, s);

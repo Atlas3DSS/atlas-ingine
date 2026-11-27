@@ -1,10 +1,24 @@
 #include "backends/qwen4exp/qwen4exp_config.h"
 
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
 namespace ingine::backends::qwen4exp {
+
+namespace {
+
+std::int64_t checked_mul_pos_i32(int a, int b, const char* what) {
+  const std::int64_t prod = static_cast<std::int64_t>(a) * static_cast<std::int64_t>(b);
+  if (prod <= 0 || prod > std::numeric_limits<int>::max()) {
+    throw std::invalid_argument(std::string("Qwen4ExpConfig: integer overflow in ") + what);
+  }
+  return prod;
+}
+
+}  // namespace
 
 const char* to_string(Qwen4ExpLayerKind kind) noexcept {
   switch (kind) {
@@ -30,9 +44,15 @@ void Qwen4ExpConfig::finalize_and_validate() {
   if (hc_mult <= 0 || hc_low_rank <= 0) {
     throw std::invalid_argument("Qwen4ExpConfig: hyper_connection count and low_rank must be positive");
   }
+  (void)checked_mul_pos_i32(hc_mult, hidden_size, "hc_dim");
   if (num_attention_heads <= 0 || num_key_value_heads <= 0 || head_dim <= 0) {
     throw std::invalid_argument("Qwen4ExpConfig: invalid full-attention dimensions");
   }
+  const std::int64_t attn_dim = checked_mul_pos_i32(num_attention_heads, head_dim, "num_attention_heads * head_dim");
+  if (attn_dim > std::numeric_limits<int>::max() / 2) {
+    throw std::invalid_argument("Qwen4ExpConfig: integer overflow in full_q_out_dim");
+  }
+  (void)checked_mul_pos_i32(num_key_value_heads, head_dim, "full_kv_out_dim");
   if (num_attention_heads % num_key_value_heads != 0) {
     throw std::invalid_argument("Qwen4ExpConfig: num_attention_heads must be divisible by num_key_value_heads");
   }
@@ -48,7 +68,12 @@ void Qwen4ExpConfig::finalize_and_validate() {
   if (ssm_time_step_rank % ssm_group_count != 0) {
     throw std::invalid_argument("Qwen4ExpConfig: ssm_time_step_rank must be divisible by ssm_group_count");
   }
-  if (ssm_inner_size != ssm_time_step_rank * ssm_state_size) {
+  const std::int64_t gdn_k = checked_mul_pos_i32(ssm_group_count, ssm_state_size, "gdn_key_dim");
+  const std::int64_t gdn_v = checked_mul_pos_i32(ssm_time_step_rank, ssm_state_size, "gdn_value_dim");
+  if (gdn_k * 2 + gdn_v > std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("Qwen4ExpConfig: integer overflow in gdn_conv_dim");
+  }
+  if (static_cast<std::int64_t>(ssm_inner_size) != gdn_v) {
     throw std::invalid_argument("Qwen4ExpConfig: ssm_inner_size must equal ssm_time_step_rank * ssm_state_size");
   }
   if (expert_count <= 0 || expert_used_count <= 0 || expert_used_count > expert_count || expert_ffn_length <= 0) {
@@ -98,6 +123,7 @@ void Qwen4ExpConfig::finalize_and_validate() {
       if (indexer_head_count <= 0 || indexer_key_length <= 0 || indexer_top_k <= 0 || rotary_dim > indexer_key_length) {
         throw std::invalid_argument("Qwen4ExpConfig: QSA compress_ratio > 0 requires valid indexer dimensions");
       }
+      (void)checked_mul_pos_i32(indexer_head_count, indexer_key_length, "indexer_head_count * indexer_key_length");
     }
   }
 
@@ -117,7 +143,7 @@ void Qwen4ExpConfig::finalize_and_validate() {
     if (n_heads <= 0 || n_heads > 64) {
       throw std::invalid_argument("Qwen4ExpConfig: ple_n_heads out of range [1, 64]");
     }
-    if (n_heads * ple_head_dim != hidden_size) {
+    if (checked_mul_pos_i32(n_heads, ple_head_dim, "ple_n_heads * ple_head_dim") != hidden_size) {
       throw std::invalid_argument("Qwen4ExpConfig: ple_n_heads * ple_head_dim must equal hidden_size");
     }
     if (static_cast<int>(ple_layer_multipliers.size()) < ple_ngram_size) {

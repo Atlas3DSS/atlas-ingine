@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 #include <tuple>
 #include <unistd.h>
@@ -547,117 +548,301 @@ void write_tiny_safetensors(const std::filesystem::path& path,
   out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
 }
 
+struct StTensor {
+  std::string dtype;
+  std::vector<std::int64_t> shape;
+  std::vector<std::uint8_t> bytes;
+};
+
+struct SyntheticElasticPack {
+  std::map<std::string, StTensor> model_tensors;
+  std::vector<std::map<std::string, StTensor>> ple_chunks;
+  std::map<std::string, std::string> qlayers_json;  // prefix -> raw JSON object string
+  std::string ple_format = "nvfp4";
+  int ple_chunk_rows = 2;
+  int hidden_size = 32;
+  int expert_count = 4;
+  int expert_ffn_length = 32;
+  int shared_expert_ffn_length = 32;
+  int ple_head_dim = 16;
+
+  static std::vector<std::uint8_t> f32_bytes(std::size_t n, float v) {
+    std::vector<std::uint8_t> b(n * sizeof(float));
+    for (std::size_t i = 0; i < n; ++i) std::memcpy(b.data() + i * sizeof(float), &v, sizeof(float));
+    return b;
+  }
+
+  static std::vector<std::uint8_t> bf16_bytes(std::size_t n, float v) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const std::uint16_t h = static_cast<std::uint16_t>(bits >> 16);
+    std::vector<std::uint8_t> b(n * 2);
+    for (std::size_t i = 0; i < n; ++i) std::memcpy(b.data() + i * 2, &h, 2);
+    return b;
+  }
+
+  void add_f32(const std::string& name, std::vector<std::int64_t> shape, float val = 1.0f) {
+    std::size_t n = 1;
+    for (auto d : shape) n *= static_cast<std::size_t>(d);
+    model_tensors[name] = StTensor{"F32", std::move(shape), f32_bytes(n, val)};
+  }
+
+  void add_bf16(const std::string& name, std::vector<std::int64_t> shape, float val = 0.25f) {
+    std::size_t n = 1;
+    for (auto d : shape) n *= static_cast<std::size_t>(d);
+    model_tensors[name] = StTensor{"BF16", std::move(shape), bf16_bytes(n, val)};
+  }
+
+  void add_fp8(const std::string& prefix, int out_f, int in_f, float scale = 1.0f) {
+    model_tensors[prefix + ".weight"] =
+        StTensor{"F8_E4M3", {out_f, in_f}, std::vector<std::uint8_t>(static_cast<std::size_t>(out_f) * in_f, 0x38u)};
+    model_tensors[prefix + ".weight_scale"] = StTensor{"F32", {}, f32_bytes(1, scale)};
+    qlayers_json[prefix] = R"({"quant_algo":"FP8"})";
+  }
+
+  void add_packed_2d(const std::string& prefix, const std::string& algo, int out_f, int in_f,
+                     std::uint8_t code_fill = 0x22u, float scale2 = 0.5f) {
+    const int packed_in = (algo == "NVFP4") ? (in_f / 2) : (algo == "ATLAS3" ? (in_f * 3) / 8 : in_f / 4);
+    const int scale_in = in_f / 16;
+    model_tensors[prefix + ".weight"] = StTensor{
+        "U8", {out_f, packed_in}, std::vector<std::uint8_t>(static_cast<std::size_t>(out_f) * packed_in, code_fill)};
+    model_tensors[prefix + ".weight_scale"] = StTensor{
+        "F8_E4M3", {out_f, scale_in}, std::vector<std::uint8_t>(static_cast<std::size_t>(out_f) * scale_in, 0x38u)};
+    model_tensors[prefix + ".weight_scale_2"] = StTensor{"F32", {}, f32_bytes(1, scale2)};
+    qlayers_json[prefix] = std::string(R"({"quant_algo":")") + algo + R"(","group_size":16})";
+  }
+
+  void add_moe_3d(const std::string& prefix, const std::string& algo, int E, int out_f, int in_f) {
+    const int packed_in = (algo == "NVFP4") ? (in_f / 2) : (algo == "ATLAS3" ? (in_f * 3) / 8 : in_f / 4);
+    const int scale_in = in_f / 16;
+    model_tensors[prefix + ".weight"] =
+        StTensor{"U8",
+                 {E, out_f, packed_in},
+                 std::vector<std::uint8_t>(static_cast<std::size_t>(E) * out_f * packed_in, 0x22u)};
+    model_tensors[prefix + ".weight_scale"] =
+        StTensor{"F8_E4M3",
+                 {E, out_f, scale_in},
+                 std::vector<std::uint8_t>(static_cast<std::size_t>(E) * out_f * scale_in, 0x38u)};
+    model_tensors[prefix + ".weight_scale_2"] = StTensor{"F32", {E}, f32_bytes(static_cast<std::size_t>(E), 0.5f)};
+    qlayers_json[prefix] =
+        std::string(R"({"quant_algo":")") + algo + R"(","group_size":16,"per_expert_scale_2":true})";
+  }
+
+  static SyntheticElasticPack make_valid(bool with_ple = true, bool f32_embed = false) {
+    SyntheticElasticPack pk;
+    const int V = 4, H = 32, hc = 2, hc_dim = 64, hc_lr = 8;
+    const int E = 4, ff_e = 32, ff_s = 32;
+    const int conv_dim = 64, val_dim = 32, v_heads = 4, ssm_k = 4, ssm_state = 8;
+    const int q_dim = 128, kv_dim = 32, attn_in = 64, hd = 16, idx_h = 2, idx_d = 16;
+
+    if (f32_embed) {
+      std::vector<float> vals(static_cast<std::size_t>(V) * H);
+      for (std::size_t i = 0; i < vals.size(); ++i) vals[i] = static_cast<float>(i) * 0.25f;
+      std::vector<std::uint8_t> raw(vals.size() * sizeof(float));
+      std::memcpy(raw.data(), vals.data(), raw.size());
+      pk.model_tensors["token_embd.weight"] = StTensor{"F32", {V, H}, std::move(raw)};
+    } else {
+      pk.add_packed_2d("token_embd", "NVFP4", V, H, 0x22u, 0.5f);
+    }
+    pk.add_packed_2d("output", "NVFP4", V, H, 0x22u, 0.5f);
+    pk.add_f32("output_hc_norm.weight", {hc_dim}, 1.0f);
+    pk.add_bf16("output_hc_down.weight", {hc_lr, hc_dim}, 0.25f);
+    pk.add_f32("output_hc_up.weight", {hc_dim, hc_lr}, 0.25f);
+
+    for (int il = 0; il < 2; ++il) {
+      const std::string p = "blk." + std::to_string(il) + ".";
+      pk.add_f32(p + "hc_attn_norm.weight", {hc_dim}, 1.0f);
+      pk.add_bf16(p + "hc_attn_down.weight", {hc_lr, hc_dim});
+      pk.add_f32(p + "hc_attn_up.weight", {hc_dim, hc_lr});
+      pk.add_bf16(p + "hc_attn_inject.weight", {hc, hc_dim});
+      pk.add_f32(p + "hc_ffn_norm.weight", {hc_dim}, 1.0f);
+      pk.add_bf16(p + "hc_ffn_down.weight", {hc_lr, hc_dim});
+      pk.add_f32(p + "hc_ffn_up.weight", {hc_dim, hc_lr});
+      pk.add_bf16(p + "hc_ffn_inject.weight", {hc, hc_dim});
+
+      if (il == 0) {
+        if (with_ple) {
+          pk.add_fp8(p + "ple_key", hc_dim, H);
+          pk.add_fp8(p + "ple_value", H, H);
+          pk.add_f32(p + "ple_norm_key.weight", {hc_dim});
+          pk.add_f32(p + "ple_norm_query.weight", {hc_dim});
+          pk.add_f32(p + "ple_norm_conv.weight", {hc_dim});
+          pk.add_f32(p + "ple_conv1d.weight", {hc_dim, 4});
+        }
+        pk.add_fp8(p + "attn_qkv", conv_dim, H);
+        pk.add_fp8(p + "attn_gate", val_dim, H);
+        pk.add_bf16(p + "ssm_alpha.weight", {v_heads, H});
+        pk.add_f32(p + "ssm_beta.weight", {v_heads, H});
+        pk.add_fp8(p + "ssm_out", H, val_dim);
+        pk.add_f32(p + "ssm_conv1d.weight", {conv_dim, ssm_k});
+        pk.add_f32(p + "ssm_dt.bias", {v_heads});
+        pk.add_f32(p + "ssm_a", {v_heads}, -0.5f);
+        pk.add_f32(p + "ssm_norm.weight", {ssm_state});
+      } else {
+        pk.add_fp8(p + "attn_q", q_dim, H);
+        pk.add_fp8(p + "attn_k", kv_dim, H);
+        pk.add_fp8(p + "attn_v", kv_dim, H);
+        pk.add_fp8(p + "attn_output", H, attn_in);
+        pk.add_f32(p + "attn_q_norm.weight", {hd});
+        pk.add_f32(p + "attn_k_norm.weight", {hd});
+        pk.add_fp8(p + "indexer.q_proj", idx_h * idx_d, H);
+        pk.add_fp8(p + "indexer.k_proj", idx_d, H);
+        pk.add_f32(p + "indexer.q_norm.weight", {idx_d});
+        pk.add_f32(p + "indexer.k_norm.weight", {idx_d});
+      }
+
+      pk.add_bf16(p + "ffn_gate_inp.weight", {E, H});
+      pk.add_f32(p + "ffn_gate_inp_shexp.weight", {H});
+      if (il == 0) {
+        // Exercise NVFP4, ATLAS3, and ATLAS2 packed dense 2D weights as well as ATLAS3 routed MoE.
+        pk.add_packed_2d(p + "ffn_gate_shexp", "NVFP4", ff_s, H);
+        pk.add_packed_2d(p + "ffn_up_shexp", "ATLAS3", ff_s, H);
+        pk.add_packed_2d(p + "ffn_down_shexp", "ATLAS2", H, ff_s);
+        pk.add_moe_3d(p + "ffn_gate_exps", "ATLAS3", E, ff_e, H);
+        pk.add_moe_3d(p + "ffn_up_exps", "ATLAS3", E, ff_e, H);
+        pk.add_moe_3d(p + "ffn_down_exps", "ATLAS3", E, H, ff_e);
+      } else {
+        // Exercise FP8 shared experts + mixed NVFP4/ATLAS2/ATLAS3 routed MoE per projection.
+        pk.add_fp8(p + "ffn_gate_shexp", ff_s, H);
+        pk.add_fp8(p + "ffn_up_shexp", ff_s, H);
+        pk.add_fp8(p + "ffn_down_shexp", H, ff_s);
+        pk.add_moe_3d(p + "ffn_gate_exps", "NVFP4", E, ff_e, H);
+        pk.add_moe_3d(p + "ffn_up_exps", "ATLAS2", E, ff_e, H);
+        pk.add_moe_3d(p + "ffn_down_exps", "ATLAS3", E, H, ff_e);
+      }
+    }
+
+    if (with_ple) {
+      // Two NVFP4 PLE chunks, chunk_rows = 2, ple_head_dim = 16 (8B codes + 1B scales per row).
+      pk.ple_format = "nvfp4";
+      pk.ple_chunk_rows = 2;
+      std::map<std::string, StTensor> ch0;
+      ch0["ple.chunk_0.weight"] = StTensor{"U8", {2, 8}, std::vector<std::uint8_t>(2 * 8, 0x22u)};
+      ch0["ple.chunk_0.weight_scale"] = StTensor{"F8_E4M3", {2, 1}, std::vector<std::uint8_t>(2 * 1, 0x38u)};
+      ch0["ple.chunk_0.weight_scale_2"] = StTensor{"F32", {}, f32_bytes(1, 0.25f)};
+      std::map<std::string, StTensor> ch1;
+      ch1["ple.chunk_1.weight"] = StTensor{"U8", {2, 8}, std::vector<std::uint8_t>(2 * 8, 0xa2u)};
+      ch1["ple.chunk_1.weight_scale"] = StTensor{"F8_E4M3", {2, 1}, std::vector<std::uint8_t>(2 * 1, 0x38u)};
+      ch1["ple.chunk_1.weight_scale_2"] = StTensor{"F32", {}, f32_bytes(1, 0.5f)};
+      pk.ple_chunks.push_back(std::move(ch0));
+      pk.ple_chunks.push_back(std::move(ch1));
+    } else {
+      pk.ple_format = "external";
+    }
+    return pk;
+  }
+
+  void write_to(const std::filesystem::path& dir) const {
+    using EntryTuple = std::tuple<std::string, std::string, std::vector<std::int64_t>, std::vector<std::uint8_t>>;
+    std::vector<EntryTuple> m_entries;
+    std::map<std::string, std::string> weight_map;
+    for (const auto& [k, t] : model_tensors) {
+      m_entries.emplace_back(k, t.dtype, t.shape, t.bytes);
+      weight_map[k] = "model-00001-of-00001.safetensors";
+    }
+    write_tiny_safetensors(dir / "model-00001-of-00001.safetensors", m_entries);
+
+    for (std::size_t i = 0; i < ple_chunks.size(); ++i) {
+      const std::string fname = "ple-0000" + std::to_string(i + 1) + "-of-0000" + std::to_string(ple_chunks.size()) +
+                                ".safetensors";
+      std::vector<EntryTuple> p_entries;
+      for (const auto& [k, t] : ple_chunks[i]) {
+        p_entries.emplace_back(k, t.dtype, t.shape, t.bytes);
+        weight_map[k] = fname;
+      }
+      write_tiny_safetensors(dir / fname, p_entries);
+    }
+
+    {
+      std::ofstream cfg(dir / "config.json");
+      cfg << "{\n"
+          << "  \"model_type\": \"qwen4exp\",\n"
+          << "  \"architectures\": [\"Qwen4ExpForCausalLM\"],\n"
+          << "  \"gguf_kv\": {\n"
+          << "    \"general.architecture\": \"qwen4exp\",\n"
+          << "    \"general.name\": \"Qwen3.8-Flash-Next-SynthElastic\",\n"
+          << "    \"qwen4exp.block_count\": 2,\n"
+          << "    \"qwen4exp.embedding_length\": " << hidden_size << ",\n"
+          << "    \"qwen4exp.context_length\": 128,\n"
+          << "    \"qwen4exp.attention.layer_norm_rms_epsilon\": 1e-6,\n"
+          << "    \"qwen4exp.hyper_connection.count\": 2,\n"
+          << "    \"qwen4exp.hyper_connection.low_rank\": 8,\n"
+          << "    \"qwen4exp.full_attention_interval\": 2,\n"
+          << "    \"qwen4exp.attention.head_count\": 4,\n"
+          << "    \"qwen4exp.attention.head_count_kv\": 2,\n"
+          << "    \"qwen4exp.attention.key_length\": 16,\n"
+          << "    \"qwen4exp.attention.value_length\": 16,\n"
+          << "    \"qwen4exp.rope.dimension_count\": 8,\n"
+          << "    \"qwen4exp.rope.freq_base\": 10000000.0,\n"
+          << "    \"qwen4exp.rope.dimension_sections\": [2, 2, 0, 0],\n"
+          << "    \"qwen4exp.attention.indexer.head_count\": 2,\n"
+          << "    \"qwen4exp.attention.indexer.key_length\": 16,\n"
+          << "    \"qwen4exp.attention.indexer.top_k\": 8,\n"
+          << "    \"qwen4exp.attention.compress_ratios\": [0, 4],\n"
+          << "    \"qwen4exp.ssm.conv_kernel\": 4,\n"
+          << "    \"qwen4exp.ssm.state_size\": 8,\n"
+          << "    \"qwen4exp.ssm.group_count\": 2,\n"
+          << "    \"qwen4exp.ssm.time_step_rank\": 4,\n"
+          << "    \"qwen4exp.ssm.inner_size\": 32,\n"
+          << "    \"qwen4exp.expert_count\": " << expert_count << ",\n"
+          << "    \"qwen4exp.expert_used_count\": 2,\n"
+          << "    \"qwen4exp.expert_feed_forward_length\": " << expert_ffn_length << ",\n"
+          << "    \"qwen4exp.expert_shared_feed_forward_length\": " << shared_expert_ffn_length;
+      if (ple_format != "external") {
+        cfg << ",\n"
+            << "    \"qwen4exp.ple.layers\": [0],\n"
+            << "    \"qwen4exp.ple.ngram_size\": 2,\n"
+            << "    \"qwen4exp.ple.heads_per_ngram\": 2,\n"
+            << "    \"qwen4exp.ple.conv_kernel\": 4,\n"
+            << "    \"qwen4exp.embedding_length_per_layer_input\": " << ple_head_dim << ",\n"
+            << "    \"qwen4exp.ple.eos_token_id\": 0,\n"
+            << "    \"qwen4exp.ple.layer_multipliers\": [11, 13],\n"
+            << "    \"qwen4exp.ple.head_offsets\": [0, 2],\n"
+            << "    \"qwen4exp.ple.head_vocab_sizes\": [2, 2]";
+      }
+      cfg << "\n  }\n}\n";
+    }
+    {
+      std::ofstream idx(dir / "model.safetensors.index.json");
+      idx << "{\"metadata\":{\"total_size\":1024},\"weight_map\":{";
+      bool first = true;
+      for (const auto& [k, sf] : weight_map) {
+        if (!first) idx << ",";
+        first = false;
+        idx << "\"" << k << "\":\"" << sf << "\"";
+      }
+      idx << "}}\n";
+    }
+    {
+      std::ofstream qcfg(dir / "hf_quant_config.json");
+      qcfg << "{\n"
+           << "  \"producer\": {\"name\": \"atlas-ingine-elastic\", \"version\": \"1.0\"},\n"
+           << "  \"quantization\": {\n"
+           << "    \"quant_algo\": \"MIXED_PRECISION\",\n"
+           << "    \"quantized_layers\": {";
+      bool first = true;
+      for (const auto& [k, vj] : qlayers_json) {
+        if (!first) qcfg << ",";
+        first = false;
+        qcfg << "\"" << k << "\":" << vj;
+      }
+      qcfg << "}\n"
+           << "  },\n"
+           << "  \"atlas_elastic\": {\n"
+           << "    \"family\": \"qwen4exp\",\n"
+           << "    \"profile\": \"atlas-56g\",\n"
+           << "    \"ple\": {\"format\": \"" << ple_format << "\", \"num_shards\": " << ple_chunks.size()
+           << ", \"chunk_rows\": " << ple_chunk_rows << "}\n"
+           << "  }\n"
+           << "}\n";
+    }
+  }
+};
+
 void test_synthetic_elastic_safetensors() {
   TempDir td("elastic_st");
-  const auto f32_bytes = [](float v) {
-    std::vector<std::uint8_t> b(4);
-    std::memcpy(b.data(), &v, 4);
-    return b;
-  };
-  // E4M3FN byte 0x38 == 1.0f; E2M1 nibble 0x02 == +1.0f, 0x0a == -1.0f (packed 0xa2 -> [+1.0, -1.0]).
-  std::vector<std::uint8_t> emb_codes(4 * 16, 0x22u);  // 4 rows x H=32 (16 bytes/row), all +1.0
-  std::vector<std::uint8_t> emb_scales(4 * 2, 0x38u);  // scale=1.0
-  write_tiny_safetensors(td.path / "model-00001-of-00001.safetensors", {
-      {"token_embd.weight", "U8", {4, 16}, emb_codes},
-      {"token_embd.weight_scale", "F8_E4M3", {4, 2}, emb_scales},
-      {"token_embd.weight_scale_2", "F32", {}, f32_bytes(0.5f)},
-  });
-
-  // Two PLE shards, chunk_rows = 2, D = 32 (16 bytes codes + 2 bytes scales per row).
-  std::vector<std::uint8_t> ple0_codes(2 * 16, 0x22u);  // +1.0 * 0.25 = +0.25
-  std::vector<std::uint8_t> ple0_scales(2 * 2, 0x38u);
-  write_tiny_safetensors(td.path / "ple-00001-of-00002.safetensors", {
-      {"ple.chunk_0.weight", "U8", {2, 16}, ple0_codes},
-      {"ple.chunk_0.weight_scale", "F8_E4M3", {2, 2}, ple0_scales},
-      {"ple.chunk_0.weight_scale_2", "F32", {}, f32_bytes(0.25f)},
-  });
-  std::vector<std::uint8_t> ple1_codes(2 * 16, 0xa2u);  // alternating +1.0, -1.0 * 0.5 = +/-0.5
-  std::vector<std::uint8_t> ple1_scales(2 * 2, 0x38u);
-  write_tiny_safetensors(td.path / "ple-00002-of-00002.safetensors", {
-      {"ple.chunk_1.weight", "U8", {2, 16}, ple1_codes},
-      {"ple.chunk_1.weight_scale", "F8_E4M3", {2, 2}, ple1_scales},
-      {"ple.chunk_1.weight_scale_2", "F32", {}, f32_bytes(0.5f)},
-  });
-
-  {
-    std::ofstream cfg(td.path / "config.json");
-    cfg << R"({
-      "model_type": "qwen4exp",
-      "architectures": ["Qwen4ExpForCausalLM"],
-      "gguf_kv": {
-        "general.architecture": "qwen4exp",
-        "general.name": "Qwen3.8-Flash-Next-SynthElastic",
-        "qwen4exp.block_count": 2,
-        "qwen4exp.embedding_length": 32,
-        "qwen4exp.context_length": 128,
-        "qwen4exp.attention.layer_norm_rms_epsilon": 1e-6,
-        "qwen4exp.hyper_connection.count": 2,
-        "qwen4exp.hyper_connection.low_rank": 8,
-        "qwen4exp.full_attention_interval": 2,
-        "qwen4exp.attention.head_count": 4,
-        "qwen4exp.attention.head_count_kv": 2,
-        "qwen4exp.attention.key_length": 16,
-        "qwen4exp.attention.value_length": 16,
-        "qwen4exp.rope.dimension_count": 8,
-        "qwen4exp.rope.freq_base": 10000000.0,
-        "qwen4exp.rope.dimension_sections": [2, 2, 0, 0],
-        "qwen4exp.ssm.conv_kernel": 4,
-        "qwen4exp.ssm.state_size": 8,
-        "qwen4exp.ssm.group_count": 2,
-        "qwen4exp.ssm.time_step_rank": 4,
-        "qwen4exp.ssm.inner_size": 32,
-        "qwen4exp.expert_count": 4,
-        "qwen4exp.expert_used_count": 2,
-        "qwen4exp.expert_feed_forward_length": 32,
-        "qwen4exp.expert_shared_feed_forward_length": 32,
-        "qwen4exp.ple.layers": [0],
-        "qwen4exp.ple.ngram_size": 3,
-        "qwen4exp.ple.heads_per_ngram": 4,
-        "qwen4exp.ple.conv_kernel": 4,
-        "qwen4exp.embedding_length_per_layer_input": 4,
-        "qwen4exp.ple.eos_token_id": 0,
-        "qwen4exp.ple.layer_multipliers": [11, 13, 17],
-        "qwen4exp.ple.head_offsets": [0, 1, 2, 3, 4, 5, 6, 7],
-        "qwen4exp.ple.head_vocab_sizes": [2, 2, 2, 2, 2, 2, 2, 2]
-      }
-    })";
-  }
-  {
-    std::ofstream idx(td.path / "model.safetensors.index.json");
-    idx << R"({
-      "metadata": {"total_size": 1024},
-      "weight_map": {
-        "token_embd.weight": "model-00001-of-00001.safetensors",
-        "token_embd.weight_scale": "model-00001-of-00001.safetensors",
-        "token_embd.weight_scale_2": "model-00001-of-00001.safetensors",
-        "ple.chunk_0.weight": "ple-00001-of-00002.safetensors",
-        "ple.chunk_0.weight_scale": "ple-00001-of-00002.safetensors",
-        "ple.chunk_0.weight_scale_2": "ple-00001-of-00002.safetensors",
-        "ple.chunk_1.weight": "ple-00002-of-00002.safetensors",
-        "ple.chunk_1.weight_scale": "ple-00002-of-00002.safetensors",
-        "ple.chunk_1.weight_scale_2": "ple-00002-of-00002.safetensors"
-      }
-    })";
-  }
-  {
-    std::ofstream qcfg(td.path / "hf_quant_config.json");
-    qcfg << R"({
-      "producer": {"name": "atlas-ingine-elastic", "version": "1.0"},
-      "quantization": {
-        "quant_algo": "MIXED_PRECISION",
-        "quantized_layers": {
-          "token_embd": {"quant_algo": "NVFP4", "group_size": 16},
-          "blk.0.ffn_gate_exps": {"quant_algo": "ATLAS3", "group_size": 16},
-          "blk.1.ffn_gate_exps": {"quant_algo": "ATLAS2", "group_size": 16}
-        }
-      },
-      "atlas_elastic": {
-        "family": "qwen4exp",
-        "profile": "atlas-56g",
-        "ple": {"format": "nvfp4", "num_shards": 2, "chunk_rows": 2}
-      }
-    })";
-  }
+  const auto pk = SyntheticElasticPack::make_valid(/*with_ple=*/true, /*f32_embed=*/false);
+  pk.write_to(td.path);
 
   CHECK(detect_checkpoint_format(td.path) == CheckpointFormat::Safetensors);
   CHECK(detect_model_family(td.path) == ModelFamily::Qwen4Exp);
@@ -669,24 +854,62 @@ void test_synthetic_elastic_safetensors() {
   CHECK(eset.config().is_ple(0));
   CHECK(eset.layer_kind("token_embd") == ElasticTensorKind::Nvfp4);
   CHECK(eset.layer_kind("blk.0.ffn_gate_exps") == ElasticTensorKind::Atlas3);
-  CHECK(eset.layer_kind("blk.1.ffn_gate_exps") == ElasticTensorKind::Atlas2);
+  CHECK(eset.layer_kind("blk.1.ffn_gate_exps") == ElasticTensorKind::Nvfp4);
+  CHECK(eset.layer_kind("blk.1.ffn_up_exps") == ElasticTensorKind::Atlas2);
+  CHECK(eset.layer_kind("blk.1.ffn_down_exps") == ElasticTensorKind::Atlas3);
 
-  std::vector<float> row(32, 0.0f);
-  eset.read_embed_row_f32(2, row);
-  for (float v : row) CHECK(std::fabs(v - 0.5f) < 1e-6f);
+  // Verify exact validated dense & MoE layout descriptors.
+  {
+    const auto d_nvfp4 = eset.validate_dense_linear("blk.0.ffn_gate_shexp.weight", 32, 32);
+    CHECK(d_nvfp4.kind == ElasticTensorKind::Nvfp4 && d_nvfp4.expected_weight_bytes == 32 * 16 &&
+          d_nvfp4.expected_scale_bytes == 32 * 2);
+    const auto d_a3 = eset.validate_dense_linear("blk.0.ffn_up_shexp.weight", 32, 32);
+    CHECK(d_a3.kind == ElasticTensorKind::Atlas3 && d_a3.expected_weight_bytes == 32 * 12 &&
+          d_a3.expected_scale_bytes == 32 * 2);
+    const auto d_a2 = eset.validate_dense_linear("blk.0.ffn_down_shexp.weight", 32, 32);
+    CHECK(d_a2.kind == ElasticTensorKind::Atlas2 && d_a2.expected_weight_bytes == 32 * 8 &&
+          d_a2.expected_scale_bytes == 32 * 2);
+    const auto d_bf16 = eset.validate_dense_linear("blk.0.ffn_gate_inp.weight", 4, 32);
+    CHECK(d_bf16.kind == ElasticTensorKind::Bf16 && d_bf16.expected_weight_bytes == 4 * 32 * 2);
+    const auto d_f32 = eset.validate_dense_linear("blk.0.ssm_beta.weight", 4, 32);
+    CHECK(d_f32.kind == ElasticTensorKind::F32 && d_f32.expected_weight_bytes == 4 * 32 * 4);
+    const auto d_fp8 = eset.validate_dense_linear("blk.0.attn_qkv.weight", 64, 32);
+    CHECK(d_fp8.kind == ElasticTensorKind::Fp8 && d_fp8.expected_weight_bytes == 64 * 32);
 
-  eset.read_ple_row_f32(1, row);  // chunk 0 -> all +0.25
-  for (float v : row) CHECK(std::fabs(v - 0.25f) < 1e-6f);
+    const auto m_a3 = eset.validate_moe_experts("blk.0.ffn_gate_exps", 4, 32, 32);
+    CHECK(m_a3.kind == ElasticTensorKind::Atlas3 && m_a3.per_expert_code_bytes == 32 * 12 &&
+          m_a3.per_expert_scale_bytes == 32 * 2);
+    const auto m_a2 = eset.validate_moe_experts("blk.1.ffn_up_exps", 4, 32, 32);
+    CHECK(m_a2.kind == ElasticTensorKind::Atlas2 && m_a2.per_expert_code_bytes == 32 * 8 &&
+          m_a2.per_expert_scale_bytes == 32 * 2);
 
-  eset.read_ple_row_f32(3, row);  // chunk 1 -> alternating +0.5, -0.5
-  for (std::size_t i = 0; i < row.size(); ++i) {
-    CHECK(std::fabs(row[i] - ((i % 2 == 0) ? 0.5f : -0.5f)) < 1e-6f);
+    // Caller dimension mismatches on an otherwise valid pack must throw fail-closed!
+    CHECK_THROWS(eset.validate_dense_linear("blk.0.ffn_gate_shexp.weight", 16, 32));
+    CHECK_THROWS(eset.validate_dense_linear("blk.0.ffn_gate_shexp.weight", 32, 64));
+    CHECK_THROWS(eset.validate_dense_linear("blk.0.attn_qkv.weight", 32, 32));
+    CHECK_THROWS(eset.validate_dense_linear("blk.0.ffn_gate_inp.weight", 8, 32));
+    CHECK_THROWS(eset.validate_moe_experts("blk.0.ffn_gate_exps", 8, 32, 32));
+    CHECK_THROWS(eset.validate_moe_experts("blk.0.ffn_gate_exps", 4, 16, 32));
+    CHECK_THROWS(eset.validate_moe_experts("blk.0.ffn_down_exps", 4, 32, 16));
+  }
+
+  std::vector<float> emb_row(32, 0.0f);
+  eset.read_embed_row_f32(2, emb_row);
+  for (float v : emb_row) CHECK(std::fabs(v - 0.5f) < 1e-6f);
+
+  std::vector<float> ple_row(16, 0.0f);
+  eset.read_ple_row_f32(1, ple_row);  // chunk 0 -> all +0.25
+  for (float v : ple_row) CHECK(std::fabs(v - 0.25f) < 1e-6f);
+
+  eset.read_ple_row_f32(3, ple_row);  // chunk 1 -> alternating +0.5, -0.5
+  for (std::size_t i = 0; i < ple_row.size(); ++i) {
+    CHECK(std::fabs(ple_row[i] - ((i % 2 == 0) ? 0.5f : -0.5f)) < 1e-6f);
   }
 
   // Out-of-bounds row / dimension reads must throw fail-closed.
-  CHECK_THROWS(eset.read_embed_row_f32(4, row));
-  CHECK_THROWS(eset.read_ple_row_f32(4, row));
-  std::vector<float> bad_dim(16, 0.0f);
+  CHECK_THROWS(eset.read_embed_row_f32(4, emb_row));
+  CHECK_THROWS(eset.read_ple_row_f32(4, ple_row));
+  std::vector<float> bad_dim(8, 0.0f);
   CHECK_THROWS(eset.read_embed_row_f32(0, bad_dim));
   CHECK_THROWS(eset.read_ple_row_f32(0, bad_dim));
 
@@ -707,7 +930,7 @@ void test_synthetic_elastic_safetensors() {
     bad << R"({"atlas_elastic": {"family": "qwen3_5", "profile": "atlas-14g"}})";
   }
   CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
-  std::printf("PASS test_synthetic_elastic_safetensors (NVFP4 embed + multi-shard PLE + fail-closed)\n");
+  std::printf("PASS test_synthetic_elastic_safetensors (full 2-layer Elastic + multi-shard PLE + fail-closed)\n");
 }
 
 void write_raw_safetensors(const std::filesystem::path& path, std::uint64_t declared_hlen, const std::string& hdr,
@@ -888,43 +1111,235 @@ void test_elastic_safetensors_ingress_rejections() {
     CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
   }
 
-  // 10. Valid F32 pack loads cleanly and returns exact float values.
+  // 10. Valid full F32-embedding pack loads cleanly and returns exact float values.
   {
     TempDir td("el_valid_f32");
-    init_base_dir(td.path);
-    std::vector<float> vals(2 * 32);
-    for (std::size_t i = 0; i < vals.size(); ++i) vals[i] = static_cast<float>(i) * 0.25f;
-    std::vector<std::uint8_t> raw(vals.size() * sizeof(float));
-    std::memcpy(raw.data(), vals.data(), raw.size());
-    write_tiny_safetensors(td.path / "s.safetensors", {{"token_embd.weight", "F32", {2, 32}, raw}});
+    const auto pk = SyntheticElasticPack::make_valid(/*with_ple=*/false, /*f32_embed=*/true);
+    pk.write_to(td.path);
     const auto eset = Qwen4ExpElasticSet::inspect_headers(td.path);
     const auto loaded = eset.read_tensor_f32(eset.require_tensor("token_embd.weight"));
-    CHECK(loaded.size() == vals.size());
-    for (std::size_t i = 0; i < vals.size(); ++i) CHECK(loaded[i] == vals[i]);
+    CHECK(loaded.size() == 4 * 32);
+    for (std::size_t i = 0; i < loaded.size(); ++i) CHECK(loaded[i] == static_cast<float>(i) * 0.25f);
     std::vector<float> row1(32, 0.0f);
     eset.read_embed_row_f32(1, row1);
-    for (std::size_t i = 0; i < 32; ++i) CHECK(row1[i] == vals[32 + i]);
+    for (std::size_t i = 0; i < 32; ++i) CHECK(row1[i] == static_cast<float>(32 + i) * 0.25f);
   }
 
   std::printf("PASS test_elastic_safetensors_ingress_rejections (all malformed + valid F32 cases verified)\n");
 }
 
+void test_elastic_consumer_layout_rejections() {
+  auto expect_rejected = [](const char* tag, auto&& mutator) {
+    TempDir td(tag);
+    auto pk = SyntheticElasticPack::make_valid(/*with_ple=*/true, /*f32_embed=*/false);
+    mutator(pk);
+    pk.write_to(td.path);
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  };
+
+  // --- A. Dense packed upload rejections (NVFP4 / ATLAS3 / ATLAS2) ---
+  // 1. Self-consistent packed dense NVFP4 weight + scale shrunk below config [32, 32].
+  expect_rejected("el_dense_nvfp4_short_both", [](SyntheticElasticPack& pk) {
+    pk.add_packed_2d("blk.0.ffn_gate_shexp", "NVFP4", 16, 32);
+  });
+  // 2. Packed dense NVFP4 weight bytes too short while weight_scale keeps full config shape [32, 2].
+  expect_rejected("el_dense_nvfp4_short_w", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.0.ffn_gate_shexp.weight"] = StTensor{"U8", {32, 8}, std::vector<std::uint8_t>(32 * 8, 0)};
+  });
+  // 3. Packed dense NVFP4 weight_scale too short while weight keeps full config shape [32, 16].
+  expect_rejected("el_dense_nvfp4_short_s", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.0.ffn_gate_shexp.weight_scale"] =
+        StTensor{"F8_E4M3", {32, 1}, std::vector<std::uint8_t>(32 * 1, 0x38u)};
+  });
+  // 4. Packed dense ATLAS3 weight packed with ATLAS2 width [32, 8] instead of [32, 12].
+  expect_rejected("el_dense_a3_wrong_width", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.0.ffn_up_shexp.weight"] = StTensor{"U8", {32, 8}, std::vector<std::uint8_t>(32 * 8, 0)};
+  });
+  // 5. Packed dense ATLAS2 wrong weight dtype (F8_E4M3 instead of U8).
+  expect_rejected("el_dense_a2_bad_wdtype", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.0.ffn_down_shexp.weight"] =
+        StTensor{"F8_E4M3", {32, 8}, std::vector<std::uint8_t>(32 * 8, 0)};
+  });
+  // 6. Packed dense wrong scale dtype (U8 instead of F8_E4M3).
+  expect_rejected("el_dense_packed_bad_sdtype", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.0.ffn_gate_shexp.weight_scale"] =
+        StTensor{"U8", {32, 2}, std::vector<std::uint8_t>(32 * 2, 0x38u)};
+  });
+  // 7. Packed dense non-scalar weight_scale_2 (shape [2] instead of scalar).
+  expect_rejected("el_dense_packed_nonscalar_s2", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.0.ffn_gate_shexp.weight_scale_2"] =
+        StTensor{"F32", {2}, SyntheticElasticPack::f32_bytes(2, 0.5f)};
+  });
+  // 8. Packed dense ATLAS3 with in_features not divisible by 32 (in_features=16 -> hc_low_rank=8 won't work;
+  //    set shared_expert_ffn_length=16 and make ffn_down_shexp [32, 16] declared ATLAS3).
+  expect_rejected("el_dense_a3_in_not_div32", [](SyntheticElasticPack& pk) {
+    pk.shared_expert_ffn_length = 16;
+    pk.add_fp8("blk.0.ffn_gate_shexp", 16, 32);
+    pk.add_fp8("blk.0.ffn_up_shexp", 16, 32);
+    pk.add_fp8("blk.1.ffn_gate_shexp", 16, 32);
+    pk.add_fp8("blk.1.ffn_up_shexp", 16, 32);
+    pk.add_fp8("blk.1.ffn_down_shexp", 32, 16);
+    pk.model_tensors["blk.0.ffn_down_shexp.weight"] = StTensor{"U8", {32, 6}, std::vector<std::uint8_t>(32 * 6, 0)};
+    pk.model_tensors["blk.0.ffn_down_shexp.weight_scale"] =
+        StTensor{"F8_E4M3", {32, 1}, std::vector<std::uint8_t>(32, 0x38u)};
+    pk.model_tensors["blk.0.ffn_down_shexp.weight_scale_2"] =
+        StTensor{"F32", {}, SyntheticElasticPack::f32_bytes(1, 0.5f)};
+    pk.qlayers_json["blk.0.ffn_down_shexp"] = R"({"quant_algo":"ATLAS3","group_size":16})";
+  });
+
+  // --- B. Dense FP8 & fallback unquantized dtype/shape rejections ---
+  // 9. FP8 projection self-consistent but shorter than config [64, 32].
+  expect_rejected("el_dense_fp8_short", [](SyntheticElasticPack& pk) {
+    pk.add_fp8("blk.0.attn_qkv", 32, 32);
+  });
+  // 10. FP8 wrong weight dtype (U8 instead of F8_E4M3).
+  expect_rejected("el_dense_fp8_bad_dtype", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.0.attn_qkv.weight"] = StTensor{"U8", {64, 32}, std::vector<std::uint8_t>(64 * 32, 0)};
+  });
+  // 11. FP8 non-scalar weight_scale (shape [4]).
+  expect_rejected("el_dense_fp8_bad_scale", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.0.attn_qkv.weight_scale"] =
+        StTensor{"F32", {4}, SyntheticElasticPack::f32_bytes(4, 1.0f)};
+  });
+  // 12. Dense fallback MUST reject every non-F32/BF16 dtype (F16, U8, I8, F8_E4M3, I32) instead of treating as F32.
+  for (const auto& [dt, bpe] : std::vector<std::pair<const char*, std::size_t>>{
+           {"F16", 2}, {"U8", 1}, {"I8", 1}, {"F8_E4M3", 1}, {"I32", 4}}) {
+    expect_rejected("el_dense_fallback_bad_dtype", [&](SyntheticElasticPack& pk) {
+      pk.model_tensors["blk.0.ffn_gate_inp.weight"] =
+          StTensor{dt, {4, 32}, std::vector<std::uint8_t>(4 * 32 * bpe, 0)};
+    });
+  }
+  // 13. Dense unquantized weight self-consistent but wrong shape ([4, 64] instead of [8, 64]).
+  expect_rejected("el_dense_bf16_short", [](SyntheticElasticPack& pk) {
+    pk.add_bf16("blk.0.hc_attn_down.weight", {4, 64});
+  });
+  // 14. Explicit BF16 quant_algo disagrees with on-disk F32 tensor (and vice versa).
+  expect_rejected("el_dense_bf16_mismatch", [](SyntheticElasticPack& pk) {
+    pk.qlayers_json["blk.0.ssm_beta"] = R"({"quant_algo":"BF16"})";  // tensor is F32
+  });
+  expect_rejected("el_dense_f32_mismatch", [](SyntheticElasticPack& pk) {
+    pk.qlayers_json["blk.0.ssm_alpha"] = R"({"quant_algo":"F32"})";  // tensor is BF16
+  });
+  // 15. Unknown quant_algo and unsupported group_size in hf_quant_config.json.
+  expect_rejected("el_bad_quant_algo", [](SyntheticElasticPack& pk) {
+    pk.qlayers_json["blk.0.attn_qkv"] = R"({"quant_algo":"INT4"})";
+  });
+  expect_rejected("el_bad_group_size", [](SyntheticElasticPack& pk) {
+    pk.qlayers_json["blk.0.ffn_gate_shexp"] = R"({"quant_algo":"NVFP4","group_size":32})";
+  });
+  // 16. 1D/conv dense tensor short shape & invalid dtype.
+  expect_rejected("el_norm_short", [](SyntheticElasticPack& pk) {
+    pk.add_f32("blk.0.hc_attn_norm.weight", {32});
+  });
+  expect_rejected("el_conv_short", [](SyntheticElasticPack& pk) {
+    pk.add_f32("blk.0.ssm_conv1d.weight", {32, 4});
+  });
+  expect_rejected("el_norm_bad_dtype", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.0.hc_attn_norm.weight"] = StTensor{"U8", {64}, std::vector<std::uint8_t>(64, 0)};
+  });
+
+  // --- C. Routed MoE gate/up/down rejections (self-consistent spans too short or mismatched for config) ---
+  // 17. Too few expert scale_2 entries ([2] instead of [4]) on EACH of gate, up, and down projections.
+  for (const char* proj : {"blk.0.ffn_gate_exps", "blk.0.ffn_up_exps", "blk.0.ffn_down_exps"}) {
+    expect_rejected("el_moe_short_scale2", [&](SyntheticElasticPack& pk) {
+      pk.model_tensors[std::string(proj) + ".weight_scale_2"] =
+          StTensor{"F32", {2}, SyntheticElasticPack::f32_bytes(2, 0.5f)};
+    });
+  }
+  // 18. Mutually self-consistent MoE tensors with too few experts (2 instead of config expert_count=4).
+  for (const char* proj : {"blk.0.ffn_gate_exps", "blk.0.ffn_up_exps", "blk.0.ffn_down_exps"}) {
+    expect_rejected("el_moe_few_experts", [&](SyntheticElasticPack& pk) {
+      pk.add_moe_3d(proj, "ATLAS3", /*E=*/2, 32, 32);
+    });
+  }
+  // 19. Self-consistent MoE tensors with too short out_features (16 instead of 32) on gate, up, and down.
+  for (const char* proj : {"blk.0.ffn_gate_exps", "blk.0.ffn_up_exps", "blk.0.ffn_down_exps"}) {
+    expect_rejected("el_moe_short_out", [&](SyntheticElasticPack& pk) {
+      pk.add_moe_3d(proj, "ATLAS3", /*E=*/4, /*out_f=*/16, /*in_f=*/32);
+    });
+  }
+  // 20. Packed code span too short for declared format (ATLAS2 width 8 packed under declared NVFP4/ATLAS3) on gate/up/down.
+  for (const char* proj : {"blk.0.ffn_gate_exps", "blk.0.ffn_up_exps", "blk.0.ffn_down_exps"}) {
+    expect_rejected("el_moe_short_packed", [&](SyntheticElasticPack& pk) {
+      pk.model_tensors[std::string(proj) + ".weight"] =
+          StTensor{"U8", {4, 32, 8}, std::vector<std::uint8_t>(4 * 32 * 8, 0)};
+    });
+  }
+  // 21. MoE weight_scale inner dim too short ([4, 32, 1] instead of [4, 32, 2]).
+  expect_rejected("el_moe_short_scale", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.1.ffn_gate_exps.weight_scale"] =
+        StTensor{"F8_E4M3", {4, 32, 1}, std::vector<std::uint8_t>(4 * 32, 0x38u)};
+  });
+  // 22. MoE wrong dtypes on weight, weight_scale, and weight_scale_2.
+  expect_rejected("el_moe_bad_wdtype", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.1.ffn_gate_exps.weight"] =
+        StTensor{"F8_E4M3", {4, 32, 16}, std::vector<std::uint8_t>(4 * 32 * 16, 0)};
+  });
+  expect_rejected("el_moe_bad_sdtype", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.1.ffn_gate_exps.weight_scale"] =
+        StTensor{"U8", {4, 32, 2}, std::vector<std::uint8_t>(4 * 32 * 2, 0x38u)};
+  });
+  expect_rejected("el_moe_bad_s2dtype", [](SyntheticElasticPack& pk) {
+    pk.model_tensors["blk.1.ffn_gate_exps.weight_scale_2"] = StTensor{"U8", {4}, std::vector<std::uint8_t>(4, 1)};
+  });
+  // 23. Missing or non-codebook quant_algo on ffn_down_exps / ffn_up_exps (even when ffn_gate_exps is valid).
+  expect_rejected("el_moe_missing_algo", [](SyntheticElasticPack& pk) {
+    pk.qlayers_json.erase("blk.0.ffn_down_exps");
+  });
+  expect_rejected("el_moe_fp8_algo", [](SyntheticElasticPack& pk) {
+    pk.qlayers_json["blk.0.ffn_up_exps"] = R"({"quant_algo":"FP8"})";
+  });
+  expect_rejected("el_moe_f32_algo", [](SyntheticElasticPack& pk) {
+    pk.qlayers_json["blk.0.ffn_down_exps"] = R"({"quant_algo":"F32"})";
+  });
+
+  // --- D. Embedded PLE chunk layout rejections ---
+  // 24. PLE chunk width disagrees with ple_head_dim=16 (shape [2, 16] instead of [2, 8]).
+  expect_rejected("el_ple_bad_width", [](SyntheticElasticPack& pk) {
+    pk.ple_chunks[0]["ple.chunk_0.weight"] = StTensor{"U8", {2, 16}, std::vector<std::uint8_t>(2 * 16, 0x22u)};
+    pk.ple_chunks[0]["ple.chunk_0.weight_scale"] = StTensor{"F8_E4M3", {2, 2}, std::vector<std::uint8_t>(2 * 2, 0x38u)};
+  });
+  // 25. Embedded PLE row count too short to cover ple_head_offsets + ple_head_vocab_sizes (2 rows < 4 required).
+  expect_rejected("el_ple_short_rows", [](SyntheticElasticPack& pk) {
+    pk.ple_chunks.resize(1);
+  });
+  // 26. token_embd declared as ATLAS3 (read_embed_row_f32 supports F32/BF16/FP8/NVFP4 only).
+  expect_rejected("el_embed_atlas3", [](SyntheticElasticPack& pk) {
+    pk.add_packed_2d("token_embd", "ATLAS3", 4, 32);
+  });
+  // 27. PLE format == external with non-zero num_shards.
+  expect_rejected("el_ple_ext_nonzero", [](SyntheticElasticPack& pk) {
+    pk.ple_format = "external";  // ple_chunks still has 2 entries -> num_shards=2
+  });
+
+  std::printf("PASS test_elastic_consumer_layout_rejections (27 dense/MoE/PLE consumer layout rejection cases)\n");
+}
+
 void test_real_quincy_elastic_packs() {
+  int checked = 0;
   for (const char* p : {
            "/mnt/storage16tb/models/Qwen3.8-Flash-Next-atlas-70g-ingine",
            "/mnt/storage16tb/models/Qwen3.8-Flash-Next-atlas-56g-ingine",
+           "/mnt/storage16tb/models/Qwen3.8-Flash-Next-atlas-42g-ingine",
        }) {
     const std::filesystem::path dir(p);
     if (!Qwen4ExpElasticSet::is_elastic_dir(dir)) {
       std::printf("SKIP test_real_quincy_elastic_packs (%s not present)\n", p);
-      return;
+      continue;
     }
     const auto eset = Qwen4ExpElasticSet::inspect_headers(dir);
-    CHECK(eset.config().num_hidden_layers == 48);
-    CHECK(eset.config().hidden_size == 2560);
-    CHECK(eset.config().vocab_size == 248320);
+    const auto& c = eset.config();
+    CHECK(c.num_hidden_layers == 48);
+    CHECK(c.hidden_size == 2560);
+    CHECK(c.vocab_size == 248320);
+    CHECK(c.expert_count == 512 && c.expert_ffn_length == 640);
     CHECK(eset.has_embedded_ple());
-    std::vector<float> emb(static_cast<std::size_t>(eset.config().hidden_size), 0.0f);
+    // Spot-check validated expert layouts on boundary (L0) and core (L4) layers.
+    const auto g0 = eset.validate_moe_experts("blk.0.ffn_gate_exps", c.expert_count, c.expert_ffn_length, c.hidden_size);
+    const auto d4 = eset.validate_moe_experts("blk.4.ffn_down_exps", c.expert_count, c.hidden_size, c.expert_ffn_length);
+    CHECK(g0.per_expert_code_bytes > 0 && g0.per_expert_scale_bytes == static_cast<std::uint64_t>(c.expert_ffn_length) * (c.hidden_size / 16));
+    CHECK(d4.per_expert_code_bytes > 0 && d4.per_expert_scale_bytes == static_cast<std::uint64_t>(c.hidden_size) * (c.expert_ffn_length / 16));
+    std::vector<float> emb(static_cast<std::size_t>(c.hidden_size), 0.0f);
     eset.read_embed_row_f32(760, emb);
     double l2 = 0.0;
     for (float v : emb) {
@@ -932,14 +1347,18 @@ void test_real_quincy_elastic_packs() {
       l2 += double(v) * double(v);
     }
     CHECK(l2 > 0.0);
-    std::vector<float> ple(static_cast<std::size_t>(eset.config().ple_head_dim), 0.0f);
+    std::vector<float> ple(static_cast<std::size_t>(c.ple_head_dim), 0.0f);
     eset.read_ple_row_f32(0, ple);
     for (float v : ple) CHECK(std::isfinite(v));
+    ++checked;
     std::printf("  real elastic pack OK: %s (profile=%s, shards=%u, total_bytes=%llu, emb_l2=%.4f)\n", p,
                 eset.profile().c_str(), eset.identity().shard_count,
                 static_cast<unsigned long long>(eset.total_tensor_bytes()), std::sqrt(l2));
   }
-  std::printf("PASS test_real_quincy_elastic_packs (130-shard atlas-70g & atlas-56g validated)\n");
+  if (checked > 0) {
+    std::printf("PASS test_real_quincy_elastic_packs (%d real 130-shard packs passed full 48-layer schema validation)\n",
+                checked);
+  }
 }
 
 }  // namespace
@@ -948,6 +1367,7 @@ int main() {
   test_family_and_synthetic_gguf();
   test_synthetic_elastic_safetensors();
   test_elastic_safetensors_ingress_rejections();
+  test_elastic_consumer_layout_rejections();
   test_ggml_dequantizers();
   test_ple_hash_and_eos_semantics();
   test_qsa_dense_and_sparse();
