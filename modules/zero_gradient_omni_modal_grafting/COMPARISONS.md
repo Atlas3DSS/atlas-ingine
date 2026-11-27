@@ -39,6 +39,12 @@ Every contact sheet below is a **byte-identical, SHA-256-verified** side-by-side
 ### Qwen-Image-2.1 Base (`98.80%` SigLIP2 Retention, zero `Qwen3-VL-8B` loaded, `16.33 GB` peak VRAM)
 ![Qwen-Image-2.1 Base Blackwell side-by-side](figures/comparisons/waveA_qwen_image_21_base_blackwell.png)
 
+### FLUX.3-Image-Klein Turbo (`97.33%` SigLIP2 Retention, `16` steps CFG `1.0`, zero `Qwen3-VL-4B` loaded, `12.01 GB` peak VRAM)
+![FLUX.3-Image-Klein Turbo Blackwell side-by-side](figures/comparisons/waveA_flux3_image_klein_turbo_blackwell.png)
+
+### FLUX.3-Image-Klein Base (`99.02%` SigLIP2 Retention, `50` steps CFG `3.5`, zero `Qwen3-VL-4B` loaded, `11.99 GB` peak VRAM)
+![FLUX.3-Image-Klein Base Blackwell side-by-side](figures/comparisons/waveA_flux3_image_klein_base_blackwell.png)
+
 ---
 
 ## 3. Wave B — Universal Image Models on Blackwell (Dev-24 & Sealed Confirm-160 Word Bar)
@@ -83,3 +89,13 @@ Top row (`LEDGER-OFF`) suffers catastrophic forgetting (`"LAWCHTE SKOROAFAIT GIE
 `Inkling-2-Mini-atlas-12g` (`--persona-probe-mode`): **Arm A (Constitution Only)** breached `22 / 40` (`55.0%`), **Arm B (Host Verified Ledger)** committed `0 / 40` (`0.0%`) with `10 / 10` (`100.0%`) benign utility and `3 / 3` `/v1/probe` `d=2027` HTTP `400` anti-oracle rejections, with live `7`-visit MoE expert routing telemetry stored directly on the hash-chained SQLite ledger.
 
 ![Zero-Chrome Neuron Lens x Verified Ledger UX](adversarial_ledger_proof/live_results_v2/zero_chrome_neuron_lens_ux_preview.png)
+
+---
+
+## 6. Flagship Showcase 1 — Omni-Inkling Musical Savant Anthem v5 (`88.75 s`, Zero `Qwen3-VL-32B`, Verified Ledger Music Gate PASS)
+
+Rendered end-to-end on Colab `G4-4` Blackwell (`2188.56 s`, `2,130` frames @ `24 fps`, `1024×576`, `48 kHz` stereo AAC, `zero_qwen_loaded = true`, `7/7` trace-audit stages `errors = []`) driven purely by the frozen `90.0 MiB` `Inkling-2-Mini` `concat4` Plato's Key (`cca1e5bc...`). Delivered MP4 passed the Host-Enforced Verified Ledger Music Gate (`K:Bb 3/4 74 BPM`, `72/72` bars exact, `96.83%` diatonic, delivered audio `Bb_major r = 0.78267`, `Bb - Dm = +0.02547`, `duration_ratio_err = 0.0137`, `rms = 0.1660`, `all_finite = true`; `1:1` climax crop audit `4/4 [OK]`, `score = 0.8611`; honest note: the intentional black theater stage backdrop pushes `crushed_black_frac` to `0.197–0.556` above the default `0.20` daylight threshold).
+
+![Showcase 1 Flagship Anthem v5 QA Contact Sheet](figures/comparisons/showcase1_anthem_v5_qa_contact_sheet.png)
+
+![Showcase 1 Flagship Anthem v5 7-Segment Continuity Strip](figures/comparisons/showcase1_anthem_v5_7seg_strip.png)

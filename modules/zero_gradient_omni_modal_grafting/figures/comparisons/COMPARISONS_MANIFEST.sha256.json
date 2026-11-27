@@ -1,5 +1,5 @@
 {
-  "count": 18,
+  "count": 22,
   "files": [
     {
       "file": "multidonor_qwen38_h3_confirm160_8domains.png",
@@ -108,6 +108,30 @@
       "bytes": 1483054,
       "sha256": "bce10a08747ecf34b7d434021b695ba1e1318eedd7e8362dd2b1a040199c1f8d",
       "source": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_runs/turnaround_360_v4/qa_contact_sheet_360_turnaround.png"
+    },
+    {
+      "file": "showcase1_anthem_v5_qa_contact_sheet.png",
+      "bytes": 681229,
+      "sha256": "eb2267591c424bc42f4d66cc38b11e8e451949122c588853504d8fc0a67e451b",
+      "source": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_runs/national_anthem_v5/qa_contact_sheet_national_anthem.png"
+    },
+    {
+      "file": "showcase1_anthem_v5_7seg_strip.png",
+      "bytes": 793499,
+      "sha256": "8773f48a0c0729c956274dcf829bc4a3dba7ad000ff80f79453111edb62a0a88",
+      "source": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_runs/national_anthem_v5/verified_ledger_delivery_audit/anthem_v5_7seg_strip.png"
+    },
+    {
+      "file": "waveA_flux3_image_klein_turbo_blackwell.png",
+      "bytes": 2838610,
+      "sha256": "ea601a1ccdd0d6a9ee0c2d28a91add15c34991474112001455ea786b45d1ef3d",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_a/blackwell_out/flux3_image_klein/qa_contact_sheet_flux3_image_klein_turbo.png"
+    },
+    {
+      "file": "waveA_flux3_image_klein_base_blackwell.png",
+      "bytes": 2818825,
+      "sha256": "0b2e8d1b83aaf93d17fe4a53504044a2a62f940c78deb193ff4d18d8cca99d37",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_a/blackwell_out/flux3_image_klein/qa_contact_sheet_flux3_image_klein_base.png"
     }
   ]
 }
