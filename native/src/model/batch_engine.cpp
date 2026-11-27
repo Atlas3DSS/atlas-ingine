@@ -31,7 +31,6 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
-#include <filesystem>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -1194,22 +1193,21 @@ class BatchGenerator final : public Generator {
       throw std::invalid_argument("continuous batching (--max-batch > 1) supports BF16 or --kv-fp8 KV cache (not --kv-q4/--kv-paged)");
     if (options.offload_vram_mb > 0)
       throw std::invalid_argument("continuous batching (--max-batch > 1) requires resident weights (not --offload-vram-mb/--atlas-6g)");
+    if (options.vram_limit_mb > 0 && is_gguf_model(options.model_dir))
+      throw std::invalid_argument(
+          "BatchGenerator: --vram-limit-mb is not supported for GGUF models (leave --vram-limit-mb 0)");
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     std::size_t total_b = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_at_entry_, &total_b));
     if (options.vram_limit_mb > 0) {
+      // Preflight weights peak BEFORE allocating a single byte on GPU (header-only safetensors scan).
+      SafetensorsModel hdr(options.model_dir);
       std::size_t non_vision_bytes = 0;
-      if (is_gguf_model(options.model_dir)) {
-        non_vision_bytes = std::size_t(std::filesystem::file_size(gguf_model_file(options.model_dir)));
-      } else {
-        // Preflight weights peak BEFORE allocating a single byte on GPU (header-only safetensors scan).
-        SafetensorsModel hdr(options.model_dir);
-        for (const auto& f : hdr.files()) {
-          for (const auto& t : f->tensors()) {
-            const bool is_vis =
-                (t.name.rfind("vision", 0) == 0 || t.name.rfind("visual", 0) == 0 || t.name.rfind("model.visual", 0) == 0);
-            if (!is_vis || options.vision) non_vision_bytes += std::size_t(t.bytes);
-          }
+      for (const auto& f : hdr.files()) {
+        for (const auto& t : f->tensors()) {
+          const bool is_vis =
+              (t.name.rfind("vision", 0) == 0 || t.name.rfind("visual", 0) == 0 || t.name.rfind("model.visual", 0) == 0);
+          if (!is_vis || options.vision) non_vision_bytes += std::size_t(t.bytes);
         }
       }
       const std::size_t cap = std::size_t(options.vram_limit_mb) << 20;
@@ -1242,6 +1240,18 @@ class BatchGenerator final : public Generator {
       throw std::invalid_argument("continuous batching (--max-batch > 1) supports BF16 or --kv-fp8 KV cache (not --kv-q4/--kv-paged)");
     if (options.offload_vram_mb > 0)
       throw std::invalid_argument("continuous batching (--max-batch > 1) requires resident weights (not --offload-vram-mb/--atlas-6g)");
+    if (options.vram_limit_mb > 0) {
+      bool is_gguf = is_gguf_model(options.model_dir);
+      for (const Layer& layer : weights_.layers) {
+        if (static_cast<int>(layer.experts.w13_fmt) > 5 || static_cast<int>(layer.experts.w2_fmt) > 5) {
+          is_gguf = true;
+          break;
+        }
+      }
+      if (is_gguf)
+        throw std::invalid_argument(
+            "BatchGenerator: --vram-limit-mb is not supported for GGUF models (leave --vram-limit-mb 0)");
+    }
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     std::size_t total_b = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_at_entry_, &total_b));

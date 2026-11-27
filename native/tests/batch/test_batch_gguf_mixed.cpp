@@ -352,6 +352,30 @@ int main(int argc, char** argv) {
       rejected_dir = true;
     }
     check(rejected_dir, "Suite 2a: make_generator(options) rejects TP1 GGUF max_batch=1 before load");
+
+    std::size_t free_before = 0, total_before = 0;
+    INGINE_TEST_CUDA(cudaMemGetInfo(&free_before, &total_before));
+    RuntimeOptions opts_cap;
+    opts_cap.model_dir = gguf_dir;
+    opts_cap.dense_fp8 = false;
+    opts_cap.max_ctx = 4096;
+    opts_cap.kv_fp8 = true;
+    opts_cap.max_batch = 2;
+    opts_cap.vram_limit_mb = 15360;
+    bool rejected_cap = false;
+    try {
+      auto g = make_generator(opts_cap);
+      (void)g;
+    } catch (const std::invalid_argument& e) {
+      std::printf("  caught expected capped GGUF rejection (--vram-limit-mb 15360): %s\n", e.what());
+      rejected_cap = (std::string(e.what()).find("--vram-limit-mb") != std::string::npos);
+    }
+    std::size_t free_after = 0, total_after = 0;
+    INGINE_TEST_CUDA(cudaMemGetInfo(&free_after, &total_after));
+    const std::size_t delta_b = free_before > free_after ? (free_before - free_after) : 0;
+    std::printf("  capped GGUF pre-load VRAM delta: %.2f MiB\n", double(delta_b) / (1024.0 * 1024.0));
+    check(rejected_cap && delta_b < (64ull << 20),
+          "Suite 2d: make_generator(options) rejects capped TP1 batched GGUF (--vram-limit-mb 15360) before load_weights");
   }
 
   const auto fmt = ingine::text::ChatFormat::load(gguf_dir);
@@ -490,6 +514,29 @@ int main(int argc, char** argv) {
         rejected_w = true;
       }
       check(rejected_w, "Suite 2c: make_generator(options, weights, ablation) rejects TP1 GGUF max_batch=1");
+
+      Weights w_check2;
+      Layer l0_cap;
+      l0_cap.experts.w13_fmt = ExpertFormat::GGUF_Q5L;
+      l0_cap.experts.w2_fmt = ExpertFormat::GGUF_IQ4;
+      w_check2.layers.push_back(std::move(l0_cap));
+      RuntimeOptions opts_cap_w;
+      opts_cap_w.model_dir = gguf_dir;
+      opts_cap_w.dense_fp8 = false;
+      opts_cap_w.max_ctx = 512;
+      opts_cap_w.kv_fp8 = true;
+      opts_cap_w.max_batch = 2;
+      opts_cap_w.vram_limit_mb = 15360;
+      bool rejected_cap_w = false;
+      try {
+        auto g = make_generator(opts_cap_w, std::move(w_check2), Ablation{});
+        (void)g;
+      } catch (const std::invalid_argument& e) {
+        std::printf("  caught expected capped make_generator(weights) rejection: %s\n", e.what());
+        rejected_cap_w = (std::string(e.what()).find("--vram-limit-mb") != std::string::npos);
+      }
+      check(rejected_cap_w,
+            "Suite 2e: make_generator(options, weights, ablation) rejects capped TP1 batched GGUF (--vram-limit-mb 15360)");
     }
 
     // Run real BatchGenerator (max_batch=2) on the mixed-format Weights (both B=1 and concurrent B=2)!
