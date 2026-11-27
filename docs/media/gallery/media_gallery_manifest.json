@@ -643,7 +643,7 @@
       "kind": "video",
       "hardware": "RTX PRO 6000 Blackwell Server Edition (7 segments, stitched on CPU)",
       "model": "MiniMax-H3 Ref2VA video with YuE2 48 kHz singing, conditioned by the Inkling-2-Mini Plato's Key (concat4)",
-      "caption": "The pass is for the music check on the delivered file (key, metre and bar count) and the run's hash-chained trace. A separate automatic frame check, with thresholds set for daylight scenes, passed 0 of 7 sampled frames of this dark stage scene.",
+      "caption": "The pass is for the music check on the delivered file (key, metre and bar count) and the run's hash-chained trace. A separate automatic frame check passed 0 of 7 sampled frames: 6 exceeded its limit on dark areas, which is set for daylight scenes, and 6 exceeded its limit on directional banding in close crops.",
       "metrics": [
         {
           "label": "Length",
