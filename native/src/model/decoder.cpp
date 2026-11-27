@@ -58,6 +58,12 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, Loo
       loopcd_omega_(loopcd_omega),
       attn_ws_(attn::workspace_bytes(8)),
       moe_down_ws_(std::max<std::size_t>(std::size_t(8) * TOP_K * HIDDEN * 2, moe::kDp4aScratchBytes)) {
+  for (const Layer& layer : w_.layers) {
+    if (static_cast<int>(layer.experts.w13_fmt) > 5 || static_cast<int>(layer.experts.w2_fmt) > 5) {
+      throw std::invalid_argument(
+          "Decoder: GGUF expert formats require batched (wgemm) decode (--max-batch > 1 or TP > 1)");
+    }
+  }
   attn_ws_.fill(0);  // zeroed once; the kernel resets its counter itself
   segments_[0] = upload_ints(proj_layout(false, true));
   segments_[1] = upload_ints(proj_layout(false, false));

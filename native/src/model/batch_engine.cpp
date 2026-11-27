@@ -23,6 +23,7 @@
 #include "model/prefill.h"
 #include "model/runtime.h"
 #include "model/vision.h"
+#include "model/weights_gguf.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -1051,8 +1053,15 @@ class BatchDecoder {
       const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
       pk::moe_route(idx_, M, work, stream);
       const Experts& ex = layer.experts;
-      const pk::MoeExperts me{static_cast<int>(ex.fmt), ex.w13.data, ex.w13_scale.data, f32p(ex.w13_factor),
-                              ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
+      pk::MoeExperts me;
+      me.fmt = static_cast<int>(ex.w13_fmt);
+      me.w13 = ex.w13.data;
+      me.w13_scale = ex.w13_scale.data;
+      me.w13_factor = f32p(ex.w13_factor);
+      me.w2 = ex.w2.data;
+      me.w2_scale = ex.w2_scale.data;
+      me.w2_factor = f32p(ex.w2_factor);
+      me.w2_fmt = static_cast<int>(ex.w2_fmt);
       pk::moe_gate_up(me, xm_, M, work, act_, stream);
       pk::moe_down(me, act_, M, work, down_, stream);
       pk::moe_combine(down_, wts_, M, moe_sum_, stream);
@@ -1189,14 +1198,18 @@ class BatchGenerator final : public Generator {
     std::size_t total_b = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_at_entry_, &total_b));
     if (options.vram_limit_mb > 0) {
-      // Preflight weights peak BEFORE allocating a single byte on GPU (header-only safetensors scan).
-      SafetensorsModel hdr(options.model_dir);
       std::size_t non_vision_bytes = 0;
-      for (const auto& f : hdr.files()) {
-        for (const auto& t : f->tensors()) {
-          const bool is_vis =
-              (t.name.rfind("vision", 0) == 0 || t.name.rfind("visual", 0) == 0 || t.name.rfind("model.visual", 0) == 0);
-          if (!is_vis || options.vision) non_vision_bytes += std::size_t(t.bytes);
+      if (is_gguf_model(options.model_dir)) {
+        non_vision_bytes = std::size_t(std::filesystem::file_size(gguf_model_file(options.model_dir)));
+      } else {
+        // Preflight weights peak BEFORE allocating a single byte on GPU (header-only safetensors scan).
+        SafetensorsModel hdr(options.model_dir);
+        for (const auto& f : hdr.files()) {
+          for (const auto& t : f->tensors()) {
+            const bool is_vis =
+                (t.name.rfind("vision", 0) == 0 || t.name.rfind("visual", 0) == 0 || t.name.rfind("model.visual", 0) == 0);
+            if (!is_vis || options.vision) non_vision_bytes += std::size_t(t.bytes);
+          }
         }
       }
       const std::size_t cap = std::size_t(options.vram_limit_mb) << 20;

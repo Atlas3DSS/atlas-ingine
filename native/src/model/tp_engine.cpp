@@ -26,6 +26,7 @@
 #include "model/drafter.h"
 #include "model/model_kernels.h"
 #include "model/runtime.h"
+#include "model/weights_gguf.h"
 
 #include <algorithm>
 #include <array>
@@ -189,6 +190,8 @@ void validate_tp_runtime_options(const RuntimeOptions& options, int tp_size) {
   if (options.kv_fp4v && !options.kv_fp8) throw std::invalid_argument(tag + ": --kv-fp4v needs --kv-fp8");
   if (options.kv_fp4v && options.max_batch == 1 && options.spec)
     throw std::invalid_argument(tag + ": --kv-fp4v is for the batch generator (not --spec with --max-batch 1)");
+  if (options.max_batch == 1 && options.spec && is_gguf_model(options.model_dir))
+    throw std::invalid_argument(tag + ": GGUF models with --max-batch 1 do not support --spec (use --max-batch > 1 or drop --spec)");
   if (options.vision) {
     throw std::invalid_argument(tag + " mode does not support --vision");
   }

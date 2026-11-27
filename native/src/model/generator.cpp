@@ -29,6 +29,7 @@
 #include "model/runtime.h"
 #include "model/spec.h"
 #include "model/vision.h"
+#include "model/weights_gguf.h"
 
 #include <algorithm>
 #include <array>
@@ -1611,6 +1612,9 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
     }
     return make_batch_generator(options);
   }
+  if (is_gguf_model(options.model_dir)) {
+    throw std::invalid_argument("TP1 GGUF models require --max-batch > 1 (batched wgemm path) or TP > 1");
+  }
   return std::make_unique<EngineGenerator>(options);
 }
 
@@ -1648,6 +1652,11 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options, Weights
       throw std::invalid_argument("persona hooks require --max-batch 1 (continuous batching with hooked persona tables is not yet enabled)");
     }
     return make_batch_generator(options, std::move(weights), std::move(ablation));
+  }
+  for (const Layer& layer : weights.layers) {
+    if (static_cast<int>(layer.experts.w13_fmt) > 5 || static_cast<int>(layer.experts.w2_fmt) > 5) {
+      throw std::invalid_argument("TP1 GGUF models require --max-batch > 1 (batched wgemm path) or TP > 1");
+    }
   }
   return std::make_unique<EngineGenerator>(options, std::move(weights), std::move(ablation));
 }
