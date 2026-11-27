@@ -297,6 +297,7 @@ void ChatServer::live_begin(const std::string& id, int prompt_tokens, int max_to
   r.prompt_tokens = prompt_tokens;
   r.max_tokens = max_tokens;
   r.started = std::chrono::system_clock::now();
+  r.started_steady = std::chrono::steady_clock::now();
   live_[id] = r;
 }
 
@@ -325,13 +326,15 @@ Json ChatServer::live_stats() {
   Json reqs = Json::array();
   for (const auto& [id, r] : live_) {
     const double started = std::chrono::duration<double>(r.started.time_since_epoch()).count();
+    const double elapsed = std::max(
+        0.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - r.started_steady).count());
     reqs.push_back(Json{{"id", id},
                         {"prompt_tokens", r.prompt_tokens},
                         {"generated", r.generated},
                         {"max_tokens", r.max_tokens},
                         {"first_token", r.first_token},
                         {"started", started},
-                        {"elapsed_s", now - started}});
+                        {"elapsed_s", elapsed}});
   }
   return Json{{"now", now},
               {"requests", std::move(reqs)},
@@ -351,6 +354,7 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
               Json{{"status", "ok"},
                    {"model", model_id_},
                    {"model_family", model_family_},
+                   {"max_context", max_model_len_},
                    {"kv_cache_mode", model::to_string(kv_cache_mode_)},
                    {"supported_kv_cache_modes", supported_kv_cache_modes_json()},
                    {"kv_cache_mode_mutable", false},
