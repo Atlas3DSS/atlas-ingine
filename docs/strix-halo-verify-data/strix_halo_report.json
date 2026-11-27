@@ -1,0 +1,428 @@
+{
+  "preflight": {
+    "timestamp_utc": "2026-11-26T17:05:24Z",
+    "hostname": "solomon",
+    "platform": "Linux-7.3.1-1-cachyos-x86_64-with-glibc2.44",
+    "kernel": "7.3.1-1-cachyos",
+    "cpu_model": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "cpu_count": 32,
+    "memory_bytes": {
+      "MemTotal": 133622710272,
+      "MemAvailable": 131121336320,
+      "SwapTotal": 133622132736,
+      "SwapFree": 133571293184
+    },
+    "rocm": {
+      "rocminfo_rc": 0,
+      "gfx_targets": [
+        "gfx1151"
+      ],
+      "gfx1151_detected": true,
+      "hipcc_version": "HIP version: 7.16.0-0000000",
+      "rocm_smi_rc": null
+    },
+    "tools": {
+      "cmake": "cmake version 4.5.1",
+      "ninja": "1.13.2"
+    },
+    "git": {
+      "repo_root": "/home/gpayton/atlas-ingine",
+      "head": "2a1fa4f2db49e38b3c3866606687411636381cc9",
+      "dirty": true
+    },
+    "model": {
+      "present": true,
+      "path": "/home/gpayton/models/Inkling-2-Mini-ingine",
+      "file_count": 16,
+      "has_ingpack": false,
+      "pack_content_sha256": null,
+      "pack_header_sha256": null,
+      "files": [
+        {
+          "name": "LICENSE",
+          "size_bytes": 11357,
+          "mtime_ns": 1795704322011890793
+        },
+        {
+          "name": "NOTICE",
+          "size_bytes": 5637,
+          "mtime_ns": 1795704322133547830
+        },
+        {
+          "name": "README.md",
+          "size_bytes": 8921,
+          "mtime_ns": 1795704322249109082
+        },
+        {
+          "name": "SHA256SUMS",
+          "size_bytes": 3065,
+          "mtime_ns": 1795704322356718729
+        },
+        {
+          "name": "chat_template.jinja",
+          "size_bytes": 6868,
+          "mtime_ns": 1795704322521396693,
+          "sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc"
+        },
+        {
+          "name": "config.json",
+          "size_bytes": 2699,
+          "mtime_ns": 1795704322642948614,
+          "sha256": "8216dd43157f5474cfff88f486a1e433fef703c674f694e485a86a761c412b1e"
+        },
+        {
+          "name": "generation_config.json",
+          "size_bytes": 98,
+          "mtime_ns": 1795704322760982402,
+          "sha256": "a08737c07a65a8fdf69f7cf086576210e5aad4b241437090b26d7b0c4f7905f7"
+        },
+        {
+          "name": "hf_quant_config.json",
+          "size_bytes": 67924,
+          "mtime_ns": 1795704322894120328
+        },
+        {
+          "name": "inkling-2-mini-abliterated.safetensors",
+          "size_bytes": 1771852,
+          "mtime_ns": 1795704323403143471
+        },
+        {
+          "name": "model-00001-of-00001.safetensors",
+          "size_bytes": 19526019168,
+          "mtime_ns": 1795704500329191043
+        },
+        {
+          "name": "model.safetensors.index.json",
+          "size_bytes": 109300,
+          "mtime_ns": 1795704500495198598,
+          "sha256": "c1631065b7b00787993522dddc66a68b3abee869192977fb3dcb796e63bc5838"
+        },
+        {
+          "name": "mtp.safetensors",
+          "size_bytes": 635801416,
+          "mtime_ns": 1795704507442514728
+        },
+        {
+          "name": "processor_config.json",
+          "size_bytes": 461,
+          "mtime_ns": 1795704507594170167
+        },
+        {
+          "name": "special_tokens_map.json",
+          "size_bytes": 529,
+          "mtime_ns": 1795704507720405269
+        },
+        {
+          "name": "tokenizer.json",
+          "size_bytes": 26178678,
+          "mtime_ns": 1795704509294599005
+        },
+        {
+          "name": "tokenizer_config.json",
+          "size_bytes": 13235,
+          "mtime_ns": 1795704509425604968,
+          "sha256": "bf09342d285139fd37ce10c70878af1d52cb390e9901e10248654293a80ee636"
+        }
+      ]
+    },
+    "ok": true
+  },
+  "build_test": {
+    "ok": false,
+    "stage": "complete",
+    "preset": "hip-strix-dev",
+    "build_dir": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151",
+    "serve_bin": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151/apps/serve/ingine-serve",
+    "pack_bin": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151/apps/pack/ingine-pack",
+    "elapsed_s": 4692.783,
+    "ctest_returncode": 8,
+    "ctest_summary": {
+      "passed": 54,
+      "failed": 6,
+      "skipped": 5,
+      "total_observed": 65,
+      "tests": [
+        {
+          "name": "batch_scheduler",
+          "status": "Passed"
+        },
+        {
+          "name": "batch_prefix_cache",
+          "status": "Passed"
+        },
+        {
+          "name": "batch_server",
+          "status": "Passed"
+        },
+        {
+          "name": "batch_kernels",
+          "status": "Passed"
+        },
+        {
+          "name": "batch_parity",
+          "status": "***Failed"
+        },
+        {
+          "name": "batch_prefix_parity",
+          "status": "Passed"
+        },
+        {
+          "name": "core_safetensors",
+          "status": "Passed"
+        },
+        {
+          "name": "core_safetensors_model",
+          "status": "Passed"
+        },
+        {
+          "name": "core_oracle_precision_bf16",
+          "status": "Passed"
+        },
+        {
+          "name": "core_oracle_precision_fp16",
+          "status": "Passed"
+        },
+        {
+          "name": "core_vendor_portability",
+          "status": "Passed"
+        },
+        {
+          "name": "core_mlx_uploader_host",
+          "status": "Passed"
+        },
+        {
+          "name": "core_arch_ops_cuda",
+          "status": "Passed"
+        },
+        {
+          "name": "hal_embed_q4_parity",
+          "status": "Passed"
+        },
+        {
+          "name": "hal_embed_q4_capture",
+          "status": "Passed"
+        },
+        {
+          "name": "core_arena",
+          "status": "Passed"
+        },
+        {
+          "name": "core_paged_tier",
+          "status": "Passed"
+        },
+        {
+          "name": "core_upload",
+          "status": "Passed"
+        },
+        {
+          "name": "core_baremetal_cpu",
+          "status": "***Failed"
+        },
+        {
+          "name": "core_baremetal_cuda",
+          "status": "***Failed"
+        },
+        {
+          "name": "core_weight_pack",
+          "status": "Passed"
+        },
+        {
+          "name": "image",
+          "status": "Passed"
+        },
+        {
+          "name": "kernels_dense",
+          "status": "Passed"
+        },
+        {
+          "name": "kernels_moe",
+          "status": "Passed"
+        },
+        {
+          "name": "kernels_attn",
+          "status": "Passed"
+        },
+        {
+          "name": "kernels_head",
+          "status": "Passed"
+        },
+        {
+          "name": "kernels_bitlock",
+          "status": "Passed"
+        },
+        {
+          "name": "model_data",
+          "status": "Passed"
+        },
+        {
+          "name": "model_tp_p2p",
+          "status": "Passed"
+        },
+        {
+          "name": "model_layer",
+          "status": "Passed"
+        },
+        {
+          "name": "model_reuse",
+          "status": "***Timeout"
+        },
+        {
+          "name": "model_cache_stage3",
+          "status": "***Timeout"
+        },
+        {
+          "name": "model_parity",
+          "status": "Passed"
+        },
+        {
+          "name": "model_parity_generate",
+          "status": "Passed"
+        },
+        {
+          "name": "model_parity_spec",
+          "status": "Passed"
+        },
+        {
+          "name": "model_path",
+          "status": "Passed"
+        },
+        {
+          "name": "model_path_spec",
+          "status": "Passed"
+        },
+        {
+          "name": "model_vision",
+          "status": "Passed"
+        },
+        {
+          "name": "prefill_attention",
+          "status": "Passed"
+        },
+        {
+          "name": "prefill_moe",
+          "status": "***Failed"
+        },
+        {
+          "name": "prefill_rows",
+          "status": "Passed"
+        },
+        {
+          "name": "prefill_bench",
+          "status": "***Skipped"
+        },
+        {
+          "name": "prefill_model_kvbf16",
+          "status": "Passed"
+        },
+        {
+          "name": "prefill_model_kvfp8",
+          "status": "Passed"
+        },
+        {
+          "name": "prefill_model_bench",
+          "status": "***Skipped"
+        },
+        {
+          "name": "prefill_synth_bench",
+          "status": "***Skipped"
+        },
+        {
+          "name": "prefill_profile",
+          "status": "***Skipped"
+        },
+        {
+          "name": "serve_scheduler",
+          "status": "Passed"
+        },
+        {
+          "name": "serve_server",
+          "status": "Passed"
+        },
+        {
+          "name": "serve_cache_baseline",
+          "status": "Passed"
+        },
+        {
+          "name": "spec_draft_kernels",
+          "status": "Passed"
+        },
+        {
+          "name": "spec_accept",
+          "status": "Passed"
+        },
+        {
+          "name": "spec_sampling_fidelity",
+          "status": "Passed"
+        },
+        {
+          "name": "spec_drafter",
+          "status": "Passed"
+        },
+        {
+          "name": "spec_forced",
+          "status": "Passed"
+        },
+        {
+          "name": "spec_conditional_fallback",
+          "status": "Passed"
+        },
+        {
+          "name": "text_tokenizer",
+          "status": "Passed"
+        },
+        {
+          "name": "text_chat",
+          "status": "Passed"
+        },
+        {
+          "name": "text_stream",
+          "status": "Passed"
+        },
+        {
+          "name": "text_pyjson",
+          "status": "Passed"
+        },
+        {
+          "name": "text_json_fsm",
+          "status": "Passed"
+        },
+        {
+          "name": "text_render_cache",
+          "status": "Passed"
+        },
+        {
+          "name": "text_traces",
+          "status": "***Skipped"
+        },
+        {
+          "name": "vision_kernels",
+          "status": "Passed"
+        },
+        {
+          "name": "vision_model",
+          "status": "Passed"
+        }
+      ]
+    },
+    "ctest_tail": "[80669]: got -3.11062e-07 ref -3.07336e-07 (allowed 0)\n  combine (exact)[101946]: got 0.00292969 ref 0.00291443 (allowed 0)\n  combine (exact)[115257]: got -0.00570679 ref -0.00567627 (allowed 0)\n  combine (exact)[128470]: got 0.0147095 ref 0.0146484 (allowed 0)\nFAIL combine (exact): 57 / 1612800 outside tolerance, worst err/limit 0.000 at 0\nSOME FAILED\n\n      Start 42: prefill_rows\n42/66 Test #42: prefill_rows .....................   Passed    1.46 sec\n      Start 43: prefill_bench\n43/66 Test #43: prefill_bench ....................***Skipped   0.03 sec\n      Start 44: prefill_model_kvbf16\n44/66 Test #44: prefill_model_kvbf16 .............   Passed  112.18 sec\n      Start 45: prefill_model_kvfp8\n45/66 Test #45: prefill_model_kvfp8 ..............   Passed  112.72 sec\n      Start 46: prefill_model_bench\n46/66 Test #46: prefill_model_bench ..............***Skipped   0.03 sec\n      Start 47: prefill_synth_bench\n47/66 Test #47: prefill_synth_bench ..............***Skipped   0.03 sec\n      Start 48: prefill_profile\n48/66 Test #48: prefill_profile ..................***Skipped   0.03 sec\n      Start 49: serve_scheduler\n49/66 Test #49: serve_scheduler ..................   Passed    0.03 sec\n      Start 50: serve_server\n50/66 Test #50: serve_server .....................   Passed   10.66 sec\n      Start 51: serve_cache_baseline\n51/66 Test #51: serve_cache_baseline .............   Passed    0.82 sec\n      Start 52: spec_draft_kernels\n52/66 Test #52: spec_draft_kernels ...............   Passed   14.77 sec\n      Start 53: spec_accept\n53/66 Test #53: spec_accept ......................   Passed    0.50 sec\n      Start 54: spec_sampling_fidelity\n54/66 Test #54: spec_sampling_fidelity ...........   Passed  138.11 sec\n      Start 55: spec_drafter\n55/66 Test #55: spec_drafter .....................   Passed    0.94 sec\n      Start 56: spec_forced\n56/66 Test #56: spec_forced ......................   Passed   50.57 sec\n      Start 57: spec_conditional_fallback\n57/66 Test #57: spec_conditional_fallback ........   Passed   32.08 sec\n      Start 58: text_tokenizer\n58/66 Test #58: text_tokenizer ...................   Passed    0.43 sec\n      Start 59: text_chat\n59/66 Test #59: text_chat ........................   Passed    0.34 sec\n      Start 60: text_stream\n60/66 Test #60: text_stream ......................   Passed    0.33 sec\n      Start 61: text_pyjson\n61/66 Test #61: text_pyjson ......................   Passed    0.00 sec\n      Start 62: text_json_fsm\n62/66 Test #62: text_json_fsm ....................   Passed    0.02 sec\n      Start 63: text_render_cache\n63/66 Test #63: text_render_cache ................   Passed    1.15 sec\n      Start 64: text_traces\n64/66 Test #64: text_traces ......................***Skipped   0.00 sec\n      Start 65: vision_kernels\n65/66 Test #65: vision_kernels ...................   Passed    0.58 sec\n      Start 66: vision_model\n66/66 Test #66: vision_model .....................   Passed   32.76 sec\n\n89% tests passed, 7 tests failed out of 66\n\nLabel Time Summary:\nbatch     = 524.82 sec*proc (6 tests)\nbench     =   0.12 sec*proc (4 tests)\ngpu       = 4677.63 sec*proc (44 tests)\nmodel     = 4394.60 sec*proc (20 tests)\nserve     =  12.32 sec*proc (5 tests)\nvision    = 114.82 sec*proc (3 tests)\n\nTotal Test time (real) = 4692.53 sec\n\nThe following tests did not run:\n\t 43 - prefill_bench (Skipped)\n\t 46 - prefill_model_bench (Skipped)\n\t 47 - prefill_synth_bench (Skipped)\n\t 48 - prefill_profile (Skipped)\n\t 64 - text_traces (Skipped)\n\nThe following tests FAILED:\n\t  5 - batch_parity (Failed)                             batch gpu model\n\t 19 - core_baremetal_cpu (Failed)                       gpu\n\t 20 - core_baremetal_cuda (Failed)                      gpu\n\t 31 - model_runtime (Subprocess aborted)                gpu\n\t 32 - model_reuse (Timeout)                             gpu model\n\t 33 - model_cache_stage3 (Timeout)                      gpu model\n\t 41 - prefill_moe (Failed)                              gpu\n\nErrors while running CTest\n",
+    "zero_cuda_audit": {
+      "zero_cuda_clean": false,
+      "checked": [
+        {
+          "binary": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151/apps/serve/ingine-serve",
+          "returncode": 0,
+          "cuda_libs": [
+            "libicudata.so.78 => /usr/lib/libicudata.so.78 (0x00007f23fe000000)"
+          ]
+        },
+        {
+          "binary": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151/apps/pack/ingine-pack",
+          "returncode": 0,
+          "cuda_libs": [
+            "libicudata.so.78 => /usr/lib/libicudata.so.78 (0x00007f6a1fa00000)"
+          ]
+        }
+      ]
+    }
+  }
+}

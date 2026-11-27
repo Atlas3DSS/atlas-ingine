@@ -1,0 +1,331 @@
+{
+  "mode": "live_engine",
+  "fake_smoke": false,
+  "server_origin": "managed_local",
+  "model_id": "inkling-2-mini",
+  "accelerator": {
+    "backend": null,
+    "selected_device_arch": null,
+    "source": "missing",
+    "conflict": false,
+    "expected_backend": null,
+    "expected_device_arch": null
+  },
+  "model_identity": {
+    "model_id": "inkling-2-mini",
+    "models_listed": 1,
+    "model_entry_matched": true,
+    "content_sha256": null,
+    "source": "missing",
+    "conflict": false,
+    "local_model_dir_pack_sha256": null,
+    "pack_header_sha256": null,
+    "expected_model_sha256": null
+  },
+  "startup_ready_s": 10.14,
+  "words_per_token_calibrated": 0.7151,
+  "decode_runs": {
+    "code": {
+      "prompt_tokens": 114,
+      "cached_tokens": 0,
+      "uncached_prompt_tokens": 114,
+      "completion_tokens": 256,
+      "chunks_seen": 257,
+      "ttft_s": 0.31937658274546266,
+      "decode_s": 8.99092458607629,
+      "total_s": 9.310301168821752,
+      "decode_tok_s": 28.361932920102937,
+      "prefill_tok_s": 356.94539349134413,
+      "output_preview": "The user wants a thread-safe LRU cache with TTL expiration in Python using only the standard library. Requirements:\n- O(1) get/put\n- size eviction\n- monotonic-clock TTL checks\n- type annotations\n- unittest test suite covering expiry, promot"
+    },
+    "prose": {
+      "prompt_tokens": 97,
+      "cached_tokens": 0,
+      "uncached_prompt_tokens": 97,
+      "completion_tokens": 256,
+      "chunks_seen": 257,
+      "ttft_s": 0.3022095658816397,
+      "decode_s": 8.984265207313001,
+      "total_s": 9.28647477319464,
+      "decode_tok_s": 28.38295554681928,
+      "prefill_tok_s": 320.9693237770972,
+      "output_preview": "The user asks for a detailed technical explanation of how unified-memory APU architectures change tradeoffs between memory bandwidth, KV cache quantization, page-locked weight residency, and speculative drafting during long-context autoregr"
+    },
+    "edit": {
+      "prompt_tokens": 222,
+      "cached_tokens": 0,
+      "uncached_prompt_tokens": 222,
+      "completion_tokens": 256,
+      "chunks_seen": 257,
+      "ttft_s": 0.3979219435714185,
+      "decode_s": 8.998646869324148,
+      "total_s": 9.396568812895566,
+      "decode_tok_s": 28.337593829721204,
+      "prefill_tok_s": 557.8983606873032,
+      "output_preview": "The user wants a refactor of a Python ring buffer. Need output unified diff followed by complete revised module. Need be careful: system says \"[decode-suite=edit nonce=1f0a23b3d6] You are a precise code editor. Return clean unified diffs an"
+    },
+    "tool": {
+      "prompt_tokens": 151,
+      "cached_tokens": 0,
+      "uncached_prompt_tokens": 151,
+      "completion_tokens": 157,
+      "chunks_seen": 147,
+      "ttft_s": 0.487916172016412,
+      "decode_s": 5.474423943087459,
+      "total_s": 5.962340115103871,
+      "decode_tok_s": 28.496148932159485,
+      "prefill_tok_s": 309.47939146177924,
+      "output_preview": "Let me inspect the repository first.{\"tool_calls\":[{\"tool_calls\":[{\"tool_calls\":[{\"path\":\"weight_pack.cpp\"},{\"path\":\"safetensors_io.cpp\"}]}]}]}The user wants a 6-step JSON tool-call plan. I need to inspect the repo. Let me first look at the"
+    },
+    "multilang": {
+      "prompt_tokens": 114,
+      "cached_tokens": 0,
+      "uncached_prompt_tokens": 114,
+      "completion_tokens": 256,
+      "chunks_seen": 257,
+      "ttft_s": 0.3526415401138365,
+      "decode_s": 8.987941534724087,
+      "total_s": 9.340583074837923,
+      "decode_tok_s": 28.371346099085194,
+      "prefill_tok_s": 323.2744502057232,
+      "output_preview": "The user asks to implement deterministic FNV-1a 64-bit hash for UTF-8 byte slices in six languages: Python, Rust, C++20, Go, TypeScript, PostgreSQL SQL. Include short verification example for input \"atlas-ingine\" in each language.\n\nNeed be "
+    }
+  },
+  "prefill_runs": {
+    "8192": {
+      "prompt_tokens": 8256,
+      "cached_tokens": 0,
+      "uncached_prompt_tokens": 8256,
+      "completion_tokens": 1,
+      "chunks_seen": 3,
+      "ttft_s": 0.0024093608371913433,
+      "decode_s": 7.36379575310275,
+      "total_s": 7.36379575310275,
+      "decode_tok_s": 0.13579952968937903,
+      "prefill_tok_s": 3426634.9284668546,
+      "output_preview": "",
+      "target_tokens": 8192,
+      "nonce": "b3d37406013d"
+    },
+    "32768": {
+      "prompt_tokens": 32892,
+      "cached_tokens": 0,
+      "uncached_prompt_tokens": 32892,
+      "completion_tokens": 1,
+      "chunks_seen": 3,
+      "ttft_s": 0.006788002327084541,
+      "decode_s": 32.26005092728883,
+      "total_s": 32.26005092728883,
+      "decode_tok_s": 0.030998091176418396,
+      "prefill_tok_s": 4845608.238635824,
+      "output_preview": "",
+      "target_tokens": 32768,
+      "nonce": "1e5826a8347d"
+    },
+    "131072": {
+      "prompt_tokens": 131453,
+      "cached_tokens": 0,
+      "uncached_prompt_tokens": 131453,
+      "completion_tokens": 1,
+      "chunks_seen": 3,
+      "ttft_s": 0.02385319583117962,
+      "decode_s": 212.43126678280532,
+      "total_s": 212.43126678280532,
+      "decode_tok_s": 0.004707404965119486,
+      "prefill_tok_s": 5510917.737411592,
+      "output_preview": "",
+      "target_tokens": 131072,
+      "nonce": "0bb42639700a"
+    }
+  },
+  "agent_runs": [
+    {
+      "target_ctx_tokens": 32768,
+      "session_nonce": "45a535419396",
+      "turn1_prime": {
+        "prompt_tokens": 32941,
+        "cached_tokens": 0,
+        "uncached_prompt_tokens": 32941,
+        "completion_tokens": 8,
+        "chunks_seen": 9,
+        "ttft_s": 33.00232666824013,
+        "decode_s": 0.2201512036845088,
+        "total_s": 33.22247787192464,
+        "decode_tok_s": 31.79632853623395,
+        "prefill_tok_s": 998.1417471302365,
+        "output_preview": "The user has pasted a"
+      },
+      "turn2_warm": {
+        "prompt_tokens": 32992,
+        "cached_tokens": 32941,
+        "uncached_prompt_tokens": 51,
+        "completion_tokens": 64,
+        "chunks_seen": 65,
+        "ttft_s": 0.3320879340171814,
+        "decode_s": 2.690606668125838,
+        "total_s": 3.0226946021430194,
+        "decode_tok_s": 23.414793676952833,
+        "prefill_tok_s": 153.57378204942967,
+        "output_preview": "The user is asking me to summarize the next action in two short bullet points, given a tool result that `ctest -R core_weight_pack` exited 0 (4/4 assertions passed).\n\nThis appears to be a continuation of a coding task. The prior context was",
+        "cache_hit_ratio": 0.9985
+      }
+    },
+    {
+      "target_ctx_tokens": 65536,
+      "session_nonce": "3905a6670fcb",
+      "turn1_prime": {
+        "prompt_tokens": 65805,
+        "cached_tokens": 0,
+        "uncached_prompt_tokens": 65805,
+        "completion_tokens": 8,
+        "chunks_seen": 9,
+        "ttft_s": 77.28014824306592,
+        "decode_s": 0.26074529672041535,
+        "total_s": 77.54089353978634,
+        "decode_tok_s": 26.846121820965244,
+        "prefill_tok_s": 851.5123417339518,
+        "output_preview": "The user has pasted a"
+      },
+      "turn2_warm": {
+        "prompt_tokens": 65856,
+        "cached_tokens": 65805,
+        "uncached_prompt_tokens": 51,
+        "completion_tokens": 64,
+        "chunks_seen": 65,
+        "ttft_s": 0.3916157470084727,
+        "decode_s": 3.1937287119217217,
+        "total_s": 3.5853444589301944,
+        "decode_tok_s": 19.72615888282252,
+        "prefill_tok_s": 130.22969681271934,
+        "output_preview": "The user is asking me to summarize the next action in two short bullet points, given a tool result that `ctest -R core_weight_pack` exited 0 (4/4 assertions passed).\n\nThis is a continuation of a prior task. The prior context: the user past",
+        "cache_hit_ratio": 0.9992
+      }
+    },
+    {
+      "target_ctx_tokens": 96000,
+      "session_nonce": "82ab7eb8eb59",
+      "turn1_prime": {
+        "prompt_tokens": 96376,
+        "cached_tokens": 0,
+        "uncached_prompt_tokens": 96376,
+        "completion_tokens": 8,
+        "chunks_seen": 9,
+        "ttft_s": 132.31715442379937,
+        "decode_s": 0.2985248379409313,
+        "total_s": 132.6156792617403,
+        "decode_tok_s": 23.44863512290083,
+        "prefill_tok_s": 728.3711656261648,
+        "output_preview": "The user has pasted a"
+      },
+      "turn2_warm": {
+        "prompt_tokens": 96427,
+        "cached_tokens": 96376,
+        "uncached_prompt_tokens": 51,
+        "completion_tokens": 64,
+        "chunks_seen": 65,
+        "ttft_s": 0.4477354190312326,
+        "decode_s": 3.6636093421839178,
+        "total_s": 4.11134476121515,
+        "decode_tok_s": 17.196156608347604,
+        "prefill_tok_s": 113.90655693567633,
+        "output_preview": "The user is asking me to summarize the next action in two short bullet points, given a tool result that `ctest -R core_weight_pack` exited 0 (4/4 assertions passed).\n\nThis appears to be a continuation of a prior task. The first message was ",
+        "cache_hit_ratio": 0.9995
+      }
+    }
+  ],
+  "cold_run": {
+    "measured": true,
+    "target_tokens": 34816,
+    "server_ready_s": 10.132,
+    "cold_total_s": 46.5816,
+    "request": {
+      "prompt_tokens": 34945,
+      "cached_tokens": 0,
+      "uncached_prompt_tokens": 34945,
+      "completion_tokens": 16,
+      "chunks_seen": 17,
+      "ttft_s": 35.87030871817842,
+      "decode_s": 0.5776044642552733,
+      "total_s": 36.447913182433695,
+      "decode_tok_s": 25.969328369613713,
+      "prefill_tok_s": 974.2040492194177,
+      "output_preview": "The user has pasted a huge block of text that looks like a"
+    }
+  },
+  "diagnostic_metrics": {
+    "decode_tok_s": {
+      "code": 28.362,
+      "prose": 28.383,
+      "edit": 28.338,
+      "tool": 28.496,
+      "multilang": 28.371
+    },
+    "prefill_tok_s_by_requested_len": {
+      "8192": {
+        "observed_prompt_tokens": 8256,
+        "cached_tokens": 0,
+        "prefill_tok_s": 3426634.928
+      },
+      "32768": {
+        "observed_prompt_tokens": 32892,
+        "cached_tokens": 0,
+        "prefill_tok_s": 4845608.239
+      },
+      "131072": {
+        "observed_prompt_tokens": 131453,
+        "cached_tokens": 0,
+        "prefill_tok_s": 5510917.737
+      }
+    },
+    "agent_warm_turns": [
+      {
+        "requested_ctx_tokens": 32768,
+        "observed_turn1_prompt_tokens": 32941,
+        "observed_turn2_prompt_tokens": 32992,
+        "cached_tokens": 32941,
+        "cache_hit_ratio": 0.9985,
+        "ttft_s": 0.3321,
+        "total_s": 3.0227
+      },
+      {
+        "requested_ctx_tokens": 65536,
+        "observed_turn1_prompt_tokens": 65805,
+        "observed_turn2_prompt_tokens": 65856,
+        "cached_tokens": 65805,
+        "cache_hit_ratio": 0.9992,
+        "ttft_s": 0.3916,
+        "total_s": 3.5853
+      },
+      {
+        "requested_ctx_tokens": 96000,
+        "observed_turn1_prompt_tokens": 96376,
+        "observed_turn2_prompt_tokens": 96427,
+        "cached_tokens": 96376,
+        "cache_hit_ratio": 0.9995,
+        "ttft_s": 0.4477,
+        "total_s": 4.1113
+      }
+    ],
+    "cold_run": {
+      "measured": true,
+      "requested_tokens": 34816,
+      "observed_prompt_tokens": 34945,
+      "cached_tokens": 0,
+      "cold_total_s": 46.5816
+    }
+  },
+  "summary_metrics": {
+    "decode_code_tok_s": 28.362,
+    "decode_prose_tok_s": 28.383,
+    "decode_edit_tok_s": 28.338,
+    "decode_tool_tok_s": 28.496,
+    "decode_multilang_tok_s": 28.371,
+    "prefill_8k_tok_s": 3426634.928,
+    "prefill_32k_tok_s": 4845608.239,
+    "prefill_131k_tok_s": 5510917.737,
+    "agent_turn_30k_96k_s": 4.1113,
+    "agent_ttft_30k_96k_s": 0.4477,
+    "cold_34k_s": 46.5816
+  },
+  "eligibility_notes": {}
+}

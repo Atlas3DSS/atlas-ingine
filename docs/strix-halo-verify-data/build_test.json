@@ -1,0 +1,298 @@
+{
+  "ok": false,
+  "stage": "complete",
+  "preset": "hip-strix-dev",
+  "build_dir": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151",
+  "serve_bin": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151/apps/serve/ingine-serve",
+  "pack_bin": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151/apps/pack/ingine-pack",
+  "elapsed_s": 434.419,
+  "ctest_returncode": 8,
+  "ctest_summary": {
+    "passed": 32,
+    "failed": 9,
+    "skipped": 24,
+    "total_observed": 65,
+    "tests": [
+      {
+        "name": "batch_scheduler",
+        "status": "Passed"
+      },
+      {
+        "name": "batch_prefix_cache",
+        "status": "Passed"
+      },
+      {
+        "name": "batch_server",
+        "status": "***Skipped"
+      },
+      {
+        "name": "batch_kernels",
+        "status": "Passed"
+      },
+      {
+        "name": "batch_parity",
+        "status": "***Skipped"
+      },
+      {
+        "name": "batch_prefix_parity",
+        "status": "***Failed"
+      },
+      {
+        "name": "core_safetensors",
+        "status": "Passed"
+      },
+      {
+        "name": "core_safetensors_model",
+        "status": "***Skipped"
+      },
+      {
+        "name": "core_oracle_precision_bf16",
+        "status": "Passed"
+      },
+      {
+        "name": "core_oracle_precision_fp16",
+        "status": "Passed"
+      },
+      {
+        "name": "core_vendor_portability",
+        "status": "Passed"
+      },
+      {
+        "name": "core_mlx_uploader_host",
+        "status": "Passed"
+      },
+      {
+        "name": "core_arch_ops_cuda",
+        "status": "Passed"
+      },
+      {
+        "name": "hal_embed_q4_parity",
+        "status": "Passed"
+      },
+      {
+        "name": "hal_embed_q4_capture",
+        "status": "Passed"
+      },
+      {
+        "name": "core_arena",
+        "status": "Passed"
+      },
+      {
+        "name": "core_paged_tier",
+        "status": "Passed"
+      },
+      {
+        "name": "core_upload",
+        "status": "Passed"
+      },
+      {
+        "name": "core_baremetal_cpu",
+        "status": "***Failed"
+      },
+      {
+        "name": "core_baremetal_cuda",
+        "status": "***Failed"
+      },
+      {
+        "name": "core_weight_pack",
+        "status": "Passed"
+      },
+      {
+        "name": "image",
+        "status": "Passed"
+      },
+      {
+        "name": "kernels_dense",
+        "status": "Passed"
+      },
+      {
+        "name": "kernels_moe",
+        "status": "Passed"
+      },
+      {
+        "name": "kernels_attn",
+        "status": "Passed"
+      },
+      {
+        "name": "kernels_head",
+        "status": "Passed"
+      },
+      {
+        "name": "kernels_bitlock",
+        "status": "Passed"
+      },
+      {
+        "name": "model_data",
+        "status": "Passed"
+      },
+      {
+        "name": "model_tp_p2p",
+        "status": "Passed"
+      },
+      {
+        "name": "model_layer",
+        "status": "***Skipped"
+      },
+      {
+        "name": "model_reuse",
+        "status": "***Skipped"
+      },
+      {
+        "name": "model_cache_stage3",
+        "status": "***Skipped"
+      },
+      {
+        "name": "model_parity",
+        "status": "***Failed"
+      },
+      {
+        "name": "model_parity_generate",
+        "status": "***Failed"
+      },
+      {
+        "name": "model_parity_spec",
+        "status": "***Failed"
+      },
+      {
+        "name": "model_path",
+        "status": "***Failed"
+      },
+      {
+        "name": "model_path_spec",
+        "status": "***Failed"
+      },
+      {
+        "name": "model_vision",
+        "status": "***Skipped"
+      },
+      {
+        "name": "prefill_attention",
+        "status": "Passed"
+      },
+      {
+        "name": "prefill_moe",
+        "status": "***Failed"
+      },
+      {
+        "name": "prefill_rows",
+        "status": "Passed"
+      },
+      {
+        "name": "prefill_bench",
+        "status": "***Skipped"
+      },
+      {
+        "name": "prefill_model_kvbf16",
+        "status": "***Skipped"
+      },
+      {
+        "name": "prefill_model_kvfp8",
+        "status": "***Skipped"
+      },
+      {
+        "name": "prefill_model_bench",
+        "status": "***Skipped"
+      },
+      {
+        "name": "prefill_synth_bench",
+        "status": "***Skipped"
+      },
+      {
+        "name": "prefill_profile",
+        "status": "***Skipped"
+      },
+      {
+        "name": "serve_scheduler",
+        "status": "Passed"
+      },
+      {
+        "name": "serve_server",
+        "status": "***Skipped"
+      },
+      {
+        "name": "serve_cache_baseline",
+        "status": "***Skipped"
+      },
+      {
+        "name": "spec_draft_kernels",
+        "status": "Passed"
+      },
+      {
+        "name": "spec_accept",
+        "status": "Passed"
+      },
+      {
+        "name": "spec_sampling_fidelity",
+        "status": "Passed"
+      },
+      {
+        "name": "spec_drafter",
+        "status": "***Skipped"
+      },
+      {
+        "name": "spec_forced",
+        "status": "***Skipped"
+      },
+      {
+        "name": "spec_conditional_fallback",
+        "status": "***Skipped"
+      },
+      {
+        "name": "text_tokenizer",
+        "status": "***Skipped"
+      },
+      {
+        "name": "text_chat",
+        "status": "***Skipped"
+      },
+      {
+        "name": "text_stream",
+        "status": "***Skipped"
+      },
+      {
+        "name": "text_pyjson",
+        "status": "Passed"
+      },
+      {
+        "name": "text_json_fsm",
+        "status": "Passed"
+      },
+      {
+        "name": "text_render_cache",
+        "status": "***Skipped"
+      },
+      {
+        "name": "text_traces",
+        "status": "***Skipped"
+      },
+      {
+        "name": "vision_kernels",
+        "status": "Passed"
+      },
+      {
+        "name": "vision_model",
+        "status": "***Skipped"
+      }
+    ]
+  },
+  "ctest_tail": "t #46: prefill_model_bench ..............***Skipped   0.03 sec\n      Start 47: prefill_synth_bench\n47/66 Test #47: prefill_synth_bench ..............***Skipped   0.03 sec\n      Start 48: prefill_profile\n48/66 Test #48: prefill_profile ..................***Skipped   0.03 sec\n      Start 49: serve_scheduler\n49/66 Test #49: serve_scheduler ..................   Passed    0.03 sec\n      Start 50: serve_server\n50/66 Test #50: serve_server .....................***Skipped   0.00 sec\n      Start 51: serve_cache_baseline\n51/66 Test #51: serve_cache_baseline .............***Skipped   0.00 sec\n      Start 52: spec_draft_kernels\n52/66 Test #52: spec_draft_kernels ...............   Passed   14.36 sec\n      Start 53: spec_accept\n53/66 Test #53: spec_accept ......................   Passed    0.50 sec\n      Start 54: spec_sampling_fidelity\n54/66 Test #54: spec_sampling_fidelity ...........   Passed  180.79 sec\n      Start 55: spec_drafter\n55/66 Test #55: spec_drafter .....................***Skipped   0.19 sec\n      Start 56: spec_forced\n56/66 Test #56: spec_forced ......................***Skipped   0.06 sec\n      Start 57: spec_conditional_fallback\n57/66 Test #57: spec_conditional_fallback ........***Skipped   0.06 sec\n      Start 58: text_tokenizer\n58/66 Test #58: text_tokenizer ...................***Skipped   0.00 sec\n      Start 59: text_chat\n59/66 Test #59: text_chat ........................***Skipped   0.00 sec\n      Start 60: text_stream\n60/66 Test #60: text_stream ......................***Skipped   0.00 sec\n      Start 61: text_pyjson\n61/66 Test #61: text_pyjson ......................   Passed    0.00 sec\n      Start 62: text_json_fsm\n62/66 Test #62: text_json_fsm ....................   Passed    0.02 sec\n      Start 63: text_render_cache\n63/66 Test #63: text_render_cache ................***Skipped   0.00 sec\n      Start 64: text_traces\n64/66 Test #64: text_traces ......................***Skipped   0.00 sec\n      Start 65: vision_kernels\n65/66 Test #65: vision_kernels ...................   Passed    0.44 sec\n      Start 66: vision_model\n66/66 Test #66: vision_model .....................***Skipped   0.05 sec\n\n85% tests passed, 10 tests failed out of 66\n\nLabel Time Summary:\nbatch     =   5.11 sec*proc (6 tests)\nbench     =   0.11 sec*proc (4 tests)\ngpu       = 291.99 sec*proc (44 tests)\nmodel     =   1.23 sec*proc (20 tests)\nserve     =   0.23 sec*proc (5 tests)\nvision    =   0.55 sec*proc (3 tests)\n\nTotal Test time (real) = 292.56 sec\n\nThe following tests did not run:\n\t  3 - batch_server (Skipped)\n\t  5 - batch_parity (Skipped)\n\t  8 - core_safetensors_model (Skipped)\n\t 30 - model_layer (Skipped)\n\t 32 - model_reuse (Skipped)\n\t 33 - model_cache_stage3 (Skipped)\n\t 39 - model_vision (Skipped)\n\t 43 - prefill_bench (Skipped)\n\t 44 - prefill_model_kvbf16 (Skipped)\n\t 45 - prefill_model_kvfp8 (Skipped)\n\t 46 - prefill_model_bench (Skipped)\n\t 47 - prefill_synth_bench (Skipped)\n\t 48 - prefill_profile (Skipped)\n\t 50 - serve_server (Skipped)\n\t 51 - serve_cache_baseline (Skipped)\n\t 55 - spec_drafter (Skipped)\n\t 56 - spec_forced (Skipped)\n\t 57 - spec_conditional_fallback (Skipped)\n\t 58 - text_tokenizer (Skipped)\n\t 59 - text_chat (Skipped)\n\t 60 - text_stream (Skipped)\n\t 63 - text_render_cache (Skipped)\n\t 64 - text_traces (Skipped)\n\t 66 - vision_model (Skipped)\n\nThe following tests FAILED:\n\t  6 - batch_prefix_parity (Failed)                      batch gpu model\n\t 19 - core_baremetal_cpu (Failed)                       gpu\n\t 20 - core_baremetal_cuda (Failed)                      gpu\n\t 31 - model_runtime (Subprocess aborted)                gpu\n\t 34 - model_parity (Failed)                             gpu model\n\t 35 - model_parity_generate (Failed)                    gpu model\n\t 36 - model_parity_spec (Failed)                        gpu model\n\t 37 - model_path (Failed)                               gpu model\n\t 38 - model_path_spec (Failed)                          gpu model\n\t 41 - prefill_moe (Failed)                              gpu\n\nErrors while running CTest\n",
+  "zero_cuda_audit": {
+    "zero_cuda_clean": false,
+    "checked": [
+      {
+        "binary": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151/apps/serve/ingine-serve",
+        "returncode": 0,
+        "cuda_libs": [
+          "libicudata.so.78 => /usr/lib/libicudata.so.78 (0x00007f5609000000)"
+        ]
+      },
+      {
+        "binary": "/home/gpayton/atlas-ingine/native/build-hip-gfx1151/apps/pack/ingine-pack",
+        "returncode": 0,
+        "cuda_libs": [
+          "libicudata.so.78 => /usr/lib/libicudata.so.78 (0x00007fbd7f600000)"
+        ]
+      }
+    ]
+  }
+}
