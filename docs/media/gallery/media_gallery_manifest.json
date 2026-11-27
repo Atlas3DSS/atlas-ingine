@@ -1,6 +1,6 @@
 {
   "schema": "atlas-media-gallery/v1",
-  "updated_at": "2026-11-27T22:39:20Z",
+  "updated_at": "2026-11-27T22:47:49Z",
   "gate": "Each item has a passed attestation receipt, an explicit QA pass verdict, and a file hash that matches the hash recorded in its QA report.",
   "categories": [
     {
@@ -612,67 +612,72 @@
       "channels": 2
     },
     {
-      "id": "showcase-anthem-v4-contact-sheet",
-      "title": "The Star-Spangled Banner showcase, six-frame contact sheet",
+      "id": "showcase-anthem-v5-contact-sheet",
+      "title": "The Star-Spangled Banner showcase, three-frame contact sheet",
       "category": "showcases",
       "kind": "image",
-      "hardware": "RTX PRO 6000 Blackwell (5 segments, stitched on CPU)",
+      "hardware": "RTX PRO 6000 Blackwell Server Edition (7 segments, stitched on CPU)",
       "model": "MiniMax-H3 Ref2VA video with YuE2 48 kHz singing, conditioned by the Inkling-2-Mini Plato's Key (concat4)",
       "caption": "",
       "metrics": [],
       "qa_status": "PASS",
       "receipt": {
-        "id": "att-21c86410",
-        "issued_at": "2026-11-27T22:26:24Z"
+        "id": "att-a5a02535",
+        "issued_at": "2026-11-27T22:47:49Z"
       },
-      "sha256": "c2f297a984cce2e413fed332c6f8445922cafb56673d7fc4886518a2692ebc68",
-      "bytes": 1603729,
+      "sha256": "eb2267591c424bc42f4d66cc38b11e8e451949122c588853504d8fc0a67e451b",
+      "bytes": 681229,
       "preview": {
-        "path": "media/showcase-anthem-v4-contact-sheet.jpg",
+        "path": "media/showcase-anthem-v5-contact-sheet.jpg",
         "mime": "image/jpeg",
-        "bytes": 76731,
-        "sha256": "103bd17c40b0ecf3193037cf5e306ba0cc6e2d2d6b569708fb5b439b783dfe5d"
+        "bytes": 39575,
+        "sha256": "2cbe920034a681c9c5523d1e8aee4e2eaa3e9e1ede0b8fdf32c627f945d43a7c"
       },
       "width": 1920,
-      "height": 778
+      "height": 416
     },
     {
-      "id": "showcase-anthem-v4-video",
-      "title": "The Star-Spangled Banner, 61-second video with singing",
+      "id": "showcase-anthem-v5-video",
+      "title": "The Star-Spangled Banner, 89-second video with singing",
       "category": "showcases",
       "kind": "video",
-      "hardware": "RTX PRO 6000 Blackwell (5 segments, stitched on CPU)",
+      "hardware": "RTX PRO 6000 Blackwell Server Edition (7 segments, stitched on CPU)",
       "model": "MiniMax-H3 Ref2VA video with YuE2 48 kHz singing, conditioned by the Inkling-2-Mini Plato's Key (concat4)",
-      "caption": "",
+      "caption": "The pass is for the music check on the delivered file (key, metre and bar count) and the run's hash-chained trace. A separate automatic frame check, with thresholds set for daylight scenes, passed 0 of 7 sampled frames of this dark stage scene.",
       "metrics": [
         {
           "label": "Length",
-          "value": 61.125,
+          "value": 88.75,
           "unit": "s"
         },
         {
           "label": "Frames",
-          "value": 1467,
+          "value": 2130,
           "unit": ""
+        },
+        {
+          "label": "Time to render, all stages",
+          "value": 2188.56,
+          "unit": "s"
         }
       ],
       "qa_status": "PASS",
       "receipt": {
-        "id": "att-21c86410",
-        "issued_at": "2026-11-27T22:26:24Z"
+        "id": "att-a5a02535",
+        "issued_at": "2026-11-27T22:47:49Z"
       },
-      "sha256": "6c3a0efb15f56038e5d96e962247be75c31dadac55b44355a716dd81b24c2376",
-      "bytes": 26401345,
+      "sha256": "0cb8255203559ccb2c49e79de422dba98322e7af8e2a02239a511121dd44a64c",
+      "bytes": 35388840,
       "preview": {
-        "path": "media/showcase-anthem-v4-video.mp4",
+        "path": "media/showcase-anthem-v5-video.mp4",
         "mime": "video/mp4",
-        "bytes": 5159680,
-        "sha256": "10aa8c87b69a51770baa0e567a1bca6a83bfbb874e7d47b76b278cb6b277ebcd",
-        "poster": "media/showcase-anthem-v4-video_poster.jpg"
+        "bytes": 7074179,
+        "sha256": "83cd7d41516e244ec430dc0fb164dcf9004bc2eba224e30c6fb3609f73416c0a",
+        "poster": "media/showcase-anthem-v5-video_poster.jpg"
       },
       "width": 1024,
       "height": 576,
-      "duration_s": 61.125
+      "duration_s": 88.75
     },
     {
       "id": "voltron-s24u-image",
