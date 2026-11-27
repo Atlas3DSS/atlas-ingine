@@ -71,7 +71,9 @@ Three architectural invariants govern every graft:
 - **Why `concat4` beats single-tap:** Concatenating four loop visits (`9216`-dim → `5120`-dim, `λ = 10,000`) cuts held-out word MSE nearly `3×` (`10.11 → 3.60`), lifts `p10` word cosine from `0.5099` to `0.8159`, and closes the `17`-point functional retention gap (`82.29% → 99.21%`) at a total map cost of `90.0 MiB`.
 - **Why Procrustes failed on cross-dim looped MoE:** Inner-holdout orthogonal Procrustes with global variance matching scored `R² = -0.405` (`cos = 0.575`) on `2304 → 5120` compared to regularized ridge `R² = 0.9948` (`cos = 0.809`). Rectangular cross-family maps require non-orthogonal ridge shrinkage.
 
-### 3.3 Visual Sample (Packet A 8-Domain Contact Sheet)
+### 3.3 Visual Sample & Packet A Adherence Figure
+
+![Packet A Adherence & Map Size](figures/fig1_packetA_adherence_and_size.png)
 
 Four columns across all 8 domains (`teacher_reinject` · `inkling_platos_key_single_tap` · `inkling_platos_key_concat4` · `b0_shuffled_single_tap`), identical `dit_seed` and initial noise per row:
 
@@ -94,6 +96,9 @@ In the reverse direction (Vision → `Inkling-2-Mini` `EmbedRows`), we tested wh
 | **Overall (`N = 192`)** | **89/192 (46.4%)** | **72/192 / 62/192** | **73/192 / 60/192** | **36/192 / 29/192** |
 
 ### 4.2 Mechanism & Packet B2 Intervention
+
+![Packet B Domain Boundary](figures/fig2_packetB_ocr_boundary.png)
+
 - **Result:** `ridge_norm` was **rejected** (`73/192` vs `72/192` agree `p = 1.0`, `60/192` vs `62/192` gold `p = 0.727`; native mean KL worsened `2.24 → 2.38`).
 - **Boundary law:** A closed-form linear map bridges coarse semantic and spatial geometry (`counting_spatial`: `45/48` teacher agreement, `40/48` gold vs `17/48` shuffled), but **cannot recover high-frequency glyph pixels already blurred out by a coarse upstream vision grid**.
 - **Packet B2 causal test (in progress):** Strip the `620M`-parameter text decoder off `stepfun-ai/GOT-OCR2_0` (retaining only its **`191 MB`**, `95.6M`-param high-resolution vision pyramid) and `google/siglip2-base-patch16-naflex` (**`343 MB`** vision-only), apply gradient-guided tile masking (`121/260` uniform background tiles dropped while preserving exact spatial coordinates), and re-fit the exact same closed-form linear bridge onto frozen `Inkling-2-Mini`. Stage 1 extraction finished in `186.8 s` at `1.56 GiB` peak VRAM (`att-5a611ab6`); Stage 2 FP64 ridge fits are running on Quincy CPU.
@@ -125,30 +130,48 @@ Before fitting audio Plato's Keys, Packet C ran a fail-closed Native Gate 0 acro
 
 ---
 
-## 6. System Footprint, Native Video+Audio Diffusion, & Consumer-GPU Ladder
+## 6. System Footprint, Native Video+Audio Diffusion, & Consumer-GPU Targets
 
-Because `MiniMax-H3`'s full **Audio+Video DiT** (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, **`20 GB`** on disk, plus `3.0 GB` video VAE and `578 MB` audio VAE) conditions on the **exact same `Qwen3-VL-32B` Layer-50 `5120`-dim space** as `MiniMax-H3` Image, the **exact same `90.0 MiB` Packet A Plato's Key** targets native video + synchronized audio generation at **zero extra bridge bytes** (functional video temporal-coherence gate `PENDING`). An already-quantized **`12 GB` NVFP4/W4A8** H3 Image DiT (`minimax_h3_image_pruned_nvfp4.safetensors`) is verified on disk.
+All sizes below use **decimal GB (`10^9` bytes)** consistently and separate **measured files / peak VRAM** from **unmeasured projection targets**. Because `MiniMax-H3`'s full **Audio+Video DiT** (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, `21.0 GB` decimal / `20 GiB` on disk, plus `3.2 GB` video VAE and `0.61 GB` audio VAE) conditions on the **exact same `Qwen3-VL-32B` Layer-50 `5120`-dim space** as `MiniMax-H3` Image, the **exact same `94.4 MB` (`90.0 MiB`) Packet A Plato's Key** targets native video + synchronized audio generation at **zero extra bridge bytes** (functional video temporal-coherence gate `PENDING`). An already-quantized **`12.54 GB` (`11.68 GiB`, `12,537,569,802` bytes) NVFP4** H3 Image DiT (`minimax_h3_image_pruned_nvfp4.safetensors`) is also on disk.
 
-| Component | Current Verified Disk / VRAM | Stripped + Atlas-Quantized Target | Precision Invariant |
+### 6.1 Measured Baseline vs Packet A Replacement (Decimal GB)
+
+| Component | Measured Disk (GB) | Measured Peak VRAM (GB) | Status |
 |---|---:|---:|---|
-| `Inkling-2-Mini` Trunk | 19.0 GB (`NVFP4`) / 10.5 GB (`atlas-10.5g`) | **6.0–10.5 GB** | Frozen trunk (`0.0%` forgetting) |
-| All 4 Plato's Key Bridges | **0.14 GB** (`90 + 16 + 7 + 38 MiB`) | **0.14 GB** | Keep FP16 (same `90 MiB` key targets H3 Image & FL2VA Video+Audio) |
-| Sight (`GOT-OCR2` vision tower) | **0.19 GB** *(already stripped)* | **0.19 GB** | `620M` decoder deleted |
-| Ears (`Gemma-4-E2B` Conformer) | 4.90 GB *(unstripped checkpoint)* | **~0.4–0.6 GB** | Strip text LLM, keep Conformer |
-| Mouth (`Qwen3-TTS-1.7B` + codec) | 4.95 GB (`4.3 GB` BF16 + `651 MB` codec) | **~1.5–1.8 GB** | Quantize talker; keep codec FP16 |
-| Diffusion Image (`MiniMax-H3` DiT + VAE) | **13.1 GB** (`12 GB` NVFP4 DiT + `1.1 GB` VAE) *(or `21.1 GB` INT8)* | **13.1 GB** *(already on disk!)* | NVFP4 DiT; keep VAE FP16 |
-| Diffusion Video+Audio (`MiniMax-H3 FL2VA`) | **23.6 GB** (`20 GB` INT8 DiT + `3.0 GB` Video VAE + `0.58 GB` Audio VAE) | **~15.6 GB** *(w/ NVFP4 FL2VA DiT)* | Shares exact same `90 MiB` Packet A key |
-| **Voice + Sight + Text Total** | **~29 GB** *(~20.5 GB elastic)* | **~8.3–11.2 GB** | **100% resident on 12 GB RTX 3060** |
-| **Full 4-Modality (+ Native Image Gen)** | **~42 GB** *(~33.6 GB elastic; −27.1 GB vs teacher)* | **~21.4–24.3 GB** *(or 12 GB w/ 6-step DiT swap)* | Single 24 GB 3090/4090 resident; 12 GB 3060 via burst swap |
+| Eliminated Teacher (`Qwen3-VL-32B` L50 INT8) | **27.14** | **31.47** | Replaced by `0.094 GB` Packet A `concat4` key (`288×` smaller) |
+| `Inkling-2-Mini` NVFP4 Donor Trunk | **19.53** | **21.82** | Measured isolated (`Packet A` report) |
+| `MiniMax-H3` Image DiT INT8 + FP16 VAE | **22.15** (`20.98 + 1.17`) | **25.55** | Measured isolated (`Packet A` report) |
+| Packet A `concat4` / `single_tap` Bridges | **0.094** / **0.024** | — | Fitted FP16 `.safetensors` files (`att-f55d4648`) |
+| Sight (`GOT-OCR2` stripped vision tower) | **0.191** | **1.56** *(Stage 1 extract)* | `620.5M` decoder stripped (`att-5a611ab6`) |
+| Unstripped Ears (`Gemma-4-E2B` INT8) | **5.20** | — | Full checkpoint on disk (Conformer not yet stripped) |
+| Unquantized Mouth (`Qwen3-TTS-1.7B` BF16 + codec) | **~5.31** (`4.62 + 0.68`) | — | Full BF16 weights on disk (not yet quantized) |
+
+### 6.2 Projected Stripped + Quantized Deployment Targets (Not Yet Measured on Silicon)
+
+*(Bridge sizes for B2 Sight `~0.016 GB`, C Ears `0.007 GB`, and C Mouth `0.038 GB` are FP16 shape arithmetic until fitted; Packet A `0.094 GB` is a measured file. Disk weights always understate live VRAM due to KV cache and activations.)*
+
+| Component | Target Weights (Decimal GB) | Precision / Engineering Rule |
+|---|---:|---|
+| `Inkling-2-Mini` Elastic Trunk (`atlas-6g` / `atlas-8g` / `atlas-10.5g`) | **6.0–10.5** *(<=8.5 GB required for 12 GB residency)* | Frozen trunk (`0.0%` forgetting) |
+| All 4 Plato's Key Bridges (`A` measured + `B2/C` shape arithmetic) | **0.16** (`0.094 + 0.016 + 0.007 + 0.038`) | Keep FP16 |
+| Sight (`GOT-OCR2` stripped tower, measured on disk) | **0.19** | Already stripped |
+| Ears (`Gemma-4-E2B` stripped Conformer, target) | **0.40–0.60** | Strip text LLM, keep Conformer |
+| Mouth (`Qwen3-TTS-1.7B` quantized talker + FP16 codec, target) | **1.50–1.80** | Quantize talker; keep `0.68 GB` codec FP16 |
+| **Voice + Sight + Text Weight Sum (exact row sum)** | **8.25–13.25** *(**8.25–11.25** with `<=8.5 GB` trunk)* | **12 GB RTX 3060 residency requires `<=8.5 GB` trunk** (leaving KV/activation headroom) |
+| Diffusion Image (`MiniMax-H3` NVFP4 DiT `12.54 GB` on disk + `1.17 GB` VAE) | **13.71** *(further packing target `~10–11 GB` not yet built)* | Keep `1.17 GB` VAE FP16 |
+| **Full 4-Modality Weight Sum (+ On-Disk NVFP4 H3 Image)** | **21.96–26.96** | Single 24–32 GB card resident (`<=8.5 GB` trunk); 12 GB 3060 requires block-level DiT streaming or further packing to `<=10–11 GB` |
+
+![Measured Footprint vs Target Ladder](figures/fig3_omni_footprint_ladder.png)
 
 ---
 
 ## 7. Pending Sections (Auto-Populating as Gates Clear)
 
-- **Section 7.1 — Packet A Sealed 160-Prompt Confirmation:** `PENDING` (`v4` runner `att-5ddf9e3c` in review; queued at priority 1 on Colab G4 / local PRO 6000).
-- **Section 7.2 — Packet B2 High-Res OCR Repair (Dev-192 & Locked-448):** `PENDING` (Quincy CPU Stage 2 fits running; paired Stock vs Ours tile-mask visual proofs to follow).
-- **Section 7.3 — Packet C Direct Ears & Mouth Phase 0 + Unforced Hello-World Lace:** `PENDING` (lexical minimal pairs, acoustic intonation pairs, silence controls, and unforced greeting audio).
-- **Section 7.4 — Two-Stage Multi-Card Silicon Sweep:**
+- **Section 7.1 — Packet A Sealed 160-Prompt Confirmation & Native `FL2VA` Video+Audio Check:** `PENDING` (`v4` floor cleared `att-615740cb`; priority 1 on Colab G4 / local PRO 6000; FL2VA 4-prompt native video+sound check uses the exact same `90.0 MiB` key).
+- **Section 7.2 — Packet B2 High-Res OCR Repair (Dev-192 & Locked-448):** `PENDING` (Quincy CPU Stage 2 fits running now; paired Stock vs Ours tile-mask visual proofs to follow).
+- **Section 7.3 — Packet C Direct Ears & Mouth Phase 0 + Unforced Representation Lace (`visits 41..47`):** `PENDING` (lexical minimal pairs, acoustic intonation pairs, silence controls, unforced greeting audio, and unscripted visual self-concept).
+- **Section 7.4 — Packet D Singing / Music (`m-a-p/YuE2-3B` + `YuE2-Vae`, 48 kHz Stereo):** `PENDING` (Native Gate 0 + continuous conditioning / ABC-notation score seam, including Inkling singing *The Star-Spangled Banner*, public domain).
+- **Section 7.5 — Two-Stage Multi-Card Silicon Sweep:**
   - *Stage 1 (Local First):* `RTX PRO 6000` (`sm_120a`), `RTX 3090` (`sm_86`), `RTX 4090` (`sm_89`), `V100-32GB` (`sm_70`).
   - *Stage 2 (Vast Full-Fleet Sweep):* `RTX 3060 12GB` through `RTX 5090 32GB` and full Pascal → Blackwell ladder.
-- **Section 7.5 — 100% Model-Authored Showcase Video & Full Auditable Process Trace:** `PENDING` (see [PROCESS_LOG.md](PROCESS_LOG.md)).
+- **Section 7.6 — 100% Model-Authored Showcase Videos & Full Auditable Process Trace + Centaur History (`platonica`):** `PENDING` (see [PROCESS_LOG.md](PROCESS_LOG.md)).

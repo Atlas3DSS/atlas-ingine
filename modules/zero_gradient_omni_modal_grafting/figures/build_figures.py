@@ -17,6 +17,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--packet-a', default=f'{RUNS}/h3_platos_key_phase0_24p_a8146fa7/h3_platos_key_phase0_report.json')
 ap.add_argument('--packet-b', default=f'{RUNS}/vision_ridge_norm_dev_val192/vision_ridge_norm_dev_report.json')
 ap.add_argument('--strip', default=f'{RUNS}/phase0_912_spinup/packetB2_ocr_towers_strip_verify_report.json')
+ap.add_argument('--image-nvfp4', default=os.path.expanduser('~/dev_genius/models/minimax_h3_image_pruned_nvfp4.safetensors'))
 ap.add_argument('--paper', default=os.path.join(HERE, '..', 'PAPER.md'))
 ap.add_argument('--no-png', action='store_true')
 ARGS = ap.parse_args()
@@ -231,15 +232,27 @@ assert DIT_B == MF['dit_h3_image_int8_convrot_plus_vae']['dit_disk_bytes'] and V
 SEC6 = PAPER.split('## 6. System Footprint')[1].split('\n## ')[0]
 
 
+SEC62 = SEC6.split('### 6.2')[1]
+
+
+def trow(label): return next(line.split('|') for line in SEC62.splitlines() if line.startswith('|') and label in line.split('|')[1])
+
+
 def target(label):
-    """Low and high end, in GB, of the target column for one row of the paper's size table."""
-    row = next(line for line in SEC6.splitlines() if line.startswith('|') and label in line.split('|')[1])
-    m = re.search(r'([\d.]+)(?:[' + chr(0x2013) + r'-]([\d.]+))?\s*GB', row.split('|')[3]); return float(m.group(1)), float(m.group(2) or m.group(1))
+    """Low and high end, in GB, of the target cell for one row of the paper's projected-size table."""
+    m = re.search(r'\*\*([\d.]+)(?:' + chr(0x2013) + r'([\d.]+))?\*\*', trow(label)[2]); return float(m.group(1)), float(m.group(2) or m.group(1))
 
 
-TG = {k: target(lab) for k, lab in (('trunk', 'Trunk'), ('maps', 'Bridges'), ('sight', 'Sight'), ('ears', 'Ears'), ('mouth', 'Mouth'), ('image', 'Diffusion'))}
-VST = [sum(TG[k][i] for k in ('trunk', 'maps', 'sight', 'ears', 'mouth')) for i in (0, 1)]; ALL = [VST[i] + TG['image'][i] for i in (0, 1)]
-assert abs(gb(ST['got_ocr2']['stripped_bytes']) - TG['sight'][0]) < 0.01  # the sight target is the stripped tower already on disk
+TG = {k: target(lab) for k, lab in (('trunk', 'Trunk'), ('maps', 'Bridges'), ('sight', 'Sight'), ('ears', 'Ears'), ('mouth', 'Mouth'))}
+CAP = float(re.search(r'<=([\d.]+) GB', trow('Trunk')[2]).group(1))  # largest trunk the paper allows on a 12 GB card
+PACK = tuple(float(v) for v in re.search(r'~([\d.]+)' + chr(0x2013) + r'([\d.]+) GB', trow('Diffusion Image')[2]).groups())
+# The quantized image model is a file on disk, so its size is read from the file, not from the table.
+NV_B = os.path.getsize(ARGS.image_nvfp4); IMG = gb(NV_B + VAE_B); SOURCES[os.path.basename(ARGS.image_nvfp4) + ' (bytes)'] = NV_B
+REST = [sum(TG[k][i] for k in ('maps', 'sight', 'ears', 'mouth')) for i in (0, 1)]
+VST = [TG['trunk'][i] + REST[i] for i in (0, 1)]; VCAP = CAP + REST[1]; ALL = [VST[i] + IMG for i in (0, 1)]
+assert tuple(round(v, 2) for v in VST) == target('Voice + Sight + Text') and abs(gb(ST['got_ocr2']['stripped_bytes']) - TG['sight'][0]) < 0.01
+for nm, mine, theirs in (('image model with VAE', (IMG, IMG), target('Diffusion Image')), ('all four', tuple(ALL), target('Full 4-Modality'))):
+    if any(abs(a_ - b_) > 0.05 for a_, b_ in zip(mine, theirs)): print(f'NOTE: {nm}: files give {mine[0]:.2f} to {mine[1]:.2f} GB, PAPER.md states {theirs[0]:.2f} to {theirs[1]:.2f}')
 
 
 def rng(lo_hi, d=1): return f'{lo_hi[0]:.{d}f}' if lo_hi[0] == lo_hi[1] else f'{lo_hi[0]:.{d}f} to {lo_hi[1]:.{d}f}'
@@ -272,17 +285,18 @@ def fig3():
     s += f'<rect x="{M}" y="{y - 14}" width="66" height="22" fill="none" stroke="{AMBER}" stroke-width="1.5"/>' + t(M + 10, y + 1.5, 'TARGET', 10.5, AMBER, 'start', 700, ls='0.08em') + t(M + 80, y + 2, 'After stripping and quantizing, weights only, from the paper draft', 14.5, INK, 'start', 700) + t(M + 80, y + 21, 'targets, not measurements; no card in this ladder has been run', 12, SEC)
     y += 66; sc2 = (x1 - x0) / 34
     s += f'<defs><pattern id="hatch" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="{BG}"/><rect width="3" height="7" fill="{AMBER}" fill-opacity="0.75"/></pattern></defs>'
-    trows = [('Voice, sight and text', 'trunk, four maps, sight, ears, mouth', VST), ('Image model alone', 'swapped in for a 6-step render', list(TG['image'])), ('All four resident', 'voice, sight, text and image', ALL)]
+    trows = [('Voice, sight and text', 'trunk, four maps, sight, ears, mouth', VST), ('Image model alone', 'NVFP4 file on disk, with VAE', [IMG, IMG]), ('All four resident', 'voice, sight, text and image', ALL)]
     for v in range(0, 35, 4): s += f'<line x1="{x0 + v * sc2:.1f}" x2="{x0 + v * sc2:.1f}" y1="{y - 6}" y2="{y + 3 * 62 - 14}" stroke="{RULE}"/>' + t(x0 + v * sc2, y + 3 * 62 + 4, f'{v} GB' if v else '0', 11.5, SEC, 'middle')
     for v, card in ((12, 'RTX 3060, 12 GB'), (24, 'RTX 3090 or 4090, 24 GB'), (32, 'RTX 5090, 32 GB')):
         s += f'<line x1="{x0 + v * sc2:.1f}" x2="{x0 + v * sc2:.1f}" y1="{y - 22}" y2="{y + 3 * 62 - 14}" stroke="{INK}" stroke-width="1.5" stroke-dasharray="5 4"/>' + t(x0 + v * sc2 - 6, y - 26, card, 11.5, INK, 'end', 700)
     for i, (lab, sub, (lo, hi)) in enumerate(trows):
         yy = y + i * 62; s += t(M, yy + 14, lab, 14, INK, 'start', 700) + t(M, yy + 31, sub, 11.5, SEC)
         s += f'<rect x="{x0}" y="{yy}" width="{lo * sc2:.1f}" height="{BH}" fill="url(#hatch)" stroke="{AMBER}" stroke-width="1"/><rect x="{x0 + lo * sc2:.1f}" y="{yy}" width="{(hi - lo) * sc2:.1f}" height="{BH}" fill="none" stroke="{AMBER}" stroke-width="1" stroke-dasharray="3 3"/>'
-        s += t(x0 + hi * sc2 + 10, yy + 20.5, f'{rng((lo, hi))} GB', 15, INK, 'start', 700)
+        s += t(x0 + hi * sc2 + 10, yy + 20.5, f'{rng((lo, hi), 2)} GB', 15, INK, 'start', 700).replace('<text ', f'<text paint-order="stroke" stroke="{BG}" stroke-width="7" stroke-linejoin="round" ')
+        if i == 0: s += f'<line x1="{x0 + VCAP * sc2:.1f}" x2="{x0 + VCAP * sc2:.1f}" y1="{yy - 5}" y2="{yy + BH + 5}" stroke="{INK}" stroke-width="2.5"/>' + t(x0 + VCAP * sc2, yy + BH + 19, f'{VCAP:.2f} with a trunk of {CAP:g} GB', 11.5, INK, 'end', 700)
     y += 3 * 62 + 40
-    h, y = para(M, y, f'Hatched to the low end of each target, dashed outline to the high end. Parts, in GB: trunk {rng(TG["trunk"])}, four maps {rng(TG["maps"], 2)}, sight tower {rng(TG["sight"], 2)}, ears {rng(TG["ears"])}, mouth {rng(TG["mouth"])}, image model with VAE {rng(TG["image"], 0)}. Totals are the sums of the parts.', 13, SEC, CW - 120, 1.5); s += h
-    f, H = footer(y + 46, f'Upper panel: file sizes of the pinned checkpoints and the fitted map, and peak card memory, as recorded in the Packet A run report. Lower panel: targets only. Weights exclude working memory during generation, and the multi-card sweep that would measure them is pending. The sight tower is already stripped to {gb(ST["got_ocr2"]["stripped_bytes"]):.2f} GB on disk.')
+    h, y = para(M, y, f'Hatched to the low end of each target, dashed outline to the high end. Parts, in GB: trunk {rng(TG["trunk"])}, four maps {rng(TG["maps"], 2)} (one measured file, three computed from their shapes), sight tower {rng(TG["sight"], 2)}, ears {rng(TG["ears"])}, mouth {rng(TG["mouth"])}. Totals are the sums of the parts. The image model at its quantized size on disk is above 12 GB by itself; {PACK[0]:g} to {PACK[1]:g} GB is a further packing target.', 13, SEC, CW - 120, 1.5); s += h
+    f, H = footer(y + 46, f'Upper panel: file sizes of the pinned checkpoints and the fitted map, and peak card memory, as recorded in the Packet A run report. Lower panel: targets, except the quantized image model, the VAE and the sight tower, which are files on disk. Weights exclude working memory during generation, and the multi-card sweep that would measure them is pending.')
     return doc(s + f, H)
 
 
