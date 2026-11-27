@@ -23,9 +23,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <numeric>
 #include <random>
 #include <string>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
@@ -354,6 +356,323 @@ void test_synthetic_gpu_vs_cpu_and_tiered_cache() {
   std::printf("PASS test_synthetic_gpu_vs_cpu_and_tiered_cache\n");
 }
 
+void write_tiny_safetensors_gpu(const std::filesystem::path& path,
+                                const std::vector<std::tuple<std::string, std::string, std::vector<std::int64_t>,
+                                                             std::vector<std::uint8_t>>>& entries) {
+  std::string hdr = "{";
+  std::uint64_t off = 0;
+  std::vector<std::uint8_t> payload;
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    const auto& [name, dtype, shape, bytes] = entries[i];
+    if (i > 0) hdr += ",";
+    hdr += "\"" + name + "\":{\"dtype\":\"" + dtype + "\",\"shape\":[";
+    for (std::size_t j = 0; j < shape.size(); ++j) {
+      if (j > 0) hdr += ",";
+      hdr += std::to_string(shape[j]);
+    }
+    hdr += "],\"data_offsets\":[" + std::to_string(off) + "," + std::to_string(off + bytes.size()) + "]}";
+    off += bytes.size();
+    payload.insert(payload.end(), bytes.begin(), bytes.end());
+  }
+  hdr += "}";
+  std::ofstream out(path, std::ios::binary);
+  CHECK(out.good());
+  const std::uint64_t hlen = hdr.size();
+  out.write(reinterpret_cast<const char*>(&hlen), 8);
+  out.write(hdr.data(), static_cast<std::streamsize>(hdr.size()));
+  out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+}
+
+void test_synthetic_elastic_all_resident_vs_tiered_cache() {
+  TempDir td("synth_elastic_e2e");
+  std::mt19937 rng(20261127u);
+  using EntryTuple = std::tuple<std::string, std::string, std::vector<std::int64_t>, std::vector<std::uint8_t>>;
+  std::vector<EntryTuple> m_entries;
+  std::map<std::string, std::string> weight_map;
+  std::map<std::string, std::string> qlayers;
+
+  auto f32_rand = [&](std::size_t n, float sd, float mean = 0.0f) {
+    std::normal_distribution<float> dist(mean, sd);
+    std::vector<std::uint8_t> b(n * sizeof(float));
+    for (std::size_t i = 0; i < n; ++i) {
+      const float v = dist(rng);
+      std::memcpy(b.data() + i * sizeof(float), &v, sizeof(float));
+    }
+    return b;
+  };
+  auto bf16_rand = [&](std::size_t n, float sd) {
+    std::normal_distribution<float> dist(0.0f, sd);
+    std::vector<std::uint8_t> b(n * 2);
+    for (std::size_t i = 0; i < n; ++i) {
+      const float v = dist(rng);
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &v, sizeof(bits));
+      const std::uint16_t h = static_cast<std::uint16_t>(bits >> 16);
+      std::memcpy(b.data() + i * 2, &h, 2);
+    }
+    return b;
+  };
+  auto f32_scalar = [](float v) {
+    std::vector<std::uint8_t> b(4);
+    std::memcpy(b.data(), &v, 4);
+    return b;
+  };
+  auto e4m3_rand = [&](std::size_t n) {
+    // Non-NaN E4M3FN bytes in valid low-magnitude range (exp 1..10).
+    std::uniform_int_distribution<int> d_sign(0, 1), d_exp(2, 8), d_m(0, 7);
+    std::vector<std::uint8_t> b(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      b[i] = static_cast<std::uint8_t>((d_sign(rng) << 7) | (d_exp(rng) << 3) | d_m(rng));
+    }
+    return b;
+  };
+  auto u8_rand = [&](std::size_t n) {
+    std::uniform_int_distribution<int> d(0, 255);
+    std::vector<std::uint8_t> b(n);
+    for (std::size_t i = 0; i < n; ++i) b[i] = static_cast<std::uint8_t>(d(rng));
+    return b;
+  };
+  auto push_m = [&](const std::string& k, const std::string& dt, std::vector<std::int64_t> sh,
+                    std::vector<std::uint8_t> bytes) {
+    weight_map[k] = "model-00001-of-00001.safetensors";
+    m_entries.emplace_back(k, dt, std::move(sh), std::move(bytes));
+  };
+  auto add_f32 = [&](const std::string& k, std::vector<std::int64_t> sh, float sd, float mean = 0.0f) {
+    std::size_t n = 1;
+    for (auto d : sh) n *= static_cast<std::size_t>(d);
+    push_m(k, "F32", std::move(sh), f32_rand(n, sd, mean));
+  };
+  auto add_bf16 = [&](const std::string& k, std::vector<std::int64_t> sh, float sd) {
+    std::size_t n = 1;
+    for (auto d : sh) n *= static_cast<std::size_t>(d);
+    push_m(k, "BF16", std::move(sh), bf16_rand(n, sd));
+  };
+  auto add_fp8 = [&](const std::string& pref, int out_f, int in_f) {
+    push_m(pref + ".weight", "F8_E4M3", {out_f, in_f}, e4m3_rand(static_cast<std::size_t>(out_f) * in_f));
+    push_m(pref + ".weight_scale", "F32", {}, f32_scalar(0.05f));
+    qlayers[pref] = R"({"quant_algo":"FP8"})";
+  };
+  auto add_packed_2d = [&](const std::string& pref, const std::string& algo, int out_f, int in_f) {
+    const int pk = (algo == "NVFP4") ? (in_f / 2) : (algo == "ATLAS3" ? (in_f * 3) / 8 : in_f / 4);
+    push_m(pref + ".weight", "U8", {out_f, pk}, u8_rand(static_cast<std::size_t>(out_f) * pk));
+    push_m(pref + ".weight_scale", "F8_E4M3", {out_f, in_f / 16},
+           std::vector<std::uint8_t>(static_cast<std::size_t>(out_f) * (in_f / 16), 0x38u));
+    push_m(pref + ".weight_scale_2", "F32", {}, f32_scalar(0.05f));
+    qlayers[pref] = std::string(R"({"quant_algo":")") + algo + R"(","group_size":16})";
+  };
+  auto add_moe = [&](const std::string& pref, const std::string& algo, int E, int out_f, int in_f) {
+    const int pk = (algo == "NVFP4") ? (in_f / 2) : (algo == "ATLAS3" ? (in_f * 3) / 8 : in_f / 4);
+    push_m(pref + ".weight", "U8", {E, out_f, pk}, u8_rand(static_cast<std::size_t>(E) * out_f * pk));
+    push_m(pref + ".weight_scale", "F8_E4M3", {E, out_f, in_f / 16},
+           std::vector<std::uint8_t>(static_cast<std::size_t>(E) * out_f * (in_f / 16), 0x38u));
+    std::vector<std::uint8_t> s2(static_cast<std::size_t>(E) * 4);
+    for (int e = 0; e < E; ++e) {
+      const float v = 0.04f + 0.01f * float(e);
+      std::memcpy(s2.data() + static_cast<std::size_t>(e) * 4, &v, 4);
+    }
+    push_m(pref + ".weight_scale_2", "F32", {E}, std::move(s2));
+    qlayers[pref] = std::string(R"({"quant_algo":")") + algo + R"(","group_size":16,"per_expert_scale_2":true})";
+  };
+
+  const int V = 24, H = 32, hc = 2, hc_dim = 64, hc_lr = 8, E = 6, ff_e = 32, ff_s = 32;
+  const int conv_dim = 64, val_dim = 32, v_heads = 4, ssm_k = 4, ssm_state = 8;
+  const int q_dim = 128, kv_dim = 32, attn_in = 64, hd = 16, idx_h = 2, idx_d = 16;
+
+  add_packed_2d("token_embd", "NVFP4", V, H);
+  add_packed_2d("output", "NVFP4", V, H);
+  add_f32("output_hc_norm.weight", {hc_dim}, 0.05f, 1.0f);
+  add_bf16("output_hc_down.weight", {hc_lr, hc_dim}, 0.1f);
+  add_f32("output_hc_up.weight", {hc_dim, hc_lr}, 0.1f);
+
+  for (int il = 0; il < 2; ++il) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+    add_f32(p + "hc_attn_norm.weight", {hc_dim}, 0.05f, 1.0f);
+    add_bf16(p + "hc_attn_down.weight", {hc_lr, hc_dim}, 0.1f);
+    add_f32(p + "hc_attn_up.weight", {hc_dim, hc_lr}, 0.1f);
+    add_bf16(p + "hc_attn_inject.weight", {hc, hc_dim}, 0.1f);
+    add_f32(p + "hc_ffn_norm.weight", {hc_dim}, 0.05f, 1.0f);
+    add_bf16(p + "hc_ffn_down.weight", {hc_lr, hc_dim}, 0.1f);
+    add_f32(p + "hc_ffn_up.weight", {hc_dim, hc_lr}, 0.1f);
+    add_bf16(p + "hc_ffn_inject.weight", {hc, hc_dim}, 0.1f);
+    if (il == 0) {
+      add_fp8(p + "ple_key", hc_dim, H);
+      add_fp8(p + "ple_value", H, H);
+      add_f32(p + "ple_norm_key.weight", {hc_dim}, 0.05f, 1.0f);
+      add_f32(p + "ple_norm_query.weight", {hc_dim}, 0.05f, 1.0f);
+      add_f32(p + "ple_norm_conv.weight", {hc_dim}, 0.05f, 1.0f);
+      add_f32(p + "ple_conv1d.weight", {hc_dim, 4}, 0.1f);
+      add_fp8(p + "attn_qkv", conv_dim, H);
+      add_fp8(p + "attn_gate", val_dim, H);
+      add_bf16(p + "ssm_alpha.weight", {v_heads, H}, 0.1f);
+      add_f32(p + "ssm_beta.weight", {v_heads, H}, 0.1f);
+      add_fp8(p + "ssm_out", H, val_dim);
+      add_f32(p + "ssm_conv1d.weight", {conv_dim, ssm_k}, 0.1f);
+      add_f32(p + "ssm_dt.bias", {v_heads}, 0.05f);
+      add_f32(p + "ssm_a", {v_heads}, 0.05f, -0.5f);
+      add_f32(p + "ssm_norm.weight", {ssm_state}, 0.05f, 1.0f);
+      add_packed_2d(p + "ffn_gate_shexp", "NVFP4", ff_s, H);
+      add_packed_2d(p + "ffn_up_shexp", "ATLAS3", ff_s, H);
+      add_packed_2d(p + "ffn_down_shexp", "ATLAS2", H, ff_s);
+      add_moe(p + "ffn_gate_exps", "ATLAS3", E, ff_e, H);
+      add_moe(p + "ffn_up_exps", "ATLAS3", E, ff_e, H);
+      add_moe(p + "ffn_down_exps", "ATLAS3", E, H, ff_e);
+    } else {
+      add_fp8(p + "attn_q", q_dim, H);
+      add_fp8(p + "attn_k", kv_dim, H);
+      add_fp8(p + "attn_v", kv_dim, H);
+      add_fp8(p + "attn_output", H, attn_in);
+      add_f32(p + "attn_q_norm.weight", {hd}, 0.05f, 1.0f);
+      add_f32(p + "attn_k_norm.weight", {hd}, 0.05f, 1.0f);
+      add_fp8(p + "indexer.q_proj", idx_h * idx_d, H);
+      add_fp8(p + "indexer.k_proj", idx_d, H);
+      add_f32(p + "indexer.q_norm.weight", {idx_d}, 0.05f, 1.0f);
+      add_f32(p + "indexer.k_norm.weight", {idx_d}, 0.05f, 1.0f);
+      add_fp8(p + "ffn_gate_shexp", ff_s, H);
+      add_fp8(p + "ffn_up_shexp", ff_s, H);
+      add_fp8(p + "ffn_down_shexp", H, ff_s);
+      add_moe(p + "ffn_gate_exps", "NVFP4", E, ff_e, H);
+      add_moe(p + "ffn_up_exps", "ATLAS2", E, ff_e, H);
+      add_moe(p + "ffn_down_exps", "ATLAS3", E, H, ff_e);
+    }
+    add_bf16(p + "ffn_gate_inp.weight", {E, H}, 0.25f);
+    add_f32(p + "ffn_gate_inp_shexp.weight", {H}, 0.1f);
+  }
+  write_tiny_safetensors_gpu(td.path / "model-00001-of-00001.safetensors", m_entries);
+
+  // Two NVFP4 PLE chunks covering 40 rows (head_offsets={0, 20}, head_vocab_sizes={19, 19}), ple_head_dim=16.
+  for (int si = 0; si < 2; ++si) {
+    const std::string fn = "ple-0000" + std::to_string(si + 1) + "-of-00002.safetensors";
+    const std::string pref = "ple.chunk_" + std::to_string(si);
+    write_tiny_safetensors_gpu(td.path / fn, {
+        {pref + ".weight", "U8", {20, 8}, u8_rand(20 * 8)},
+        {pref + ".weight_scale", "F8_E4M3", {20, 1}, std::vector<std::uint8_t>(20, 0x38u)},
+        {pref + ".weight_scale_2", "F32", {}, f32_scalar(0.05f)},
+    });
+    weight_map[pref + ".weight"] = fn;
+    weight_map[pref + ".weight_scale"] = fn;
+    weight_map[pref + ".weight_scale_2"] = fn;
+  }
+
+  {
+    std::ofstream cfg(td.path / "config.json");
+    cfg << R"({
+      "model_type": "qwen4exp",
+      "architectures": ["Qwen4ExpForCausalLM"],
+      "gguf_kv": {
+        "general.architecture": "qwen4exp",
+        "general.name": "Qwen3.8-Flash-Next-SynthElasticGpu",
+        "qwen4exp.block_count": 2,
+        "qwen4exp.embedding_length": 32,
+        "qwen4exp.context_length": 128,
+        "qwen4exp.attention.layer_norm_rms_epsilon": 1e-6,
+        "qwen4exp.hyper_connection.count": 2,
+        "qwen4exp.hyper_connection.low_rank": 8,
+        "qwen4exp.full_attention_interval": 2,
+        "qwen4exp.attention.head_count": 4,
+        "qwen4exp.attention.head_count_kv": 2,
+        "qwen4exp.attention.key_length": 16,
+        "qwen4exp.attention.value_length": 16,
+        "qwen4exp.rope.dimension_count": 8,
+        "qwen4exp.rope.freq_base": 10000000.0,
+        "qwen4exp.rope.dimension_sections": [2, 2, 0, 0],
+        "qwen4exp.attention.indexer.head_count": 2,
+        "qwen4exp.attention.indexer.key_length": 16,
+        "qwen4exp.attention.indexer.top_k": 8,
+        "qwen4exp.attention.compress_ratios": [0, 4],
+        "qwen4exp.ssm.conv_kernel": 4,
+        "qwen4exp.ssm.state_size": 8,
+        "qwen4exp.ssm.group_count": 2,
+        "qwen4exp.ssm.time_step_rank": 4,
+        "qwen4exp.ssm.inner_size": 32,
+        "qwen4exp.expert_count": 6,
+        "qwen4exp.expert_used_count": 2,
+        "qwen4exp.expert_feed_forward_length": 32,
+        "qwen4exp.expert_shared_feed_forward_length": 32,
+        "qwen4exp.ple.layers": [0],
+        "qwen4exp.ple.ngram_size": 2,
+        "qwen4exp.ple.heads_per_ngram": 2,
+        "qwen4exp.ple.conv_kernel": 4,
+        "qwen4exp.embedding_length_per_layer_input": 16,
+        "qwen4exp.ple.eos_token_id": 0,
+        "qwen4exp.ple.layer_multipliers": [23703573157769, 20109073645365],
+        "qwen4exp.ple.head_offsets": [0, 20],
+        "qwen4exp.ple.head_vocab_sizes": [19, 19]
+      }
+    })";
+  }
+  {
+    std::ofstream idx(td.path / "model.safetensors.index.json");
+    idx << "{\"metadata\":{\"total_size\":1024},\"weight_map\":{";
+    bool first = true;
+    for (const auto& [k, sf] : weight_map) {
+      if (!first) idx << ",";
+      first = false;
+      idx << "\"" << k << "\":\"" << sf << "\"";
+    }
+    idx << "}}\n";
+  }
+  {
+    std::ofstream qcfg(td.path / "hf_quant_config.json");
+    qcfg << "{\"producer\":{\"name\":\"atlas-ingine-elastic\",\"version\":\"1.0\"},"
+         << "\"quantization\":{\"quant_algo\":\"MIXED_PRECISION\",\"quantized_layers\":{";
+    bool first = true;
+    for (const auto& [k, vj] : qlayers) {
+      if (!first) qcfg << ",";
+      first = false;
+      qcfg << "\"" << k << "\":" << vj;
+    }
+    qcfg << "}},\"atlas_elastic\":{\"family\":\"qwen4exp\",\"profile\":\"atlas-56g\","
+         << "\"ple\":{\"format\":\"nvfp4\",\"num_shards\":2,\"chunk_rows\":20}}}\n";
+  }
+
+  const std::vector<std::int32_t> seq = {3, 7, 11, 2, 19, 5, 13, 17, 23, 1, 4, 8, 12, 15};
+
+  // Mode A: Elastic AllResident GPU
+  std::vector<float> logits_all_res;
+  {
+    Qwen4ExpGpuLoadOptions opts;
+    opts.model_dir = td.path;
+    opts.max_ctx = 64;
+    Qwen4ExpGpuBackend gpu(opts);
+    CHECK(gpu.load_stats().all_experts_resident);
+    auto sess = gpu.create_session();
+    auto* gs = dynamic_cast<Qwen4ExpGpuSession*>(sess.get());
+    CHECK(gs != nullptr);
+    for (std::size_t i = 0; i < seq.size(); ++i) {
+      logits_all_res = gpu.forward_token_logits_gpu(*gs, seq[i], /*compute_logits=*/i + 1 == seq.size());
+    }
+    for (float v : logits_all_res) CHECK(std::isfinite(v));
+  }
+
+  // Mode B: Elastic TieredExpertCache GPU (forced 3-slot LRU -> exercises fetch_elastic misses, hits, & evictions)
+  std::vector<float> logits_tiered;
+  {
+    // Max slot stride across L0(ATLAS3) and L1(NVFP4/ATLAS2/ATLAS3):
+    // max_gate = 32*16+32*2 = 576, max_up = 32*12+32*2 = 448, max_down = 32*12+32*2 = 448 -> slot = 1472 B -> 3 slots = 4416 B.
+    Qwen4ExpGpuLoadOptions opts;
+    opts.model_dir = td.path;
+    opts.max_ctx = 64;
+    opts.expert_cache_bytes = 3 * (576 + 448 + 448);
+    Qwen4ExpGpuBackend gpu(opts);
+    CHECK(!gpu.load_stats().all_experts_resident);
+    CHECK(gpu.load_stats().expert_cache_slots == 3);
+    auto sess = gpu.create_session();
+    auto* gs = dynamic_cast<Qwen4ExpGpuSession*>(sess.get());
+    CHECK(gs != nullptr);
+    for (std::size_t i = 0; i < seq.size(); ++i) {
+      logits_tiered = gpu.forward_token_logits_gpu(*gs, seq[i], /*compute_logits=*/i + 1 == seq.size());
+    }
+    const auto cs = gpu.expert_cache_stats();
+    const float diff = max_abs(logits_all_res, logits_tiered);
+    std::printf("  Elastic AllResident vs TieredExpertCache max_abs=%.6e (slots=%llu hits=%llu misses=%llu)\n", diff,
+                static_cast<unsigned long long>(cs.slots_capacity), static_cast<unsigned long long>(cs.hits),
+                static_cast<unsigned long long>(cs.misses));
+    CHECK(diff < 1e-6f);
+    CHECK(cs.misses > 0);
+  }
+  std::printf("PASS test_synthetic_elastic_all_resident_vs_tiered_cache\n");
+}
+
 void test_real_gguf_if_configured() {
   const char* gguf_dir = std::getenv("INGINE_QWEN4EXP_GGUF_DIR");
   if (!gguf_dir || !*gguf_dir) return;
@@ -484,6 +803,7 @@ int main() {
   const bool real_only = std::getenv("INGINE_QWEN4EXP_REAL_ONLY") != nullptr;
   if (!real_only) {
     test_synthetic_gpu_vs_cpu_and_tiered_cache();
+    test_synthetic_elastic_all_resident_vs_tiered_cache();
   }
   test_real_gguf_if_configured();
   std::printf("qwen4exp_gpu_e2e: PASS\n");

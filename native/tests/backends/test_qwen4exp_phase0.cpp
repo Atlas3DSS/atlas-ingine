@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <string>
 #include <tuple>
@@ -1311,8 +1312,143 @@ void test_elastic_consumer_layout_rejections() {
   expect_rejected("el_ple_ext_nonzero", [](SyntheticElasticPack& pk) {
     pk.ple_format = "external";  // ple_chunks still has 2 entries -> num_shards=2
   });
+  // 28. Embedded PLE shards with empty ple_layers (and empty/short head_offsets/vocab_sizes) must be rejected before indexing.
+  {
+    TempDir td("el_ple_empty_layers");
+    auto pk = SyntheticElasticPack::make_valid(/*with_ple=*/true, /*f32_embed=*/false);
+    pk.write_to(td.path);
+    // Rewrite config.json with ple.layers=[] alongside stray PLE metadata and empty head_offsets/head_vocab_sizes.
+    std::ifstream in(td.path / "config.json");
+    std::string cfg((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    const auto pos = cfg.find("\"qwen4exp.ple.layers\": [0]");
+    CHECK(pos != std::string::npos);
+    cfg.replace(pos, std::strlen("\"qwen4exp.ple.layers\": [0]"), "\"qwen4exp.ple.layers\": []");
+    const auto p_off = cfg.find("\"qwen4exp.ple.head_offsets\": [0, 2]");
+    CHECK(p_off != std::string::npos);
+    cfg.replace(p_off, std::strlen("\"qwen4exp.ple.head_offsets\": [0, 2]"), "\"qwen4exp.ple.head_offsets\": []");
+    const auto p_voc = cfg.find("\"qwen4exp.ple.head_vocab_sizes\": [2, 2]");
+    CHECK(p_voc != std::string::npos);
+    cfg.replace(p_voc, std::strlen("\"qwen4exp.ple.head_vocab_sizes\": [2, 2]"),
+                "\"qwen4exp.ple.head_vocab_sizes\": []");
+    std::ofstream out(td.path / "config.json", std::ios::trunc);
+    out << cfg;
+    out.close();
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+  // 29. Embedded PLE shards when config.json omits ple.layers completely must also be rejected.
+  {
+    TempDir td("el_ple_missing_layers");
+    auto pk = SyntheticElasticPack::make_valid(/*with_ple=*/false, /*f32_embed=*/false);
+    pk.write_to(td.path);
+    // Inject embedded PLE config into hf_quant_config.json + a PLE shard while config.json has PLE disabled.
+    write_tiny_safetensors(td.path / "ple-00001-of-00001.safetensors", {
+        {"ple.chunk_0.weight", "U8", {2, 8}, std::vector<std::uint8_t>(16, 0x22u)},
+        {"ple.chunk_0.weight_scale", "F8_E4M3", {2, 1}, std::vector<std::uint8_t>(2, 0x38u)},
+        {"ple.chunk_0.weight_scale_2", "F32", {}, SyntheticElasticPack::f32_bytes(1, 0.25f)},
+    });
+    {
+      std::ifstream in(td.path / "model.safetensors.index.json");
+      std::string idx((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      in.close();
+      const auto p = idx.rfind("}}");
+      CHECK(p != std::string::npos);
+      idx.insert(p,
+                 ",\"ple.chunk_0.weight\":\"ple-00001-of-00001.safetensors\""
+                 ",\"ple.chunk_0.weight_scale\":\"ple-00001-of-00001.safetensors\""
+                 ",\"ple.chunk_0.weight_scale_2\":\"ple-00001-of-00001.safetensors\"");
+      std::ofstream out(td.path / "model.safetensors.index.json", std::ios::trunc);
+      out << idx;
+    }
+    {
+      std::ifstream in(td.path / "hf_quant_config.json");
+      std::string qc((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      in.close();
+      const auto p = qc.find("\"format\": \"external\", \"num_shards\": 0");
+      CHECK(p != std::string::npos);
+      qc.replace(p, std::strlen("\"format\": \"external\", \"num_shards\": 0"),
+                 "\"format\": \"nvfp4\", \"num_shards\": 1");
+      std::ofstream out(td.path / "hf_quant_config.json", std::ios::trunc);
+      out << qc;
+    }
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+  // 30. Valid PLE-disabled Elastic model (explicit ple.layers=[], ple.format=external, num_shards=0) MUST load cleanly.
+  {
+    TempDir td("el_ple_disabled_ok");
+    auto pk = SyntheticElasticPack::make_valid(/*with_ple=*/false, /*f32_embed=*/false);
+    pk.write_to(td.path);
+    std::ifstream in(td.path / "config.json");
+    std::string cfg((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    const auto p = cfg.find("\"qwen4exp.expert_shared_feed_forward_length\": 32");
+    CHECK(p != std::string::npos);
+    cfg.insert(p + std::strlen("\"qwen4exp.expert_shared_feed_forward_length\": 32"),
+               ",\n    \"qwen4exp.ple.layers\": []");
+    std::ofstream out(td.path / "config.json", std::ios::trunc);
+    out << cfg;
+    out.close();
+    const auto eset = Qwen4ExpElasticSet::inspect_headers(td.path);
+    CHECK(!eset.has_embedded_ple());
+    CHECK(eset.config().ple_layers.empty());
+    CHECK(eset.config().ple_n_heads() == 0);
+    CHECK(eset.config().ple_conv_history_cols() == 0);
+  }
+  // 31. Direct Qwen4ExpConfig wide-checked PLE overflow & inconsistent PLE-disabled rejection tests.
+  {
+    const auto base_model = Qwen4ExpMiniModelCpu::make_synthetic(123u);
+    const Qwen4ExpConfig base = base_model.config();
 
-  std::printf("PASS test_elastic_consumer_layout_rejections (27 dense/MoE/PLE consumer layout rejection cases)\n");
+    // Valid PLE-disabled config passes finalize_and_validate().
+    {
+      Qwen4ExpConfig disabled = base;
+      disabled.ple_layers.clear();
+      disabled.ple_ngram_size = 0;
+      disabled.ple_heads_per_ngram = 0;
+      disabled.ple_conv_kernel = 0;
+      disabled.ple_head_dim = 0;
+      disabled.ple_layer_multipliers.clear();
+      disabled.ple_head_offsets.clear();
+      disabled.ple_head_vocab_sizes.clear();
+      disabled.finalize_and_validate();
+      CHECK(disabled.ple_n_heads() == 0 && disabled.ple_conv_history_cols() == 0);
+    }
+    // Inconsistent PLE-disabled config (empty ple_layers with non-zero PLE hyperparameters) must throw.
+    {
+      Qwen4ExpConfig bad = base;
+      bad.ple_layers.clear();
+      CHECK_THROWS(bad.finalize_and_validate());
+    }
+    // Signed int overflow in (ple_ngram_size - 1) * ple_heads_per_ngram must throw (wide checked arithmetic).
+    {
+      Qwen4ExpConfig ovf_heads = base;
+      ovf_heads.ple_ngram_size = 8;
+      ovf_heads.ple_heads_per_ngram = std::numeric_limits<int>::max();
+      CHECK_THROWS(ovf_heads.finalize_and_validate());
+    }
+    // Signed int overflow in (ple_conv_kernel - 1) * ple_ngram_size must throw (wide checked arithmetic).
+    {
+      Qwen4ExpConfig ovf_conv = base;
+      ovf_conv.ple_ngram_size = 4;
+      ovf_conv.ple_conv_kernel = std::numeric_limits<int>::max();
+      CHECK_THROWS(ovf_conv.finalize_and_validate());
+    }
+    // Signed int overflow in ple_conv_history_cols * hc_dim must throw.
+    {
+      Qwen4ExpConfig ovf_hist_hc = base;
+      ovf_hist_hc.ple_conv_kernel = 100000000;
+      CHECK_THROWS(ovf_hist_hc.finalize_and_validate());
+    }
+    // Unsigned 64-bit overflow in ple_head_offsets[h] + ple_head_vocab_sizes[h] must throw.
+    {
+      Qwen4ExpConfig ovf_vocab = base;
+      ovf_vocab.ple_head_offsets[0] = std::numeric_limits<std::uint64_t>::max() - 1;
+      ovf_vocab.ple_head_vocab_sizes[0] = 4;
+      CHECK_THROWS(ovf_vocab.finalize_and_validate());
+    }
+  }
+
+  std::printf("PASS test_elastic_consumer_layout_rejections (31 dense/MoE/PLE/config layout & overflow cases)\n");
 }
 
 void test_real_quincy_elastic_packs() {

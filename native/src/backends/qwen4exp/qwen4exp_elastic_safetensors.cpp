@@ -258,17 +258,22 @@ Qwen4ExpElasticSet Qwen4ExpElasticSet::inspect_headers(const std::filesystem::pa
   c.expert_weights_scale = kv.value(p + "expert_weights_scale", 1.0f);
   if (c.expert_weights_scale == 0.0f) c.expert_weights_scale = 1.0f;
 
-  if (kv.contains(p + "ple.layers") && kv[p + "ple.layers"].is_array()) {
+  if (kv.contains(p + "ple.layers")) {
+    if (!kv[p + "ple.layers"].is_array()) {
+      throw std::invalid_argument("config.json ple.layers must be an array");
+    }
     c.ple_layers = kv[p + "ple.layers"].get<std::vector<int>>();
-    c.ple_ngram_size = kv.at(p + "ple.ngram_size").get<int>();
-    c.ple_heads_per_ngram = kv.at(p + "ple.heads_per_ngram").get<int>();
-    c.ple_conv_kernel = kv.at(p + "ple.conv_kernel").get<int>();
-    c.ple_head_dim = kv.at(p + "embedding_length_per_layer_input").get<int>();
-    c.ple_eos_token_id = kv.at(p + "ple.eos_token_id").get<std::int32_t>();
-    c.ple_image_token_id = kv.value(p + "ple.image_token_id", 0);
-    c.ple_layer_multipliers = kv.at(p + "ple.layer_multipliers").get<std::vector<std::uint64_t>>();
-    c.ple_head_offsets = kv.at(p + "ple.head_offsets").get<std::vector<std::uint64_t>>();
-    c.ple_head_vocab_sizes = kv.at(p + "ple.head_vocab_sizes").get<std::vector<std::uint64_t>>();
+    if (!c.ple_layers.empty()) {
+      c.ple_ngram_size = kv.at(p + "ple.ngram_size").get<int>();
+      c.ple_heads_per_ngram = kv.at(p + "ple.heads_per_ngram").get<int>();
+      c.ple_conv_kernel = kv.at(p + "ple.conv_kernel").get<int>();
+      c.ple_head_dim = kv.at(p + "embedding_length_per_layer_input").get<int>();
+      c.ple_eos_token_id = kv.at(p + "ple.eos_token_id").get<std::int32_t>();
+      c.ple_image_token_id = kv.value(p + "ple.image_token_id", 0);
+      c.ple_layer_multipliers = kv.at(p + "ple.layer_multipliers").get<std::vector<std::uint64_t>>();
+      c.ple_head_offsets = kv.at(p + "ple.head_offsets").get<std::vector<std::uint64_t>>();
+      c.ple_head_vocab_sizes = kv.at(p + "ple.head_vocab_sizes").get<std::vector<std::uint64_t>>();
+    }
   }
 
   // Parse quantized_layers map fail-closed (no silent fallback on unknown quant_algo or group_size != 16).
@@ -400,8 +405,21 @@ Qwen4ExpElasticSet Qwen4ExpElasticSet::inspect_headers(const std::filesystem::pa
 
   // Validate embedded host-only PLE shard tensors at ingress against config PLE geometry and row bounds.
   if (set.ple_num_shards_ > 0 && set.ple_format_ != "external") {
-    if (c.ple_n_heads() <= 0 || c.ple_head_dim <= 0) {
-      throw std::invalid_argument("embedded PLE shards require valid PLE config (ple_n_heads and ple_head_dim > 0)");
+    if (c.ple_layers.empty()) {
+      throw std::invalid_argument("embedded PLE shards require non-empty ple.layers in config.json");
+    }
+    const std::int64_t ple_heads_64 =
+        (c.ple_ngram_size >= 2 && c.ple_heads_per_ngram > 0)
+            ? static_cast<std::int64_t>(c.ple_ngram_size - 1) * static_cast<std::int64_t>(c.ple_heads_per_ngram)
+            : 0;
+    if (ple_heads_64 <= 0 || ple_heads_64 > 64 || c.ple_head_dim <= 0) {
+      throw std::invalid_argument(
+          "embedded PLE shards require valid PLE config (ple_n_heads in [1, 64] and ple_head_dim > 0)");
+    }
+    const std::size_t n_ple_heads = static_cast<std::size_t>(ple_heads_64);
+    if (c.ple_head_offsets.size() != n_ple_heads || c.ple_head_vocab_sizes.size() != n_ple_heads) {
+      throw std::invalid_argument(
+          "embedded PLE shards require ple_head_offsets and ple_head_vocab_sizes length == ple_n_heads");
     }
     const std::int64_t ple_dim = static_cast<std::int64_t>(c.ple_head_dim);
     std::uint64_t total_ple_rows = 0;
@@ -468,10 +486,10 @@ Qwen4ExpElasticSet Qwen4ExpElasticSet::inspect_headers(const std::filesystem::pa
       }
     }
 
-    for (int h = 0; h < c.ple_n_heads(); ++h) {
+    for (std::size_t h = 0; h < n_ple_heads; ++h) {
       const std::uint64_t end_row = checked_add_u64(
-          c.ple_head_offsets[static_cast<std::size_t>(h)],
-          c.ple_head_vocab_sizes[static_cast<std::size_t>(h)],
+          c.ple_head_offsets[h],
+          c.ple_head_vocab_sizes[h],
           "ple head end_row");
       if (end_row > total_ple_rows) {
         throw std::invalid_argument("PLE head vocab exceeds embedded PLE shard row count");

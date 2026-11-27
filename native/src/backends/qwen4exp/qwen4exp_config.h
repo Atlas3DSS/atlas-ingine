@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -82,10 +83,16 @@ struct Qwen4ExpConfig {
   [[nodiscard]] int full_q_out_dim() const noexcept { return num_attention_heads * head_dim * 2; }
   [[nodiscard]] int full_kv_out_dim() const noexcept { return num_key_value_heads * head_dim; }
   [[nodiscard]] int ple_n_heads() const noexcept {
-    return (ple_ngram_size >= 2 && ple_heads_per_ngram > 0) ? (ple_ngram_size - 1) * ple_heads_per_ngram : 0;
+    if (ple_layers.empty() || ple_ngram_size < 2 || ple_heads_per_ngram <= 0) return 0;
+    const std::int64_t n =
+        static_cast<std::int64_t>(ple_ngram_size - 1) * static_cast<std::int64_t>(ple_heads_per_ngram);
+    return (n > 0 && n <= std::numeric_limits<int>::max()) ? static_cast<int>(n) : 0;
   }
   [[nodiscard]] int ple_conv_history_cols() const noexcept {
-    return (ple_conv_kernel > 1 && ple_ngram_size > 0) ? (ple_conv_kernel - 1) * ple_ngram_size : 0;
+    if (ple_layers.empty() || ple_conv_kernel <= 1 || ple_ngram_size <= 0) return 0;
+    const std::int64_t cols =
+        static_cast<std::int64_t>(ple_conv_kernel - 1) * static_cast<std::int64_t>(ple_ngram_size);
+    return (cols > 0 && cols <= std::numeric_limits<int>::max()) ? static_cast<int>(cols) : 0;
   }
   [[nodiscard]] bool is_ple(int layer) const noexcept {
     return layer >= 0 && static_cast<std::size_t>(layer) < is_ple_layer.size() && is_ple_layer[layer] != 0;

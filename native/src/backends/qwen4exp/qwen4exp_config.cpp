@@ -44,7 +44,7 @@ void Qwen4ExpConfig::finalize_and_validate() {
   if (hc_mult <= 0 || hc_low_rank <= 0) {
     throw std::invalid_argument("Qwen4ExpConfig: hyper_connection count and low_rank must be positive");
   }
-  (void)checked_mul_pos_i32(hc_mult, hidden_size, "hc_dim");
+  const std::int64_t hc_dim_val = checked_mul_pos_i32(hc_mult, hidden_size, "hc_dim");
   if (num_attention_heads <= 0 || num_key_value_heads <= 0 || head_dim <= 0) {
     throw std::invalid_argument("Qwen4ExpConfig: invalid full-attention dimensions");
   }
@@ -139,25 +139,49 @@ void Qwen4ExpConfig::finalize_and_validate() {
         ple_head_dim <= 0) {
       throw std::invalid_argument("Qwen4ExpConfig: invalid PLE hyperparameters");
     }
-    const int n_heads = ple_n_heads();
-    if (n_heads <= 0 || n_heads > 64) {
+    const std::int64_t n_heads_64 =
+        static_cast<std::int64_t>(ple_ngram_size - 1) * static_cast<std::int64_t>(ple_heads_per_ngram);
+    if (n_heads_64 <= 0 || n_heads_64 > 64) {
       throw std::invalid_argument("Qwen4ExpConfig: ple_n_heads out of range [1, 64]");
+    }
+    const std::int64_t conv_hist_64 =
+        (ple_conv_kernel > 1)
+            ? static_cast<std::int64_t>(ple_conv_kernel - 1) * static_cast<std::int64_t>(ple_ngram_size)
+            : 0;
+    if (conv_hist_64 < 0 || conv_hist_64 > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("Qwen4ExpConfig: integer overflow in ple_conv_history_cols");
+    }
+    if (conv_hist_64 > 0) {
+      (void)checked_mul_pos_i32(static_cast<int>(conv_hist_64), static_cast<int>(hc_dim_val),
+                                "ple_conv_history_cols * hc_dim");
+    }
+    const int n_heads = ple_n_heads();
+    if (n_heads != static_cast<int>(n_heads_64)) {
+      throw std::invalid_argument("Qwen4ExpConfig: ple_n_heads mismatch");
     }
     if (checked_mul_pos_i32(n_heads, ple_head_dim, "ple_n_heads * ple_head_dim") != hidden_size) {
       throw std::invalid_argument("Qwen4ExpConfig: ple_n_heads * ple_head_dim must equal hidden_size");
     }
-    if (static_cast<int>(ple_layer_multipliers.size()) < ple_ngram_size) {
+    if (ple_layer_multipliers.size() < static_cast<std::size_t>(ple_ngram_size)) {
       throw std::invalid_argument("Qwen4ExpConfig: ple_layer_multipliers must have at least ple_ngram_size entries");
     }
-    if (static_cast<int>(ple_head_offsets.size()) != n_heads ||
-        static_cast<int>(ple_head_vocab_sizes.size()) != n_heads) {
+    if (ple_head_offsets.size() != static_cast<std::size_t>(n_heads) ||
+        ple_head_vocab_sizes.size() != static_cast<std::size_t>(n_heads)) {
       throw std::invalid_argument("Qwen4ExpConfig: ple_head_offsets and ple_head_vocab_sizes must equal ple_n_heads");
     }
     for (int h = 0; h < n_heads; ++h) {
-      if (ple_head_vocab_sizes[static_cast<std::size_t>(h)] == 0) {
+      const std::uint64_t off = ple_head_offsets[static_cast<std::size_t>(h)];
+      const std::uint64_t voc = ple_head_vocab_sizes[static_cast<std::size_t>(h)];
+      if (voc == 0) {
         throw std::invalid_argument("Qwen4ExpConfig: ple_head_vocab_sizes entry cannot be 0");
       }
+      if (off > std::numeric_limits<std::uint64_t>::max() - voc) {
+        throw std::invalid_argument("Qwen4ExpConfig: integer overflow in PLE head vocab range");
+      }
     }
+  } else if (ple_ngram_size != 0 || ple_heads_per_ngram != 0 || ple_conv_kernel != 0 || ple_head_dim != 0 ||
+             !ple_layer_multipliers.empty() || !ple_head_offsets.empty() || !ple_head_vocab_sizes.empty()) {
+    throw std::invalid_argument("Qwen4ExpConfig: PLE hyperparameters set while ple_layers is empty");
   }
 }
 
