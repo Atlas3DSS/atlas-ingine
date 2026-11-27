@@ -816,6 +816,7 @@ void test_synthetic_atlas_elastic_manifest() {
         Qwen38LinearQuantKind::Nvfp4);
   // Synthetic custom Elastic pack does not match official 4-shard sizes -> std::nullopt (HeadersOnly, no false pin).
   CHECK(!qwen38_default_pin_spec_for_dir(ed.path).has_value());
+  CHECK(qwen38_27b_atlas_17g_pin_spec().shards.size() == 4);
   CHECK(qwen38_27b_atlas_14g_pin_spec().shards.size() == 4);
   CHECK(qwen38_27b_atlas_11g_pin_spec().shards.size() == 3);
 }

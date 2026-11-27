@@ -1100,6 +1100,27 @@ ingine::model::CheckpointPinSpec qwen38_27b_nvfp4_pin_spec() {
   return spec;
 }
 
+ingine::model::CheckpointPinSpec qwen38_27b_atlas_17g_pin_spec() {
+  ingine::model::CheckpointPinSpec spec;
+  spec.config_sha256 =
+      ingine::model::parse_sha256_hex("71fa01bb64de20971045cd82a82c0ebb25a54e1b0a3f09ef23cf5479e9c54df8");
+  spec.tokenizer_sha256 =
+      ingine::model::parse_sha256_hex("0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3");
+  spec.chat_template_sha256 =
+      ingine::model::parse_sha256_hex("c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041");
+  spec.shards = {
+      {"model-00001-of-00004.safetensors", 4480187616ull,
+       ingine::model::parse_sha256_hex("babfe016170150a471902e85e009d22b8fca0202386d3415255301613d5219e0")},
+      {"model-00002-of-00004.safetensors", 4461772388ull,
+       ingine::model::parse_sha256_hex("916032f9534a296f8c2b1faf466f8193c331be3ee6cb25ef3d4b4462da6d5c37")},
+      {"model-00003-of-00004.safetensors", 4465600316ull,
+       ingine::model::parse_sha256_hex("23427dbd059ebf1810d36c3d22d33f38b1e307ce1f130f7893dbdc485315f1d5")},
+      {"model-00004-of-00004.safetensors", 3043893508ull,
+       ingine::model::parse_sha256_hex("1b9a5ab9336e508d60759d45ff96de568759e0de481d8d25d696afccd691defb")},
+  };
+  return spec;
+}
+
 ingine::model::CheckpointPinSpec qwen38_27b_atlas_14g_pin_spec() {
   ingine::model::CheckpointPinSpec spec;
   spec.config_sha256 =
@@ -1130,12 +1151,12 @@ ingine::model::CheckpointPinSpec qwen38_27b_atlas_11g_pin_spec() {
   spec.chat_template_sha256 =
       ingine::model::parse_sha256_hex("c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041");
   spec.shards = {
-      {"model-00001-of-00003.safetensors", 4496257352ull,
-       ingine::model::parse_sha256_hex("5205c716df1fd52b22265009fc8d0b5a3eebb071e6f4b475340db462843ae32a")},
-      {"model-00002-of-00003.safetensors", 4480527000ull,
-       ingine::model::parse_sha256_hex("667608b52e0f86ea1c2b575ac14844ffc72a7f0307036575b09032a6cde908ed")},
-      {"model-00003-of-00003.safetensors", 2573912900ull,
-       ingine::model::parse_sha256_hex("776dfd26fc0583c92980a467cc139a8a74930eeff3ea99405c408261ce9ee2c0")},
+      {"model-00001-of-00003.safetensors", 4494186160ull,
+       ingine::model::parse_sha256_hex("957d609ca33537794e546522fbadbec9b6016851582521dc86837f109b7faa45")},
+      {"model-00002-of-00003.safetensors", 4487928192ull,
+       ingine::model::parse_sha256_hex("8137a5cd3b07a783a5df1626591dd857f67b2861ec36a04a5125fd1eec26fc6f")},
+      {"model-00003-of-00003.safetensors", 3200353532ull,
+       ingine::model::parse_sha256_hex("19f499b0853c1f0fba0225cf66ffe9e50f38be370e3595334971914f2edd2140")},
   };
   return spec;
 }
@@ -1161,6 +1182,10 @@ std::optional<ingine::model::CheckpointPinSpec> qwen38_default_pin_spec_for_dir(
     }
     return true;
   };
+  if (prof == "atlas-17g") {
+    auto spec = qwen38_27b_atlas_17g_pin_spec();
+    if (matches_shard_layout(spec)) return spec;
+  }
   if (prof == "atlas-14g") {
     auto spec = qwen38_27b_atlas_14g_pin_spec();
     if (matches_shard_layout(spec)) return spec;

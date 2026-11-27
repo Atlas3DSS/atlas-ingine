@@ -127,12 +127,13 @@ std::array<std::uint8_t, 32> qwen38_config_fingerprint(const Qwen38Config& confi
 std::string qwen38_config_fingerprint_hex(const Qwen38Config& config);
 
 ingine::model::CheckpointPinSpec qwen38_27b_nvfp4_pin_spec();
+ingine::model::CheckpointPinSpec qwen38_27b_atlas_17g_pin_spec();
 ingine::model::CheckpointPinSpec qwen38_27b_atlas_14g_pin_spec();
 ingine::model::CheckpointPinSpec qwen38_27b_atlas_11g_pin_spec();
 
 // Resolves the default compiled-in pin spec for a Qwen3.8 checkpoint directory:
 //   - Non-Elastic checkpoints -> qwen38_27b_nvfp4_pin_spec() (fail-closed)
-//   - Official Atlas Elastic packs matching compiled-in profile & shard sizes -> atlas-14g / atlas-11g pin spec
+//   - Official Atlas Elastic packs matching compiled-in profile & shard sizes -> atlas-17g / atlas-14g / atlas-11g pin spec
 //   - Custom user-quantized Atlas Elastic packs -> std::nullopt (HeadersOnly; never fakes PinnedVerified)
 std::optional<ingine::model::CheckpointPinSpec> qwen38_default_pin_spec_for_dir(const std::filesystem::path& model_dir);
 
