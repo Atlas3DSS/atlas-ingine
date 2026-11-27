@@ -333,6 +333,26 @@ int main(int argc, char** argv) {
       rejected = true;
     }
     check(rejected, "Suite 2 (TP>1): make_generator rejects GGUF max_batch=1 --spec before load");
+
+    for (int mb : {1, 4}) {
+      RuntimeOptions opts_cap;
+      opts_cap.model_dir = gguf_dir;
+      opts_cap.dense_fp8 = false;
+      opts_cap.max_ctx = 8192;
+      opts_cap.kv_fp8 = true;
+      opts_cap.max_batch = mb;
+      opts_cap.spec = false;
+      opts_cap.vram_limit_mb = 15360;
+      bool rejected_cap = false;
+      try {
+        auto g = make_generator(opts_cap);
+        (void)g;
+      } catch (const std::invalid_argument& e) {
+        std::printf("  caught expected TP>1 capped GGUF (max_batch=%d) rejection: %s\n", mb, e.what());
+        rejected_cap = (std::string(e.what()).find("--vram-limit-mb") != std::string::npos);
+      }
+      check(rejected_cap, "Suite 2b (TP>1): make_generator rejects capped GGUF --vram-limit-mb 15360 before load");
+    }
   }
 #else
   std::printf("=== Suite 2 (TP1): Explicit Pre-Decode Rejection on Public max_batch=1 Entry Points ===\n");

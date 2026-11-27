@@ -6,8 +6,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <unistd.h>
 
 using namespace ingine::model;
 
@@ -97,18 +102,100 @@ int main() {
     expect_rejects(with([](RuntimeOptions& o) { o.max_ctx = 8; }), 2, "TP rejects max_ctx < 16");
     expect_rejects(with([](RuntimeOptions& o) { o.max_batch = 0; }), 2, "TP rejects max_batch < 1");
 
+    // Minimal valid GGUF header (general.architecture = "inkling2_loop") for pre-load GGUF validation tests.
+    struct TempGguf {
+      std::filesystem::path path;
+      TempGguf() {
+        path = std::filesystem::temp_directory_path() /
+               ("ingine_tp_gguf_cap_test_" + std::to_string(::getpid()) + ".gguf");
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        auto w32 = [&](std::uint32_t v) { out.write(reinterpret_cast<const char*>(&v), 4); };
+        auto w64 = [&](std::uint64_t v) { out.write(reinterpret_cast<const char*>(&v), 8); };
+        auto wstr = [&](const std::string& s) {
+          w64(s.size());
+          out.write(s.data(), static_cast<std::streamsize>(s.size()));
+        };
+        out.write("GGUF", 4);
+        w32(3);  // version
+        w64(0);  // n_tensors
+        w64(1);  // n_kv
+        wstr("general.architecture");
+        w32(8);  // GGUF_TYPE_STRING
+        wstr("inkling2_loop");
+        out.flush();
+      }
+      ~TempGguf() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+      }
+    } temp_gguf;
+
+    auto expect_rejects_msg = [&](const RuntimeOptions& opts, int tp_size, const char* substr, const char* what) {
+      bool ok = false;
+      try {
+        validate_tp_runtime_options(opts, tp_size);
+      } catch (const std::invalid_argument& e) {
+        ok = (std::string(e.what()).find(substr) != std::string::npos);
+      }
+      expect(ok, what);
+    };
+
+    {
+      RuntimeOptions g_uncapped;
+      g_uncapped.model_dir = temp_gguf.path;
+      g_uncapped.dense_fp8 = false;
+      g_uncapped.max_ctx = 8192;
+      g_uncapped.kv_fp8 = true;
+      g_uncapped.max_batch = 1;
+      g_uncapped.spec = false;
+      expect_accepts(g_uncapped, 2, "TP2 accepts uncapped GGUF max_batch=1");
+      g_uncapped.max_batch = 4;
+      expect_accepts(g_uncapped, 2, "TP2 accepts uncapped GGUF max_batch=4");
+
+      RuntimeOptions g_cap1 = g_uncapped;
+      g_cap1.max_batch = 1;
+      g_cap1.vram_limit_mb = 15360;
+      expect_rejects_msg(g_cap1, 2, "--vram-limit-mb", "TP2 rejects capped GGUF max_batch=1 --vram-limit-mb 15360");
+
+      RuntimeOptions g_cap4 = g_uncapped;
+      g_cap4.max_batch = 4;
+      g_cap4.vram_limit_mb = 15360;
+      expect_rejects_msg(g_cap4, 2, "--vram-limit-mb", "TP2 rejects capped GGUF max_batch=4 --vram-limit-mb 15360");
+
+      RuntimeOptions non_gguf_cap = base;
+      non_gguf_cap.vram_limit_mb = 15360;
+      expect_accepts(non_gguf_cap, 2, "TP2 retains non-GGUF option acceptance with vram_limit_mb");
+    }
+
 #if INGINE_TP_SIZE > 1
     // Verify the public model::make_generator() entry point rejects unsupported KV/feature options before allocation
     // on both B=1 spec (TpSpecGenerator) and batch/plain (TpBatchGenerator) routes.
-    auto expect_make_gen_rejects = [&](const RuntimeOptions& o, const char* what) {
+    auto expect_make_gen_rejects = [&](const RuntimeOptions& o, const char* what, const char* substr = nullptr) {
       bool threw = false;
       try {
         (void)make_generator(o);
-      } catch (const std::invalid_argument&) {
-        threw = true;
+      } catch (const std::invalid_argument& e) {
+        threw = (!substr || std::string(e.what()).find(substr) != std::string::npos);
       }
       expect(threw, what);
     };
+    {
+      for (int mb : {1, 4}) {
+        RuntimeOptions g_cap;
+        g_cap.model_dir = temp_gguf.path;
+        g_cap.dense_fp8 = false;
+        g_cap.max_ctx = 8192;
+        g_cap.kv_fp8 = true;
+        g_cap.max_batch = mb;
+        g_cap.spec = false;
+        g_cap.vram_limit_mb = 15360;
+        expect_make_gen_rejects(
+            g_cap,
+            mb == 1 ? "TP2 make_generator(max_batch=1) rejects capped GGUF --vram-limit-mb 15360 before load"
+                    : "TP2 make_generator(max_batch=4) rejects capped GGUF --vram-limit-mb 15360 before load",
+            "--vram-limit-mb");
+      }
+    }
     for (bool spec_mode : {true, false}) {
       auto mk = [&](auto fn) {
         RuntimeOptions o;

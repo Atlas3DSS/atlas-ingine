@@ -192,6 +192,8 @@ void validate_tp_runtime_options(const RuntimeOptions& options, int tp_size) {
     throw std::invalid_argument(tag + ": --kv-fp4v is for the batch generator (not --spec with --max-batch 1)");
   if (options.max_batch == 1 && options.spec && is_gguf_model(options.model_dir))
     throw std::invalid_argument(tag + ": GGUF models with --max-batch 1 do not support --spec (use --max-batch > 1 or drop --spec)");
+  if (options.vram_limit_mb > 0 && is_gguf_model(options.model_dir))
+    throw std::invalid_argument(tag + ": --vram-limit-mb is not supported for GGUF models (leave --vram-limit-mb 0)");
   if (options.vision) {
     throw std::invalid_argument(tag + " mode does not support --vision");
   }
