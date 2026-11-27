@@ -1,7 +1,7 @@
 # Ingine by Atlas
 
 Multi-architecture Apache-2.0 CUDA inference engine for
-[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), with a Qwen3.8-27B-NVFP4 backend, forked from
+[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), with [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (`qwen4exp`) CUDA backends, forked from
 [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine).
 
 ![Why use Ingine by Atlas: GPU coverage, 1,000,000-token context, speed, and agent reliability](docs/media/why_atlas_ingine.png)
@@ -13,6 +13,13 @@ Multi-architecture Apache-2.0 CUDA inference engine for
 
 ## Checkpoints (Direct Hugging Face Links)
 
+Browse checkpoints by model family on Hugging Face:
+- **Inkling-2-Mini Collection (6 GB to 96 GB):** [Atlas3D/inkling-2-mini-atlas-3d-6-gb-to-96-gb](https://huggingface.co/collections/Atlas3D/inkling-2-mini-atlas-3d-6-gb-to-96-gb-6b054702b9c8001bb2b06675)
+- **Qwen3.8-27B Collection (12 GB to 24 GB, Apache-2.0):** [Atlas3D/qwen38-27b-atlas-3d-12-gb-to-24-gb](https://huggingface.co/collections/Atlas3D/qwen38-27b-atlas-3d-12-gb-to-24-gb-6b08ed57e702a2206df7dac7)
+- **Qwen3.8-Flash-Next (177B) Collection (Qwen Community License 1.0):** [Atlas3D/qwen38-flash-next-177b-atlas-3d](https://huggingface.co/collections/Atlas3D/qwen38-flash-next-177b-atlas-3d-6b08ed57d62742b964d01f70)
+
+### Inkling-2-Mini
+
 | Checkpoint | Format | Target VRAM / Use | Direct Link |
 |---|---|---|---|
 | **Native `NVFP4+MXFP8`** | Base safetensors (`20.2 GB`) | `24 GB+` cards (`64K–262K`), `32–96 GB` (`1M` ctx) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) |
@@ -21,6 +28,28 @@ Multi-architecture Apache-2.0 CUDA inference engine for
 | **EXL3 9 GB (FP8-prebaked)** | Native EXL3 + FP8 (`~9 GB`) | **`6 GB–24 GB` 1M-context** (`--kv-q4`, `0.000000` KL vs `--dense-fp8`) | [Atlas3D/Inkling-2-Mini-atlas-exl3-9g-fp8-ingine](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-exl3-9g-fp8-ingine) |
 | **EXL3 9 GB (BF16 dense)** | Native EXL3 + BF16 (`~9 GB`) | `6 GB–24 GB` cards (unquantized dense projections) | [Atlas3D/Inkling-2-Mini-atlas-exl3-9g-ingine](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-exl3-9g-ingine) |
 | **Atlas Elastic GGUF** | GGUF (`llama.cpp` / `atlas-engine`) | `llama.cpp` / [Atlas3DSS/atlas-engine](https://github.com/Atlas3DSS/atlas-engine) serving | [Atlas3D/Inkling-2-Mini-Atlas-Elastic-GGUF](https://huggingface.co/Atlas3D/Inkling-2-Mini-Atlas-Elastic-GGUF) |
+
+### Qwen3.8-27B (Text-Only Elastic Packs, Apache-2.0)
+
+Collection: [**Qwen3.8-27B — Atlas 3D (12 GB to 24 GB)**](https://huggingface.co/collections/Atlas3D/qwen38-27b-atlas-3d-12-gb-to-24-gb-6b08ed57e702a2206df7dac7). All three Elastic packs carry compiled-in SHA-256 pins (`PinnedVerified` in `native/src/backends/qwen38/qwen38_manifest.cpp`).
+
+| Checkpoint | Format / Size | Peak VRAM @ 4K & Parity vs `NVFP4` Base | Direct Link |
+|---|---|---|---|
+| **Baseline `NVFP4`** | Mixed `FP8`/`NVFP4` (`18.77 GiB` weights) | `19.42 GiB` peak VRAM (`24 GB+` cards) | [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) |
+| **Elastic `atlas-17g` (v2)** | `NVFP4`/`ATLAS3` MLP, `FP8` Attn (`16.45 GB` / `15.33 GiB`, 4 sh) | `15.97 GiB` (`-3.45 GiB`), V100 SM70 KLD `0.1640`, cos `0.9731`, top-1 `0.750` | [Atlas3D/Qwen3.8-27B-atlas-17g-ingine](https://huggingface.co/Atlas3D/Qwen3.8-27B-atlas-17g-ingine) |
+| **Elastic `atlas-14g`** | `NVFP4`/`ATLAS3` MLP, `FP8`/`NVFP4` Attn (`13.69 GB` / `12.75 GiB`, 4 sh) | `12.64 GiB` (`-6.02 GiB` weights), PRO 6000 SM120a KLD `0.1323`, cos `0.9724`, top-1 `0.8125` | [Atlas3D/Qwen3.8-27B-atlas-14g-ingine](https://huggingface.co/Atlas3D/Qwen3.8-27B-atlas-14g-ingine) |
+| **Elastic `atlas-11g` (v3)** | Pure `ATLAS3`+`NVFP4` (zero `ATLAS2`, `12.18 GB` / `11.35 GiB`, 3 sh) | `12.00 GiB` (`-7.42 GiB`), V100 SM70 KLD `0.1415`, cos `0.9553`, top-1 `0.781` | [Atlas3D/Qwen3.8-27B-atlas-11g-ingine](https://huggingface.co/Atlas3D/Qwen3.8-27B-atlas-11g-ingine) |
+
+### Qwen3.8-Flash-Next 177B (`qwen4exp`, Qwen Community License 1.0)
+
+Collection: [**Qwen3.8-Flash-Next (177B) — Atlas 3D**](https://huggingface.co/collections/Atlas3D/qwen38-flash-next-177b-atlas-3d-6b08ed57d62742b964d01f70). Derived from `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q6_K_XL` (text-only, single-GPU `INGINE_TP_SIZE=1`); host-only Per-Layer Embeddings (`320,001,536 x 160` in `NVFP4`, `28.80 GB`, 81 shards) remain in host RAM/mmap (`0 GB VRAM`).
+
+| Checkpoint | Format / Footprint | Verified V100 SM70 `TieredExpertCache` (`25.28 GiB` cache) vs FP32 `Q6_K_XL` Oracle | Direct Link |
+|---|---|---|---|
+| **Elastic `atlas-70g`** | All-`NVFP4` MoE, `FP8` Dense (`73.06 GB` GPU / 49 sh + `28.80 GB` PLE / 81 sh) | `cos=0.9757`, `top1=true`, warm 8-tok greedy `6.29 tok/s`; sized for `AllResident` on 96 GB GPUs | [Atlas3D/Qwen3.8-Flash-Next-atlas-70g-ingine](https://huggingface.co/Atlas3D/Qwen3.8-Flash-Next-atlas-70g-ingine) |
+| **Elastic `atlas-56g`** | Boundary `NVFP4` + Core `ATLAS3` MoE, `FP8` Dense (`59.22 GB` GPU / 49 sh + `28.80 GB` PLE / 81 sh) | `cos=0.9722`, `top1=true`, warm 8-tok greedy `6.12 tok/s`, live `ingine-serve` HTTP smoke PASS; sized for `AllResident` on 80–96 GB GPUs | [Atlas3D/Qwen3.8-Flash-Next-atlas-56g-ingine](https://huggingface.co/Atlas3D/Qwen3.8-Flash-Next-atlas-56g-ingine) |
+
+**Scope & disclosure (177B):** Real 177B SM120a `AllResident` speed is unmeasured in this release (all real-177B GPU evaluations ran on Tesla V100 SM70 `TieredExpertCache`; SM120a coverage on `qwen4exp` is synthetic `qwen4exp_cuda_ops` and `qwen4exp_gpu_e2e` across `AllResident` and `TieredExpertCache`). `atlas-42g` is held back from publication pending `ffn_down_exps=atlas3` or Hessian/DFly-SFT calibration.
 
 ## Measured performance (16K, 64K & 262K context across 6 NVIDIA generations)
 
