@@ -103,6 +103,54 @@ Published V100 and P100 figures from other projects, on their hardware, quants, 
 - **[iammrduncan/tensorless](https://github.com/iammrduncan/tensorless)** (`11df9a5`; Tesla P100 16 GB, 12.8 GB quant on a `llama.cpp`-based engine, draft recipe): `28.5 tok/s` decode, `240 tok/s` prefill at about 4K, against the P100 `atlas-10g` 16K row above (`20.2` / `22.9 tok/s`, `282 tok/s`). The [StrataEngine card](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata/blob/04996a1e2c45009b6a04f2af126cb6bdb2ba3587/README.md) lists a Tesla P100 16 GB on its SQ-10 pack at `35.0 tok/s` decode, `223 tok/s` prefill, and `136.9 tok/s` across 32 requests (thinking off).
 - No V100 figures were found for Project Maya or upstream `satellitedown/ingine`.
 
+## Physical GPU measurements with the 9 GB checkpoint
+
+The additional sweep measured 25 physical GPU models using the [EXL3 9 GB FP8 pack](https://huggingface.co/Atlas3D/Inkling-2-Mini-atlas-exl3-9g-fp8-ingine/tree/6a118e83ac566f4b908f777e27a4bb9afc35a12e).
+All 25 produced decode measurements at 16K KV allocation; 23 did so at 64K allocation.
+These are `ingine-bench` built-in short-prompt decode rates, in tokens/s, with separate synthetic prefill measurements.
+The allocation is 16,384 or 65,536 tokens; the synthetic prefill is 16,000 or 64,000 tokens.
+GPU names and VRAM below come from physical `nvidia-smi`, not provider offer descriptions.
+The 6 GB cards use `--atlas-6g` with `--spec` omitted; every row identifies its 16K drafting mode.
+
+| Physical GPU | nvidia-smi VRAM (MiB) | 16K allocation: chat / code | 64K allocation: chat / code, --spec | 64K allocation: chat / code, drafting off |
+| --- | --- | --- | --- | --- |
+| NVIDIA GeForce RTX 5090 | 32,607 | 484.48 / 617.78 (`--spec`) | 484.63 / 618.00 | 203.60 / 203.60 |
+| NVIDIA GeForce RTX 5080 | 16,303 | 283.54 / 361.68 (`--spec`) | 283.12 / 360.83 | 158.33 / 158.34 |
+| NVIDIA RTX PRO 4500 Blackwell | 32,623 | 259.44 / 327.70 (`--spec`) | 258.34 / 326.41 | 145.82 / 145.40 |
+| NVIDIA GeForce RTX 5070 Ti | 16,303 | 226.02 / 331.63 (`--spec`) | 223.69 / 331.17 | 137.56 / 138.47 |
+| NVIDIA GeForce RTX 4080 | 16,376 | 216.22 / 321.43 (`--spec`) | 216.16 / 321.23 | 132.86 / 132.97 |
+| NVIDIA GeForce RTX 4070 Ti SUPER | 16,376 | 197.61 / 202.26 (`--spec`) | 197.51 / 202.16 | 107.16 / 107.19 |
+| NVIDIA RTX PRO 4000 Blackwell | 24,467 | 173.02 / 246.27 (`--spec`) | 171.59 / 249.13 | 113.27 / 112.31 |
+| NVIDIA GeForce RTX 5070 | 12,227 | 168.72 / 247.84 (`--spec`) | 168.54 / 247.34 | 124.95 / 124.95 |
+| NVIDIA GeForce RTX 4070 | 12,282 | 150.51 / 220.24 (`--spec`) | 150.00 / 219.57 | 93.36 / 93.48 |
+| NVIDIA GeForce RTX 5060 Ti | 16,311 | 142.42 / 192.83 (`--spec`) | 142.29 / 192.88 | 101.73 / 101.71 |
+| NVIDIA GeForce RTX 4060 Ti | 16,380 | 108.00 / 115.77 (`--spec`) | 107.92 / 115.65 | 61.37 / 61.38 |
+| Quadro RTX 8000 | 49,152 | 89.51 / 135.36 (`--spec`) | 89.63 / 135.45 | 79.89 / 79.88 |
+| NVIDIA RTX A4000 | 16,376 | 84.01 / 109.51 (`--spec`) | 83.16 / 108.09 | 61.19 / 60.46 |
+| NVIDIA GeForce RTX 3060 | 12,288 | 69.69 / 83.83 (`--spec`) | 69.62 / 83.83 | 48.43 / 48.23 |
+| NVIDIA GeForce RTX 2060 | 12,288 | 59.23 / 71.34 (`--spec`) | 58.88 / 71.05 | 39.13 / 39.04 |
+| NVIDIA GeForce RTX 3080 | 10,240 | 49.80 / 51.87 (`--spec`) | 56.11 / 66.06 | 58.08 / 57.93 |
+| Tesla T4 | 15,360 | 47.38 / 62.22 (`--spec`) | 46.64 / 61.37 | 36.55 / 36.43 |
+| NVIDIA GeForce RTX 3060 Ti | 8,192 | 36.75 / 41.84 (`--spec`) | 30.70 / 35.25 | 39.93 / 40.48 |
+| NVIDIA GeForce RTX 3070 | 8,192 | 36.52 / 43.38 (`--spec`) | 30.13 / 36.31 | 42.03 / 42.43 |
+| NVIDIA L4 | 23,034 | 35.29 / 43.60 (`--spec`) | 34.17 / 42.57 | 24.47 / 24.04 |
+| NVIDIA GeForce RTX 5060 | 8,151 | 27.63 / 33.87 (`--spec`) | 21.87 / 27.20 | 34.39 / 34.84 |
+| NVIDIA RTX A2000 | 6,138 | 28.40 / 28.14 (drafting off) | Drafting unsupported | 26.59 / 26.73 |
+| NVIDIA GeForce GTX 1080 Ti | 11,264 | 18.84 / 21.77 (`--spec`) | Unavailable (command rejected) | Unavailable (command rejected) |
+| NVIDIA GeForce GTX 1660 | 6,144 | 10.66 / 10.54 (drafting off) | Drafting unsupported | Timeout |
+| NVIDIA GeForce RTX 3050 | 6,144 | 10.75 / 10.85 (drafting off) | Drafting unsupported | 9.38 / 9.99 |
+
+At 64K allocation, plain decoding beat drafting on all three measured 8 GB cards:
+RTX 3070 (42.03 vs 30.13 chat tokens/s), RTX 3060 Ti (39.93 vs 30.70), and RTX 5060 (34.39 vs 21.87).
+Additional expert transfers across the VRAM/PCIe boundary are an unmeasured explanation, not a profiled result.
+
+The RTX 4070 Ti SUPER and RTX 3060 each passed a 1,048,576-token target with 1,048,480 fresh document tokens and 3/3 needles.
+The RTX 2060 and RTX 3070 passed a 262,144-token target in a 1M allocation; their larger runs were deferred by the time cap.
+Other policy-skipped runs are explicitly `one_m_skipped_by_policy`.
+GTX 1080 Ti primary 64K commands were rejected, and sidecar retries timed out; GTX 1660's 64K plain run timed out.
+
+See [full methodology, separate prefill rates, revisions, long-context outcomes, and failed bookings](docs/consumer_gpu_911_benchmarks.md).
+
 ## 1,000,000-Token Context (6 GB to 96 GB Silicon)
 
 ![1,000,000-Token Context Across 6 GB to 96 GB NVIDIA GPUs](docs/media/one_million_tokens.png)
