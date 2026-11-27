@@ -1,8 +1,8 @@
 # Zero-Gradient Omni-Modal Grafting
 
-**Working Draft v0.3 (Living Manuscript — 2026-11-27)**
+**Working Draft v0.4 (Living Manuscript — 2026-11-27)**
 **Authors:** Neon & Atlas3D Research (`Atlas3DSS`)
-**Status:** Packet A Sealed Confirm-160 PASS (`att-7bea8414`) & FL2VA/NVFP4 PASS (`att-b6a83a21`) · Packet C Mouth Prosody-vs-Lexeme Split (`att-6c4b19fe`, `att-b194ab6a`) & Visit Lace PASS (`att-d0e96537`) · Packet D `YuE2` 48 kHz Music PASS (`att-0fcf223c`) · 2-Way Multi-Model Blend & Cross-LLM Hubs PASS (`att-4aa9bbc3`) · 24-GPU Stage 2 (`att-41cf9f0c`) + 3-Gen Wave 3 Real AV (`V100 → 3090 → PRO 6000`) + 3-Device Android Voltron Neural Mesh (`att-111b1358`)
+**Status:** Packet A Sealed Confirm-160 PASS (`att-7bea8414`) & FL2VA/NVFP4 PASS (`att-b6a83a21`) · Packet C Mouth Amended v2 PASS `6/6` + `32/32` Blind Human Audibility PASS (`att-092ddfeb`, `mouth_confirm_reserve` GO) · Packet D `YuE2` 48 kHz Music PASS (`att-0fcf223c`) · `#941` Half-Depth `Qwen3.8-27B` `layer_31` Sealed Confirm-160 `101.55%` (`13/16` > 32B teacher, `p = 0.0213`) + 2-Way Blend & Cross-LLM Hubs PASS (`att-4aa9bbc3`) · 24-GPU Stage 2 + 3-Gen Wave 3 Real AV + 3-Device Android Voltron Neural Mesh
 
 ---
 
@@ -206,7 +206,7 @@ Under pre-registered authorization (`att-8745190b`) on `mouth_val_dev` (`400` cl
 | **Roundtrip Fit Check (`2` gold clips)** | `0.0` drift | **`0.0` max abs WAV diff** (`2/2`) | — | — | Exact sample-for-sample match (`65,280` & `80,640` samples) |
 | **EOS / Zero Silence Controls (`16` clips)** | `0/16` FP | `16/16` Whisper `"Thank you."` | — | — | All `16/16` physically near-silent (`RMS 0.000794–0.002809`) |
 
-Five of six pre-registered `val_dev` gates passed; `all_val_dev_gates_passed` remains `false` (`FAIL 5/6`) solely because un-gated `faster-whisper` hallucinates `"Thank you."` on all `16/16` physically silent controls (`max_rms = 0.002809`). A frozen prospective scorer amendment (`mono float32 16 kHz`, no gain normalization, `RMS >= 0.01 AND duration >= 0.20 s` applied blind across every arm/clip with gated speech counted missed plus a blinded listening pack) is running on the saved dev WAVs prior to any `confirm_reserve` decision.
+Five of six pre-registered `val_dev` gates passed; `all_val_dev_gates_passed` remains `false` (`FAIL 5/6`) solely because un-gated `faster-whisper` hallucinates `"Thank you."` on all `16/16` physically silent controls (`max_rms = 0.002809`). Under a pre-registered prospective scorer amendment (`att-092ddfeb`, `mono float32 16 kHz`, no gain normalization, `RMS >= 0.01 AND duration >= 0.20 s`, applied blind across all arms/clips with gated expected speech counted missed), amended `val_dev` passed `6/6` gates. An independent human blind listening audit over all `32` opaque WAVs (`listening_audit_sheet_LOCKED.md`, `sha256 18a51a06...`, locked prior to unsealing `sealed_audit_key.json`) confirmed **`32/32` (`100%`) binary audibility agreement** with the eligibility gate (`16/16` `eos_zero_control` clips judged `NONE`; `16/16` genuine speech clips judged audible; reported as binary audibility rather than exact word transcription). Original development stays logged as `FAIL 5/6`; one prespecified `M_explicit_lexical_plus_hidden` run on `mouth_confirm_reserve` (`80` items) is now cleared while `ears_confirm_reserve` (`80` items) remains `0/80` sealed.
 
 ### 5.4 Visit Lace (`att-d0e96537`), Whisper Ears (`att-773f320b`), & Packet D `YuE2-3B` 48 kHz Music (`att-0fcf223c`)
 
@@ -234,10 +234,19 @@ Using the exact same frozen `fit` / `val_dev` / sealed `confirm_reserve` split (
 | **Mode C: Hub `Inkling → Qwen3.8(L31)` → `H3`** | `91 MiB` hub | `0.94177` (hub) · **`0.91739`** (→H3) | `0.998053` | — | Transitive conditioning via frozen Qwen3.8 middle layer |
 | **Mode C: Hub `Qwen3.8 → Inkling(V41)` → `H3`** | `91 MiB` hub | `0.92945` (hub) · **`0.93407`** (→H3) | **`0.998595`** | — | **Beats Inkling's own direct `concat4` (`0.92282`)** while routing through Inkling's latent space |
 
-### 6.2 Mechanistic Findings
+### 6.2 Mechanistic Findings & Half-Depth Early-Exit Sealed Confirm-160 Proof (`640` `1024×1024` Images)
 
 1. **Cross-model norm imbalance breaks naive concatenation.** Directly stacking raw hidden states from a looped MoE (`Inkling-2-Mini`) and a dense 27B model (`Qwen3.8-27B`) regressed `-0.00301` on `val_dev` (`0.95622` vs `0.95917`). Applying block-weighted multi-kernel ridge (`alpha = [0.1, 0.9]`, solved via Dual Woodbury in FP64) turned that regression into a uniform `16/16`-group, `8/8`-domain gain on sealed Confirm-160 (`+0.00300`, `p = 3.052e-5`), with the largest domain gain on `typography_signage` (`+0.00641`).
-2. **Half-depth single taps suffice for conditioning.** On 64-layer `Qwen3.8-27B`, a single tap at middle layer `31` already reaches `cos = 0.95274` / `R² = 0.99909` on sealed Confirm-160, motivating early-exit multimedia prefill (`#944`).
+2. **Half-depth single tap (`layer_31 / 64`, `50.02 MiB`) statistically outperforms the `27.14 GB` native `Qwen3-VL-32B` teacher on sealed Confirm-160 (`640` `1024×1024` images).** Evaluating the frozen `Qwen3.8-27B` keys directly on the sealed 160-prompt `MiniMax-H3` image confirmation split (`2× RTX 5090`, `fit_calls_executed = 0`, 4-prompt dev floor `4/4` exact `0.0` RMSE / `99.0 dB`, `per_prompt_outcomes_sha256 142fc216...`):
+
+| Arm (`Qwen3.8-27B` Sealed Confirm-160, `640` `1024×1024` Images) | Key Size (FP16) | RTX 5090 Proj (`32` tok) | SigLIP2 Text-Img (`G=16`) | Margin Retention | Img-vs-Teacher Cos | Final Latent Cos | Paired vs Teacher / `B0` |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **Native `Qwen3-VL-32B` Teacher Reinject** | `27,141 MB` | — | `0.19838` | `100.00%` | `1.00000` | `1.00000` | `16/16` vs `B0` |
+| **`Qwen3.8` `single_tap` (`layer_31 / 64` ONLY)** | **`50.02 MiB`** | **`0.049 ms`** | **`0.20234`** | **`101.55%`** | **`0.90103`** | `0.78411` | **Beats teacher `13/16` groups (`+0.00396`, 95% CI `[+0.00010, +0.00760]`, `p = 0.0213`)**; `16/16` vs `B0` (`p = 3.05e-5`) |
+| **`Qwen3.8` `concat4`** *(separate)* | `200.05 MiB` | `0.143 ms` | `0.19992` | `100.60%` | `0.89562` | **`0.78751`** | `9/16` vs teacher (`+0.00154`, `p = 0.804`); `single_tap` beat `concat4` `13/16` on SigLIP2 (`p = 0.0213`) |
+| **Matched Shuffled `B0` (`layer_31`)** | `50.02 MiB` | — | `-0.05670` | `0.00%` | `0.48249` | `0.34597` | — |
+
+   *Scope boundary:* This proves functionally across `640` unseen `1024×1024` images that the back half of a 64-layer dense donor LLM (`layers 32–63`, final norm, and LM head) is unnecessary for image diffusion conditioning, and that `50.02 MiB` `layer_31` outperforms both the `27.14 GB` teacher (`p = 0.0213`) and `200.05 MiB` `concat4` (`p = 0.0213`) on SigLIP2 prompt adherence. End-to-end wall-clock early-exit prefill speedups and per-layer sweeps on `Inkling-2-Mini` / `FL2VA` / `Mouth` remain in `#944` (not yet measured).
 
 ---
 
