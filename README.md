@@ -517,6 +517,8 @@ Add `--no-vision` to save ~0.6 GiB VRAM on text-only workloads, `--dflash2-dir /
 
 **Linux GeForce RTX 20/30/40 note:** When `ingine-serve --engine` starts on a Linux GeForce RTX 20/30/40 GPU without `/sys/module/gpu_unlock`, it logs a one-line notice pointing to the optional external [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module (GPL-2.0; zero code or firmware is bundled in this repository).
 
+**Tesla V100 (`sm_70`) stock HBM2 clock policy:** All Tesla V100 measurements in this repository run strictly at stock `877.5 MHz` HBM2 clocks. We intentionally do **not** apply live PCI BAR0 HBM2 PLL overclockers such as `FBR-ROM/FBR-RAM-Downloader` (`v100-unlock`, which writes multicast register `0x98BC98` directly to `1053 MHz` with no HBM2 self-refresh, no intermediate frequency steps, and upstream validation limited to 4-Hi V100-SXM2-16GB): in field testing on multi-GPU V100 rigs, single-shot live PLL jumps have triggered uncorrectable HBM2 double-bit ECC errors (`Xid 48/171`), pending page retirement, and `Xid 154` (`GPU Reset Required`).
+
 ### Option B: Hardware-aware auto-tuner & interactive installer
 
 Open the local setup page to select a model, inspect the recommended server flags and estimated memory use, and approve the download or launch.
