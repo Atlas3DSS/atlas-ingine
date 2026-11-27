@@ -314,63 +314,91 @@ def build_fig7_silicon():
     data = json.loads(summary_path.read_text())
     cards = data["wave3_real_av_cards"]
 
+    # Clean white-background print-legible palette for two-column paper
+    P_BG = "#FFFFFF"
+    P_CARD = "#F8FAFC"
+    P_GRID = "#CBD5E1"
+    P_TEXT = "#0F172A"
+    P_MUTED = "#475569"
+    ARCH_PAL = {
+        "Volta": "#D97706",
+        "Turing": "#0284C7",
+        "Ampere": "#16A34A",
+        "Ada": "#0D9488",
+        "Blackwell": "#7C3AED",
+    }
+
     labels = [c["label"] for c in cards]
     img_s = [float(c["image_s"]) for c in cards]
     av_s = [float(c["av_s"]) for c in cards]
-    cols = [c.get("arch_color", BLUE) for c in cards]
+    cols = [ARCH_PAL.get(c.get("arch_family", ""), "#2563EB") for c in cards]
+
+    def fmt_mode(raw: str) -> str:
+        low = str(raw or "").lower()
+        if "lowvram" in low or "block_offload" in low:
+            return "LOWVRAM"
+        if "resident_or_comfy_auto" in low:
+            return "AUTO*"
+        return "UNREC"
 
     fig, (ax1, ax2) = plt.subplots(
-        1, 2, figsize=(16.5, 8.2), facecolor=BG, dpi=220,
-        gridspec_kw={"wspace": 0.42, "left": 0.21, "right": 0.97, "top": 0.88, "bottom": 0.11},
+        1, 2, figsize=(16.5, 8.7), facecolor=P_BG, dpi=220,
+        gridspec_kw={"wspace": 0.42, "left": 0.21, "right": 0.97, "top": 0.825, "bottom": 0.125},
     )
     y = np.arange(len(cards))[::-1]
 
     for ax in (ax1, ax2):
-        ax.set_facecolor(CARD)
-        ax.tick_params(colors=TEXT, labelsize=9.2)
+        ax.set_facecolor(P_CARD)
+        ax.tick_params(colors=P_TEXT, labelsize=9.2)
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
         for sp in ("left", "bottom"):
-            ax.spines[sp].set_color(GRID)
-        ax.grid(axis="x", color=GRID, linestyle="--", alpha=0.45, linewidth=0.6)
+            ax.spines[sp].set_color("#94A3B8")
+            ax.spines[sp].set_linewidth(0.9)
+        ax.grid(axis="x", color=P_GRID, linestyle="--", alpha=0.8, linewidth=0.7)
         ax.set_axisbelow(True)
 
-    ax1.barh(y, img_s, color=cols, height=0.68, alpha=0.95)
+    ax1.barh(y, img_s, color=cols, height=0.68, alpha=0.92, edgecolor="#0F172A", linewidth=0.35)
     ax1.set_yticks(y)
-    ax1.set_yticklabels(labels, color=TEXT, fontsize=9.2)
-    ax1.set_xlim(0, 118)
-    ax1.set_xlabel("Warm DiT+VAE Time (s / 1024x1024 PNG)", color=TEXT, fontsize=9.8)
-    ax1.set_title("A. 1024x1024 Image (6-Step MiniMax-H3, Zero 32B Encoder)", color=TEXT, fontsize=10.8, fontweight="bold", pad=10)
+    ax1.set_yticklabels(labels, color=P_TEXT, fontsize=9.2, fontweight="medium")
+    ax1.set_xlim(0, 124)
+    ax1.set_xlabel("Warm DiT+VAE Time (s / 1024x1024 PNG; excludes donor LLM & cold load)", color=P_TEXT, fontsize=9.4)
+    ax1.set_title("A. 1024x1024 Image (6-Step MiniMax-H3, Saved concat4 Key)", color=P_TEXT, fontsize=10.8, fontweight="bold", pad=10)
     for yi, c, v in zip(y, cards, img_s):
-        mode = "LOWVRAM" if "lowvram" in str(c.get("image_mode", "")).lower() else "RESIDENT"
+        mode = fmt_mode(c.get("image_mode", ""))
         fmt = "NVFP4" if "nvfp4" in str(c.get("image_dit_file", "")).lower() else "INT8"
-        ax1.text(v + 1.4, yi, f"{v:.1f}s | {c['image_peak_gib']:.1f} GiB | {fmt} ({mode})", va="center", ha="left", color=TEXT, fontsize=8.4)
+        ax1.text(v + 1.4, yi, f"{v:.1f}s | {c['image_peak_gib']:.1f} GiB | {fmt} ({mode})", va="center", ha="left", color=P_TEXT, fontsize=8.4)
 
-    ax2.barh(y, av_s, color=cols, height=0.68, alpha=0.95)
+    ax2.barh(y, av_s, color=cols, height=0.68, alpha=0.92, edgecolor="#0F172A", linewidth=0.35)
     ax2.set_yticks(y)
-    ax2.set_yticklabels(labels, color=TEXT, fontsize=9.2)
-    ax2.set_xlim(0, 1480)
-    ax2.set_xlabel("Warm DiT+VAE Time (s / 5.875s 141f Video + 32kHz Audio)", color=TEXT, fontsize=9.8)
-    ax2.set_title("B. 5.875s Video + 32kHz Stereo Audio (12-Step FL2VA)", color=TEXT, fontsize=10.8, fontweight="bold", pad=10)
+    ax2.set_yticklabels(labels, color=P_TEXT, fontsize=9.2, fontweight="medium")
+    ax2.set_xlim(0, 1520)
+    ax2.set_xlabel("Warm DiT+VAE Time (s / 5.875s 141f Video + 32kHz Audio; excludes mux)", color=P_TEXT, fontsize=9.4)
+    ax2.set_title("B. 5.875s Video + 32kHz Stereo Audio (12-Step FL2VA, Saved Key)", color=P_TEXT, fontsize=10.8, fontweight="bold", pad=10)
     for yi, c, v in zip(y, cards, av_s):
-        mode = "LOWVRAM" if "lowvram" in str(c.get("av_mode", "")).lower() else "RESIDENT"
-        ax2.text(v + 16.0, yi, f"{v:.1f}s | {c['av_peak_gib']:.1f} GiB | rms={c['av_audio_rms']:.4f} ({mode})", va="center", ha="left", color=TEXT, fontsize=8.4)
+        mode = fmt_mode(c.get("av_mode", ""))
+        ax2.text(v + 16.0, yi, f"{v:.1f}s | {c['av_peak_gib']:.1f} GiB | rms={c['av_audio_rms']:.4f} ({mode})", va="center", ha="left", color=P_TEXT, fontsize=8.4)
+
+    # Compact architecture legend strip cleanly separated between suptitle and panel titles
+    leg_handles = [patches.Patch(facecolor=col, edgecolor="#0F172A", linewidth=0.4, label=arch) for arch, col in ARCH_PAL.items()]
+    fig.legend(handles=leg_handles, loc="upper center", bbox_to_anchor=(0.56, 0.922), ncol=5, frameon=False, fontsize=9.4)
 
     fig.suptitle(
-        "Cross-Silicon Real Image & 5.875s Video+Audio Generation (16 Distinct GPUs, 5 CUDA Architectures, Zero 32B Encoder)",
-        color=TEXT, fontsize=12.6, fontweight="bold", y=0.955,
+        "Cross-Silicon Warm DiT+VAE Timings from Saved Conditioning (16 Distinct GPUs, 5 CUDA Architectures, Zero 32B Encoder)",
+        color=P_TEXT, fontsize=12.4, fontweight="bold", y=0.968,
     )
     fig.text(
         0.5, 0.022,
-        "17 verified runs across 16 distinct GPUs (Volta -> Turing -> Ampere -> Ada -> Blackwell; summary sha256 0a5d535f), including 12 GB RTX 5070 (9.00/9.33 GiB block offload) and RTX 5090 (5.72s/93.34s).\n"
-        "Timings measure warm DiT+VAE generation from saved 90 MiB Inkling concat4 conditioning (excluding cold load, donor forward, and mux); memory values are PyTorch peak CUDA allocated GiB.",
-        ha="center", color=MUTED, fontsize=8.4, linespacing=1.32,
+        "17 verified runs across 16 distinct GPUs (summary sha256 0a5d535f), including 12 GB RTX 5070 (9.00/9.33 GiB LOWVRAM) and RTX 5090 (5.72s/93.34s).\n"
+        "Timings are warm DiT+VAE from saved 90 MiB Inkling concat4 conditioning (NOT end-to-end; excludes donor LLM forward, cold load, and mux). Peak memory is PyTorch CUDA allocated GiB.\n"
+        "Mode labels taken directly from run logs: LOWVRAM = explicit comfy_lowvram_block_offload; *AUTO = resident_or_comfy_auto (resident vs. auto-offload not disambiguated by harness).",
+        ha="center", color=P_MUTED, fontsize=8.2, linespacing=1.32,
     )
 
     out_png = FIG_DIR / "fig7_silicon_16gpu_av.png"
     out_svg = FIG_DIR / "fig7_silicon_16gpu_av.svg"
-    fig.savefig(out_png, facecolor=BG, dpi=220)
-    fig.savefig(out_svg, facecolor=BG)
+    fig.savefig(out_png, facecolor=P_BG, dpi=220)
+    fig.savefig(out_svg, facecolor=P_BG)
     plt.close(fig)
     print(f"WROTE {out_png} ({out_png.stat().st_size} B, sha256={sha256_file(out_png)[:16]}...)")
     return out_png

@@ -311,39 +311,67 @@ def fig4():
     for i, (txt, col) in enumerate(c_rows):
         s += t(L_X + 16, ly + 27 + i * 19, txt, 10.6, col, 'start', 700 if i < 2 else 400, mono=True)
 
-    # --- RIGHT PANEL: Universal Cross-Encoder Retention Ladder ---
+    # --- RIGHT PANEL: Two Explicitly Separated Sub-Axes (No Shared Formula Axis) ---
     s += box(R_X, P_TOP, R_W, P_H, stroke=RULE, fill=PANEL, sw=1.2)
-    s += t(R_X + 16, P_TOP + 22, 'B. ZERO-TEXT-ENCODER SIGLIP2 RETENTION (TWO FORMULAS)', 10.6, INK, 'start', 700, ls='0.04em')
-    s += t(R_X + 16, P_TOP + 37, 'C-160: (cand-B0)/(teach-B0)  |  Wave B Dev-24: cand/native (sep. B0 gate)', 9.6, SEC)
+    s += t(R_X + 16, P_TOP + 22, 'B. ZERO-TEXT-ENCODER SIGLIP2 RETENTION (SEPARATE AXES)', 10.6, INK, 'start', 700, ls='0.04em')
 
-    bars = [
-        ('FLUX.2-dev (Dev-24, cand/nat)', 'replaces 44.7 GiB Mistral-24B', f2d_ret, G),
-        ('MiniMax-H3 · Qwen3.8 L31 (C-160)', '50 MiB L31, (c-B0)/(t-B0)', qw_st_ret, G),
-        ('MiniMax-H3 · Inkling c4 (C-160)', '90 MiB c4, (c-B0)/(t-B0)', pa_concat4_ret, G),
-        ('FLUX.2-klein-9B (Dev-24, cand/nat)', 'replaces Qwen3-8B encoder', f2k9_ret, G),
-        ('FLUX.1-dev (Dev-24, cand/nat)', 'replaces T5-XXL + CLIP-L', f1dev_ret, BLUE),
-        ('FLUX.1-schnell (Dev-24, cand/nat)', 'replaces T5-XXL + CLIP-L', f1sch_ret, BLUE),
-        ('SDXL-base-1.0 (Dev-24 FAIL)', 'cand/nat · CLIP-L pad hypothesis', sdxl_b_ret, RED),
-        ('SDXL-Turbo (Dev-24 FAIL)', 'cand/nat · CLIP-L pad hypothesis', sdxl_t_ret, RED),
-    ]
     bx0 = R_X + 236
     bx1 = R_X + R_W - 72
     bw = bx1 - bx0
+
+    # Sub-panel B1: Sealed Confirm-160 (B0-anchored formula)
+    b1_top = P_TOP + 34
+    s += t(R_X + 16, b1_top + 11, 'B1. SEALED CONFIRM-160 · B0-anchored (cand-B0)/(teach-B0)', 9.6, G, 'start', 700)
+    b1_bars = [
+        ('MiniMax-H3 · Qwen3.8 L31 (C-160)', '50 MiB L31 (donor LLM resident)', qw_st_ret, G),
+        ('MiniMax-H3 · Inkling c4 (C-160)', '90 MiB c4 (donor LLM resident)', pa_concat4_ret, G),
+    ]
+    b1_y0 = b1_top + 19
+    b1_y1 = b1_y0 + len(b1_bars) * 35 + 4
     for pct, pcol in ((50, RULE), (80, RULE), (100, INK)):
         xx = bx0 + (pct / 100.0) * bw
-        s += f'<line x1="{xx:.1f}" x2="{xx:.1f}" y1="{P_TOP+48}" y2="{P_TOP+354}" stroke="{pcol}" stroke-opacity="{"0.65" if pct==100 else "1"}" stroke-dasharray="{"4 3" if pct==100 else ""}"/>'
-        s += t(xx, P_TOP + 370, f'{pct}%', 10.5, pcol if pct == 100 else SEC, 'middle', mono=True)
-
-    for i, (name, sub, val, col) in enumerate(bars):
-        by = P_TOP + 52 + i * 37
-        s += t(R_X + 16, by + 13, name, 11.2, INK if col != RED else RED, 'start', 700)
-        s += t(R_X + 16, by + 26, sub, 9.8, SEC)
+        s += f'<line x1="{xx:.1f}" x2="{xx:.1f}" y1="{b1_y0}" y2="{b1_y1}" stroke="{pcol}" stroke-opacity="{"0.65" if pct==100 else "1"}" stroke-dasharray="{"4 3" if pct==100 else ""}"/>'
+        s += t(xx, b1_y1 + 12, f'{pct}%', 9.2, pcol if pct == 100 else SEC, 'middle', mono=True)
+    for i, (name, sub, val, col) in enumerate(b1_bars):
+        by = b1_y0 + 3 + i * 35
+        s += t(R_X + 16, by + 12, name, 10.8, INK, 'start', 700)
+        s += t(R_X + 16, by + 24, sub, 9.4, SEC)
         wbar = max(4.0, (val / 100.0) * bw)
-        s += f'<rect x="{bx0:.1f}" y="{by+3:.1f}" width="{wbar:.1f}" height="20" rx="2" fill="{col}"/>'
+        s += f'<rect x="{bx0:.1f}" y="{by+2:.1f}" width="{wbar:.1f}" height="18" rx="2" fill="{col}"/>'
         lbl_x = bx1 + 8 if val >= 88.0 else bx0 + wbar + 8
-        s += t(lbl_x, by + 17.5, f'{val:.2f}%', 11.5, col, 'start', 700, mono=True).replace('<text ', f'<text paint-order="stroke" stroke="{PANEL}" stroke-width="5" stroke-linejoin="round" ')
+        s += t(lbl_x, by + 15.5, f'{val:.2f}%', 11.0, col, 'start', 700, mono=True).replace('<text ', f'<text paint-order="stroke" stroke="{PANEL}" stroke-width="5" stroke-linejoin="round" ')
 
-    f, H = footer(P_TOP + P_H + 26, 'Left: real N=1..3 val_dev (solid) and separate 2-real + clone stress series from shared N=2 (dashed; convex_equal omitted at 0.622); Confirm-160 significance is vs Qwen3.8 alone (+0.000601 vs 2-way descriptive). Right: C-160 bars use B0-anchored (cand-B0)/(teach-B0); Wave B Dev-24 bars use cand_margin/native_margin with separate B0 gate (e.g. FLUX.2-dev 0.2711/0.2721=99.65%; Wave B Confirm-160 word bars 4/6 PASS incl. FLUX.2-dev R^2=0.6523, Confirm-160 image renders sealed).')
+    # Divider between B1 and B2
+    div_y = b1_y1 + 21
+    s += f'<line x1="{R_X+16}" x2="{R_X+R_W-16}" y1="{div_y}" y2="{div_y}" stroke="{RULE}" stroke-width="1.2"/>'
+
+    # Sub-panel B2: Unsealed Wave B Dev-24 (cand_margin / native_margin formula)
+    b2_top = div_y + 15
+    s += t(R_X + 16, b2_top, 'B2. UNSEALED WAVE B DEV-24 · cand/native (sep. B0 gate)', 9.6, BLUE, 'start', 700)
+    b2_bars = [
+        ('FLUX.2-dev (Dev-24)', '271 MiB key vs 44.7 GiB Mistral', f2d_ret, G),
+        ('FLUX.2-klein-9B (Dev-24)', 'replaces Qwen3-8B encoder', f2k9_ret, G),
+        ('FLUX.1-dev (Dev-24)', 'T5-XXL+CLIP-L (C-160 word R2=0.53)', f1dev_ret, BLUE),
+        ('FLUX.1-schnell (Dev-24)', 'T5-XXL+CLIP-L (C-160 word R2=0.53)', f1sch_ret, BLUE),
+        ('SDXL-base-1.0 (Dev-24 FAIL)', 'C-160 word R2=0.54 · pad hyp.', sdxl_b_ret, RED),
+        ('SDXL-Turbo (Dev-24 FAIL)', 'C-160 word R2=0.54 · pad hyp.', sdxl_t_ret, RED),
+    ]
+    b2_y0 = b2_top + 8
+    b2_y1 = b2_y0 + len(b2_bars) * 35 + 4
+    for pct, pcol in ((50, RULE), (80, RULE), (100, INK)):
+        xx = bx0 + (pct / 100.0) * bw
+        s += f'<line x1="{xx:.1f}" x2="{xx:.1f}" y1="{b2_y0}" y2="{b2_y1}" stroke="{pcol}" stroke-opacity="{"0.65" if pct==100 else "1"}" stroke-dasharray="{"4 3" if pct==100 else ""}"/>'
+        s += t(xx, b2_y1 + 12, f'{pct}%', 9.2, pcol if pct == 100 else SEC, 'middle', mono=True)
+    for i, (name, sub, val, col) in enumerate(b2_bars):
+        by = b2_y0 + 3 + i * 35
+        s += t(R_X + 16, by + 12, name, 10.8, INK if col != RED else RED, 'start', 700)
+        s += t(R_X + 16, by + 24, sub, 9.4, SEC)
+        wbar = max(4.0, (val / 100.0) * bw)
+        s += f'<rect x="{bx0:.1f}" y="{by+2:.1f}" width="{wbar:.1f}" height="18" rx="2" fill="{col}"/>'
+        lbl_x = bx1 + 8 if val >= 88.0 else bx0 + wbar + 8
+        s += t(lbl_x, by + 15.5, f'{val:.2f}%', 11.0, col, 'start', 700, mono=True).replace('<text ', f'<text paint-order="stroke" stroke="{PANEL}" stroke-width="5" stroke-linejoin="round" ')
+
+    f, H = footer(P_TOP + P_H + 26, 'Left: real N=1..3 val_dev (solid) and separate 2-real + clone stress series from shared N=2 (dashed; convex_equal omitted at 0.622); Confirm-160 significance is vs Qwen3.8 alone (+0.000601 vs 2-way descriptive). Right: B1 (Sealed Confirm-160, B0-anchored formula) and B2 (Unsealed Wave B Dev-24, cand/native formula with separate B0 gate) are plotted on separate axes; Wave B Confirm-160 word bars 4/6 PASS (Confirm-160 image renders sealed).')
     return doc(s + f, H)
 
 
