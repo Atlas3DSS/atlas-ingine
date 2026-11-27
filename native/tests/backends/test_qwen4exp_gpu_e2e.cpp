@@ -245,10 +245,18 @@ void write_random_synthetic_qwen4exp_shards(const std::filesystem::path& dir) {
   emit_shard(dir / "q4exp-00002-of-00002.gguf", s2, false);
 }
 
-float max_abs(const std::vector<float>& a, const std::vector<float>& b) {
-  CHECK(a.size() == b.size());
+float max_abs_checked(const std::vector<float>& a, const std::vector<float>& b, std::size_t expected_size) {
+  CHECK(expected_size > 0);
+  CHECK(a.size() == expected_size);
+  CHECK(b.size() == expected_size);
   float m = 0.0f;
-  for (std::size_t i = 0; i < a.size(); ++i) m = std::max(m, std::fabs(a[i] - b[i]));
+  for (std::size_t i = 0; i < expected_size; ++i) {
+    CHECK(std::isfinite(a[i]));
+    CHECK(std::isfinite(b[i]));
+    const float d = std::fabs(a[i] - b[i]);
+    CHECK(std::isfinite(d));
+    if (d > m) m = d;
+  }
   return m;
 }
 
@@ -266,6 +274,9 @@ void test_synthetic_gpu_vs_cpu_and_tiered_cache() {
     cpu_logits = forward_gguf_token_logits_cpu(gguf, cpu_sess, seq[i], /*compute_logits=*/i + 1 == seq.size());
   }
 
+  const std::size_t expected_vocab = static_cast<std::size_t>(gguf.config().vocab_size);
+  CHECK(expected_vocab > 0);
+
   // Mode A: AllResident GPU
   {
     Qwen4ExpGpuLoadOptions opts;
@@ -280,7 +291,7 @@ void test_synthetic_gpu_vs_cpu_and_tiered_cache() {
     for (std::size_t i = 0; i < seq.size(); ++i) {
       gpu_logits = gpu.forward_token_logits_gpu(*gs, seq[i], /*compute_logits=*/i + 1 == seq.size());
     }
-    const float diff = max_abs(cpu_logits, gpu_logits);
+    const float diff = max_abs_checked(cpu_logits, gpu_logits, expected_vocab);
     std::printf("  AllResident GPU vs CPU max_abs=%.6e\n", diff);
     CHECK(diff < 5e-4f);
   }
@@ -300,7 +311,7 @@ void test_synthetic_gpu_vs_cpu_and_tiered_cache() {
     for (std::size_t i = 0; i < seq.size(); ++i) {
       gpu_logits = gpu.forward_token_logits_gpu(*gs, seq[i], /*compute_logits=*/i + 1 == seq.size());
     }
-    const float diff = max_abs(cpu_logits, gpu_logits);
+    const float diff = max_abs_checked(cpu_logits, gpu_logits, expected_vocab);
     const auto cs = gpu.expert_cache_stats();
     std::printf("  TieredExpertCache GPU vs CPU max_abs=%.6e (slots=%llu hits=%llu misses=%llu)\n", diff,
                 static_cast<unsigned long long>(cs.slots_capacity), static_cast<unsigned long long>(cs.hits),
@@ -641,6 +652,7 @@ void test_synthetic_elastic_all_resident_vs_tiered_cache() {
     for (std::size_t i = 0; i < seq.size(); ++i) {
       logits_all_res = gpu.forward_token_logits_gpu(*gs, seq[i], /*compute_logits=*/i + 1 == seq.size());
     }
+    CHECK(logits_all_res.size() == static_cast<std::size_t>(V));
     for (float v : logits_all_res) CHECK(std::isfinite(v));
   }
 
@@ -662,8 +674,10 @@ void test_synthetic_elastic_all_resident_vs_tiered_cache() {
     for (std::size_t i = 0; i < seq.size(); ++i) {
       logits_tiered = gpu.forward_token_logits_gpu(*gs, seq[i], /*compute_logits=*/i + 1 == seq.size());
     }
+    CHECK(logits_tiered.size() == static_cast<std::size_t>(V));
+    for (float v : logits_tiered) CHECK(std::isfinite(v));
     const auto cs = gpu.expert_cache_stats();
-    const float diff = max_abs(logits_all_res, logits_tiered);
+    const float diff = max_abs_checked(logits_all_res, logits_tiered, static_cast<std::size_t>(V));
     std::printf("  Elastic AllResident vs TieredExpertCache max_abs=%.6e (slots=%llu hits=%llu misses=%llu)\n", diff,
                 static_cast<unsigned long long>(cs.slots_capacity), static_cast<unsigned long long>(cs.hits),
                 static_cast<unsigned long long>(cs.misses));

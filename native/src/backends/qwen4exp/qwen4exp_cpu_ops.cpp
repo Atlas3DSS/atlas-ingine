@@ -154,7 +154,10 @@ void ple_hash_step(const Qwen4ExpConfig& cfg, std::int32_t token_id, std::vector
   const int n_gram = cfg.ple_ngram_size;
   const int per_gram = cfg.ple_heads_per_ngram;
   const int n_heads = cfg.ple_n_heads();
-  if (n_heads <= 0 || static_cast<int>(out_rows.size()) != n_heads) {
+  if (n_heads <= 0 || static_cast<int>(out_rows.size()) != n_heads ||
+      cfg.ple_layer_multipliers.size() < static_cast<std::size_t>(n_gram) ||
+      cfg.ple_head_vocab_sizes.size() != static_cast<std::size_t>(n_heads) ||
+      cfg.ple_head_offsets.size() != static_cast<std::size_t>(n_heads)) {
     throw std::invalid_argument("ple_hash_step: invalid PLE config or output size");
   }
   const std::int32_t eos = cfg.ple_eos_token_id;
@@ -181,9 +184,16 @@ void ple_hash_step(const Qwen4ExpConfig& cfg, std::int32_t token_id, std::vector
     const int base = (n - 2) * per_gram;
     for (int g = 0; g < per_gram; ++g) {
       const int hi = base + g;
-      const std::uint64_t row =
-          (mixed % cfg.ple_head_vocab_sizes[static_cast<std::size_t>(hi)]) +
-          cfg.ple_head_offsets[static_cast<std::size_t>(hi)];
+      const std::uint64_t voc = cfg.ple_head_vocab_sizes[static_cast<std::size_t>(hi)];
+      const std::uint64_t off = cfg.ple_head_offsets[static_cast<std::size_t>(hi)];
+      if (voc == 0) {
+        throw std::invalid_argument("ple_hash_step: ple_head_vocab_sizes entry cannot be 0");
+      }
+      const std::uint64_t rem = mixed % voc;
+      if (off > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) - rem) {
+        throw std::out_of_range("ple_hash_step: row index exceeds INT32_MAX");
+      }
+      const std::uint64_t row = rem + off;
       out_rows[static_cast<std::size_t>(hi)] = static_cast<std::int32_t>(row);
     }
   }

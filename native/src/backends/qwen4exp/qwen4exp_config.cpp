@@ -178,6 +178,10 @@ void Qwen4ExpConfig::finalize_and_validate() {
       if (off > std::numeric_limits<std::uint64_t>::max() - voc) {
         throw std::invalid_argument("Qwen4ExpConfig: integer overflow in PLE head vocab range");
       }
+      const std::uint64_t last_row = off + (voc - 1u);
+      if (last_row > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("Qwen4ExpConfig: PLE inclusive last row exceeds INT32_MAX");
+      }
     }
   } else if (ple_ngram_size != 0 || ple_heads_per_ngram != 0 || ple_conv_kernel != 0 || ple_head_dim != 0 ||
              !ple_layer_multipliers.empty() || !ple_head_offsets.empty() || !ple_head_vocab_sizes.empty()) {

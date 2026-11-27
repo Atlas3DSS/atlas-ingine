@@ -1446,9 +1446,36 @@ void test_elastic_consumer_layout_rejections() {
       ovf_vocab.ple_head_vocab_sizes[0] = 4;
       CHECK_THROWS(ovf_vocab.finalize_and_validate());
     }
+    // Inclusive last PLE row == INT32_MAX must pass; one past INT32_MAX must reject (both config & ple_hash_step).
+    {
+      constexpr std::uint64_t kI32Max = static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max());
+      Qwen4ExpConfig at_max = base;
+      at_max.ple_head_offsets[0] = kI32Max;
+      at_max.ple_head_vocab_sizes[0] = 1;
+      at_max.ple_head_offsets[1] = kI32Max - 10;
+      at_max.ple_head_vocab_sizes[1] = 11;
+      at_max.finalize_and_validate();
+      std::vector<std::int32_t> hist;
+      std::vector<std::int32_t> rows(static_cast<std::size_t>(at_max.ple_n_heads()), -1);
+      ple_hash_step(at_max, 7, hist, rows);
+      CHECK(rows[0] == std::numeric_limits<std::int32_t>::max());
+      CHECK(rows[1] >= static_cast<std::int32_t>(kI32Max - 10) && rows[1] <= std::numeric_limits<std::int32_t>::max());
+
+      Qwen4ExpConfig past_max_voc = base;
+      past_max_voc.ple_head_offsets[0] = kI32Max;
+      past_max_voc.ple_head_vocab_sizes[0] = 2;  // inclusive last row == INT32_MAX + 1
+      CHECK_THROWS(past_max_voc.finalize_and_validate());
+
+      Qwen4ExpConfig past_max_off = base;
+      past_max_off.ple_head_offsets[0] = kI32Max + 1;
+      past_max_off.ple_head_vocab_sizes[0] = 1;  // inclusive last row == INT32_MAX + 1
+      CHECK_THROWS(past_max_off.finalize_and_validate());
+      // Direct defense-in-depth check on ple_hash_step when bypassing finalize_and_validate().
+      CHECK_THROWS(ple_hash_step(past_max_off, 7, hist, rows));
+    }
   }
 
-  std::printf("PASS test_elastic_consumer_layout_rejections (31 dense/MoE/PLE/config layout & overflow cases)\n");
+  std::printf("PASS test_elastic_consumer_layout_rejections (32 dense/MoE/PLE/config layout & boundary cases)\n");
 }
 
 void test_real_quincy_elastic_packs() {

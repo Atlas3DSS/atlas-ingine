@@ -57,11 +57,13 @@ struct DevVec {
 };
 
 float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
-  CHECK(a.size() == b.size());
+  CHECK(!a.empty() && a.size() == b.size());
   float m = 0.0f;
   for (std::size_t i = 0; i < a.size(); ++i) {
     CHECK(std::isfinite(a[i]) && std::isfinite(b[i]));
-    m = std::max(m, std::fabs(a[i] - b[i]));
+    const float d = std::fabs(a[i] - b[i]);
+    CHECK(std::isfinite(d));
+    if (d > m) m = d;
   }
   return m;
 }
