@@ -3,16 +3,14 @@
 
 #include <nlohmann/json.hpp>
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 
 namespace ingine::backends::qwen4exp {
 namespace {
@@ -44,28 +42,48 @@ float bf16_to_f32_host(std::uint16_t b) noexcept {
   return out;
 }
 
-std::shared_ptr<int> open_fd_ro(const std::filesystem::path& p) {
-  const int fd = ::open(p.c_str(), O_RDONLY);
-  if (fd < 0) throw std::runtime_error("cannot open elastic shard " + p.string() + ": " + std::strerror(errno));
-  return std::shared_ptr<int>(new int(fd), [](int* fp) {
-    if (fp) {
-      if (*fp >= 0) ::close(*fp);
-      delete fp;
-    }
-  });
+std::uint64_t checked_mul_u64(std::uint64_t a, std::uint64_t b, const char* what) {
+  if (b != 0 && a > std::numeric_limits<std::uint64_t>::max() / b) {
+    throw std::overflow_error(std::string("qwen4exp elastic: integer overflow in ") + what);
+  }
+  return a * b;
 }
 
-void pread_all(int fd, const std::filesystem::path& p, std::uint64_t off, std::uint8_t* dst, std::size_t len) {
-  std::size_t done = 0;
-  while (done < len) {
-    const ssize_t n = ::pread(fd, dst + done, len - done, static_cast<off_t>(off + done));
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      throw std::runtime_error("pread failed on " + p.string() + ": " + std::strerror(errno));
-    }
-    if (n == 0) throw std::runtime_error("unexpected EOF in " + p.string());
-    done += static_cast<std::size_t>(n);
+std::uint64_t checked_add_u64(std::uint64_t a, std::uint64_t b, const char* what) {
+  if (a > std::numeric_limits<std::uint64_t>::max() - b) {
+    throw std::overflow_error(std::string("qwen4exp elastic: integer overflow in ") + what);
   }
+  return a + b;
+}
+
+std::filesystem::path validate_shard_path(const std::filesystem::path& dir,
+                                          const std::filesystem::path& canonical_dir,
+                                          const std::string& shard_name) {
+  if (shard_name.empty() || shard_name == "." || shard_name == ".." ||
+      shard_name.find('/') != std::string::npos || shard_name.find('\\') != std::string::npos ||
+      shard_name.find('\0') != std::string::npos) {
+    throw std::invalid_argument("invalid elastic shard filename: '" + shard_name + "'");
+  }
+  const std::filesystem::path rel(shard_name);
+  if (rel.is_absolute() || rel.has_parent_path() || rel.filename().string() != shard_name) {
+    throw std::invalid_argument("elastic shard path must be a plain filename: '" + shard_name + "'");
+  }
+  const std::filesystem::path sp = dir / rel;
+  std::error_code ec;
+  const auto st = std::filesystem::symlink_status(sp, ec);
+  if (ec || !std::filesystem::exists(sp, ec)) {
+    throw std::invalid_argument("elastic shard does not exist: " + sp.string());
+  }
+  if (std::filesystem::is_symlink(st)) {
+    const auto canon_sp = std::filesystem::canonical(sp, ec);
+    if (ec || canon_sp.parent_path() != canonical_dir) {
+      throw std::invalid_argument("elastic shard symlink escapes checkpoint directory: " + shard_name);
+    }
+  }
+  if (!std::filesystem::is_regular_file(sp, ec) || ec) {
+    throw std::invalid_argument("elastic shard is not a regular file: " + sp.string());
+  }
+  return sp;
 }
 
 ElasticTensorKind parse_algo(const std::string& algo) {
@@ -99,9 +117,17 @@ Qwen4ExpElasticSet Qwen4ExpElasticSet::inspect_headers(const std::filesystem::pa
   const auto qcfg_j = read_json(dir / "hf_quant_config.json");
   const auto idx_j = read_json(dir / "model.safetensors.index.json");
 
-  if (!qcfg_j.contains("atlas_elastic") || !qcfg_j["atlas_elastic"].is_object()) {
+  if (!cfg_j.is_object()) {
+    throw std::invalid_argument("config.json is not a JSON object");
+  }
+  if (!qcfg_j.is_object() || !qcfg_j.contains("atlas_elastic") || !qcfg_j["atlas_elastic"].is_object()) {
     throw std::invalid_argument("hf_quant_config.json missing atlas_elastic section");
   }
+  if (!idx_j.is_object() || !idx_j.contains("weight_map") || !idx_j["weight_map"].is_object() ||
+      idx_j["weight_map"].empty()) {
+    throw std::invalid_argument("model.safetensors.index.json missing non-empty weight_map object");
+  }
+
   const auto& ae = qcfg_j["atlas_elastic"];
   if (ae.value("family", std::string{}) != "qwen4exp") {
     throw std::invalid_argument("hf_quant_config.json atlas_elastic.family != qwen4exp");
@@ -109,10 +135,23 @@ Qwen4ExpElasticSet Qwen4ExpElasticSet::inspect_headers(const std::filesystem::pa
 
   Qwen4ExpElasticSet set;
   set.profile_ = ae.value("profile", std::string("elastic"));
-  if (ae.contains("ple") && ae["ple"].is_object()) {
+  if (ae.contains("ple")) {
+    if (!ae["ple"].is_object()) {
+      throw std::invalid_argument("hf_quant_config.json atlas_elastic.ple must be an object");
+    }
     set.ple_format_ = ae["ple"].value("format", std::string("external"));
     set.ple_num_shards_ = ae["ple"].value("num_shards", 0);
     set.ple_chunk_rows_ = ae["ple"].value("chunk_rows", 2000000ull);
+    if (set.ple_num_shards_ < 0) {
+      throw std::invalid_argument("hf_quant_config.json atlas_elastic.ple.num_shards must be >= 0");
+    }
+    if (set.ple_format_ != "external" && set.ple_format_ != "nvfp4" && set.ple_format_ != "q8_0" &&
+        set.ple_format_ != "f32") {
+      throw std::invalid_argument("unsupported atlas_elastic.ple.format: '" + set.ple_format_ + "'");
+    }
+    if (set.ple_num_shards_ > 0 && set.ple_format_ != "external" && set.ple_chunk_rows_ == 0) {
+      throw std::invalid_argument("hf_quant_config.json atlas_elastic.ple.chunk_rows must be > 0");
+    }
   }
 
   // Populate Qwen4ExpConfig from config.json["gguf_kv"].
@@ -172,69 +211,166 @@ Qwen4ExpElasticSet Qwen4ExpElasticSet::inspect_headers(const std::filesystem::pa
   }
 
   // Parse quantized_layers map.
-  if (qcfg_j.contains("quantization") && qcfg_j["quantization"].contains("quantized_layers")) {
+  if (qcfg_j.contains("quantization") && qcfg_j["quantization"].is_object() &&
+      qcfg_j["quantization"].contains("quantized_layers") && qcfg_j["quantization"]["quantized_layers"].is_object()) {
     for (const auto& [k, v] : qcfg_j["quantization"]["quantized_layers"].items()) {
+      if (!v.is_object()) {
+        throw std::invalid_argument("hf_quant_config.json quantized_layers entry is not an object: " + k);
+      }
       set.layer_kinds_[k] = parse_algo(v.value("quant_algo", std::string{}));
     }
   }
 
-  // Inspect all safetensors shard headers.
-  std::set<std::string> shard_names;
-  for (const auto& [tname, sname] : idx_j.at("weight_map").items()) {
-    (void)tname;
-    shard_names.insert(sname.get<std::string>());
+  // Validate weight_map shard filenames and inspect every referenced shard via ingine::SafetensorsFile.
+  std::error_code ec;
+  const std::filesystem::path canonical_dir = std::filesystem::canonical(dir, ec);
+  if (ec) {
+    throw std::invalid_argument("cannot canonicalize elastic checkpoint directory: " + dir.string());
   }
+
+  std::set<std::string> shard_names;
+  std::unordered_map<std::string, std::string> declared_map;
+  for (const auto& [tname, sname_val] : idx_j.at("weight_map").items()) {
+    if (tname.empty() || !sname_val.is_string()) {
+      throw std::invalid_argument("invalid weight_map entry in model.safetensors.index.json: '" + tname + "'");
+    }
+    const std::string sname = sname_val.get<std::string>();
+    (void)validate_shard_path(dir, canonical_dir, sname);
+    shard_names.insert(sname);
+    declared_map.emplace(tname, sname);
+  }
+
   for (const std::string& sname : shard_names) {
-    const std::filesystem::path sp = dir / sname;
+    const std::filesystem::path sp = validate_shard_path(dir, canonical_dir, sname);
+    auto sf = std::make_shared<ingine::SafetensorsFile>(sp);
+    if (!sf->open_stat().valid) {
+      throw std::invalid_argument("elastic shard is not a regular file: " + sp.string());
+    }
+    if (sf->is_weight_pack()) {
+      throw std::invalid_argument("elastic shard unexpectedly uses INGPACK1 format: " + sp.string());
+    }
+
     ElasticShardInfo si;
     si.filename = sname;
     si.full_path = sp;
-    si.file_size = std::filesystem::file_size(sp);
-    si.cached_fd = open_fd_ro(sp);
+    si.file_size = sf->file_size();
+    si.data_start = sf->data_offset();
+    si.file = sf;
 
-    std::uint8_t hdr_len_b[8]{};
-    pread_all(*si.cached_fd, sp, 0, hdr_len_b, 8);
-    std::uint64_t hlen = 0;
-    for (int i = 0; i < 8; ++i) hlen |= static_cast<std::uint64_t>(hdr_len_b[i]) << (8 * i);
-    std::string hdr_str(hlen, '\0');
-    pread_all(*si.cached_fd, sp, 8, reinterpret_cast<std::uint8_t*>(hdr_str.data()), hlen);
-    si.data_start = 8ull + hlen;
-
-    const auto hj = nlohmann::json::parse(hdr_str);
     const std::size_t sidx = set.shards_.size();
-    for (const auto& [tname, meta] : hj.items()) {
-      if (tname == "__metadata__") continue;
+    for (const ingine::SafetensorsTensor& t : sf->tensors()) {
+      // Fail closed on unknown/unsupported dtypes (SafetensorsFile skips size check when dtype is unknown).
+      const std::size_t elem_bytes = ingine::safetensors_dtype_size(t.dtype);
+      std::uint64_t expected_bytes = static_cast<std::uint64_t>(elem_bytes);
+      for (const std::int64_t dim : t.shape) {
+        if (dim < 0) {
+          throw std::invalid_argument("tensor '" + t.name + "' has negative/overflowed dimension in " + sname);
+        }
+        expected_bytes = checked_mul_u64(expected_bytes, static_cast<std::uint64_t>(dim), "tensor shape bytes");
+      }
+      if (t.bytes != expected_bytes) {
+        throw std::invalid_argument("tensor '" + t.name + "' byte size " + std::to_string(t.bytes) +
+                                    " disagrees with dtype/shape size " + std::to_string(expected_bytes) + " in " +
+                                    sname);
+      }
+      if (t.offset < si.data_start || t.offset > si.file_size || t.bytes > si.file_size - t.offset) {
+        throw std::invalid_argument("tensor '" + t.name + "' span out of bounds in " + sname);
+      }
+
       SafetensorsEntry e;
-      e.name = tname;
-      e.dtype = meta.at("dtype").get<std::string>();
-      e.shape = meta.at("shape").get<std::vector<std::int64_t>>();
-      const auto offs = meta.at("data_offsets").get<std::vector<std::uint64_t>>();
+      e.name = t.name;
+      e.dtype = t.dtype;
+      e.shape = t.shape;
       e.shard_index = sidx;
-      e.data_offset = si.data_start + offs[0];
-      e.byte_size = offs[1] - offs[0];
-      set.total_tensor_bytes_ += e.byte_size;
-      set.tensors_.emplace(tname, std::move(e));
+      e.data_offset = t.offset;
+      e.byte_size = t.bytes;
+
+      set.total_tensor_bytes_ = checked_add_u64(set.total_tensor_bytes_, e.byte_size, "total_tensor_bytes");
+      if (!set.tensors_.emplace(e.name, std::move(e)).second) {
+        throw std::invalid_argument("duplicate tensor '" + t.name + "' across elastic safetensors shards");
+      }
     }
     set.shards_.push_back(std::move(si));
   }
 
-  // Derive vocab_size from token_embd.weight.
+  // Verify every tensor listed in weight_map actually resides in its declared shard.
+  for (const auto& [tname, expected_shard] : declared_map) {
+    const auto* e = set.find_tensor(tname);
+    if (!e) {
+      throw std::invalid_argument("weight_map tensor '" + tname + "' missing from shard '" + expected_shard + "'");
+    }
+    if (set.shards_.at(e->shard_index).filename != expected_shard) {
+      throw std::invalid_argument("weight_map tensor '" + tname + "' declared in '" + expected_shard +
+                                  "' but found in '" + set.shards_.at(e->shard_index).filename + "'");
+    }
+  }
+
+  // Derive and validate vocab_size and token_embd tensor layout.
   const auto& te = set.require_tensor("token_embd.weight");
-  c.vocab_size = static_cast<int>(te.shape.at(0));
+  if (te.shape.size() != 2 || te.shape[0] <= 0 ||
+      te.shape[0] > static_cast<std::int64_t>(std::numeric_limits<int>::max()) || te.shape[1] <= 0) {
+    throw std::invalid_argument("token_embd.weight must have a valid positive 2D shape");
+  }
+  c.vocab_size = static_cast<int>(te.shape[0]);
   c.finalize_and_validate();
 
   set.embed_kind_ = set.layer_kind("token_embd");
   if (set.embed_kind_ == ElasticTensorKind::Fp8) {
+    if (te.dtype != "F8_E4M3" || te.shape[1] != c.hidden_size) {
+      throw std::invalid_argument("token_embd.weight FP8 dtype/shape mismatch against hidden_size");
+    }
     set.embed_scale_ = set.read_scalar_f32(set.require_tensor("token_embd.weight_scale"));
   } else if (set.embed_kind_ == ElasticTensorKind::Nvfp4) {
+    if ((c.hidden_size % 16) != 0 || te.dtype != "U8" || te.shape[1] != c.hidden_size / 2) {
+      throw std::invalid_argument("token_embd.weight NVFP4 dtype/shape mismatch against hidden_size");
+    }
+    const auto& sc_e = set.require_tensor("token_embd.weight_scale");
+    if (sc_e.dtype != "F8_E4M3" || sc_e.shape.size() != 2 || sc_e.shape[0] != te.shape[0] ||
+        sc_e.shape[1] != c.hidden_size / 16) {
+      throw std::invalid_argument("token_embd.weight_scale NVFP4 dtype/shape mismatch");
+    }
     set.embed_scale_ = set.read_scalar_f32(set.require_tensor("token_embd.weight_scale_2"));
+  } else {
+    if ((te.dtype != "F32" && te.dtype != "BF16") || te.shape[1] != c.hidden_size) {
+      throw std::invalid_argument("token_embd.weight dense dtype/shape mismatch against hidden_size");
+    }
   }
 
-  if (set.ple_num_shards_ > 0 && set.ple_format_ == "nvfp4") {
-    set.ple_chunk_scale2_.resize(static_cast<std::size_t>(set.ple_num_shards_), 1.0f);
-    for (int i = 0; i < set.ple_num_shards_; ++i) {
-      set.ple_chunk_scale2_[static_cast<std::size_t>(i)] =
-          set.read_scalar_f32(set.require_tensor("ple.chunk_" + std::to_string(i) + ".weight_scale_2"));
+  // Validate embedded host-only PLE shard tensors at ingress.
+  if (set.ple_num_shards_ > 0 && set.ple_format_ != "external") {
+    if (set.ple_format_ == "nvfp4") {
+      set.ple_chunk_scale2_.resize(static_cast<std::size_t>(set.ple_num_shards_), 1.0f);
+      for (int i = 0; i < set.ple_num_shards_; ++i) {
+        const std::string pref = "ple.chunk_" + std::to_string(i);
+        const auto& w = set.require_tensor(pref + ".weight");
+        const auto& sc = set.require_tensor(pref + ".weight_scale");
+        if (w.dtype != "U8" || w.shape.size() != 2 || w.shape[0] <= 0 || w.shape[1] <= 0 || (w.shape[1] % 8) != 0) {
+          throw std::invalid_argument(pref + ".weight NVFP4 dtype/shape mismatch");
+        }
+        if (sc.dtype != "F8_E4M3" || sc.shape.size() != 2 || sc.shape[0] != w.shape[0] ||
+            sc.shape[1] != w.shape[1] / 8) {
+          throw std::invalid_argument(pref + ".weight_scale NVFP4 dtype/shape mismatch");
+        }
+        set.ple_chunk_scale2_[static_cast<std::size_t>(i)] =
+            set.read_scalar_f32(set.require_tensor(pref + ".weight_scale_2"));
+      }
+    } else if (set.ple_format_ == "q8_0") {
+      for (int i = 0; i < set.ple_num_shards_; ++i) {
+        const std::string pref = "ple.chunk_" + std::to_string(i);
+        const auto& raw = set.require_tensor(pref + ".q8_0_raw");
+        if (raw.dtype != "U8" || raw.shape.size() != 2 || raw.shape[0] <= 0 || raw.shape[1] <= 0 ||
+            (raw.shape[1] % 34) != 0) {
+          throw std::invalid_argument(pref + ".q8_0_raw dtype/shape mismatch");
+        }
+      }
+    } else if (set.ple_format_ == "f32") {
+      for (int i = 0; i < set.ple_num_shards_; ++i) {
+        const std::string pref = "ple.chunk_" + std::to_string(i);
+        const auto& f32 = set.require_tensor(pref + ".f32");
+        if (f32.dtype != "F32" || f32.shape.size() != 2 || f32.shape[0] <= 0 || f32.shape[1] <= 0) {
+          throw std::invalid_argument(pref + ".f32 dtype/shape mismatch");
+        }
+      }
     }
   }
 
@@ -265,28 +401,46 @@ ElasticTensorKind Qwen4ExpElasticSet::layer_kind(const std::string& prefix) cons
 
 void Qwen4ExpElasticSet::read_tensor_bytes(const SafetensorsEntry& entry, std::uint64_t rel_offset,
                                            std::span<std::uint8_t> dst) const {
+  if (entry.shard_index >= shards_.size() || !shards_[entry.shard_index].file) {
+    throw std::out_of_range("read_tensor_bytes invalid shard index on " + entry.name);
+  }
   if (rel_offset > entry.byte_size || dst.size() > entry.byte_size - rel_offset) {
     throw std::out_of_range("read_tensor_bytes out of bounds on " + entry.name);
   }
-  const auto& sh = shards_.at(entry.shard_index);
-  pread_all(*sh.cached_fd, sh.full_path, entry.data_offset + rel_offset, dst.data(), dst.size());
+  const std::uint64_t abs_off = checked_add_u64(entry.data_offset, rel_offset, "read_tensor_bytes offset");
+  if (dst.empty()) return;
+  shards_[entry.shard_index].file->read_range(abs_off, dst.size(), dst.data());
 }
 
 std::vector<std::uint8_t> Qwen4ExpElasticSet::read_tensor_raw(const SafetensorsEntry& entry) const {
-  std::vector<std::uint8_t> out(entry.byte_size);
+  if (entry.byte_size > std::numeric_limits<std::size_t>::max()) {
+    throw std::overflow_error("read_tensor_raw size exceeds address space on " + entry.name);
+  }
+  std::vector<std::uint8_t> out(static_cast<std::size_t>(entry.byte_size));
   read_tensor_bytes(entry, 0, out);
   return out;
 }
 
 std::vector<float> Qwen4ExpElasticSet::read_tensor_f32(const SafetensorsEntry& entry) const {
-  const auto raw = read_tensor_raw(entry);
   if (entry.dtype == "F32") {
-    std::vector<float> out(raw.size() / 4);
-    std::memcpy(out.data(), raw.data(), raw.size());
+    if ((entry.byte_size % sizeof(float)) != 0) {
+      throw std::invalid_argument("read_tensor_f32 misaligned F32 byte size (" + std::to_string(entry.byte_size) +
+                                  ") on " + entry.name);
+    }
+    const auto raw = read_tensor_raw(entry);
+    std::vector<float> out(raw.size() / sizeof(float));
+    if (!raw.empty()) {
+      std::memcpy(out.data(), raw.data(), raw.size());
+    }
     return out;
   }
   if (entry.dtype == "BF16") {
-    const std::size_t n = raw.size() / 2;
+    if ((entry.byte_size % 2u) != 0) {
+      throw std::invalid_argument("read_tensor_f32 misaligned BF16 byte size (" + std::to_string(entry.byte_size) +
+                                  ") on " + entry.name);
+    }
+    const auto raw = read_tensor_raw(entry);
+    const std::size_t n = raw.size() / 2u;
     std::vector<float> out(n);
     for (std::size_t i = 0; i < n; ++i) {
       std::uint16_t b = 0;
@@ -306,12 +460,19 @@ float Qwen4ExpElasticSet::read_scalar_f32(const SafetensorsEntry& entry) const {
 
 void Qwen4ExpElasticSet::read_embed_row_f32(std::uint64_t row_idx, std::span<float> out) const {
   const std::size_t H = out.size();
+  if (row_idx >= static_cast<std::uint64_t>(config_.vocab_size) ||
+      H != static_cast<std::size_t>(config_.hidden_size)) {
+    throw std::out_of_range("read_embed_row_f32 row or hidden size out of range");
+  }
   const auto& w = require_tensor("token_embd.weight");
   if (embed_kind_ == ElasticTensorKind::Nvfp4) {
+    if ((H % 16) != 0) {
+      throw std::invalid_argument("read_embed_row_f32 NVFP4 hidden size must be divisible by 16");
+    }
     const auto& sc_e = require_tensor("token_embd.weight_scale");
     std::vector<std::uint8_t> codes(H / 2), scales(H / 16);
-    read_tensor_bytes(w, row_idx * (H / 2), codes);
-    read_tensor_bytes(sc_e, row_idx * (H / 16), scales);
+    read_tensor_bytes(w, checked_mul_u64(row_idx, H / 2, "embed nvfp4 code offset"), codes);
+    read_tensor_bytes(sc_e, checked_mul_u64(row_idx, H / 16, "embed nvfp4 scale offset"), scales);
     for (std::size_t b = 0; b < H / 16; ++b) {
       const float sc = decode_e4m3fn_host(scales[b]) * embed_scale_;
       for (int i = 0; i < 8; ++i) {
@@ -324,12 +485,14 @@ void Qwen4ExpElasticSet::read_embed_row_f32(std::uint64_t row_idx, std::span<flo
   }
   if (embed_kind_ == ElasticTensorKind::Fp8) {
     std::vector<std::uint8_t> row(H);
-    read_tensor_bytes(w, row_idx * H, row);
+    read_tensor_bytes(w, checked_mul_u64(row_idx, H, "embed fp8 offset"), row);
     for (std::size_t i = 0; i < H; ++i) out[i] = decode_e4m3fn_host(row[i]) * embed_scale_;
     return;
   }
-  std::vector<std::uint8_t> row(H * (w.dtype == "F32" ? 4 : 2));
-  read_tensor_bytes(w, row_idx * row.size(), row);
+  const std::uint64_t elem_w = (w.dtype == "F32") ? 4u : 2u;
+  const std::uint64_t row_bytes = checked_mul_u64(H, elem_w, "embed dense row bytes");
+  std::vector<std::uint8_t> row(static_cast<std::size_t>(row_bytes));
+  read_tensor_bytes(w, checked_mul_u64(row_idx, row_bytes, "embed dense offset"), row);
   if (w.dtype == "F32") {
     std::memcpy(out.data(), row.data(), row.size());
   } else {
@@ -342,31 +505,57 @@ void Qwen4ExpElasticSet::read_embed_row_f32(std::uint64_t row_idx, std::span<flo
 }
 
 void Qwen4ExpElasticSet::read_ple_row_f32(std::uint64_t row_idx, std::span<float> out) const {
+  if (ple_num_shards_ <= 0 || ple_chunk_rows_ == 0 || ple_format_ == "external") {
+    throw std::invalid_argument("read_ple_row_f32 called without embedded PLE shards");
+  }
   const std::size_t D = out.size();
-  const std::size_t si = static_cast<std::size_t>(row_idx / ple_chunk_rows_);
+  const std::uint64_t si_u64 = row_idx / ple_chunk_rows_;
   const std::uint64_t local_row = row_idx % ple_chunk_rows_;
+  if (si_u64 >= static_cast<std::uint64_t>(ple_num_shards_)) {
+    throw std::out_of_range("read_ple_row_f32 row_idx exceeds embedded PLE shard range");
+  }
+  const std::size_t si = static_cast<std::size_t>(si_u64);
   const std::string p = "ple.chunk_" + std::to_string(si);
   if (ple_format_ == "f32") {
     const auto& e = require_tensor(p + ".f32");
-    std::vector<std::uint8_t> raw(D * 4);
-    read_tensor_bytes(e, local_row * D * 4, raw);
-    std::memcpy(out.data(), raw.data(), D * 4);
+    if (local_row >= static_cast<std::uint64_t>(e.shape.at(0)) ||
+        static_cast<std::int64_t>(D) != e.shape.at(1)) {
+      throw std::out_of_range("read_ple_row_f32 f32 row/dim mismatch");
+    }
+    const std::uint64_t row_bytes = checked_mul_u64(D, sizeof(float), "ple f32 row bytes");
+    std::vector<std::uint8_t> raw(static_cast<std::size_t>(row_bytes));
+    read_tensor_bytes(e, checked_mul_u64(local_row, row_bytes, "ple f32 offset"), raw);
+    std::memcpy(out.data(), raw.data(), raw.size());
     return;
   }
   if (ple_format_ == "q8_0") {
     const auto& e = require_tensor(p + ".q8_0_raw");
+    if (local_row >= static_cast<std::uint64_t>(e.shape.at(0)) || (D % 32) != 0) {
+      throw std::out_of_range("read_ple_row_f32 q8_0 row/dim mismatch");
+    }
     const std::size_t rb = static_cast<std::size_t>(e.shape.at(1));
+    if (rb != (D / 32) * 34) {
+      throw std::invalid_argument("read_ple_row_f32 q8_0 row byte width mismatch");
+    }
     std::vector<std::uint8_t> raw(rb);
-    read_tensor_bytes(e, local_row * rb, raw);
+    read_tensor_bytes(e, checked_mul_u64(local_row, rb, "ple q8_0 offset"), raw);
     dequantize_row_to_f32(8u, raw, out);
     return;
   }
+  if ((D % 16) != 0) {
+    throw std::invalid_argument("read_ple_row_f32 NVFP4 dim must be divisible by 16");
+  }
   const auto& w = require_tensor(p + ".weight");
   const auto& sc_e = require_tensor(p + ".weight_scale");
+  if (local_row >= static_cast<std::uint64_t>(w.shape.at(0)) ||
+      static_cast<std::int64_t>(D / 2) != w.shape.at(1) ||
+      static_cast<std::int64_t>(D / 16) != sc_e.shape.at(1)) {
+    throw std::out_of_range("read_ple_row_f32 NVFP4 row/dim mismatch");
+  }
   const float fac = ple_chunk_scale2_.at(si);
   std::vector<std::uint8_t> codes(D / 2), scales(D / 16);
-  read_tensor_bytes(w, local_row * (D / 2), codes);
-  read_tensor_bytes(sc_e, local_row * (D / 16), scales);
+  read_tensor_bytes(w, checked_mul_u64(local_row, D / 2, "ple nvfp4 code offset"), codes);
+  read_tensor_bytes(sc_e, checked_mul_u64(local_row, D / 16, "ple nvfp4 scale offset"), scales);
   for (std::size_t b = 0; b < D / 16; ++b) {
     const float sc = decode_e4m3fn_host(scales[b]) * fac;
     for (int i = 0; i < 8; ++i) {

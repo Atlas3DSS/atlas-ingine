@@ -6,6 +6,7 @@ add_library(ingine_qwen4exp_cpu STATIC
 )
 
 target_link_libraries(ingine_qwen4exp_cpu PUBLIC
+  ingine_core
   ingine_qwen38_cpu
   ingine_engine
   ingine_text

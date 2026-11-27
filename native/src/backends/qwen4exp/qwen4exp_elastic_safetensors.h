@@ -4,6 +4,7 @@
 #pragma once
 
 #include "backends/qwen4exp/qwen4exp_config.h"
+#include "core/safetensors.h"
 #include "ingine/model_backend.h"
 
 #include <cstdint>
@@ -39,7 +40,7 @@ struct ElasticShardInfo {
   std::filesystem::path full_path;
   std::uint64_t file_size = 0;
   std::uint64_t data_start = 0;
-  std::shared_ptr<int> cached_fd;
+  std::shared_ptr<ingine::SafetensorsFile> file;
 };
 
 class Qwen4ExpElasticSet {

@@ -683,6 +683,24 @@ void test_synthetic_elastic_safetensors() {
     CHECK(std::fabs(row[i] - ((i % 2 == 0) ? 0.5f : -0.5f)) < 1e-6f);
   }
 
+  // Out-of-bounds row / dimension reads must throw fail-closed.
+  CHECK_THROWS(eset.read_embed_row_f32(4, row));
+  CHECK_THROWS(eset.read_ple_row_f32(4, row));
+  std::vector<float> bad_dim(16, 0.0f);
+  CHECK_THROWS(eset.read_embed_row_f32(0, bad_dim));
+  CHECK_THROWS(eset.read_ple_row_f32(0, bad_dim));
+
+  // Direct defense-in-depth check on read_tensor_f32 for non-word-aligned F32 / BF16 byte_size.
+  {
+    SafetensorsEntry mis_f32 = eset.require_tensor("token_embd.weight_scale_2");
+    mis_f32.byte_size = 6;
+    CHECK_THROWS(eset.read_tensor_f32(mis_f32));
+    SafetensorsEntry mis_bf16 = mis_f32;
+    mis_bf16.dtype = "BF16";
+    mis_bf16.byte_size = 3;
+    CHECK_THROWS(eset.read_tensor_f32(mis_bf16));
+  }
+
   // Fail-closed when atlas_elastic.family mismatches.
   {
     std::ofstream bad(td.path / "hf_quant_config.json");
@@ -692,16 +710,250 @@ void test_synthetic_elastic_safetensors() {
   std::printf("PASS test_synthetic_elastic_safetensors (NVFP4 embed + multi-shard PLE + fail-closed)\n");
 }
 
+void write_raw_safetensors(const std::filesystem::path& path, std::uint64_t declared_hlen, const std::string& hdr,
+                           const std::vector<std::uint8_t>& payload) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  CHECK(out.good());
+  out.write(reinterpret_cast<const char*>(&declared_hlen), 8);
+  if (!hdr.empty()) out.write(hdr.data(), static_cast<std::streamsize>(hdr.size()));
+  if (!payload.empty()) out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+}
+
+void test_elastic_safetensors_ingress_rejections() {
+  auto init_base_dir = [](const std::filesystem::path& dir) {
+    {
+      std::ofstream cfg(dir / "config.json");
+      cfg << R"({
+        "model_type": "qwen4exp",
+        "architectures": ["Qwen4ExpForCausalLM"],
+        "gguf_kv": {
+          "general.architecture": "qwen4exp",
+          "general.name": "Qwen3.8-Flash-Next-ValTest",
+          "qwen4exp.block_count": 2,
+          "qwen4exp.embedding_length": 32,
+          "qwen4exp.context_length": 128,
+          "qwen4exp.attention.layer_norm_rms_epsilon": 1e-6,
+          "qwen4exp.hyper_connection.count": 2,
+          "qwen4exp.hyper_connection.low_rank": 8,
+          "qwen4exp.full_attention_interval": 2,
+          "qwen4exp.attention.head_count": 4,
+          "qwen4exp.attention.head_count_kv": 2,
+          "qwen4exp.attention.key_length": 16,
+          "qwen4exp.attention.value_length": 16,
+          "qwen4exp.rope.dimension_count": 8,
+          "qwen4exp.rope.freq_base": 10000000.0,
+          "qwen4exp.rope.dimension_sections": [2, 2, 0, 0],
+          "qwen4exp.ssm.conv_kernel": 4,
+          "qwen4exp.ssm.state_size": 8,
+          "qwen4exp.ssm.group_count": 2,
+          "qwen4exp.ssm.time_step_rank": 4,
+          "qwen4exp.ssm.inner_size": 32,
+          "qwen4exp.expert_count": 4,
+          "qwen4exp.expert_used_count": 2,
+          "qwen4exp.expert_feed_forward_length": 32,
+          "qwen4exp.expert_shared_feed_forward_length": 32
+        }
+      })";
+    }
+    {
+      std::ofstream qcfg(dir / "hf_quant_config.json");
+      qcfg << R"({
+        "producer": {"name": "atlas-ingine-elastic", "version": "1.0"},
+        "quantization": {"quant_algo": "MIXED_PRECISION", "quantized_layers": {}},
+        "atlas_elastic": {"family": "qwen4exp", "profile": "atlas-test", "ple": {"format": "external", "num_shards": 0}}
+      })";
+    }
+    {
+      std::ofstream idx(dir / "model.safetensors.index.json");
+      idx << R"({"metadata": {"total_size": 256}, "weight_map": {"token_embd.weight": "s.safetensors"}})";
+    }
+  };
+
+  // 1. Truncated shard (< 8 bytes).
+  {
+    TempDir td("el_trunc");
+    init_base_dir(td.path);
+    std::ofstream f(td.path / "s.safetensors", std::ios::binary);
+    f.write("1234", 4);
+    f.close();
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+
+  // 2. Huge unchecked header length (UINT64_MAX & >100 MiB & past EOF) and zero header length.
+  for (std::uint64_t bad_hlen : {0ull, 200ull << 20, 0xFFFFFFFFFFFFFFFFull, 512ull}) {
+    TempDir td("el_hlen");
+    init_base_dir(td.path);
+    write_raw_safetensors(td.path / "s.safetensors", bad_hlen, "{}", std::vector<std::uint8_t>(16, 0));
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+
+  // 3. Shard path traversal, subdirectory, and absolute path in weight_map.
+  for (const char* bad_shard : {"../escape.safetensors", "sub/s.safetensors", "/etc/passwd", "", ".."}) {
+    TempDir td("el_path");
+    init_base_dir(td.path);
+    std::ofstream idx(td.path / "model.safetensors.index.json");
+    idx << "{\"weight_map\":{\"token_embd.weight\":\"" << bad_shard << "\"}}";
+    idx.close();
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+
+  // 4. Symlink escaping checkpoint directory.
+  {
+    TempDir td("el_sym");
+    init_base_dir(td.path);
+    TempDir ext("el_sym_ext");
+    write_tiny_safetensors(ext.path / "ext.safetensors",
+                           {{"token_embd.weight", "F32", {2, 32}, std::vector<std::uint8_t>(2 * 32 * 4, 0)}});
+    std::filesystem::create_symlink(ext.path / "ext.safetensors", td.path / "s.safetensors");
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+
+  // 5. Malformed data_offsets: wrong arity, reversed [end, start], out-of-bounds, negative.
+  for (const char* bad_offs : {"[0]", "[0,256,512]", "[256,0]", "[0,9999]", "[-4,256]"}) {
+    TempDir td("el_offs");
+    init_base_dir(td.path);
+    const std::string hdr = std::string(R"({"token_embd.weight":{"dtype":"F32","shape":[2,32],"data_offsets":)") +
+                            bad_offs + "}}";
+    write_raw_safetensors(td.path / "s.safetensors", hdr.size(), hdr, std::vector<std::uint8_t>(256, 0));
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+
+  // 6. Dtype/shape/byte-size mismatches including non-word-aligned F32 (6 bytes) & unknown dtype & overflow shape.
+  {
+    TempDir td("el_misalign_f32");
+    init_base_dir(td.path);
+    const std::string hdr = R"({"token_embd.weight":{"dtype":"F32","shape":[2,32],"data_offsets":[0,6]}})";
+    write_raw_safetensors(td.path / "s.safetensors", hdr.size(), hdr, std::vector<std::uint8_t>(16, 0));
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+  {
+    TempDir td("el_bad_dtype");
+    init_base_dir(td.path);
+    const std::string hdr = R"({"token_embd.weight":{"dtype":"F99","shape":[2,32],"data_offsets":[0,256]}})";
+    write_raw_safetensors(td.path / "s.safetensors", hdr.size(), hdr, std::vector<std::uint8_t>(256, 0));
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+  {
+    TempDir td("el_neg_shape");
+    init_base_dir(td.path);
+    const std::string hdr = R"({"token_embd.weight":{"dtype":"F32","shape":[-2,32],"data_offsets":[0,256]}})";
+    write_raw_safetensors(td.path / "s.safetensors", hdr.size(), hdr, std::vector<std::uint8_t>(256, 0));
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+  {
+    TempDir td("el_ovf_shape");
+    init_base_dir(td.path);
+    const std::string hdr =
+        R"({"token_embd.weight":{"dtype":"F32","shape":[10000000000,10000000000],"data_offsets":[0,256]}})";
+    write_raw_safetensors(td.path / "s.safetensors", hdr.size(), hdr, std::vector<std::uint8_t>(256, 0));
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+
+  // 7. Duplicate tensor name across two shards.
+  {
+    TempDir td("el_dup");
+    init_base_dir(td.path);
+    write_tiny_safetensors(td.path / "a.safetensors",
+                           {{"token_embd.weight", "F32", {2, 32}, std::vector<std::uint8_t>(256, 0)}});
+    write_tiny_safetensors(td.path / "b.safetensors",
+                           {{"token_embd.weight", "F32", {2, 32}, std::vector<std::uint8_t>(256, 0)},
+                            {"extra.weight", "F32", {1}, std::vector<std::uint8_t>(4, 0)}});
+    std::ofstream idx(td.path / "model.safetensors.index.json");
+    idx << R"({"weight_map":{"token_embd.weight":"a.safetensors","extra.weight":"b.safetensors"}})";
+    idx.close();
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+
+  // 8. Dangling weight_map entry missing from declared shard.
+  {
+    TempDir td("el_dangling");
+    init_base_dir(td.path);
+    write_tiny_safetensors(td.path / "s.safetensors",
+                           {{"token_embd.weight", "F32", {2, 32}, std::vector<std::uint8_t>(256, 0)}});
+    std::ofstream idx(td.path / "model.safetensors.index.json");
+    idx << R"({"weight_map":{"token_embd.weight":"s.safetensors","ghost.weight":"s.safetensors"}})";
+    idx.close();
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+
+  // 9. Invalid PLE chunk_rows == 0.
+  {
+    TempDir td("el_ple0");
+    init_base_dir(td.path);
+    write_tiny_safetensors(td.path / "s.safetensors",
+                           {{"token_embd.weight", "F32", {2, 32}, std::vector<std::uint8_t>(256, 0)}});
+    std::ofstream qcfg(td.path / "hf_quant_config.json");
+    qcfg << R"({"atlas_elastic":{"family":"qwen4exp","profile":"atlas-test","ple":{"format":"nvfp4","num_shards":1,"chunk_rows":0}}})";
+    qcfg.close();
+    CHECK_THROWS(Qwen4ExpElasticSet::inspect_headers(td.path));
+  }
+
+  // 10. Valid F32 pack loads cleanly and returns exact float values.
+  {
+    TempDir td("el_valid_f32");
+    init_base_dir(td.path);
+    std::vector<float> vals(2 * 32);
+    for (std::size_t i = 0; i < vals.size(); ++i) vals[i] = static_cast<float>(i) * 0.25f;
+    std::vector<std::uint8_t> raw(vals.size() * sizeof(float));
+    std::memcpy(raw.data(), vals.data(), raw.size());
+    write_tiny_safetensors(td.path / "s.safetensors", {{"token_embd.weight", "F32", {2, 32}, raw}});
+    const auto eset = Qwen4ExpElasticSet::inspect_headers(td.path);
+    const auto loaded = eset.read_tensor_f32(eset.require_tensor("token_embd.weight"));
+    CHECK(loaded.size() == vals.size());
+    for (std::size_t i = 0; i < vals.size(); ++i) CHECK(loaded[i] == vals[i]);
+    std::vector<float> row1(32, 0.0f);
+    eset.read_embed_row_f32(1, row1);
+    for (std::size_t i = 0; i < 32; ++i) CHECK(row1[i] == vals[32 + i]);
+  }
+
+  std::printf("PASS test_elastic_safetensors_ingress_rejections (all malformed + valid F32 cases verified)\n");
+}
+
+void test_real_quincy_elastic_packs() {
+  for (const char* p : {
+           "/mnt/storage16tb/models/Qwen3.8-Flash-Next-atlas-70g-ingine",
+           "/mnt/storage16tb/models/Qwen3.8-Flash-Next-atlas-56g-ingine",
+       }) {
+    const std::filesystem::path dir(p);
+    if (!Qwen4ExpElasticSet::is_elastic_dir(dir)) {
+      std::printf("SKIP test_real_quincy_elastic_packs (%s not present)\n", p);
+      return;
+    }
+    const auto eset = Qwen4ExpElasticSet::inspect_headers(dir);
+    CHECK(eset.config().num_hidden_layers == 48);
+    CHECK(eset.config().hidden_size == 2560);
+    CHECK(eset.config().vocab_size == 248320);
+    CHECK(eset.has_embedded_ple());
+    std::vector<float> emb(static_cast<std::size_t>(eset.config().hidden_size), 0.0f);
+    eset.read_embed_row_f32(760, emb);
+    double l2 = 0.0;
+    for (float v : emb) {
+      CHECK(std::isfinite(v));
+      l2 += double(v) * double(v);
+    }
+    CHECK(l2 > 0.0);
+    std::vector<float> ple(static_cast<std::size_t>(eset.config().ple_head_dim), 0.0f);
+    eset.read_ple_row_f32(0, ple);
+    for (float v : ple) CHECK(std::isfinite(v));
+    std::printf("  real elastic pack OK: %s (profile=%s, shards=%u, total_bytes=%llu, emb_l2=%.4f)\n", p,
+                eset.profile().c_str(), eset.identity().shard_count,
+                static_cast<unsigned long long>(eset.total_tensor_bytes()), std::sqrt(l2));
+  }
+  std::printf("PASS test_real_quincy_elastic_packs (130-shard atlas-70g & atlas-56g validated)\n");
+}
+
 }  // namespace
 
 int main() {
   test_family_and_synthetic_gguf();
   test_synthetic_elastic_safetensors();
+  test_elastic_safetensors_ingress_rejections();
   test_ggml_dequantizers();
   test_ple_hash_and_eos_semantics();
   test_qsa_dense_and_sparse();
   test_mini_model_e2e();
   test_real_quincy_ud_q6_k_xl();
+  test_real_quincy_elastic_packs();
   std::printf("qwen4exp_phase0: PASS\n");
   return 0;
 }
