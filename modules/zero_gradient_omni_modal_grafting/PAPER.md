@@ -114,25 +114,32 @@ Before fitting audio Plato's Keys, Packet C ran a fail-closed Native Gate 0 acro
 3. **Inkling-2-Mini GPU `EmbedRows` + Zero-Dose Lace Floor:**
    - Native GPU reinjection matched `4/4` exact tokens with `0.0` max abs logit diff and `0.0` KL (vs `0.8494` KL and `1/4` exact tokens on zeroed control).
 
-### Verified Audio Samples (Committed in `samples/`)
+### Verified Audio Samples (Inline Spectrogram + Playable MP4 & Lossless 24 kHz WAVs)
+
+![Packet C Mouth Gate 0 Causal Swap Spectrogram](samples/mouth_gate0_causal_swap_spectrogram.png)
+
+- [samples/mouth_gate0_causal_swap.mp4](samples/mouth_gate0_causal_swap.mp4) — Playable audio-preview card (`e2e A` → `swap B→A` → `zero control`)
 - [samples/mouth_e2e_A.wav](samples/mouth_e2e_A.wav) — `"Order code 407 is confirmed."` (`sha256 54371273...`, identical to native reinjection)
 - [samples/mouth_swap_B_into_A.wav](samples/mouth_swap_B_into_A.wav) — `"Sensor gate 928 is closed."` (`sha256 5b7d228b...`, pure continuous hidden-state swap into A)
 - [samples/mouth_zero_A.wav](samples/mouth_zero_A.wav) — Zeroed continuous hidden-state control (`RMS 0.0023`, `sha256 068aa066...`)
 
 ---
 
-## 6. System Footprint & Consumer-GPU Deployment Ladder
+## 6. System Footprint, Native Video+Audio Diffusion, & Consumer-GPU Ladder
+
+Because `MiniMax-H3`'s full **Audio+Video DiT** (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, **`20 GB`** on disk, plus `3.0 GB` video VAE and `578 MB` audio VAE) conditions on the **exact same `Qwen3-VL-32B` Layer-50 `5120`-dim space** as `MiniMax-H3` Image, the **exact same `90.0 MiB` Packet A Plato's Key** targets native video + synchronized audio generation at **zero extra bridge bytes** (functional video temporal-coherence gate `PENDING`). An already-quantized **`12 GB` NVFP4/W4A8** H3 Image DiT (`minimax_h3_image_pruned_nvfp4.safetensors`) is verified on disk.
 
 | Component | Current Verified Disk / VRAM | Stripped + Atlas-Quantized Target | Precision Invariant |
 |---|---:|---:|---|
 | `Inkling-2-Mini` Trunk | 19.0 GB (`NVFP4`) / 10.5 GB (`atlas-10.5g`) | **6.0–10.5 GB** | Frozen trunk (`0.0%` forgetting) |
-| All 4 Plato's Key Bridges | **0.14 GB** (`90 + 16 + 7 + 38 MiB`) | **0.14 GB** | Keep FP16 |
+| All 4 Plato's Key Bridges | **0.14 GB** (`90 + 16 + 7 + 38 MiB`) | **0.14 GB** | Keep FP16 (same `90 MiB` key targets H3 Image & FL2VA Video+Audio) |
 | Sight (`GOT-OCR2` vision tower) | **0.19 GB** *(already stripped)* | **0.19 GB** | `620M` decoder deleted |
 | Ears (`Gemma-4-E2B` Conformer) | 4.90 GB *(unstripped checkpoint)* | **~0.4–0.6 GB** | Strip text LLM, keep Conformer |
 | Mouth (`Qwen3-TTS-1.7B` + codec) | 4.95 GB (`4.3 GB` BF16 + `651 MB` codec) | **~1.5–1.8 GB** | Quantize talker; keep codec FP16 |
-| Diffusion (`MiniMax-H3` DiT + VAE) | 21.1 GB (`20 GB` INT8 + `1.1 GB` VAE) | **~10–11 GB** | NVFP4/ATLAS DiT; keep VAE FP16 |
+| Diffusion Image (`MiniMax-H3` DiT + VAE) | **13.1 GB** (`12 GB` NVFP4 DiT + `1.1 GB` VAE) *(or `21.1 GB` INT8)* | **13.1 GB** *(already on disk!)* | NVFP4 DiT; keep VAE FP16 |
+| Diffusion Video+Audio (`MiniMax-H3 FL2VA`) | **23.6 GB** (`20 GB` INT8 DiT + `3.0 GB` Video VAE + `0.58 GB` Audio VAE) | **~15.6 GB** *(w/ NVFP4 FL2VA DiT)* | Shares exact same `90 MiB` Packet A key |
 | **Voice + Sight + Text Total** | **~29 GB** *(~20.5 GB elastic)* | **~8.3–11.2 GB** | **100% resident on 12 GB RTX 3060** |
-| **Full 4-Modality (+ Image Gen)** | **~50 GB** *(~41.5 GB elastic; −27.1 GB vs teacher)* | **~22–24 GB** *(or 12 GB w/ 6-step DiT swap)* | Single 24 GB 3090/4090 resident; 12 GB 3060 via burst swap |
+| **Full 4-Modality (+ Native Image Gen)** | **~42 GB** *(~33.6 GB elastic; −27.1 GB vs teacher)* | **~21.4–24.3 GB** *(or 12 GB w/ 6-step DiT swap)* | Single 24 GB 3090/4090 resident; 12 GB 3060 via burst swap |
 
 ---
 
