@@ -2,7 +2,7 @@
 
 Every contact sheet below is a **byte-identical, SHA-256-verified** side-by-side comparison rendered on real GPUs with **zero upstream diffusion text encoder loaded** in the Plato's Key and matched deranged `B0` control arms (`COMPARISONS_MANIFEST.sha256.json`). Both winning transfers and explicit failure boundaries (`SDXL`, `turnaround_360_v4` strict gate `FAIL`) are published transparently.
 
-- **Main Paper (`v0.9`):** [PAPER.md](PAPER.md)
+- **Main Paper (`v0.9.3`):** [PAPER.md](PAPER.md) / [PAPER.pdf](PAPER.pdf) · **360° World-Model Turnaround:** [WORLD_MODEL_TURNAROUND.md](world_model_turnaround/WORLD_MODEL_TURNAROUND.md)
 - **Shot-by-Shot Walkthrough:** [TUTORIAL.md](TUTORIAL.md)
 - **Host-Enforced Alignment & Live Pliny Proof:** [HOST_ENFORCED_ALIGNMENT.md](HOST_ENFORCED_ALIGNMENT.md)
 - **Hugging Face Collection (`Omni by Atlas`):** https://huggingface.co/collections/Atlas3D/omni-by-atlas-6b09daccd0f65e23233163b3

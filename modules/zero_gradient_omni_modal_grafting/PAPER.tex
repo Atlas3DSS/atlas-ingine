@@ -43,7 +43,7 @@
 \title{\vspace{-1.1em}\Large\bfseries Zero-Gradient Omni-Modal Grafting via Closed-Form Representation Maps:\\
 Sealed Confirmation, Spectral Rank Collapse, Multi-Donor Blends, and Host-Enforced Alignment}
 
-\author{William Joseph Tatum (Monkey)\thanks{Human author and project director, Atlas 3DSS. AI coding and research agents (\emph{Neon}, Atlas 3DSS) assisted with implementation, verification automation, and manuscript drafting under human oversight and cryptographic artifact verification; AI systems are disclosed here rather than listed as authors per arXiv authorship policy.}\\
+\author{William Joseph Tatum (Monkey)\footnotemark[1]\\
 \small Atlas 3DSS\\
 \small\url{https://github.com/Atlas3DSS/atlas-ingine}\\
 \small\url{https://huggingface.co/collections/Atlas3D/omni-by-atlas-6b09daccd0f65e23233163b3}}
@@ -87,6 +87,7 @@ Closed-form linear representation maps (\emph{Plato's Keys}) graft image diffusi
 \vspace{0.8em}
 \end{@twocolumnfalse}
 ]
+{\renewcommand\thefootnote{\fnsymbol{footnote}}\footnotetext[1]{Human author and project director, Atlas 3DSS. AI coding and research agents (\emph{Neon}, Atlas 3DSS) assisted with implementation, verification automation, and manuscript drafting under human oversight and cryptographic artifact verification; AI systems are disclosed here and on the opening acknowledgment page rather than listed as authors per arXiv authorship policy.}}
 
 \section{Introduction}
 Multimodal foundation models typically align text, image, video, audio, and speech components through multi-billion-token joint pretraining or gradient-trained adapters (Flamingo \cite{alayrac2022flamingo}, BLIP-2 \cite{li2023blip2}, LLaVA \cite{liu2023llava,liu2023llava15}). We evaluate an operational systems question: \emph{how far do zero-gradient closed-form linear maps carry cross-modal conditioning between frozen language trunks and frozen generative/perceptual receivers, where do they break, and how do they compose with host-enforced verification?} (Fig.~\ref{fig:arch}).
@@ -226,7 +227,7 @@ Across $30$ distinct NVIDIA GPU models spanning $6$ sampled CUDA architectures (
 
 \begin{table}[t]
 \centering
-\caption{Measured single-stage disk (decimal GB) and peak VRAM (binary GiB) vs.\ projected full-resident targets (distinct from block-offloaded \texttt{RTX 5070} generation in Fig.~\ref{fig:silicon}).}
+\caption{Measured single-stage disk (decimal GB) and peak VRAM (GB/GiB as reported in source manifests) vs.\ projected full-resident targets (distinct from block-offloaded \texttt{RTX 5070} generation in Fig.~\ref{fig:silicon}).}
 \label{tab:footprint}
 \scriptsize
 \setlength{\tabcolsep}{2.2pt}
@@ -260,7 +261,7 @@ Wave~B 6/6 \& \texttt{FLUX.2-dev} C-160 & Local Wave~B 6/6 summary \& \texttt{FL
 FP64 SVD \& Live V100 MoE Pruning & Local \texttt{part1a}/\texttt{part1b} JSON & \texttt{7aff2432} / \texttt{fb8db8f0} \\
 5-Family Expressive TTS Shoot-Out & Local \texttt{report\_942\_unified.json} & \texttt{72ae01e0} \\
 Pliny v2 Host Alignment Report & Repo \texttt{adversarial\_ledger\_proof/live\_results\_v2/} & \texttt{eb8b7923} \\
-30-GPU / 16-GPU Real AV Sweep & Repo \texttt{figures/fig7\_silicon\_16gpu\_av.png} & \texttt{0a5d535f} / \texttt{52a76b0a} \\
+30-GPU / 16-GPU Real AV Sweep & Repo \texttt{figures/fig7\_silicon\_16gpu\_av.png} & \texttt{0a5d535f} / \texttt{2dd7319c} \\
 $360^\circ$ World-Model Turnaround & Repo \texttt{world\_model\_turnaround/} (report / MP4) & \texttt{28edf210} / \texttt{6fdde381} \\
 23 Side-by-Side Comparison Sheets & Repo \texttt{figures/comparisons/COMPARISONS\_MANIFEST.sha256.json} & \texttt{c1ea6ff4} \\
 \bottomrule
