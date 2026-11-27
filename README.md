@@ -31,7 +31,7 @@ Browse checkpoints by model family on Hugging Face:
 
 ### Qwen3.8-27B (Text-Only Elastic Packs, Apache-2.0)
 
-Collection: [**Qwen3.8-27B — Atlas 3D (12 GB to 24 GB)**](https://huggingface.co/collections/Atlas3D/qwen38-27b-atlas-3d-12-gb-to-24-gb-6b08ed57e702a2206df7dac7). All three Elastic packs carry compiled-in SHA-256 pins (`PinnedVerified` in `native/src/backends/qwen38/qwen38_manifest.cpp`).
+Collection: [**Qwen3.8-27B - Atlas 3D (12 GB to 24 GB)**](https://huggingface.co/collections/Atlas3D/qwen38-27b-atlas-3d-12-gb-to-24-gb-6b08ed57e702a2206df7dac7). All three Elastic packs carry compiled-in SHA-256 pins (`PinnedVerified` in `native/src/backends/qwen38/qwen38_manifest.cpp`).
 
 | Checkpoint | Format / Size | Peak VRAM @ 4K & Parity vs `NVFP4` Base | Direct Link |
 |---|---|---|---|
@@ -42,7 +42,7 @@ Collection: [**Qwen3.8-27B — Atlas 3D (12 GB to 24 GB)**](https://huggingface.
 
 ### Qwen3.8-Flash-Next 177B (`qwen4exp`, Qwen Community License 1.0)
 
-Collection: [**Qwen3.8-Flash-Next (177B) — Atlas 3D**](https://huggingface.co/collections/Atlas3D/qwen38-flash-next-177b-atlas-3d-6b08ed57d62742b964d01f70). Derived from `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q6_K_XL` (text-only, single-GPU `INGINE_TP_SIZE=1`); host-only Per-Layer Embeddings (`320,001,536 x 160` in `NVFP4`, `28.80 GB`, 81 shards) remain in host RAM/mmap (`0 GB VRAM`).
+Collection: [**Qwen3.8-Flash-Next (177B) - Atlas 3D**](https://huggingface.co/collections/Atlas3D/qwen38-flash-next-177b-atlas-3d-6b08ed57d62742b964d01f70). Derived from `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q6_K_XL` (text-only, single-GPU `INGINE_TP_SIZE=1`); host-only Per-Layer Embeddings (`320,001,536 x 160` in `NVFP4`, `28.80 GB`, 81 shards) remain in host RAM/mmap (`0 GB VRAM`).
 
 | Checkpoint | Format / Footprint | Verified V100 SM70 `TieredExpertCache` (`25.28 GiB` cache) vs FP32 `Q6_K_XL` Oracle | Direct Link |
 |---|---|---|---|
