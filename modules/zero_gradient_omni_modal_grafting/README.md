@@ -1,12 +1,22 @@
-# Zero-Gradient Omni-Modal Grafting (Dedicated Module)
+# Zero-Gradient Omni-Modal Grafting
 
-This module contains the living research paper, append-only experimental process log, verified visual/audio samples, and upcoming multi-card silicon sweep + 100% model-authored showcase video trace for **Omni-Inkling-2-Mini**.
+Closed-form FP64 ridge bridges that graft image diffusion, native video+audio diffusion, visual perception, and speech control onto frozen language models with zero gradient updates and without loading `27.14 GB` (`Qwen3-VL-32B`) or `44.7 GiB` (`Mistral-Small-3.1-24B`) text encoders at runtime.
 
-## Contents
-- **[PAPER.md](PAPER.md)** — Living manuscript (*Zero-Gradient Omni-Modal Grafting*, v0.8).
-- **[PROCESS_LOG.md](PROCESS_LOG.md)** — Append-only chronological record of every gate, receipt, clean negative, SHA-256 pin, and model-authored video step.
-- **[samples/h3_phase0_contact_sheet_8domains.png](samples/h3_phase0_contact_sheet_8domains.png)** — Packet A 8-domain visual comparison (`27.14 GB` native teacher vs `22.5 MiB` single-tap vs `90.0 MiB` `concat4` Plato's Key vs shuffled `B0` control).
-- **[samples/mouth_e2e_A.wav](samples/mouth_e2e_A.wav)**, **[samples/mouth_swap_B_into_A.wav](samples/mouth_swap_B_into_A.wav)**, **[samples/mouth_zero_A.wav](samples/mouth_zero_A.wav)** — Packet C Native Gate 0 24 kHz audio proofs demonstrating byte-identical causal lexical control purely from continuous hidden states.
+![Zero-Gradient Omni-Modal Grafting Architecture](figures/fig0_architecture_pipeline.png)
+
+## Start Here
+- **[TUTORIAL.md](TUTORIAL.md)** — **Shot-by-shot technical walkthrough** with system-authored images, contact sheets, audio spectrograms, failure boundaries, and local reproduction commands.
+- **[PAPER.md](PAPER.md)** — **Full research manuscript (`v0.9`)** with sealed Confirm-160 statistics, orthogonal `DINOv3-ViT-L/16` audit, matched-data MLP baseline, clean negative boundaries, multi-donor comparisons, and 9-GPU real AV benchmarks.
+- **[PROCESS_LOG.md](PROCESS_LOG.md)** — Append-only chronological ledger of every verified gate, clean negative, receipt, and SHA-256 pin.
+
+## Verified Visual & Audio Artifacts (`samples/` & `figures/`)
+- **Figures (`figures/`):** [fig0_architecture_pipeline.png](figures/fig0_architecture_pipeline.png) · [fig1_packetA_adherence_and_size.png](figures/fig1_packetA_adherence_and_size.png) · [fig2_packetB_ocr_boundary.png](figures/fig2_packetB_ocr_boundary.png) · [fig3_omni_footprint_ladder.png](figures/fig3_omni_footprint_ladder.png) · [fig4_multidonor_and_universal.png](figures/fig4_multidonor_and_universal.png) · [omni912_wave3_real_image_and_5s_av_benchmark.png](figures/omni912_wave3_real_image_and_5s_av_benchmark.png)
+- **System-Authored Contact Sheets (`samples/`):**
+  - [h3_confirm160_contact_sheet_8domains.png](samples/h3_confirm160_contact_sheet_8domains.png) — Sealed Confirm-160 `Inkling-2-Mini` (`90 MiB`) replacing `27.14 GB` `Qwen3-VL-32B` (`97.50%` margin retention)
+  - [qwen38_h3_confirm160_contact_sheet_8domains.png](samples/qwen38_h3_confirm160_contact_sheet_8domains.png) — Controlled `cu130` Confirm-160 `Qwen3.8` half-depth `layer_31` (`50 MiB`, `98.90%` retention)
+  - [flux2_dev_singleton_contact_sheet.png](samples/flux2_dev_singleton_contact_sheet.png) — Dev-24 `FLUX.2-dev` (`271 MiB`) replacing `44.7 GiB` `Mistral-Small-3.1-24B` (`99.65%` retention)
+  - [sdxl_base_turbo_base_contact_sheet.png](samples/sdxl_base_turbo_base_contact_sheet.png) — Honest Dev-24 `SDXL` unmasked `CLIP-L` failure boundary (`57.69%` FAIL)
+- **Audio Proofs (`samples/`):** [mouth_gate0_causal_swap.mp4](samples/mouth_gate0_causal_swap.mp4) · [mouth_gate0_causal_swap_spectrogram.png](samples/mouth_gate0_causal_swap_spectrogram.png) · [mouth_e2e_A.wav](samples/mouth_e2e_A.wav) · [mouth_swap_B_into_A.wav](samples/mouth_swap_B_into_A.wav) · [mouth_zero_A.wav](samples/mouth_zero_A.wav)
 
 ## Release & Branch Discipline
 - Living updates filter onto branch `feat/zero-gradient-omni-modal-grafting` as each stage clears verification.
