@@ -16,6 +16,7 @@ RUNS = '/mnt/storage/omni_gate2_runs'
 ap = argparse.ArgumentParser()
 ap.add_argument('--packet-a', default=f'{RUNS}/h3_platos_key_phase0_24p_a8146fa7/h3_platos_key_phase0_report.json')
 ap.add_argument('--packet-b', default=f'{RUNS}/vision_ridge_norm_dev_val192/vision_ridge_norm_dev_report.json')
+ap.add_argument('--confirm', default=f'{RUNS}/packetA_confirm160_full/h3_confirm160_report.json')
 ap.add_argument('--strip', default=f'{RUNS}/phase0_912_spinup/packetB2_ocr_towers_strip_verify_report.json')
 ap.add_argument('--image-nvfp4', default=os.path.expanduser('~/dev_genius/models/minimax_h3_image_pruned_nvfp4.safetensors'))
 ap.add_argument('--paper', default=os.path.join(HERE, '..', 'PAPER.md'))
@@ -90,13 +91,14 @@ def sci(v):
 
 
 A = json.load(open(ARGS.packet_a)); B = json.load(open(ARGS.packet_b)); ST = json.load(open(ARGS.strip)); PAPER = open(ARGS.paper).read()
-SOURCES = {os.path.basename(p): sha(p) for p in (ARGS.packet_a, ARGS.packet_b, ARGS.strip)}; SOURCES['PAPER.md (size targets, figure 3)'] = sha(ARGS.paper)
+CF = json.load(open(ARGS.confirm)); CFJ = os.path.join(os.path.dirname(ARGS.confirm), 'h3_confirm160_per_prompt_outcomes.jsonl')
+SOURCES = {os.path.basename(p): sha(p) for p in (ARGS.packet_a, ARGS.packet_b, ARGS.strip, ARGS.confirm, CFJ)}; SOURCES['PAPER.md (size targets, figure 3)'] = sha(ARGS.paper)
 assert A['qualifier']['qualified_complete'] and B['qualifier']['qualified_complete'] and ST['all_verified']
 
 # ------------------------------------------------------------------ figure 1: Packet A adherence and size
 FE = A['functional_evidence']; SUM = FE['arm_summaries']; PP = FE['per_prompt_outcomes']; MF = A['measured_memory_footprint']
-ARMS = [('teacher_reinject', 'Teacher encoder', 'Qwen3-VL-32B, layer 50', INK), ('inkling_platos_key_concat4', 'Four-tap map', '9,216 to 5,120 dims', G),
-        ('inkling_platos_key_single_tap', 'Single-tap map', '2,304 to 5,120 dims', G2), ('b0_shuffled_single_tap', 'Shuffled control', 'map fitted on mismatched prompts', DIM)]
+ARMS = [('teacher_reinject', 'Teacher encoder', 'Qwen3-VL-32B, layer 50', INK), ('inkling_platos_key_concat4', 'Four-tap map', '9,216 to 5,120 dims, separate analysis', G),
+        ('inkling_platos_key_single_tap', 'Single-tap map', '2,304 to 5,120 dims, pre-declared primary', G2), ('b0_shuffled_single_tap', 'Shuffled control', 'map fitted on mismatched prompts', DIM)]
 NP = len(PP); assert NP == 24 == A['split_audit']['functional_dit_eval_prompts_used'] and FE['source_group_audit']['n_source_groups'] == 16
 for k, *_ in ARMS:  # per-prompt rows must reproduce the arm means
     assert abs(sum(p['arms'][k]['siglip2_text_image_cos'] for p in PP) / NP - SUM[k]['siglip2_text_image_cos_mean']) < 1e-9
@@ -110,9 +112,30 @@ assert TB == A['pinned_weights_verified']['teacher_qwen3vl_32b_layer50']['bytes'
 FIT = A['fitted_keys']['concat4']['fit_audit']; FITS = A['split_audit']['fit_prompts_used']; FITT = A['staged_handoffs']['stageB_elapsed_seconds']
 
 
+# sealed confirmation: 160 prompts read once, with the maps frozen from the development run
+CP = [json.loads(line) for line in open(CFJ)]; NS = len(CP); GROUPS = sorted({p['source_group_id'] for p in CP}); NG = len(GROUPS)
+PR = CF['primary_single_tap_matched_b0_analysis_g16']; CC = CF['separate_concat4_analysis_g16']; WS = CF['word_span_metrics']
+assert CF['qualified_complete'] and CF['status'] == 'COMPLETED' and sha(CFJ) == CF['per_prompt_outcomes_sha256'] and CF['fit_calls_executed'] == 0
+assert NS == CF['unique_confirm_prompt_ids'] == CF['confirm_reserve_rows_read'] == 160 and NG == 16 and CF['dev_floor_audit']['passed'] and PR['confirmation_bar_passed']
+assert all(CF['frozen_keys_audit'][k]['sha256'] == A['fitted_keys'][k2]['saved']['sha256'] for k, k2 in (('concat4', 'concat4'), ('single_tap', 'single_tap'), ('b0_shuffled', 'b0_shuffled_single_tap')))
+
+
+def gmean(arm, key):  # mean over source groups of the group mean, the unit the report's statistics use
+    return sum(sum(p['arms'][arm][key] for p in CP if p['source_group_id'] == g) / sum(p['source_group_id'] == g for p in CP) for g in GROUPS) / NG
+
+
+for key in ('siglip2_text_image', 'siglip2_image_teacher'):  # per-prompt rows must reproduce the report's arm means
+    assert abs(gmean('inkling_platos_key_single_tap', key) - PR['vs_matched_b0'][key]['mean_a']) < 1e-9 and abs(gmean('b0_shuffled_single_tap', key) - PR['vs_matched_b0'][key]['mean_b']) < 1e-9
+    assert abs(gmean('inkling_platos_key_concat4', key) - CC['vs_teacher_reinject'][key]['mean_a']) < 1e-9 and abs(gmean('teacher_reinject', key) - CC['vs_teacher_reinject'][key]['mean_b']) < 1e-9
+CT = CC['vs_teacher_reinject']['siglip2_text_image']; CB = CC['vs_single_tap_b0_reference_only']['siglip2_text_image']; PB = PR['vs_matched_b0']['siglip2_text_image']
+RET4 = CC['siglip2_margin_retention_using_st_b0_reference']; RET1 = PR['siglip2_margin_retention_vs_teacher_and_b0']
+assert CT['ci95_high'] < 0 and CB['n_a_gt_b'] == PB['n_a_gt_b'] == NG and abs(RET4 - CB['paired_delta'] / (CT['mean_b'] - CB['mean_b'])) < 1e-9
+RH = 60
+
+
 def strip_panel(x0, x1, y0, rows, lo, hi, ticks, key, title, sub, fmt):
     """One row of per-prompt dots per arm, with the arm mean as a vertical bar."""
-    sx = lambda v: x0 + (v - lo) / (hi - lo) * (x1 - x0); RH = 58
+    sx = lambda v: x0 + (v - lo) / (hi - lo) * (x1 - x0)
     s = t(x0, y0 - 34, title, 14.5, INK, 'start', 700) + t(x0, y0 - 16, sub, 12, SEC)
     for v in ticks:
         s += f'<line x1="{sx(v):.1f}" x2="{sx(v):.1f}" y1="{y0}" y2="{y0 + len(ARMS) * RH}" stroke="{SEC if v == 0 else RULE}" stroke-width="1"/>' + t(sx(v), y0 + len(ARMS) * RH + 18, fmt(v), 11.5, SEC, 'middle')
@@ -120,40 +143,53 @@ def strip_panel(x0, x1, y0, rows, lo, hi, ticks, key, title, sub, fmt):
         cy = y0 + i * RH + RH / 2
         if k not in rows:
             s += t(sx(hi), cy + 4, 'reference', 12, DIM, 'end'); continue
-        vals = sorted(p['arms'][k][key] for p in PP)
-        for j, v in enumerate(vals):  # deterministic vertical offsets so equal values stay visible
-            s += f'<circle cx="{sx(v):.1f}" cy="{cy + ((j * 7) % 5 - 2) * 4.2:.1f}" r="4" fill="{col}" fill-opacity="0.78"/>'
-        m = sum(vals) / NP
-        s += f'<line x1="{sx(m):.1f}" x2="{sx(m):.1f}" y1="{cy - 19}" y2="{cy + 19}" stroke="{INK}" stroke-width="2.5"/>'
-        right = sx(max(vals)) + 12; left = sx(min(vals)) - 12
-        s += t(right, cy + 5, n4(m), 14, INK, 'start', 700) if right + 50 < x1 + 60 else t(left, cy + 5, n4(m), 14, INK, 'end', 700)
+        vals = sorted(p['arms'][k][key] for p in CP)
+        for j, v in enumerate(vals):  # deterministic vertical offsets so close values stay visible
+            s += f'<circle cx="{sx(v):.1f}" cy="{cy + ((j * 5) % 11 - 5) * 3.6:.1f}" r="2.7" fill="{col}" fill-opacity="0.7"/>'
+        m = gmean(k, key)
+        s += f'<line x1="{sx(m):.1f}" x2="{sx(m):.1f}" y1="{cy - 23}" y2="{cy + 23}" stroke="{INK}" stroke-width="2.5"/>'
+        lab = t(sx(max(vals)) + 10, cy + 5, n4(m), 14, INK, 'start', 700) if sx(max(vals)) + 60 < x1 + 66 else t(sx(min(vals)) - 10, cy + 5, n4(m), 14, INK, 'end', 700)
+        s += lab.replace('<text ', f'<text paint-order="stroke" stroke="{BG}" stroke-width="5" stroke-linejoin="round" ')
     return s
 
 
 def fig1():
-    ret = C4['siglip2_adherence_margin_retention_vs_teacher']
-    s, y = header('MEASURED', G, 'INKLING-2-MINI TO MINIMAX-H3 IMAGE DIFFUSION ' + chr(183) + ' 24 DEVELOPMENT PROMPTS',
-                  f'A {K4["mib"]:.1f} MiB linear map stands in for a {gb(TB):.2f} GB text encoder and keeps {ret * 100:.1f}% of its prompt adherence margin',
-                  f'The image model normally takes its prompt from a {gb(TB):.2f} GB encoder. Here it takes Inkling-2-Mini hidden states, passed through a ridge map solved in closed form with no gradient steps. Each dot is one prompt; the white bar is the mean of {NP}.')
-    y0 = y + 46; LAB = M; PA0, PA1 = M + 250, M + 640; PB0, PB1 = M + 760, M + 1070; RH = 58
+    DW = A['heldout_val_dev_word_metrics']
+    s, y = header('MEASURED', G, 'INKLING-2-MINI TO MINIMAX-H3 IMAGE DIFFUSION ' + chr(183) + f' {NS} SEALED CONFIRMATION PROMPTS',
+                  f'A {K4["mib"]:.1f} MiB linear map stands in for a {gb(TB):.2f} GB text encoder and keeps {RET4 * 100:.1f}% of its prompt adherence margin on {NS} sealed prompts',
+                  f'The image model normally takes its prompt from a {gb(TB):.2f} GB encoder. Here it takes Inkling-2-Mini hidden states, passed through a ridge map solved in closed form with no gradient steps. Each dot is one sealed prompt; the white bar is the mean.')
+    y0 = y + 46; LAB = M; PA0, PA1 = M + 250, M + 640; PB0, PB1 = M + 760, M + 1070
     for i, (k, nm, sub, col) in enumerate(ARMS):
         cy = y0 + i * RH + RH / 2
         s += f'<line x1="{M}" x2="{W - M}" y1="{y0 + i * RH}" y2="{y0 + i * RH}" stroke="{RULE}"/>'
         s += f'<rect x="{LAB}" y="{cy - 12}" width="5" height="24" fill="{col}"/>' + t(LAB + 16, cy - 1, nm, 14, INK, 'start', 700) + t(LAB + 16, cy + 16, sub, 11.5, SEC)
     s += f'<line x1="{M}" x2="{W - M}" y1="{y0 + 4 * RH}" y2="{y0 + 4 * RH}" stroke="{RULE}"/>'
-    s += strip_panel(PA0, PA1, y0, {a[0] for a in ARMS}, -0.2, 0.3, (-0.2, -0.1, 0, 0.1, 0.2, 0.3), 'siglip2_text_image_cos', 'Does the picture match the prompt?', 'SigLIP2 cosine, prompt text to image', lambda v: (MINUS if v < 0 else '') + f'{abs(v):.1f}')
-    s += strip_panel(PB0, PB1, y0, {a[0] for a in ARMS[1:]}, 0.2, 1.0, (0.2, 0.4, 0.6, 0.8, 1.0), 'siglip2_image_vs_teacher_cos', "Does it match the teacher's picture?", 'SigLIP2 cosine, image to teacher image', lambda v: f'{v:.1f}')
+    s += strip_panel(PA0, PA1, y0, {a[0] for a in ARMS}, -0.2, 0.3, (-0.2, -0.1, 0, 0.1, 0.2, 0.3), 'siglip2_text_image', 'Does the picture match the prompt?', 'SigLIP2 cosine, prompt text to image', lambda v: (MINUS if v < 0 else '') + f'{abs(v):.1f}')
+    s += strip_panel(PB0, PB1, y0, {a[0] for a in ARMS[1:]}, 0.2, 1.0, (0.2, 0.4, 0.6, 0.8, 1.0), 'siglip2_image_teacher', "Does it match the teacher's picture?", 'SigLIP2 cosine, image to teacher image', lambda v: f'{v:.1f}')
     y = y0 + 4 * RH + 62
-    # paired statistics for the four-tap map
-    cols = [(f'{ret * 100:.1f}%', f"of the teacher's margin over the shuffled control is kept by the four-tap map. The single-tap map keeps {S1['siglip2_adherence_margin_retention_vs_teacher'] * 100:.1f}%."),
-            (s4(VT['paired_delta']), f"paired difference to the teacher, 95% interval {s4(VT['ci95_low'])} to {s4(VT['ci95_high'])}. Sign test p = {VT['sign_exact_p']:.3f}: {VT['n_a_gt_b']} prompts above the teacher, {VT['n_a_lt_b']} below."),
-            (f"{VB['n_a_gt_b']} of {NP}", f"prompts score above the shuffled control, for both maps. Sign test p = {sci(VB['sign_exact_p'])}.")]
+    cols = [(f'{RET4 * 100:.1f}%', f"of the teacher's margin over the shuffled control is kept by the four-tap map on the sealed set. The single-tap map, the pre-declared primary, keeps {RET1 * 100:.1f}% and passed its bar."),
+            (s4(CT['paired_delta']), f"paired difference to the teacher across {NG} source groups, 95% interval {s4(CT['ci95_low'])} to {s4(CT['ci95_high'])}. The interval is below zero: the map scores slightly under the teacher. {CT['n_a_gt_b']} groups above the teacher, {CT['n_a_lt_b']} below, sign test p = {CT['sign_test_p_two_sided']:.3f}."),
+            (f"{CB['n_a_gt_b']} of {NG}", f"source groups score above the shuffled control, for both maps. Sign test p = {sci(CB['sign_test_p_two_sided'])}.")]
     cw = (CW - 2 * 36) / 3; yb = y
     for i, (big, txt) in enumerate(cols):
         x = M + i * (cw + 36)
         s += f'<line x1="{x}" x2="{x + cw}" y1="{y}" y2="{y}" stroke="{RULE}"/>' + t(x, y + 38, big, 27, INK, 'start', 700, True)
         h, yy = para(x, y + 62, txt, 13, SEC, cw, 1.5); s += h; yb = max(yb, yy)
     y = yb + 50
+    # development panel beside the sealed set
+    s += f'<line x1="{M}" x2="{W - M}" y1="{y}" y2="{y}" stroke="{RULE}"/>' + t(M, y + 34, 'Development panel against the sealed set', 14.5, INK, 'start', 700) + t(M + 318, y + 34, f'the maps were frozen after the {NP} development prompts; the {NS} sealed prompts were read once', 12, SEC)
+    cx = [M + 250, M + 430, M + 560, M + 740, M + 870, M + 1050]; yh = y + 66
+    for j, (xa, lab) in enumerate(((cx[0], 'PROMPT MATCH'), (cx[2], "TEACHER'S PICTURE MATCH"), (cx[4], 'WORD-STATE COSINE'))): s += t(xa, yh, lab, 10.5, SEC, ls='0.06em')
+    for j in range(3): s += t(cx[2 * j], yh + 17, f'{NP} dev', 11.5, DIM) + t(cx[2 * j] + 78, yh + 17, f'{NS} sealed', 11.5, DIM)
+    dw = {'inkling_platos_key_concat4': 'inkling_platos_key_concat4', 'inkling_platos_key_single_tap': 'inkling_platos_key_single_tap', 'b0_shuffled_single_tap': 'b0_shuffled_single_tap'}
+    for i, (k, nm, _, col) in enumerate(ARMS):
+        yy = yh + 44 + i * 27; s += f'<line x1="{M}" x2="{W - M}" y1="{yy - 18}" y2="{yy - 18}" stroke="{RULE}"/><rect x="{M}" y="{yy - 11}" width="5" height="14" fill="{col}"/>' + t(M + 16, yy, nm, 13, BODY)
+        cells = [n4(SUM[k]['siglip2_text_image_cos_mean']), n4(gmean(k, 'siglip2_text_image'))]
+        cells += ['reference', ''] if k == 'teacher_reinject' else [n4(SUM[k]['siglip2_image_vs_teacher_cos_mean']), n4(gmean(k, 'siglip2_image_teacher'))]
+        cells += ['reference', ''] if k == 'teacher_reinject' else [n4(DW[dw[k]]['cosine_mean']), n4(WS[k]['cosine_mean'])]
+        for j, c in enumerate(cells):
+            s += t(cx[j - j % 2] + (78 if j % 2 else 0), yy, c, 13, DIM if c == 'reference' else (INK if j % 2 else SEC), 'start', 700 if j % 2 and c != 'reference' else 400)
+    y = yh + 44 + 4 * 27 + 18
     # size: areas in proportion to bytes on disk
     s += f'<line x1="{M}" x2="{W - M}" y1="{y}" y2="{y}" stroke="{RULE}"/>' + t(M, y + 34, 'Size on disk', 14.5, INK, 'start', 700) + t(M + 100, y + 34, 'areas drawn in proportion to bytes', 12, SEC)
     side = 190; ys = y + 56
@@ -165,9 +201,9 @@ def fig1():
         s += t(xk + 34, yy + 1, f'{kk["mib"]:.1f} MiB', 20, INK, 'start', 700, True) + t(xk + 34, yy + 20, f'{nm}, {TB / kk["disk_bytes"]:,.0f}{TIMES} smaller than the teacher', 12.5, SEC)
     xr = M + 640
     h, yy = para(xr, ys + 20, f'The four-tap map was fitted on {FITS} prompts ({FIT["n_samples"]:,} aligned word spans) in {FITT:.0f} s on CPU. It reads four hidden-state taps from Inkling-2-Mini, so that model has to be loaded; the teacher encoder does not.', 13.5, BODY, CW - 640, 1.55); s += h
-    h, yy = para(xr, yy + 32, f'The teacher re-injection check reproduced the native run exactly on 4 prompts before any map was scored.', 13.5, BODY, CW - 640, 1.55); s += h
+    h, yy = para(xr, yy + 32, f'No fitting ran during confirmation. The teacher re-injection check again reproduced the native run exactly on {CF["dev_floor_audit"]["n_floor_prompts"]} prompts.', 13.5, BODY, CW - 640, 1.55); s += h
     y = ys + side + 46
-    f, H = footer(y, f'{NP} held-out development prompts from {FE["source_group_audit"]["n_source_groups"]} source groups. {A["fixed_invariants"]["dit_pdd_steps"]}-step sampling at 1024 by 1024, with the same seed and starting noise in every arm. The sealed 160-prompt confirmation set has not been run. Margin kept is the map minus control, divided by teacher minus control.')
+    f, H = footer(y, f'{NS} sealed confirmation prompts from {NG} source groups, with statistics paired by source group. The shuffled control was fitted for the single-tap map; the four-tap map is reported separately against the same control. {A["fixed_invariants"]["dit_pdd_steps"]}-step sampling at 1024 by 1024, with the same seed and starting noise in every arm. Margin kept is the map minus control, divided by teacher minus control.')
     return doc(s + f, H)
 
 

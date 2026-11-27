@@ -2,6 +2,8 @@
  "h3_platos_key_phase0_report.json": "340f72c997cc4b55ef082da7ccd3615fa5b3001144a24293ab1bc870cf51201a",
  "vision_ridge_norm_dev_report.json": "5e2b7ac473635aeb0622bf04dd22974dfdbdb63909a7f75efaa82c0be578892b",
  "packetB2_ocr_towers_strip_verify_report.json": "bc090515ba83c9e63c68c984c0635ca22329a7e982afa76e12f6661a78345222",
- "PAPER.md (size targets, figure 3)": "15abbd85b229577767185961a27f5dff5df4e60ca057d5d952f8180022bf05cc",
+ "h3_confirm160_report.json": "5dace34769350d7d40255b0b9922d4c19ecf867e48d7fde8dfdf90731714e05d",
+ "h3_confirm160_per_prompt_outcomes.jsonl": "9ed2987efb9cd15773b3e358cf001b505b68705f5d577c2cff2c4d852add34c8",
+ "PAPER.md (size targets, figure 3)": "11f8accf52f1be032cdf0ee34a37e621d64502f7dc0333091a6b96a2f5e8b8e4",
  "minimax_h3_image_pruned_nvfp4.safetensors (bytes)": 12537569802
 }
