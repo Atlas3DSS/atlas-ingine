@@ -414,7 +414,11 @@ class TpWorkerPool {
       log.info("TP{}/EP{} rank {}/{}: dev={} {} ({}, {}) Q=[{}..{}) KV=[{}..{}) experts=[{}..{}) vocab=[{}..{}) free={}MiB",
                TP_SIZE, TP_SIZE, r, TP_SIZE, info_[r].device, info_[r].name, info_[r].uuid, info_[r].pci_bus,
                r * HEADS, (r + 1) * HEADS, r * KV_HEADS, (r + 1) * KV_HEADS,
-               r * e_per, (r + 1) * e_per, v0, v1, info_[r].vram_free_init_mib);
+               INGINE_TP_ETP ? 0 : r * e_per, INGINE_TP_ETP ? EXPERTS : (r + 1) * e_per, v0, v1,
+               info_[r].vram_free_init_mib);
+      if (INGINE_TP_ETP)
+        log.info("TP{} rank {}: expert tensor parallel, intermediate rows [{}..{}) of every expert", TP_SIZE, r,
+                 r * INTER_LOCAL, (r + 1) * INTER_LOCAL);
     }
 
     for (int r = 0; r < TP_SIZE; ++r) {
@@ -474,7 +478,8 @@ class TpWorkerPool {
       os << "\n  rank=" << r << " uuid=" << in.uuid << " pci=" << in.pci_bus
          << " Q=" << (r * HEADS) << ".." << ((r + 1) * HEADS - 1)
          << " KV=" << (r * KV_HEADS) << ".." << ((r + 1) * KV_HEADS - 1)
-         << " experts=" << (r * (EXPERTS / TP_SIZE)) << ".." << ((r + 1) * (EXPERTS / TP_SIZE) - 1)
+         << " experts=" << (INGINE_TP_ETP ? 0 : r * (EXPERTS / TP_SIZE)) << ".."
+         << (INGINE_TP_ETP ? EXPERTS - 1 : (r + 1) * (EXPERTS / TP_SIZE) - 1)
          << " prefill_steps=" << in.prefill_steps.load()
          << " decode_steps=" << in.decode_steps.load()
          << " allreduce=" << in.allreduce_calls.load()
