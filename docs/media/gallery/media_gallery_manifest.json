@@ -1,6 +1,6 @@
 {
   "schema": "atlas-media-gallery/v1",
-  "updated_at": "2026-11-27T22:30:26Z",
+  "updated_at": "2026-11-27T22:39:20Z",
   "gate": "Each item has a passed attestation receipt, an explicit QA pass verdict, and a file hash that matches the hash recorded in its QA report.",
   "categories": [
     {
@@ -849,6 +849,31 @@
       "width": 640,
       "height": 384,
       "duration_s": 2.325
+    },
+    {
+      "id": "blend941-qwen38-confirm160-sheet",
+      "title": "Qwen3.8-27B half-depth key: sealed 160-prompt renders across 8 domains",
+      "category": "blends",
+      "kind": "image",
+      "hardware": "RTX PRO 6000 Blackwell",
+      "model": "MiniMax-H3 image, conditioned by a Qwen3.8-27B layer-31 Plato's Key",
+      "caption": "One prompt per row, one row per domain. Columns, left to right: the image model's own text encoder; the Qwen3.8 key read from one layer; the key read from four layers; a control with prompts shuffled, where an unrelated picture is the expected result.",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-5d697b5c",
+        "issued_at": "2026-11-27T22:39:20Z"
+      },
+      "sha256": "d3a48bafacd90f9fdd71b2e70c046b786ad824246ce24cbfe0137765f8285ada",
+      "bytes": 3984866,
+      "preview": {
+        "path": "media/blend941-qwen38-confirm160-sheet.jpg",
+        "mime": "image/jpeg",
+        "bytes": 150902,
+        "sha256": "e3929fb564b6ba4620df210037fa88ec7f5c5aa002e1c8761a7d8d0b5dde5cce"
+      },
+      "width": 1024,
+      "height": 2048
     },
     {
       "id": "waveb-flux1-schnell-dev-base",
