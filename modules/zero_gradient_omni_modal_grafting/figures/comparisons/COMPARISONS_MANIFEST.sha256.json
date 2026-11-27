@@ -1,0 +1,113 @@
+{
+  "count": 18,
+  "files": [
+    {
+      "file": "multidonor_qwen38_h3_confirm160_8domains.png",
+      "bytes": 3984866,
+      "sha256": "d3a48bafacd90f9fdd71b2e70c046b786ad824246ce24cbfe0137765f8285ada",
+      "source": "/mnt/storage/omni_platos_keys_multimodel/qwen38/devbox_cu130_out/phase1_confirm160_workers/qwen38_h3_confirm160_contact_sheet_8domains.png"
+    },
+    {
+      "file": "multidonor_deepseek_v41_h3_confirm160_8domains.png",
+      "bytes": 5101662,
+      "sha256": "773428a23be153a1096447e39f38480f1f55d9c526592ac38f220ad864ae11e3",
+      "source": "/mnt/storage/omni_platos_keys_multimodel/deepseek_v41/devbox_cu130_out/phase1_confirm160_workers/ds41_h3_confirm160_contact_sheet_8domains.png"
+    },
+    {
+      "file": "waveA_z_image_turbo_blackwell.png",
+      "bytes": 2488579,
+      "sha256": "4533c4447661bcc7a145ef15105fb91817619cb5f7a8878daabb2095fb4ac6fc",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_a/blackwell_out/z_image_turbo/qa_contact_sheet_z_image_turbo_turbo.png"
+    },
+    {
+      "file": "waveA_z_image_base_blackwell.png",
+      "bytes": 2751313,
+      "sha256": "c04ba62eb7883364936b639321f35d029802cd620a9033ffa6ee4adf36526967",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_a/blackwell_out/z_image_turbo/qa_contact_sheet_z_image_turbo_base.png"
+    },
+    {
+      "file": "waveA_flux2_klein_4b_turbo_blackwell.png",
+      "bytes": 2698964,
+      "sha256": "7df299e0e382caa4c3c2c50c284229735e324c47b8e9fa61c24c8a83102944c3",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_a/blackwell_out/flux2_klein_4b/qa_contact_sheet_flux2_klein_4b_turbo.png"
+    },
+    {
+      "file": "waveA_flux2_klein_4b_base_blackwell.png",
+      "bytes": 2200710,
+      "sha256": "70a53286e8beae98c87d384dce039e3e264c673ea67ea72ebda271c00ffe4026",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_a/blackwell_out/flux2_klein_4b/qa_contact_sheet_flux2_klein_4b_base.png"
+    },
+    {
+      "file": "waveA_qwen_image_21_turbo_blackwell.png",
+      "bytes": 2719317,
+      "sha256": "47e2f390d731ab2bae7f90f35a3d8d801577a81754b9c08252fa83b9a684bc36",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_a/blackwell_out/qwen_image_21/qa_contact_sheet_qwen_image_21_turbo.png"
+    },
+    {
+      "file": "waveA_qwen_image_21_base_blackwell.png",
+      "bytes": 2404746,
+      "sha256": "2731e5fccfceb2a56cea88fdab1c77230797adb18665fc14bcb5a4e36651f0bc",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_a/blackwell_out/qwen_image_21/qa_contact_sheet_qwen_image_21_base.png"
+    },
+    {
+      "file": "waveB_flux2_dev_blackwell.png",
+      "bytes": 2101346,
+      "sha256": "cac1010f5726c8a1eafdc56a7a5acc19e06f116927cda117929ca324893c3704",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_b/blackwell_out/flux2_dev/siglip2/flux2_dev/flux2_dev_singleton_contact_sheet.png"
+    },
+    {
+      "file": "waveB_p_image_oss_blackwell.png",
+      "bytes": 1900464,
+      "sha256": "ee161984322dad71828186ee55e023eb64f945a2b691cbd9e79f2970df68b8bd",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_b/blackwell_out/parity_part2/siglip2/p_image_oss/p_image_oss_singleton_contact_sheet.png"
+    },
+    {
+      "file": "waveB_moss_image_base_blackwell.png",
+      "bytes": 2112578,
+      "sha256": "fe02c4dd066b6ec697b51a6d3f0ac6ce0b7f903ef0d72e2fa0f8edadaa25b25f",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_b/blackwell_out/parity_part2/siglip2/moss_image/moss_image_base_contact_sheet.png"
+    },
+    {
+      "file": "waveB_moss_image_turbo_blackwell.png",
+      "bytes": 2234374,
+      "sha256": "01befd5fb2cd5cdf8764327f86868e8e5ea34e58dd035d3b358c3caeebb211ac",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_b/blackwell_out/parity_part2/siglip2/moss_image/moss_image_turbo_contact_sheet.png"
+    },
+    {
+      "file": "waveB_flux2_klein_9b_base_blackwell.png",
+      "bytes": 1940695,
+      "sha256": "ad9af558452e9df7f297e0453057614784c1efd15d353de47128a1fc67db2d0b",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_b/blackwell_out/parity_part1/siglip2/flux2_klein_9b/flux2_klein_9b_base_contact_sheet.png"
+    },
+    {
+      "file": "waveB_flux1_dev_blackwell.png",
+      "bytes": 1979090,
+      "sha256": "475da276529d9d225dad0645fcc614331f538732afa1c55ed73b1c13671c5350",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_b/blackwell_out/parity_part1/siglip2/flux1_schnell_dev/flux1_schnell_dev_base_contact_sheet.png"
+    },
+    {
+      "file": "waveB_flux1_schnell_blackwell.png",
+      "bytes": 2013256,
+      "sha256": "22cd3e63d007a9fa343c48d169a849ede01df9a8d5c5d2222b5826677edd488f",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_b/blackwell_out/parity_part1/siglip2/flux1_schnell_dev/flux1_schnell_dev_turbo_contact_sheet.png"
+    },
+    {
+      "file": "waveB_sdxl_base_negative_control.png",
+      "bytes": 1935581,
+      "sha256": "2f5ba4ba01667ded3e1ce99408ab3bdb82aa48e66e2fef178c9ae1afa43921ae",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_b/blackwell_out/parity_part1/siglip2/sdxl_base_turbo/sdxl_base_turbo_base_contact_sheet.png"
+    },
+    {
+      "file": "waveB_sdxl_turbo_negative_control.png",
+      "bytes": 2054637,
+      "sha256": "7fdfd5e9342b7e997b379b2b4ee03a484632b0bca3e513bdde901f636fe11875",
+      "source": "/mnt/storage/omni_platos_keys_images/wave_b/blackwell_out/parity_part1/siglip2/sdxl_base_turbo/sdxl_base_turbo_turbo_contact_sheet.png"
+    },
+    {
+      "file": "turnaround_360_v4_contact_sheet.png",
+      "bytes": 1483054,
+      "sha256": "bce10a08747ecf34b7d434021b695ba1e1318eedd7e8362dd2b1a040199c1f8d",
+      "source": "/mnt/storage/omni_gate2_runs/phase0_912_spinup/showcase_runs/turnaround_360_v4/qa_contact_sheet_360_turnaround.png"
+    }
+  ]
+}

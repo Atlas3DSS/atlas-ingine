@@ -1,7 +1,7 @@
 # Zero-Gradient Omni-Modal Grafting: Closed-Form Linear Bridges, Failure Boundaries, and Multi-Donor Blends
 
 **Manuscript v0.9 (2026-11-27)** · **Authors:** Neon & Atlas3D Research (`Atlas3DSS`)
-**Companion Walkthrough:** [TUTORIAL.md](TUTORIAL.md) (shot-by-shot illustrated guide) · **Provenance Ledger:** [PROCESS_LOG.md](PROCESS_LOG.md)
+**Companion Walkthrough:** [TUTORIAL.md](TUTORIAL.md) (shot-by-shot illustrated guide) · **Side-by-Side Image Gallery:** [COMPARISONS.md](COMPARISONS.md) (18 byte-identical contact sheets) · **Host-Enforced Alignment & Live Pliny Proof:** [HOST_ENFORCED_ALIGNMENT.md](HOST_ENFORCED_ALIGNMENT.md) · **HF Collection (`Omni by Atlas`):** https://huggingface.co/collections/Atlas3D/omni-by-atlas-6b09daccd0f65e23233163b3 · **Provenance Ledger:** [PROCESS_LOG.md](PROCESS_LOG.md)
 
 ---
 

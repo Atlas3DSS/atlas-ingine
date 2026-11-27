@@ -2,7 +2,7 @@
 
 A step-by-step engineering guide to how one frozen language model (`Inkling-2-Mini`) drives image diffusion, native video+audio diffusion, prosodic speech control, and multi-donor representation blends without loading a `27.14 GB` `Qwen3-VL-32B` or `44.7 GiB` `Mistral-Small-3.1-24B` text encoder and without running gradient updates on the trunk.
 
-Every contact sheet, spectrogram, and chart below was produced by the system or generated from pinned run reports (see Shot 6 for local regeneration requirements). Every claim cites its confirmation scope or clean negative boundary.
+Every contact sheet, spectrogram, and chart below was produced by the system or generated from pinned run reports (see Shot 6 for local regeneration requirements). Every claim cites its confirmation scope or clean negative boundary. For all 18 full-resolution side-by-side image comparisons (Wave A, Wave B, multi-donor Confirm-160, SDXL negative controls, and 360° turnaround), see **[COMPARISONS.md](COMPARISONS.md)**; for our live Pliny-style adversarial red-team & Neuron Lens proof, see **[HOST_ENFORCED_ALIGNMENT.md](HOST_ENFORCED_ALIGNMENT.md)**; for downloadable `.safetensors` Plato's Keys, see **[Omni by Atlas on Hugging Face](https://huggingface.co/collections/Atlas3D/omni-by-atlas-6b09daccd0f65e23233163b3)**.
 
 ---
 
