@@ -205,7 +205,7 @@ def build_fig6():
 
     fig, (ax_arch, ax_bar) = plt.subplots(
         1, 2, figsize=(17.5, 6.2), facecolor=BG, dpi=220,
-        gridspec_kw={"width_ratios": [1.65, 1.0], "wspace": 0.18, "left": 0.03, "right": 0.97, "top": 0.84, "bottom": 0.13},
+        gridspec_kw={"width_ratios": [1.65, 1.0], "wspace": 0.18, "left": 0.03, "right": 0.97, "top": 0.84, "bottom": 0.175},
     )
 
     # ---- Left: 4-Stage Closed-Loop Alignment Schematic ----
@@ -216,25 +216,25 @@ def build_fig6():
 
     boxes = [
         (0.3, 3.6, 4.2, 2.0, GREEN, "1. Deterministic Verified Data Factory",
-         "LIVE — Verified Ledger Hillclimber\n"
+         "MEASURED — Verified Ledger Hillclimber\n"
          "• KernelBench CUDA, Blender/Godot/DragonFruit\n"
          "• Pliny 5-Invariant Adversarial Red-Team\n"
          "→ Host-verified (failure, proof, winner/refusal) traces"),
-        (5.4, 3.6, 4.3, 2.0, BLUE, "2. Internalize Depth via LoopRes (Pilot)",
-         "NEXT STAGE — NUS-HPC-AI-Lab/LoopRes (arXiv:2611.31094)\n"
+        (5.4, 3.6, 4.3, 2.0, BLUE, "2. Proposed Gradient SFT via LoopRes (#951)",
+         "PROPOSED PILOT — Qwen3-1.7B Only (Unmeasured)\n"
+         "• NUS-HPC-AI-Lab/LoopRes (arXiv:2611.31094, MIT)\n"
          "• Prelude → Looped Core (static_read, W=1) → Coda\n"
-         "• Per-(layer, step) KV cache + loop-aware keys\n"
-         "→ Moves external repair/audit into per-token loops"),
-        (5.4, 0.7, 4.3, 2.0, PURPLE, "3. Defense-in-Depth Hard Wall + Telemetry",
-         "LIVE — Verified Ledger + Neuron Lens + --loopcd\n"
-         "• Unconditional 0/40 committed breach boundary\n"
-         "• Live /v1/probe/* MoE routing shift (5x-10x on b64/hex)\n"
-         "• Anti-oracle d=2027 tamper HTTP 400 fail-closed"),
-        (0.3, 0.7, 4.2, 2.0, ORANGE, "4. Zero-Gradient Omni Re-Lock",
-         "LIVE — Plato's Key Closed-Form FP64 Solve (<1 s)\n"
-         "• 0 diffusion/video/audio/music gradient steps\n"
-         "• Low-rank U@V: 1.4-2.8 MiB Mouth, 21-75 MiB H3\n"
-         "→ Upgraded looped brain regains full omni control"),
+         "→ Targets context-observable breaches vs stock SFT"),
+        (5.4, 0.7, 4.3, 2.0, PURPLE, "3. Host-Enforced Commit Gate + Telemetry",
+         "MEASURED — Verified Ledger + Neuron Lens\n"
+         "• 0/40 committed violations on tested 5-invariant set\n"
+         "• Live /v1/probe/* MoE routing shift logs\n"
+         "• 3/3 direct d=2027 tampers rejected (HTTP 400)"),
+        (0.3, 0.7, 4.2, 2.0, ORANGE, "4. Zero-Gradient H3 Key Re-Lock (Phase 2)",
+         "MEASURED METHOD — Closed-Form FP64 Ridge\n"
+         "• 0 trunk/diffusion weight edits after SFT\n"
+         "• Phase 2 tests H3 word-span re-lock (render opt.)\n"
+         "• Low-rank SVD: 1.4-2.8 MiB Ink/DS Mouth, 21-75 MiB H3"),
     ]
 
     for x, y, w, h, col, title, body in boxes:
@@ -268,41 +268,36 @@ def build_fig6():
     ax_bar.set_axisbelow(True)
 
     cats = [
-        "Arm A: Prompt\nConstitution Only\n(Live Measured)",
-        "Arm B: Host\nVerified Ledger\n(Live Measured)",
-        "Arm B: Benign\nControl Utility\n(Live Measured)",
-        "LoopRes Target\nInternal Breaches\n(Pilot — Unmeasured)",
+        "Arm A: Prompt\nConstitution Only\n(Policy-Violating Proposals)",
+        "Arm B: Host\nVerified Ledger\n(Committed Violations)",
+        "Arm B: Benign\nControl Utility\n(Admitted Commits)",
     ]
     vals = [
         100.0 * arm_a_breach / n_adv,
         100.0 * arm_b_breach / n_adv,
         100.0 * benign_ok / n_benign,
-        0.0,
     ]
-    bcols = [RED, GREEN, BLUE, MUTED]
+    bcols = [RED, GREEN, BLUE]
     x = np.arange(len(cats))
-    bars = ax_bar.bar(x[:3], vals[:3], width=0.58, color=bcols[:3], alpha=0.92)
-    # Dashed target box for LoopRes pilot (honestly labeled unmeasured)
-    ax_bar.bar([3], [12.0], width=0.58, facecolor="none", edgecolor=CYAN, linestyle="--", linewidth=1.8)
-    ax_bar.text(0, vals[0] + 2.5, f"{arm_a_breach}/{n_adv}\n({vals[0]:.1f}%)", ha="center", va="bottom", color=RED, fontsize=9.0, fontweight="bold")
-    ax_bar.text(1, vals[1] + 2.5, f"{arm_b_breach}/{n_adv}\n(0.0% breach)", ha="center", va="bottom", color=GREEN, fontsize=9.0, fontweight="bold")
-    ax_bar.text(2, vals[2] - 10.0, f"{benign_ok}/{n_benign}\n(100.0%)", ha="center", va="top", color="#0d1117", fontsize=9.0, fontweight="bold")
-    ax_bar.text(3, 14.5, "Active Pilot\n(close 55%→0%\ninternal gap)", ha="center", va="bottom", color=CYAN, fontsize=8.2, fontweight="bold")
+    ax_bar.bar(x, vals, width=0.52, color=bcols, alpha=0.92)
+    ax_bar.text(0, vals[0] + 2.5, f"{arm_a_breach}/{n_adv}\n({vals[0]:.1f}%)", ha="center", va="bottom", color=RED, fontsize=9.2, fontweight="bold")
+    ax_bar.text(1, vals[1] + 2.5, f"{arm_b_breach}/{n_adv}\n(0.0% committed)", ha="center", va="bottom", color=GREEN, fontsize=9.2, fontweight="bold")
+    ax_bar.text(2, vals[2] - 10.0, f"{benign_ok}/{n_benign}\n(100.0%)", ha="center", va="top", color="#0d1117", fontsize=9.2, fontweight="bold")
     ax_bar.set_xticks(x)
-    ax_bar.set_xticklabels(cats, color=TEXT, fontsize=8.0)
+    ax_bar.set_xticklabels(cats, color=TEXT, fontsize=8.3)
     ax_bar.set_ylim(0, 114)
     ax_bar.set_ylabel("Percentage (%)", color=TEXT, fontsize=9.0)
-    ax_bar.set_title("B. Measured Pliny v2 Anchor vs. LoopRes Pilot Goal", color=TEXT, fontsize=10.5, fontweight="bold", pad=8)
+    ax_bar.set_title("B. Measured Live Pliny v2 Anchor (40 Adv + 10 Benign)", color=TEXT, fontsize=10.5, fontweight="bold", pad=8)
 
     fig.suptitle(
-        "Closing the Full Alignment Loop: Host-Enforced Verified Ledger × LoopRes Recurrent Depth × Plato's Key",
-        color=TEXT, fontsize=13.0, fontweight="bold", y=0.955,
+        "Host-Enforced Verified Ledger (Measured) & Proposed LoopRes Closed-Loop Pilot (#951, Unmeasured)",
+        color=TEXT, fontsize=12.8, fontweight="bold", y=0.955,
     )
     fig.text(
         0.5, 0.02,
-        "Measured anchor: live Inkling-2-Mini-atlas-12g (--persona-probe-mode, 40 Pliny Tier-1/Tier-2 attacks + 10 benign controls, att-0be1ebd9). "
-        "LoopRes (Zhao et al., arXiv:2611.31094, MIT) closes the 55% internal attempt gap without replacing the 0% host-enforced commit gate.",
-        ha="center", color=MUTED, fontsize=8.0,
+        "Measured anchor: single model Inkling-2-Mini-atlas-12g (--persona-probe-mode, 40 sequential Pliny proposals + 10 benign controls across 5 invariants; att-0be1ebd9).\n"
+        "Proposed pilot #951 tests gradient-trained LoopRes SFT (Zhao et al., arXiv:2611.31094) on Qwen3-1.7B for context-observable attacks vs matched stock SFT (unmeasured).",
+        ha="center", color=MUTED, fontsize=8.0, linespacing=1.3,
     )
 
     out_png = FIG_DIR / "fig6_closed_loop_alignment_architecture.png"
