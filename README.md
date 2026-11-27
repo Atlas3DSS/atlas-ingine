@@ -51,6 +51,10 @@ Collection: [**Qwen3.8-Flash-Next (177B) - Atlas 3D**](https://huggingface.co/co
 
 **Scope & disclosure (177B):** Real 177B SM120a `AllResident` speed is unmeasured in this release (all real-177B GPU evaluations ran on Tesla V100 SM70 `TieredExpertCache`; SM120a coverage on `qwen4exp` is synthetic `qwen4exp_cuda_ops` and `qwen4exp_gpu_e2e` across `AllResident` and `TieredExpertCache`). `atlas-42g` is held back from publication pending `ffn_down_exps=atlas3` or Hessian/DFly-SFT calibration.
 
+![Qwen3.8-27B packs, plain and drafting decode speed, and Qwen3.8-Flash-Next 177B packs](docs/media/qwen38_27b_and_177b_packs_and_speed.png)
+
+In the 32-position agreement check, all three Qwen3.8-27B Elastic packs decoded slower than the `NVFP4` baseline on the same card. The plain-decode and DFlash2 drafting speeds in the figure were measured on development branches that are not yet merged into `main`. With drafting, the chat prompt on the Tesla V100 ran slower than plain decoding (`0.91x` greedy, `0.88x` sampled).
+
 ## Measured performance (16K, 64K & 262K context across 6 NVIDIA generations)
 
 ![10-Year NVIDIA Architecture Lineup and Continuous Batching](docs/media/nvidia_10yr_and_batch.png)
@@ -141,6 +145,8 @@ The allocation is 16,384 or 65,536 tokens; the synthetic prefill is 16,000 or 64
 GPU names and VRAM below come from physical `nvidia-smi`, not provider offer descriptions.
 The 6 GB cards use `--atlas-6g` with `--spec` omitted; every row identifies its 16K drafting mode.
 
+![Inkling-2-Mini on 25 NVIDIA cards from 6 GB to 48 GB: chat and code tokens per second at 64K allocation](docs/media/consumer_gpu_sweep_25_cards.png)
+
 | Physical GPU | nvidia-smi VRAM (MiB) | 16K allocation: chat / code | 64K allocation: chat / code, --spec | 64K allocation: chat / code, drafting off |
 | --- | --- | --- | --- | --- |
 | NVIDIA GeForce RTX 5090 | 32,607 | 484.48 / 617.78 (`--spec`) | 484.63 / 618.00 | 203.60 / 203.60 |
@@ -168,6 +174,8 @@ The 6 GB cards use `--atlas-6g` with `--spec` omitted; every row identifies its 
 | NVIDIA GeForce GTX 1080 Ti | 11,264 | 18.84 / 21.77 (`--spec`) | Unavailable (command rejected) | Unavailable (command rejected) |
 | NVIDIA GeForce GTX 1660 | 6,144 | 10.66 / 10.54 (drafting off) | Drafting unsupported | Timeout |
 | NVIDIA GeForce RTX 3050 | 6,144 | 10.75 / 10.85 (drafting off) | Drafting unsupported | 9.38 / 9.99 |
+
+![25-card sweep limits: drafting slower on 8 GB cards, long-context needle results, and recorded failures](docs/media/consumer_gpu_sweep_limits.png)
 
 At 64K allocation, plain decoding beat drafting on all three measured 8 GB cards:
 RTX 3070 (42.03 vs 30.13 chat tokens/s), RTX 3060 Ti (39.93 vs 30.70), and RTX 5060 (34.39 vs 21.87).
@@ -200,6 +208,12 @@ Using Q4_0 full-attention KV caching (`--kv-q4`), 3-tier paged KV (`VRAM -> pinn
 
 - **1M Atomic Disk KV Checkpoint & Resume (`main @ 2050ba4`):** Streaming `O(1)` (~4.5 MiB buffer) atomic (`tmp -> fsync -> rename`) disk checkpoint/resume verified bit-identical (**`0.000000` KL, `0.000000` max logit diff, `17/17` top-1**) across resident Q4, 3-tier paged Q4, and cross-mode (`save resident -> load paged`), with loud SHA-256 prompt-prefix mismatch rejection and real multi-process `SIGTERM` stop -> `0.93s` resume (`--kv-ckpt-path`, `--kv-ckpt-every`, `--kv-ckpt-resume`).
 
+### NO-GO: long-document soft-token compression
+
+![NO-GO: replacing a 4,096-token document with 64 soft tokens was faster and lost the document](docs/media/soft_token_compression_no_go.png)
+
+This experiment failed and the method was not promoted. A ridge map replaced a 4,096-token document with 64 soft input rows for Inkling-2-Mini, tested on 64 held-out papers on one RTX PRO 6000. Both speed targets were met: prefill took `0.094x` and total time `0.399x` of the full-text run. The quality target was not: the soft tokens picked the correct title for `19/64` papers, against `64/64` for full text, `63/64` for 64 tokens of head-and-tail text, and `11/64` for a wrong-paper control. They recalled `0/192` planted records. The method is adapted from Stanford Hazy Research, "Plato's key".
+
 ## KernelBench Level-2 Benchmarks (100 Tasks, Continual Learning & Verified Ledger)
 
 ![KernelBench Level-2 100-Task Continual Learning and Verified Ledger Results](docs/media/kernelbench_tessellation.png)
@@ -222,6 +236,9 @@ Other Verified Ledger evaluations with unchanged weights:
 - **Loktar web tasks** (128 canvas and front-end tasks, deterministic browser verifier; [showcase](https://monkeyalignment.com/inkling/self-repair/#loktar-testing)): `68/128` passed on the first attempt (mean score `56.91`) and `117/128` after verifier-guided repair with the Verified Ledger (mean `84.68`, 370 iterations in total). The first-attempt arm has no retries, so the difference includes the retries as well as the ledger.
 - **BenchFlow Robo Use** (local fleet, in progress; rollup of 2026-11-26 10:46 UTC): over 69 matched task/seed/host pairs, stock passed `32` (`46.4%`) and Verified Ledger `37` (`53.6%`); 11 ledger-only wins, 6 stock-only wins, 52 ties. The difference is not statistically significant at this size.
 - **BFCL v3 multi-turn** (unmodified `gorilla@6ea57973`, 800 of 800 entries, `--spec`, 2× Tesla V100): stock Inkling-2-Mini scores `42.75%` (`342/800`; base `53.5%`, missing function `30.5%`, missing parameter `43.0%`, long context `44.0%`). The Verified Ledger arm has not finished.
+- **Graph-query benchmarks** (CypherBench, 2,348 questions, and Neo4j Text2Cypher, 943 questions; exact-result check on a live Neo4j database; one Tesla V100, one seed): on CypherBench, repair from database errors plus four parallel attempts raised accuracy from `50.60%` to `65.12%`. Adding Verified Ledger lessons to repair made no detectable difference on either benchmark (`-0.34` and `-0.26` points on CypherBench, `+0.32` and `-0.21` on Text2Cypher; none significant).
+
+![Graph-query benchmarks: repair and parallel attempts raised accuracy, Verified Ledger lessons did not](docs/media/graph_query_benchmarks_six_arms.png)
 
 ## Autonomous Multimodal Video Examples
 
