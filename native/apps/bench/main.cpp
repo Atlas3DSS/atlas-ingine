@@ -309,24 +309,26 @@ int main(int argc, char** argv) {
     if (ap.given("--loopcd-omega") && (!std::isfinite(loopcd_omega) || loopcd_omega < 0.0 || loopcd_omega > 4.0)) {
       throw std::invalid_argument("--loopcd-omega must be finite and in [0, 4]");
     }
-    if (ingine::model::detect_model_family(model_dir) == ingine::model::ModelFamily::Qwen3_5) {
+    const auto bench_family = ingine::model::detect_model_family(model_dir);
+    if (bench_family == ingine::model::ModelFamily::Qwen3_5 ||
+        bench_family == ingine::model::ModelFamily::Qwen4Exp) {
       if (loop_passes_explicit) {
         throw std::invalid_argument(
-            "qwen38-dense is a non-looped dense architecture and does not support --loop-passes");
+            "qwen38/qwen4exp is a non-looped architecture and does not support --loop-passes");
       }
       if (parsed_loopcd_mode != ingine::model::LoopCdMode::Off) {
         throw std::invalid_argument(
-            "qwen38-dense is a non-looped dense architecture and does not support --loopcd");
+            "qwen38/qwen4exp is a non-looped architecture and does not support --loopcd");
       }
       if (loop_bf16) {
         throw std::invalid_argument(
-            "qwen38-dense is a non-looped dense architecture and does not support --loop-bf16");
+            "qwen38/qwen4exp is a non-looped architecture and does not support --loop-bf16");
       }
       if (parsed_attn_requant != ingine::model::AttnRequantMode::Off) {
-        throw std::invalid_argument("qwen38-dense does not support --attn-requant");
+        throw std::invalid_argument("qwen38/qwen4exp does not support --attn-requant");
       }
       if (expert_swaps != 0) {
-        throw std::invalid_argument("qwen38-dense has no MoE experts and does not support --expert-swaps");
+        throw std::invalid_argument("qwen38/qwen4exp does not support --expert-swaps");
       }
       if (!ap.given("--max-ctx")) max_ctx = 8192;
       if (!ap.given("--prefill-chunk")) prefill_chunk = 256;

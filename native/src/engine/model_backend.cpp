@@ -179,6 +179,10 @@ ModelFamily classify_safetensors_tag(std::string_view tag) {
       lower == "qwen3_5forcausallm") {
     return ModelFamily::Qwen3_5;
   }
+  if (lower == "qwen4exp" || lower == "qwen4_exp" || lower == "qwen4expforconditionalgeneration" ||
+      lower == "qwen4expforcausallm" || lower == "qwen3_8_flash_next") {
+    return ModelFamily::Qwen4Exp;
+  }
   if (lower == "deepseek_v41" || lower == "deepseek_v41_text" || lower == "deepseekv41forcausallm" ||
       lower == "deepseekv41forconditionalgeneration") {
     return ModelFamily::DeepSeekV4;
@@ -195,6 +199,7 @@ ModelFamily classify_gguf_arch(std::string_view arch) {
   const std::string lower = to_lower_ascii(arch);
   if (lower == "inkling2_loop") return ModelFamily::Inkling2;
   if (lower == "qwen35") return ModelFamily::Qwen3_5;
+  if (lower == "qwen4exp") return ModelFamily::Qwen4Exp;
   if (lower == "deepseek41") return ModelFamily::DeepSeekV4;
   if (lower == "glm5-next" || lower == "glm5_next") return ModelFamily::GlmFlash;
   return ModelFamily::Unknown;
@@ -352,6 +357,7 @@ const char* to_string(ModelFamily family) noexcept {
     case ModelFamily::Qwen3_5: return "qwen3_5";
     case ModelFamily::DeepSeekV4: return "deepseek_v4";
     case ModelFamily::GlmFlash: return "glm_flash";
+    case ModelFamily::Qwen4Exp: return "qwen4exp";
     default: return "unknown";
   }
 }
@@ -405,6 +411,10 @@ ModelFamily parse_model_family(std::string_view s) {
   if (lower == "qwen3_5" || lower == "qwen35" || lower == "qwen3.5" || lower == "qwen3_5_text" ||
       lower == "qwen38" || lower == "qwen3.8") {
     return ModelFamily::Qwen3_5;
+  }
+  if (lower == "qwen4exp" || lower == "qwen4_exp" || lower == "qwen3.8-flash-next" ||
+      lower == "qwen38-flash-next" || lower == "qwen3_8_flash_next") {
+    return ModelFamily::Qwen4Exp;
   }
   if (lower == "deepseek_v4" || lower == "deepseek_v41" || lower == "deepseek41") {
     return ModelFamily::DeepSeekV4;

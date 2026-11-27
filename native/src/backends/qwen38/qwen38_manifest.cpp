@@ -471,7 +471,13 @@ void assert_tensor(const std::unordered_map<std::string, Qwen38TensorInfo>& tens
 }
 
 void assert_linear_proj(const std::unordered_map<std::string, Qwen38TensorInfo>& tensors, const std::string& prefix,
-                        int out_f, int in_f, Qwen38LinearQuantKind quant, std::unordered_set<std::string>& seen) {
+                        int out_f, int in_f, Qwen38LinearQuantKind quant, std::unordered_set<std::string>& seen,
+                        bool optional_input_scale = false) {
+  auto check_in_scale = [&]() {
+    if (!optional_input_scale || tensors.find(prefix + ".input_scale") != tensors.end()) {
+      assert_tensor(tensors, prefix + ".input_scale", {"F32"}, {}, seen);
+    }
+  };
   if (quant == Qwen38LinearQuantKind::Bf16) {
     assert_tensor(tensors, prefix + ".weight", {"BF16"}, {out_f, in_f}, seen);
     return;
@@ -479,7 +485,27 @@ void assert_linear_proj(const std::unordered_map<std::string, Qwen38TensorInfo>&
   if (quant == Qwen38LinearQuantKind::Fp8E4M3) {
     assert_tensor(tensors, prefix + ".weight", {"F8_E4M3"}, {out_f, in_f}, seen);
     assert_tensor(tensors, prefix + ".weight_scale", {"F32"}, {}, seen);
-    assert_tensor(tensors, prefix + ".input_scale", {"F32"}, {}, seen);
+    check_in_scale();
+    return;
+  }
+  if (quant == Qwen38LinearQuantKind::Atlas3) {
+    if (in_f % 32 != 0) {
+      throw std::invalid_argument("ATLAS3 tensor '" + prefix + "' requires in_features divisible by 32");
+    }
+    assert_tensor(tensors, prefix + ".weight", {"U8"}, {out_f, (in_f * 3) / 8}, seen);
+    assert_tensor(tensors, prefix + ".weight_scale", {"F8_E4M3"}, {out_f, in_f / 16}, seen);
+    assert_tensor(tensors, prefix + ".weight_scale_2", {"F32"}, {}, seen);
+    check_in_scale();
+    return;
+  }
+  if (quant == Qwen38LinearQuantKind::Atlas2) {
+    if (in_f % 16 != 0) {
+      throw std::invalid_argument("ATLAS2 tensor '" + prefix + "' requires in_features divisible by 16");
+    }
+    assert_tensor(tensors, prefix + ".weight", {"U8"}, {out_f, in_f / 4}, seen);
+    assert_tensor(tensors, prefix + ".weight_scale", {"F8_E4M3"}, {out_f, in_f / 16}, seen);
+    assert_tensor(tensors, prefix + ".weight_scale_2", {"F32"}, {}, seen);
+    check_in_scale();
     return;
   }
   if (in_f % 16 != 0) {
@@ -488,7 +514,7 @@ void assert_linear_proj(const std::unordered_map<std::string, Qwen38TensorInfo>&
   assert_tensor(tensors, prefix + ".weight", {"U8"}, {out_f, in_f / 2}, seen);
   assert_tensor(tensors, prefix + ".weight_scale", {"F8_E4M3"}, {out_f, in_f / 16}, seen);
   assert_tensor(tensors, prefix + ".weight_scale_2", {"F32"}, {}, seen);
-  assert_tensor(tensors, prefix + ".input_scale", {"F32"}, {}, seen);
+  check_in_scale();
 }
 
 }  // namespace
@@ -760,6 +786,38 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
     manifest.verified_files.emplace("chat_template.jinja", tmpl_file->identity);
   }
 
+  // Optional Elastic Quant metadata in hf_quant_config.json ("atlas_elastic" + per-layer quantized_layers).
+  if (const auto qcfg_file = read_and_hash_small_file_fd(model_dir / "hf_quant_config.json", "hf_quant_config.json", true);
+      qcfg_file.has_value()) {
+    nlohmann::json qj;
+    try {
+      qj = nlohmann::json::parse(qcfg_file->bytes);
+    } catch (const nlohmann::json::exception& e) {
+      throw std::invalid_argument("invalid hf_quant_config.json: " + std::string(e.what()));
+    }
+    if (qj.is_object() && qj.contains("atlas_elastic") && qj.at("atlas_elastic").is_object()) {
+      manifest.verified_files.emplace("hf_quant_config.json", qcfg_file->identity);
+      manifest.elastic_profile = qj.at("atlas_elastic").value("profile", std::string("elastic"));
+      manifest.checkpoint.schema_variant = "qwen3_5_atlas_elastic_" + manifest.elastic_profile;
+      if (qj.contains("quantization") && qj.at("quantization").is_object() &&
+          qj.at("quantization").contains("quantized_layers") &&
+          qj.at("quantization").at("quantized_layers").is_object()) {
+        for (const auto& [k, v] : qj.at("quantization").at("quantized_layers").items()) {
+          if (!v.is_object()) continue;
+          const std::string algo = v.value("quant_algo", std::string{});
+          if (algo == "FP8") manifest.layer_quant_overrides[k] = Qwen38LinearQuantKind::Fp8E4M3;
+          else if (algo == "NVFP4") manifest.layer_quant_overrides[k] = Qwen38LinearQuantKind::Nvfp4;
+          else if (algo == "ATLAS3") manifest.layer_quant_overrides[k] = Qwen38LinearQuantKind::Atlas3;
+          else if (algo == "ATLAS2") manifest.layer_quant_overrides[k] = Qwen38LinearQuantKind::Atlas2;
+          else if (algo == "BF16") manifest.layer_quant_overrides[k] = Qwen38LinearQuantKind::Bf16;
+          else if (!algo.empty()) {
+            throw std::invalid_argument("unsupported atlas_elastic quant_algo '" + algo + "' for '" + k + "'");
+          }
+        }
+      }
+    }
+  }
+
   const std::filesystem::path index_path = model_dir / "model.safetensors.index.json";
   const auto idx_file = read_and_hash_small_file_fd(index_path, "model.safetensors.index.json", true);
 
@@ -859,16 +917,24 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
   }
   manifest.active_text_tensor_count = manifest.active_tensors.size();
 
-  // Verify exact expected text tensor inventory against Qwen38Config.
+  // Verify exact expected text tensor inventory against Qwen38Config (+ optional atlas_elastic overrides).
   const Qwen38Config& c = manifest.config;
+  const bool is_elastic = !manifest.elastic_profile.empty();
   std::unordered_set<std::string> seen;
   seen.reserve(manifest.active_tensors.size());
 
-  assert_tensor(manifest.active_tensors, "model.language_model.embed_tokens.weight", {"BF16"},
-                {c.vocab_size, c.hidden_size}, seen);
+  const auto embed_q = manifest.quant_for("model.language_model.embed_tokens", Qwen38LinearQuantKind::Bf16);
+  if (embed_q == Qwen38LinearQuantKind::Bf16) {
+    assert_tensor(manifest.active_tensors, "model.language_model.embed_tokens.weight", {"BF16"},
+                  {c.vocab_size, c.hidden_size}, seen);
+  } else {
+    assert_linear_proj(manifest.active_tensors, "model.language_model.embed_tokens", c.vocab_size, c.hidden_size,
+                       embed_q, seen, /*optional_input_scale=*/true);
+  }
   assert_tensor(manifest.active_tensors, "model.language_model.norm.weight", {"BF16"}, {c.hidden_size}, seen);
   if (!c.tie_word_embeddings) {
-    assert_linear_proj(manifest.active_tensors, "lm_head", c.vocab_size, c.hidden_size, c.lm_head_quant(), seen);
+    assert_linear_proj(manifest.active_tensors, "lm_head", c.vocab_size, c.hidden_size,
+                       manifest.quant_for("lm_head", c.lm_head_quant()), seen, is_elastic);
   }
 
   for (int i = 0; i < c.num_hidden_layers; ++i) {
@@ -889,32 +955,32 @@ Qwen38Manifest Qwen38Manifest::inspect(const std::filesystem::path& model_dir, b
       assert_tensor(manifest.active_tensors, attn + ".norm.weight", {"BF16", "F32"}, {c.linear_value_head_dim}, seen);
 
       assert_linear_proj(manifest.active_tensors, attn + ".in_proj_qkv", c.linear_conv_dim(), c.hidden_size,
-                         c.linear_attn_quant(), seen);
+                         manifest.quant_for(attn + ".in_proj_qkv", c.linear_attn_quant()), seen, is_elastic);
       assert_linear_proj(manifest.active_tensors, attn + ".in_proj_z", c.linear_value_dim(), c.hidden_size,
-                         c.linear_attn_quant(), seen);
+                         manifest.quant_for(attn + ".in_proj_z", c.linear_attn_quant()), seen, is_elastic);
       assert_linear_proj(manifest.active_tensors, attn + ".out_proj", c.hidden_size, c.linear_value_dim(),
-                         c.linear_attn_quant(), seen);
+                         manifest.quant_for(attn + ".out_proj", c.linear_attn_quant()), seen, is_elastic);
     } else {
       const std::string attn = lp + ".self_attn";
       assert_tensor(manifest.active_tensors, attn + ".q_norm.weight", {"BF16", "F32"}, {c.head_dim}, seen);
       assert_tensor(manifest.active_tensors, attn + ".k_norm.weight", {"BF16", "F32"}, {c.head_dim}, seen);
 
       assert_linear_proj(manifest.active_tensors, attn + ".q_proj", c.full_q_proj_out_dim(), c.hidden_size,
-                         c.full_attn_quant(), seen);
+                         manifest.quant_for(attn + ".q_proj", c.full_attn_quant()), seen, is_elastic);
       assert_linear_proj(manifest.active_tensors, attn + ".k_proj", c.full_kv_proj_out_dim(), c.hidden_size,
-                         c.full_attn_quant(), seen);
+                         manifest.quant_for(attn + ".k_proj", c.full_attn_quant()), seen, is_elastic);
       assert_linear_proj(manifest.active_tensors, attn + ".v_proj", c.full_kv_proj_out_dim(), c.hidden_size,
-                         c.full_attn_quant(), seen);
+                         manifest.quant_for(attn + ".v_proj", c.full_attn_quant()), seen, is_elastic);
       assert_linear_proj(manifest.active_tensors, attn + ".o_proj", c.hidden_size, c.num_attention_heads * c.head_dim,
-                         c.full_attn_quant(), seen);
+                         manifest.quant_for(attn + ".o_proj", c.full_attn_quant()), seen, is_elastic);
     }
 
     assert_linear_proj(manifest.active_tensors, lp + ".mlp.gate_proj", c.intermediate_size, c.hidden_size,
-                       c.mlp_quant(), seen);
+                       manifest.quant_for(lp + ".mlp.gate_proj", c.mlp_quant()), seen, is_elastic);
     assert_linear_proj(manifest.active_tensors, lp + ".mlp.up_proj", c.intermediate_size, c.hidden_size,
-                       c.mlp_quant(), seen);
+                       manifest.quant_for(lp + ".mlp.up_proj", c.mlp_quant()), seen, is_elastic);
     assert_linear_proj(manifest.active_tensors, lp + ".mlp.down_proj", c.hidden_size, c.intermediate_size,
-                       c.mlp_quant(), seen);
+                       manifest.quant_for(lp + ".mlp.down_proj", c.mlp_quant()), seen, is_elastic);
   }
 
   if (seen.size() != manifest.active_tensors.size()) {
@@ -1032,6 +1098,103 @@ ingine::model::CheckpointPinSpec qwen38_27b_nvfp4_pin_spec() {
        ingine::model::parse_sha256_hex("0506ad35dc21469708e7813bd76c592cef08bd0317b4a1fe899745ebe2435271")},
   };
   return spec;
+}
+
+ingine::model::CheckpointPinSpec qwen38_27b_atlas_17g_pin_spec() {
+  ingine::model::CheckpointPinSpec spec;
+  spec.config_sha256 =
+      ingine::model::parse_sha256_hex("71fa01bb64de20971045cd82a82c0ebb25a54e1b0a3f09ef23cf5479e9c54df8");
+  spec.tokenizer_sha256 =
+      ingine::model::parse_sha256_hex("0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3");
+  spec.chat_template_sha256 =
+      ingine::model::parse_sha256_hex("c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041");
+  spec.shards = {
+      {"model-00001-of-00004.safetensors", 4480187616ull,
+       ingine::model::parse_sha256_hex("babfe016170150a471902e85e009d22b8fca0202386d3415255301613d5219e0")},
+      {"model-00002-of-00004.safetensors", 4461772388ull,
+       ingine::model::parse_sha256_hex("916032f9534a296f8c2b1faf466f8193c331be3ee6cb25ef3d4b4462da6d5c37")},
+      {"model-00003-of-00004.safetensors", 4465600316ull,
+       ingine::model::parse_sha256_hex("23427dbd059ebf1810d36c3d22d33f38b1e307ce1f130f7893dbdc485315f1d5")},
+      {"model-00004-of-00004.safetensors", 3043893508ull,
+       ingine::model::parse_sha256_hex("1b9a5ab9336e508d60759d45ff96de568759e0de481d8d25d696afccd691defb")},
+  };
+  return spec;
+}
+
+ingine::model::CheckpointPinSpec qwen38_27b_atlas_14g_pin_spec() {
+  ingine::model::CheckpointPinSpec spec;
+  spec.config_sha256 =
+      ingine::model::parse_sha256_hex("71fa01bb64de20971045cd82a82c0ebb25a54e1b0a3f09ef23cf5479e9c54df8");
+  spec.tokenizer_sha256 =
+      ingine::model::parse_sha256_hex("0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3");
+  spec.chat_template_sha256 =
+      ingine::model::parse_sha256_hex("c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041");
+  spec.shards = {
+      {"model-00001-of-00004.safetensors", 4471336976ull,
+       ingine::model::parse_sha256_hex("e0fc1b38feeccdc04bc2b9e716d087242bb6b5ceb3bc76fb6f2815feed667d18")},
+      {"model-00002-of-00004.safetensors", 4499404784ull,
+       ingine::model::parse_sha256_hex("3c57a22942fb0f440d50e4f236531c715c794cd135e059850b4d23e9d7a4c628")},
+      {"model-00003-of-00004.safetensors", 4497083160ull,
+       ingine::model::parse_sha256_hex("79a31c383c6583a15539cdf91f64d218d1612e04587601d985edaa5c7a7667cc")},
+      {"model-00004-of-00004.safetensors", 221967252ull,
+       ingine::model::parse_sha256_hex("e0bf95e60180dcec6e765d7064f0ce9c976ab7107f141fd3fd88c1efad9ca620")},
+  };
+  return spec;
+}
+
+ingine::model::CheckpointPinSpec qwen38_27b_atlas_11g_pin_spec() {
+  ingine::model::CheckpointPinSpec spec;
+  spec.config_sha256 =
+      ingine::model::parse_sha256_hex("71fa01bb64de20971045cd82a82c0ebb25a54e1b0a3f09ef23cf5479e9c54df8");
+  spec.tokenizer_sha256 =
+      ingine::model::parse_sha256_hex("0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3");
+  spec.chat_template_sha256 =
+      ingine::model::parse_sha256_hex("c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041");
+  spec.shards = {
+      {"model-00001-of-00003.safetensors", 4494186160ull,
+       ingine::model::parse_sha256_hex("957d609ca33537794e546522fbadbec9b6016851582521dc86837f109b7faa45")},
+      {"model-00002-of-00003.safetensors", 4487928192ull,
+       ingine::model::parse_sha256_hex("8137a5cd3b07a783a5df1626591dd857f67b2861ec36a04a5125fd1eec26fc6f")},
+      {"model-00003-of-00003.safetensors", 3200353532ull,
+       ingine::model::parse_sha256_hex("19f499b0853c1f0fba0225cf66ffe9e50f38be370e3595334971914f2edd2140")},
+  };
+  return spec;
+}
+
+std::optional<ingine::model::CheckpointPinSpec> qwen38_default_pin_spec_for_dir(const std::filesystem::path& model_dir) {
+  const std::filesystem::path qcfg_path = model_dir / "hf_quant_config.json";
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(qcfg_path, ec)) {
+    return qwen38_27b_nvfp4_pin_spec();
+  }
+  std::ifstream in(qcfg_path);
+  if (!in) return qwen38_27b_nvfp4_pin_spec();
+  const auto j = nlohmann::json::parse(in, nullptr, false);
+  if (j.is_discarded() || !j.contains("atlas_elastic") || !j["atlas_elastic"].is_object()) {
+    return qwen38_27b_nvfp4_pin_spec();
+  }
+  const std::string prof = j["atlas_elastic"].value("profile", std::string{});
+  auto matches_shard_layout = [&](const ingine::model::CheckpointPinSpec& cand) {
+    for (const auto& s : cand.shards) {
+      const std::filesystem::path sp = model_dir / s.filename;
+      if (!std::filesystem::is_regular_file(sp, ec)) return false;
+      if (std::filesystem::file_size(sp, ec) != s.byte_size || ec) return false;
+    }
+    return true;
+  };
+  if (prof == "atlas-17g") {
+    auto spec = qwen38_27b_atlas_17g_pin_spec();
+    if (matches_shard_layout(spec)) return spec;
+  }
+  if (prof == "atlas-14g") {
+    auto spec = qwen38_27b_atlas_14g_pin_spec();
+    if (matches_shard_layout(spec)) return spec;
+  }
+  if (prof == "atlas-11g") {
+    auto spec = qwen38_27b_atlas_11g_pin_spec();
+    if (matches_shard_layout(spec)) return spec;
+  }
+  return std::nullopt;
 }
 
 }  // namespace ingine::backends::qwen38

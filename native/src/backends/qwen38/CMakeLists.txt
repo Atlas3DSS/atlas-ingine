@@ -20,6 +20,7 @@ target_compile_options(ingine_qwen38_cpu PRIVATE -Wall -Wextra -Wpedantic)
 if(INGINE_BACKEND STREQUAL "CUDA")
   add_library(ingine_qwen38_cuda STATIC
     qwen38_cuda_ops.cu
+    qwen38_elastic_ops.cu
     qwen38_dense_gpu.cu
   )
   ingine_cuda_target(ingine_qwen38_cuda)

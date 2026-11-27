@@ -665,11 +665,168 @@ void test_bounded_streaming_and_same_size_mutation() {
   }
 }
 
+void test_synthetic_atlas_elastic_manifest() {
+  TempDir ed("elastic");
+  // Build a minimal 2-layer synthetic Elastic safetensors checkpoint (hidden=32, inter=64, linear+full attn)
+  // exercising FP8 embed, ATLAS3 core MLP, ATLAS2 boundary MLP, NVFP4 attention, and optional input_scale.
+  write_str(ed.path / "config.json", R"({
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "model_type": "qwen3_5",
+    "tie_word_embeddings": false,
+    "text_config": {
+      "model_type": "qwen3_5_text",
+      "vocab_size": 32,
+      "hidden_size": 32,
+      "intermediate_size": 64,
+      "num_hidden_layers": 2,
+      "max_position_embeddings": 128,
+      "rms_norm_eps": 1e-6,
+      "full_attention_interval": 2,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 1,
+      "head_dim": 16,
+      "attention_bias": false,
+      "attn_output_gate": true,
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 16,
+      "linear_value_head_dim": 16,
+      "linear_num_key_heads": 1,
+      "linear_num_value_heads": 2,
+      "mamba_ssm_dtype": "float32",
+      "layer_types": ["linear_attention", "full_attention"],
+      "rope_parameters": {"rope_theta": 10000000, "partial_rotary_factor": 0.25}
+    }
+  })");
+  write_str(ed.path / "tokenizer.json", R"({"version":"1.0"})");
+  write_str(ed.path / "chat_template.jinja", "{{ messages }}");
+  write_str(ed.path / "hf_quant_config.json", R"({
+    "producer": {"name": "atlas-ingine-elastic", "version": "1.0"},
+    "quantization": {
+      "quant_algo": "MIXED_PRECISION",
+      "quantized_layers": {
+        "model.language_model.embed_tokens": {"quant_algo": "FP8"},
+        "lm_head": {"quant_algo": "NVFP4", "group_size": 16},
+        "model.language_model.layers.0.linear_attn.in_proj_qkv": {"quant_algo": "NVFP4", "group_size": 16},
+        "model.language_model.layers.0.linear_attn.in_proj_z": {"quant_algo": "NVFP4", "group_size": 16},
+        "model.language_model.layers.0.linear_attn.out_proj": {"quant_algo": "NVFP4", "group_size": 16},
+        "model.language_model.layers.0.mlp.gate_proj": {"quant_algo": "ATLAS3", "group_size": 16},
+        "model.language_model.layers.0.mlp.up_proj": {"quant_algo": "ATLAS3", "group_size": 16},
+        "model.language_model.layers.0.mlp.down_proj": {"quant_algo": "ATLAS3", "group_size": 16},
+        "model.language_model.layers.1.self_attn.q_proj": {"quant_algo": "FP8"},
+        "model.language_model.layers.1.self_attn.k_proj": {"quant_algo": "FP8"},
+        "model.language_model.layers.1.self_attn.v_proj": {"quant_algo": "FP8"},
+        "model.language_model.layers.1.self_attn.o_proj": {"quant_algo": "FP8"},
+        "model.language_model.layers.1.mlp.gate_proj": {"quant_algo": "ATLAS2", "group_size": 16},
+        "model.language_model.layers.1.mlp.up_proj": {"quant_algo": "ATLAS2", "group_size": 16},
+        "model.language_model.layers.1.mlp.down_proj": {"quant_algo": "ATLAS2", "group_size": 16}
+      }
+    },
+    "atlas_elastic": {"family": "qwen3_5", "model": "Qwen3.8-Synth", "profile": "atlas-14g"}
+  })");
+
+  struct Spec {
+    std::string name;
+    std::string dtype;
+    std::vector<std::int64_t> shape;
+    std::size_t elem_bytes;
+  };
+  std::vector<Spec> specs = {
+      {"model.language_model.embed_tokens.weight", "F8_E4M3", {32, 32}, 1},
+      {"model.language_model.embed_tokens.weight_scale", "F32", {}, 4},
+      {"model.language_model.norm.weight", "BF16", {32}, 2},
+      {"lm_head.weight", "U8", {32, 16}, 1},
+      {"lm_head.weight_scale", "F8_E4M3", {32, 2}, 1},
+      {"lm_head.weight_scale_2", "F32", {}, 4},
+      // L0 linear_attention + ATLAS3 MLP
+      {"model.language_model.layers.0.input_layernorm.weight", "BF16", {32}, 2},
+      {"model.language_model.layers.0.post_attention_layernorm.weight", "BF16", {32}, 2},
+      {"model.language_model.layers.0.linear_attn.A_log", "F32", {2}, 4},
+      {"model.language_model.layers.0.linear_attn.dt_bias", "BF16", {2}, 2},
+      {"model.language_model.layers.0.linear_attn.conv1d.weight", "BF16", {64, 1, 4}, 2},
+      {"model.language_model.layers.0.linear_attn.in_proj_a.weight", "BF16", {2, 32}, 2},
+      {"model.language_model.layers.0.linear_attn.in_proj_b.weight", "BF16", {2, 32}, 2},
+      {"model.language_model.layers.0.linear_attn.norm.weight", "F32", {16}, 4},
+      {"model.language_model.layers.0.linear_attn.in_proj_qkv.weight", "U8", {64, 16}, 1},
+      {"model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale", "F8_E4M3", {64, 2}, 1},
+      {"model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale_2", "F32", {}, 4},
+      {"model.language_model.layers.0.linear_attn.in_proj_z.weight", "U8", {32, 16}, 1},
+      {"model.language_model.layers.0.linear_attn.in_proj_z.weight_scale", "F8_E4M3", {32, 2}, 1},
+      {"model.language_model.layers.0.linear_attn.in_proj_z.weight_scale_2", "F32", {}, 4},
+      {"model.language_model.layers.0.linear_attn.out_proj.weight", "U8", {32, 16}, 1},
+      {"model.language_model.layers.0.linear_attn.out_proj.weight_scale", "F8_E4M3", {32, 2}, 1},
+      {"model.language_model.layers.0.linear_attn.out_proj.weight_scale_2", "F32", {}, 4},
+      {"model.language_model.layers.0.mlp.gate_proj.weight", "U8", {64, 12}, 1},
+      {"model.language_model.layers.0.mlp.gate_proj.weight_scale", "F8_E4M3", {64, 2}, 1},
+      {"model.language_model.layers.0.mlp.gate_proj.weight_scale_2", "F32", {}, 4},
+      {"model.language_model.layers.0.mlp.up_proj.weight", "U8", {64, 12}, 1},
+      {"model.language_model.layers.0.mlp.up_proj.weight_scale", "F8_E4M3", {64, 2}, 1},
+      {"model.language_model.layers.0.mlp.up_proj.weight_scale_2", "F32", {}, 4},
+      {"model.language_model.layers.0.mlp.down_proj.weight", "U8", {32, 24}, 1},
+      {"model.language_model.layers.0.mlp.down_proj.weight_scale", "F8_E4M3", {32, 4}, 1},
+      {"model.language_model.layers.0.mlp.down_proj.weight_scale_2", "F32", {}, 4},
+      // L1 full_attention (FP8) + ATLAS2 MLP
+      {"model.language_model.layers.1.input_layernorm.weight", "BF16", {32}, 2},
+      {"model.language_model.layers.1.post_attention_layernorm.weight", "BF16", {32}, 2},
+      {"model.language_model.layers.1.self_attn.q_norm.weight", "BF16", {16}, 2},
+      {"model.language_model.layers.1.self_attn.k_norm.weight", "BF16", {16}, 2},
+      {"model.language_model.layers.1.self_attn.q_proj.weight", "F8_E4M3", {64, 32}, 1},
+      {"model.language_model.layers.1.self_attn.q_proj.weight_scale", "F32", {}, 4},
+      {"model.language_model.layers.1.self_attn.k_proj.weight", "F8_E4M3", {16, 32}, 1},
+      {"model.language_model.layers.1.self_attn.k_proj.weight_scale", "F32", {}, 4},
+      {"model.language_model.layers.1.self_attn.v_proj.weight", "F8_E4M3", {16, 32}, 1},
+      {"model.language_model.layers.1.self_attn.v_proj.weight_scale", "F32", {}, 4},
+      {"model.language_model.layers.1.self_attn.o_proj.weight", "F8_E4M3", {32, 32}, 1},
+      {"model.language_model.layers.1.self_attn.o_proj.weight_scale", "F32", {}, 4},
+      {"model.language_model.layers.1.mlp.gate_proj.weight", "U8", {64, 8}, 1},
+      {"model.language_model.layers.1.mlp.gate_proj.weight_scale", "F8_E4M3", {64, 2}, 1},
+      {"model.language_model.layers.1.mlp.gate_proj.weight_scale_2", "F32", {}, 4},
+      {"model.language_model.layers.1.mlp.up_proj.weight", "U8", {64, 8}, 1},
+      {"model.language_model.layers.1.mlp.up_proj.weight_scale", "F8_E4M3", {64, 2}, 1},
+      {"model.language_model.layers.1.mlp.up_proj.weight_scale_2", "F32", {}, 4},
+      {"model.language_model.layers.1.mlp.down_proj.weight", "U8", {32, 16}, 1},
+      {"model.language_model.layers.1.mlp.down_proj.weight_scale", "F8_E4M3", {32, 4}, 1},
+      {"model.language_model.layers.1.mlp.down_proj.weight_scale_2", "F32", {}, 4},
+  };
+  nlohmann::ordered_json hdr;
+  std::uint64_t offset = 0;
+  for (const auto& sp : specs) {
+    std::uint64_t elems = 1;
+    for (std::int64_t d : sp.shape) elems *= static_cast<std::uint64_t>(d);
+    const std::uint64_t bytes = elems * sp.elem_bytes;
+    hdr[sp.name] = {{"dtype", sp.dtype}, {"shape", sp.shape}, {"data_offsets", {offset, offset + bytes}}};
+    offset += bytes;
+  }
+  const std::string hdr_str = hdr.dump();
+  const std::uint64_t hdr_len = hdr_str.size();
+  std::vector<std::uint8_t> st(8 + hdr_len + offset, 0u);
+  for (int i = 0; i < 8; ++i) st[i] = static_cast<std::uint8_t>((hdr_len >> (8 * i)) & 0xffu);
+  std::memcpy(st.data() + 8, hdr_str.data(), hdr_len);
+  write_bytes(ed.path / "model.safetensors", st.data(), st.size());
+
+  const auto m = Qwen38Manifest::inspect(ed.path, false, "elastic-r1");
+  CHECK(m.elastic_profile == "atlas-14g");
+  CHECK(m.checkpoint.schema_variant == "qwen3_5_atlas_elastic_atlas-14g");
+  CHECK(m.quant_for("model.language_model.embed_tokens", Qwen38LinearQuantKind::Bf16) ==
+        Qwen38LinearQuantKind::Fp8E4M3);
+  CHECK(m.quant_for("model.language_model.layers.0.mlp.gate_proj", Qwen38LinearQuantKind::Bf16) ==
+        Qwen38LinearQuantKind::Atlas3);
+  CHECK(m.quant_for("model.language_model.layers.1.mlp.down_proj", Qwen38LinearQuantKind::Bf16) ==
+        Qwen38LinearQuantKind::Atlas2);
+  CHECK(m.quant_for("model.language_model.layers.0.linear_attn.in_proj_qkv", Qwen38LinearQuantKind::Bf16) ==
+        Qwen38LinearQuantKind::Nvfp4);
+  // Synthetic custom Elastic pack does not match official 4-shard sizes -> std::nullopt (HeadersOnly, no false pin).
+  CHECK(!qwen38_default_pin_spec_for_dir(ed.path).has_value());
+  CHECK(qwen38_27b_atlas_17g_pin_spec().shards.size() == 4);
+  CHECK(qwen38_27b_atlas_14g_pin_spec().shards.size() == 4);
+  CHECK(qwen38_27b_atlas_11g_pin_spec().shards.size() == 3);
+}
+
 }  // namespace
 
 int main() {
   test_config_validation();
   test_synthetic_manifest();
+  test_synthetic_atlas_elastic_manifest();
   test_real_checkpoints();
   test_bounded_streaming_and_same_size_mutation();
   std::printf("qwen38_manifest: PASS\n");

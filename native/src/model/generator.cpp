@@ -15,6 +15,7 @@
 #include "ingine/generator.h"
 
 #include "backends/qwen38/qwen38_dense_gpu.h"
+#include "backends/qwen4exp/qwen4exp_gpu.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/host_memory.h"
@@ -1565,6 +1566,14 @@ std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
 #else
       backends::qwen38::register_qwen38_cuda_backend();
       return BackendRegistry::instance().create(ModelFamily::Qwen3_5, options);
+#endif
+    }
+    if (family == ModelFamily::Qwen4Exp) {
+#if INGINE_TP_SIZE > 1
+      throw std::invalid_argument("qwen4exp-cuda does not support INGINE_TP_SIZE > 1 yet");
+#else
+      backends::qwen4exp::register_qwen4exp_cuda_backend();
+      return BackendRegistry::instance().create(ModelFamily::Qwen4Exp, options);
 #endif
     }
     if (family != ModelFamily::Inkling2) {

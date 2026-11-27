@@ -2,6 +2,7 @@
 
 #include "backends/qwen38/qwen38_cpu_ops.h"
 #include "backends/qwen38/qwen38_cuda_ops.h"
+#include "backends/qwen38/qwen38_elastic_ops.h"
 #include "core/device.h"
 
 #include <cuda_bf16.h>
@@ -277,7 +278,11 @@ struct Qwen38DenseBackend::Impl {
   DevBuf<std::uint8_t> weights_arena;
   DevBuf<float> f32_arena;
 
+  Qwen38LinearQuantKind embed_quant = Qwen38LinearQuantKind::Bf16;
   const __nv_bfloat16* embed_tokens = nullptr;
+  const std::uint8_t* embed_u8 = nullptr;
+  const std::uint8_t* embed_scales = nullptr;
+  float embed_scale = 1.0f;
   const __nv_bfloat16* final_norm = nullptr;
   DevProj lm_head;
   std::vector<DevLayer> layers;
@@ -338,6 +343,12 @@ struct Qwen38DenseBackend::Impl {
       }
       qwen38_cuda_fp8_linear_f32_batched(x_use, p.w_u8, p.weight_scale, 0.0f, m, p.out_features, p.in_features, out,
                                          ctx.stream);
+    } else if (p.quant == Qwen38LinearQuantKind::Atlas3) {
+      qwen38_cuda_atlas3_linear_f32_batched(x, p.w_u8, p.w_scales, p.weight_scale_2, m, p.out_features, p.in_features,
+                                            out, ctx.stream);
+    } else if (p.quant == Qwen38LinearQuantKind::Atlas2) {
+      qwen38_cuda_atlas2_linear_f32_batched(x, p.w_u8, p.w_scales, p.weight_scale_2, m, p.out_features, p.in_features,
+                                            out, ctx.stream);
     } else {
       qwen38_cuda_nvfp4_linear_f32_batched(x, p.w_u8, p.w_scales, p.weight_scale_2, m, p.out_features, p.in_features,
                                            out, ctx.stream);
@@ -349,9 +360,18 @@ struct Qwen38DenseBackend::Impl {
     if (m <= 0) throw std::invalid_argument("lm_head_forward_f32 m <= 0");
     if (p.quant == Qwen38LinearQuantKind::Bf16) {
       qwen38_cuda_bf16_linear_f32_batched(x, p.w_bf16, m, p.out_features, p.in_features, out_f32, ctx.stream);
+    } else if (p.quant == Qwen38LinearQuantKind::Fp8E4M3) {
+      qwen38_cuda_fp8_linear_f32_batched(x, p.w_u8, p.weight_scale, 0.0f, m, p.out_features, p.in_features, out_f32,
+                                         ctx.stream);
     } else if (p.quant == Qwen38LinearQuantKind::Nvfp4) {
       qwen38_cuda_nvfp4_linear_f32_batched(x, p.w_u8, p.w_scales, p.weight_scale_2, m, p.out_features, p.in_features,
                                            out_f32, ctx.stream);
+    } else if (p.quant == Qwen38LinearQuantKind::Atlas3) {
+      qwen38_cuda_atlas3_linear_f32_batched(x, p.w_u8, p.w_scales, p.weight_scale_2, m, p.out_features, p.in_features,
+                                            out_f32, ctx.stream);
+    } else if (p.quant == Qwen38LinearQuantKind::Atlas2) {
+      qwen38_cuda_atlas2_linear_f32_batched(x, p.w_u8, p.w_scales, p.weight_scale_2, m, p.out_features, p.in_features,
+                                            out_f32, ctx.stream);
     } else {
       throw std::invalid_argument("unsupported lm_head quant");
     }
@@ -397,7 +417,14 @@ struct Qwen38DenseBackend::Impl {
       CUDA_CHECK(cudaMemcpyAsync(token_ids_dev.ptr, token_ids.data() + off,
                                  static_cast<std::size_t>(M) * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                  ctx.stream));
-      qwen38_cuda_embed_lookup_f32(embed_tokens, token_ids_dev.ptr, M, H, V, hidden.ptr, ctx.stream);
+      if (embed_quant == Qwen38LinearQuantKind::Fp8E4M3) {
+        qwen38_cuda_embed_lookup_fp8_f32(embed_u8, embed_scale, token_ids_dev.ptr, M, H, V, hidden.ptr, ctx.stream);
+      } else if (embed_quant == Qwen38LinearQuantKind::Nvfp4) {
+        qwen38_cuda_embed_lookup_nvfp4_f32(embed_u8, embed_scales, embed_scale, token_ids_dev.ptr, M, H, V, hidden.ptr,
+                                           ctx.stream);
+      } else {
+        qwen38_cuda_embed_lookup_f32(embed_tokens, token_ids_dev.ptr, M, H, V, hidden.ptr, ctx.stream);
+      }
 
       std::size_t lin_idx = 0;
       std::size_t full_idx = 0;
@@ -1050,8 +1077,13 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
 
   const auto t_sha0 = std::chrono::steady_clock::now();
   if (options.verify_pins) {
-    const auto spec = options.expected_pins.has_value() ? *options.expected_pins : qwen38_27b_nvfp4_pin_spec();
-    impl_->manifest = Qwen38Manifest::inspect_pinned(options.model_dir, spec, options.revision);
+    if (options.expected_pins.has_value()) {
+      impl_->manifest = Qwen38Manifest::inspect_pinned(options.model_dir, *options.expected_pins, options.revision);
+    } else if (const auto def_spec = qwen38_default_pin_spec_for_dir(options.model_dir); def_spec.has_value()) {
+      impl_->manifest = Qwen38Manifest::inspect_pinned(options.model_dir, *def_spec, options.revision);
+    } else {
+      impl_->manifest = Qwen38Manifest::inspect(options.model_dir, false, options.revision);
+    }
   } else {
     impl_->manifest = Qwen38Manifest::inspect(options.model_dir, false, options.revision);
   }
@@ -1074,9 +1106,11 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   profile_ = make_qwen38_worker_profile(m, ropt, "dense_bf16", "dense");
   profile_.state_identity.act_dtype = ingine::model::ActivationDtype::Fp32;
   profile_.state_identity.numeric_abi =
-      std::string((c.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4)
-                      ? "act=f32;attn=fp8_e4m3_cal;mlp=nvfp4_w4a32;gdn=f32;kv=bf16"
-                      : "act=f32;attn=bf16;mlp=bf16;gdn=f32;kv=bf16") +
+      std::string(!m.elastic_profile.empty()
+                      ? ("act=f32;elastic=" + m.elastic_profile + ";gdn=f32;kv=bf16")
+                      : ((c.weight_precision == Qwen38WeightPrecision::MixedFp8Nvfp4)
+                             ? "act=f32;attn=fp8_e4m3_cal;mlp=nvfp4_w4a32;gdn=f32;kv=bf16"
+                             : "act=f32;attn=bf16;mlp=bf16;gdn=f32;kv=bf16")) +
       (options.use_fast_attn ? ";attn_kernel=gqa64" : ";attn_kernel=ref");
   profile_.state_identity.kv_format = "gdn_f32_conv_f32_kv_bf16";
 
@@ -1131,25 +1165,37 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   std::vector<PlannedProj> planned_projs;
   planned_projs.reserve(static_cast<std::size_t>(c.num_hidden_layers) * 9u + 1u);
 
-  auto plan_proj = [&](const std::string& prefix, int out_f, int in_f, Qwen38LinearQuantKind q, DevProj* dst) {
+  const bool is_elastic = !m.elastic_profile.empty();
+  auto plan_proj = [&](const std::string& prefix, int out_f, int in_f, Qwen38LinearQuantKind default_q, DevProj* dst) {
+    const Qwen38LinearQuantKind q = m.quant_for(prefix, default_q);
     dst->out_features = out_f;
     dst->in_features = in_f;
     dst->quant = q;
     PlannedProj pp;
     pp.dst = dst;
     pp.main_off = plan_dev(prefix + ".weight");
+    const bool has_in_scale = m.active_tensors.find(prefix + ".input_scale") != m.active_tensors.end();
     if (q == Qwen38LinearQuantKind::Fp8E4M3) {
       plan_scalar(prefix + ".weight_scale", &dst->weight_scale);
-      plan_scalar(prefix + ".input_scale", &dst->input_scale);
-    } else if (q == Qwen38LinearQuantKind::Nvfp4) {
+      if (!is_elastic || has_in_scale) plan_scalar(prefix + ".input_scale", &dst->input_scale);
+    } else if (q == Qwen38LinearQuantKind::Nvfp4 || q == Qwen38LinearQuantKind::Atlas3 ||
+               q == Qwen38LinearQuantKind::Atlas2) {
       pp.scale_off = plan_dev(prefix + ".weight_scale");
       plan_scalar(prefix + ".weight_scale_2", &dst->weight_scale_2);
-      plan_scalar(prefix + ".input_scale", &dst->input_scale);
+      if (!is_elastic || has_in_scale) plan_scalar(prefix + ".input_scale", &dst->input_scale);
     }
     planned_projs.push_back(pp);
   };
 
+  impl_->embed_quant = m.quant_for("model.language_model.embed_tokens", Qwen38LinearQuantKind::Bf16);
   const std::uint64_t embed_off = plan_dev("model.language_model.embed_tokens.weight");
+  std::uint64_t embed_scale_off = 0;
+  if (impl_->embed_quant == Qwen38LinearQuantKind::Fp8E4M3) {
+    plan_scalar("model.language_model.embed_tokens.weight_scale", &impl_->embed_scale);
+  } else if (impl_->embed_quant == Qwen38LinearQuantKind::Nvfp4) {
+    embed_scale_off = plan_dev("model.language_model.embed_tokens.weight_scale");
+    plan_scalar("model.language_model.embed_tokens.weight_scale_2", &impl_->embed_scale);
+  }
   const std::uint64_t norm_off = plan_dev("model.language_model.norm.weight");
   if (!c.tie_word_embeddings) {
     plan_proj("lm_head", c.vocab_size, c.hidden_size, c.lm_head_quant(), &impl_->lm_head);
@@ -1289,7 +1335,14 @@ Qwen38DenseBackend::Qwen38DenseBackend(const Qwen38DenseLoadOptions& options)
   // Resolve device pointers inside arenas.
   const std::uint8_t* wbase = impl_->weights_arena.ptr;
   const float* fbase = impl_->f32_arena.ptr;
-  impl_->embed_tokens = reinterpret_cast<const __nv_bfloat16*>(wbase + embed_off);
+  if (impl_->embed_quant == Qwen38LinearQuantKind::Bf16) {
+    impl_->embed_tokens = reinterpret_cast<const __nv_bfloat16*>(wbase + embed_off);
+  } else if (impl_->embed_quant == Qwen38LinearQuantKind::Fp8E4M3) {
+    impl_->embed_u8 = wbase + embed_off;
+  } else {
+    impl_->embed_u8 = wbase + embed_off;
+    impl_->embed_scales = wbase + embed_scale_off;
+  }
   impl_->final_norm = reinterpret_cast<const __nv_bfloat16*>(wbase + norm_off);
   for (const auto& pp : planned_projs) {
     if (pp.dst->quant == Qwen38LinearQuantKind::Bf16) {

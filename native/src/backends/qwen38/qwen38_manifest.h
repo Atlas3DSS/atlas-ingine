@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -66,6 +67,15 @@ struct Qwen38Manifest {
   std::unordered_map<std::string, Qwen38VerifiedFile> verified_files;
   std::array<std::uint8_t, 32> parsed_config_fingerprint{};
   std::vector<std::int32_t> media_token_ids;
+  // Optional per-module Elastic Quant overrides parsed from hf_quant_config.json ("atlas_elastic").
+  std::string elastic_profile;
+  std::unordered_map<std::string, Qwen38LinearQuantKind> layer_quant_overrides;
+
+  [[nodiscard]] Qwen38LinearQuantKind quant_for(const std::string& prefix,
+                                                Qwen38LinearQuantKind fallback) const noexcept {
+    const auto it = layer_quant_overrides.find(prefix);
+    return it == layer_quant_overrides.end() ? fallback : it->second;
+  }
 
   // Verifies an already-open file descriptor against the pinned manifest: requires PinnedVerified,
   // matching fstat (S_ISREG, dev, ino, byte_size), and a full bounded streaming SHA-256 verification
@@ -117,6 +127,15 @@ std::array<std::uint8_t, 32> qwen38_config_fingerprint(const Qwen38Config& confi
 std::string qwen38_config_fingerprint_hex(const Qwen38Config& config);
 
 ingine::model::CheckpointPinSpec qwen38_27b_nvfp4_pin_spec();
+ingine::model::CheckpointPinSpec qwen38_27b_atlas_17g_pin_spec();
+ingine::model::CheckpointPinSpec qwen38_27b_atlas_14g_pin_spec();
+ingine::model::CheckpointPinSpec qwen38_27b_atlas_11g_pin_spec();
+
+// Resolves the default compiled-in pin spec for a Qwen3.8 checkpoint directory:
+//   - Non-Elastic checkpoints -> qwen38_27b_nvfp4_pin_spec() (fail-closed)
+//   - Official Atlas Elastic packs matching compiled-in profile & shard sizes -> atlas-17g / atlas-14g / atlas-11g pin spec
+//   - Custom user-quantized Atlas Elastic packs -> std::nullopt (HeadersOnly; never fakes PinnedVerified)
+std::optional<ingine::model::CheckpointPinSpec> qwen38_default_pin_spec_for_dir(const std::filesystem::path& model_dir);
 
 std::string sha256_bytes_hex(const void* data, std::size_t size);
 std::string sha256_file_hex_streaming(const std::filesystem::path& path);
