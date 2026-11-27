@@ -1,0 +1,47 @@
+{
+  "schema": "atlas-zero-chrome-media-manifest/v1",
+  "files": [
+    {
+      "filename": "blender_alpha_creative_mode.png",
+      "bytes": 1469909,
+      "sha256": "d4a8d972d89dbf44ae2edd13f5125622cf08755c2998af61ec20d33e6d2beb9e",
+      "description": "Blender by Atlas (Alpha, 5.2.5 LTS) \u2014 Zero-Chrome Creative Mode"
+    },
+    {
+      "filename": "blender_alpha_power_user_mode.png",
+      "bytes": 1233621,
+      "sha256": "ddc1a998f6f5988dfd507c489fecd06b723d4d0f472571bbd449f01f067451ef",
+      "description": "Blender by Atlas (Alpha, 5.2.5 LTS) \u2014 Power User Mode (Ctrl+F10)"
+    },
+    {
+      "filename": "blender_alpha_omni_brush_18_matrix.png",
+      "bytes": 1176691,
+      "sha256": "88f8644c900707294b134d1b425fd0467aea4145c433bfa637ee5c800b28986b",
+      "description": "Blender by Atlas (Alpha, 5.2.5 LTS) \u2014 18-Brush Omni-Brush Live-Stroke Matrix"
+    },
+    {
+      "filename": "godot_alpha_creative_mode.png",
+      "bytes": 426041,
+      "sha256": "16b657da6adf99e35ed12af4fa57e1b060893f08844df47e59a012d2f4dedd2c",
+      "description": "Godot by Atlas (Alpha, 4.7.2) \u2014 Zero-Chrome Creative Mode (live Orrery bridge)"
+    },
+    {
+      "filename": "godot_alpha_power_user_mode.png",
+      "bytes": 535748,
+      "sha256": "6e9bf034b72fe3602c0c1395c9b3cdd0b93d17e86197967bcf03cb98078e990b",
+      "description": "Godot by Atlas (Alpha, 4.7.2) \u2014 Power User Mode (Ctrl+F10, Verified Ledger strip)"
+    },
+    {
+      "filename": "dragonfruit_alpha_creative_mode.png",
+      "bytes": 96479,
+      "sha256": "8951fb7a79a590da466638e4a396168b2b1645b8ec5b179ae58c1a6ab24178c0",
+      "description": "DragonFruit by Atlas (Alpha) \u2014 Zero-Chrome Creative Mode (Orrery miniature on build plate)"
+    },
+    {
+      "filename": "dragonfruit_alpha_power_user_mode.png",
+      "bytes": 283901,
+      "sha256": "dd7ecfc7e30d786ef9534dea7d646db642471054c8fed3b6eaada7a24b0c55b7",
+      "description": "DragonFruit by Atlas (Alpha) \u2014 Power User Mode (Ctrl+F10, 1723 layers + Verified Ledger)"
+    }
+  ]
+}
