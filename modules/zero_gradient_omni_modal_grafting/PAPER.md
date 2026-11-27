@@ -22,7 +22,7 @@ Every cell below comes from sealed or attested runs on local hardware. Remaining
 | **Packet A — SEALED Confirm-160 (`single_tap`)** | `Inkling-2-Mini` (`visit_41`, 2304→5120) → `MiniMax-H3` DiT (`0` fits) | **22.5 MiB** | **Sealed `n = 160` (`16` groups):** Word cos **0.7961** (`R² = 0.9949`); SigLIP2 text-img **0.1544** (**80.02%** margin retention); img-vs-teacher **0.7669**; latent cos **0.6774** | Matched `2304`-d shuffled `B0`: `-0.0463` (**`16/16` groups**, `p = 3.05e-5`, img-vs-teacher `0.4873`) | **SEALED CONFIRM-160 PASS** (`att-7bea8414`) |
 | **Packet B** (Vision → LLM, Clean Negative) | Cached `B4@L42` (`4480→2304`) → `Inkling-2-Mini` `EmbedRows` (`ridge_frozen` / `ridge_norm`) | **20.6 MiB** | Overall `62/192` gold (`ridge_frozen`) vs `60/192` (`ridge_norm`, rejected `p = 0.727`). Counting: **45/48** agree / **40/48** gold. OCR: **1/48**–**3/48**. Charts/UI: **1/48**–**2/48** | Shuffled B0: `29/192` gold (`p = 1.03e-7`); Teacher ceiling: `89/192` gold (`41/48` counting, `21/48` OCR, `4/48` charts) | **Clean Negative / Rejected** (`att-07365411`); motivated Packet B2 |
 | **Packet B2** (High-Res Sight Repair) | Stripped `GOT-OCR2` (**191 MB**, `620M` decoder removed) + `SigLIP2-NaFlex` (**343 MB**) → `Inkling-2-Mini` | ~8–16 MiB *(shape)* | Stage 1 extraction complete (`186.8 s`, `1.56 GiB` peak VRAM, `0/448` locked test); Stage 2 FP64 ridge running on Quincy V100 native FP64 | Packet B cached baseline + shuffled B0 | **Stage 2 Running** (`att-5a611ab6`); Dev-192 & Locked-448 `PENDING` |
-| **Packet C** (Audio Gate 0 & Stage 2) | `Gemma-4-E2B` Conformer (`1536`) · `Qwen3-TTS-12Hz-1.7B` (`2048`) · `Inkling-2-Mini` GPU `EmbedRows` | `7.1 MiB` / `9.4–37.7 MiB` *(shape)* | **Gate 0 PASS 3/3 (`0.0` drift):** Mouth hidden-state swap `B → A` yields byte-identical 24 kHz WAV shifting Whisper `"Order code 407 is confirmed."` → `"Sensor gate 928 is closed."`; **Stage 2 PASS:** `416` Mouth (`att-7253aaa3`) + `416` Ears (`att-b88d1931`) clips audited (`0/160` confirm) | Zero controls: Mouth RMS `0.0023` (`"Thank you."`); Ears RMSE `1.9285`; Inkling KL `0.8494` (`1/4` exact) | **Gate 0 & Stage 2 PASS** (`att-b4446ba1`); Stage 3 Fits `PENDING` |
+| **Packet C** (Audio Gate 0, Stage 2, & Stage 3 Mouth `val_dev`) | `Gemma-4-E2B` Conformer (`1536`) · `Qwen3-TTS-12Hz-1.7B` (`2048`) · `Inkling-2-Mini` GPU `EmbedRows` | `7.1 MiB` / `9.4–37.7 MiB` *(split-head key `cd9a2158`)* | **Gate 0 PASS 3/3 (`0.0` drift):** Mouth swap shifts Whisper byte-identically (`"Order code 407..."` → `"Sensor gate 928..."`); **Stage 3 Mouth `val_dev` (`att-6c4b19fe`, `0/160` confirm):** **Prosody/Style PASS `27/32` (`84.4%`, `p = 1.13e-4` vs swapped)**; **Lexical FAIL `0/32`** (vs `27/32` native); EOS/zero `16/16` near-silent Whisper `"Thank you."` (`RMS 0.0008–0.0028`) | Swapped hidden: `5/32` style / `0/32` lexical; Zero hidden: `12/32` style / `0/32` lexical; Native ceiling: `30/32` style / `27/32` lexical | **Mechanistic Split (`all_val_dev_gates_passed = false`)** (`att-6c4b19fe`); Confirm-160 `SEALED` |
 | **Multi-Card Silicon Sweep** | Local (`V100 sm_70` PASS; `PRO 6000`, `3090`, `4090`) → Vast (`3060 12GB` through `5090 32GB`) | Unified stack + `8.46 GB` trunk | **Quincy V100 (`sm_70`) PASS (`att-cb2b03b4`):** `concat4` `1.62 ms`/32 tok (`0.99996` cos vs FP64), `single_tap` `0.44 ms`, Mouth TTS `4.48 GiB` VRAM; `atlas-exl3-8.4g` (`8.46 GB`, `att-7c0c0098`) & `atlas-10.5g` (`10.49 GB`, `att-444d65d1`) built | Watchdog v6 cleared (`att-787c159b`); Stage 2 Vast launches right after Stage 1 local | **1/4 Local Cards PASS** (`att-cb2b03b4`); FL2VA & remaining cards active |
 
 ---
@@ -120,7 +120,9 @@ In the reverse direction (Vision → `Inkling-2-Mini` `EmbedRows`), we tested wh
 
 ---
 
-## 5. Packet C: Zero-Drift Native Audio Seams (Ears & Mouth Gate 0)
+## 5. Packet C: Native Audio Seams & The Prosody-vs-Lexeme Boundary
+
+### 5.1 Zero-Drift Gate 0 Verification (Ears & Mouth)
 
 Before fitting audio Plato's Keys, Packet C ran a fail-closed Native Gate 0 across all three receivers (`att-b4446ba1`, `272.67 s` total, `0/160` confirm reserve touched):
 
@@ -142,6 +144,39 @@ Before fitting audio Plato's Keys, Packet C ran a fail-closed Native Gate 0 acro
 - [samples/mouth_e2e_A.wav](samples/mouth_e2e_A.wav) — `"Order code 407 is confirmed."` (`sha256 54371273...`, identical to native reinjection)
 - [samples/mouth_swap_B_into_A.wav](samples/mouth_swap_B_into_A.wav) — `"Sensor gate 928 is closed."` (`sha256 5b7d228b...`, pure continuous hidden-state swap into A)
 - [samples/mouth_zero_A.wav](samples/mouth_zero_A.wav) — Zeroed continuous hidden-state control (`RMS 0.0023`, `sha256 068aa066...`)
+
+### 5.2 Stage 3 Mouth (`val_dev`): Prosody Transfers Linearly (`27/32`), Exact Lexemes Do Not (`0/32`) (`att-6c4b19fe`)
+
+On the held-out `val_dev` split (`400` synthesized `24 kHz` clips on RTX PRO 6000 Blackwell, `4.34 GiB` peak VRAM, `1,889.04 s` total, `zero_qwen_text_lookup_at_valdev = true`, `0/160` sealed `confirm_reserve` touched, `key_sha256 cd9a2158...`, report `sha256 b98f45ae...`), closed-form ridge projection from frozen `Inkling-2-Mini` into `Qwen3-TTS-12Hz-1.7B` exposed a sharp functional split. Exact roundtrip reinjection on fit gold clips passed at `0.0` max abs WAV diff (`65,280` and `80,640` samples), eliminating seam or vocoder bugs as confounders. Overall `all_val_dev_gates_passed` is `false` and `confirm_reserve` remains sealed.
+
+#### Exact Counts (`N = 32` Minimal Pairs per Track + `16` Silence Controls)
+
+| Evaluation Track (`val_dev`, `0/160` confirm) | Native `Qwen3-TTS` Ceiling | Inkling Ridge Candidate | Swapped Hidden Control | Zero Hidden Control | Paired Test vs Controls |
+|---|---:|---:|---:|---:|---|
+| **Style / Prosody Overall (`32` pairs)** | **30/32** (`93.8%`) | **27/32** (`84.4%`) | `5/32` (`15.6%`) | `12/32` (`37.5%`) | vs swapped: **`+22` (`+68.8` pts, 95% CI `[+43.8, +93.8]`, `p = 1.13e-4`)**; vs zero: **`+15` (`+46.9` pts, `p = 1.49e-3`)** |
+| — `slow_deliberate` vs `brisk_conversational` | — | **8/8** | `0/8` | `0/8` | — |
+| — `calm_neutral` vs `urgent_emphatic` | — | **7/8** | `1/8` | `3/8` | — |
+| — `warm_reassuring` vs `terse_clipped` | — | **7/8** | `1/8` | `5/8` | — |
+| — `rising_question` vs `falling_declarative` | — | **5/8** | `3/8` | `4/8` | — |
+| **Lexical Content Overall (`32` pairs)** | **27/32** (`84.4%`) | **0/32** (`0.0%`) | `0/32` (`0.0%`) | `0/32` (`0.0%`) | `0/8` across every subtype (`digit`, `name`, `negation`, `order`; `p = 1.0`) |
+| **EOS / Zero Silence Controls (`16` clips)** | `0/16` FP target | `16/16` Whisper `"Thank you."` | — | — | `8` `eos_only` (`0.56 s`, `RMS 0.000794`) + `8` `zero_cond` (`1.28 s`, `RMS 0.002809`) |
+
+#### Exact Failure Shape
+
+1. **Prosody and cadence survive linear projection; discrete word identities collapse into near-homophone gibberish.** In 4-fold speaker-disjoint cross-validation over the `256` fit clips (`16` speakers), the split-head instruction ridge head achieved `cos = 0.9589` / `R² = 0.8805` (`λ = 30.0`), whereas the lexical text head reached only `cos = 0.7922` / `R² = 0.2387` (`λ = 30,000`; `R² = 0.1713` under the joint head). Downstream blinded `faster-whisper` transcripts on lexical pairs preserve English syllable rhythm while corrupting every critical token:
+   - `mouth_val_crit_000` (`digit`: `8520` vs `8250`) → `"Treep Taw 7000 2061 Dradtry"` vs `"Treep 2-1-D-Civito-7 cried side."`
+   - `mouth_val_crit_001` (`name`: `Kowalski-1` vs `Patel-1`) → `"Draft Balwar Alavo 1, send RAR."` vs `"Trad alverfua finn send Raymurn."`
+   - `mouth_val_crit_002` (`negation`: `still` vs `no longer`) → `"The train and zero traf in slot one."` vs `"The trained Aeon, Braft, and Slot Twin."`
+   - `mouth_val_crit_003` (`order`: `Oslo-1` vs `Bergen-1`) → `"Fright Grind going number nine."` vs `"Fright Grind Gurei Benter Nguyen Dambaster Nguyen."`
+2. **Unmasked ASR turns near-silent controls into false positives.** Every EOS-only (`RMS = 0.000794`) and zero-conditioning (`RMS = 0.002809`) clip collapsed to near-silence physically, yet `faster-whisper` hallucinated `"Thank you."` on `16/16` clips. Silence-control gates require an explicit pre-ASR RMS energy floor (`RMS >= 0.01`) rather than raw Whisper word counts.
+
+#### Mechanism & Engineering Invariants
+
+Just as Packet B exposed a spatial-frequency boundary on vision (coarse grids carry layout and count linearly but lose crisp glyph pixels), Packet C Stage 3 exposes a **prosody-vs-lexeme boundary on speech synthesis**:
+
+1. **Continuous delivery axes align linearly across frozen models.** Speaking rate (`8/8`), urgency (`7/8`), and warmth (`7/8`) occupy smooth, low-frequency directions in `Qwen3-TTS`'s instruction space (`R² = 0.8805`), allowing a zero-gradient linear map from `Inkling-2-Mini` to retain `90%` of the native directional ceiling (`27/32` vs `30/32`).
+2. **Discrete lexical lookup does not tolerate ridge shrinkage.** `Qwen3-TTS`'s `text_projection` seam behaves like a sharp discrete vocabulary lookup (`R² = 0.2387` across mismatched tokenizers). Ridge shrinkage averages nearby subword vectors, leaving cadence intact while destroying exact digits, proper nouns, and negations (`0/32`).
+3. **Production speech architecture: discrete tokens for words, Plato's Key for delivery.** A frozen LLM already emits exact discrete text tokens. Routing discrete text tokens to `Qwen3-TTS`'s text input preserves `100%` lexical accuracy, while routing the closed-form Plato's Key strictly into the continuous style/instruction seam delivers zero-gradient prosodic and affective control (`27/32`, `p = 1.13e-4`) directly from the LLM's internal hidden states.
 
 ---
 
