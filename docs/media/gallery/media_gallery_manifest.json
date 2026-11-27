@@ -1,6 +1,6 @@
 {
   "schema": "atlas-media-gallery/v1",
-  "updated_at": "2026-11-27T18:29:16Z",
+  "updated_at": "2026-11-27T22:30:26Z",
   "gate": "Each item has a passed attestation receipt, an explicit QA pass verdict, and a file hash that matches the hash recorded in its QA report.",
   "categories": [
     {
@@ -14,9 +14,19 @@
       "ticket": "#912 packets"
     },
     {
+      "key": "showcases",
+      "label": "Showcases",
+      "ticket": ""
+    },
+    {
       "key": "voltron_mobile",
       "label": "On-device phone pipeline",
       "ticket": "#914 Voltron Mobile"
+    },
+    {
+      "key": "blends",
+      "label": "Blends",
+      "ticket": "#941"
     },
     {
       "key": "base_turbo_images",
@@ -328,6 +338,238 @@
       "duration_s": 5.875
     },
     {
+      "id": "packeta-0080-image",
+      "title": "Coral reef, 1024x1024 image",
+      "category": "packets",
+      "kind": "image",
+      "hardware": "not recorded in the QA report",
+      "model": "MiniMax-H3 image (NVFP4), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-17b7a90b",
+        "issued_at": "2026-11-27T22:26:38Z"
+      },
+      "sha256": "0ebedee3823a97696fe6ddae42c9df67978672c3a4a268c4bc5d26498c222dbd",
+      "bytes": 2085782,
+      "preview": {
+        "path": "media/packeta-0080-image.jpg",
+        "mime": "image/jpeg",
+        "bytes": 258919,
+        "sha256": "9f09227ef6fb9210b541ff03e375784129e86059dbc45a8c5608ae1e91f256c8"
+      },
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "id": "packeta-0080-video",
+      "title": "Coral reef, 2.3-second video with stereo audio",
+      "category": "packets",
+      "kind": "video",
+      "hardware": "not recorded in the QA report",
+      "model": "MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Frames",
+          "value": 56,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-17b7a90b",
+        "issued_at": "2026-11-27T22:26:38Z"
+      },
+      "sha256": "f540738ad2f092524a5384a6bf548c5a48b406b87089370774c2d1eafdaa7be3",
+      "bytes": 637433,
+      "preview": {
+        "path": "media/packeta-0080-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 202650,
+        "sha256": "d0f12f6308a04edec6fb73f3285af81657201da227bf2038c5e2f589c295ed36",
+        "poster": "media/packeta-0080-video_poster.jpg"
+      },
+      "width": 640,
+      "height": 384,
+      "duration_s": 2.325
+    },
+    {
+      "id": "packeta-0200-image",
+      "title": "Draughtsman at a drawing board, 1024x1024 image",
+      "category": "packets",
+      "kind": "image",
+      "hardware": "not recorded in the QA report",
+      "model": "MiniMax-H3 image (NVFP4), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-17b7a90b",
+        "issued_at": "2026-11-27T22:26:38Z"
+      },
+      "sha256": "4c2212936d888c2bd3f0f11a9072057d7807317d850310bd0797a3177546d71d",
+      "bytes": 1667486,
+      "preview": {
+        "path": "media/packeta-0200-image.jpg",
+        "mime": "image/jpeg",
+        "bytes": 158217,
+        "sha256": "3441d79548b0a7909c88f6cdec9f2ab68fc327db562f2a0af058f9cd3f7fa16e"
+      },
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "id": "packeta-0200-video",
+      "title": "Draughtsman at a drawing board, 2.3-second video with stereo audio",
+      "category": "packets",
+      "kind": "video",
+      "hardware": "not recorded in the QA report",
+      "model": "MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Frames",
+          "value": 56,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-17b7a90b",
+        "issued_at": "2026-11-27T22:26:38Z"
+      },
+      "sha256": "d5ef789b704daa955345d45b6681aad76c6817c424764ce48f32c79e07b989bd",
+      "bytes": 163818,
+      "preview": {
+        "path": "media/packeta-0200-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 72461,
+        "sha256": "d1772e0b644e188cd8bcd044c42941bdfdb64683c4753703208623bd49caf530",
+        "poster": "media/packeta-0200-video_poster.jpg"
+      },
+      "width": 640,
+      "height": 384,
+      "duration_s": 2.325
+    },
+    {
+      "id": "packeta-0320-image",
+      "title": "Stone cloister, 1024x1024 image",
+      "category": "packets",
+      "kind": "image",
+      "hardware": "not recorded in the QA report",
+      "model": "MiniMax-H3 image (NVFP4), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-17b7a90b",
+        "issued_at": "2026-11-27T22:26:38Z"
+      },
+      "sha256": "6b5d86bbf1dd9bac4b28a4fdd55e6e042a620aa292074e77b9f0796eac922951",
+      "bytes": 1934435,
+      "preview": {
+        "path": "media/packeta-0320-image.jpg",
+        "mime": "image/jpeg",
+        "bytes": 207613,
+        "sha256": "3b470897c70c832782db1504d5103e22c55ee4f6ff44bd60f66c2d38c3d1f783"
+      },
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "id": "packeta-0320-video",
+      "title": "Stone cloister, 2.3-second video with stereo audio",
+      "category": "packets",
+      "kind": "video",
+      "hardware": "not recorded in the QA report",
+      "model": "MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Frames",
+          "value": 56,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-17b7a90b",
+        "issued_at": "2026-11-27T22:26:38Z"
+      },
+      "sha256": "79dd350025902f6eccc08583c9d6e4c599a22c5cc2fc87d6ebb7e9089f1f74c2",
+      "bytes": 372673,
+      "preview": {
+        "path": "media/packeta-0320-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 108515,
+        "sha256": "5d6102d56d2a0c62b73ff626941ade79509b98f5b20406d2180b757823c297e7",
+        "poster": "media/packeta-0320-video_poster.jpg"
+      },
+      "width": 640,
+      "height": 384,
+      "duration_s": 2.325
+    },
+    {
+      "id": "packeta-0440-image",
+      "title": "Brass clockwork, 1024x1024 image",
+      "category": "packets",
+      "kind": "image",
+      "hardware": "not recorded in the QA report",
+      "model": "MiniMax-H3 image (NVFP4), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-17b7a90b",
+        "issued_at": "2026-11-27T22:26:38Z"
+      },
+      "sha256": "fdfa27847121a4a75d1f50adf6721b8ab21eb73f6a3d0641352fcec451d3ae9e",
+      "bytes": 2369273,
+      "preview": {
+        "path": "media/packeta-0440-image.jpg",
+        "mime": "image/jpeg",
+        "bytes": 303831,
+        "sha256": "47a66575ec524a9d8ff8e0f70c36e4f068094eb9b89666e0ae6334dea0e8226f"
+      },
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "id": "packeta-0440-video",
+      "title": "Brass clockwork, 2.3-second video with stereo audio",
+      "category": "packets",
+      "kind": "video",
+      "hardware": "not recorded in the QA report",
+      "model": "MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Frames",
+          "value": 56,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-17b7a90b",
+        "issued_at": "2026-11-27T22:26:38Z"
+      },
+      "sha256": "ccd7dd8e074e4366f39291ec36afc33228099652e1353887b404bcc7f84bd9d6",
+      "bytes": 562731,
+      "preview": {
+        "path": "media/packeta-0440-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 172645,
+        "sha256": "1605cc1bc6583b007c9ccd6b3fb9bfad563058a97f41a8ea12122cc17a408dca",
+        "poster": "media/packeta-0440-video_poster.jpg"
+      },
+      "width": 640,
+      "height": 384,
+      "duration_s": 2.325
+    },
+    {
       "id": "packetd-anthem-48k",
       "title": "The Star-Spangled Banner, 60-second 48 kHz stereo",
       "category": "packets",
@@ -368,6 +610,69 @@
       "duration_s": 60.639,
       "sample_rate": 48000,
       "channels": 2
+    },
+    {
+      "id": "showcase-anthem-v4-contact-sheet",
+      "title": "The Star-Spangled Banner showcase, six-frame contact sheet",
+      "category": "showcases",
+      "kind": "image",
+      "hardware": "RTX PRO 6000 Blackwell (5 segments, stitched on CPU)",
+      "model": "MiniMax-H3 Ref2VA video with YuE2 48 kHz singing, conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-21c86410",
+        "issued_at": "2026-11-27T22:26:24Z"
+      },
+      "sha256": "c2f297a984cce2e413fed332c6f8445922cafb56673d7fc4886518a2692ebc68",
+      "bytes": 1603729,
+      "preview": {
+        "path": "media/showcase-anthem-v4-contact-sheet.jpg",
+        "mime": "image/jpeg",
+        "bytes": 76731,
+        "sha256": "103bd17c40b0ecf3193037cf5e306ba0cc6e2d2d6b569708fb5b439b783dfe5d"
+      },
+      "width": 1920,
+      "height": 778
+    },
+    {
+      "id": "showcase-anthem-v4-video",
+      "title": "The Star-Spangled Banner, 61-second video with singing",
+      "category": "showcases",
+      "kind": "video",
+      "hardware": "RTX PRO 6000 Blackwell (5 segments, stitched on CPU)",
+      "model": "MiniMax-H3 Ref2VA video with YuE2 48 kHz singing, conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Length",
+          "value": 61.125,
+          "unit": "s"
+        },
+        {
+          "label": "Frames",
+          "value": 1467,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-21c86410",
+        "issued_at": "2026-11-27T22:26:24Z"
+      },
+      "sha256": "6c3a0efb15f56038e5d96e962247be75c31dadac55b44355a716dd81b24c2376",
+      "bytes": 26401345,
+      "preview": {
+        "path": "media/showcase-anthem-v4-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 5159680,
+        "sha256": "10aa8c87b69a51770baa0e567a1bca6a83bfbb874e7d47b76b278cb6b277ebcd",
+        "poster": "media/showcase-anthem-v4-video_poster.jpg"
+      },
+      "width": 1024,
+      "height": 576,
+      "duration_s": 61.125
     },
     {
       "id": "voltron-s24u-image",
@@ -436,6 +741,114 @@
       "duration_s": 8.025,
       "sample_rate": 24000,
       "channels": 1
+    },
+    {
+      "id": "blend941-qwen38-0080-video",
+      "title": "Coral reef, 2.3-second video with stereo audio",
+      "category": "blends",
+      "kind": "video",
+      "hardware": "RTX PRO 6000 Blackwell",
+      "model": "MiniMax-H3 FL2VA video+audio, conditioned by a Qwen3.8-27B Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-1c109fa2",
+        "issued_at": "2026-11-27T22:30:26Z"
+      },
+      "sha256": "73d703f63ee41bca1fe3f89c5e08ca373278d495573f35edcf58cf19ac663bde",
+      "bytes": 578584,
+      "preview": {
+        "path": "media/blend941-qwen38-0080-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 185054,
+        "sha256": "9460cac5b5534534549cdff9307c81983954f8ce972dd0c08b71d05e3211a6d8",
+        "poster": "media/blend941-qwen38-0080-video_poster.jpg"
+      },
+      "width": 640,
+      "height": 384,
+      "duration_s": 2.325
+    },
+    {
+      "id": "blend941-qwen38-0200-video",
+      "title": "Draughtsman at a drawing board, 2.3-second video with stereo audio",
+      "category": "blends",
+      "kind": "video",
+      "hardware": "RTX PRO 6000 Blackwell",
+      "model": "MiniMax-H3 FL2VA video+audio, conditioned by a Qwen3.8-27B Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-1c109fa2",
+        "issued_at": "2026-11-27T22:30:26Z"
+      },
+      "sha256": "86ce8ec0e879aff3b2f59245cf2ffcdbc72d5f081c976e9dbf7cdfcf1f8ab6c3",
+      "bytes": 173895,
+      "preview": {
+        "path": "media/blend941-qwen38-0200-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 72252,
+        "sha256": "03fc48888668bd6b87b3a1181da0e9758640b4e12ee18595bbf916a5dc48639e",
+        "poster": "media/blend941-qwen38-0200-video_poster.jpg"
+      },
+      "width": 640,
+      "height": 384,
+      "duration_s": 2.325
+    },
+    {
+      "id": "blend941-qwen38-0320-video",
+      "title": "Stone cloister, 2.3-second video with stereo audio",
+      "category": "blends",
+      "kind": "video",
+      "hardware": "RTX PRO 6000 Blackwell",
+      "model": "MiniMax-H3 FL2VA video+audio, conditioned by a Qwen3.8-27B Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-1c109fa2",
+        "issued_at": "2026-11-27T22:30:26Z"
+      },
+      "sha256": "3398fe5776fff2def75d77993a307d268f294ebf4987ad4d984f5d72fe40744f",
+      "bytes": 288126,
+      "preview": {
+        "path": "media/blend941-qwen38-0320-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 105099,
+        "sha256": "6d51031768b7f8a7f698a8ba94b3fa139b6ff47eb7276f486764ce5510e7b65c",
+        "poster": "media/blend941-qwen38-0320-video_poster.jpg"
+      },
+      "width": 640,
+      "height": 384,
+      "duration_s": 2.325
+    },
+    {
+      "id": "blend941-qwen38-0440-video",
+      "title": "Brass clockwork, 2.3-second video with stereo audio",
+      "category": "blends",
+      "kind": "video",
+      "hardware": "RTX PRO 6000 Blackwell",
+      "model": "MiniMax-H3 FL2VA video+audio, conditioned by a Qwen3.8-27B Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-1c109fa2",
+        "issued_at": "2026-11-27T22:30:26Z"
+      },
+      "sha256": "63a127450eed068c7870a7c8dbd4114c35a614107b1a517ed3c53b2c9bcf3dd5",
+      "bytes": 443317,
+      "preview": {
+        "path": "media/blend941-qwen38-0440-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 149080,
+        "sha256": "f47801a28a09949e58fb029b0ef0f6140b6b734b8769b6130cd41a32036680f3",
+        "poster": "media/blend941-qwen38-0440-video_poster.jpg"
+      },
+      "width": 640,
+      "height": 384,
+      "duration_s": 2.325
     },
     {
       "id": "waveb-flux1-schnell-dev-base",

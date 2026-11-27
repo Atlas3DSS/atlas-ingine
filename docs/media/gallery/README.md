@@ -19,7 +19,22 @@ Each item has a passed attestation receipt, an explicit QA pass verdict, and a f
 
 | Preview | Item | Hardware | Model | Measured | Receipt | SHA-256 of original |
 |---|---|---|---|---|---|---|
+| <img src="media/packeta-0080-image.jpg" width="220" alt="Coral reef, 1024x1024 image"> | Coral reef, 1024x1024 image | not recorded in the QA report | MiniMax-H3 image (NVFP4), conditioned by the Inkling-2-Mini Plato's Key (concat4) | not recorded | `att-17b7a90b` | `0ebedee3823a9769…` |
+| <a href="media/packeta-0080-video.mp4"><img src="media/packeta-0080-video_poster.jpg" width="220" alt="Coral reef, 2.3-second video with stereo audio"></a><br>[Play MP4](media/packeta-0080-video.mp4) | Coral reef, 2.3-second video with stereo audio | not recorded in the QA report | MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4) | Frames: 56 | `att-17b7a90b` | `f540738ad2f09252…` |
+| <img src="media/packeta-0200-image.jpg" width="220" alt="Draughtsman at a drawing board, 1024x1024 image"> | Draughtsman at a drawing board, 1024x1024 image | not recorded in the QA report | MiniMax-H3 image (NVFP4), conditioned by the Inkling-2-Mini Plato's Key (concat4) | not recorded | `att-17b7a90b` | `4c2212936d888c2b…` |
+| <a href="media/packeta-0200-video.mp4"><img src="media/packeta-0200-video_poster.jpg" width="220" alt="Draughtsman at a drawing board, 2.3-second video with stereo audio"></a><br>[Play MP4](media/packeta-0200-video.mp4) | Draughtsman at a drawing board, 2.3-second video with stereo audio | not recorded in the QA report | MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4) | Frames: 56 | `att-17b7a90b` | `d5ef789b704daa95…` |
+| <img src="media/packeta-0320-image.jpg" width="220" alt="Stone cloister, 1024x1024 image"> | Stone cloister, 1024x1024 image | not recorded in the QA report | MiniMax-H3 image (NVFP4), conditioned by the Inkling-2-Mini Plato's Key (concat4) | not recorded | `att-17b7a90b` | `6b5d86bbf1dd9bac…` |
+| <a href="media/packeta-0320-video.mp4"><img src="media/packeta-0320-video_poster.jpg" width="220" alt="Stone cloister, 2.3-second video with stereo audio"></a><br>[Play MP4](media/packeta-0320-video.mp4) | Stone cloister, 2.3-second video with stereo audio | not recorded in the QA report | MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4) | Frames: 56 | `att-17b7a90b` | `79dd350025902f6e…` |
+| <img src="media/packeta-0440-image.jpg" width="220" alt="Brass clockwork, 1024x1024 image"> | Brass clockwork, 1024x1024 image | not recorded in the QA report | MiniMax-H3 image (NVFP4), conditioned by the Inkling-2-Mini Plato's Key (concat4) | not recorded | `att-17b7a90b` | `fdfa27847121a4a7…` |
+| <a href="media/packeta-0440-video.mp4"><img src="media/packeta-0440-video_poster.jpg" width="220" alt="Brass clockwork, 2.3-second video with stereo audio"></a><br>[Play MP4](media/packeta-0440-video.mp4) | Brass clockwork, 2.3-second video with stereo audio | not recorded in the QA report | MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4) | Frames: 56 | `att-17b7a90b` | `ccd7dd8e074e4366…` |
 | [Listen (MP3)](media/packetd-anthem-48k.mp3) | The Star-Spangled Banner, 60-second 48 kHz stereo | RTX PRO 6000 Blackwell Server Edition | YuE2-3B with YuE2-Vae, native 48 kHz stereo | Time to generate: 31.6 s<br>Clip length: 60.6 s<br>Peak VRAM: 8.65 GiB | `att-0fcf223c` | `0242e9ff491f806b…` |
+
+## Showcases
+
+| Preview | Item | Hardware | Model | Measured | Receipt | SHA-256 of original |
+|---|---|---|---|---|---|---|
+| <img src="media/showcase-anthem-v4-contact-sheet.jpg" width="220" alt="The Star-Spangled Banner showcase, six-frame contact sheet"> | The Star-Spangled Banner showcase, six-frame contact sheet | RTX PRO 6000 Blackwell (5 segments, stitched on CPU) | MiniMax-H3 Ref2VA video with YuE2 48 kHz singing, conditioned by the Inkling-2-Mini Plato's Key (concat4) | not recorded | `att-21c86410` | `c2f297a984cce2e4…` |
+| <a href="media/showcase-anthem-v4-video.mp4"><img src="media/showcase-anthem-v4-video_poster.jpg" width="220" alt="The Star-Spangled Banner, 61-second video with singing"></a><br>[Play MP4](media/showcase-anthem-v4-video.mp4) | The Star-Spangled Banner, 61-second video with singing | RTX PRO 6000 Blackwell (5 segments, stitched on CPU) | MiniMax-H3 Ref2VA video with YuE2 48 kHz singing, conditioned by the Inkling-2-Mini Plato's Key (concat4) | Length: 61.1 s<br>Frames: 1467 | `att-21c86410` | `6c3a0efb15f56038…` |
 
 ## On-device phone pipeline
 
@@ -27,6 +42,15 @@ Each item has a passed attestation receipt, an explicit QA pass verdict, and a f
 |---|---|---|---|---|---|---|
 | <img src="media/voltron-s24u-image.jpg" width="220" alt="Red spaceship over snow-capped pines, 512x512 image made on a phone"> | Red spaceship over snow-capped pines, 512x512 image made on a phone | Galaxy S24 Ultra (on device, no server GPU) | SDXS-512 Q8 GGUF, 1 step; prompt written by Inkling-2-Mini on a Galaxy S26 | Time to generate: 37.9 s | `att-111b1358` | `6aeba3f39109f45b…` |
 | [Listen (MP3)](media/voltron-tabs8p-voice.mp3) | Spoken line, 8-second 24 kHz voice made on a tablet | Galaxy Tab S8+ (on device, no server GPU) | Kokoro-82M INT8 ONNX; text written by Inkling-2-Mini on a Galaxy S26 | Time to generate: 5.74 s<br>Clip length: 8.03 s | `att-111b1358` | `e0152bb1e5fa12a6…` |
+
+## Blends
+
+| Preview | Item | Hardware | Model | Measured | Receipt | SHA-256 of original |
+|---|---|---|---|---|---|---|
+| <a href="media/blend941-qwen38-0080-video.mp4"><img src="media/blend941-qwen38-0080-video_poster.jpg" width="220" alt="Coral reef, 2.3-second video with stereo audio"></a><br>[Play MP4](media/blend941-qwen38-0080-video.mp4) | Coral reef, 2.3-second video with stereo audio | RTX PRO 6000 Blackwell | MiniMax-H3 FL2VA video+audio, conditioned by a Qwen3.8-27B Plato's Key (concat4) | not recorded | `att-1c109fa2` | `73d703f63ee41bca…` |
+| <a href="media/blend941-qwen38-0200-video.mp4"><img src="media/blend941-qwen38-0200-video_poster.jpg" width="220" alt="Draughtsman at a drawing board, 2.3-second video with stereo audio"></a><br>[Play MP4](media/blend941-qwen38-0200-video.mp4) | Draughtsman at a drawing board, 2.3-second video with stereo audio | RTX PRO 6000 Blackwell | MiniMax-H3 FL2VA video+audio, conditioned by a Qwen3.8-27B Plato's Key (concat4) | not recorded | `att-1c109fa2` | `86ce8ec0e879aff3…` |
+| <a href="media/blend941-qwen38-0320-video.mp4"><img src="media/blend941-qwen38-0320-video_poster.jpg" width="220" alt="Stone cloister, 2.3-second video with stereo audio"></a><br>[Play MP4](media/blend941-qwen38-0320-video.mp4) | Stone cloister, 2.3-second video with stereo audio | RTX PRO 6000 Blackwell | MiniMax-H3 FL2VA video+audio, conditioned by a Qwen3.8-27B Plato's Key (concat4) | not recorded | `att-1c109fa2` | `3398fe5776fff2de…` |
+| <a href="media/blend941-qwen38-0440-video.mp4"><img src="media/blend941-qwen38-0440-video_poster.jpg" width="220" alt="Brass clockwork, 2.3-second video with stereo audio"></a><br>[Play MP4](media/blend941-qwen38-0440-video.mp4) | Brass clockwork, 2.3-second video with stereo audio | RTX PRO 6000 Blackwell | MiniMax-H3 FL2VA video+audio, conditioned by a Qwen3.8-27B Plato's Key (concat4) | not recorded | `att-1c109fa2` | `63a127450eed068c…` |
 
 ## Base and turbo images
 
