@@ -1470,12 +1470,40 @@ void test_elastic_consumer_layout_rejections() {
       past_max_off.ple_head_offsets[0] = kI32Max + 1;
       past_max_off.ple_head_vocab_sizes[0] = 1;  // inclusive last row == INT32_MAX + 1
       CHECK_THROWS(past_max_off.finalize_and_validate());
-      // Direct defense-in-depth check on ple_hash_step when bypassing finalize_and_validate().
+      // Direct defense-in-depth checks on ple_hash_step when bypassing finalize_and_validate():
+      // (a) oversized offset > INT32_MAX
       CHECK_THROWS(ple_hash_step(past_max_off, 7, hist, rows));
+      // (b) oversized remainder rem == INT32_MAX + 1 with off == 0 (catches unsigned underflow in limit - rem)
+      {
+        Qwen4ExpConfig bad_rem = base;
+        bad_rem.ple_eos_token_id = 0;
+        bad_rem.ple_layer_multipliers.assign(static_cast<std::size_t>(bad_rem.ple_ngram_size), 0ull);
+        bad_rem.ple_layer_multipliers[0] = kI32Max + 1ull;  // token_id=1 -> mixed == INT32_MAX + 1
+        bad_rem.ple_head_offsets[0] = 0;
+        bad_rem.ple_head_vocab_sizes[0] = kI32Max + 2ull;   // rem == INT32_MAX + 1
+        std::vector<std::int32_t> h_rem;
+        CHECK_THROWS(ple_hash_step(bad_rem, 1, h_rem, rows));
+      }
+      // (c) both off <= INT32_MAX and rem <= INT32_MAX, with off + rem == INT32_MAX (pass) vs INT32_MAX + 1 (throw)
+      {
+        Qwen4ExpConfig sum_edge = base;
+        sum_edge.ple_eos_token_id = 0;
+        sum_edge.ple_layer_multipliers.assign(static_cast<std::size_t>(sum_edge.ple_ngram_size), 0ull);
+        sum_edge.ple_layer_multipliers[0] = kI32Max - 10ull;  // token_id=1 -> mixed == INT32_MAX - 10
+        sum_edge.ple_head_offsets[0] = 10;
+        sum_edge.ple_head_vocab_sizes[0] = kI32Max;           // rem == INT32_MAX - 10 -> off + rem == INT32_MAX
+        std::vector<std::int32_t> h_edge;
+        ple_hash_step(sum_edge, 1, h_edge, rows);
+        CHECK(rows[0] == std::numeric_limits<std::int32_t>::max());
+
+        sum_edge.ple_head_offsets[0] = 11;                    // off + rem == INT32_MAX + 1
+        h_edge.clear();
+        CHECK_THROWS(ple_hash_step(sum_edge, 1, h_edge, rows));
+      }
     }
   }
 
-  std::printf("PASS test_elastic_consumer_layout_rejections (32 dense/MoE/PLE/config layout & boundary cases)\n");
+  std::printf("PASS test_elastic_consumer_layout_rejections (33 dense/MoE/PLE/config layout & boundary cases)\n");
 }
 
 void test_real_quincy_elastic_packs() {

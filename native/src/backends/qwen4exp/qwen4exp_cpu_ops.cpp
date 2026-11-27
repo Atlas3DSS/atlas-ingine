@@ -190,7 +190,8 @@ void ple_hash_step(const Qwen4ExpConfig& cfg, std::int32_t token_id, std::vector
         throw std::invalid_argument("ple_hash_step: ple_head_vocab_sizes entry cannot be 0");
       }
       const std::uint64_t rem = mixed % voc;
-      if (off > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) - rem) {
+      constexpr std::uint64_t kMaxRow = static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max());
+      if (off > kMaxRow || rem > kMaxRow - off) {
         throw std::out_of_range("ple_hash_step: row index exceeds INT32_MAX");
       }
       const std::uint64_t row = rem + off;
