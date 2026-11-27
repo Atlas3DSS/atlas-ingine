@@ -1,0 +1,760 @@
+{
+  "schema": "atlas-media-gallery/v1",
+  "updated_at": "2026-11-27T18:29:16Z",
+  "gate": "Each item has a passed attestation receipt, an explicit QA pass verdict, and a file hash that matches the hash recorded in its QA report.",
+  "categories": [
+    {
+      "key": "wave3",
+      "label": "Multi-card benchmark: one image and one 5-second video with audio per card",
+      "ticket": "#912 Wave 3"
+    },
+    {
+      "key": "packets",
+      "label": "Image, video and music checks",
+      "ticket": "#912 packets"
+    },
+    {
+      "key": "voltron_mobile",
+      "label": "On-device phone pipeline",
+      "ticket": "#914 Voltron Mobile"
+    },
+    {
+      "key": "base_turbo_images",
+      "label": "Base and turbo images",
+      "ticket": "#943"
+    },
+    {
+      "key": "creative_trinity",
+      "label": "Blender, Godot and DragonFruit by Atlas",
+      "ticket": "#937-939"
+    }
+  ],
+  "items": [
+    {
+      "id": "wave3-pro6000-image",
+      "title": "Coral reef, 1024x1024 image",
+      "category": "wave3",
+      "kind": "image",
+      "hardware": "RTX PRO 6000 Blackwell (sm_120, 95 GiB)",
+      "model": "MiniMax-H3 image (NVFP4), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Time to generate",
+          "value": 27.678,
+          "unit": "s"
+        },
+        {
+          "label": "Steps",
+          "value": 6,
+          "unit": ""
+        },
+        {
+          "label": "Peak VRAM",
+          "value": 12.95,
+          "unit": "GiB"
+        },
+        {
+          "label": "Memory mode",
+          "value": "resident_or_comfy_auto",
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-af0ed07a",
+        "issued_at": "2026-11-27T12:11:11Z"
+      },
+      "sha256": "b812cb247c31304a7891ce05bdde33a878c198080181acfe31ac9538598dfc1e",
+      "bytes": 2384151,
+      "preview": {
+        "path": "media/wave3-pro6000-image.jpg",
+        "mime": "image/jpeg",
+        "bytes": 309210,
+        "sha256": "020e899cdfe82ccfd82244dd3dd3e212e224bc92a440d2f92d6f71b4b55c8440"
+      },
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "id": "wave3-pro6000-video",
+      "title": "Coral reef, 5.9-second video with stereo audio",
+      "category": "wave3",
+      "kind": "video",
+      "hardware": "RTX PRO 6000 Blackwell (sm_120, 95 GiB)",
+      "model": "MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Time to generate",
+          "value": 99.612,
+          "unit": "s"
+        },
+        {
+          "label": "Frames",
+          "value": 141,
+          "unit": ""
+        },
+        {
+          "label": "Resolution",
+          "value": "768x448",
+          "unit": ""
+        },
+        {
+          "label": "Peak VRAM",
+          "value": 22.97,
+          "unit": "GiB"
+        },
+        {
+          "label": "Memory mode",
+          "value": "resident_or_comfy_auto",
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-af0ed07a",
+        "issued_at": "2026-11-27T12:11:11Z"
+      },
+      "sha256": "cb1fd6df9f34c3cf5b9e9ebc365dc19116767bbef5fa29147cabb91ea18f784d",
+      "bytes": 3168483,
+      "preview": {
+        "path": "media/wave3-pro6000-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 944243,
+        "sha256": "60cbbc65480314f1aeef7a08bc1238efb784a235a89cbacda4fba7908fc3e070",
+        "poster": "media/wave3-pro6000-video_poster.jpg"
+      },
+      "width": 768,
+      "height": 448,
+      "duration_s": 5.875
+    },
+    {
+      "id": "wave3-rtx3090-image",
+      "title": "Coral reef, 1024x1024 image",
+      "category": "wave3",
+      "kind": "image",
+      "hardware": "RTX 3090 (sm_86, 24 GiB)",
+      "model": "MiniMax-H3 image (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Time to generate",
+          "value": 71.516,
+          "unit": "s"
+        },
+        {
+          "label": "Steps",
+          "value": 6,
+          "unit": ""
+        },
+        {
+          "label": "Peak VRAM",
+          "value": 20.77,
+          "unit": "GiB"
+        },
+        {
+          "label": "Memory mode",
+          "value": "resident_or_comfy_auto",
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-82078ba5",
+        "issued_at": "2026-11-27T12:21:40Z"
+      },
+      "sha256": "7c48fa180b7b06e848098f7977b5b148b633d8113af2abe1a732bd62983ae303",
+      "bytes": 2222327,
+      "preview": {
+        "path": "media/wave3-rtx3090-image.jpg",
+        "mime": "image/jpeg",
+        "bytes": 274869,
+        "sha256": "54a05be83b5a9618ff0834bacd9005a710215763090d9d9060002a78187d230f"
+      },
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "id": "wave3-rtx3090-video",
+      "title": "Coral reef, 5.9-second video with stereo audio",
+      "category": "wave3",
+      "kind": "video",
+      "hardware": "RTX 3090 (sm_86, 24 GiB)",
+      "model": "MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Time to generate",
+          "value": 178.619,
+          "unit": "s"
+        },
+        {
+          "label": "Frames",
+          "value": 141,
+          "unit": ""
+        },
+        {
+          "label": "Resolution",
+          "value": "768x448",
+          "unit": ""
+        },
+        {
+          "label": "Peak VRAM",
+          "value": 22.09,
+          "unit": "GiB"
+        },
+        {
+          "label": "Memory mode",
+          "value": "resident_or_comfy_auto",
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-82078ba5",
+        "issued_at": "2026-11-27T12:21:40Z"
+      },
+      "sha256": "19962856184c8fa7e846c2a6bcc091fd64f73116cbb458acc4fa3c6e30691323",
+      "bytes": 3188864,
+      "preview": {
+        "path": "media/wave3-rtx3090-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 951173,
+        "sha256": "6cea6892a46988f47d768dbc6c41e7da70a718b6c41ecbfd47a4b1786a114b67",
+        "poster": "media/wave3-rtx3090-video_poster.jpg"
+      },
+      "width": 768,
+      "height": 448,
+      "duration_s": 5.875
+    },
+    {
+      "id": "wave3-v100-image",
+      "title": "Coral reef, 1024x1024 image",
+      "category": "wave3",
+      "kind": "image",
+      "hardware": "Tesla V100 32 GB (sm_70, 2017)",
+      "model": "MiniMax-H3 image (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Time to generate",
+          "value": 29.308,
+          "unit": "s"
+        },
+        {
+          "label": "Steps",
+          "value": 6,
+          "unit": ""
+        },
+        {
+          "label": "Peak VRAM",
+          "value": 22.32,
+          "unit": "GiB"
+        },
+        {
+          "label": "Memory mode",
+          "value": "resident_or_comfy_auto",
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-717e4057",
+        "issued_at": "2026-11-27T12:35:17Z"
+      },
+      "sha256": "02b770e3385a26ddf25494e086fc680b90205023c3c88453a351b2292bb64cf0",
+      "bytes": 2222657,
+      "preview": {
+        "path": "media/wave3-v100-image.jpg",
+        "mime": "image/jpeg",
+        "bytes": 274840,
+        "sha256": "a00ab2eaa0eb166908dc21eef0150140507d0cfa09c49b4aa680a803e35a10bc"
+      },
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "id": "wave3-v100-video",
+      "title": "Coral reef, 5.9-second video with stereo audio",
+      "category": "wave3",
+      "kind": "video",
+      "hardware": "Tesla V100 32 GB (sm_70, 2017)",
+      "model": "MiniMax-H3 FL2VA video+audio (INT8), conditioned by the Inkling-2-Mini Plato's Key (concat4)",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Time to generate",
+          "value": 796.005,
+          "unit": "s"
+        },
+        {
+          "label": "Frames",
+          "value": 141,
+          "unit": ""
+        },
+        {
+          "label": "Resolution",
+          "value": "768x448",
+          "unit": ""
+        },
+        {
+          "label": "Peak VRAM",
+          "value": 27.02,
+          "unit": "GiB"
+        },
+        {
+          "label": "Memory mode",
+          "value": "resident_or_comfy_auto",
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-717e4057",
+        "issued_at": "2026-11-27T12:35:17Z"
+      },
+      "sha256": "94c9367fa2cb87c8445aadeab6cba37c8b3e8a8e3fb16d06e7882b9ae0a1162e",
+      "bytes": 3117178,
+      "preview": {
+        "path": "media/wave3-v100-video.mp4",
+        "mime": "video/mp4",
+        "bytes": 940248,
+        "sha256": "fd0e9fd47e485d39fb20ff10fd2bed7dacc317e05d7cd7815d3422aa5626f939",
+        "poster": "media/wave3-v100-video_poster.jpg"
+      },
+      "width": 768,
+      "height": 448,
+      "duration_s": 5.875
+    },
+    {
+      "id": "packetd-anthem-48k",
+      "title": "The Star-Spangled Banner, 60-second 48 kHz stereo",
+      "category": "packets",
+      "kind": "audio",
+      "hardware": "RTX PRO 6000 Blackwell Server Edition",
+      "model": "YuE2-3B with YuE2-Vae, native 48 kHz stereo",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Time to generate",
+          "value": 31.59,
+          "unit": "s"
+        },
+        {
+          "label": "Clip length",
+          "value": 60.639,
+          "unit": "s"
+        },
+        {
+          "label": "Peak VRAM",
+          "value": 8.65,
+          "unit": "GiB"
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-0fcf223c",
+        "issued_at": "2026-11-27T10:15:27Z"
+      },
+      "sha256": "0242e9ff491f806baeaea33493eec76fc9124fb79df622bd3dd0abb3254a36f9",
+      "bytes": 11642668,
+      "preview": {
+        "path": "media/packetd-anthem-48k.mp3",
+        "mime": "audio/mpeg",
+        "bytes": 728397,
+        "sha256": "9647de6dd4b2c34e85c33b2eaa0d26ad89e69834958d72f59f07ccaaab660b23"
+      },
+      "duration_s": 60.639,
+      "sample_rate": 48000,
+      "channels": 2
+    },
+    {
+      "id": "voltron-s24u-image",
+      "title": "Red spaceship over snow-capped pines, 512x512 image made on a phone",
+      "category": "voltron_mobile",
+      "kind": "image",
+      "hardware": "Galaxy S24 Ultra (on device, no server GPU)",
+      "model": "SDXS-512 Q8 GGUF, 1 step; prompt written by Inkling-2-Mini on a Galaxy S26",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Time to generate",
+          "value": 37.88468,
+          "unit": "s"
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-111b1358",
+        "issued_at": "2026-11-27T12:37:44Z"
+      },
+      "sha256": "6aeba3f39109f45b74d528ba69e3eb72118a23b221c082f327d6724e0b786653",
+      "bytes": 650375,
+      "preview": {
+        "path": "media/voltron-s24u-image.jpg",
+        "mime": "image/jpeg",
+        "bytes": 61760,
+        "sha256": "f3922a0ecf8e2429fc883514237ef35e2579884149e5804eb234daecaf1e0852"
+      },
+      "width": 512,
+      "height": 512
+    },
+    {
+      "id": "voltron-tabs8p-voice",
+      "title": "Spoken line, 8-second 24 kHz voice made on a tablet",
+      "category": "voltron_mobile",
+      "kind": "audio",
+      "hardware": "Galaxy Tab S8+ (on device, no server GPU)",
+      "model": "Kokoro-82M INT8 ONNX; text written by Inkling-2-Mini on a Galaxy S26",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Time to generate",
+          "value": 5.74395,
+          "unit": "s"
+        },
+        {
+          "label": "Clip length",
+          "value": 8.025,
+          "unit": "s"
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-111b1358",
+        "issued_at": "2026-11-27T12:37:44Z"
+      },
+      "sha256": "e0152bb1e5fa12a6d8f0679e9effefae38bebf93cac88c2865179fa18333fd21",
+      "bytes": 385244,
+      "preview": {
+        "path": "media/voltron-tabs8p-voice.mp3",
+        "mime": "audio/mpeg",
+        "bytes": 97389,
+        "sha256": "c03d1f3d76828a60abcb25919e0fc1540dc429c1396ce9d779072b4ea04a9822"
+      },
+      "duration_s": 8.025,
+      "sample_rate": 24000,
+      "channels": 1
+    },
+    {
+      "id": "waveb-flux1-schnell-dev-base",
+      "title": "FLUX.1-dev: native text encoder, Plato's Key and shuffled control, side by side",
+      "category": "base_turbo_images",
+      "kind": "image",
+      "hardware": "Blackwell GPU (sm_120)",
+      "model": "black-forest-labs/FLUX.1-dev, conditioned by a Plato's Key in place of its text encoder",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Prompt match kept vs native encoder, 24 development prompts",
+          "value": 93.069515,
+          "unit": "%"
+        },
+        {
+          "label": "Source groups",
+          "value": 16,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-62431c15",
+        "issued_at": "2026-11-27T17:28:17Z"
+      },
+      "sha256": "475da276529d9d225dad0645fcc614331f538732afa1c55ed73b1c13671c5350",
+      "bytes": 1979090,
+      "preview": {
+        "path": "media/waveb-flux1-schnell-dev-base.jpg",
+        "mime": "image/jpeg",
+        "bytes": 119463,
+        "sha256": "9c7fff970b61bb9c956ee3a93a274839de4b95684be57033a00852443f5f22c7"
+      },
+      "width": 800,
+      "height": 1628
+    },
+    {
+      "id": "waveb-flux1-schnell-dev-turbo",
+      "title": "FLUX.1-schnell: native text encoder, Plato's Key and shuffled control, side by side",
+      "category": "base_turbo_images",
+      "kind": "image",
+      "hardware": "Blackwell GPU (sm_120)",
+      "model": "black-forest-labs/FLUX.1-schnell, conditioned by a Plato's Key in place of its text encoder",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Prompt match kept vs native encoder, 24 development prompts",
+          "value": 91.438095,
+          "unit": "%"
+        },
+        {
+          "label": "Source groups",
+          "value": 16,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-62431c15",
+        "issued_at": "2026-11-27T17:28:17Z"
+      },
+      "sha256": "22cd3e63d007a9fa343c48d169a849ede01df9a8d5c5d2222b5826677edd488f",
+      "bytes": 2013256,
+      "preview": {
+        "path": "media/waveb-flux1-schnell-dev-turbo.jpg",
+        "mime": "image/jpeg",
+        "bytes": 129634,
+        "sha256": "56066b608ae35eb33cc9a17c2d3627b504ad5b908a1291ef888fd9940458ccb6"
+      },
+      "width": 800,
+      "height": 1628
+    },
+    {
+      "id": "waveb-flux2-dev-singleton",
+      "title": "FLUX.2-dev: native text encoder, Plato's Key and shuffled control, side by side",
+      "category": "base_turbo_images",
+      "kind": "image",
+      "hardware": "Blackwell GPU (sm_120)",
+      "model": "black-forest-labs/FLUX.2-dev, conditioned by a Plato's Key in place of its text encoder",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Prompt match kept vs native encoder, 24 development prompts",
+          "value": 99.645001,
+          "unit": "%"
+        },
+        {
+          "label": "Source groups",
+          "value": 16,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-f2803f13",
+        "issued_at": "2026-11-27T16:56:14Z"
+      },
+      "sha256": "cac1010f5726c8a1eafdc56a7a5acc19e06f116927cda117929ca324893c3704",
+      "bytes": 2101346,
+      "preview": {
+        "path": "media/waveb-flux2-dev-singleton.jpg",
+        "mime": "image/jpeg",
+        "bytes": 133528,
+        "sha256": "eb37b6f343bf8c48587fc3dc747d3ffcf580df4a97725ddc165754dbd53a9741"
+      },
+      "width": 800,
+      "height": 1628
+    },
+    {
+      "id": "waveb-flux2-klein-9b-base",
+      "title": "FLUX.2-klein-9B (base): native text encoder, Plato's Key and shuffled control, side by side",
+      "category": "base_turbo_images",
+      "kind": "image",
+      "hardware": "Blackwell GPU (sm_120)",
+      "model": "black-forest-labs/FLUX.2-klein-base-9B, conditioned by a Plato's Key in place of its text encoder",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Prompt match kept vs native encoder, 24 development prompts",
+          "value": 97.166479,
+          "unit": "%"
+        },
+        {
+          "label": "Source groups",
+          "value": 16,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-62431c15",
+        "issued_at": "2026-11-27T17:28:17Z"
+      },
+      "sha256": "ad9af558452e9df7f297e0453057614784c1efd15d353de47128a1fc67db2d0b",
+      "bytes": 1940695,
+      "preview": {
+        "path": "media/waveb-flux2-klein-9b-base.jpg",
+        "mime": "image/jpeg",
+        "bytes": 122036,
+        "sha256": "a2b5f44a8addc60f919b689855842288464310d87b933142dc2b3fb5c42cc78b"
+      },
+      "width": 800,
+      "height": 1628
+    },
+    {
+      "id": "waveb-moss-image-base",
+      "title": "moss_image (base): native text encoder, Plato's Key and shuffled control, side by side",
+      "category": "base_turbo_images",
+      "kind": "image",
+      "hardware": "Blackwell GPU (sm_120)",
+      "model": "OpenMOSS-Team/MOSS-Image-Base, conditioned by a Plato's Key in place of its text encoder",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Prompt match kept vs native encoder, 24 development prompts",
+          "value": 98.250976,
+          "unit": "%"
+        },
+        {
+          "label": "Source groups",
+          "value": 16,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-371e4b11",
+        "issued_at": "2026-11-27T18:29:16Z"
+      },
+      "sha256": "fe02c4dd066b6ec697b51a6d3f0ac6ce0b7f903ef0d72e2fa0f8edadaa25b25f",
+      "bytes": 2112578,
+      "preview": {
+        "path": "media/waveb-moss-image-base.jpg",
+        "mime": "image/jpeg",
+        "bytes": 116099,
+        "sha256": "c81a67cc53627bf33b9b97e143b739471cb98030579e9cf9f5722a52951247c6"
+      },
+      "width": 800,
+      "height": 1628
+    },
+    {
+      "id": "waveb-moss-image-turbo",
+      "title": "moss_image (turbo): native text encoder, Plato's Key and shuffled control, side by side",
+      "category": "base_turbo_images",
+      "kind": "image",
+      "hardware": "Blackwell GPU (sm_120)",
+      "model": "OpenMOSS-Team/MOSS-Image-SFT, conditioned by a Plato's Key in place of its text encoder",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Prompt match kept vs native encoder, 24 development prompts",
+          "value": 95.376508,
+          "unit": "%"
+        },
+        {
+          "label": "Source groups",
+          "value": 16,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-371e4b11",
+        "issued_at": "2026-11-27T18:29:16Z"
+      },
+      "sha256": "01befd5fb2cd5cdf8764327f86868e8e5ea34e58dd035d3b358c3caeebb211ac",
+      "bytes": 2234374,
+      "preview": {
+        "path": "media/waveb-moss-image-turbo.jpg",
+        "mime": "image/jpeg",
+        "bytes": 135709,
+        "sha256": "fbba096a8e0fee5d869bdfea19908710a422cbb53249bb0e0a0f95dcbb4f89a5"
+      },
+      "width": 800,
+      "height": 1628
+    },
+    {
+      "id": "waveb-p-image-oss-singleton",
+      "title": "p_image_oss: native text encoder, Plato's Key and shuffled control, side by side",
+      "category": "base_turbo_images",
+      "kind": "image",
+      "hardware": "Blackwell GPU (sm_120)",
+      "model": "PrunaAI/P-Image-OSS, conditioned by a Plato's Key in place of its text encoder",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Prompt match kept vs native encoder, 24 development prompts",
+          "value": 99.085469,
+          "unit": "%"
+        },
+        {
+          "label": "Source groups",
+          "value": 16,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-371e4b11",
+        "issued_at": "2026-11-27T18:29:16Z"
+      },
+      "sha256": "ee161984322dad71828186ee55e023eb64f945a2b691cbd9e79f2970df68b8bd",
+      "bytes": 1900464,
+      "preview": {
+        "path": "media/waveb-p-image-oss-singleton.jpg",
+        "mime": "image/jpeg",
+        "bytes": 110674,
+        "sha256": "4f8f267bcfb345b4a4499b4e7c2c914ea8eaa8c5b77396d642a6080e0e42f2c3"
+      },
+      "width": 800,
+      "height": 1628
+    },
+    {
+      "id": "blender-omni-brush-18-matrix",
+      "title": "18 brushes, before and after",
+      "category": "creative_trinity",
+      "kind": "image",
+      "hardware": "CPU only (no GPU)",
+      "model": "Blender by Atlas 5.2.5 LTS, Omni-Brush",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Brushes",
+          "value": 18,
+          "unit": ""
+        },
+        {
+          "label": "Ledger checkpoints",
+          "value": 88,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-4c3064b2",
+        "issued_at": "2026-11-27T18:15:31Z"
+      },
+      "sha256": "88f8644c900707294b134d1b425fd0467aea4145c433bfa637ee5c800b28986b",
+      "bytes": 1176691,
+      "preview": {
+        "path": "media/blender-omni-brush-18-matrix.jpg",
+        "mime": "image/jpeg",
+        "bytes": 122539,
+        "sha256": "8f220138001652f5b9d9d37e5fae255dfbe61236eb4dc146fe58ac2388def1b4"
+      },
+      "width": 1636,
+      "height": 2040
+    },
+    {
+      "id": "blender-omni-brush-forking",
+      "title": "Ambiguous prompts forked into three candidates",
+      "category": "creative_trinity",
+      "kind": "image",
+      "hardware": "CPU only (no GPU)",
+      "model": "Blender by Atlas 5.2.5 LTS, Omni-Brush",
+      "caption": "",
+      "metrics": [
+        {
+          "label": "Prompts",
+          "value": 5,
+          "unit": ""
+        }
+      ],
+      "qa_status": "PASS",
+      "receipt": {
+        "id": "att-4c3064b2",
+        "issued_at": "2026-11-27T18:15:31Z"
+      },
+      "sha256": "be6135b73df43d96a8bf8625e4016aae8a034f5ebab830fac4b06d526faa66a2",
+      "bytes": 832471,
+      "preview": {
+        "path": "media/blender-omni-brush-forking.jpg",
+        "mime": "image/jpeg",
+        "bytes": 128216,
+        "sha256": "3d2b0ba7b539c6eb8fa6a47d54ee8ebea224f2ae2590540d45e87404e41d1908"
+      },
+      "width": 1224,
+      "height": 1594
+    }
+  ]
+}
