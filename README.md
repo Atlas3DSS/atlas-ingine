@@ -1,5 +1,7 @@
 # Ingine by Atlas (Omni by Atlas)
 
+> **New here? Start with the 5-minute plain-English starter guide:** [**START_HERE.md**](START_HERE.md) *(30-second laptop toy key, 1-command GPU setup, Hugging Face downloads, and drop-in Diffusers/ComfyUI loaders).*
+
 Multi-architecture Apache-2.0 CUDA **omni-modal** inference engine for
 [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), with [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (`qwen4exp`) CUDA backends, zero-gradient **Plato's Key** omni-modal grafting (image, native video+audio, symbolic music, and prosodic voice), **Host-Enforced Verified Ledger** alignment, and live **Neuron Lens** interpretability hooks — forked from
 [satellitedown/ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine).
