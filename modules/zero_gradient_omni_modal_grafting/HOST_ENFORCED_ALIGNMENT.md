@@ -85,3 +85,18 @@ A host-enforced Verified Ledger delivers **provable personal alignment for every
 3. **Host Isolation:** The guarantee holds only while the model cannot edit the verifier, forge receipts, or bypass the commit path — verified above via `0/8` forged receipts and `3/3` HTTP `400` anti-oracle rejections on `/v1/probe/chat` `d=2027` tamper attempts.
 
 In the limit, alignment does not require hoping a black-box lab model resists every Pliny jailbreak. Your host enforces your invariants mathematically at every state transition, while Neuron Lens makes every internal routing shift inspectable directly on the ledger.
+
+---
+
+## Closing the Full Alignment Loop (`Verified Ledger` × `LoopRes` × `Neuron Lens` × `Plato's Key`)
+
+The live red-team measurement above isolates an exact boundary: **Host-Enforced Verified Ledger** guarantees **`0/40 (0.0%)` committed violations** at **`10/10 (100.0%)` benign utility**, while the frozen base trunk still *attempted* **`22/40 (55.0%)`** violations internally (with `5×–10×` Neuron Lens MoE routing shifts on base64/hex IP attacks).
+
+Combining our deterministic Verified Ledger hillclimber with **`LoopRes`** (Zhao et al., 2026; [`NUS-HPC-AI-Lab/LoopRes`](https://github.com/NUS-HPC-AI-Lab/LoopRes), `arXiv:2611.31094`, MIT) closes the loop from external enforcement to internalized recurrent alignment:
+
+1. **Deterministic Verified Data Factory (Live):** Verified Ledger hillclimbing against deterministic host verifiers emits host-verified `(prompt, failed/obfuscated attempt, verifier proof, repaired winner / safe refusal)` traces.
+2. **Internalize Depth via `LoopRes` (Active Pilot `#951`):** `LoopRes` partitions any pretrained LLM into **prelude → looped core (`static_read` over bounded `previous_step` window + trainable loop-aware keys + per-`(layer, step)` KV cache) → coda** via SFT (`+29.1%` over standard SFT on `Qwen3-1.7B-Base` at `2×` compute), turning multi-turn external repair and adversarial auditing into internal per-token recurrent passes aimed at driving the *internal* `Arm A` breach rate from `55% → 0%`.
+3. **Unconditional Outer Boundary + Telemetry (Live):** Host-Enforced Verified Ledger remains permanently active as the `0%` commit gate (defense-in-depth), paired with live `/v1/probe/*` Neuron Lens telemetry and `--loopcd` pass-to-pass contrast.
+4. **Zero-Gradient Omni Re-Lock (Live):** After any `LoopRes` generation finishes, closed-form FP64 Plato's Keys (`1.4–2.8 MiB` low-rank Speech/Mouth, `21–75 MiB` Video H3) re-attach all omni-modal generators in seconds with zero diffusion or audio gradient retraining.
+
+![Closed-Loop Full Alignment Architecture](figures/fig6_closed_loop_alignment_architecture.png)

@@ -1,0 +1,230 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.72in,top=0.82in,bottom=0.82in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage[colorlinks=true,linkcolor=blue!55!black,citecolor=blue!55!black,urlcolor=blue!55!black]{hyperref}
+
+\definecolor{atlasdark}{HTML}{111827}
+\definecolor{atlasaccent}{HTML}{1E40AF}
+\definecolor{atlasmuted}{HTML}{4B5563}
+
+\setlength{\columnsep}{0.24in}
+\setlength{\parskip}{3pt}
+\captionsetup{font=small,labelfont=bf,skip=4pt}
+\titleformat{\section}{\large\bfseries\color{atlasdark}}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries\color{atlasdark}}{\thesubsection}{0.45em}{}
+\titlespacing*{\section}{0pt}{10pt}{4pt}
+\titlespacing*{\subsection}{0pt}{7pt}{3pt}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\footnotesize\color{atlasmuted}Omni by Atlas --- Zero-Gradient Omni-Modal Grafting \& Closed-Loop Alignment}
+\fancyhead[R]{\footnotesize\color{atlasmuted}Preprint v0.9.1 (2026-11-27)}
+\fancyfoot[C]{\footnotesize\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\title{\vspace{-1.1em}\Large\bfseries Zero-Gradient Omni-Modal Grafting via Closed-Form Representation Maps:\\
+Sealed Confirmation, Spectral Rank Collapse, Multi-Donor Blends, and Closed-Loop Alignment}
+
+\author{Atlas 3DSS Systems \& Research\\
+\small\url{https://github.com/Atlas3DSS/atlas-ingine}\\
+\small\url{https://huggingface.co/collections/Atlas3D/omni-by-atlas-6b09daccd0f65e23233163b3}}
+\date{November 27, 2026}
+
+\begin{document}
+\twocolumn[
+\begin{@twocolumnfalse}
+\maketitle
+\vspace{-1.2em}
+\begin{abstract}
+\noindent
+Closed-form linear representation maps (\emph{Plato's Keys}) can graft image diffusion, native video+audio diffusion, coarse visual perception, speech perception, symbolic music, and prosodic speech control onto frozen language models with zero gradient steps and zero trunk weight edits. Replacing the $27.14\,\text{GB}$ \texttt{Qwen3-VL-32B} layer-50 text encoder inside \texttt{MiniMax-H3} image diffusion with a $90.0\,\text{MiB}$ FP16 closed-form \texttt{concat4} ridge map from looped-MoE \texttt{Inkling-2-Mini} (fitted in $355\,\text{s}$ CPU on $640$ prompts / $13{,}872$ word spans) retains $\mathbf{97.50\%}$ of the teacher's $B_0$-anchored SigLIP2 margin on a sealed $160$-prompt confirmation split ($640$ $1024\times 1024$ images, $G=16$ disjoint groups, $\texttt{fit\_calls}=0$; $0.1982$ vs.\ $0.2045$ teacher, $0.8942$ image-vs-teacher cosine, $0.9228$ pooled word cosine / $R^2=0.9982$), corroborated orthogonally by self-supervised \texttt{DINOv3-ViT-L/16} ($0.7599$ CLS / $0.8697$ mean-patch / $0.6910$ spatial cosine, $16/16$ groups, $p=3.05\times 10^{-5}$). A matched-data 2-layer residual GELU MLP yields no statistically detectable improvement on grouped word-span cosine ($-0.00027$, $p=1.0$). The same frozen $90.0\,\text{MiB}$ key transfers zero-refit to $5.875\,\text{s}$ \texttt{FL2VA} video+32\,kHz audio across $16$ distinct GPUs ($30$ GPUs across $6$ CUDA generations total, down to a $12\,\text{GB}$ RTX~5070 at $9.33\,\text{GiB}$ peak and $5.72\,\text{s}$ image / $93.34\,\text{s}$ AV on RTX~5090), and generalizes across diffusion families including \texttt{FLUX.2-dev} ($99.65\%$ retention replacing $44.7\,\text{GiB}$ Mistral-24B), \texttt{Z-Image} ($98.88\%/101.19\%$), \texttt{Qwen-Image-2.1} ($96.37\%/98.80\%$), and \texttt{FLUX.3-Image-Klein} ($97.33\%/99.02\%$). We report exact failure boundaries transparently: reverse Vision$\to$LLM dense OCR ($1\to 2/48$ agree), \texttt{SDXL} unmasked \texttt{CLIP-L} padding ($57.69\%/42.66\%$), and one-shot prosodic \texttt{Mouth} confirmation (\textsc{fail} $4/6$ due to an intonation inversion). Exact FP64 SVD on $20$ fitted keys reveals $26.2\times\text{--}29.1\times$ low-rank compression for Speech/Mouth ($1.4\text{--}2.8\,\text{MiB}$ at $r=64$, $<0.001$ cosine loss) and mid-depth dominance for H3 (\texttt{Qwen3.8} layer~31 $=95.8\%$ output energy, retaining $98.90\%$ Confirm-160 margin at half depth). A $1{,}416$-clip blind 5-family expressive TTS shoot-out shows \texttt{Qwen3-TTS} + \texttt{Qwen3.8} Plato's Key reaches $24/60$ ($40.0\%$) vs.\ $26/60$ ($43.3\%$) native ceiling ($p=0.79053$) and leads all $20$ TTS arms on melancholic recall ($6/14=42.9\%$). Finally, live Pliny-style red-teaming shows Host-Enforced \emph{Verified Ledger} holds $0/40$ ($0.0\%$) committed violations vs.\ $22/40$ ($55.0\%$) prompt-only breaches at $10/10$ benign utility, and we detail how \texttt{LoopRes} (\texttt{arXiv:2611.31094}) closes the loop from external verification to internalized recurrent alignment.
+\end{abstract}
+\vspace{0.8em}
+\end{@twocolumnfalse}
+]
+
+\section{Introduction}
+Multimodal foundation models typically align text, image, video, audio, and speech components through multi-billion-token joint pretraining or gradient-trained adapter layers (Flamingo, BLIP-2, LLaVA). We ask a sharper systems question: \emph{when frozen language models and frozen modality encoders/generators already share sufficient linear representation geometry, how far can zero-gradient closed-form ridge regression go, where does it break, and how does it compose with host-enforced agent verification?}
+
+Building on the \emph{Platonic Representation Hypothesis} \cite{huh2024platonic}, \emph{Relative Representations} \cite{moschella2023relative}, and closed-form cross-LLM bridging in \emph{Plato's Key} \cite{cheng2026platoskey,alissonerdx2026tepk}, we present an end-to-end empirical map of zero-gradient omni-modal grafting onto frozen local trunks (\texttt{Inkling-2-Mini} looped-MoE, \texttt{Qwen3.8-27B}, \texttt{DeepSeek-V4.1-Flash}, and \texttt{GLM-5.3-Flash}). Every confirmation split is cryptographically frozen before inspection, every failure boundary is retained without retuning, and every latency and memory claim is grounded in hardware telemetry across $30$ physical NVIDIA GPUs (2016 Pascal through 2025 Blackwell) and an on-device Android Vulkan mesh.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig0_architecture_pipeline.png}
+\caption{Zero-gradient omni-modal grafting architecture. Frozen trunk activations are mapped via FP64 closed-form ridge regression (Plato's Keys, $1.4\text{--}271\,\text{MiB}$ FP16) directly into image DiTs, native video+audio DiTs (\texttt{FL2VA}), 48\,kHz music (\texttt{YuE2-3B}), and expressive speech (\texttt{Qwen3-TTS}), eliminating up to $44.7\,\text{GiB}$ of upstream text encoders with zero trunk weight edits.}
+\label{fig:arch}
+\end{figure*}
+
+\section{Method: Closed-Form FP64 Ridge Mapping}
+Given aligned source activations $X \in \mathbb{R}^{N \times d_s}$ (single layer or $4$-tap concatenation \texttt{concat4}) and target conditioning embeddings $Y \in \mathbb{R}^{N \times d_t}$ over $N$ word-aligned spans from $640$ training prompts ($N=13{,}872$ for Packet~A), we solve the exact FP64 regularized normal equations:
+\begin{equation}
+W^\star = (X^\top X + \lambda I)^{-1} X^\top Y, \qquad \hat{Y} = X W^\star + b,
+\end{equation}
+selecting $\lambda$ strictly by source-group-disjoint inner cross-validation (never touching \texttt{val\_dev} or \texttt{confirm\_reserve}). Because heterogeneous donor/receiver pairs (e.g.\ looped-MoE $d_s=2304$ or $9216$ to dense $d_t=5120$) have mismatched spectral shapes, Orthogonal Procrustes fails catastrophically ($R^2 = -0.405$), whereas unnormalized ridge preserves both direction and target variance ($R^2=0.9982$).
+
+For $M$-donor blends ($X = [\sqrt{\alpha_1} X_1, \dots, \sqrt{\alpha_M} X_M]$), naive unweighted concatenation degrades at $M \ge 2$ due to inter-donor variance imbalance. \emph{Block-weighted multi-kernel ridge} allocates simplex weights $\alpha_m$ via inner-fold OOF MSE, scaling monotonically from $M=1 \to 2 \to 3$.
+
+\section{Packet A: Sealed Image \& Video+Audio Transfer}
+\subsection{Sealed Confirm-160 Image Evaluation ($640$ PNGs)}
+Table~\ref{tab:packeta} reports the sealed $160$-prompt confirmation evaluation ($G=16$ disjoint source groups, $8$ domains, $4$ arms $= 640$ $1024\times 1024$ \texttt{MiniMax-H3} renders, $\texttt{fit\_calls}=0$, $4/4$ dev-floor reinject parity at $0.0$ RMSE). \texttt{Inkling-2-Mini} \texttt{concat4} ($90.0\,\text{MiB}$, $288\times$ smaller than the $27.14\,\text{GB}$ \texttt{Qwen3-VL-32B} teacher) retains $\mathbf{97.50\%}$ of the teacher's $B_0$-anchored SigLIP2 margin ($0.1982$ vs.\ $0.2045$, $\Delta=-0.0063$, 95\% CI $[-0.0117,-0.0010]$) and beats the primary $22.5\,\text{MiB}$ \texttt{single\_tap} key on $16/16$ groups ($p=3.05\times 10^{-5}$).
+
+\begin{table}[h]
+\centering
+\caption{Packet~A Sealed Confirm-160 ($640$ $1024\times 1024$ images, $G=16$ groups, $0$ refits).}
+\label{tab:packeta}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Arm (Key Size) & Word Cos & SigLIP2 & Margin & Img-Tch \\
+\midrule
+Teacher Reinject ($27.14\,\text{GB}$) & 1.0000 & \textbf{0.2045} & 100.00\% & 1.0000 \\
+\texttt{concat4} ($90.0\,\text{MiB}$) & \textbf{0.9228} & \textbf{0.1982} & \textbf{97.50\%} & \textbf{0.8942} \\
+\texttt{single\_tap} ($22.5\,\text{MiB}$) & 0.7961 & 0.1544 & 80.02\% & 0.7669 \\
+Shuffled $B_0$ ($22.5\,\text{MiB}$) & 0.6425 & $-0.0463$ & 0.00\% & 0.4873 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig1_packetA_adherence_and_size.png}
+\caption{Packet~A Sealed Confirm-160 adherence and encoder footprint compression ($27.14\,\text{GB} \to 90.0\,\text{MiB}$ \texttt{concat4} / $22.5\,\text{MiB}$ \texttt{single\_tap}) alongside orthogonal \texttt{DINOv3-ViT-L/16} teacher similarity across $640$ rendered PNGs.}
+\label{fig:packeta}
+\end{figure*}
+
+\subsection{Orthogonal DINOv3 Audit \& Matched-Data MLP Baseline}
+Scoring all $640$ Confirm-160 PNGs with self-supervised \texttt{facebook/dinov3-vitl16-pretrain-lvd1689m} \cite{simeoni2025dinov3} confirms that \texttt{concat4} beats both \texttt{single\_tap} and $B_0$ on $16/16$ groups ($p=3.05\times 10^{-5}$): global CLS cosine $0.7599\pm 0.1041$ (vs.\ $0.4871$ \texttt{single\_tap}, $0.0309$ $B_0$), mean-patch $0.8697\pm 0.0592$, and spatial patch-to-patch $0.6910\pm 0.1083$ (vs.\ $0.1729$ $B_0$).
+
+On identical $640$-prompt word-span data ($13{,}872$ spans, fold-0 inner selection), a gradient-trained \texttt{ResidualRidgeMLP} ($76.56\,\text{M}$ params, $146.0\,\text{MiB}$ FP16, initialized at exact ridge) yielded no statistically detectable grouped cosine improvement over closed-form ridge ($\Delta=-0.00027$, $p=1.0$; $8/16$ groups), while a scratch 2-layer GELU MLP ($40$ epochs) trailed severely ($R^2=0.505$).
+
+\subsection{Zero-Refit Video+Audio Transfer \& Universal Receivers}
+Without refitting a single weight, the exact same $90.0\,\text{MiB}$ \texttt{concat4} key (\texttt{sha256 cca1e5bc}) drives $5.875\,\text{s}$ ($141$-frame) \texttt{MiniMax-H3 FL2VA} video + $32\,\text{kHz}$ stereo audio generation across $16$ distinct GPUs (Section~\ref{sec:silicon}). Across external open-weights image diffusion receivers (zero upstream text encoder loaded, Blackwell \texttt{sm\_120}), closed-form keys generalize cleanly to \texttt{FLUX.2-dev} ($99.65\%$ retention, $271\,\text{MiB}$ replacing $44.7\,\text{GiB}$ \texttt{Mistral-Small-3.1-24B}), \texttt{Z-Image} ($98.88\%$ Turbo / $101.19\%$ Base, $45.1\,\text{MiB}$, $-8.10\,\text{GB}$ VRAM), \texttt{Qwen-Image-2.1} ($96.37\%$ / $98.80\%$), \texttt{FLUX.3-Image-Klein} ($97.33\%$ / $99.02\%$, $12.0\,\text{GB}$ VRAM), \texttt{FLUX.2-klein-4B} ($97.73\%$ / $83.49\%$), \texttt{p\_image\_oss} ($99.09\%$ Dev-24; Confirm-160 word bar $\cos=0.9746$, $R^2=0.8449$), \texttt{moss\_image} ($98.25\%/95.38\%$; Confirm-160 $\cos=0.9191$, $R^2=0.6869$), and \texttt{FLUX.2-klein-9B} ($97.17\%$; Confirm-160 $\cos=0.9426$, $R^2=0.7197$). Conversely, \texttt{SDXL} fails cleanly ($57.69\%$ Base / $42.66\%$ Turbo; Confirm-160 $R^2=0.5403$) due to unmasked 77-token \texttt{CLIP-L} padding dilution.
+
+\section{Failure Boundaries: Vision OCR \& Speech Lexemes}
+We explicitly map where frozen linear maps broke in our tested configurations:
+\begin{enumerate}[leftmargin=1.3em,itemsep=2pt]
+\item \textbf{Reverse Vision$\to$LLM Dense OCR (Packet~B/B2):} Projecting high-resolution vision towers (\texttt{GOT-OCR2}, \texttt{SigLIP2-NaFlex}) linearly into frozen \texttt{Inkling-2-Mini} \texttt{EmbedRows} carries coarse object counting ($45/48$) and improves chart agreement ($1\to 8/48$), but fails dense typography and UI OCR ($1\to 2/48$ agree, $1\to 0/48$ gold; locked $448$-item test remains $0$ touched; Fig.~\ref{fig:ocr}).
+\item \textbf{Direct Continuous TTS Lexemes \& One-Shot Mouth Confirmation (Packet~C):} Direct continuous projection of lexical tokens into \texttt{Qwen3-TTS} failed $0/32$ contrastive pairs across mismatched tokenizers. Supplying discrete text tokens plus continuous prosody held $29/32$ lexical accuracy on one-shot $80$-item confirmation ($400$ WAVs), yet failed overall prosody ($4/6$ amended gates; $21/32$, $p=0.1102$) because \texttt{rising\_question\_vs\_falling\_declarative} inverted $0/8$ vs.\ $8/8$ under the frozen acoustic scorer despite $8/8$ urgency and $8/8$ pace. This failure is preserved without retuning.
+\end{enumerate}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/fig2_packetB_ocr_boundary.png}
+\caption{Packet~B/B2 Vision$\to$LLM linear boundary: coarse counting succeeds ($45/48$) while dense OCR fails without sequence-aligned adaptation.}
+\label{fig:ocr}
+\end{figure*}
+
+\section{Multi-Donor Blends, Spectral Rank, \& Prosody}
+\subsection{Multi-Donor Blends \& Half-Depth Early Exit}
+Across $3$ real donor families (\texttt{Qwen3.8-27B}, \texttt{Inkling-2-Mini}, \texttt{DeepSeek-V4.1-Flash}) on sealed Confirm-160 ($n=3{,}413$ words, $G=16$ groups), unweighted concatenation controls ($0.9585, 0.9569, 0.9566$) all fall below single-donor \texttt{Qwen3.8} ($0.9596$), whereas block-weighted \texttt{stacked\_multikernel\_concat4} reaches $\mathbf{0.963201}$ ($+0.003602$, $16/16$ groups \& $8/8$ domains, $p=3.05\times 10^{-5}$). In controlled same-host \texttt{PRO 6000 cu130} Confirm-160 renders ($640$ images), a \emph{single half-depth layer} of \texttt{Qwen3.8-27B} (\texttt{layer\_31/64}, $50.02\,\text{MiB}$) retains $\mathbf{98.90\%}$ of the teacher's $B_0$-anchored margin ($0.201639$ vs.\ $0.204513$ teacher, $16/16$ vs.\ $B_0$, $p=3.05\times 10^{-5}$; Fig.~\ref{fig:multidonor}).
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig4_multidonor_and_universal.png}
+\caption{Left: Multi-donor scaling ($N=1\to 3$ real donors vs.\ synthetic clone stress) showing unweighted stacking regression vs.\ monotonic block-weighted multi-kernel ridge ($0.963201$ Confirm-160). Right: Cross-encoder retention across \texttt{MiniMax-H3} and Wave~B diffusion receivers including the \texttt{SDXL} negative control.}
+\label{fig:multidonor}
+\end{figure*}
+
+\subsection{Exact FP64 Spectral Rank \& Depth Dominance (\#944 Part 1A)}
+Exact FP64 SVD across $20$ fitted keys on strictly held-out \texttt{val\_dev} ($\texttt{confirm\_reserve\_touched}=0$, \texttt{att-3634267d}; Fig.~\ref{fig:svd_prosody}A--B) uncovers two structural laws:
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+\item \textbf{Ultra-low-rank Speech/Mouth keys:} \texttt{Qwen3-TTS} $2048$-d text heads compress $\mathbf{26.2\times\text{--}29.1\times}$ at rank $r=64$ ($1.4\text{--}2.8\,\text{MiB}$, $<0.001$ cosine loss; \texttt{inkling\_to\_mouth\_\_text} $r_{\text{eff}}=51.0$), and instruct heads compress $9.7\times\text{--}14.5\times$ ($2.8\text{--}8.2\,\text{MiB}$).
+\item \textbf{Bimodal Video H3 \& mid-depth dominance:} H3 keys combine low stable rank ($1.1\text{--}1.8$) with a semantic tail ($r_{\text{eff}}=2{,}387\text{--}2{,}937$), hitting the $-0.002$ cosine knee at $2.1\times\text{--}7.6\times$ ($21\text{--}75\,\text{MiB}$). Output energy ($\%Y$) concentrates sharply at mid-depth (\texttt{Qwen3.8} \texttt{layer\_31}$=95.8\%$, \texttt{Inkling} \texttt{visit\_23}$=66.5\%$, \texttt{GLM-5.3} \texttt{layer\_21}$=67.1\%$), explaining Section~5.1's half-depth early-exit retention.
+\end{itemize}
+
+\subsection{5-Family Expressive Open-Source TTS Shoot-Out (\#942)}
+Across $1{,}416$ anonymized clips ($25$ arms, $5$ TTS families + \texttt{YuE2-3B} 48\,kHz singing, frozen \texttt{emotion2vec+} and \texttt{faster-whisper-large-v3-turbo} gated by $\text{RMS}\ge 0.01$; $256$ cross-shard human anchor pairs $\max|\Delta\text{WER}|=0.0$, $\max|\Delta p|=0.001488$; \texttt{att-aedf1343}, \texttt{att-213dab41}; Fig.~\ref{fig:svd_prosody}C):
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+\item \textbf{\texttt{Qwen3-TTS} + \texttt{Qwen3.8} Plato's Key continuous style} reached $\mathbf{24/60\,(40.0\%)}$ \texttt{e2v+} top-1 vs.\ $\mathbf{26/60\,(43.3\%)}$ hand-written native ceiling ($-3.3\,\text{pp}$, $6$ improvements vs.\ $8$ regressions, 95\% CI $[-15.0,+8.3]\,\text{pp}$, exact McNemar $p=0.79053$), matched $16/40$ vs.\ $16/40$ on RAVDESS-40 ($+30.0\,\text{pp}$ vs.\ neutral $p=0.0118$, $+32.5\,\text{pp}$ vs.\ swapped $B_0$ $p=0.00235$), achieved the highest melancholic \texttt{sad} recall across all $20$ TTS arms ($\mathbf{6/14=42.9\%}$ vs.\ $4/14$ ceiling and $5/14$ \texttt{Orpheus-3B}), and cut WER by $-10.73\,\text{pp}$ ($23.18\%$ overall; $11.36\%$ pass-only). Short 6-word RAVDESS prompts exposed a greedy silence attractor ($5.68\,\text{s}$, $2\times 10^{-5}$ RMS) across stock \texttt{Qwen3-TTS} arms ($100\%$ pass on EmergentTTS-40); lightly sampled decoding with an $\text{RMS}\ge 0.01$ retry guard is proposed awaiting evaluation.
+\item \textbf{Rival open-source TTS families:} \texttt{Orpheus-TTS-3B} (Apache-2.0) was the strongest commercial-safe fallback ($18/60=30.0\%$ \texttt{e2v+}, $60/60$ above RMS threshold, $3.09\%$ WER, $0.00\%$ RAVDESS WER, $5/14$ \texttt{sad}). \texttt{Chatterbox-0.5B} ($15/60=25.0\%$, $1.42\%$ WER, retired Aug~2026) carried a $1.000$ Resemble PerTh implicit watermark on all $10/10$ checked clips and $1/14$ ($7.1\%$) \texttt{sad} recall. \texttt{Step-Audio-EditX} single-pass edit reached $12/60$ ($20.0\%$, $-23.3\,\text{pp}$ vs.\ Qwen3 native ceiling, $p=0.00434$, $11.07\,\text{GiB}$ VRAM). \texttt{IndexTTS-2} (non-commercial Bilibili license, $0.389$ RTF) showed a \texttt{happy}-timbre bias ($0/14$ \texttt{sad}), yet strict 4-fold OOF Plato's Key vectors (\texttt{Qwen3.8} $\cos=0.9362$, $R^2=0.8067$) causally lifted RAVDESS-40 from $0/40$ (neutral \& $B_0$) to $6/40$ ($15.0\%$, nominal $p=0.03125$), beating its native 8-float ceiling ($7/60$ vs.\ $2/60$).
+\item \textbf{\texttt{YuE2-3B} 48\,kHz singing:} Continuous Plato's Key affect ($0$ style tokens, Gate~0 exact $0.0$) matched melancholic tempo and key on $4/4$ songs ($78.5\,\text{BPM}$, \texttt{K:Bb} vs.\ $73.5\,\text{BPM}$ plain tag), while swapped upbeat context doubled tempo to $156.75\,\text{BPM}$ (\texttt{K:F/Fm/Dm}).
+\end{itemize}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig5_lowrank_svd_and_prosody.png}
+\caption{(A) Exact FP64 SVD low-rank compression across $12$ representative Plato's Keys at the $-0.002$ \texttt{val\_dev} cosine knee (\#944 Part~1A, \texttt{att-3634267d}). (B) Held-out output energy split ($\%Y$) across taps showing mid-depth H3 dominance ($95.8\%$ \texttt{Qwen3.8} layer~31). (C) Blind 5-family expressive TTS shoot-out (\#942, $1{,}416$ clips, \texttt{att-aedf1343}, \texttt{att-213dab41}).}
+\label{fig:svd_prosody}
+\end{figure*}
+
+\section{Host-Enforced Alignment \& Closing the Loop via \texttt{LoopRes}}
+Prompt-level alignment degrades under obfuscated jailbreaks. Running live Pliny-style adversarial red-teaming against \texttt{ingine-serve -\/-persona-probe-mode} (\texttt{Inkling-2-Mini-atlas-12g}, $20$ Tier-1 single-turn + $20$ Tier-2 \texttt{L1B3RT4S} many-shot attacks + $10$ benign controls, \texttt{att-0be1ebd9}; Fig.~\ref{fig:closedloop}B):
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+\item \textbf{Arm A (System-Prompt Constitution Only):} breached $\mathbf{22/40\,(55.0\%)}$ receipts across all five invariants (budget $4/8$, IP boundary $5/8$, monotonic head $5/8$, music theory $3/8$, receipt integrity $5/8$).
+\item \textbf{Arm B (Host-Enforced Verified Ledger):} committed $\mathbf{0/40\,(0.0\%)}$ violations while admitting $\mathbf{10/10\,(100.0\%)}$ benign controls, blocking $3/3$ direct \texttt{/v1/probe} $d=2027$ tampers (\texttt{HTTP 400}), and maintaining $50/50$ hash-chain verification. Live Neuron Lens MoE routing telemetry recorded $5\times\text{--}10\times$ larger routing shifts ($0.0375\text{--}0.0824$) on breached base64/hex IP attacks vs.\ refused direct attacks ($0.0081$).
+\end{itemize}
+
+Integrating \textbf{\texttt{LoopRes}} \cite{zhao2026loopres} (MIT, \texttt{arXiv:2611.31094}) closes the loop between external verification and internalized depth-recurrent alignment (Fig.~\ref{fig:closedloop}A): (1)~Verified Ledger hillclimbing generates deterministic, host-verified \texttt{(prompt, failure/attack, verifier proof, repaired winner/refusal)} traces; (2)~\texttt{LoopRes} converts any pretrained trunk into a prelude $\to$ looped core (\texttt{static\_read} over a bounded $W$-step window with trainable loop-aware keys and per-\texttt{(layer, step)} KV cache) $\to$ coda via SFT to drive internal \texttt{Arm A} breaches from $55\%\to 0\%$; (3)~Verified Ledger + Neuron Lens + \texttt{-\/-loopcd} remain permanently active as the unconditional $0\%$ commit gate; and (4)~closed-form FP64 Plato's Keys re-attach all omni-modal heads in seconds with zero diffusion or audio gradient retraining. A preregistered \texttt{Qwen3-1.7B} $\to$ \texttt{Qwen3.8} closed-loop pilot is underway (unmeasured in this revision).
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig6_closed_loop_alignment_architecture.png}
+\caption{Closed-loop full alignment architecture combining Verified Ledger deterministic data generation, \texttt{LoopRes} recurrent depth internalization \cite{zhao2026loopres}, Neuron Lens + \texttt{-\/-loopcd} defense-in-depth, and zero-gradient Plato's Key omni re-lock, anchored by live Pliny v2 measurements ($22/40$ prompt-only vs.\ $0/40$ Verified Ledger committed breaches at $10/10$ benign utility).}
+\label{fig:closedloop}
+\end{figure*}
+
+\section{Cross-Silicon Deployment \& Flagship Showcase}
+\label{sec:silicon}
+Across $30$ distinct NVIDIA GPUs spanning $6$ CUDA generations (\texttt{Pascal} $\to$ \texttt{Blackwell}, all cloud teardowns zero-confirmed, \texttt{att-5a19dfba}), $16$ distinct GPUs ($17$ runs across $5$ architectures) executed real end-to-end $1024\times 1024$ image and $5.875\,\text{s}$ ($141$-frame) \texttt{FL2VA} video + $32\,\text{kHz}$ stereo audio driven purely by the frozen $90.0\,\text{MiB}$ \texttt{Inkling} \texttt{concat4} key (Fig.~\ref{fig:silicon}). Highlights include the first $12\,\text{GB}$ consumer GPU (\texttt{RTX 5070}: $23.02\,\text{s}$ img @ $9.00\,\text{GiB}$ peak, $269.24\,\text{s}$ AV @ $9.33\,\text{GiB}$ peak), fastest consumer GPU (\texttt{RTX 5090}: $5.72\,\text{s}$ img, $93.34\,\text{s}$ AV @ $23.37\,\text{GiB}$), 2017 \texttt{Tesla V100} ($29.31\,\text{s}$ img, $796.01\,\text{s}$ AV), and \texttt{Quadro RTX 8000} ($28.64\,\text{s}$ img, $792.12\,\text{s}$ AV).
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/omni912_wave3_real_image_and_5s_av_benchmark.png}
+\caption{Real end-to-end $1024\times 1024$ image (6-step) and $5.875\,\text{s}$ $141$-frame \texttt{FL2VA} video + $32\,\text{kHz}$ stereo audio across $16$ distinct NVIDIA GPUs ($17$ verified runs, $5$ architectures \texttt{Volta} $\to$ \texttt{Blackwell}, zero \texttt{Qwen3-VL-32B} loaded; \texttt{att-5a19dfba}).}
+\label{fig:silicon}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig3_omni_footprint_ladder.png}
+\caption{Measured disk and peak VRAM footprint ladder comparing eliminated $27.14\,\text{GB}$ text encoders against closed-form Plato's Key bridges and quantized local trunks.}
+\label{fig:footprint}
+\end{figure*}
+
+\textbf{Flagship Anthem Showcase v5 (\#946, \texttt{att-87bcde4d}):} Using the same frozen $90.0\,\text{MiB}$ \texttt{Inkling-2-Mini} key ($0$ \texttt{Qwen3-VL-32B} loaded, $7/7$ trace-audit stages \texttt{errors=[]}), we rendered an $88.75\,\text{s}$ ($2{,}130$-frame, $1024\times 576$, $48\,\text{kHz}$ stereo AAC) continuous live music video in $2{,}188.56\,\text{s}$ on Colab Blackwell. The delivered MP4 passed the Host-Enforced Verified Ledger Music Gate (\texttt{K:Bb 3/4 74 BPM}, $72/72$ bars exact, $96.83\%$ diatonic, delivered audio \texttt{Bb\_major} $r=0.78267$, $\texttt{Bb}-\texttt{Dm}=+0.02547$, duration error $1.37\%$, climax $1:1$ crop audit $4/4$ \textsc{ok}, score $0.8611$).
+
+\textbf{On-Device Android Mesh:} A 3-device Wi-Fi LAN mesh (\texttt{Galaxy S26} Brain at $9.81\text{--}10.46\,\text{tok/s}$, \texttt{Tab S8+} Voice \texttt{Kokoro-82M} at $1.40\times$ RT, \texttt{S24 Ultra} Artist \texttt{SDXS-512}) pairs with bit-exact Kotlin \texttt{VPKE v1} projection ($328{,}223\,\text{B}$, $0$ ULP across $64\times 2560$ FP16 elements, $76.92\,\text{ms}$ min LAN RTT) and Adreno~840 \texttt{VK\_KHR\_cooperative\_matrix} benchmarking ($2.50\text{--}2.68$ FP16 TFLOPS; $4\times$ S26 full-studio tipping point at $0$ swaps / $60.49\,\text{s}$/turn vs.\ $5$ swaps / $90.32\,\text{s}$ on $2\times$ S26).
+
+\section{Limitations \& Threats to Validity}
+\begin{enumerate}[leftmargin=1.3em,itemsep=2pt]
+\item \textbf{Preserved failures \& remaining sealed splits:} Packet~C Mouth one-shot confirmation failed ($4/6$ amended gates) and is preserved unretuned; Packet~B2 locked OCR ($448$ items), Packet~C Ears ($80$ items), and Wave~B \texttt{FLUX.2-dev} Confirm-160 remain sealed.
+\item \textbf{Sample size on \texttt{FL2VA} \& human ratings:} Zero-refit \texttt{FL2VA} video+audio quality verification covers $n=4$ pinned dev prompts per donor (expanded Dev-24 and 8-domain \texttt{val\_dev} sweeps are in flight); Confirm-160 images do not yet include blinded human A/B preference ratings.
+\item \textbf{Unresolved historical Vast shift:} Controlled \texttt{PRO 6000 cu130} replay matched Packet~A on all $160/160$ teacher tensors and scores ($0.204513$), while historical Vast \texttt{cu128} diverged starting at token index~24 on long prompts ($\max|\Delta|\ge 12.47$); exact hardware vs.\ kernel attribution remains open.
+\item \textbf{Closed-loop \texttt{LoopRes} status:} Section~6's \texttt{LoopRes} integration is an active preregistered pilot; internalized breach reduction is unmeasured until completion.
+\end{enumerate}
+
+\section*{Acknowledgments \& Provenance}
+All checkpoints, Plato's Keys, side-by-side contact sheets ($22$ SHA-256-pinned PNGs), and cryptographic audit receipts are published under Apache-2.0 at \url{https://github.com/Atlas3DSS/atlas-ingine} and \url{https://huggingface.co/collections/Atlas3D/omni-by-atlas-6b09daccd0f65e23233163b3}.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{14}
+\footnotesize
+\bibitem{alayrac2022flamingo} J.-B. Alayrac et al. Flamingo: a Visual Language Model for Few-Shot Learning. \emph{NeurIPS}, 2022.
+\bibitem{alissonerdx2026tepk} Alissonerdx. TE-PK-Minimax-H3. Hugging Face, 2026.
+\bibitem{bakker2026relative} T. Bakker and C. Louizos. Relative Representations Enable Portable White-Box Monitoring Across Language Models. \emph{arXiv:2610.28366}, 2026.
+\bibitem{bansal2021stitching} Y. Bansal, P. Nakkiran, and B. Barak. Revisiting Model Stitching to Compare Neural Representations. \emph{NeurIPS}, 2021.
+\bibitem{cheng2026platoskey} V. Cheng, J. Liu, M. Yau, and C. R\'e. Plato's Key. Stanford Hazy Research, Nov 2026.
+\bibitem{huh2024platonic} M. Huh, B. Cheung, T. Wang, and P. Isola. The Platonic Representation Hypothesis. \emph{ICML}, 2024.
+\bibitem{lenc2015equivariance} K. Lenc and A. Vedaldi. Understanding Image Representations by Measuring Their Equivariance and Equivalence. \emph{CVPR}, 2015.
+\bibitem{li2023blip2} J. Li, D. Li, S. Savarese, and S. Hoi. BLIP-2. \emph{ICML}, 2023.
+\bibitem{liu2023llava} H. Liu et al. Visual Instruction Tuning (LLaVA) \& LLaVA-1.5. \emph{NeurIPS} / \emph{arXiv:2310.03744}, 2023.
+\bibitem{moschella2023relative} L. Moschella et al. Relative Representations Enable Zero-Shot Latent Space Communication. \emph{ICLR}, 2023.
+\bibitem{simeoni2025dinov3} O. Sim\'eoni et al. DINOv3. \emph{arXiv:2508.10104}, 2025.
+\bibitem{tschannen2025siglip2} M. Tschannen et al. SigLIP~2: Multilingual Vision-Language Encoders. Google Research, 2025.
+\bibitem{zhao2026loopres} X. Zhao, H. Xu, K. Wang, Y. Luo, Y. Ren, Z. Zhu, Y. Lou, K. Xu, Y. Wang, K. Sarkar, and Y. You. Unlocking the Power of Loops in Pretrained LLMs with Loop Residuals (LoopRes). \emph{arXiv:2611.31094}, 2026.
+\end{thebibliography}
+
+\end{document}
