@@ -1,0 +1,22 @@
+{
+  "img_b0:h3p0_0940__b0_shuffled_single_tap.png": "ddfd92907b31cc300897bd05c5b028849bb0cd84e2ac52d923b01eb0ae0033c3",
+  "img_concat4:h3p0_0940__inkling_platos_key_concat4.png": "8e1d37d337f7604cce4e38b2e42877a905c7c9de0fa313a366a7c3f2e2aa2112",
+  "img_teacher:h3p0_0940__teacher_reinject.png": "43d655ad8db4b6d092e6e4ffd7495a46e91f1e7666e6ac8b1bd451a6923f785f",
+  "music_song_a_wav:packetD_song_A__inkling_platos_key_36m_48k_stereo.wav": "b451060ba28bf06e904ba9e2dbe1b607a88cbe25fc00d1fa7b2c9660918b4524",
+  "music_song_b_wav:packetD_song_B__inkling_platos_key_36m_48k_stereo.wav": "a4168d8d9c036d5aae7924ac4fb4f054e9978a45ef588a708d10d8a1141c53a5",
+  "packet_a_outcomes:h3_confirm160_per_prompt_outcomes.jsonl": "9ed2987efb9cd15773b3e358cf001b505b68705f5d577c2cff2c4d852add34c8",
+  "packet_a_report:h3_confirm160_report.json": "5dace34769350d7d40255b0b9922d4c19ecf867e48d7fde8dfdf90731714e05d",
+  "prompts_jsonl:h3_platos_key_phase0_prompts.jsonl": "9a577ef24ecf6234db1374bbd86fcf8088f46684cc2d3c8d65b0f8827ade8c52",
+  "prosody_clips:per_clip_scores_942_unified.jsonl": "d0a02b87e1dc11d644fe54c2be0f7901c0817566e8440c0cbb6e40d707635838",
+  "prosody_report:report_942_unified.json": "72ae01e03e27a876acfb6153ef5a0c3632815c2c9c6a839286be883dfa1e47c1",
+  "prosody_worker:worker_status.json": "5499aae4c25e730521c0b5d3eafa40ca68654a27d6e7ebcf0e02c4b60fa8ee65",
+  "qwen38_report:qwen38_h3_confirm160_report.json": "8011cca2565a64810bef15fea19386707bce743bb23b64daf473009e6444591a",
+  "speech_angry_wav:blind_072.wav": "96ec0988e7e5d550bd66bc90683742336c857dd1a85a2ca084b9119875ebb0bd",
+  "speech_sad_wav:blind_069.wav": "0042685c44905caf66d3bd6826a601acc2ea2db05e5dc73e975228fd07cba5f9",
+  "wave3_5070ti_report:wave3_card_report.json": "8bfdc7c16e095b85fafd48984a29ac2b463dba2620700eb94890963d14782558",
+  "wave3_mp4:wave3_real_5s_video_with_audio.mp4": "cb1fd6df9f34c3cf5b9e9ebc365dc19116767bbef5fa29147cabb91ea18f784d",
+  "wave3_pro6000_report:wave3_card_report.json": "258b35f20d173ed5e74c00ee858837d384dd3b38ee2654b8a264a198a8dcb5b8",
+  "wave3_wav:wave3_real_5s_audio_32k_stereo.wav": "89091bbed41f63a54c79ed901d9374c3f765f3d261d61713b8f8e013a106e32b",
+  "yue2_report:plato_36m_live_30s_singing_report.json": "053d4048b01c2ab0858c947ab2a64712c7a0394fa935b39c72d6e5ccd1758d21",
+  "yue2_whisper:plato_36m_blinded_whisper_audit.json": "7196b5dc59ec75709bbbeed7127912b01fca1305b2548759643d5138eb82ac95"
+}
