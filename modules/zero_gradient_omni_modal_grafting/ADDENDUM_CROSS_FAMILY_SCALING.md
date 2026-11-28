@@ -7,6 +7,8 @@
 
 ---
 
+![Combining Different AI Brains Keeps Cutting Error — If You Weight Them Properly](figures/fig_addendum_cross_family_scaling.png)
+
 ## 1. Observed Effect (Measured Through `N = 5` Independent LLM Families)
 
 When frozen hidden states from $N$ distinct open-weight LLM families are combined through exact FP64 multi-kernel dual Ridge regression ($K = \sum_{i=1}^{N} \alpha_i K_i$, $\alpha_i \ge 0$, $\sum_i \alpha_i = 1$, zero gradient steps, zero trunk weight edits) to predict MiniMax-H3 text-conditioning embeddings (`concat_all4` taps per trunk), held-out `val_dev` accuracy improves monotonically at every step from `N = 1` to `N = 5` (`160` held-out prompts, `3,446` words; `confirm_reserve = 0/160` untouched for `N = 4, 5`):
