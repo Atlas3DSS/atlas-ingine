@@ -6,6 +6,27 @@ Every contact sheet, spectrogram, and chart below was produced by the system or 
 
 ---
 
+## At a Glance: 1-Strip Visual Walkthrough & Real-Generation Reel
+
+One frozen language model forward pass multiplied by one closed-form FP16 Plato's Key (`1.4–90.0 MiB`, `0` gradient steps, `0` trunk edits, `zero_32b_qwen_loaded = true`) drives all four verified output modalities below:
+
+![1-Strip Visual Walkthrough: Prompt to Plato's Key to Image, 5.9s Video+Audio, Speech & 48 kHz Music](figures/walkthrough_1strip_omni_generations.png)
+
+### Animated 4-Modality Walkthrough Reel (Honest Playback Rate & Real Wall-Clock Badges)
+
+![Sped-Up Real-Generation Walkthrough Reel (16s, 4 Modalities)](samples/omni_platos_key_walkthrough_spedup.gif)
+
+*Full `1280×720` H.264 + `48 kHz` stereo audio walkthrough (`16.0 s`, `3.10 MB`):* **[samples/omni_platos_key_walkthrough_spedup.mp4](samples/omni_platos_key_walkthrough_spedup.mp4)** — generated directly from the `20` SHA-256-pinned artifacts in [`figures/walkthrough_sources.sha256.json`](figures/walkthrough_sources.sha256.json).
+
+| Step | Real Verified Output | Plato's Key | Reel Playback Rate | Real Generation Wall Time & GPU | Verified Result & Honest Boundary |
+|---|---|---|---|---|---|
+| **1. Image** | Sealed Confirm-160 `1024×1024` (`h3p0_0940`, plaster bust, `MiniMax-H3`) | `90.0 MiB` `Inkling concat4` (`50.0 MiB` `Qwen3.8 L31`) | Static real outputs (same `dit_seed` 3-way) | `27.7 s` NVFP4 (`RTX PRO 6000`) · `11.8 s` (`RTX 5070 Ti 16 GB`) | `img-teacher cos = 0.9879`, `SigLIP2 = 0.2468` vs `0.2553` `27.14 GB` teacher & `-0.0648` `B0` collapse (`97.50%` Confirm-160; `98.90%` `Qwen3.8 L31`). Unmasked `CLIP-L` `SDXL` fails (`57.7%`). |
+| **2. Video + Audio** | `5.875 s` `768×448 @ 24 fps` + `32 kHz` stereo (`h3p0_0080`, coral lagoon, `MiniMax-H3 FL2VA`) | **`+0 B`** (same `90.0 MiB` key, `0` refits) | **`2.0×` sped-up** (`5.88 s → 3.00 s`, real audio pitch-kept via `atempo`) | `99.6 s` (`RTX PRO 6000`) · `191.9 s` (`RTX 5070 Ti 16 GB`, `11.74 GiB` alloc) · `178.6 s` (`RTX 3090`) · `796.0 s` (`V100`) | `motion L1 = 8.16`, `RMS = 0.0119`, `zero_32b_qwen_loaded = true`. Warm DiT+VAE timed from saved key tensor across 16 verified GPUs. |
+| **3. Speech** | `24 kHz` mono `Qwen3-TTS-12Hz-1.7B` on identical words (`"Dogs are sitting by the door."`, `0` style prompt) | `1.4–2.8 MiB` FP64 SVD rank-64 | **`1.0×` real-time** (`2.08 s` sad → `2.00 s` angry) | `~2.2 s / clip` mean (`RTF 2.19`, `4.57 GiB` VRAM) | Continuous key flips `Qwen3.8 → sad` (`e2v 0.974`, `F0 154 Hz`, `WER 0%`) to `Inkling → angry` (`e2v 1.000`, `F0 254 Hz`, `WER 0%`). Exact words remain discrete (`0/32` direct lexemes). |
+| **4. Music** | `34.0 s` `48 kHz` stereo singing (`YuE2-3B + YuE2-Vae`, `zero_yue2_prompt_token_lookup = true`) | `36.0 MiB` `Inkling` key | **`1.0×` audio excerpt** (`19–24 s` of `34.0 s`) | `20.9 s` Song B (`1.63×` faster than real time) · `27.4 s` Song A (`RTX PRO 6000`, `7.24 GiB` alloc) | Song B `#1 G_major r = 0.801` (`125 BPM`, `4/12` Whisper lyrics vs `0/12` zero); Song A `#1 Bb_major r = 0.973` (avoids native `173 BPM` `Dm` prior). Verbatim anthem lyrics use discrete tokens (`10/11` Anthem v5). |
+
+---
+
 ## Shot 0: What Runs in Memory (and Why Prompt-Wrapper Harnesses Cannot Do This)
 
 A prompt-wrapper harness sends text strings over HTTP from an LLM to a separate media server that still loads a `27.14 GB` to `44.7 GiB` text encoder (`Qwen3-VL-32B`, `Mistral-Small-3.1-24B`, or `T5-XXL`). That design runs two separate language models on every prompt and leaves the media engine blind to the donor model's internal hidden states.
@@ -152,7 +173,10 @@ python3 modules/zero_gradient_omni_modal_grafting/figures/build_figures.py
 # 2. Regenerate architecture + multi-donor/cross-encoder figures (fig0, fig4) from 7 pinned JSONs
 python3 modules/zero_gradient_omni_modal_grafting/figures/build_extra_figures.py
 
-# 3. Inspect full append-only provenance ledger & cryptographic pins
+# 3. Regenerate 1-strip visual walkthrough PNG/SVG + sped-up MP4 & GIF from 20 pinned sources
+python3 modules/zero_gradient_omni_modal_grafting/figures/build_walkthrough_strip.py
+
+# 4. Inspect full append-only provenance ledger & cryptographic pins
 cat modules/zero_gradient_omni_modal_grafting/PROCESS_LOG.md
 ```
 
