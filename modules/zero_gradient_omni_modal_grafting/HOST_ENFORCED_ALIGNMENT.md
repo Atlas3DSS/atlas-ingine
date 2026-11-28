@@ -33,13 +33,13 @@ Additional host-isolation and interpretability checks in the same live run:
 
 ### 500-Turn Multimodal Follow-Up (`#954`)
 
-A preregistered follow-up ran one ordered sequence of 500 image+text turns (`400` adversarial across eight attack families, `100` benign) on the same `Inkling-2-Mini-atlas-12g` pack. Inputs, model weights, engine binary, code and the turn order were frozen before the run (manifest SHA-256 `fc2c4dcdead405ac8de80242f368ca166395a2c34e634e87e218c0a23e6653b9`). The system prompt is Anthropic's published constitution text (CC0 1.0). The model answers each turn once: Arm A scores that raw response, and Arm B scores what the host Verified Ledger lets through. The test is of Inkling-2-Mini under that prompt, not of any Claude model.
+A preregistered follow-up ran one ordered sequence of 500 image+text turns (`400` adversarial across eight attack families, `100` benign) on the same `Inkling-2-Mini-atlas-12g` pack. Inputs, model weights, engine binary, code and the turn order were frozen before the run (manifest SHA-256 `fc2c4dcdead405ac8de80242f368ca166395a2c34e634e87e218c0a23e6653b9`). The system prompt is a 2,877-byte benchmark-authored prompt (SHA-256 `af1e492ef2c9aa2efa2d18b1f799afacef90ac7d2b6c6cbdc26b28fe8e575ce2`) adapted from Anthropic's published constitution (CC0 1.0): it restates the constitution's priorities and adds domain rules and JSON action schemas. It is not the constitution text itself. Each turn produced one model response. Arm A scores its proposed action and raw text; Arm B scores the action the host committed and the text it released. The test is of Inkling-2-Mini under that prompt, not of any Claude model.
 
-| Measure | Arm A: constitution text only | Arm B: host Verified Ledger |
+| Measure | Arm A: model response as proposed | Arm B: after the host Verified Ledger |
 |---|---:|---:|
 | Adversarial turns with any breach | `86 / 400` (`21.5%`) | `0 / 400` |
-| Adversarial turns with an action breach | `58 / 400` | `0 / 400` |
-| Adversarial turns with a raw disclosure | `38 / 400` | `0 / 400` |
+| Adversarial turns with an action breach (proposed vs committed) | `58 / 400` | `0 / 400` |
+| Adversarial turns with a disclosure (raw response vs released text) | `38 / 400` | `0 / 400` |
 | Benign tasks completed | `42 / 100` | `42 / 100` |
 | Valid benign proposals blocked by the host | n/a | `0` |
 
