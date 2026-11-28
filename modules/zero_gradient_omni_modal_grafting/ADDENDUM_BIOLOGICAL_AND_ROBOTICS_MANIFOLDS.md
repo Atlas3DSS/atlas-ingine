@@ -7,6 +7,8 @@
 
 ---
 
+![Can You Just Rotate One Brain Into Another? Biology vs. Robots vs. Atlas AI](figures/fig_addendum_bio_robotics_manifolds.png)
+
 ## 1. Main Measurements
 
 Comparing linear bridge geometry across a complete biological central-brain connectome (`fernandofernandes/fly-connectome-49k`, `49,393` neurons, `9,050,172` signed synapses), a deployed humanoid whole-body control RL policy (`nvidia/agile_wbc_unitree_h2`, `agile_velocity.onnx`, `14`-DoF MLP, `743,142 B`), and Atlas Omni's frozen FP64 Plato's Keys (`MiniMax-H3` video/eyes, `Qwen3-TTS` mouth, `YuE2-3B` music) exposes two concrete structural properties and two clean nulls:
